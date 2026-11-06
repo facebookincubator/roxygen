@@ -1,0 +1,1705 @@
+//! Fixed-worker TCP/TLS HTTP server lifecycle.
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::io;
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
+use std::net::TcpListener;
+use std::net::TcpStream;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::SyncSender;
+
+use roxygen_core::error::HttpError;
+use roxygen_core::filter_factory::FilterFactory;
+use roxygen_core::filter_factory::HttpFilterFactoryHandler;
+use roxygen_core::handler::HttpHandlerRef;
+use roxygen_core::http::CodecProtocol;
+use roxygen_runtime::tokio_host::ManagedWorker;
+use roxygen_runtime::tokio_host::ManagedWorkerError;
+use roxygen_runtime::worker::SubmitError;
+use roxygen_runtime::worker::WorkerContext;
+use roxygen_session::uniplex::UniplexRunSummary;
+#[cfg(test)]
+use roxygen_transport::byte_stream::TransportRetirement;
+use roxygen_transport::tls::TlsServerOptions;
+use socket2::Domain;
+use socket2::Protocol;
+use socket2::SockAddr;
+use socket2::Socket;
+use socket2::Type;
+use thiserror::Error;
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
+
+use crate::acceptor::AcceptedConnectionObserver;
+use crate::acceptor::AcceptorConfig;
+use crate::acceptor::NewConnectionFilter;
+use crate::acceptor::ServerSessionConfig;
+use crate::acceptor::SessionControl;
+use crate::acceptor::TlsHandshakeObserver;
+use crate::acceptor::accept_session;
+use crate::acceptor::invoke_accept_callback;
+use crate::acceptor::run_session;
+pub use crate::connection::ServeTransportOptions;
+pub use crate::connection::ServerConnection;
+pub use crate::connection::serve_transport;
+
+const DEFAULT_COMMAND_CAPACITY: usize = 1_024;
+const DEFAULT_BACKLOG: i32 = 1_024;
+
+#[cfg(test)]
+pub(crate) const ADMISSION_EVENT_LIMIT: usize = 8;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AdmissionListenerKey {
+    pub(crate) worker_index: usize,
+    pub(crate) task_id: tokio::task::Id,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmissionAttempt {
+    Enqueued,
+    Full,
+    Closed,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AdmissionSocket {
+    pub(crate) worker_index: usize,
+    pub(crate) local: Option<SocketAddr>,
+    pub(crate) peer: SocketAddr,
+    pub(crate) capacity: usize,
+    pub(crate) max_capacity: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmissionJoinOutcome {
+    Returned,
+    Cancelled,
+    Panicked,
+    OtherFailure,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmissionEvent {
+    ListenerRegistered(AdmissionListenerKey),
+    DequeueHeld {
+        worker_index: usize,
+    },
+    Socket {
+        key: AdmissionListenerKey,
+        socket: AdmissionSocket,
+        attempt: AdmissionAttempt,
+    },
+    ForceObserved {
+        worker_index: usize,
+        queued: usize,
+        capacity: usize,
+        max_capacity: usize,
+        held: bool,
+        sessions: usize,
+        controls: usize,
+        mappings: usize,
+    },
+    ListenerReaped {
+        key: AdmissionListenerKey,
+        outcome: AdmissionJoinOutcome,
+        remaining: usize,
+    },
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct AdmissionProgress {
+    stage: usize,
+    key: Option<AdmissionListenerKey>,
+    first_socket: Option<AdmissionSocket>,
+    failed: bool,
+}
+
+#[cfg(test)]
+impl AdmissionProgress {
+    pub(crate) fn observe(&mut self, event: AdmissionEvent) -> bool {
+        let valid = match (self.stage, event) {
+            (0, AdmissionEvent::ListenerRegistered(key)) => {
+                self.key = Some(key);
+                key.worker_index == 0
+            }
+            (1, AdmissionEvent::DequeueHeld { worker_index }) => worker_index == 0,
+            (
+                2,
+                AdmissionEvent::Socket {
+                    key,
+                    socket,
+                    attempt: AdmissionAttempt::Enqueued,
+                },
+            ) => {
+                self.first_socket = Some(socket);
+                self.key == Some(key)
+                    && socket.worker_index == 0
+                    && socket.local.is_some()
+                    && socket.capacity == 0
+                    && socket.max_capacity == 1
+            }
+            (
+                3,
+                AdmissionEvent::Socket {
+                    key,
+                    socket,
+                    attempt: AdmissionAttempt::Full,
+                },
+            ) => {
+                self.key == Some(key)
+                    && socket.worker_index == 0
+                    && socket.capacity == 0
+                    && socket.max_capacity == 1
+                    && self.first_socket.is_some_and(|first| {
+                        first.local == socket.local && first.peer != socket.peer
+                    })
+            }
+            (
+                4,
+                AdmissionEvent::ForceObserved {
+                    worker_index: 0,
+                    queued: 1,
+                    capacity: 0,
+                    max_capacity: 1,
+                    held: true,
+                    sessions: 0,
+                    controls: 0,
+                    mappings: 0,
+                },
+            ) => true,
+            (
+                5,
+                AdmissionEvent::ListenerReaped {
+                    key,
+                    outcome,
+                    remaining: 0,
+                },
+            ) => {
+                self.key == Some(key)
+                    && matches!(
+                        outcome,
+                        AdmissionJoinOutcome::Returned | AdmissionJoinOutcome::Cancelled
+                    )
+            }
+            _ => false,
+        };
+        self.failed |= !valid;
+        if !self.failed {
+            self.stage += 1;
+        }
+        !self.failed
+    }
+
+    pub(crate) fn saturated(&self) -> bool {
+        !self.failed && self.stage == 4
+    }
+
+    pub(crate) fn retired(&self) -> bool {
+        !self.failed && self.stage == 6
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct AdmissionProbe {
+    sender: SyncSender<AdmissionEvent>,
+    failed: AtomicBool,
+    records: AtomicUsize,
+    registrations: AtomicUsize,
+    progress: Mutex<AdmissionProgress>,
+    gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[cfg(test)]
+impl AdmissionProbe {
+    pub(crate) fn new() -> (
+        Arc<Self>,
+        Receiver<AdmissionEvent>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(ADMISSION_EVENT_LIMIT);
+        let (release, gate) = tokio::sync::oneshot::channel();
+        (
+            Arc::new(Self {
+                sender,
+                failed: AtomicBool::new(false),
+                records: AtomicUsize::new(0),
+                registrations: AtomicUsize::new(0),
+                progress: Mutex::new(AdmissionProgress::default()),
+                gate: Mutex::new(Some(gate)),
+            }),
+            receiver,
+            release,
+        )
+    }
+
+    fn confirm(&self, valid: bool) -> bool {
+        if !valid {
+            self.failed.store(true, Ordering::Release);
+        }
+        valid
+    }
+
+    pub(crate) fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn registrations(&self) -> usize {
+        self.registrations.load(Ordering::Acquire)
+    }
+
+    fn publish(&self, event: AdmissionEvent) {
+        if !self.confirm(
+            self.records
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count
+                        .checked_add(1)
+                        .filter(|count| *count <= ADMISSION_EVENT_LIMIT)
+                })
+                .is_ok(),
+        ) {
+            return;
+        }
+        let valid = match self.progress.try_lock() {
+            Ok(mut progress) => progress.observe(event),
+            Err(_) => false,
+        };
+        self.confirm(valid);
+        self.confirm(self.sender.try_send(event).is_ok());
+    }
+
+    fn take_gate(&self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        let gate = self.gate.try_lock().ok().and_then(|mut gate| gate.take());
+        self.confirm(gate.is_some());
+        gate
+    }
+
+    fn session_registered(&self) {
+        let _ = self
+            .registrations
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            });
+        self.confirm(false);
+    }
+}
+
+#[cfg(test)]
+async fn observe_accept_reaps(
+    tasks: &mut JoinSet<()>,
+    probe: &AdmissionProbe,
+    worker_index: usize,
+) {
+    while let Some(result) = tasks.join_next_with_id().await {
+        let (task_id, outcome) = match result {
+            Ok((task_id, ())) => (task_id, AdmissionJoinOutcome::Returned),
+            Err(error) => {
+                let task_id = error.id();
+                let outcome = if error.is_panic() {
+                    AdmissionJoinOutcome::Panicked
+                } else if error.is_cancelled() {
+                    AdmissionJoinOutcome::Cancelled
+                } else {
+                    AdmissionJoinOutcome::OtherFailure
+                };
+                drop(error);
+                (task_id, outcome)
+            }
+        };
+        probe.publish(AdmissionEvent::ListenerReaped {
+            key: AdmissionListenerKey {
+                worker_index,
+                task_id,
+            },
+            outcome,
+            remaining: tasks.len(),
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) const SESSION_RETIREMENT_EVENT_LIMIT: usize = 8;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SessionRetirementKey {
+    pub(crate) worker_index: usize,
+    pub(crate) session_id: u64,
+    pub(crate) task_id: tokio::task::Id,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) enum SessionRunOutcome {
+    Returned(Result<UniplexRunSummary, HttpError>),
+    JoinFailed { panic: bool, cancelled: bool },
+}
+
+#[cfg(test)]
+pub(crate) struct SessionReaped {
+    pub(crate) outcome: SessionRunOutcome,
+    pub(crate) mapping_removed: bool,
+    pub(crate) control_removed: bool,
+    pub(crate) remaining_tasks: usize,
+    pub(crate) remaining_controls: usize,
+}
+
+#[cfg(test)]
+pub(crate) enum SessionRetirementRecord {
+    Registered,
+    TransportBound(Option<TransportRetirement>),
+    RunReturned,
+    Reaped(SessionReaped),
+}
+
+#[cfg(test)]
+pub(crate) struct SessionRetirementEvent {
+    pub(crate) key: SessionRetirementKey,
+    pub(crate) record: SessionRetirementRecord,
+}
+
+#[cfg(test)]
+pub(crate) struct SessionRunGate {
+    pub(crate) worker_index: usize,
+    pub(crate) session_id: u64,
+    pub(crate) release: tokio::sync::oneshot::Receiver<()>,
+    pub(crate) timeout: std::time::Duration,
+}
+
+#[cfg(test)]
+pub(crate) struct SessionRetirementProbe {
+    sender: SyncSender<SessionRetirementEvent>,
+    failed: AtomicBool,
+    records: AtomicUsize,
+    gate: Mutex<Option<SessionRunGate>>,
+}
+
+#[cfg(test)]
+impl SessionRetirementProbe {
+    pub(crate) fn new(
+        gate: Option<SessionRunGate>,
+    ) -> (Arc<Self>, Receiver<SessionRetirementEvent>) {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(SESSION_RETIREMENT_EVENT_LIMIT);
+        (
+            Arc::new(Self {
+                sender,
+                failed: AtomicBool::new(false),
+                records: AtomicUsize::new(0),
+                gate: Mutex::new(gate),
+            }),
+            receiver,
+        )
+    }
+
+    pub(crate) fn confirm(&self, valid: bool) -> bool {
+        if !valid {
+            self.failed.store(true, Ordering::Release);
+        }
+        valid
+    }
+
+    pub(crate) fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    fn publish(&self, key: SessionRetirementKey, record: SessionRetirementRecord) {
+        if !self.confirm(
+            self.records
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |records| {
+                    records
+                        .checked_add(1)
+                        .filter(|records| *records <= SESSION_RETIREMENT_EVENT_LIMIT)
+                })
+                .is_ok(),
+        ) {
+            return;
+        }
+        self.confirm(
+            self.sender
+                .try_send(SessionRetirementEvent { key, record })
+                .is_ok(),
+        );
+    }
+
+    fn take_gate(&self, worker_index: usize, session_id: u64) -> Option<SessionRunGate> {
+        match self.gate.try_lock() {
+            Ok(mut gate) => {
+                if gate.as_ref().is_some_and(|gate| {
+                    gate.worker_index == worker_index && gate.session_id == session_id
+                }) {
+                    gate.take()
+                } else {
+                    None
+                }
+            }
+            Err(_) => {
+                self.confirm(false);
+                None
+            }
+        }
+    }
+}
+
+pub type HandlerFactory = Arc<dyn Fn(usize) -> HttpHandlerRef + Send + Sync>;
+
+/// Constructs worker-local application state on the worker serving its requests.
+/// The context can register asynchronous cleanup that is joined at worker exit.
+pub type WorkerHandlerFactory = Arc<dyn Fn(WorkerContext, usize) -> HttpHandlerRef + Send + Sync>;
+
+pub trait ServerFilterFactory: Send + Sync + 'static {
+    fn make_filter_factory(&self) -> Rc<dyn FilterFactory>;
+
+    fn on_server_start(&self, _worker_index: usize) {}
+
+    fn on_server_stop(&self, _worker_index: usize) {}
+}
+
+pub trait ServerObserver: Send + Sync + 'static {
+    fn on_thread_start(&self, _worker_index: usize) {}
+
+    fn on_thread_stop(&self, _worker_index: usize) {}
+}
+
+pub trait TlsCredentialProvider: Send + Sync + 'static {
+    fn load(&self) -> Result<TlsServerOptions, HttpError>;
+}
+
+pub struct StaticTlsCredentials {
+    options: TlsServerOptions,
+}
+
+impl StaticTlsCredentials {
+    pub fn new(options: TlsServerOptions) -> Self {
+        Self { options }
+    }
+}
+
+impl TlsCredentialProvider for StaticTlsCredentials {
+    fn load(&self) -> Result<TlsServerOptions, HttpError> {
+        Ok(self.options.clone())
+    }
+}
+
+pub struct ServerSocketConfig {
+    pub bind_addresses: Vec<SocketAddr>,
+    pub prebound_listeners: Vec<TcpListener>,
+    pub backlog: i32,
+    pub reuse_port: bool,
+    pub tcp_max_segment: Option<u32>,
+    pub use_zero_copy: bool,
+}
+
+impl Default for ServerSocketConfig {
+    fn default() -> Self {
+        Self {
+            bind_addresses: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)],
+            prebound_listeners: Vec::new(),
+            backlog: DEFAULT_BACKLOG,
+            reuse_port: false,
+            tcp_max_segment: None,
+            use_zero_copy: false,
+        }
+    }
+}
+
+pub struct ServerConfig {
+    pub socket: ServerSocketConfig,
+    pub plaintext_protocol: CodecProtocol,
+    pub session: ServerSessionConfig,
+    pub num_io_threads: usize,
+    pub command_capacity: usize,
+    pub shutdown_on_signals: Vec<i32>,
+    pub new_connection_filter: Option<Arc<dyn NewConnectionFilter>>,
+    pub filter_factories: Vec<Arc<dyn ServerFilterFactory>>,
+    pub tls_credentials: Option<Arc<dyn TlsCredentialProvider>>,
+    pub tls_observer: Option<Arc<dyn TlsHandshakeObserver>>,
+    pub connection_observer: Option<Arc<dyn AcceptedConnectionObserver>>,
+    pub zero_copy_enable_threshold: usize,
+    #[cfg(test)]
+    pub(crate) session_retirement_probe: Option<Arc<SessionRetirementProbe>>,
+    #[cfg(test)]
+    pub(crate) admission_probe: Option<Arc<AdmissionProbe>>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            socket: ServerSocketConfig::default(),
+            plaintext_protocol: CodecProtocol::Http11,
+            session: ServerSessionConfig::default(),
+            num_io_threads: 1,
+            command_capacity: DEFAULT_COMMAND_CAPACITY,
+            shutdown_on_signals: vec![libc::SIGINT],
+            new_connection_filter: None,
+            filter_factories: Vec::new(),
+            tls_credentials: None,
+            tls_observer: None,
+            connection_observer: None,
+            zero_copy_enable_threshold: 0,
+            #[cfg(test)]
+            session_retirement_probe: None,
+            #[cfg(test)]
+            admission_probe: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum HttpServerState {
+    Uninitialized,
+    Running,
+    Draining,
+    ForceStopping,
+    Stopped,
+}
+
+impl HttpServerState {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            1 => Self::Running,
+            2 => Self::Draining,
+            3 => Self::ForceStopping,
+            4 => Self::Stopped,
+            _ => Self::Uninitialized,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum HttpServerError {
+    #[error("server configuration is invalid: {0}")]
+    InvalidConfig(&'static str),
+    #[error("server socket setup failed: {0}")]
+    Socket(#[from] io::Error),
+    #[error("server worker setup failed: {0}")]
+    Worker(#[from] ManagedWorkerError),
+    #[error("server worker rejected its startup command: {0}")]
+    Submit(#[from] SubmitError),
+    #[error("server worker failed to initialize: {0}")]
+    WorkerStartup(String),
+    #[error("server TLS credential reload failed: {0}")]
+    TlsReload(HttpError),
+    #[error("server {stage:?} callback panicked on worker {worker_index}")]
+    CallbackPanic {
+        worker_index: usize,
+        stage: ServerCallbackStage,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServerCallbackStage {
+    HandlerFactory,
+    FilterConstruction,
+    TlsHandshakeObserver,
+    AcceptedConnectionObserver,
+    LifecycleObserverFactory,
+    ObserverStart,
+    FilterStart,
+    SessionDrain,
+    SessionForceStop,
+    ObserverStop,
+    FilterStop,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CallbackFailure {
+    worker_index: usize,
+    stage: ServerCallbackStage,
+}
+
+enum WorkerCommand {
+    Drain,
+    ForceStop,
+}
+
+struct WorkerConfig {
+    index: usize,
+    acceptor: AcceptorConfig,
+    handler_factory: WorkerHandlerFactory,
+    filter_factories: Vec<Arc<dyn ServerFilterFactory>>,
+    observer: Option<Arc<dyn ServerObserver>>,
+    draining: Arc<AtomicBool>,
+    control: HttpServerControl,
+    shutdown_on_signals: Vec<i32>,
+    callback_failure: Arc<Mutex<Option<CallbackFailure>>>,
+    lifecycle_started: Arc<AtomicBool>,
+    #[cfg(test)]
+    session_retirement_probe: Option<Arc<SessionRetirementProbe>>,
+    #[cfg(test)]
+    admission_probe: Option<Arc<AdmissionProbe>>,
+}
+
+#[derive(Clone)]
+pub struct HttpServerControl {
+    state: Arc<AtomicU8>,
+    draining: Arc<AtomicBool>,
+    commands: Vec<mpsc::UnboundedSender<WorkerCommand>>,
+}
+
+impl HttpServerControl {
+    pub fn state(&self) -> HttpServerState {
+        HttpServerState::from_raw(self.state.load(Ordering::Acquire))
+    }
+
+    pub fn drain(&self) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                HttpServerState::Running as u8,
+                HttpServerState::Draining as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.draining.store(true, Ordering::Release);
+        for sender in &self.commands {
+            let _ = sender.send(WorkerCommand::Drain);
+        }
+        true
+    }
+
+    pub fn force_stop(&self) -> bool {
+        let previous = self
+            .state
+            .swap(HttpServerState::ForceStopping as u8, Ordering::AcqRel);
+        if matches!(
+            HttpServerState::from_raw(previous),
+            HttpServerState::ForceStopping | HttpServerState::Stopped
+        ) {
+            return false;
+        }
+        self.draining.store(true, Ordering::Release);
+        for sender in &self.commands {
+            let _ = sender.send(WorkerCommand::ForceStop);
+        }
+        true
+    }
+}
+
+pub struct HttpServer {
+    state: Arc<AtomicU8>,
+    draining: Arc<AtomicBool>,
+    addresses: Vec<SocketAddr>,
+    tcp_max_segments: Vec<Option<u32>>,
+    num_io_threads: usize,
+    workers: RefCell<Vec<ManagedWorker>>,
+    commands: Vec<mpsc::UnboundedSender<WorkerCommand>>,
+    tls_credentials: Option<Arc<dyn TlsCredentialProvider>>,
+    tls: Option<Arc<ArcSwap<TlsServerOptions>>>,
+    callback_failure: Arc<Mutex<Option<CallbackFailure>>>,
+    exit_receivers: RefCell<Vec<Receiver<()>>>,
+}
+
+impl HttpServer {
+    pub fn start(
+        config: ServerConfig,
+        handler_factory: HandlerFactory,
+        observer: Option<Arc<dyn ServerObserver>>,
+    ) -> Result<Self, HttpServerError> {
+        Self::start_with_worker_factory(
+            config,
+            Arc::new(move |_, index| handler_factory(index)),
+            observer,
+        )
+    }
+
+    /// Starts a server whose handlers are constructed with their owning worker.
+    /// Existing worker cleanup scopes retire application resources before join.
+    pub fn start_with_worker_factory(
+        mut config: ServerConfig,
+        handler_factory: WorkerHandlerFactory,
+        observer: Option<Arc<dyn ServerObserver>>,
+    ) -> Result<Self, HttpServerError> {
+        if config.command_capacity == 0 {
+            return Err(HttpServerError::InvalidConfig(
+                "command capacity must be nonzero",
+            ));
+        }
+        config
+            .session
+            .check_owned_http1()
+            .map_err(HttpServerError::InvalidConfig)?;
+        let num_io_threads = if config.num_io_threads == 0 {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+        } else {
+            config.num_io_threads
+        };
+        let listeners = if config.socket.prebound_listeners.is_empty() {
+            bind_listeners(&config.socket)?
+        } else {
+            let listeners = std::mem::take(&mut config.socket.prebound_listeners);
+            if config.socket.use_zero_copy {
+                listeners.iter().for_each(enable_zero_copy_best_effort);
+            }
+            listeners
+        };
+        if listeners.is_empty() {
+            return Err(HttpServerError::InvalidConfig(
+                "at least one listening socket is required",
+            ));
+        }
+        #[cfg(test)]
+        if config.admission_probe.is_some()
+            && (num_io_threads != 1
+                || listeners.len() != 1
+                || config.command_capacity != 1
+                || !config.shutdown_on_signals.is_empty()
+                || config.tls_credentials.is_some())
+        {
+            return Err(HttpServerError::InvalidConfig(
+                "admission probe requires one worker/listener, capacity one, no signals or TLS",
+            ));
+        }
+        for listener in &listeners {
+            listener.set_nonblocking(true)?;
+        }
+        let addresses = listeners
+            .iter()
+            .map(TcpListener::local_addr)
+            .collect::<Result<Vec<_>, _>>()?;
+        let tcp_max_segments = listeners.iter().map(read_tcp_max_segment).collect();
+        let tls = match config.tls_credentials.as_ref() {
+            Some(provider) => Some(Arc::new(ArcSwap::from_pointee(
+                provider.load().map_err(HttpServerError::TlsReload)?,
+            ))),
+            None => None,
+        };
+        let acceptor = AcceptorConfig {
+            plaintext_protocol: config.plaintext_protocol,
+            session: config.session,
+            connection_filter: config.new_connection_filter,
+            tls: tls.clone(),
+            tls_observer: config.tls_observer,
+            connection_observer: config.connection_observer,
+            zero_copy_threshold: config.zero_copy_enable_threshold,
+        };
+        let state = Arc::new(AtomicU8::new(HttpServerState::Uninitialized as u8));
+        let draining = Arc::new(AtomicBool::new(false));
+        let callback_failure = Arc::new(Mutex::new(None));
+        let mut workers = Vec::with_capacity(num_io_threads);
+        let mut commands = Vec::with_capacity(num_io_threads);
+        let mut receivers = Vec::with_capacity(num_io_threads);
+        let mut accepted_senders = Vec::with_capacity(num_io_threads);
+        let mut accepted_receivers = Vec::with_capacity(num_io_threads);
+        let mut lifecycle_started = Vec::with_capacity(num_io_threads);
+        let mut exit_receivers = Vec::with_capacity(num_io_threads);
+        for index in 0..num_io_threads {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            commands.push(sender);
+            receivers.push(Some(receiver));
+            let (accepted_sender, accepted_receiver) = mpsc::channel(config.command_capacity);
+            accepted_senders.push(accepted_sender);
+            accepted_receivers.push(Some(accepted_receiver));
+            let started = Arc::new(AtomicBool::new(false));
+            lifecycle_started.push(Arc::clone(&started));
+            let callback_observer = observer.clone();
+            let callback_factories = config.filter_factories.clone();
+            let callback_failure = Arc::clone(&callback_failure);
+            let (exit_sender, exit_receiver) = std::sync::mpsc::sync_channel(1);
+            workers.push(ManagedWorker::new_with_exit_callback(
+                config.command_capacity,
+                move || {
+                    if started.load(Ordering::Acquire) {
+                        notify_worker_stop(
+                            index,
+                            callback_observer,
+                            callback_factories,
+                            &callback_failure,
+                        );
+                    }
+                    let _ = exit_sender.send(());
+                },
+            )?);
+            exit_receivers.push(exit_receiver);
+        }
+
+        let accept_round_robin = Arc::new(AtomicUsize::new(0));
+        let control = HttpServerControl {
+            state: Arc::clone(&state),
+            draining: Arc::clone(&draining),
+            commands: commands.clone(),
+        };
+        let mut startup_receivers = Vec::with_capacity(num_io_threads);
+        let mut owned_listeners = Some(listeners);
+        for index in 0..num_io_threads {
+            let receiver = receivers[index]
+                .take()
+                .expect("each server worker owns one command receiver");
+            let accepted_receiver = accepted_receivers[index]
+                .take()
+                .expect("each server worker owns one accepted-socket receiver");
+            let worker_config = WorkerConfig {
+                index,
+                acceptor: acceptor.clone(),
+                handler_factory: Arc::clone(&handler_factory),
+                filter_factories: config.filter_factories.clone(),
+                observer: observer.clone(),
+                draining: Arc::clone(&draining),
+                control: control.clone(),
+                shutdown_on_signals: if index == 0 {
+                    config.shutdown_on_signals.clone()
+                } else {
+                    Vec::new()
+                },
+                callback_failure: Arc::clone(&callback_failure),
+                lifecycle_started: Arc::clone(&lifecycle_started[index]),
+                #[cfg(test)]
+                session_retirement_probe: config.session_retirement_probe.clone(),
+                #[cfg(test)]
+                admission_probe: config.admission_probe.clone(),
+            };
+            let worker_accepted = accepted_senders.clone();
+            let round_robin = Arc::clone(&accept_round_robin);
+            let listeners = if index == 0 {
+                owned_listeners.take().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+            workers[index].handle().spawn_local(move |context| {
+                worker_loop(
+                    context,
+                    receiver,
+                    accepted_receiver,
+                    worker_accepted,
+                    round_robin,
+                    listeners,
+                    worker_config,
+                    started_tx,
+                )
+            })?;
+            startup_receivers.push(started_rx);
+        }
+        for receiver in startup_receivers {
+            match receiver.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(HttpServerError::WorkerStartup(error)),
+                Err(error) => return Err(HttpServerError::WorkerStartup(error.to_string())),
+            }
+        }
+        state.store(HttpServerState::Running as u8, Ordering::Release);
+        Ok(Self {
+            state,
+            draining,
+            addresses,
+            tcp_max_segments,
+            num_io_threads,
+            workers: RefCell::new(workers),
+            commands,
+            tls_credentials: config.tls_credentials,
+            tls,
+            callback_failure,
+            exit_receivers: RefCell::new(exit_receivers),
+        })
+    }
+
+    pub fn state(&self) -> HttpServerState {
+        HttpServerState::from_raw(self.state.load(Ordering::Acquire))
+    }
+
+    pub fn control(&self) -> HttpServerControl {
+        HttpServerControl {
+            state: Arc::clone(&self.state),
+            draining: Arc::clone(&self.draining),
+            commands: self.commands.clone(),
+        }
+    }
+
+    pub fn address(&self) -> Option<SocketAddr> {
+        (self.addresses.len() == 1).then(|| self.addresses[0])
+    }
+
+    pub fn addresses(&self) -> &[SocketAddr] {
+        &self.addresses
+    }
+
+    pub fn tcp_max_segment(&self, listener_index: usize) -> Option<u32> {
+        self.tcp_max_segments.get(listener_index).copied().flatten()
+    }
+
+    pub const fn num_io_threads(&self) -> usize {
+        self.num_io_threads
+    }
+
+    pub fn drain(&self) -> bool {
+        self.control().drain()
+    }
+
+    pub fn force_stop(&self) -> Result<bool, HttpServerError> {
+        if self.state() == HttpServerState::Stopped && self.workers.borrow().is_empty() {
+            return Ok(false);
+        }
+        let previous = self.state();
+        if !matches!(previous, HttpServerState::ForceStopping) {
+            let _ = self.drain();
+        }
+        self.state
+            .store(HttpServerState::ForceStopping as u8, Ordering::Release);
+        for sender in &self.commands {
+            let _ = sender.send(WorkerCommand::ForceStop);
+        }
+        self.finish_workers()?;
+        Ok(true)
+    }
+
+    /// Waits for a previously requested graceful drain and joins every worker.
+    pub fn wait_for_stop(&self) -> Result<bool, HttpServerError> {
+        match self.state() {
+            HttpServerState::Stopped => return Ok(false),
+            HttpServerState::Draining => {}
+            _ => {
+                return Err(HttpServerError::InvalidConfig(
+                    "wait_for_stop requires a draining server",
+                ));
+            }
+        }
+        self.finish_workers()?;
+        Ok(true)
+    }
+
+    fn finish_workers(&self) -> Result<(), HttpServerError> {
+        std::mem::take(&mut *self.exit_receivers.borrow_mut())
+            .into_iter()
+            .for_each(|receiver| {
+                let _ = receiver.recv();
+            });
+        let workers = std::mem::take(&mut *self.workers.borrow_mut());
+        let mut worker_error = None;
+        for worker in workers {
+            if let Err(error) = worker.shutdown()
+                && worker_error.is_none()
+            {
+                worker_error = Some(error);
+            }
+        }
+        self.state
+            .store(HttpServerState::Stopped as u8, Ordering::Release);
+        if let Some(failure) = self
+            .callback_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            return Err(HttpServerError::CallbackPanic {
+                worker_index: failure.worker_index,
+                stage: failure.stage,
+            });
+        }
+        if let Some(error) = worker_error {
+            return Err(HttpServerError::Worker(error));
+        }
+        Ok(())
+    }
+
+    pub fn update_tls_credentials(&self) -> Result<(), HttpServerError> {
+        let Some(provider) = self.tls_credentials.as_ref() else {
+            return Err(HttpServerError::InvalidConfig(
+                "TLS credentials are not configured",
+            ));
+        };
+        let Some(tls) = self.tls.as_ref() else {
+            return Err(HttpServerError::InvalidConfig(
+                "TLS runtime state is not configured",
+            ));
+        };
+        let replacement = provider.load().map_err(HttpServerError::TlsReload)?;
+        tls.store(Arc::new(replacement));
+        Ok(())
+    }
+}
+
+impl Drop for HttpServer {
+    fn drop(&mut self) {
+        let _ = self.force_stop();
+    }
+}
+
+async fn worker_loop(
+    context: WorkerContext,
+    mut receiver: mpsc::UnboundedReceiver<WorkerCommand>,
+    mut accepted_receiver: mpsc::Receiver<TcpStream>,
+    accepted_senders: Vec<mpsc::Sender<TcpStream>>,
+    round_robin: Arc<AtomicUsize>,
+    listeners: Vec<TcpListener>,
+    config: WorkerConfig,
+    started: SyncSender<Result<(), String>>,
+) {
+    let user_handler = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (config.handler_factory)(context.clone(), config.index)
+    })) {
+        Ok(handler) => handler,
+        Err(_) => {
+            record_callback_failure(
+                &config.callback_failure,
+                config.index,
+                ServerCallbackStage::HandlerFactory,
+            );
+            let _ = started.send(Err("handler factory panicked".to_owned()));
+            context.handle().begin_shutdown();
+            return;
+        }
+    };
+    let handler = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        build_handler(user_handler, &config.filter_factories)
+    })) {
+        Ok(handler) => handler,
+        Err(_) => {
+            record_callback_failure(
+                &config.callback_failure,
+                config.index,
+                ServerCallbackStage::FilterConstruction,
+            );
+            let _ = started.send(Err("filter factory panicked".to_owned()));
+            context.handle().begin_shutdown();
+            return;
+        }
+    };
+    if let Some(observer) = config.observer.as_ref() {
+        invoke_callback(&config, ServerCallbackStage::ObserverStart, || {
+            observer.on_thread_start(config.index);
+        });
+    }
+    for factory in &config.filter_factories {
+        invoke_callback(&config, ServerCallbackStage::FilterStart, || {
+            factory.on_server_start(config.index);
+        });
+    }
+    config.lifecycle_started.store(true, Ordering::Release);
+    let acceptor = Rc::new(config.acceptor.clone());
+    #[cfg(test)]
+    let mut admission_gate = config
+        .admission_probe
+        .as_ref()
+        .and_then(|probe| probe.take_gate());
+    #[cfg(test)]
+    let mut dequeue_held = false;
+
+    let mut accept_tasks = JoinSet::new();
+    for listener in listeners {
+        let listener = match tokio::net::TcpListener::from_std(listener) {
+            Ok(listener) => listener,
+            Err(error) => {
+                let _ = started.send(Err(error.to_string()));
+                context.handle().begin_shutdown();
+                return;
+            }
+        };
+        let worker_accepted = accepted_senders.clone();
+        let round_robin = Arc::clone(&round_robin);
+        let draining = Arc::clone(&config.draining);
+        #[cfg(test)]
+        let admission_probe = config.admission_probe.clone();
+        #[cfg(test)]
+        let worker_index = config.index;
+        let task = accept_tasks.spawn_local(async move {
+            while !draining.load(Ordering::Acquire) {
+                match listener.accept().await {
+                    Ok((stream, peer)) => {
+                        #[cfg(not(test))]
+                        let _ = peer;
+                        let Ok(stream) = stream.into_std() else {
+                            #[cfg(test)]
+                            if let Some(probe) = &admission_probe {
+                                probe.confirm(false);
+                            }
+                            continue;
+                        };
+                        let index =
+                            round_robin.fetch_add(1, Ordering::Relaxed) % worker_accepted.len();
+                        #[cfg(test)]
+                        if let Some(probe) = &admission_probe {
+                            let local = stream.local_addr().ok();
+                            let attempt = match worker_accepted[index].try_send(stream) {
+                                Ok(()) => AdmissionAttempt::Enqueued,
+                                Err(mpsc::error::TrySendError::Full(stream)) => {
+                                    drop(stream);
+                                    AdmissionAttempt::Full
+                                }
+                                Err(mpsc::error::TrySendError::Closed(stream)) => {
+                                    drop(stream);
+                                    AdmissionAttempt::Closed
+                                }
+                            };
+                            probe.publish(AdmissionEvent::Socket {
+                                key: AdmissionListenerKey {
+                                    worker_index,
+                                    task_id: tokio::task::id(),
+                                },
+                                socket: AdmissionSocket {
+                                    worker_index: index,
+                                    local,
+                                    peer,
+                                    capacity: worker_accepted[index].capacity(),
+                                    max_capacity: worker_accepted[index].max_capacity(),
+                                },
+                                attempt,
+                            });
+                        } else {
+                            let _ = worker_accepted[index].try_send(stream);
+                        }
+                        #[cfg(not(test))]
+                        let _ = worker_accepted[index].try_send(stream);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        #[cfg(test)]
+        if let Some(probe) = &config.admission_probe {
+            probe.publish(AdmissionEvent::ListenerRegistered(AdmissionListenerKey {
+                worker_index: config.index,
+                task_id: task.id(),
+            }));
+        }
+        drop(task);
+    }
+    #[cfg(unix)]
+    for signal in &config.shutdown_on_signals {
+        let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(*signal))
+        else {
+            continue;
+        };
+        let control = config.control.clone();
+        accept_tasks.spawn_local(async move {
+            signal.recv().await;
+            control.drain();
+        });
+    }
+    let _ = started.send(Ok(()));
+
+    let mut next_session = 1_u64;
+    let mut controls: BTreeMap<u64, Rc<RefCell<Option<SessionControl>>>> = BTreeMap::new();
+    let mut task_sessions = HashMap::new();
+    let mut sessions: JoinSet<(u64, Result<UniplexRunSummary, HttpError>)> = JoinSet::new();
+    let mut drain_requested = false;
+    loop {
+        tokio::select! {
+            biased;
+            command = receiver.recv() => {
+                match command {
+                    Some(WorkerCommand::Drain) => {
+                        drain_requested = true;
+                        accept_tasks.abort_all();
+                        for control in controls.values() {
+                            if let Some(control) = control.borrow().as_ref() {
+                                invoke_callback(&config, ServerCallbackStage::SessionDrain, || {
+                                    control.drain();
+                                });
+                            }
+                        }
+                    }
+                    Some(WorkerCommand::ForceStop) => {
+                        #[cfg(test)]
+                        if let Some(probe) = &config.admission_probe {
+                            probe.publish(AdmissionEvent::ForceObserved {
+                                worker_index: config.index,
+                                queued: accepted_receiver.len(),
+                                capacity: accepted_receiver.capacity(),
+                                max_capacity: accepted_receiver.max_capacity(),
+                                held: dequeue_held && admission_gate.is_some(),
+                                sessions: sessions.len(),
+                                controls: controls.len(),
+                                mappings: task_sessions.len(),
+                            });
+                        }
+                        #[cfg(test)]
+                        if let Some(probe) = &config.session_retirement_probe {
+                            probe.confirm(sessions.is_empty() && controls.is_empty() && task_sessions.is_empty());
+                        }
+                        accept_tasks.abort_all();
+                        for control in controls.values() {
+                            if let Some(control) = control.borrow().as_ref() {
+                                invoke_callback(
+                                    &config,
+                                    ServerCallbackStage::SessionForceStop,
+                                    || {
+                                        control.force_stop();
+                                    },
+                                );
+                            }
+                        }
+                        sessions.abort_all();
+                        while sessions.join_next().await.is_some() {}
+                        controls.clear();
+                        task_sessions.clear();
+                        #[cfg(test)]
+                        if let Some(probe) = &config.admission_probe {
+                            observe_accept_reaps(&mut accept_tasks, probe, config.index).await;
+                        }
+                        while accept_tasks.join_next().await.is_some() {}
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            accepted = async {
+                #[cfg(test)]
+                if let Some(gate) = admission_gate.as_mut() {
+                    if !dequeue_held {
+                        dequeue_held = true;
+                        if let Some(probe) = &config.admission_probe {
+                            probe.publish(AdmissionEvent::DequeueHeld { worker_index: config.index });
+                        }
+                    }
+                    let _ = gate.await;
+                    if let Some(probe) = &config.admission_probe {
+                        probe.confirm(false);
+                    }
+                    std::future::pending::<()>().await;
+                }
+                accepted_receiver.recv().await
+            }, if !drain_requested => {
+                if let Some(socket) = accepted {
+                    let id = next_session;
+                    next_session = next_session.wrapping_add(1);
+                    let slot = Rc::new(RefCell::new(None));
+                    #[cfg(test)]
+                    if let Some(probe) = &config.session_retirement_probe {
+                        probe.confirm(id != 0 && !controls.contains_key(&id));
+                    }
+                    controls.insert(id, Rc::clone(&slot));
+                    let context = context.clone();
+                    let handler = Rc::clone(&handler);
+                    let acceptor = Rc::clone(&acceptor);
+                    let draining = Arc::clone(&config.draining);
+                    let callback_failure = Arc::clone(&config.callback_failure);
+                    let worker_index = config.index;
+                    #[cfg(test)]
+                    let probe = config.session_retirement_probe.clone();
+                    #[cfg(test)]
+                    let gate = probe.as_ref().and_then(|probe| probe.take_gate(worker_index, id));
+                    let task = sessions.spawn_local(async move {
+                        #[cfg(test)]
+                        let key = SessionRetirementKey {
+                            worker_index,
+                            session_id: id,
+                            task_id: tokio::task::id(),
+                        };
+                        #[cfg(test)]
+                        let mut run_returned = false;
+                        let result = match accept_session(
+                            context,
+                            socket,
+                            handler,
+                            Rc::clone(&acceptor),
+                            draining,
+                            worker_index,
+                            Arc::clone(&callback_failure),
+                        )
+                        .await
+                        {
+                            Ok(accepted) => {
+                                #[cfg(test)]
+                                if let Some(probe) = &probe {
+                                    probe.publish(
+                                        key,
+                                        SessionRetirementRecord::TransportBound(accepted.retirement),
+                                    );
+                                }
+                                slot.replace(Some(accepted.control));
+                                let notification = acceptor.connection_observer.as_ref().map_or(Ok(()), |observer| {
+                                    invoke_accept_callback(
+                                        &callback_failure,
+                                        worker_index,
+                                        ServerCallbackStage::AcceptedConnectionObserver,
+                                        || observer.on_registered(),
+                                    )
+                                });
+                                if notification.is_err() {
+                                    let control = slot.borrow().clone();
+                                    if let Some(control) = control {
+                                        discard_panicking_value(invoke_accept_callback(
+                                            &callback_failure,
+                                            worker_index,
+                                            ServerCallbackStage::SessionForceStop,
+                                            || control.force_stop(),
+                                        ));
+                                    }
+                                }
+                                drop(acceptor);
+                                drop(callback_failure);
+                                let result = run_session(accepted.session).await;
+                                slot.borrow_mut().take();
+                                #[cfg(test)]
+                                {
+                                    run_returned = true;
+                                }
+                                if let Err(error) = notification {
+                                    discard_panicking_value(result);
+                                    Err(error)
+                                } else {
+                                    result
+                                }
+                            }
+                            Err(error) => Err(error),
+                        };
+                        #[cfg(test)]
+                        {
+                            drop(slot);
+                            if let Some(probe) = &probe
+                                && probe.confirm(run_returned)
+                            {
+                                probe.publish(key, SessionRetirementRecord::RunReturned);
+                                if let Some(gate) = gate {
+                                    probe.confirm(matches!(
+                                        tokio::time::timeout(gate.timeout, gate.release).await,
+                                        Ok(Ok(()))
+                                    ));
+                                }
+                            }
+                        }
+                        (id, result)
+                    });
+                    #[cfg(test)]
+                    if let Some(probe) = &config.session_retirement_probe {
+                        probe.confirm(!task_sessions.contains_key(&task.id()));
+                    }
+                    task_sessions.insert(task.id(), id);
+                    #[cfg(test)]
+                    if let Some(probe) = &config.admission_probe {
+                        probe.session_registered();
+                    }
+                    #[cfg(test)]
+                    if let Some(probe) = &config.session_retirement_probe {
+                        probe.publish(
+                            SessionRetirementKey {
+                                worker_index,
+                                session_id: id,
+                                task_id: task.id(),
+                            },
+                            SessionRetirementRecord::Registered,
+                        );
+                    }
+                }
+            }
+            completed = sessions.join_next_with_id(), if !sessions.is_empty() => {
+                #[cfg(test)]
+                let observed = config.session_retirement_probe.as_ref().and_then(|probe| {
+                    let (task_id, id, outcome) = match &completed {
+                        Some(Ok((task_id, (id, result)))) => {
+                            (*task_id, *id, SessionRunOutcome::Returned(result.clone()))
+                        }
+                        Some(Err(error)) => {
+                            let task_id = error.id();
+                            let Some(id) = task_sessions.get(&task_id).copied() else {
+                                probe.confirm(false);
+                                return None;
+                            };
+                            (
+                                task_id,
+                                id,
+                                SessionRunOutcome::JoinFailed {
+                                    panic: error.is_panic(),
+                                    cancelled: error.is_cancelled(),
+                                },
+                            )
+                        }
+                        None => return None,
+                    };
+                    let mapping_removed = task_sessions.get(&task_id) == Some(&id);
+                    let control_removed = controls.contains_key(&id);
+                    probe.confirm(mapping_removed && control_removed);
+                    Some((
+                        SessionRetirementKey {
+                            worker_index: config.index,
+                            session_id: id,
+                            task_id,
+                        },
+                        SessionReaped {
+                            outcome,
+                            mapping_removed,
+                            control_removed,
+                            remaining_tasks: 0,
+                            remaining_controls: 0,
+                        },
+                    ))
+                });
+                match completed {
+                    Some(Ok((task_id, (id, _)))) => {
+                        task_sessions.remove(&task_id);
+                        controls.remove(&id);
+                    }
+                    Some(Err(error)) => {
+                        if let Some(id) = task_sessions.remove(&error.id()) {
+                            controls.remove(&id);
+                        }
+                    }
+                    None => {}
+                }
+                #[cfg(test)]
+                if let Some((key, mut reaped)) = observed
+                    && let Some(probe) = &config.session_retirement_probe
+                {
+                    reaped.mapping_removed &= !task_sessions.contains_key(&key.task_id);
+                    reaped.control_removed &= !controls.contains_key(&key.session_id);
+                    reaped.remaining_tasks = task_sessions.len();
+                    reaped.remaining_controls = controls.len();
+                    probe.confirm(reaped.mapping_removed && reaped.control_removed);
+                    probe.publish(key, SessionRetirementRecord::Reaped(reaped));
+                }
+            }
+        }
+        if drain_requested && sessions.is_empty() {
+            break;
+        }
+    }
+    accept_tasks.abort_all();
+    #[cfg(test)]
+    if let Some(probe) = &config.admission_probe {
+        observe_accept_reaps(&mut accept_tasks, probe, config.index).await;
+    }
+    while accept_tasks.join_next().await.is_some() {}
+    #[cfg(test)]
+    if let Some(probe) = &config.session_retirement_probe {
+        probe.confirm(sessions.is_empty() && controls.is_empty() && task_sessions.is_empty());
+    }
+    sessions.abort_all();
+    while sessions.join_next().await.is_some() {}
+    context.handle().begin_shutdown();
+}
+
+fn build_handler(
+    user_handler: HttpHandlerRef,
+    filter_factories: &[Arc<dyn ServerFilterFactory>],
+) -> HttpHandlerRef {
+    if filter_factories.is_empty() {
+        return user_handler;
+    }
+    let mut filters = HttpFilterFactoryHandler::new();
+    for factory in filter_factories {
+        filters.add_filter_factory(Some(factory.make_filter_factory()));
+    }
+    let chain = Rc::new(filters.into_chain_handler());
+    chain.set_next_handler(Some(user_handler));
+    chain as HttpHandlerRef
+}
+
+fn notify_worker_stop(
+    worker_index: usize,
+    observer: Option<Arc<dyn ServerObserver>>,
+    filter_factories: Vec<Arc<dyn ServerFilterFactory>>,
+    callback_failure: &Arc<Mutex<Option<CallbackFailure>>>,
+) {
+    if let Some(observer) = observer {
+        invoke_lifecycle_callback(
+            callback_failure,
+            worker_index,
+            ServerCallbackStage::ObserverStop,
+            || {
+                observer.on_thread_stop(worker_index);
+            },
+        );
+        discard_panicking_value(observer);
+    }
+    for factory in filter_factories {
+        invoke_lifecycle_callback(
+            callback_failure,
+            worker_index,
+            ServerCallbackStage::FilterStop,
+            || {
+                factory.on_server_stop(worker_index);
+            },
+        );
+        discard_panicking_value(factory);
+    }
+}
+
+fn invoke_lifecycle_callback(
+    callback_failure: &Arc<Mutex<Option<CallbackFailure>>>,
+    worker_index: usize,
+    stage: ServerCallbackStage,
+    callback: impl FnOnce(),
+) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)) {
+        record_callback_failure(callback_failure, worker_index, stage);
+        discard_panicking_value(payload);
+    }
+}
+
+pub(crate) fn discard_panicking_value<T>(value: T) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)));
+}
+
+fn invoke_callback(config: &WorkerConfig, stage: ServerCallbackStage, callback: impl FnOnce()) {
+    invoke_lifecycle_callback(&config.callback_failure, config.index, stage, callback);
+}
+
+pub(crate) fn record_callback_failure(
+    callback_failure: &Arc<Mutex<Option<CallbackFailure>>>,
+    worker_index: usize,
+    stage: ServerCallbackStage,
+) {
+    let mut failure = callback_failure
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    failure.get_or_insert(CallbackFailure {
+        worker_index,
+        stage,
+    });
+}
+
+fn bind_listeners(config: &ServerSocketConfig) -> Result<Vec<TcpListener>, io::Error> {
+    if config.bind_addresses.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "server has no bind addresses",
+        ));
+    }
+    config
+        .bind_addresses
+        .iter()
+        .copied()
+        .map(|address| bind_listener(address, config))
+        .collect()
+}
+
+fn bind_listener(
+    address: SocketAddr,
+    config: &ServerSocketConfig,
+) -> Result<TcpListener, io::Error> {
+    let domain = if address.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    if config.reuse_port {
+        set_reuse_port(&socket)?;
+    }
+    if let Some(max_segment) = config.tcp_max_segment {
+        set_tcp_max_segment(&socket, max_segment)?;
+    }
+    if config.use_zero_copy {
+        enable_zero_copy_best_effort(&socket);
+    }
+    socket.bind(&SockAddr::from(address))?;
+    socket.listen(config.backlog)?;
+    let listener: TcpListener = socket.into();
+    Ok(listener)
+}
+
+#[cfg(target_os = "linux")]
+fn enable_zero_copy_best_effort(socket: &impl AsRawFd) {
+    let value: libc::c_int = 1;
+    // SAFETY: `socket` owns a valid fd for this call, and `value` is an initialized
+    // `c_int` whose pointer and reported length match.
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_ZEROCOPY,
+            (&raw const value).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enable_zero_copy_best_effort<T>(_socket: &T) {}
+
+#[cfg(unix)]
+fn set_socket_option(
+    socket: &Socket,
+    level: libc::c_int,
+    option: libc::c_int,
+    value: libc::c_int,
+) -> Result<(), io::Error> {
+    use std::os::fd::AsRawFd;
+
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            option,
+            (&raw const value).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn set_reuse_port(socket: &Socket) -> Result<(), io::Error> {
+    set_socket_option(socket, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)
+}
+
+#[cfg(not(unix))]
+fn set_reuse_port(_socket: &Socket) -> Result<(), io::Error> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "SO_REUSEPORT is unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn set_tcp_max_segment(socket: &Socket, maximum: u32) -> Result<(), io::Error> {
+    let maximum = libc::c_int::try_from(maximum)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "TCP_MAXSEG exceeds c_int"))?;
+    set_socket_option(socket, libc::IPPROTO_TCP, libc::TCP_MAXSEG, maximum)
+}
+
+#[cfg(not(unix))]
+fn set_tcp_max_segment(_socket: &Socket, _maximum: u32) -> Result<(), io::Error> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "TCP_MAXSEG is unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn read_tcp_max_segment(listener: &TcpListener) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+
+    let mut value: libc::c_int = 0;
+    let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            listener.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_MAXSEG,
+            (&raw mut value).cast(),
+            &raw mut length,
+        )
+    };
+    (result == 0 && value >= 0).then_some(value as u32)
+}
+
+#[cfg(not(unix))]
+fn read_tcp_max_segment(_listener: &TcpListener) -> Option<u32> {
+    None
+}
+use arc_swap::ArcSwap;

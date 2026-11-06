@@ -1,0 +1,4115 @@
+//! Experimental HTTP/2 driver with concrete downstream and upstream exchange owners.
+
+mod upstream;
+
+use std::any::Any;
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::collections::hash_map::Entry;
+use std::future::Future;
+use std::hash::BuildHasher;
+use std::hash::RandomState;
+use std::ops::Deref;
+use std::ops::DerefMut;
+use std::panic::AssertUnwindSafe;
+use std::panic::catch_unwind;
+use std::panic::resume_unwind;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Wake;
+use std::task::Waker;
+use std::time::Duration;
+use std::time::Instant;
+
+use foldhash::SharedSeed;
+use foldhash::fast::SeedableRandomState;
+use futures::task::ArcWake;
+use futures::task::waker_ref;
+use parking_lot::Mutex;
+use roxygen_codec::CodecCallbackAction;
+use roxygen_codec::CodecCallbackActions;
+use roxygen_codec::CodecEvent;
+use roxygen_codec::EgressFrame;
+use roxygen_codec::H2ErrorCode;
+use roxygen_codec::HttpCodec;
+use roxygen_codec::HttpCodecCallback;
+use roxygen_codec::HttpExceptionDirection;
+use roxygen_codec::OwnedEgressFrame;
+use roxygen_codec::error_adapter::h2_error_code_to_http_error_code;
+use roxygen_codec::error_adapter::http_error_code_to_h2_error_code;
+use roxygen_codec::error_adapter::http_exception_to_http_error_code;
+use roxygen_core::buf_queue::BufQueue;
+use roxygen_core::byte_event::FieldSectionInfo;
+use roxygen_core::byte_event::FieldSectionType;
+use roxygen_core::byte_event::HttpByteEventRegistration;
+use roxygen_core::error::HttpError;
+use roxygen_core::error::HttpErrorCode;
+use roxygen_core::events::HttpBodyEvent;
+use roxygen_core::events::HttpBodyEventKind;
+use roxygen_core::events::HttpHeaderEvent;
+use roxygen_core::flow_control::Window;
+use roxygen_core::headers::HttpHeaderCode;
+use roxygen_core::http::HttpMethod;
+use roxygen_core::http::TransportDirection;
+use roxygen_core::ids::StreamId;
+use roxygen_core::ingress_completion::IngressCompletion;
+use roxygen_core::message::HttpMessage;
+use roxygen_core::message::MessageTypeError;
+use roxygen_core::priority::HttpPriorityHeaderAccess;
+use roxygen_core::stream_source::FlowControlState;
+use roxygen_core::stream_source::HttpIngressBody;
+use roxygen_core::stream_source::HttpResponseSource;
+use roxygen_core::stream_source::HttpStreamSourceDrain;
+use roxygen_core::stream_source::HttpStreamSourceProducer;
+use roxygen_core::stream_source::HttpStreamSourceSharedCallback;
+use roxygen_http2::Http2Codec;
+use roxygen_http2::flow_control::ConnectionFlowControlCallback;
+use roxygen_http2::flow_control::FlowControlledCodec;
+use roxygen_http2::settings::SettingsId;
+use roxygen_runtime::cancellation::CancellationSource;
+use roxygen_runtime::host::Host;
+use roxygen_runtime::panic::discard_panic;
+use roxygen_runtime::worker::WorkerContext;
+use roxygen_transport::byte_event::AsyncSocketByteEventObserver;
+use roxygen_transport::byte_event::ByteEventOffsets;
+use roxygen_transport::byte_event::ByteEventWriteFlags;
+use roxygen_transport::byte_event::SocketByteEventType;
+use roxygen_transport::byte_stream::ByteEventCapability;
+use roxygen_transport::byte_stream::LocalTransportFuture;
+use roxygen_transport::byte_stream::TransportWriteError;
+use roxygen_transport::byte_stream::WriteInfo;
+pub use upstream::OwnedH2ExclusiveResponse;
+pub use upstream::OwnedH2ExclusiveSubmission;
+pub use upstream::OwnedH2ResponseObserver;
+pub use upstream::OwnedH2UpstreamHandle;
+pub use upstream::OwnedH2UpstreamObserver;
+pub use upstream::OwnedH2UpstreamRequest;
+pub use upstream::OwnedH2UpstreamReservation;
+pub use upstream::OwnedH2UpstreamResponse;
+pub use upstream::OwnedH2UpstreamSession;
+pub use upstream::OwnedH2UpstreamSubmission;
+
+use crate::http2::DEFAULT_STREAM_WINDOW;
+use crate::http2::Http2SessionConfig;
+use crate::http2::protocol::CodecFailureContext;
+use crate::http2::protocol::CodecFailureDisposition;
+use crate::http2::protocol::PeerSetting;
+use crate::http2::protocol::SentGoaway;
+use crate::http2::protocol::{self};
+use crate::http2::scheduler::PriorityEntry;
+use crate::http2::scheduler::PriorityQueue;
+pub use crate::owned::OwnedApplication as OwnedH2Application;
+use crate::owned::OwnedApplication;
+pub use crate::owned::OwnedExchange as OwnedH2Exchange;
+use crate::owned::OwnedExchange;
+use crate::uniplex::UniplexConfig;
+use crate::uniplex::UniplexRead;
+use crate::uniplex::UniplexRunSummary;
+use crate::uniplex::UniplexTransport;
+use crate::uniplex::UniplexWriteQueue;
+
+const TURN_BUDGET: usize = 64;
+
+/// Inputs selected once, before starting an experimental HTTP/2 connection.
+pub struct OwnedH2Options {
+    pub context: WorkerContext,
+    pub transport: Rc<dyn UniplexTransport>,
+    pub io: UniplexConfig,
+    pub http2: Http2SessionConfig,
+}
+
+// Critical sections only push, pop or clone and drop replaced wakers after unlocking, so
+// nothing unwinds while the lock is held and a poisoning mutex would never observe poison.
+#[derive(Default)]
+struct ReadyQueue {
+    state: Mutex<ReadyQueueState>,
+    /// Set under the lock by every wake and every push; cleared only by `settle`.
+    busy: AtomicBool,
+}
+
+#[derive(Default)]
+struct ReadyQueueState {
+    streams: VecDeque<StreamId>,
+    waker: Option<Arc<Waker>>,
+}
+
+impl ReadyQueue {
+    fn wake(&self) {
+        self.wake_after(|| {});
+    }
+
+    /// Wakes the session after `mark`, which runs under the lock after the `busy` store:
+    /// `settle` sees both or neither, and the lock-free `Control::can_fold` never sees what
+    /// it marks without `busy`.
+    fn wake_after(&self, mark: impl FnOnce()) {
+        let wake = {
+            let state = self.state.lock();
+            self.busy.store(true, Ordering::Release);
+            mark();
+            state.waker.clone()
+        };
+        if let Some(wake) = wake {
+            wake.wake_by_ref();
+        }
+    }
+
+    /// Clears `busy` if nothing is queued and neither I/O wake is pending; returns whether it
+    /// did. A wake or push that the lock orders after this sets `busy` again.
+    fn settle(&self, read: &IoWake, write: &IoWake) -> bool {
+        let state = self.state.lock();
+        let settled = state.streams.is_empty()
+            && !read.ready.load(Ordering::Acquire)
+            && !write.ready.load(Ordering::Acquire);
+        if settled {
+            self.busy.store(false, Ordering::Release);
+        }
+        settled
+    }
+
+    // Only the session owner installs wakers, and `installed` is its copy of the current one,
+    // so a stable waker needs no lock. Pushes racing with a poll are still seen, or woken
+    // through the installed waker, because every poll pops under the lock.
+    fn register(&self, installed: &mut Option<Arc<Waker>>, context: &Context<'_>) {
+        if installed
+            .as_ref()
+            .is_some_and(|waker| waker.will_wake(context.waker()))
+        {
+            return;
+        }
+        let replacement = Arc::new(context.waker().clone());
+        let old = self.state.lock().waker.replace(Arc::clone(&replacement));
+        let previous = installed.replace(replacement);
+        drop(old);
+        drop(previous);
+    }
+
+    fn pop(&self) -> Option<StreamId> {
+        self.state.lock().streams.pop_front()
+    }
+}
+
+struct IoWake {
+    ready: AtomicBool,
+    queue: Arc<ReadyQueue>,
+}
+
+impl IoWake {
+    fn new(queue: &Arc<ReadyQueue>) -> Arc<Self> {
+        Arc::new(Self {
+            ready: AtomicBool::new(false),
+            queue: Arc::clone(queue),
+        })
+    }
+
+    fn take_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire) && self.ready.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl Wake for IoWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.queue
+            .wake_after(|| self.ready.store(true, Ordering::Release));
+    }
+}
+
+struct StreamWake {
+    id: StreamId,
+    queue: Arc<ReadyQueue>,
+    queued: AtomicBool,
+    headers_poll_ready: AtomicBool,
+    live: AtomicBool,
+}
+
+impl StreamWake {
+    fn take_headers_ready(&self) -> bool {
+        self.headers_poll_ready.load(Ordering::Acquire)
+            && self.headers_poll_ready.swap(false, Ordering::AcqRel)
+    }
+
+    // Only the session owner may enqueue; cross-thread wakes must use schedule.
+    // A successful enqueue requires another queue check or a session wake.
+    fn enqueue(&self) -> bool {
+        if !self.live.load(Ordering::Acquire)
+            || self.queued.load(Ordering::Acquire)
+            || self.queued.swap(true, Ordering::AcqRel)
+        {
+            return false;
+        }
+        let mut state = self.queue.state.lock();
+        self.queue.busy.store(true, Ordering::Release);
+        state.streams.push_back(self.id);
+        true
+    }
+
+    fn schedule(&self) {
+        if !self.live.load(Ordering::Acquire) || self.queued.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let wake = {
+            let mut state = self.queue.state.lock();
+            self.queue.busy.store(true, Ordering::Release);
+            state.streams.push_back(self.id);
+            state.waker.clone()
+        };
+        if let Some(wake) = wake {
+            wake.wake_by_ref();
+        }
+    }
+}
+
+impl ArcWake for StreamWake {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.headers_poll_ready.store(true, Ordering::Release);
+        arc_self.schedule();
+    }
+}
+
+struct IngressSignals {
+    control: Rc<Control>,
+    active: Cell<bool>,
+    source_complete: Cell<bool>,
+    response_complete: Cell<bool>,
+    upstream: bool,
+    ingress_complete: Cell<bool>,
+    wake: Arc<StreamWake>,
+    consumed: Cell<usize>,
+    acknowledge: Cell<usize>,
+    completed: Cell<Option<Result<(), HttpError>>>,
+    /// Something waits on the source's completion, so it always wakes the owner.
+    wake_on_completion: Cell<bool>,
+}
+
+impl IngressSignals {
+    fn finish_protocol(&self) {
+        let ingress_complete = if self.upstream {
+            self.ingress_complete.get()
+        } else {
+            self.source_complete.get()
+        };
+        if ingress_complete && self.response_complete.get() && self.active.replace(false) {
+            self.control
+                .active_incoming
+                .set(self.control.active_incoming.get() - 1);
+        }
+    }
+
+    fn close_protocol(&self) {
+        if self.active.replace(false) {
+            self.control
+                .active_incoming
+                .set(self.control.active_incoming.get() - 1);
+        }
+    }
+
+    fn ingress_complete(&self) {
+        self.ingress_complete.set(true);
+        self.finish_protocol();
+    }
+
+    fn response_complete(&self) {
+        self.response_complete.set(true);
+        self.finish_protocol();
+    }
+
+    fn error_response_pending(&self) {
+        self.response_complete.set(false);
+        self.wake_on_completion.set(true);
+        if !self.active.replace(true) {
+            self.control
+                .active_incoming
+                .set(self.control.active_incoming.get() + 1);
+        }
+    }
+}
+
+impl HttpStreamSourceSharedCallback for IngressSignals {
+    fn bytes_processed(&self, _id: StreamId, amount: usize, acknowledge: usize) {
+        if acknowledge == 0
+            && !self.upstream
+            && self.wake.live.load(Ordering::Acquire)
+            && self.control.fold_credit(amount)
+        {
+            return;
+        }
+        self.consumed
+            .set(self.consumed.get().saturating_add(amount));
+        self.acknowledge
+            .set(self.acknowledge.get().saturating_add(acknowledge));
+        self.wake.schedule();
+    }
+
+    fn source_complete(&self, _id: StreamId, error: Option<HttpError>) {
+        let fold = error.is_none()
+            && !self.upstream
+            && !self.response_complete.get()
+            && !self.wake_on_completion.get()
+            && self.wake.live.load(Ordering::Acquire)
+            && self.control.can_fold(0);
+        self.source_complete.set(true);
+        self.finish_protocol();
+        self.completed.set(Some(error.map_or(Ok(()), Err)));
+        if fold {
+            self.control.early_completed.borrow_mut().push(self.wake.id);
+            self.control.folds_pending.set(true);
+        } else {
+            self.wake.schedule();
+        }
+    }
+}
+
+struct Control {
+    drain: Cell<bool>,
+    cancel: Cell<bool>,
+    complete: Cell<bool>,
+    active_incoming: Cell<usize>,
+    ready: Arc<ReadyQueue>,
+    upstream: Option<Rc<upstream::Admission>>,
+    idle: Cell<bool>,
+    host: Host,
+    /// Published by a downstream session's poll that ended with nothing left to do; cleared
+    /// when the next poll starts.
+    quiescent: Cell<bool>,
+    /// The codec's connection credit headroom when `quiescent` was published.
+    credit_headroom: Cell<i64>,
+    /// Credit reported while quiescent, which the next poll returns before anything else.
+    early_credit: Cell<u32>,
+    /// Streams whose request source completed without error while quiescent.
+    early_completed: RefCell<Vec<StreamId>>,
+    folds_pending: Cell<bool>,
+}
+
+impl Control {
+    /// Whether `amount` more credit can wait for the session's next poll: an idle session
+    /// woken now would only return it, without emitting, before doing anything else.
+    fn can_fold(&self, amount: usize) -> bool {
+        self.quiescent.get()
+            && !self.ready.busy.load(Ordering::Acquire)
+            && i64::from(self.early_credit.get())
+                .saturating_add(i64::try_from(amount).unwrap_or(i64::MAX))
+                <= self.credit_headroom.get()
+            && self.host.runs_wakes_this_iteration()
+    }
+
+    fn fold_credit(&self, amount: usize) -> bool {
+        if !self.can_fold(amount) {
+            return false;
+        }
+        // `can_fold` bounds the sum by the headroom, which is below `u32::MAX`.
+        self.early_credit
+            .set(self.early_credit.get() + amount as u32);
+        self.folds_pending.set(true);
+        true
+    }
+}
+
+/// Owner-local control; mutations are consumed outside codec/application callbacks.
+#[derive(Clone)]
+pub struct OwnedH2Handle(Rc<Control>);
+
+impl OwnedH2Handle {
+    pub fn initiate_drain(&self) -> Result<bool, HttpError> {
+        if self.0.complete.get() {
+            return Ok(false);
+        }
+        let changed = !self.0.drain.replace(true);
+        self.0.ready.wake();
+        Ok(changed)
+    }
+
+    pub fn cancel(&self) {
+        self.0.cancel.set(true);
+        self.0.ready.wake();
+    }
+}
+
+struct ConnectionWindowWake(Arc<ReadyQueue>);
+
+impl ConnectionFlowControlCallback for ConnectionWindowWake {
+    fn on_connection_send_window_open(&self) {
+        self.0.wake();
+    }
+
+    fn on_connection_send_window_closed(&self) {}
+}
+
+enum PendingEgress {
+    Headers(HttpHeaderEvent),
+    Body(HttpBodyEvent),
+}
+
+impl PendingEgress {
+    fn eom(&self) -> bool {
+        match self {
+            Self::Headers(headers) => headers.eom(),
+            Self::Body(body) => body.eom(),
+        }
+    }
+}
+
+trait ExchangeStorage<const UPSTREAM: bool>: OwnedExchange + Sized {
+    type Stored: 'static;
+
+    fn store_downstream(exchange: Self) -> Self::Stored;
+    fn store_upstream(exchange: upstream::Exchange) -> Self::Stored;
+    fn downstream(exchange: &mut Self::Stored) -> &mut Self;
+    fn upstream(exchange: &Self::Stored) -> Option<&upstream::Exchange>;
+    fn upstream_mut(exchange: &mut Self::Stored) -> Option<&mut upstream::Exchange>;
+    fn cancel_stored(exchange: &mut Self::Stored, error: &HttpError, peer: bool);
+    fn response_complete_stored(exchange: &mut Self::Stored);
+    fn complete_stored(exchange: &mut Option<Self::Stored>);
+}
+
+impl<E: OwnedExchange> ExchangeStorage<false> for E {
+    type Stored = E;
+
+    fn store_downstream(exchange: E) -> E {
+        exchange
+    }
+
+    fn store_upstream(_exchange: upstream::Exchange) -> E {
+        unreachable!("downstream streams cannot own upstream exchanges")
+    }
+
+    fn downstream(exchange: &mut E) -> &mut E {
+        exchange
+    }
+
+    fn upstream(_exchange: &E) -> Option<&upstream::Exchange> {
+        None
+    }
+
+    fn upstream_mut(_exchange: &mut E) -> Option<&mut upstream::Exchange> {
+        None
+    }
+
+    fn cancel_stored(exchange: &mut E, error: &HttpError, peer: bool) {
+        exchange.cancel(error, peer);
+    }
+
+    fn response_complete_stored(exchange: &mut E) {
+        exchange.response_complete();
+    }
+
+    fn complete_stored(exchange: &mut Option<E>) {
+        exchange
+            .take()
+            .expect("a stream owns one application exchange")
+            .complete();
+    }
+}
+
+impl<E: OwnedExchange> ExchangeStorage<true> for E {
+    type Stored = upstream::Exchange;
+
+    fn store_downstream(_exchange: E) -> upstream::Exchange {
+        unreachable!("upstream streams cannot own downstream application exchanges")
+    }
+
+    fn store_upstream(exchange: upstream::Exchange) -> upstream::Exchange {
+        exchange
+    }
+
+    fn downstream(_exchange: &mut upstream::Exchange) -> &mut E {
+        unreachable!("upstream exchanges never enter downstream policy polling")
+    }
+
+    fn upstream(exchange: &upstream::Exchange) -> Option<&upstream::Exchange> {
+        Some(exchange)
+    }
+
+    fn upstream_mut(exchange: &mut upstream::Exchange) -> Option<&mut upstream::Exchange> {
+        Some(exchange)
+    }
+
+    fn cancel_stored(exchange: &mut upstream::Exchange, error: &HttpError, _peer: bool) {
+        exchange.cancel(error);
+    }
+
+    fn response_complete_stored(_exchange: &mut upstream::Exchange) {}
+
+    fn complete_stored(exchange: &mut Option<upstream::Exchange>) {
+        exchange
+            .as_ref()
+            .expect("a stream owns one application exchange");
+        *exchange = None;
+    }
+}
+
+enum IngressSource {
+    Request(HttpIngressBody),
+    Response(HttpResponseSource),
+}
+
+impl IngressSource {
+    fn initialize_body_only(&self, message: &mut HttpMessage, eom: bool) -> bool {
+        match self {
+            Self::Request(source) => source.initialize_body_only(message, eom),
+            Self::Response(source) => source.initialize_body_only(message, eom),
+        }
+    }
+
+    fn ingress_completion(&self) -> Option<IngressCompletion> {
+        match self {
+            Self::Request(source) => source.ingress_completion(),
+            Self::Response(source) => source.ingress_completion(),
+        }
+    }
+}
+
+struct Stream<E, const UPSTREAM: bool>
+where
+    E: ExchangeStorage<UPSTREAM>,
+{
+    application: Option<E::Stored>,
+    wake: Arc<StreamWake>,
+    signals: Rc<IngressSignals>,
+    source: Option<IngressSource>,
+    producer: HttpStreamSourceProducer,
+    drain: Option<HttpStreamSourceDrain>,
+    head: Option<Box<HttpMessage>>,
+    started: bool,
+    wire_ingress_complete: bool,
+    ingress_rejected: bool,
+    consumed: bool,
+    peer_reset: Option<HttpError>,
+    reset_after_response: bool,
+    resume: Option<roxygen_core::events::ResumeFuture>,
+    request_head: bool,
+    request_body_length: u64,
+    request_body_events: bool,
+    expected_request_length: Option<u64>,
+    send_window: Window,
+    scheduling: PriorityEntry,
+    stalled: bool,
+    pending: Option<PendingEgress>,
+    response_headers: bool,
+    response_complete: bool,
+    write_boundary: Option<u64>,
+    physically_complete: bool,
+    /// Some serialized event registered a byte event.
+    registered_byte_events: bool,
+    reset: bool,
+    stream_offset: u64,
+    body_offset: u64,
+}
+
+impl<E, const UPSTREAM: bool> Stream<E, UPSTREAM>
+where
+    E: ExchangeStorage<UPSTREAM>,
+{
+    fn upstream(&self) -> Option<&upstream::Exchange> {
+        self.application
+            .as_ref()
+            .and_then(<E as ExchangeStorage<UPSTREAM>>::upstream)
+    }
+
+    fn upstream_mut(&mut self) -> Option<&mut upstream::Exchange> {
+        self.application
+            .as_mut()
+            .and_then(<E as ExchangeStorage<UPSTREAM>>::upstream_mut)
+    }
+
+    fn release_upstream_capacity(&self) {
+        if let Some(exchange) = self.upstream()
+            && exchange.status.ingress_succeeded()
+        {
+            self.signals.ingress_complete();
+            if self.response_complete {
+                exchange.status.release();
+            }
+        }
+    }
+
+    fn protocol_active(&self) -> bool {
+        self.signals.active.get()
+    }
+
+    /// Counted in `ConnectionState::awaiting_ingress`.
+    fn awaits_ingress(&self) -> bool {
+        !self.wire_ingress_complete && !self.reset
+    }
+
+    fn can_serialize(&self, budget: SerializationBudget) -> bool {
+        if !self.protocol_active() {
+            return false;
+        }
+        match &self.pending {
+            Some(PendingEgress::Headers(_)) => !self.reset || self.signals.source_complete.get(),
+            Some(PendingEgress::Body(event)) => match event.kind() {
+                HttpBodyEventKind::Body(bytes)
+                    if (!UPSTREAM && self.request_head) || bytes.is_empty() =>
+                {
+                    budget.wire >= roxygen_http2::constants::FRAME_HEADER_SIZE
+                }
+                HttpBodyEventKind::Body(_) => {
+                    budget.credit.min(self.send_window.non_negative_size()) != 0
+                }
+                HttpBodyEventKind::Padding(_) => {
+                    budget.wire >= roxygen_http2::constants::FRAME_HEADER_SIZE
+                }
+                _ => true,
+            },
+            None => false,
+        }
+    }
+}
+
+type PanicPayload = Box<dyn Any + Send>;
+
+fn retain_panic(first: &mut Option<PanicPayload>, panic: PanicPayload) {
+    if first.is_none() {
+        *first = Some(panic);
+    } else {
+        discard_panic(panic);
+    }
+}
+
+fn capture<T>(first: &mut Option<PanicPayload>, action: impl FnOnce() -> T) -> Option<T> {
+    match catch_unwind(AssertUnwindSafe(action)) {
+        Ok(result) => Some(result),
+        Err(panic) => {
+            retain_panic(first, panic);
+            None
+        }
+    }
+}
+
+impl<E, const UPSTREAM: bool> Drop for Stream<E, UPSTREAM>
+where
+    E: ExchangeStorage<UPSTREAM>,
+{
+    fn drop(&mut self) {
+        self.wake.live.store(false, Ordering::Release);
+        let mut panic = None;
+        if self.application.is_some() {
+            capture(&mut panic, || drop(self.application.take()));
+        }
+        capture(&mut panic, || drop(self.source.take()));
+        capture(&mut panic, || drop(self.drain.take()));
+        capture(&mut panic, || drop(self.pending.take()));
+        capture(&mut panic, || drop(self.resume.take()));
+        capture(&mut panic, || drop(self.head.take()));
+        if let Some(panic) = panic {
+            if std::thread::panicking() {
+                discard_panic(panic);
+            } else {
+                resume_unwind(panic);
+            }
+        }
+    }
+}
+
+enum OwnerPollResult {
+    Polled,
+    Serialized(Result<(), HttpError>),
+}
+
+#[derive(Clone, Copy)]
+struct SerializationBudget {
+    wire: usize,
+    credit: u32,
+}
+
+fn serialization_budget(
+    config: &UniplexConfig,
+    egress: &BufQueue,
+    codec: &FlowControlledCodec,
+) -> Option<SerializationBudget> {
+    if egress.chain_length() >= config.maximum_write_size {
+        return None;
+    }
+    let wire = config
+        .maximum_write_size
+        .saturating_sub(egress.chain_length())
+        .min(egress.remaining_capacity());
+    let frame = roxygen_http2::constants::MAX_FRAME_PAYLOAD_LENGTH_MIN as usize;
+    let overhead = roxygen_http2::constants::FRAME_HEADER_SIZE;
+    let payload =
+        (wire / (frame + overhead)) * frame + (wire % (frame + overhead)).saturating_sub(overhead);
+    Some(SerializationBudget {
+        wire,
+        credit: codec.available_send().min(payload as u32),
+    })
+}
+
+struct Failure {
+    stream: StreamId,
+    error: HttpError,
+    status: Option<u16>,
+    wire_code: Option<H2ErrorCode>,
+    direction: HttpExceptionDirection,
+    new_stream: bool,
+}
+
+impl Failure {
+    fn new(stream: StreamId, error: HttpError) -> Self {
+        Self {
+            stream,
+            error,
+            status: None,
+            wire_code: None,
+            direction: HttpExceptionDirection::IngressAndEgress,
+            new_stream: false,
+        }
+    }
+}
+
+/// Live streams by id. Peers choose stream ids, so each session draws its own seed. Iteration
+/// follows the hash, so every site whose order is observable visits the streams sorted by id.
+struct StreamTable<E, const UPSTREAM: bool>(
+    HashMap<StreamId, Box<Stream<E, UPSTREAM>>, SeedableRandomState>,
+)
+where
+    E: ExchangeStorage<UPSTREAM>;
+
+impl<E, const UPSTREAM: bool> StreamTable<E, UPSTREAM>
+where
+    E: ExchangeStorage<UPSTREAM>,
+{
+    fn with_hasher(state: SeedableRandomState) -> Self {
+        Self(HashMap::with_hasher(state))
+    }
+
+    fn ids_in_order(&self) -> Vec<StreamId> {
+        let mut ids: Vec<_> = self.0.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn drop_in_order(&mut self) {
+        for id in self.ids_in_order() {
+            drop(self.0.remove(&id));
+        }
+    }
+}
+
+/// Drops the remaining streams in id order, as the `BTreeMap` this table replaced did. If a
+/// stream's drop panics, the rest still drop in id order while unwinding.
+impl<E, const UPSTREAM: bool> Drop for StreamTable<E, UPSTREAM>
+where
+    E: ExchangeStorage<UPSTREAM>,
+{
+    fn drop(&mut self) {
+        struct Rest<'a, E, const UPSTREAM: bool>(&'a mut StreamTable<E, UPSTREAM>)
+        where
+            E: ExchangeStorage<UPSTREAM>;
+
+        impl<E, const UPSTREAM: bool> Drop for Rest<'_, E, UPSTREAM>
+        where
+            E: ExchangeStorage<UPSTREAM>,
+        {
+            fn drop(&mut self) {
+                self.0.drop_in_order();
+            }
+        }
+
+        if !self.0.is_empty() {
+            Rest(self).0.drop_in_order();
+        }
+    }
+}
+
+impl<E, const UPSTREAM: bool> Deref for StreamTable<E, UPSTREAM>
+where
+    E: ExchangeStorage<UPSTREAM>,
+{
+    type Target = HashMap<StreamId, Box<Stream<E, UPSTREAM>>, SeedableRandomState>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<E, const UPSTREAM: bool> DerefMut for StreamTable<E, UPSTREAM>
+where
+    E: ExchangeStorage<UPSTREAM>,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// A per-session stream-table hash state. foldhash is built without `std`, so the per-hasher
+/// seed comes from std's `RandomState`.
+fn stream_hash_state() -> SeedableRandomState {
+    SeedableRandomState::with_seed(
+        RandomState::new().hash_one("roxygen owned h2 streams"),
+        SharedSeed::global_random(),
+    )
+}
+
+#[cfg(test)]
+fn fixed_stream_hash_state(seed: u64) -> SeedableRandomState {
+    SeedableRandomState::with_seed(seed, SharedSeed::global_fixed())
+}
+
+/// The order in which a stream table seeded with `seed` iterates `streams` inserted in order.
+#[cfg(test)]
+pub(crate) fn stream_seed_order(seed: u64, streams: &[u64]) -> Vec<u64> {
+    let mut table = HashMap::with_hasher(fixed_stream_hash_state(seed));
+    table.extend(streams.iter().map(|stream| (StreamId::new(*stream), ())));
+    table.keys().map(|stream| stream.get()).collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    static OWNER_WRITE_STATE_READS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// How many times stream-owner code on this thread has evaluated whether writes are pending.
+#[cfg(test)]
+pub(crate) fn owner_write_state_reads() -> usize {
+    OWNER_WRITE_STATE_READS.with(Cell::get)
+}
+
+/// A concrete-exchange H2 driver, selected only by experimental opt-in integrations.
+///
+/// Policy and body futures are children owned directly by each stream. No
+/// application task is spawned; cancelling a stream retires those futures before
+/// the stream's ingress-source and physical-write fences can complete.
+pub struct OwnedH2Session<A: OwnedApplication>(Driver<A, false>);
+
+/// Drives a [`Driver`] to completion. Every poll isolates callback panics, and completion
+/// closes admission, publishes `complete` and drops the driver before returning.
+struct DriverRun<A, const UPSTREAM: bool>(Option<Driver<A, UPSTREAM>>)
+where
+    A: OwnedApplication,
+    A::Exchange: ExchangeStorage<UPSTREAM>;
+
+// The driver is only ever accessed through `&mut`; nothing pins it.
+impl<A, const UPSTREAM: bool> Unpin for DriverRun<A, UPSTREAM>
+where
+    A: OwnedApplication,
+    A::Exchange: ExchangeStorage<UPSTREAM>,
+{
+}
+
+impl<A, const UPSTREAM: bool> Future for DriverRun<A, UPSTREAM>
+where
+    A: OwnedApplication,
+    A::Exchange: ExchangeStorage<UPSTREAM>,
+{
+    type Output = Result<UniplexRunSummary, HttpError>;
+
+    #[inline(always)]
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let driver = this
+            .0
+            .as_mut()
+            .expect("owned H2 runner polled after completion");
+        driver.started = true;
+        driver.set_admission_polling(true);
+        let polled = catch_unwind(AssertUnwindSafe(|| driver.poll(context)));
+        driver.set_admission_polling(false);
+        match polled {
+            Ok(Poll::Pending) => {
+                // Every step a session test drives ends with a pending poll.
+                #[cfg(test)]
+                driver.debug_assert_stream_counts();
+                Poll::Pending
+            }
+            Ok(Poll::Ready(result)) => {
+                let driver = this.0.take().expect("owned H2 runner completes once");
+                Poll::Ready(driver.finish_run(result))
+            }
+            Err(panic) => {
+                driver.poll_panicked(panic, context);
+                Poll::Pending
+            }
+        }
+    }
+}
+
+struct Driver<A, const UPSTREAM: bool>
+where
+    A: OwnedApplication,
+    A::Exchange: ExchangeStorage<UPSTREAM>,
+{
+    context: WorkerContext,
+    transport: Rc<dyn UniplexTransport>,
+    application: A,
+    h2: Http2SessionConfig,
+    connection: OwnedConnection,
+    streams: StreamTable<A::Exchange, UPSTREAM>,
+    ingress: BufQueue,
+    egress: BufQueue,
+    read: Option<LocalTransportFuture<Result<UniplexRead, HttpError>>>,
+    write: Option<LocalTransportFuture<Result<WriteInfo, TransportWriteError>>>,
+    write_queue: Option<Box<dyn UniplexWriteQueue>>,
+    read_wake: Arc<IoWake>,
+    read_waker: Waker,
+    write_wake: Arc<IoWake>,
+    write_waker: Waker,
+    cancellation: CancellationSource,
+    write_cancellation: CancellationSource,
+    transport_reset: bool,
+    write_end: u64,
+    eof_processed: bool,
+    failure: DriverFailure,
+    started: bool,
+    eof: bool,
+    sent_initial_goaway: bool,
+    sent_final_goaway: bool,
+    goaway_deadline: Option<Instant>,
+    goaway_wait: Option<roxygen_runtime::host::LocalFuture>,
+    budget_yield: Option<roxygen_runtime::host::LocalFuture>,
+    ready_waker: Option<Arc<Waker>>,
+    /// A queued write started without arming the writer, and no `poll_complete` has since
+    /// registered its waker or found the queue idle.
+    unarmed_write: bool,
+}
+
+struct OwnedConnection {
+    codec: FlowControlledCodec,
+    state: ConnectionState,
+}
+
+struct ConnectionState {
+    observer: AsyncSocketByteEventObserver,
+    control: Rc<Control>,
+    config: UniplexConfig,
+    scheduler: PriorityQueue,
+    write_fences: VecDeque<(u64, StreamId)>,
+    peer_initial_window: u32,
+    peer_maximum_streams: u32,
+    peer_push_enabled: bool,
+    incoming_limit: u64,
+    zero_write_pending: bool,
+    /// Live streams that still await wire ingress: neither ingress-complete nor reset.
+    awaiting_ingress: usize,
+    /// Live streams with `Stream::consumed` set.
+    consumed_streams: usize,
+    /// Set before the first byte-event registration; until then the observer holds no events.
+    byte_events_registered: bool,
+    discarded: BTreeMap<StreamId, bool>,
+    rejected_credit: usize,
+    draining: bool,
+    ingress_grace: bool,
+    summary: UniplexRunSummary,
+}
+
+struct DriverFailure {
+    failures: VecDeque<Failure>,
+    fatal: Option<HttpError>,
+    panic: Option<PanicPayload>,
+}
+
+impl ConnectionState {
+    /// Call just before `stream` completes its wire ingress, is reset, or retires.
+    fn settle_ingress<E, const UPSTREAM: bool>(&mut self, stream: &Stream<E, UPSTREAM>)
+    where
+        E: ExchangeStorage<UPSTREAM>,
+    {
+        if stream.awaits_ingress() {
+            self.awaiting_ingress -= 1;
+        }
+    }
+}
+
+struct StreamConnection<'a, const UPSTREAM: bool> {
+    connection: &'a mut OwnedConnection,
+    context: &'a WorkerContext,
+    failure: &'a mut DriverFailure,
+    egress: &'a mut BufQueue,
+    write: &'a Option<LocalTransportFuture<Result<WriteInfo, TransportWriteError>>>,
+    write_queue: Option<&'a dyn UniplexWriteQueue>,
+    transport_reset: bool,
+}
+
+fn writes_pending(
+    write: &Option<LocalTransportFuture<Result<WriteInfo, TransportWriteError>>>,
+    write_queue: Option<&dyn UniplexWriteQueue>,
+) -> bool {
+    write.is_some() || write_queue.is_some_and(|queue| !queue.is_idle())
+}
+
+struct NoopCallback;
+impl HttpCodecCallback for NoopCallback {
+    fn on_event(&mut self, _event: CodecEvent<'_>) {}
+}
+
+#[cold]
+#[inline(never)]
+fn failure(code: HttpErrorCode, message: &'static [u8]) -> HttpError {
+    HttpError::with_message(code, message)
+}
+
+/// `None` is a panic captured from the observer callback.
+#[cold]
+#[inline(never)]
+fn retain_observer_failure<T>(
+    failed: &mut Option<HttpError>,
+    observed: Option<Result<T, HttpError>>,
+) {
+    match observed {
+        Some(Ok(_)) => {}
+        Some(Err(error)) => {
+            failed.get_or_insert(error);
+        }
+        None => {
+            failed.get_or_insert(failure(
+                HttpErrorCode::INTERNAL_ERROR,
+                b"owned H2 callback panicked",
+            ));
+        }
+    }
+}
+
+/// Only called for failed or short writes.
+#[cold]
+#[inline(never)]
+fn retain_write_failure(
+    failed: &mut Option<HttpError>,
+    result: Result<WriteInfo, TransportWriteError>,
+) {
+    match result {
+        Err(error) => {
+            failed.get_or_insert_with(|| error.error().clone());
+        }
+        Ok(_) => {
+            failed.get_or_insert(failure(
+                HttpErrorCode::TRANSPORT_WRITE_ERROR,
+                b"transport reported a short successful write",
+            ));
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn retain_cancellation(failed: &mut Option<HttpError>) {
+    failed.get_or_insert(failure(
+        HttpErrorCode::CORO_CANCELLED,
+        b"owned H2 connection cancelled",
+    ));
+}
+
+#[cold]
+#[inline(never)]
+fn push_connection_failure(failures: &mut VecDeque<Failure>, error: HttpError) {
+    failures.push_back(Failure::new(StreamId::UNSPECIFIED, error));
+}
+
+const fn transport_direction<const UPSTREAM: bool>() -> TransportDirection {
+    if UPSTREAM {
+        TransportDirection::Upstream
+    } else {
+        TransportDirection::Downstream
+    }
+}
+
+impl<A: OwnedApplication> OwnedH2Session<A> {
+    /// Creates the experimental opt-in session with its current untimed, unbounded-rate H2
+    /// configuration.
+    pub fn new(
+        application: A,
+        options: OwnedH2Options,
+    ) -> Result<(Self, OwnedH2Handle), HttpError> {
+        let (driver, handle) = Driver::<A, false>::new(application, options)?;
+        Ok((Self(driver), handle))
+    }
+
+    /// Replaces the per-session random stream-table seed with a fixed one.
+    #[cfg(test)]
+    pub(crate) fn with_stream_seed(self, seed: u64) -> Self {
+        Self(self.0.with_stream_seed(seed))
+    }
+
+    /// Runs inside the caller's registered worker cleanup scope.
+    pub fn run(self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
+        self.0.run()
+    }
+}
+
+impl<A, const UPSTREAM: bool> Driver<A, UPSTREAM>
+where
+    A: OwnedApplication,
+    A::Exchange: ExchangeStorage<UPSTREAM>,
+{
+    #[cfg(test)]
+    fn with_stream_seed(mut self, seed: u64) -> Self {
+        assert!(
+            self.streams.is_empty(),
+            "the seed is fixed before any stream opens"
+        );
+        self.streams = StreamTable::with_hasher(fixed_stream_hash_state(seed));
+        self
+    }
+
+    fn new(application: A, options: OwnedH2Options) -> Result<(Self, OwnedH2Handle), HttpError> {
+        let OwnedH2Options {
+            context,
+            transport,
+            io,
+            http2,
+        } = options;
+        let io = io.validate()?;
+        let rates = http2.rate_limits;
+        if !context.is_owner_thread()
+            || context.is_cancelled()
+            || io.buffer_limit == 0
+            || io.maximum_read_size == 0
+            || io.maximum_write_size <= roxygen_http2::constants::FRAME_HEADER_SIZE
+            || io.maximum_read_size > io.buffer_limit
+            || io.maximum_write_size > io.buffer_limit
+            || (!UPSTREAM && !io.drain_request_body_on_drop)
+            || (UPSTREAM && io.drain_request_body_on_drop)
+            || !io.read_timeout.is_zero()
+            || !io.stream_read_timeout.is_zero()
+            || !io.write_timeout.is_zero()
+            || (!UPSTREAM && !http2.goaway_timeout.is_zero())
+            || http2.stats.is_some()
+            || http2
+                .ping_probes
+                .is_some_and(|probes| !probes.interval.is_zero())
+            || http2.connection_receive_window > i32::MAX as u32
+            || (!UPSTREAM
+                && [
+                    rates.control_frames,
+                    rates.header_frames,
+                    rates.resets,
+                    rates.direct_errors,
+                ]
+                .iter()
+                .any(|rate| rate.maximum != u64::MAX))
+            || transport.byte_event_capability(&context)? != ByteEventCapability::Unsupported
+        {
+            return Err(failure(
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"owned H2 diagnostic configuration is not supported",
+            ));
+        }
+        let advertised_window = http2
+            .settings
+            .iter()
+            .rev()
+            .find_map(|setting| {
+                (setting.identifier == SettingsId::InitialWindowSize.as_u16())
+                    .then_some(setting.value)
+            })
+            .unwrap_or(u64::from(DEFAULT_STREAM_WINDOW));
+        if advertised_window != u64::from(http2.stream_receive_window)
+            || http2.stream_receive_window == 0
+            || http2.stream_receive_window > i32::MAX as u32
+        {
+            return Err(failure(
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"owned H2 requires matching advertised and source receive windows",
+            ));
+        }
+        let incoming_limit = http2
+            .settings
+            .iter()
+            .rev()
+            .find_map(|setting| {
+                (setting.identifier == SettingsId::MaxConcurrentStreams.as_u16())
+                    .then_some(setting.value)
+            })
+            .unwrap_or(u64::from(u32::MAX));
+        if UPSTREAM
+            && (http2.max_concurrent_outgoing_streams == 0
+                || http2.settings.iter().rev().find_map(|setting| {
+                    (setting.identifier == SettingsId::EnablePush.as_u16()).then_some(setting.value)
+                }) != Some(0))
+        {
+            return Err(failure(
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"owned upstream H2 requires nonzero admission and disabled push",
+            ));
+        }
+        let ready = Arc::new(ReadyQueue::default());
+        let upstream = UPSTREAM.then(|| {
+            Rc::new(upstream::Admission::new(
+                Arc::clone(&ready),
+                context.clone(),
+                http2.max_concurrent_outgoing_streams,
+            ))
+        });
+        let control = Rc::new(Control {
+            drain: Cell::new(false),
+            cancel: Cell::new(false),
+            complete: Cell::new(false),
+            active_incoming: Cell::new(0),
+            ready,
+            upstream,
+            idle: Cell::new(false),
+            host: context.host().clone(),
+            quiescent: Cell::new(false),
+            credit_headroom: Cell::new(0),
+            early_credit: Cell::new(0),
+            early_completed: RefCell::new(Vec::new()),
+            folds_pending: Cell::new(false),
+        });
+        let mut egress = BufQueue::new(io.buffer_limit);
+        let mut codec = Http2Codec::new(transport_direction::<UPSTREAM>());
+        codec.set_compact_data(true);
+        for setting in &http2.settings {
+            if let Some(id) = SettingsId::from_u16(setting.identifier) {
+                codec.egress_settings_mut().set(id, setting.value);
+            }
+        }
+        if http2.double_goaway_drain {
+            codec.enable_double_goaway_drain();
+        } else {
+            codec.disable_double_goaway_drain();
+        }
+        codec.set_header_codec_stats(http2.header_codec_stats.clone());
+        if let Some(strategy) = &http2.header_indexing_strategy {
+            codec.set_header_indexing_strategy(Rc::clone(strategy));
+        }
+        codec.generate(
+            &mut egress,
+            EgressFrame::ConnectionPreface,
+            &mut NoopCallback,
+        )?;
+        codec.generate_configured_settings(&mut egress, &mut NoopCallback)?;
+        let codec = FlowControlledCodec::new(
+            Box::new(codec),
+            Rc::new(ConnectionWindowWake(Arc::clone(&control.ready))),
+            &mut egress,
+            &mut NoopCallback,
+            http2.connection_receive_window,
+        )?;
+        let observer = AsyncSocketByteEventObserver::new(&context)?;
+        observer.set_tx_ack_events_enabled(&context, false)?;
+        let read_wake = IoWake::new(&control.ready);
+        let write_wake = IoWake::new(&control.ready);
+        let cancellation = CancellationSource::new();
+        let write_cancellation = CancellationSource::new();
+        let write_queue = transport.try_write_queue(
+            &context,
+            io.maximum_write_size,
+            io.write_timeout,
+            write_cancellation.token(),
+        )?;
+        Ok((
+            Self {
+                context,
+                transport,
+                application,
+                h2: http2,
+                connection: OwnedConnection {
+                    codec,
+                    state: ConnectionState {
+                        observer,
+                        control: Rc::clone(&control),
+                        config: io,
+                        scheduler: PriorityQueue::default(),
+                        write_fences: VecDeque::new(),
+                        peer_initial_window: DEFAULT_STREAM_WINDOW,
+                        peer_maximum_streams: u32::MAX,
+                        peer_push_enabled: true,
+                        incoming_limit,
+                        zero_write_pending: false,
+                        awaiting_ingress: 0,
+                        consumed_streams: 0,
+                        byte_events_registered: false,
+                        discarded: BTreeMap::new(),
+                        rejected_credit: 0,
+                        draining: false,
+                        ingress_grace: false,
+                        summary: UniplexRunSummary::default(),
+                    },
+                },
+                streams: StreamTable::with_hasher(stream_hash_state()),
+                ingress: BufQueue::new(io.buffer_limit),
+                egress,
+                read: None,
+                write: None,
+                write_queue,
+                read_waker: Waker::from(Arc::clone(&read_wake)),
+                read_wake,
+                write_waker: Waker::from(Arc::clone(&write_wake)),
+                write_wake,
+                cancellation,
+                write_cancellation,
+                transport_reset: false,
+                write_end: 0,
+                eof_processed: false,
+                failure: DriverFailure {
+                    failures: VecDeque::new(),
+                    fatal: None,
+                    panic: None,
+                },
+                started: false,
+                eof: false,
+                sent_initial_goaway: false,
+                sent_final_goaway: false,
+                goaway_deadline: None,
+                goaway_wait: None,
+                budget_yield: None,
+                ready_waker: None,
+                unarmed_write: false,
+            },
+            OwnedH2Handle(control),
+        ))
+    }
+
+    fn run(self) -> DriverRun<A, UPSTREAM> {
+        DriverRun(Some(self))
+    }
+
+    #[inline(always)]
+    fn set_admission_polling(&self, polling: bool) {
+        if UPSTREAM && let Some(admission) = &self.connection.state.control.upstream {
+            admission.polling.set(polling);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn poll_panicked(&mut self, panic: PanicPayload, context: &Context<'_>) {
+        retain_panic(&mut self.failure.panic, panic);
+        self.abort(failure(
+            HttpErrorCode::INTERNAL_ERROR,
+            b"owned H2 callback panicked",
+        ));
+        context.waker().wake_by_ref();
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn finish_run(
+        mut self,
+        result: Result<UniplexRunSummary, HttpError>,
+    ) -> Result<UniplexRunSummary, HttpError> {
+        if let Some(admission) = &self.connection.state.control.upstream {
+            capture(&mut self.failure.panic, || {
+                admission.close(failure(
+                    HttpErrorCode::TRANSPORT_EOF,
+                    b"owned upstream H2 session finished",
+                ))
+            });
+        }
+        self.connection.state.control.complete.set(true);
+        if let Some(panic) = self.failure.panic.take() {
+            resume_unwind(panic);
+        }
+        result
+    }
+
+    fn cancelled(&self) -> bool {
+        self.connection.state.control.cancel.get() || self.context.is_cancelled()
+    }
+
+    fn check_cancel(&mut self) {
+        if self.cancelled() && !self.transport_reset {
+            self.abort_cancelled();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn abort_cancelled(&mut self) {
+        self.abort(failure(
+            HttpErrorCode::CORO_CANCELLED,
+            b"owned H2 connection cancelled",
+        ));
+    }
+
+    // `ran` records whether a phase since the last check went past its guard. A phase that
+    // stopped at its guard ran no application code, so `control.cancel` is unchanged, and it
+    // did not act on cancellation, so skipping this check is the same as a concurrent worker
+    // cancellation arriving just after it; the next check observes it.
+    fn check_cancel_after(&mut self, ran: &mut bool) {
+        if std::mem::take(ran) {
+            self.check_cancel();
+        }
+    }
+
+    fn poll(&mut self, context: &mut Context<'_>) -> Poll<Result<UniplexRunSummary, HttpError>> {
+        if !UPSTREAM {
+            if self.connection.state.control.folds_pending.get() {
+                self.apply_folds();
+            }
+            self.connection.state.control.quiescent.set(false);
+        }
+        self.connection
+            .state
+            .control
+            .ready
+            .register(&mut self.ready_waker, context);
+        // A completion that no waker was registered for is consumed by this poll.
+        if self.unarmed_write {
+            self.write_wake.ready.store(true, Ordering::Release);
+        }
+        if self.budget_yield.is_some() && self.poll_budget_yield(context).is_pending() {
+            return Poll::Pending;
+        }
+        // Only an exit below publishes idleness, so it stays false for every turn until then.
+        self.connection.state.control.idle.set(false);
+        for turn in 0..TURN_BUDGET {
+            if self.unarmed_write
+                && !self.write_wake.ready.load(Ordering::Acquire)
+                && self.write_completion_needed()
+            {
+                self.write_wake.ready.store(true, Ordering::Release);
+            }
+            self.check_cancel();
+            let mut ran = self.goaway_wait.is_some() || self.goaway_deadline.is_some();
+            if self.connection.state.control.drain.get()
+                && !self.connection.state.draining
+                && self.failure.fatal.is_none()
+            {
+                ran = true;
+                self.start_drain();
+            }
+            if self.goaway_wait.is_some() || self.goaway_deadline.is_some() {
+                self.poll_goaway(context);
+            }
+            let mut progress = false;
+            if let Some(wrote) = self.poll_write() {
+                progress = wrote;
+                ran = true;
+            }
+            self.check_cancel_after(&mut ran);
+            if let Some(read) = self.poll_read() {
+                progress |= read;
+                ran = true;
+            }
+            self.check_cancel_after(&mut ran);
+            if self.failure.fatal.is_none()
+                && (!self.ingress.is_empty() || (self.eof && !self.eof_processed))
+            {
+                match self.parse_input() {
+                    Ok(consumed) => progress |= consumed,
+                    Err(error) => self.fail_connection(error),
+                }
+                ran = true;
+            }
+            self.check_cancel_after(&mut ran);
+            if self.failure.fatal.is_none() && !self.failure.failures.is_empty() {
+                self.handle_queued_failure();
+                progress = true;
+                ran = true;
+            }
+            if UPSTREAM && let Some(submitted) = self.poll_upstream_submission() {
+                progress |= submitted;
+                ran = true;
+            }
+            self.check_cancel_after(&mut ran);
+            let mut serialized_owner = false;
+            if let Some(stream) = self.connection.state.control.ready.pop() {
+                match self.poll_stream(stream) {
+                    Ok(OwnerPollResult::Polled) => {}
+                    Ok(OwnerPollResult::Serialized(result)) => {
+                        serialized_owner = true;
+                        if let Err(error) = result {
+                            self.fail_connection(error);
+                        }
+                    }
+                    Err(error) => self.reset_polled_stream(stream, error),
+                }
+                progress = true;
+                ran = true;
+            }
+            self.check_cancel_after(&mut ran);
+            if self.failure.fatal.is_none() && !serialized_owner {
+                // `Ok(false)` means nothing was selected, which runs no application code.
+                match self.serialize_next() {
+                    Ok(serialized) => {
+                        progress |= serialized;
+                        ran |= serialized;
+                    }
+                    Err((_stream, error)) => {
+                        self.fail_connection(error);
+                        ran = true;
+                    }
+                }
+            }
+            self.check_cancel_after(&mut ran);
+            if !self.transport_reset
+                && (!self.egress.is_empty() || self.connection.state.zero_write_pending)
+                && self.can_start_write()
+                && (!progress
+                    || self.egress.chain_length()
+                        >= self.connection.state.config.maximum_write_size
+                    || turn + 1 == TURN_BUDGET
+                    || self.failure.fatal.is_some()
+                    || self.connection.state.zero_write_pending)
+            {
+                if let Err(error) = self.start_write() {
+                    self.abort(error);
+                }
+                progress = true;
+                ran = true;
+            }
+            self.check_cancel_after(&mut ran);
+            if self.failure.fatal.is_some()
+                && self.egress.is_empty()
+                && !self.writes_pending()
+                && !self.transport_reset
+            {
+                self.reset_transport();
+                progress = true;
+            }
+            if self.transport_reset
+                && !self.writes_pending()
+                && self.read.is_none()
+                && self.streams.is_empty()
+            {
+                return Poll::Ready(Err(self.take_fatal()));
+            }
+            if self.failure.fatal.is_none()
+                && (self.eof
+                    || (self.connection.state.draining && !self.connection.state.ingress_grace))
+                && self.streams.is_empty()
+                && self.egress.is_empty()
+                && !self.writes_pending()
+            {
+                if let Some(closed) = self.close_idle() {
+                    return Poll::Ready(closed);
+                }
+                // Only the outstanding read can progress: its completion wakes the task.
+                if !progress {
+                    return Poll::Pending;
+                }
+                continue;
+            }
+            if !progress || turn + 1 == TURN_BUDGET {
+                self.connection.state.control.idle.set(
+                    self.streams.is_empty()
+                        && self
+                            .connection
+                            .state
+                            .control
+                            .upstream
+                            .as_ref()
+                            .is_none_or(|admission| admission.used.get() == 0)
+                        && self.egress.is_empty()
+                        && !self.connection.state.zero_write_pending
+                        && !self.writes_pending()
+                        && self.failure.fatal.is_none()
+                        && !self.transport_reset,
+                );
+            }
+            if !progress {
+                if !UPSTREAM {
+                    self.publish_quiescence();
+                }
+                return Poll::Pending;
+            }
+        }
+        self.budget_yield = Some(self.context.host().yield_to_io());
+        // A yield that completes on its first poll arranged no wake.
+        if self.poll_budget_yield(context).is_ready() {
+            context.waker().wake_by_ref();
+        }
+        Poll::Pending
+    }
+
+    /// Applies what the poll an idle session skipped would have done first: return the folded
+    /// credit, which cannot emit, and consume the listed completions.
+    #[inline(never)]
+    fn apply_folds(&mut self) {
+        let control = &self.connection.state.control;
+        control.folds_pending.set(false);
+        let credit = control.early_credit.replace(0);
+        let mut completed = control.early_completed.borrow_mut();
+        // A cancelled session's first turn would have aborted before any owner poll; the
+        // listed completions stay in their sources.
+        if control.cancel.get() || self.context.is_cancelled() {
+            completed.clear();
+            return;
+        }
+        if credit != 0 && self.failure.fatal.is_none() {
+            match self.connection.codec.ingress_bytes_processed(
+                &mut self.egress,
+                credit,
+                &mut NoopCallback,
+            ) {
+                Ok(emitted) => debug_assert!(!emitted, "folded credit stays below the headroom"),
+                Err(error) => push_connection_failure(&mut self.failure.failures, error),
+            }
+        }
+        for id in completed.drain(..) {
+            let Some(stream) = self.streams.get_mut(&id) else {
+                continue;
+            };
+            if stream.consumed || !stream.signals.source_complete.get() {
+                continue;
+            }
+            if let Some(completion) = stream.signals.completed.take() {
+                debug_assert!(completion.is_ok(), "only successful completions fold");
+                stream.consumed = true;
+                self.connection.state.consumed_streams += 1;
+            }
+        }
+    }
+
+    fn publish_quiescence(&mut self) {
+        let state = &self.connection.state;
+        // Only a live stream whose request source has not completed can still report credit.
+        if state.consumed_streams != self.streams.len()
+            && self.ingress.is_empty()
+            && !(self.eof && !self.eof_processed)
+            && self.egress.is_empty()
+            && !state.zero_write_pending
+            && self.budget_yield.is_none()
+            && self.goaway_wait.is_none()
+            && self.goaway_deadline.is_none()
+            && !state.control.drain.get()
+            && !state.draining
+            && !self.cancelled()
+            && self.failure.fatal.is_none()
+            && self.failure.failures.is_empty()
+            && state
+                .control
+                .ready
+                .settle(&self.read_wake, &self.write_wake)
+        {
+            state
+                .control
+                .credit_headroom
+                .set(self.connection.codec.ingress_credit_headroom());
+            state.control.quiescent.set(true);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn poll_budget_yield(&mut self, context: &mut Context<'_>) -> Poll<()> {
+        let Some(mut wait) = self.budget_yield.take() else {
+            return Poll::Ready(());
+        };
+        let poll = wait.as_mut().poll(context);
+        if poll.is_pending() {
+            self.budget_yield = Some(wait);
+        }
+        poll
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn start_drain(&mut self) {
+        self.connection.state.draining = true;
+        self.connection.state.ingress_grace = !UPSTREAM && self.h2.double_goaway_drain;
+        if UPSTREAM {
+            self.sent_initial_goaway = true;
+        }
+        if let Err(error) = self.generate_goaway(H2ErrorCode::NO_ERROR) {
+            self.abort(error);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn poll_goaway(&mut self, context: &mut Context<'_>) {
+        if let Some(wait) = &mut self.goaway_wait {
+            let _ = wait.as_mut().poll(context);
+        }
+        if self
+            .goaway_deadline
+            .is_some_and(|deadline| deadline <= self.context.host().now())
+            && self.failure.fatal.is_none()
+            && let Err(error) = self.generate_goaway(H2ErrorCode::NO_ERROR)
+        {
+            self.abort(error);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn handle_queued_failure(&mut self) {
+        if let Some(failure) = self.failure.failures.pop_front() {
+            self.handle_failure(failure);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn reset_polled_stream(&mut self, stream: StreamId, error: HttpError) {
+        let wire = http_error_code_to_h2_error_code(error.code(), true);
+        self.reset_stream(stream, error, false, Some(wire));
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn take_fatal(&mut self) -> HttpError {
+        self.failure
+            .fatal
+            .take()
+            .expect("failed connection retains its cause")
+    }
+
+    /// `None` while the outstanding read has yet to observe cancellation.
+    #[cold]
+    #[inline(never)]
+    fn close_idle(&mut self) -> Option<Result<UniplexRunSummary, HttpError>> {
+        if self.cancellation.request_cancellation() {
+            self.read_wake.ready.store(true, Ordering::Release);
+        }
+        if self.read.is_some() {
+            return None;
+        }
+        Some(
+            self.transport
+                .close(&self.context)
+                .map(|()| self.connection.state.summary),
+        )
+    }
+
+    fn generate_goaway(&mut self, code: H2ErrorCode) -> Result<(), HttpError> {
+        let plan = protocol::plan_goaway(
+            code,
+            self.connection.codec.last_incoming_stream_id(),
+            self.h2.double_goaway_drain,
+            self.sent_initial_goaway,
+        );
+        self.connection.codec.generate(
+            &mut self.egress,
+            EgressFrame::Goaway {
+                last_stream: plan.last_stream,
+                code,
+                debug_data: None,
+            },
+            &mut NoopCallback,
+        )?;
+        if plan.phase.commit(
+            SentGoaway {
+                sent_initial: &mut self.sent_initial_goaway,
+                sent_final: &mut self.sent_final_goaway,
+                deadline: &mut self.goaway_deadline,
+            },
+            || self.context.host().deadline_after(self.h2.goaway_timeout),
+        ) {
+            self.connection.state.ingress_grace = false;
+        }
+        self.goaway_wait = self
+            .goaway_deadline
+            .map(|deadline| self.context.host().sleep_until(deadline));
+        Ok(())
+    }
+
+    /// `None` when an outstanding read was not ready and nothing was polled.
+    fn poll_read(&mut self) -> Option<bool> {
+        if self.read.is_none()
+            && !self.eof
+            && self.failure.fatal.is_none()
+            && !self.cancelled()
+            && !self.cancellation.is_cancellation_requested()
+        {
+            let maximum = self
+                .connection
+                .state
+                .config
+                .maximum_read_size
+                .min(self.ingress.remaining_capacity());
+            if maximum != 0 {
+                self.read = Some(
+                    self.transport.read(
+                        &self.context,
+                        maximum,
+                        self.connection
+                            .state
+                            .config
+                            .read_allocation_size
+                            .min(maximum),
+                        self.connection.state.config.read_timeout,
+                        self.cancellation.token(),
+                    ),
+                );
+                self.read_wake.ready.store(true, Ordering::Release);
+            }
+        }
+        let Some(read) = &mut self.read else {
+            return Some(false);
+        };
+        if !self.read_wake.take_ready() {
+            return None;
+        }
+        let mut context = Context::from_waker(&self.read_waker);
+        let Poll::Ready(result) = read.as_mut().poll(&mut context) else {
+            return Some(false);
+        };
+        self.read.take();
+        match result {
+            Ok(read) => {
+                self.connection.state.summary.bytes_read = self
+                    .connection
+                    .state
+                    .summary
+                    .bytes_read
+                    .saturating_add(read.bytes_read() as u64);
+                self.eof |= read.is_eof();
+                let mut data = read.into_data();
+                if self.ingress.append(&mut data).is_err() {
+                    self.ingress_overflowed();
+                }
+            }
+            Err(error) => self.read_failed(error),
+        }
+        Some(true)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn ingress_overflowed(&mut self) {
+        self.fail_connection(failure(
+            HttpErrorCode::TRANSPORT_READ_ERROR,
+            b"transport read exceeded requested ingress capacity",
+        ));
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read_failed(&mut self, error: HttpError) {
+        if self.failure.fatal.is_none() && !self.cancellation.is_cancellation_requested() {
+            self.fail_connection(error);
+        }
+    }
+
+    fn writes_pending(&self) -> bool {
+        writes_pending(&self.write, self.write_queue.as_deref())
+    }
+
+    fn can_start_write(&self) -> bool {
+        match &self.write_queue {
+            Some(queue) => queue.can_write(
+                self.egress
+                    .chain_length()
+                    .min(self.connection.state.config.maximum_write_size),
+            ),
+            None => self.write.is_none(),
+        }
+    }
+
+    /// Whether a queued write's completion must wake the session: something waits for it
+    /// that no later poll is guaranteed to observe. While a live stream still awaits wire
+    /// ingress and nothing below holds, that ingress, or the stream's consumer, polls the
+    /// session again, and the poll consumes the completion (`unarmed_write`). A downstream
+    /// session with no streams left has nothing waiting on a receipt beyond what the other
+    /// terms arm for; its next request, EOF, cancel or drain consumes the receipt.
+    fn write_completion_needed(&self) -> bool {
+        let state = &self.connection.state;
+        (state.awaiting_ingress == 0 && (UPSTREAM || !self.streams.is_empty()))
+            || state.control.drain.get()
+            || state.draining
+            || self.sent_initial_goaway
+            || self.sent_final_goaway
+            || self.goaway_deadline.is_some()
+            || self.eof
+            || self.failure.fatal.is_some()
+            || self.transport_reset
+            || self.cancelled()
+            || !self.can_start_write()
+            || state.zero_write_pending
+            || (state.byte_events_registered
+                && !matches!(state.observer.pending_events(&self.context), Ok(0)))
+            || (state.consumed_streams != 0
+                && state.write_fences.iter().any(|(_, id)| {
+                    self.streams
+                        .get(id)
+                        .is_some_and(|stream| stream.consumed && stream.response_complete)
+                }))
+    }
+
+    fn start_write(&mut self) -> Result<(), HttpError> {
+        self.connection.state.zero_write_pending = false;
+        let data = self
+            .egress
+            .split_at_most(self.connection.state.config.maximum_write_size);
+        self.connection.state.summary.bytes_scheduled = self
+            .connection
+            .state
+            .summary
+            .bytes_scheduled
+            .saturating_add(data.chain_length() as u64);
+        self.write_end = self.connection.state.summary.bytes_scheduled;
+        self.connection
+            .state
+            .observer
+            .transport_write(&self.context, self.write_end)?;
+        if self.cancelled() {
+            return Err(failure(
+                HttpErrorCode::CORO_CANCELLED,
+                b"write observer cancelled the connection",
+            ));
+        }
+        if let Some(queue) = &mut self.write_queue {
+            queue.start_write(data)?;
+            if self.write_completion_needed() {
+                self.write_wake.ready.store(true, Ordering::Release);
+            } else {
+                self.unarmed_write = true;
+            }
+        } else {
+            self.write = Some(self.transport.write(
+                &self.context,
+                data,
+                ByteEventWriteFlags::default(),
+                self.connection.state.config.write_timeout,
+                self.write_cancellation.token(),
+            ));
+            self.write_wake.ready.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// `None` when no write was ready to poll.
+    fn poll_write(&mut self) -> Option<bool> {
+        if self.write_queue.is_some() {
+            return self.poll_queued_write();
+        }
+        let Some(write) = &mut self.write else {
+            return None;
+        };
+        if !self.write_wake.take_ready() {
+            return None;
+        }
+        let mut context = Context::from_waker(&self.write_waker);
+        {
+            let polled = write.as_mut().poll(&mut context);
+            let Poll::Ready(result) = &polled else {
+                return Some(false);
+            };
+            self.write.take();
+            let bytes = match result {
+                Ok(info) => info.bytes_written,
+                Err(error) => error.bytes_written(),
+            };
+            self.connection.state.summary.bytes_written = self
+                .connection
+                .state
+                .summary
+                .bytes_written
+                .saturating_add(bytes as u64);
+            let observed = self
+                .connection
+                .state
+                .observer
+                .socket_byte_event(
+                    &self.context,
+                    SocketByteEventType::Write,
+                    self.connection.state.summary.bytes_written,
+                )
+                .and_then(|_| {
+                    self.connection.state.observer.transport_write_complete(
+                        &self.context,
+                        self.connection.state.summary.bytes_written,
+                        None,
+                    )
+                });
+            if let Err(error) = observed {
+                self.abort(error);
+            }
+            match result {
+                Err(error) => self.abort(error.error().clone()),
+                Ok(_) if self.connection.state.summary.bytes_written != self.write_end => self
+                    .abort(failure(
+                        HttpErrorCode::TRANSPORT_WRITE_ERROR,
+                        b"transport reported a short successful write",
+                    )),
+                Ok(_) => {}
+            }
+        }
+        self.retire_write_fences();
+        Some(true)
+    }
+
+    fn poll_queued_write(&mut self) -> Option<bool> {
+        if !self.write_wake.take_ready() {
+            return None;
+        }
+        let mut progress = false;
+        let mut failed = None;
+        loop {
+            let queue = self
+                .write_queue
+                .as_mut()
+                .expect("the queued writer is installed");
+            // Polling an idle queue would register a waker that the next write's completion
+            // fires even when nothing waits for it.
+            if queue.is_idle() {
+                break;
+            }
+            let completion = {
+                let mut context = Context::from_waker(&self.write_waker);
+                queue.poll_complete(&mut context)
+            };
+            let Poll::Ready(completion) = completion else {
+                break;
+            };
+            progress = true;
+            let bytes = match &completion.result {
+                Ok(info) => info.bytes_written,
+                Err(error) => error.bytes_written(),
+            };
+            self.connection.state.summary.bytes_written = self
+                .connection
+                .state
+                .summary
+                .bytes_written
+                .saturating_add(bytes as u64);
+            let observed = capture(&mut self.failure.panic, || {
+                self.connection
+                    .state
+                    .observer
+                    .socket_byte_event(
+                        &self.context,
+                        SocketByteEventType::Write,
+                        self.connection.state.summary.bytes_written,
+                    )
+                    .and_then(|_| {
+                        self.connection.state.observer.transport_write_complete(
+                            &self.context,
+                            self.connection.state.summary.bytes_written,
+                            None,
+                        )
+                    })
+            });
+            match observed {
+                Some(Ok(_)) => {}
+                observed => retain_observer_failure(&mut failed, observed),
+            }
+            match completion.result {
+                Ok(_) if bytes == completion.requested_bytes => {}
+                result => retain_write_failure(&mut failed, result),
+            }
+            if self.cancelled() {
+                retain_cancellation(&mut failed);
+            }
+        }
+        self.unarmed_write = false;
+        if let Some(error) = failed {
+            self.abort(error);
+        }
+        self.retire_write_fences();
+        Some(progress)
+    }
+
+    fn retire_write_fences(&mut self) {
+        if self.transport_reset {
+            self.retire_write_fences_after_reset();
+        } else {
+            self.retire_write_fences_with(false);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn retire_write_fences_after_reset(&mut self) {
+        let reset_complete = !self.writes_pending();
+        self.retire_write_fences_with(reset_complete);
+    }
+
+    #[inline(always)]
+    fn retire_write_fences_with(&mut self, reset_complete: bool) {
+        while self
+            .connection
+            .state
+            .write_fences
+            .front()
+            .is_some_and(|(offset, _)| {
+                *offset <= self.connection.state.summary.bytes_written || reset_complete
+            })
+        {
+            let (_, id) = self
+                .connection
+                .state
+                .write_fences
+                .pop_front()
+                .expect("write fence was present");
+            if let Some(stream) = self.streams.get_mut(&id)
+                && (reset_complete
+                    || stream
+                        .write_boundary
+                        .is_some_and(|end| end <= self.connection.state.summary.bytes_written))
+            {
+                stream.physically_complete = true;
+                stream.wake.enqueue();
+            }
+        }
+    }
+}
+
+struct CodecInput<'a, A, const UPSTREAM: bool>
+where
+    A: OwnedApplication,
+    A::Exchange: ExchangeStorage<UPSTREAM>,
+{
+    application: &'a A,
+    context: &'a WorkerContext,
+    streams: &'a mut StreamTable<A::Exchange, UPSTREAM>,
+    state: &'a mut ConnectionState,
+    failures: &'a mut VecDeque<Failure>,
+    receive_window: u32,
+    peer_goaway_pending: bool,
+    peer_goaway_generated: bool,
+}
+
+impl<A, const UPSTREAM: bool> CodecInput<'_, A, UPSTREAM>
+where
+    A: OwnedApplication,
+    A::Exchange: ExchangeStorage<UPSTREAM>,
+{
+    /// The driver ignores `CodecEvent::FrameHeader` (`DIV-026`).
+    const OBSERVES_FRAME_HEADERS: bool = false;
+
+    #[cold]
+    fn fail(&mut self, failure: Failure) {
+        if failure.status.is_some()
+            && let Some(owner) = self.streams.get_mut(&failure.stream)
+        {
+            owner.ingress_rejected = true;
+        }
+        if failure.stream.is_unspecified() {
+            self.failures.clear();
+            self.failures.push_back(failure);
+        } else if !self
+            .failures
+            .back()
+            .is_some_and(|failure| failure.stream.is_unspecified())
+        {
+            self.failures.push_back(failure);
+        }
+    }
+
+    fn new_stream(&mut self, id: StreamId) -> Result<(), HttpError> {
+        let Entry::Vacant(entry) = self.streams.entry(id) else {
+            return Err(failure(
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"request stream already exists",
+            ));
+        };
+        let wake = Arc::new(StreamWake {
+            id,
+            queue: Arc::clone(&self.state.control.ready),
+            queued: AtomicBool::new(false),
+            headers_poll_ready: AtomicBool::new(true),
+            live: AtomicBool::new(true),
+        });
+        let signals = Rc::new(IngressSignals {
+            control: Rc::clone(&self.state.control),
+            active: Cell::new(true),
+            source_complete: Cell::new(false),
+            response_complete: Cell::new(false),
+            upstream: false,
+            ingress_complete: Cell::new(false),
+            wake: Arc::clone(&wake),
+            consumed: Cell::new(0),
+            acknowledge: Cell::new(0),
+            completed: Cell::new(None),
+            wake_on_completion: Cell::new(false),
+        });
+        let source = HttpIngressBody::new_shared(
+            id,
+            signals.clone(),
+            self.receive_window,
+            self.context.host().clone(),
+        )
+        .map_err(|_| {
+            failure(
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"invalid stream receive window",
+            )
+        })?;
+        let producer = source.producer();
+        let drain = source.drain_on_drop();
+        let ingress = source
+            .ingress_completion()
+            .expect("a stream source has an ingress receipt");
+        let application = self.application.new_exchange(id, ingress);
+        let send_window =
+            Window::new(self.state.peer_initial_window).expect("peer initial window was validated");
+        // Allocating before the value is built lets it be written in place instead of copied.
+        entry.insert(Box::write(
+            Box::new_uninit(),
+            Stream {
+                application: Some(
+                    <A::Exchange as ExchangeStorage<UPSTREAM>>::store_downstream(application),
+                ),
+                wake,
+                signals,
+                source: Some(IngressSource::Request(source)),
+                producer,
+                drain: Some(drain),
+                head: None,
+                started: false,
+                wire_ingress_complete: false,
+                ingress_rejected: false,
+                consumed: false,
+                peer_reset: None,
+                reset_after_response: false,
+                resume: None,
+                request_head: false,
+                request_body_length: 0,
+                request_body_events: false,
+                expected_request_length: None,
+                send_window,
+                scheduling: PriorityEntry::default(),
+                stalled: false,
+                pending: None,
+                response_headers: false,
+                response_complete: false,
+                write_boundary: None,
+                physically_complete: false,
+                registered_byte_events: false,
+                reset: false,
+                stream_offset: 0,
+                body_offset: 0,
+            },
+        ));
+        self.state
+            .control
+            .active_incoming
+            .set(self.state.control.active_incoming.get() + 1);
+        self.state.awaiting_ingress += 1;
+        Ok(())
+    }
+
+    #[cold]
+    fn return_rejected_credit(&mut self, amount: usize) {
+        match self.state.rejected_credit.checked_add(amount) {
+            Some(total) if total <= u32::MAX as usize => self.state.rejected_credit = total,
+            _ => self.fail(Failure::new(
+                StreamId::UNSPECIFIED,
+                failure(
+                    HttpErrorCode::FLOW_CONTROL_ERROR,
+                    b"rejected DATA connection credit overflowed",
+                ),
+            )),
+        }
+    }
+}
+
+impl<A, const UPSTREAM: bool> HttpCodecCallback for CodecInput<'_, A, UPSTREAM>
+where
+    A: OwnedApplication,
+    A::Exchange: ExchangeStorage<UPSTREAM>,
+{
+    fn on_event(&mut self, event: CodecEvent<'_>) {
+        if self.peer_goaway_pending
+            && let CodecEvent::GeneratedFrameHeader { frame_type, .. } = event
+            && frame_type == roxygen_http2::frame::FrameType::GOAWAY.as_u8()
+        {
+            self.peer_goaway_generated = true;
+        }
+    }
+
+    fn on_ingress_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
+        let mut actions = Vec::new();
+        if self.state.control.cancel.get() || self.context.is_cancelled() {
+            actions.push(CodecCallbackAction::SetParserPaused(true));
+            return actions.into();
+        }
+        if self
+            .failures
+            .back()
+            .is_some_and(|failure| failure.stream.is_unspecified())
+        {
+            return actions.into();
+        }
+        match event {
+            CodecEvent::MessageBegin { stream, .. } => {
+                if UPSTREAM {
+                    return actions.into();
+                }
+                if self.state.control.active_incoming.get() as u64 >= self.state.incoming_limit
+                    || (self.state.draining && !self.state.ingress_grace)
+                {
+                    self.state.discarded.insert(stream, false);
+                    actions.push(CodecCallbackAction::Generate(OwnedEgressFrame::Reset {
+                        stream,
+                        code: H2ErrorCode::REFUSED_STREAM,
+                    }));
+                } else if let Err(error) = self.new_stream(stream) {
+                    self.fail(Failure::new(stream, error));
+                }
+            }
+            CodecEvent::HeadersComplete {
+                stream,
+                mut message,
+            } => {
+                if self.state.discarded.contains_key(&stream) {
+                    return actions.into();
+                }
+                let owner = self.streams.get_mut(&stream);
+                if owner.as_ref().is_some_and(|owner| owner.ingress_rejected) {
+                    return actions.into();
+                }
+                if UPSTREAM {
+                    if let Some(owner) = owner {
+                        if !owner.producer.headers_boxed(message, false) {
+                            self.fail(Failure::new(
+                                stream,
+                                failure(
+                                    HttpErrorCode::HEADER_PARSE_ERROR,
+                                    b"upstream source rejected response headers",
+                                ),
+                            ));
+                        } else if let Some(exchange) = owner.upstream() {
+                            exchange.status.publish_response();
+                        }
+                    }
+                    return actions.into();
+                }
+                if crate::uniplex::request_has_forbidden_body(&mut message) {
+                    let mut error = failure(
+                        HttpErrorCode::HEADER_PARSE_ERROR,
+                        b"RFC2616 request body is not allowed for this method",
+                    );
+                    error.set_http_message(Some(*message));
+                    self.fail(Failure {
+                        stream,
+                        error,
+                        status: Some(400),
+                        wire_code: None,
+                        direction: HttpExceptionDirection::Ingress,
+                        new_stream: true,
+                    });
+                    return actions.into();
+                }
+                let Some(owner) = owner else {
+                    return actions.into();
+                };
+                owner.request_head = message.method().ok().flatten() == Some(HttpMethod::Head);
+                owner.expected_request_length = crate::uniplex::message_content_length(&message);
+                if let Some(priority) = message.get_http_priority() {
+                    self.state
+                        .scheduler
+                        .update(stream, &mut owner.scheduling, priority);
+                }
+                let source = owner
+                    .source
+                    .as_ref()
+                    .expect("unstarted request retains its source");
+                if !source.initialize_body_only(&mut message, false) {
+                    let error = source
+                        .ingress_completion()
+                        .and_then(|receipt| receipt.snapshot())
+                        .and_then(Result::err)
+                        .unwrap_or_else(|| {
+                            failure(
+                                HttpErrorCode::HEADER_PARSE_ERROR,
+                                b"ingress source rejected request head",
+                            )
+                        });
+                    self.fail(Failure {
+                        stream,
+                        error,
+                        status: Some(400),
+                        wire_code: None,
+                        direction: HttpExceptionDirection::Ingress,
+                        new_stream: true,
+                    });
+                    return actions.into();
+                }
+                owner.head = Some(message);
+                owner.wake.enqueue();
+            }
+            CodecEvent::Body {
+                stream,
+                body,
+                padding,
+            } => {
+                let length = body.chain_length();
+                if self.state.discarded.contains_key(&stream) {
+                    self.return_rejected_credit(length);
+                    return actions.into();
+                }
+                let Some(owner) = self
+                    .streams
+                    .get_mut(&stream)
+                    .filter(|owner| !owner.reset && !owner.ingress_rejected)
+                else {
+                    self.return_rejected_credit(length);
+                    return actions.into();
+                };
+                owner.request_body_events = true;
+                owner.request_body_length = owner.request_body_length.saturating_add(length as u64);
+                if owner.producer.body(body, padding, false) == FlowControlState::Error {
+                    let complete = owner.wire_ingress_complete;
+                    self.return_rejected_credit(length);
+                    let mut rejected = Failure::new(
+                        stream,
+                        failure(
+                            if complete {
+                                HttpErrorCode::INVALID_STATE_TRANSITION
+                            } else {
+                                HttpErrorCode::FLOW_CONTROL_ERROR
+                            },
+                            b"ingress source rejected body bytes",
+                        ),
+                    );
+                    if complete {
+                        rejected.direction = HttpExceptionDirection::Ingress;
+                        rejected.wire_code = Some(H2ErrorCode::PROTOCOL_ERROR);
+                    }
+                    self.fail(rejected);
+                }
+            }
+            CodecEvent::TrailersComplete { stream, trailers } => {
+                if self.state.discarded.contains_key(&stream) {
+                    return actions.into();
+                }
+                if let Some(owner) = self
+                    .streams
+                    .get_mut(&stream)
+                    .filter(|owner| !owner.ingress_rejected)
+                {
+                    owner.request_body_events = true;
+                    // As `UniplexSession`: the source's `trailers` leaves the body open for a
+                    // later EOM, and the trailers end this message, so EOM follows them here.
+                    let accepted = owner.producer.trailers(*trailers) && owner.producer.eom();
+                    self.state.settle_ingress(owner);
+                    owner.wire_ingress_complete = true;
+                    owner.wake.enqueue();
+                    if UPSTREAM {
+                        owner.release_upstream_capacity();
+                    }
+                    if !accepted {
+                        self.fail(Failure::new(
+                            stream,
+                            failure(
+                                HttpErrorCode::INVALID_STATE_TRANSITION,
+                                b"ingress source rejected trailers",
+                            ),
+                        ));
+                    }
+                }
+            }
+            CodecEvent::MessageComplete { stream, .. } => {
+                if self.state.discarded.remove(&stream).is_some() {
+                    return actions.into();
+                }
+                if let Some(owner) = self.streams.get_mut(&stream) {
+                    self.state.settle_ingress(owner);
+                    if owner.ingress_rejected {
+                        owner.wire_ingress_complete = true;
+                        return actions.into();
+                    }
+                    if !owner.wire_ingress_complete {
+                        owner.wire_ingress_complete = true;
+                        // A rejected EOM (e.g. before any head) leaves the response source
+                        // terminal, and the caller reads that error from the source.
+                        if !owner.producer.eom()
+                            && UPSTREAM
+                            && let Some(exchange) = owner.upstream()
+                        {
+                            exchange.status.publish_response();
+                        }
+                    }
+                    if UPSTREAM {
+                        owner.release_upstream_capacity();
+                    }
+                    let mismatch = owner
+                        .expected_request_length
+                        .is_some_and(|expected| expected != owner.request_body_length);
+                    owner.wake.enqueue();
+                    if mismatch {
+                        self.fail(Failure {
+                            stream,
+                            error: failure(
+                                HttpErrorCode::CONTENT_LENGTH_MISMATCH,
+                                b"ingress Content-Length did not match body bytes",
+                            ),
+                            status: None,
+                            wire_code: Some(H2ErrorCode::INTERNAL_ERROR),
+                            direction: HttpExceptionDirection::Ingress,
+                            new_stream: false,
+                        });
+                    }
+                }
+            }
+            CodecEvent::Error {
+                stream,
+                error,
+                new_stream,
+            } => {
+                let mut partial = error.partial_message().cloned();
+                let code = if !UPSTREAM
+                    && partial
+                        .as_mut()
+                        .is_some_and(crate::uniplex::request_has_forbidden_body)
+                {
+                    HttpErrorCode::HEADER_PARSE_ERROR
+                } else {
+                    http_exception_to_http_error_code(error)
+                };
+                let mut adapted = HttpError::with_message(code, error.message());
+                adapted.set_http_message(partial);
+                self.fail(Failure {
+                    stream,
+                    error: adapted,
+                    status: error
+                        .http_status_code()
+                        .and_then(|status| u16::try_from(status).ok()),
+                    wire_code: error.codec_status_code(),
+                    direction: error.direction(),
+                    new_stream,
+                });
+            }
+            CodecEvent::Abort { stream, code } => {
+                let code = h2_error_code_to_http_error_code(code);
+                let code = if code == HttpErrorCode::NO_ERROR {
+                    HttpErrorCode::CANCEL
+                } else {
+                    code
+                };
+                if let Some(owner) = self.streams.get_mut(&stream) {
+                    owner.ingress_rejected = true;
+                    owner.signals.close_protocol();
+                    self.state.scheduler.dequeue(stream, &mut owner.scheduling);
+                    let selected = owner
+                        .upstream()
+                        .and_then(|exchange| exchange.status.selected_error());
+                    owner.peer_reset.get_or_insert_with(|| {
+                        selected.unwrap_or_else(|| {
+                            failure(code, b"peer reset cancelled local byte events")
+                        })
+                    });
+                    owner.wake.enqueue();
+                }
+            }
+            CodecEvent::WindowUpdate { stream, amount } => {
+                if !stream.is_unspecified() {
+                    let Some(owner) = self
+                        .streams
+                        .get_mut(&stream)
+                        .filter(|owner| owner.protocol_active())
+                    else {
+                        return actions.into();
+                    };
+                    if !protocol::free_stream_send(
+                        &mut owner.send_window,
+                        &mut owner.stalled,
+                        amount,
+                    ) {
+                        self.fail(Failure::new(
+                            StreamId::UNSPECIFIED,
+                            failure(
+                                HttpErrorCode::FLOW_CONTROL_ERROR,
+                                b"stream send-window update overflowed",
+                            ),
+                        ));
+                        let owner = self
+                            .streams
+                            .get_mut(&stream)
+                            .expect("window update retains its stream");
+                        self.state.scheduler.enqueue(stream, &mut owner.scheduling);
+                    } else {
+                        self.state.scheduler.enqueue(stream, &mut owner.scheduling);
+                    }
+                }
+            }
+            CodecEvent::Settings { settings } => {
+                for setting in settings.iter() {
+                    match PeerSetting::from(*setting) {
+                        PeerSetting::MaxConcurrentStreams(maximum) => {
+                            self.state.peer_maximum_streams = maximum;
+                            if let Some(admission) = &self.state.control.upstream {
+                                admission.set_peer_limit(maximum);
+                            }
+                        }
+                        PeerSetting::EnablePush(enabled) => self.state.peer_push_enabled = enabled,
+                        PeerSetting::InitialWindowSize(capacity) => {
+                            let mut windows: Vec<_> = self
+                                .streams
+                                .iter_mut()
+                                .filter(|(_, stream)| stream.protocol_active())
+                                .collect();
+                            windows.sort_unstable_by_key(|(id, _)| **id);
+                            if !protocol::update_initial_send_window(
+                                &mut self.state.peer_initial_window,
+                                capacity,
+                                windows
+                                    .into_iter()
+                                    .map(|(_, stream)| &mut stream.send_window),
+                            ) {
+                                self.fail(Failure::new(
+                                    StreamId::UNSPECIFIED,
+                                    failure(
+                                        HttpErrorCode::FLOW_CONTROL_ERROR,
+                                        b"peer initial stream window is not representable",
+                                    ),
+                                ));
+                            }
+                        }
+                        PeerSetting::Other => {}
+                    }
+                }
+                actions.push(CodecCallbackAction::Generate(OwnedEgressFrame::SettingsAck));
+            }
+            CodecEvent::Goaway {
+                last_good_stream,
+                code,
+                ..
+            } => {
+                for id in self.streams.ids_in_order() {
+                    if protocol::peer_goaway_refuses(
+                        id,
+                        last_good_stream,
+                        transport_direction::<UPSTREAM>(),
+                    ) {
+                        let owner = self
+                            .streams
+                            .get_mut(&id)
+                            .expect("GOAWAY visits live streams");
+                        owner.ingress_rejected = true;
+                        owner.signals.close_protocol();
+                        self.state.scheduler.dequeue(id, &mut owner.scheduling);
+                        let selected = owner
+                            .upstream()
+                            .and_then(|exchange| exchange.status.selected_error());
+                        owner.peer_reset.get_or_insert_with(|| {
+                            selected.unwrap_or_else(|| {
+                                failure(
+                                    HttpErrorCode::REFUSED_STREAM,
+                                    b"peer GOAWAY refused stream",
+                                )
+                            })
+                        });
+                        owner.wake.enqueue();
+                    }
+                }
+                if let Some(admission) = &self.state.control.upstream {
+                    admission.close(failure(
+                        HttpErrorCode::REFUSED_STREAM,
+                        b"peer GOAWAY closed admission",
+                    ));
+                }
+                if code != H2ErrorCode::NO_ERROR {
+                    self.fail(Failure::new(
+                        StreamId::UNSPECIFIED,
+                        failure(
+                            h2_error_code_to_http_error_code(code),
+                            b"peer GOAWAY carried a connection error",
+                        ),
+                    ));
+                } else if !self.state.draining {
+                    self.state.draining = true;
+                    self.state.ingress_grace = false;
+                    actions.push(CodecCallbackAction::Generate(OwnedEgressFrame::Goaway {
+                        last_stream: StreamId::MAX,
+                        code: H2ErrorCode::NO_ERROR,
+                        debug_data: None,
+                    }));
+                    self.peer_goaway_pending = true;
+                }
+            }
+            CodecEvent::PingRequest { data } => {
+                actions.push(CodecCallbackAction::Generate(OwnedEgressFrame::PingReply {
+                    data,
+                }))
+            }
+            CodecEvent::FrameHeader { .. }
+            | CodecEvent::SettingsAck
+            | CodecEvent::PingReply { .. }
+            | CodecEvent::Priority { .. }
+            | CodecEvent::PushPriority { .. }
+            | CodecEvent::GeneratedFrameHeader { .. }
+            | CodecEvent::ChunkHeader { .. }
+            | CodecEvent::ChunkComplete { .. } => {}
+            CodecEvent::PushMessageBegin { .. } => {
+                self.fail(Failure::new(
+                    StreamId::UNSPECIFIED,
+                    failure(
+                        HttpErrorCode::PROTOCOL_ERROR,
+                        b"downstream peer sent a push promise",
+                    ),
+                ));
+            }
+        }
+        actions.into()
+    }
+
+    fn num_incoming_streams(&self) -> u32 {
+        if UPSTREAM {
+            0
+        } else {
+            self.state
+                .control
+                .active_incoming
+                .get()
+                .min(u32::MAX as usize) as u32
+        }
+    }
+
+    fn observes_frame_headers(&self) -> bool {
+        Self::OBSERVES_FRAME_HEADERS
+    }
+}
+
+impl<A, const UPSTREAM: bool> Driver<A, UPSTREAM>
+where
+    A: OwnedApplication,
+    A::Exchange: ExchangeStorage<UPSTREAM>,
+{
+    fn parse_input(&mut self) -> Result<bool, HttpError> {
+        let input = &self.ingress;
+        let mut callback = CodecInput::<A, UPSTREAM> {
+            application: &self.application,
+            context: &self.context,
+            streams: &mut self.streams,
+            state: &mut self.connection.state,
+            failures: &mut self.failure.failures,
+            receive_window: self.h2.stream_receive_window,
+            peer_goaway_pending: false,
+            peer_goaway_generated: false,
+        };
+        let (consumed, mut egress_results) = if input.is_empty() {
+            (0, Vec::new())
+        } else {
+            let result = self
+                .connection
+                .codec
+                .on_ingress(input, &mut callback, &mut self.egress);
+            (result.consumed, result.egress_results)
+        };
+        let finishing_eof =
+            self.eof && !self.eof_processed && (consumed == input.chain_length() || consumed == 0);
+        if finishing_eof {
+            self.eof_processed = true;
+            let result = self
+                .connection
+                .codec
+                .on_ingress_eof(&mut callback, &mut self.egress);
+            egress_results.extend(result.egress_results);
+        }
+        let peer_goaway_generated = callback.peer_goaway_generated;
+        if finishing_eof && let Some(admission) = &self.connection.state.control.upstream {
+            admission.close(failure(HttpErrorCode::TRANSPORT_EOF, b"transport EOF"));
+        }
+        if peer_goaway_generated {
+            let phase = if self.connection.codec.is_waiting_to_drain() {
+                protocol::GoawayPhase::Initial
+            } else {
+                protocol::GoawayPhase::Final
+            };
+            if phase.commit(
+                SentGoaway {
+                    sent_initial: &mut self.sent_initial_goaway,
+                    sent_final: &mut self.sent_final_goaway,
+                    deadline: &mut self.goaway_deadline,
+                },
+                || self.context.host().deadline_after(self.h2.goaway_timeout),
+            ) {
+                self.connection.state.ingress_grace = false;
+            }
+        }
+        if peer_goaway_generated {
+            self.goaway_wait = self
+                .goaway_deadline
+                .map(|deadline| self.context.host().sleep_until(deadline));
+        }
+        if consumed > input.chain_length() {
+            return Err(failure(
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"codec consumed beyond the supplied prefix",
+            ));
+        }
+        self.ingress
+            .trim_start(consumed)
+            .expect("codec consumption was range checked");
+        if self.connection.state.rejected_credit != 0 {
+            let credit = std::mem::take(&mut self.connection.state.rejected_credit) as u32;
+            self.connection.codec.ingress_bytes_processed(
+                &mut self.egress,
+                credit,
+                &mut NoopCallback,
+            )?;
+        }
+        for result in egress_results {
+            result?;
+        }
+        while self.failure.fatal.is_none()
+            && let Some(problem) = self.failure.failures.pop_front()
+        {
+            self.handle_failure(problem);
+            self.check_cancel();
+        }
+        if finishing_eof && self.failure.fatal.is_none() {
+            let mut incomplete = self.streams.ids_in_order();
+            incomplete.retain(|id| {
+                let owner = &self.streams[id];
+                !owner.wire_ingress_complete && !owner.reset && !owner.ingress_rejected
+            });
+            for id in incomplete {
+                self.handle_failure(Failure {
+                    stream: id,
+                    error: failure(HttpErrorCode::TRANSPORT_EOF, b"transport EOF"),
+                    status: (!UPSTREAM).then_some(500),
+                    wire_code: None,
+                    direction: HttpExceptionDirection::Ingress,
+                    new_stream: false,
+                });
+                self.check_cancel();
+                if self.failure.fatal.is_some() {
+                    break;
+                }
+            }
+        }
+        Ok(consumed != 0 || finishing_eof)
+    }
+
+    fn stream_connection(
+        &mut self,
+    ) -> (
+        &mut StreamTable<A::Exchange, UPSTREAM>,
+        StreamConnection<'_, UPSTREAM>,
+    ) {
+        (
+            &mut self.streams,
+            StreamConnection {
+                connection: &mut self.connection,
+                context: &self.context,
+                failure: &mut self.failure,
+                egress: &mut self.egress,
+                write: &self.write,
+                write_queue: self.write_queue.as_deref(),
+                transport_reset: self.transport_reset,
+            },
+        )
+    }
+
+    fn poll_stream(&mut self, id: StreamId) -> Result<OwnerPollResult, HttpError> {
+        let mut serialized = None;
+        let retired = {
+            let (streams, mut connection) = self.stream_connection();
+            let Entry::Occupied(mut entry) = streams.entry(id) else {
+                return Ok(OwnerPollResult::Polled);
+            };
+            let stream = entry.get_mut();
+            stream.wake.queued.swap(false, Ordering::AcqRel);
+            if let Err(error) = connection.poll_stream_owner(id, stream) {
+                if self.failure.panic.is_some() && self.failure.fatal.is_none() {
+                    self.abort_retirement_panic();
+                }
+                return Err(error);
+            }
+            // While the message's last event waits, the source's completion wakes the owner.
+            if stream.pending.as_ref().is_some_and(PendingEgress::eom) {
+                stream.signals.wake_on_completion.set(true);
+            }
+            let retired =
+                if stream.consumed && stream.response_complete && stream.physically_complete {
+                    let waker = waker_ref(&stream.wake);
+                    let mut context = Context::from_waker(&waker);
+                    match connection
+                        .connection
+                        .state
+                        .observer
+                        .poll_stream_events_drained(connection.context, id, &mut context)
+                    {
+                        Poll::Ready(Ok(())) => true,
+                        Poll::Ready(Err(error)) => {
+                            push_connection_failure(&mut connection.failure.failures, error);
+                            false
+                        }
+                        Poll::Pending => false,
+                    }
+                } else {
+                    false
+                };
+            if retired {
+                connection.connection.state.settle_ingress(stream);
+                connection.connection.state.consumed_streams -= 1;
+                Some(entry.remove())
+            } else {
+                serialized = connection.serialize_polled(id, stream);
+                None
+            }
+        };
+        if let Some(mut stream) = retired {
+            self.debug_assert_stream_counts();
+            if let Some(exchange) = stream.upstream() {
+                capture(&mut self.failure.panic, || exchange.status.release());
+            }
+            self.connection
+                .state
+                .scheduler
+                .dequeue(id, &mut stream.scheduling);
+            stream.wake.live.store(false, Ordering::Release);
+            if !stream.reset {
+                capture(&mut self.failure.panic, || {
+                    <A::Exchange as ExchangeStorage<UPSTREAM>>::complete_stored(
+                        &mut stream.application,
+                    )
+                });
+            }
+            capture(&mut self.failure.panic, || drop(stream));
+        }
+        if serialized.is_none() && self.failure.panic.is_some() && self.failure.fatal.is_none() {
+            self.abort_retirement_panic();
+        }
+        Ok(serialized.map_or(OwnerPollResult::Polled, OwnerPollResult::Serialized))
+    }
+
+    fn debug_assert_stream_counts(&self) {
+        debug_assert_eq!(
+            self.connection.state.awaiting_ingress,
+            self.streams
+                .values()
+                .filter(|stream| stream.awaits_ingress())
+                .count(),
+            "the awaiting-ingress count matches the live streams"
+        );
+        debug_assert_eq!(
+            self.connection.state.consumed_streams,
+            self.streams
+                .values()
+                .filter(|stream| stream.consumed)
+                .count(),
+            "the consumed count matches the live streams"
+        );
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn abort_retirement_panic(&mut self) {
+        self.abort(failure(
+            HttpErrorCode::INTERNAL_ERROR,
+            b"owned H2 retirement panicked",
+        ));
+    }
+}
+
+impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
+    /// Read only where a stream's physical completion is decided.
+    fn writes_pending(&self) -> bool {
+        #[cfg(test)]
+        OWNER_WRITE_STATE_READS.with(|reads| reads.set(reads.get() + 1));
+        writes_pending(self.write, self.write_queue)
+    }
+
+    fn cancelled(&self) -> bool {
+        self.connection.state.control.cancel.get() || self.context.is_cancelled()
+    }
+
+    fn poll_stream_owner<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        id: StreamId,
+        stream: &mut Stream<E, UPSTREAM>,
+    ) -> Result<(), HttpError> {
+        if let Some(error) = stream.peer_reset.take() {
+            self.reset_owner(id, stream, &error, true, None);
+        }
+        if UPSTREAM {
+            let waker = waker_ref(&stream.wake);
+            let mut context = Context::from_waker(&waker);
+            if let Some(exchange) = stream
+                .application
+                .as_mut()
+                .and_then(<E as ExchangeStorage<UPSTREAM>>::upstream_mut)
+            {
+                exchange.poll_response_observer(&mut context);
+            }
+        }
+        // The shared source publishes once, before waking this owner.
+        let completion = if !stream.consumed && stream.signals.source_complete.get() {
+            stream.signals.completed.take()
+        } else {
+            None
+        };
+        if let Some(completion) = completion {
+            stream.consumed = true;
+            self.connection.state.consumed_streams += 1;
+            if !stream.reset
+                && let Err(error) = completion
+            {
+                self.source_failed(id, stream, error);
+            }
+        }
+        let consumed = stream.signals.consumed.replace(0);
+        let acknowledge = stream.signals.acknowledge.replace(0);
+        if self.failure.fatal.is_none() {
+            let credit = (|| {
+                if consumed != 0 {
+                    let amount = u32::try_from(consumed).map_err(|_| {
+                        failure(
+                            HttpErrorCode::FLOW_CONTROL_ERROR,
+                            b"connection return credit overflowed",
+                        )
+                    })?;
+                    self.connection.codec.ingress_bytes_processed(
+                        self.egress,
+                        amount,
+                        &mut NoopCallback,
+                    )?;
+                }
+                if acknowledge != 0 && !stream.reset {
+                    let amount = u32::try_from(acknowledge).map_err(|_| {
+                        failure(
+                            HttpErrorCode::FLOW_CONTROL_ERROR,
+                            b"stream return credit overflowed",
+                        )
+                    })?;
+                    self.connection.codec.generate(
+                        self.egress,
+                        EgressFrame::WindowUpdate { stream: id, amount },
+                        &mut NoopCallback,
+                    )?;
+                }
+                Ok::<_, HttpError>(())
+            })();
+            if let Err(error) = credit {
+                push_connection_failure(&mut self.failure.failures, error);
+                return Ok(());
+            }
+        }
+        if stream.reset {
+            if stream.consumed
+                && stream.pending.is_some()
+                && !stream.response_complete
+                && self.failure.fatal.is_none()
+            {
+                self.connection
+                    .state
+                    .scheduler
+                    .enqueue(id, &mut stream.scheduling);
+            }
+            if self.transport_reset && !self.writes_pending() {
+                stream.physically_complete = true;
+            }
+            return Ok(());
+        }
+        if UPSTREAM {
+            return self.poll_upstream_stream(id, stream);
+        }
+        let waker = waker_ref(&stream.wake);
+        let mut context = Context::from_waker(&waker);
+        if !stream.started
+            && let Some(head) = stream.head.take()
+        {
+            let source = stream
+                .source
+                .take()
+                .expect("unstarted request retains its body source");
+            let IngressSource::Request(mut source) = source else {
+                unreachable!("downstream requests retain a fresh ingress body");
+            };
+            let eom = stream.wire_ingress_complete && !stream.request_body_events;
+            if eom {
+                source = source.retire_empty_body(&mut context)?;
+            }
+            if self.cancelled() {
+                return Ok(());
+            }
+            stream.started = true;
+            <E as ExchangeStorage<UPSTREAM>>::downstream(
+                stream
+                    .application
+                    .as_mut()
+                    .expect("application remains owned"),
+            )
+            .request_body(head, source, eom);
+        }
+        if self.cancelled()
+            || !stream.started
+            || stream.pending.is_some()
+            || stream.response_complete
+        {
+            return Ok(());
+        }
+        if let Some(resume) = &mut stream.resume {
+            match resume.as_mut().poll(&mut context) {
+                Poll::Pending => return Ok(()),
+                Poll::Ready(roxygen_core::events::ResumeStatus::Cancelled) => {
+                    return Err(failure(
+                        HttpErrorCode::CORO_CANCELLED,
+                        b"response body resume cancelled",
+                    ));
+                }
+                Poll::Ready(_) => {
+                    stream.resume.take();
+                }
+            }
+        }
+        if self.cancelled() {
+            return Ok(());
+        }
+        let application = <E as ExchangeStorage<UPSTREAM>>::downstream(
+            stream
+                .application
+                .as_mut()
+                .expect("application remains owned"),
+        );
+        if !stream.response_headers {
+            if !stream.wake.take_headers_ready() {
+                return Ok(());
+            }
+            match application.poll_headers(&mut context) {
+                Poll::Pending => {}
+                Poll::Ready(Err(error)) => return Err(error),
+                Poll::Ready(Ok(headers)) => {
+                    // Informational headers can have an immediately ready successor.
+                    stream
+                        .wake
+                        .headers_poll_ready
+                        .store(true, Ordering::Release);
+                    stream.pending = Some(PendingEgress::Headers(headers));
+                    self.connection
+                        .state
+                        .scheduler
+                        .enqueue(id, &mut stream.scheduling);
+                }
+            }
+        } else {
+            match application.poll_body(
+                &mut context,
+                self.connection.state.config.buffer_limit.min(64 << 10) as u32,
+            ) {
+                Poll::Pending => {}
+                Poll::Ready(Err(error)) => return Err(error),
+                Poll::Ready(Ok(event)) => {
+                    if event.as_body().is_some_and(|body| {
+                        body.chain_length()
+                            > self.connection.state.config.buffer_limit.min(64 << 10)
+                    }) {
+                        return Err(failure(
+                            HttpErrorCode::MESSAGE_ERROR,
+                            b"response source exceeded its admitted body read",
+                        ));
+                    }
+                    if matches!(event.kind(), HttpBodyEventKind::PushPromise(_)) {
+                        return Err(failure(
+                            HttpErrorCode::PROTOCOL_ERROR,
+                            b"owned downstream experiment does not admit push responses",
+                        ));
+                    }
+                    if matches!(event.kind(), HttpBodyEventKind::Suspend(_)) {
+                        let HttpBodyEventKind::Suspend(resume) = event.into_kind() else {
+                            unreachable!("event kind was checked");
+                        };
+                        stream.resume = Some(resume);
+                        stream.wake.schedule();
+                    } else {
+                        stream.pending = Some(PendingEgress::Body(event));
+                        self.connection
+                            .state
+                            .scheduler
+                            .enqueue(id, &mut stream.scheduling);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn source_failed<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        id: StreamId,
+        stream: &mut Stream<E, UPSTREAM>,
+        error: HttpError,
+    ) {
+        if UPSTREAM {
+            if !stream.response_complete || !stream.wire_ingress_complete {
+                let error = stream
+                    .upstream()
+                    .and_then(|exchange| exchange.status.selected_error())
+                    .unwrap_or(error);
+                let code = crate::session::source_complete_reset_code(error.code());
+                let code = if code == HttpErrorCode::NO_ERROR {
+                    HttpErrorCode::CANCEL
+                } else {
+                    code
+                };
+                let wire = http_error_code_to_h2_error_code(code, false);
+                let error = if error.code() == HttpErrorCode::NO_ERROR {
+                    failure(
+                        HttpErrorCode::CANCEL,
+                        b"upstream response source was abandoned",
+                    )
+                } else {
+                    error
+                };
+                self.reset_owner(id, stream, &error, false, Some(wire));
+            }
+        } else if error.code() == HttpErrorCode::NO_ERROR {
+            if !stream.response_complete {
+                stream.reset_after_response = !stream.wire_ingress_complete;
+            }
+        } else if !stream.response_complete || !stream.wire_ingress_complete {
+            let code = crate::session::source_complete_reset_code(error.code());
+            let wire = http_error_code_to_h2_error_code(code, false);
+            self.reset_owner(id, stream, &error, false, Some(wire));
+        }
+    }
+
+    fn discard_pending<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        stream: &mut Stream<E, UPSTREAM>,
+        error: &HttpError,
+    ) {
+        if let Some(pending) = &mut stream.pending {
+            let registrations = match pending {
+                PendingEgress::Headers(headers) => headers.byte_event_registrations_mut(),
+                PendingEgress::Body(body) => body.byte_event_registrations_mut(),
+            };
+            for registration in registrations {
+                capture(&mut self.failure.panic, || registration.cancel(error, None));
+            }
+        }
+        capture(&mut self.failure.panic, || drop(stream.pending.take()));
+    }
+
+    #[cold]
+    fn cancel_owner<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        id: StreamId,
+        stream: &mut Stream<E, UPSTREAM>,
+        error: &HttpError,
+        peer: bool,
+    ) {
+        if stream.reset {
+            return;
+        }
+        stream.signals.wake_on_completion.set(true);
+        self.connection.state.settle_ingress(stream);
+        stream.reset = true;
+        stream.ingress_rejected = true;
+        stream.signals.close_protocol();
+        stream.response_complete = true;
+        stream.signals.response_complete();
+        self.connection
+            .state
+            .scheduler
+            .dequeue(id, &mut stream.scheduling);
+        capture(&mut self.failure.panic, || {
+            stream
+                .producer
+                .abort_with_error(error.clone(), b"owned H2 stream cancelled")
+        });
+        if let Some(application) = &mut stream.application {
+            if capture(&mut self.failure.panic, || {
+                <E as ExchangeStorage<UPSTREAM>>::cancel_stored(application, error, peer)
+            })
+            .is_none()
+            {
+                capture(&mut self.failure.panic, || drop(stream.application.take()));
+            }
+        }
+        capture(&mut self.failure.panic, || drop(stream.resume.take()));
+        self.discard_pending(stream, error);
+        capture(&mut self.failure.panic, || drop(stream.head.take()));
+        if !UPSTREAM {
+            capture(&mut self.failure.panic, || {
+                stream.producer.stop_reading(Some(error.code()))
+            });
+        }
+        capture(&mut self.failure.panic, || drop(stream.source.take()));
+        capture(&mut self.failure.panic, || {
+            self.connection
+                .state
+                .observer
+                .cancel_stream_events(self.context, id, error)
+        });
+        capture(&mut self.failure.panic, || stream.wake.schedule());
+    }
+}
+
+impl<A, const UPSTREAM: bool> Driver<A, UPSTREAM>
+where
+    A: OwnedApplication,
+    A::Exchange: ExchangeStorage<UPSTREAM>,
+{
+    #[cold]
+    fn reset_stream(
+        &mut self,
+        id: StreamId,
+        error: HttpError,
+        peer: bool,
+        wire: Option<H2ErrorCode>,
+    ) {
+        let Some(mut stream) = self.streams.remove(&id) else {
+            return;
+        };
+        let (error, peer, wire) = if UPSTREAM {
+            if let Some(error) = stream.peer_reset.take() {
+                (error, true, None)
+            } else if let Some(error) = stream
+                .upstream()
+                .and_then(|exchange| exchange.status.selected_error())
+            {
+                let wire = upstream::cancellation_wire_code(error.code());
+                (error, peer, Some(wire))
+            } else {
+                (error, peer, wire)
+            }
+        } else {
+            (error, peer, wire)
+        };
+        let reset = catch_unwind(AssertUnwindSafe(|| {
+            self.stream_connection()
+                .1
+                .reset_owner(id, &mut stream, &error, peer, wire)
+        }));
+        self.streams.insert(id, stream);
+        if let Err(panic) = reset {
+            resume_unwind(panic);
+        }
+    }
+}
+
+impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
+    #[cold]
+    fn reset_owner<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        id: StreamId,
+        stream: &mut Stream<E, UPSTREAM>,
+        error: &HttpError,
+        peer: bool,
+        wire: Option<H2ErrorCode>,
+    ) {
+        stream.signals.wake_on_completion.set(true);
+        if stream.reset && self.failure.fatal.is_some() {
+            stream.response_complete = true;
+            stream.signals.response_complete();
+        }
+        if stream.reset && peer {
+            if let Some(application) = &mut stream.application {
+                capture(&mut self.failure.panic, || {
+                    <E as ExchangeStorage<UPSTREAM>>::cancel_stored(application, error, true)
+                });
+            }
+            if !stream.response_complete || stream.pending.is_some() {
+                self.connection
+                    .state
+                    .scheduler
+                    .dequeue(id, &mut stream.scheduling);
+                self.discard_pending(stream, error);
+                stream.response_complete = true;
+                stream.signals.response_complete();
+                let offset = self
+                    .connection
+                    .state
+                    .summary
+                    .bytes_scheduled
+                    .saturating_add(self.egress.chain_length() as u64);
+                stream.write_boundary = Some(offset);
+                stream.physically_complete =
+                    offset <= self.connection.state.summary.bytes_written && !self.writes_pending();
+                if !stream.physically_complete {
+                    self.connection.state.write_fences.push_back((offset, id));
+                }
+            }
+        }
+        if !stream.reset {
+            self.cancel_owner(id, stream, error, peer);
+            if !peer && self.failure.fatal.is_none() && (!UPSTREAM || stream.response_headers) {
+                let code =
+                    wire.unwrap_or_else(|| http_error_code_to_h2_error_code(error.code(), false));
+                if let Err(error) = self.connection.codec.generate(
+                    self.egress,
+                    EgressFrame::Reset { stream: id, code },
+                    &mut NoopCallback,
+                ) {
+                    push_connection_failure(&mut self.failure.failures, error);
+                }
+            }
+            let offset = self
+                .connection
+                .state
+                .summary
+                .bytes_scheduled
+                .saturating_add(self.egress.chain_length() as u64);
+            stream.write_boundary = Some(offset);
+            stream.physically_complete = (self.transport_reset
+                || offset <= self.connection.state.summary.bytes_written)
+                && !self.writes_pending();
+            if !stream.physically_complete {
+                self.connection.state.write_fences.push_back((offset, id));
+            }
+            stream.wake.schedule();
+        }
+    }
+}
+
+impl<A, const UPSTREAM: bool> Driver<A, UPSTREAM>
+where
+    A: OwnedApplication,
+    A::Exchange: ExchangeStorage<UPSTREAM>,
+{
+    #[cold]
+    fn reset_transport(&mut self) {
+        self.read_wake.ready.store(true, Ordering::Release);
+        self.write_wake.ready.store(true, Ordering::Release);
+        if !self.transport_reset {
+            self.transport_reset = true;
+            self.connection.state.summary.reset = true;
+            capture(&mut self.failure.panic, || {
+                self.cancellation.request_cancellation()
+            });
+            capture(&mut self.failure.panic, || {
+                self.write_cancellation.request_cancellation()
+            });
+            capture(&mut self.failure.panic, || {
+                self.transport.close_with_reset(&self.context)
+            });
+        }
+        for id in self.streams.ids_in_order() {
+            let stream = &self.streams[&id];
+            capture(&mut self.failure.panic, || stream.wake.schedule());
+        }
+    }
+
+    #[cold]
+    fn fail_connection(&mut self, error: HttpError) {
+        if self.failure.fatal.is_some() {
+            return;
+        }
+        self.failure.fatal = Some(error.clone());
+        if let Some(admission) = &self.connection.state.control.upstream {
+            capture(&mut self.failure.panic, || admission.close(error.clone()));
+        }
+        self.failure.failures.clear();
+        self.read_wake.ready.store(true, Ordering::Release);
+        capture(&mut self.failure.panic, || {
+            self.cancellation.request_cancellation()
+        });
+        let wire = http_error_code_to_h2_error_code(error.code(), false);
+        let generated = self.generate_goaway(wire);
+        for id in self.streams.ids_in_order() {
+            self.reset_stream(id, error.clone(), false, None);
+        }
+        capture(&mut self.failure.panic, || {
+            self.connection
+                .state
+                .observer
+                .cancel_events(&self.context, &error)
+        });
+        if generated.is_err() {
+            self.abort(error);
+        }
+    }
+
+    #[cold]
+    fn abort(&mut self, error: HttpError) {
+        if self.failure.fatal.is_none() {
+            self.failure.fatal = Some(error.clone());
+        }
+        if let Some(admission) = &self.connection.state.control.upstream {
+            capture(&mut self.failure.panic, || admission.close(error.clone()));
+        }
+        self.failure.failures.clear();
+        self.reset_transport();
+        for id in self.streams.ids_in_order() {
+            self.reset_stream(id, error.clone(), false, None);
+        }
+        self.egress = BufQueue::new(self.connection.state.config.buffer_limit);
+        self.connection.state.zero_write_pending = false;
+        capture(&mut self.failure.panic, || {
+            self.connection
+                .state
+                .observer
+                .cancel_events(&self.context, &error)
+        });
+    }
+
+    #[cold]
+    fn handle_failure(&mut self, mut problem: Failure) {
+        let owner = self.streams.get(&problem.stream);
+        let decision = CodecFailureContext {
+            direction: transport_direction::<UPSTREAM>(),
+            stream: problem.stream,
+            exception_direction: problem.direction,
+            new_stream: problem.new_stream,
+            http_status: problem.status,
+            wire_code: problem.wire_code,
+            live_stream: owner
+                .filter(|owner| !owner.consumed || !owner.response_complete)
+                .map(|owner| {
+                    !owner.response_headers
+                        && !owner.response_complete
+                        && owner.peer_reset.is_none()
+                }),
+            discarded: self
+                .connection
+                .state
+                .discarded
+                .contains_key(&problem.stream)
+                || owner.is_some_and(|owner| owner.reset || owner.ingress_rejected),
+            protocol_stream_present: owner.is_some_and(|owner| owner.protocol_active()),
+        }
+        .disposition();
+        match decision {
+            CodecFailureDisposition::Connection => self.fail_connection(problem.error),
+            CodecFailureDisposition::Ignore => {}
+            CodecFailureDisposition::Reset {
+                explicit_wire_code,
+                fallback_wire_code,
+            } => {
+                if owner.is_some() {
+                    self.reset_stream(problem.stream, problem.error, false, explicit_wire_code);
+                } else if let Err(error) = self.connection.codec.generate(
+                    &mut self.egress,
+                    EgressFrame::Reset {
+                        stream: problem.stream,
+                        code: fallback_wire_code,
+                    },
+                    &mut NoopCallback,
+                ) {
+                    self.abort(error);
+                }
+            }
+            CodecFailureDisposition::Response(status) => {
+                let Some(mut stream) = self.streams.remove(&problem.stream) else {
+                    return;
+                };
+                let response = catch_unwind(AssertUnwindSafe(|| {
+                    if let Some(mut message) = problem.error.take_http_message()
+                        && let Some(source) = &stream.source
+                    {
+                        source.initialize_body_only(&mut message, false);
+                    }
+                    self.stream_connection().1.cancel_owner(
+                        problem.stream,
+                        &mut stream,
+                        &problem.error,
+                        false,
+                    );
+                    let mut message = HttpMessage::new();
+                    message
+                        .set_status_code(status)
+                        .expect("codec error HTTP status was validated");
+                    message.set_http_version(1, 1);
+                    message.set_wants_keepalive(false);
+                    message
+                        .headers_mut()
+                        .set(HttpHeaderCode::ContentLength, b"0");
+                    let headers = HttpHeaderEvent::new(message, true)
+                        .expect("final error response accepts EOM");
+                    stream.pending = Some(PendingEgress::Headers(headers));
+                    stream.response_complete = false;
+                    stream.signals.error_response_pending();
+                    stream.reset_after_response = false;
+                    stream.wake.schedule();
+                    if stream.signals.source_complete.get() {
+                        self.connection
+                            .state
+                            .scheduler
+                            .enqueue(problem.stream, &mut stream.scheduling);
+                    }
+                }));
+                self.streams.insert(problem.stream, stream);
+                if let Err(panic) = response {
+                    resume_unwind(panic);
+                }
+            }
+        }
+    }
+}
+
+impl<A, const UPSTREAM: bool> Driver<A, UPSTREAM>
+where
+    A: OwnedApplication,
+    A::Exchange: ExchangeStorage<UPSTREAM>,
+{
+    fn serialize_next(&mut self) -> Result<bool, (StreamId, HttpError)> {
+        if self.connection.state.scheduler.is_empty() {
+            return Ok(false);
+        }
+        let Some(budget) = serialization_budget(
+            &self.connection.state.config,
+            &self.egress,
+            &self.connection.codec,
+        ) else {
+            return Ok(false);
+        };
+        let Some(id) = self.connection.state.scheduler.next_matching(|id| {
+            self.streams
+                .get(&id)
+                .is_some_and(|stream| stream.can_serialize(budget))
+        }) else {
+            return Ok(false);
+        };
+        let (streams, mut connection) = self.stream_connection();
+        let stream = streams
+            .get_mut(&id)
+            .expect("scheduler selected an owned stream");
+        connection
+            .serialize_selected(id, stream, budget)
+            .map(|()| true)
+            .map_err(|error| (id, error))
+    }
+}
+
+impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
+    fn serialize_polled<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        id: StreamId,
+        stream: &mut Stream<E, UPSTREAM>,
+    ) -> Option<Result<(), HttpError>> {
+        // Cancellation and retirement retain their checkpoint before serialization.
+        if self.failure.fatal.is_some()
+            || self.failure.panic.is_some()
+            || self.cancelled()
+            || self.connection.state.scheduler.head() != Some(id)
+        {
+            return None;
+        }
+        let budget = serialization_budget(
+            &self.connection.state.config,
+            self.egress,
+            &self.connection.codec,
+        )?;
+        if !stream.can_serialize(budget) {
+            return None;
+        }
+        Some(self.serialize_selected(id, stream, budget))
+    }
+
+    fn serialize_selected<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        id: StreamId,
+        stream: &mut Stream<E, UPSTREAM>,
+        budget: SerializationBudget,
+    ) -> Result<(), HttpError> {
+        let maximum = budget.credit.min(stream.send_window.non_negative_size());
+        let mut event = stream
+            .pending
+            .take()
+            .expect("serialization requires a pending event");
+        if let PendingEgress::Body(body) = &mut event
+            && (UPSTREAM || !stream.request_head)
+            && let Some(bytes) = body.as_body_mut()
+        {
+            let maximum = maximum as usize;
+            if bytes.chain_length() > maximum {
+                let partial = bytes.split_at_most(maximum);
+                stream.pending = Some(event);
+                event = PendingEgress::Body(HttpBodyEvent::body(partial, false));
+            }
+        }
+        self.serialize_event(id, stream, event)?;
+        if stream.pending.is_none() {
+            self.connection
+                .state
+                .scheduler
+                .dequeue(id, &mut stream.scheduling);
+        }
+        if stream.pending.is_none() && (!stream.response_complete || stream.physically_complete) {
+            stream.wake.enqueue();
+        }
+        Ok(())
+    }
+
+    fn serialize_event<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        id: StreamId,
+        stream: &mut Stream<E, UPSTREAM>,
+        event: PendingEgress,
+    ) -> Result<(), HttpError> {
+        if UPSTREAM
+            && let Some((error, wire)) = stream
+                .upstream()
+                .and_then(|exchange| exchange.egress_error(stream.response_headers))
+        {
+            self.reset_before_egress(id, stream, event, (error, wire));
+            return Ok(());
+        }
+        let mut section = None;
+        let mut encoded_callback = None;
+        let eom;
+        let mut body_length = 0;
+        let mut registrations;
+        let generated = match event {
+            PendingEgress::Headers(mut headers) => {
+                registrations = headers.take_byte_event_registrations();
+                eom = headers.eom();
+                let final_headers = headers.is_final().map_err(message_type_failure)?;
+                if let Some(priority) = headers.headers().get_http_priority() {
+                    self.connection
+                        .state
+                        .scheduler
+                        .update(id, &mut stream.scheduling, priority);
+                }
+                let result = self.connection.codec.generate(
+                    self.egress,
+                    EgressFrame::Headers {
+                        stream: id,
+                        message: headers.headers(),
+                        end_stream: eom,
+                        extra_headers: None,
+                    },
+                    &mut NoopCallback,
+                );
+                if let Err(error) = &result {
+                    cancel_registrations(&mut registrations, error);
+                }
+                let generated = result?;
+                stream.response_headers |= final_headers;
+                if let Some(size) = generated.header_size {
+                    section = Some(FieldSectionInfo {
+                        section_type: FieldSectionType::Headers,
+                        final_headers,
+                        size,
+                    });
+                    encoded_callback = Some((headers, size));
+                }
+                generated
+            }
+            PendingEgress::Body(mut event) => {
+                eom = event.eom();
+                registrations = event.take_byte_event_registrations();
+                let result = match event.into_kind() {
+                    HttpBodyEventKind::Body(_body) if !UPSTREAM && stream.request_head => {
+                        if eom {
+                            self.connection.codec.generate(
+                                self.egress,
+                                EgressFrame::EndOfMessage { stream: id },
+                                &mut NoopCallback,
+                            )
+                        } else {
+                            Ok(roxygen_codec::GeneratedFrame::default())
+                        }
+                    }
+                    HttpBodyEventKind::Body(body) => {
+                        body_length = body.chain_length() as u64;
+                        if !body.is_empty()
+                            && !stream.send_window.reserve(body.chain_length() as u32, true)
+                        {
+                            Err(failure(
+                                HttpErrorCode::FLOW_CONTROL_ERROR,
+                                b"HTTP/2 stream send window is exhausted",
+                            ))
+                        } else {
+                            self.connection.codec.generate(
+                                self.egress,
+                                EgressFrame::Body {
+                                    stream: id,
+                                    body,
+                                    padding: None,
+                                    end_stream: eom,
+                                },
+                                &mut NoopCallback,
+                            )
+                        }
+                    }
+                    HttpBodyEventKind::Trailers(trailers) => {
+                        let generated = self.connection.codec.generate(
+                            self.egress,
+                            EgressFrame::Trailers {
+                                stream: id,
+                                trailers: &trailers,
+                            },
+                            &mut NoopCallback,
+                        );
+                        if let Ok(generated) = &generated
+                            && let Some(size) = generated.header_size
+                        {
+                            section = Some(FieldSectionInfo {
+                                section_type: FieldSectionType::Trailers,
+                                final_headers: true,
+                                size,
+                            });
+                        }
+                        generated
+                    }
+                    HttpBodyEventKind::Padding(length) => self.connection.codec.generate(
+                        self.egress,
+                        EgressFrame::Padding { stream: id, length },
+                        &mut NoopCallback,
+                    ),
+                    HttpBodyEventKind::Upgrade => Ok(roxygen_codec::GeneratedFrame::default()),
+                    HttpBodyEventKind::PushPromise(_) => Err(failure(
+                        HttpErrorCode::PROTOCOL_ERROR,
+                        b"owned downstream experiment does not admit push responses",
+                    )),
+                    HttpBodyEventKind::Suspend(_) => Err(failure(
+                        HttpErrorCode::INVALID_STATE_TRANSITION,
+                        b"a suspended event escaped body polling",
+                    )),
+                };
+                if let Err(error) = &result {
+                    cancel_registrations(&mut registrations, error);
+                }
+                let generated = result?;
+                if stream.pending.is_some() {
+                    self.connection.state.scheduler.consume(
+                        id,
+                        &stream.scheduling,
+                        generated.bytes_written,
+                    );
+                }
+                generated
+            }
+        };
+        stream.stream_offset = stream
+            .stream_offset
+            .saturating_add(generated.bytes_written as u64);
+        stream.body_offset = stream.body_offset.saturating_add(body_length);
+        let mut end = self
+            .connection
+            .state
+            .summary
+            .bytes_scheduled
+            .saturating_add(self.egress.chain_length() as u64);
+        if generated.bytes_written == 0 && !registrations.is_empty() {
+            self.connection.state.zero_write_pending = true;
+        }
+        stream.registered_byte_events |= !registrations.is_empty();
+        if eom {
+            stream.response_complete = true;
+            stream.signals.response_complete();
+            stream.release_upstream_capacity();
+            if UPSTREAM {
+                stream.producer.arm_read_timeout();
+            }
+            <E as ExchangeStorage<UPSTREAM>>::response_complete_stored(
+                stream
+                    .application
+                    .as_mut()
+                    .expect("application remains owned"),
+            );
+            if self.cancelled() {
+                return Err(completion_cancelled(&mut registrations));
+            }
+            if stream.reset_after_response {
+                self.connection.codec.generate(
+                    self.egress,
+                    EgressFrame::Reset {
+                        stream: id,
+                        code: H2ErrorCode::NO_ERROR,
+                    },
+                    &mut NoopCallback,
+                )?;
+            }
+            let physical_end = self
+                .connection
+                .state
+                .summary
+                .bytes_scheduled
+                .saturating_add(self.egress.chain_length() as u64);
+            end = physical_end;
+            stream.write_boundary = Some(physical_end);
+            stream.physically_complete = (physical_end
+                <= self.connection.state.summary.bytes_written
+                && !self.writes_pending())
+                || self.retires_at_serialization(stream);
+            if !stream.physically_complete {
+                self.connection
+                    .state
+                    .write_fences
+                    .push_back((physical_end, id));
+            }
+        }
+        if !registrations.is_empty() || self.context.is_cancelled() {
+            self.connection.state.byte_events_registered = true;
+            self.connection.state.observer.register_byte_events(
+                self.context,
+                ByteEventOffsets {
+                    stream_id: id,
+                    session_byte_offset: end,
+                    session_bytes_scheduled: self.connection.state.summary.bytes_scheduled,
+                    stream_offset: stream.stream_offset,
+                    body_offset: stream.body_offset,
+                },
+                section,
+                registrations,
+                eom,
+            )?;
+        }
+        if let Some((mut headers, size)) = encoded_callback {
+            headers.on_headers_encoded(size);
+        }
+        if UPSTREAM && stream.response_headers {
+            self.acknowledge_upstream(id, stream)?;
+        }
+        Ok(())
+    }
+}
+
+impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
+    /// Whether a downstream stream whose END_STREAM was just serialized skips its write
+    /// fence (`DIV-028`): it completes normally, its request has fully arrived with no
+    /// trailing RST owed, it registered no byte event, and the write queue is not saturated.
+    /// The terms run in this order, so only an otherwise eligible stream queries the queue.
+    fn retires_at_serialization<E: ExchangeStorage<UPSTREAM>>(
+        &self,
+        stream: &Stream<E, UPSTREAM>,
+    ) -> bool {
+        !UPSTREAM
+            && !stream.reset
+            && !stream.ingress_rejected
+            && stream.wire_ingress_complete
+            && !stream.reset_after_response
+            && !stream.registered_byte_events
+            && self.write_queue.is_some_and(|queue| !queue.is_saturated())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn reset_before_egress<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        id: StreamId,
+        stream: &mut Stream<E, UPSTREAM>,
+        event: PendingEgress,
+        (error, wire): (HttpError, H2ErrorCode),
+    ) {
+        stream.pending = Some(event);
+        self.reset_owner(id, stream, &error, false, Some(wire));
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn message_type_failure(error: MessageTypeError) -> HttpError {
+    HttpError::with_message(HttpErrorCode::MESSAGE_ERROR, error.to_string())
+}
+
+#[cold]
+#[inline(never)]
+fn cancel_registrations(registrations: &mut [HttpByteEventRegistration], error: &HttpError) {
+    for registration in registrations {
+        registration.cancel(error, None);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn completion_cancelled(registrations: &mut [HttpByteEventRegistration]) -> HttpError {
+    let error = failure(
+        HttpErrorCode::CORO_CANCELLED,
+        b"response completion cancelled the connection",
+    );
+    cancel_registrations(registrations, &error);
+    error
+}
+
+impl<A, const UPSTREAM: bool> Drop for Driver<A, UPSTREAM>
+where
+    A: OwnedApplication,
+    A::Exchange: ExchangeStorage<UPSTREAM>,
+{
+    fn drop(&mut self) {
+        if !self.connection.state.control.complete.get() {
+            self.abort(failure(
+                HttpErrorCode::CORO_CANCELLED,
+                b"owned H2 runner abandoned before cleanup completed",
+            ));
+            if let Some(panic) = self.failure.panic.take() {
+                if std::thread::panicking() {
+                    discard_panic(panic);
+                } else {
+                    resume_unwind(panic);
+                }
+            }
+            assert!(
+                !self.started || std::thread::panicking(),
+                "started owned H2 runner dropped before application and native I/O cleanup joined"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod codec_input_tests {
+    use roxygen_core::stream_source::HttpStreamSourceOwner;
+
+    use super::*;
+
+    /// Names a concrete `CodecInput`; never constructed.
+    enum Unused {}
+
+    impl OwnedExchange for Unused {
+        fn request(&mut self, _head: Box<HttpMessage>, _body: HttpStreamSourceOwner, _eom: bool) {
+            match *self {}
+        }
+
+        fn poll_headers(
+            &mut self,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+            match *self {}
+        }
+
+        fn poll_body(
+            &mut self,
+            _context: &mut Context<'_>,
+            _maximum: u32,
+        ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+            match *self {}
+        }
+
+        fn cancel(&mut self, _error: &HttpError, _peer_reset: bool) {
+            match *self {}
+        }
+
+        fn response_complete(&mut self) {
+            match *self {}
+        }
+
+        fn complete(self) {
+            match self {}
+        }
+    }
+
+    impl OwnedApplication for Unused {
+        type Exchange = Self;
+
+        fn new_exchange(&self, _stream: StreamId, _ingress: IngressCompletion) -> Self {
+            match *self {}
+        }
+    }
+
+    #[test]
+    fn owned_h2_codec_input_opts_out() {
+        assert_eq!(
+            [
+                CodecInput::<Unused, false>::OBSERVES_FRAME_HEADERS,
+                CodecInput::<Unused, true>::OBSERVES_FRAME_HEADERS,
+            ],
+            [false, false],
+            "the downstream and upstream drivers ignore frame-header events"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ready_queue_tests {
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn wake_after_publishes_busy_before_its_mark() {
+        let queue = ReadyQueue::default();
+        let mut busy_at_mark = None;
+        queue.wake_after(|| busy_at_mark = Some(queue.busy.load(Ordering::Acquire)));
+        assert_eq!(
+            busy_at_mark,
+            Some(true),
+            "a lock-free `can_fold` that sees a marked `ready` must also see `busy`"
+        );
+    }
+
+    #[test]
+    fn io_wake_marks_ready_only_under_the_queue_lock() {
+        let queue = Arc::new(ReadyQueue::default());
+        let read = IoWake::new(&queue);
+        let waker = Waker::from(Arc::clone(&read));
+        let held = queue.state.lock();
+        let waking = thread::spawn(move || waker.wake_by_ref());
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while !read.ready.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let marked_outside_the_lock = read.ready.load(Ordering::Acquire);
+        drop(held);
+        waking.join().expect("the wake completes");
+        assert!(
+            !marked_outside_the_lock,
+            "an `IoWake` must mark `ready` through `wake_after`, under the queue lock and after \
+             `busy`, or a quiescent session could fold credit ahead of a pending read"
+        );
+        assert!(read.ready.load(Ordering::Acquire) && queue.busy.load(Ordering::Acquire));
+    }
+}

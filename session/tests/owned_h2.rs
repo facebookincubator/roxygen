@@ -1,0 +1,10868 @@
+use std::sync::atomic::AtomicBool;
+use std::task::Context;
+use std::task::Waker;
+
+use futures::future::Either;
+use futures::future::select;
+use roxygen_codec::CodecSetting;
+use roxygen_core::ingress_completion::IngressCompletion;
+use roxygen_core::stream_source::HttpStreamSourceOwner;
+use roxygen_http2::hpack::HeaderName;
+use roxygen_http2::hpack::HpackDecoder;
+use roxygen_http2::hpack::HpackEncodeBuffer;
+use roxygen_http2::hpack::HpackEncoder;
+use roxygen_http2::hpack::HpackHeader;
+
+use super::*;
+use crate::external_host_tests::YieldMode;
+use crate::owned_h2::OwnedH2Application;
+use crate::owned_h2::OwnedH2Exchange;
+use crate::owned_h2::OwnedH2Handle;
+use crate::owned_h2::OwnedH2Options;
+use crate::owned_h2::OwnedH2Session;
+use crate::owned_h2::OwnedH2UpstreamSession;
+use crate::owned_h2::stream_seed_order;
+use crate::uniplex::UniplexRunSummary;
+
+#[derive(Clone, Copy)]
+enum Reply {
+    Body(usize),
+    Push,
+    /// The body bytes, then a trailers event carrying these fields and EOM.
+    BodyThenTrailers(usize, &'static [(&'static str, &'static str)]),
+}
+
+#[derive(Default)]
+struct Probe {
+    requested: Cell<usize>,
+    request_eom: Cell<bool>,
+    request_bytes: Cell<usize>,
+    request_trailer: RefCell<Option<Vec<u8>>>,
+    produced_bytes: Cell<usize>,
+    body_polls: Cell<usize>,
+    body_event_ends: RefCell<Vec<u64>>,
+    response_complete: Cell<usize>,
+    completed: Cell<usize>,
+    dropped: Cell<usize>,
+    push_stops: Cell<usize>,
+    cancelled: RefCell<Vec<(HttpErrorCode, bool)>>,
+    ingress: RefCell<Option<IngressCompletion>>,
+    held_body: RefCell<Option<HttpSourceHolder>>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CancelAt {
+    HeaderPoll,
+    BodyPoll,
+    HeaderEncoded,
+    ResumePoll,
+    ResumeDrop,
+}
+
+struct ReentrantCancel {
+    at: CancelAt,
+    handle: RefCell<Option<OwnedH2Handle>>,
+    transport: Rc<RefCell<FixtureTransportState>>,
+    writes_at_cancel: Cell<Option<usize>>,
+}
+
+impl ReentrantCancel {
+    fn fire(&self, at: CancelAt) {
+        if self.at == at {
+            self.writes_at_cancel
+                .set(Some(self.transport.borrow().writes.len()));
+            self.handle.borrow().as_ref().unwrap().cancel();
+        }
+    }
+}
+
+struct CancelResume(Rc<ReentrantCancel>);
+
+impl Future for CancelResume {
+    type Output = ResumeStatus;
+
+    fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<ResumeStatus> {
+        self.0.fire(CancelAt::ResumePoll);
+        Poll::Ready(ResumeStatus::Signalled)
+    }
+}
+
+impl Drop for CancelResume {
+    fn drop(&mut self) {
+        self.0.fire(CancelAt::ResumeDrop);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CallbackPanicAt {
+    HeaderPoll,
+    HeaderEncoded,
+}
+
+#[derive(Default)]
+struct OwnerPollGate {
+    ready: Cell<bool>,
+    polls: Cell<usize>,
+    self_wake_once: Cell<bool>,
+    informational: Cell<bool>,
+    panic_first: Cell<bool>,
+    wakers: RefCell<Vec<Option<Waker>>>,
+    pending_visits: Option<RefCell<Vec<usize>>>,
+    control_read: RefCell<Option<Arc<tokio::sync::Notify>>>,
+}
+
+impl OwnerPollGate {
+    fn release(&self) {
+        self.ready.set(true);
+        for waker in self.wakers.borrow().iter() {
+            waker.as_ref().unwrap().wake_by_ref();
+        }
+    }
+}
+
+#[derive(Default)]
+struct StreamOrderProbe {
+    cancelled: RefCell<Vec<u64>>,
+    dropped: RefCell<Vec<(u64, bool)>>,
+    panic: Cell<bool>,
+}
+
+struct Application {
+    replies: Vec<Reply>,
+    response_priorities: Vec<Option<HttpPriority>>,
+    response_date: Option<&'static [u8]>,
+    retain_request: bool,
+    /// Holds the request body and drains it inside the poll that produces the response's
+    /// final body event.
+    drain_request_last: bool,
+    /// Drops the request body unread as soon as the request head arrives.
+    drop_request_body: bool,
+    hold_headers: bool,
+    empty_terminal: Option<Arc<tokio::sync::Notify>>,
+    body_chunk: usize,
+    reentrant_cancel: Option<Rc<ReentrantCancel>>,
+    callback_panic: Option<(CallbackPanicAt, Arc<tokio::sync::Notify>)>,
+    owner_poll_gate: Option<Rc<OwnerPollGate>>,
+    byte_events: Option<Rc<ByteEventProbe>>,
+    /// Registers only `TransportWrite` instead of `TransportWrite` and `KernelWrite`.
+    transport_write_events: bool,
+    probes: Rc<RefCell<Vec<Rc<Probe>>>>,
+    stream_order: Option<Rc<StreamOrderProbe>>,
+}
+
+impl Application {
+    fn new(replies: Vec<Reply>) -> (Self, Rc<RefCell<Vec<Rc<Probe>>>>) {
+        let probes = Rc::new(RefCell::new(Vec::new()));
+        (
+            Self {
+                replies,
+                response_priorities: Vec::new(),
+                response_date: None,
+                retain_request: false,
+                drain_request_last: false,
+                drop_request_body: false,
+                hold_headers: false,
+                empty_terminal: None,
+                body_chunk: 4096,
+                reentrant_cancel: None,
+                callback_panic: None,
+                owner_poll_gate: None,
+                byte_events: None,
+                transport_write_events: false,
+                probes: Rc::clone(&probes),
+                stream_order: None,
+            },
+            probes,
+        )
+    }
+}
+
+struct Exchange {
+    reply: Reply,
+    response_priority: Option<HttpPriority>,
+    response_date: Option<&'static [u8]>,
+    remaining: usize,
+    suspended: bool,
+    terminal: Option<LocalSourceFuture<()>>,
+    retain_request: bool,
+    drain_request_last: bool,
+    drop_request_body: bool,
+    drained_request: Option<HttpSourceHolder>,
+    hold_headers: bool,
+    body_chunk: usize,
+    reentrant_cancel: Option<Rc<ReentrantCancel>>,
+    callback_panic: Option<(CallbackPanicAt, LocalSourceFuture<()>)>,
+    owner_poll_gate: Option<(usize, Rc<OwnerPollGate>)>,
+    byte_events: Option<Rc<ByteEventProbe>>,
+    transport_write_events: bool,
+    upload: Option<LocalSourceFuture<Result<(), HttpError>>>,
+    probe: Rc<Probe>,
+    stream_order: Option<(StreamId, Rc<StreamOrderProbe>)>,
+}
+
+impl OwnedH2Application for Application {
+    type Exchange = Exchange;
+
+    fn new_exchange(&self, stream: StreamId, ingress: IngressCompletion) -> Exchange {
+        let probe = Rc::new(Probe::default());
+        *probe.ingress.borrow_mut() = Some(ingress);
+        let ordinal = self.probes.borrow().len();
+        self.probes.borrow_mut().push(Rc::clone(&probe));
+        let reply = self.replies[ordinal];
+        let terminal = self.empty_terminal.as_ref().map(|gate| {
+            let gate = Arc::clone(gate);
+            Box::pin(async move { gate.notified().await }) as LocalSourceFuture<()>
+        });
+        Exchange {
+            reply,
+            response_priority: self.response_priorities.get(ordinal).copied().flatten(),
+            response_date: self.response_date,
+            remaining: match reply {
+                Reply::Body(size) | Reply::BodyThenTrailers(size, _) => size,
+                Reply::Push => 0,
+            },
+            suspended: false,
+            terminal,
+            retain_request: self.retain_request,
+            drain_request_last: self.drain_request_last,
+            drop_request_body: self.drop_request_body,
+            drained_request: None,
+            hold_headers: self.hold_headers,
+            body_chunk: self.body_chunk,
+            reentrant_cancel: self.reentrant_cancel.clone(),
+            callback_panic: self.callback_panic.as_ref().map(|(at, gate)| {
+                let gate = Arc::clone(gate);
+                (
+                    *at,
+                    Box::pin(async move { gate.notified().await }) as LocalSourceFuture<()>,
+                )
+            }),
+            owner_poll_gate: self.owner_poll_gate.as_ref().map(|gate| {
+                gate.wakers.borrow_mut().push(None);
+                (ordinal, Rc::clone(gate))
+            }),
+            byte_events: self.byte_events.clone(),
+            transport_write_events: self.transport_write_events,
+            upload: None,
+            probe,
+            stream_order: self
+                .stream_order
+                .as_ref()
+                .map(|probe| (stream, Rc::clone(probe))),
+        }
+    }
+}
+
+impl OwnedH2Exchange for Exchange {
+    fn request(&mut self, mut head: Box<HttpMessage>, body: HttpStreamSourceOwner, eom: bool) {
+        let mut body = body.into_source_holder();
+        assert!(head.method().unwrap().is_some());
+        self.probe.requested.set(self.probe.requested.get() + 1);
+        self.probe.request_eom.set(eom);
+        if eom || self.drop_request_body {
+            drop(body);
+        } else if self.drain_request_last {
+            self.drained_request = Some(body);
+        } else if self.retain_request {
+            *self.probe.held_body.borrow_mut() = Some(body);
+        } else {
+            let probe = Rc::clone(&self.probe);
+            self.upload = Some(Box::pin(async move {
+                loop {
+                    let event = body.read_body_event(4096).await?;
+                    if let Some(bytes) = event.as_body() {
+                        probe
+                            .request_bytes
+                            .set(probe.request_bytes.get() + bytes.chain_length());
+                    }
+                    if let HttpBodyEventKind::Trailers(trailers) = event.kind() {
+                        *probe.request_trailer.borrow_mut() =
+                            Some(trailers.get_single_or_empty(b"x-check").to_vec());
+                    }
+                    if event.eom() {
+                        return Ok(());
+                    }
+                }
+            }));
+        }
+    }
+
+    fn poll_headers(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        if self.hold_headers {
+            return Poll::Pending;
+        }
+        if let Some((ordinal, gate)) = &self.owner_poll_gate {
+            gate.polls.set(gate.polls.get() + 1);
+            gate.wakers.borrow_mut()[*ordinal] = Some(context.waker().clone());
+            if !gate.ready.get() {
+                return Poll::Pending;
+            }
+            if gate.self_wake_once.replace(false) {
+                context.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            if gate.informational.replace(false) {
+                let mut response = HttpMessage::new();
+                response.set_status_code(103).unwrap();
+                response.set_http_version(1, 1);
+                return Poll::Ready(Ok(HttpHeaderEvent::new(response, false).unwrap()));
+            }
+            if *ordinal == 0 && gate.panic_first.replace(false) {
+                context.waker().wake_by_ref();
+                gate.wakers.borrow()[1].as_ref().unwrap().wake_by_ref();
+                panic_any("first ready owner");
+            }
+            if let Some(visits) = &gate.pending_visits {
+                visits.borrow_mut().push(*ordinal);
+                return Poll::Pending;
+            }
+        }
+        if let Some(upload) = &mut self.upload {
+            match upload.as_mut().poll(context) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => {
+                    self.upload.take();
+                    result?;
+                }
+            }
+        }
+        let panic_at = if let Some((at, ready)) = &mut self.callback_panic {
+            if ready.as_mut().poll(context).is_pending() {
+                return Poll::Pending;
+            }
+            Some(*at)
+        } else {
+            None
+        };
+        self.callback_panic.take();
+        if matches!(panic_at, Some(CallbackPanicAt::HeaderPoll)) {
+            panic_any("application header poll");
+        }
+        let mut response = HttpMessage::new();
+        response.set_status_code(200).unwrap();
+        response.set_http_version(1, 1);
+        if let Some(priority) = self.response_priority {
+            response.set_http_priority(priority);
+        }
+        if let Reply::Body(size) = self.reply {
+            response
+                .headers_mut()
+                .set(HttpHeaderCode::ContentLength, size.to_string().as_bytes());
+        }
+        if let Some(date) = self.response_date {
+            response.headers_mut().set(HttpHeaderCode::Date, date);
+        }
+        let mut headers =
+            HttpHeaderEvent::new(response, matches!(self.reply, Reply::Body(0))).unwrap();
+        if let Some(cancel) = &self.reentrant_cancel {
+            cancel.fire(CancelAt::HeaderPoll);
+            if cancel.at == CancelAt::HeaderEncoded {
+                let cancel = Rc::clone(cancel);
+                headers.set_egress_headers_callback(move |_| cancel.fire(CancelAt::HeaderEncoded));
+            }
+        }
+        if matches!(panic_at, Some(CallbackPanicAt::HeaderEncoded)) {
+            headers.set_egress_headers_callback(|_| panic_any("application encoded headers"));
+        }
+        Poll::Ready(Ok(headers))
+    }
+
+    fn poll_body(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        self.probe.body_polls.set(self.probe.body_polls.get() + 1);
+        if let Some((_, gate)) = &self.owner_poll_gate
+            && let Some(ready) = gate.control_read.borrow_mut().take()
+        {
+            ready.notify_one();
+        }
+        if let Some(cancel) = &self.reentrant_cancel {
+            cancel.fire(CancelAt::BodyPoll);
+            if !self.suspended && matches!(cancel.at, CancelAt::ResumePoll | CancelAt::ResumeDrop) {
+                self.suspended = true;
+                return Poll::Ready(Ok(HttpBodyEvent::suspend(Box::pin(CancelResume(
+                    Rc::clone(cancel),
+                )))));
+            }
+        }
+        match self.reply {
+            Reply::Body(_) => {
+                if self.remaining == 0 {
+                    let terminal = self
+                        .terminal
+                        .as_mut()
+                        .expect("the body must not be polled after its terminal event");
+                    if terminal.as_mut().poll(context).is_pending() {
+                        return Poll::Pending;
+                    }
+                    self.terminal.take();
+                    return Poll::Ready(Ok(HttpBodyEvent::body(queue(&[]), true)));
+                }
+                let size = self.remaining.min(maximum as usize).min(self.body_chunk);
+                assert!(size > 0, "a data source needs positive production capacity");
+                self.remaining -= size;
+                self.probe
+                    .produced_bytes
+                    .set(self.probe.produced_bytes.get() + size);
+                let mut event = HttpBodyEvent::body(
+                    queue(&vec![b'r'; size]),
+                    self.remaining == 0 && self.terminal.is_none(),
+                );
+                if let Some(callback) = &self.byte_events {
+                    self.probe
+                        .body_event_ends
+                        .borrow_mut()
+                        .push(self.probe.produced_bytes.get() as u64);
+                    event
+                        .byte_event_registrations_mut()
+                        .push(HttpByteEventRegistration::new(
+                            None,
+                            if self.transport_write_events {
+                                ByteEventType::TransportWrite.bit()
+                            } else {
+                                ByteEventType::TransportWrite.bit()
+                                    | ByteEventType::KernelWrite.bit()
+                            },
+                            callback,
+                        ));
+                }
+                if event.eom()
+                    && let Some(mut body) = self.drained_request.take()
+                {
+                    loop {
+                        let mut read = body.read_body_event_unboxed(u32::MAX);
+                        let Poll::Ready(read) = Pin::new(&mut read).poll(context) else {
+                            panic!("the drained request body has fully arrived");
+                        };
+                        let read = read.expect("the drained request body reads cleanly");
+                        if let Some(bytes) = read.as_body() {
+                            self.probe
+                                .request_bytes
+                                .set(self.probe.request_bytes.get() + bytes.chain_length());
+                        }
+                        if read.eom() {
+                            break;
+                        }
+                    }
+                }
+                Poll::Ready(Ok(event))
+            }
+            Reply::BodyThenTrailers(_, fields) => {
+                if self.remaining == 0 {
+                    let mut trailers = HttpHeaders::new();
+                    for (name, value) in fields {
+                        trailers.add(*name, *value);
+                    }
+                    return Poll::Ready(Ok(HttpBodyEvent::trailers(trailers)));
+                }
+                let size = self.remaining.min(maximum as usize).min(self.body_chunk);
+                self.remaining -= size;
+                self.probe
+                    .produced_bytes
+                    .set(self.probe.produced_bytes.get() + size);
+                Poll::Ready(Ok(HttpBodyEvent::body(queue(&vec![b'r'; size]), false)))
+            }
+            Reply::Push => {
+                let mut promise = HttpMessage::new();
+                promise.set_method(HttpMethod::Get).unwrap();
+                promise.set_url(b"/push", false).unwrap();
+                promise.set_http_version(1, 1);
+                promise
+                    .headers_mut()
+                    .set(HttpHeaderCode::Host, b"example.com");
+                Poll::Ready(Ok(HttpBodyEvent::push_promise(
+                    promise,
+                    Some(Box::new(PushSource(Rc::clone(&self.probe)))),
+                    false,
+                )))
+            }
+        }
+    }
+
+    fn cancel(&mut self, error: &HttpError, peer_reset: bool) {
+        self.probe
+            .cancelled
+            .borrow_mut()
+            .push((error.code(), peer_reset));
+        self.upload.take();
+        self.terminal.take();
+        self.callback_panic.take();
+        if let Some((stream, probe)) = &self.stream_order {
+            probe.cancelled.borrow_mut().push(stream.get());
+            if probe.panic.get() && stream.get() == 7 {
+                panic_any(("ordered owner cancellation", stream.get()));
+            }
+        }
+    }
+
+    fn response_complete(&mut self) {
+        self.probe
+            .response_complete
+            .set(self.probe.response_complete.get() + 1);
+    }
+
+    fn complete(self) {
+        self.probe.completed.set(self.probe.completed.get() + 1);
+    }
+}
+
+impl Drop for Exchange {
+    fn drop(&mut self) {
+        self.probe.dropped.set(self.probe.dropped.get() + 1);
+        if let Some((stream, probe)) = &self.stream_order {
+            probe
+                .dropped
+                .borrow_mut()
+                .push((stream.get(), std::thread::panicking()));
+            if probe.panic.get() {
+                panic_any(("ordered owner drop", stream.get()));
+            }
+        }
+    }
+}
+
+struct PushSource(Rc<Probe>);
+
+impl HttpSource for PushSource {
+    fn read_header_event(&mut self) -> LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
+        panic!("unsupported push must not start its source")
+    }
+
+    fn read_body_event(
+        &mut self,
+        _maximum: u32,
+    ) -> LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
+        panic!("unsupported push must not read its source")
+    }
+
+    fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {
+        self.0.push_stops.set(self.0.push_stops.get() + 1);
+    }
+}
+
+fn options(context: WorkerContext, transport: Rc<dyn UniplexTransport>) -> OwnedH2Options {
+    let unlimited = RateLimitConfig::new(u64::MAX, Duration::from_millis(100), 0);
+    OwnedH2Options {
+        context,
+        transport,
+        io: UniplexConfig {
+            read_timeout: Duration::ZERO,
+            stream_read_timeout: Duration::ZERO,
+            write_timeout: Duration::ZERO,
+            drain_request_body_on_drop: true,
+            ingress_buffer_limit: 1 << 20,
+            ..UniplexConfig::default()
+        },
+        http2: Http2SessionConfig {
+            goaway_timeout: Duration::ZERO,
+            rate_limits: Http2RateLimitConfig {
+                control_frames: unlimited,
+                header_frames: unlimited,
+                resets: unlimited,
+                direct_errors: unlimited,
+            },
+            ..Http2SessionConfig::default()
+        },
+    }
+}
+
+fn ready_owner_requests(count: usize) -> (Http2Codec, Vec<u8>) {
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    let mut output = BufQueue::new(1 << 20);
+    peer.generate(
+        &mut output,
+        EgressFrame::ConnectionPreface,
+        &mut IgnoreCodecEvents,
+    )
+    .unwrap();
+    peer.generate_configured_settings(&mut output, &mut IgnoreCodecEvents)
+        .unwrap();
+    let mut request = HttpMessage::new();
+    request.set_method(HttpMethod::Get).unwrap();
+    request.set_url(b"/ready", false).unwrap();
+    request.set_http_version(1, 1);
+    request
+        .headers_mut()
+        .set(HttpHeaderCode::Host, b"example.com");
+    request.set_http_priority(HttpPriority::from_urgency_and_incremental(0, true));
+    for _ in 0..count {
+        let stream = peer.create_stream();
+        peer.generate(
+            &mut output,
+            EgressFrame::Headers {
+                stream,
+                message: &request,
+                end_stream: true,
+                extra_headers: None,
+            },
+            &mut IgnoreCodecEvents,
+        )
+        .unwrap();
+    }
+    let bytes = output.coalesce(output.chain_length()).unwrap().to_vec();
+    (peer, bytes)
+}
+
+async fn exercise(
+    session: OwnedH2Session<Application>,
+    handle: &OwnedH2Handle,
+    gates: &[Arc<tokio::sync::Notify>],
+    operation: impl Future<Output = ()>,
+) {
+    let run = async {
+        let outcome =
+            eligibility_catch_unwind(tokio::time::timeout(Duration::from_secs(5), operation)).await;
+        gates.iter().for_each(|gate| gate.notify_one());
+        handle.cancel();
+        outcome
+    };
+    let (result, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(session.run(), run)
+    })
+    .await
+    .expect("the cancelled connection joins its transport operations");
+    match outcome {
+        Ok(result) => result.expect("owned H2 exchange made progress"),
+        Err(payload) => resume_unwind(payload),
+    }
+    assert_eq!(
+        result.expect_err("exercise ends by cancellation").code(),
+        HttpErrorCode::CORO_CANCELLED
+    );
+}
+
+async fn pending_owners_after_low_stream_retirement(
+    context: WorkerContext,
+    order: Rc<StreamOrderProbe>,
+) -> (
+    LocalTransportFuture<Result<UniplexRunSummary, HttpError>>,
+    OwnedH2Handle,
+) {
+    let release_reset = Arc::new(tokio::sync::Notify::new());
+    let (mut peer, input) = ready_owner_requests(4);
+    let reset = eligibility_frame(
+        &mut peer,
+        EgressFrame::Reset {
+            stream: StreamId::new(1),
+            code: H2ErrorCode::CANCEL,
+        },
+    );
+    let (transport, _) = FixtureTransport::new([
+        FixtureRead::SegmentedData(queue(&input)),
+        FixtureRead::WaitData(Arc::clone(&release_reset), reset),
+    ]);
+    let (mut application, probes) = Application::new(vec![Reply::Body(0); 4]);
+    application.hold_headers = true;
+    application.stream_order = Some(Rc::clone(&order));
+    assert_seed_reorders(&[1, 3, 5, 7]);
+    let (session, handle) = OwnedH2Session::new(application, options(context, transport)).unwrap();
+    let session = session.with_stream_seed(ORDER_SEED);
+    let mut run: LocalTransportFuture<Result<UniplexRunSummary, HttpError>> =
+        Box::pin(session.run());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        poll_fn(|context| {
+            assert!(run.as_mut().poll(context).is_pending());
+            let probes = probes.borrow();
+            if probes.len() == 4 && probes.iter().all(|probe| probe.requested.get() == 1) {
+                Poll::Ready(())
+            } else {
+                context.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })
+        .await;
+        release_reset.notify_one();
+        poll_fn(|context| {
+            assert!(run.as_mut().poll(context).is_pending());
+            if probes.borrow()[0].dropped.get() == 1 {
+                Poll::Ready(())
+            } else {
+                context.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })
+        .await;
+    })
+    .await
+    .expect("the low stream retires while the other responses remain pending");
+    assert_eq!(order.cancelled.borrow().as_slice(), &[1]);
+    assert_eq!(order.dropped.borrow().as_slice(), &[(1, false)]);
+    order.cancelled.borrow_mut().clear();
+    order.dropped.borrow_mut().clear();
+    drop(probes);
+    (run, handle)
+}
+
+#[test]
+fn connection_cancellation_keeps_stream_order_after_retirement() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let order = Rc::new(StreamOrderProbe::default());
+            let (run, handle) =
+                pending_owners_after_low_stream_retirement(context, Rc::clone(&order)).await;
+            handle.cancel();
+            let error = tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("connection cancellation retires all remaining owners")
+                .expect_err("connection was cancelled");
+            assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+            assert_eq!(order.cancelled.borrow().as_slice(), &[3, 5, 7]);
+            assert_eq!(
+                order.dropped.borrow().as_slice(),
+                &[(3, false), (5, false), (7, false)]
+            );
+        })
+    });
+}
+
+#[test]
+fn abandoned_streams_drop_in_order_and_preserve_first_panic() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let order = Rc::new(StreamOrderProbe::default());
+            let (run, handle) =
+                pending_owners_after_low_stream_retirement(context, Rc::clone(&order)).await;
+            drop(handle);
+            order.panic.set(true);
+            let panic = catch_unwind(AssertUnwindSafe(|| drop(run)))
+                .expect_err("the first cancellation panic survives owner destruction");
+            assert_eq!(
+                panic.downcast_ref::<(&'static str, u64)>(),
+                Some(&("ordered owner cancellation", 7))
+            );
+            assert_eq!(order.cancelled.borrow().as_slice(), &[3, 5, 7]);
+            assert_eq!(
+                order.dropped.borrow().as_slice(),
+                &[(7, false), (3, true), (5, true)]
+            );
+        })
+    });
+}
+
+#[test]
+fn terminal_head_and_small_bodies_round_trip_over_fragmented_ingress() {
+    for size in [0, 1, 1024] {
+        run_on_worker(move |context| {
+            Box::pin(async move {
+                let input = peer_request_bytes(
+                    HttpMethod::Post,
+                    &vec![b'q'; size],
+                    None,
+                    PeerControl::None,
+                );
+                let reads = input
+                    .chunks(7)
+                    .map(|chunk| FixtureRead::Data(chunk.to_vec()));
+                let (transport, state) =
+                    FixtureTransport::new(reads.chain([FixtureRead::DataEof(Vec::new())]));
+                let (application, probes) = Application::new(vec![Reply::Body(size)]);
+                let (session, _) =
+                    OwnedH2Session::new(application, options(context, transport)).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), session.run())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let probes = probes.borrow();
+                assert_eq!(probes.len(), 1);
+                let probe = &probes[0];
+                assert_eq!(probe.requested.get(), 1);
+                assert_eq!(probe.request_eom.get(), size == 0);
+                assert_eq!(probe.request_bytes.get(), size);
+                assert_eq!(probe.response_complete.get(), 1);
+                assert_eq!(probe.completed.get(), 1);
+                assert_eq!(probe.dropped.get(), 1);
+                assert!(probe.cancelled.borrow().is_empty());
+                let decoded = decode_server_frames(&state.borrow().writes.concat());
+                assert_eq!(decoded.header_statuses, [(StreamId::new(1), 200)]);
+                assert_eq!(decoded.body_data, vec![b'r'; size]);
+                assert!(decoded.resets.is_empty());
+                assert!(decoded.errors.is_empty());
+            })
+        });
+    }
+}
+
+#[test]
+fn held_write_allows_bounded_body_progress_without_completing_the_exchange() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (mut input, _) = peer_request_with_stream_window(1 << 20, 1, false);
+            input.extend(peer_connection_window_update(1 << 20));
+            let (transport, state) = FixtureTransport::new([FixtureRead::Data(input)]);
+            let release_write = Arc::new(tokio::sync::Notify::new());
+            state.borrow_mut().write_gate = Some(Arc::clone(&release_write));
+            let (mut application, probes) = Application::new(vec![Reply::Body(256 << 10)]);
+            application.body_chunk = usize::MAX;
+            let byte_events = Rc::new(ByteEventProbe::default());
+            application.byte_events = Some(Rc::clone(&byte_events));
+            let mut config = options(context, transport);
+            config.io.buffer_limit = 16 << 10;
+            config.io.maximum_write_size = 4096;
+            config.io.maximum_read_size = 4096;
+            config.io.read_allocation_size = 4096;
+            config.io.ingress_buffer_limit = 16 << 10;
+            let buffer_limit = config.io.buffer_limit;
+            let (session, handle) = OwnedH2Session::new(application, config).unwrap();
+            exercise(session, &handle, &[Arc::clone(&release_write)], async {
+            complete_credit_wait(|| state.borrow().write_gate_pending.is_some() && probes.borrow().len() == 1).await;
+            let probe = Rc::clone(&probes.borrow()[0]);
+            complete_credit_wait(|| probe.produced_bytes.get() > 4096).await;
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            let produced = probe.produced_bytes.get();
+            assert!(produced <= 2 * buffer_limit, "one held write, bounded staging, and one pending body event must not drain a 256 KiB source");
+            assert!(state.borrow().writes.is_empty());
+            assert!(byte_events.delivered.borrow().is_empty());
+            assert_eq!(probe.completed.get(), 0);
+            assert_eq!(probe.dropped.get(), 0);
+            release_write.notify_one();
+            complete_credit_wait(|| probe.completed.get() == 1).await;
+            assert_eq!(probe.response_complete.get(), 1);
+            assert_eq!(probe.dropped.get(), 1);
+            assert!(probe.cancelled.borrow().is_empty());
+            let decoded = decode_server_frames(&state.borrow().writes.concat());
+            assert_eq!(decoded.body_data, vec![b'r'; 256 << 10]);
+            assert!(decoded.errors.is_empty());
+            assert!(byte_events.cancelled.borrow().is_empty());
+            let wire = state.borrow().writes.concat();
+            let original_ends = probe.body_event_ends.borrow();
+            let mut expected_offsets = Vec::new();
+            let mut offset = 0;
+            let mut body_offset = 0;
+            while offset < wire.len() {
+                let length = (usize::from(wire[offset]) << 16)
+                    | (usize::from(wire[offset + 1]) << 8)
+                    | usize::from(wire[offset + 2]);
+                let is_data = wire[offset + 3] == FrameType::DATA.as_u8();
+                offset += FRAME_HEADER_SIZE + length;
+                if is_data {
+                    body_offset += length as u64;
+                    if original_ends.contains(&body_offset) {
+                        expected_offsets.push((body_offset, offset as u64));
+                    }
+                }
+            }
+            assert_eq!(expected_offsets.len(), original_ends.len());
+            for kind in [ByteEventType::TransportWrite, ByteEventType::KernelWrite] {
+                let events = byte_events.delivered.borrow();
+                let actual: Vec<_> = events.iter().filter(|event| event.event_type == kind)
+                    .map(|event| (event.body_offset, event.transport_offset)).collect();
+                assert_eq!(actual, expected_offsets, "a split body's observer remains on the original event's last byte");
+                assert_eq!(events.iter().filter(|event| event.event_type == kind && event.eom).count(), 1);
+            }
+        }).await;
+        })
+    });
+}
+
+async fn zero_credit_case(context: WorkerContext, connection: bool) {
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    peer.egress_settings_mut().set(
+        SettingsId::InitialWindowSize,
+        if connection { 131_072 } else { 0 },
+    );
+    let mut preface = BufQueue::new(4096);
+    peer.generate(
+        &mut preface,
+        EgressFrame::ConnectionPreface,
+        &mut IgnoreCodecEvents,
+    )
+    .unwrap();
+    peer.generate_configured_settings(&mut preface, &mut IgnoreCodecEvents)
+        .unwrap();
+    let mut initial = preface.coalesce(preface.chain_length()).unwrap().to_vec();
+    initial.extend(eligibility_request(&mut peer, 0));
+    let mut siblings = eligibility_request(&mut peer, 1);
+    siblings.extend(eligibility_request(&mut peer, 2));
+    let mut control = eligibility_frame(&mut peer, EgressFrame::PingRequest { data: Some(42) });
+    for stream in [StreamId::new(1), StreamId::new(3)] {
+        if !connection && stream == StreamId::new(3) {
+            control.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate { stream, amount: 1 },
+            ));
+        }
+        control.extend(eligibility_frame(
+            &mut peer,
+            EgressFrame::Reset {
+                stream,
+                code: H2ErrorCode::CANCEL,
+            },
+        ));
+        for amount in [i32::MAX as u32, 1] {
+            control.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate { stream, amount },
+            ));
+        }
+    }
+    if connection {
+        control.extend(eligibility_frame(
+            &mut peer,
+            EgressFrame::WindowUpdate {
+                stream: StreamId::UNSPECIFIED,
+                amount: 1,
+            },
+        ));
+    }
+    let credit = eligibility_frame(
+        &mut peer,
+        EgressFrame::WindowUpdate {
+            stream: if connection {
+                StreamId::UNSPECIFIED
+            } else {
+                StreamId::new(5)
+            },
+            amount: 1,
+        },
+    );
+    let send_siblings = Arc::new(tokio::sync::Notify::new());
+    let send_control = Arc::new(tokio::sync::Notify::new());
+    let send_credit = Arc::new(tokio::sync::Notify::new());
+    let (transport, state) = FixtureTransport::new([
+        FixtureRead::Data(initial),
+        FixtureRead::WaitData(Arc::clone(&send_siblings), siblings),
+        FixtureRead::WaitData(Arc::clone(&send_control), control),
+        FixtureRead::WaitData(Arc::clone(&send_credit), credit),
+    ]);
+    let (application, probes) = Application::new(vec![
+        Reply::Body(if connection { 65_536 } else { 1 }),
+        Reply::Body(1),
+        Reply::Body(1),
+    ]);
+    let (session, handle) = OwnedH2Session::new(application, options(context, transport)).unwrap();
+    exercise(
+        session,
+        &handle,
+        &[
+            Arc::clone(&send_siblings),
+            Arc::clone(&send_control),
+            Arc::clone(&send_credit),
+        ],
+        async {
+            complete_credit_wait(|| {
+                let decoded = decode_server_frames(&state.borrow().writes.concat());
+                decoded.header_streams == [StreamId::new(1)]
+                    && decoded.body_bytes == if connection { 65_535 } else { 0 }
+            })
+            .await;
+            send_siblings.notify_one();
+            complete_credit_wait(|| {
+                let decoded =
+                    decode_server_frames_with_requests(&state.borrow().writes.concat(), 3);
+                decoded.header_streams.len() == 3
+                    && decoded.body_bytes == if connection { 65_535 } else { 0 }
+            })
+            .await;
+            let first = Rc::clone(&probes.borrow()[0]);
+            let second = Rc::clone(&probes.borrow()[1]);
+            let sibling = Rc::clone(&probes.borrow()[2]);
+            assert_eq!(first.completed.get(), 0);
+            assert_eq!(second.completed.get(), 0);
+            assert_eq!(sibling.completed.get(), 0);
+            send_control.notify_one();
+            complete_credit_wait(|| {
+                first.cancelled.borrow().len() == 1
+                    && second.cancelled.borrow().len() == 1
+                    && decode_server_frames_with_requests(&state.borrow().writes.concat(), 3)
+                        .ping_replies
+                        == [42]
+                    && (!connection || sibling.completed.get() == 1)
+            })
+            .await;
+            for reset in [&first, &second] {
+                assert_eq!(
+                    reset.cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::CANCEL, true)]
+                );
+            }
+            assert!(sibling.cancelled.borrow().is_empty());
+            let blocked = decode_server_frames_with_requests(&state.borrow().writes.concat(), 3);
+            assert_eq!(blocked.body_bytes, if connection { 65_536 } else { 0 });
+            assert!(
+                !blocked.body_streams.contains(&StreamId::new(3)),
+                "a second reset's pending DATA is ineligible before its owner is polled"
+            );
+            assert!(blocked.resets.is_empty(), "a peer reset must not be echoed");
+            send_credit.notify_one();
+            complete_credit_wait(|| {
+                sibling.completed.get() == 1
+                    && first.dropped.get() == 1
+                    && second.dropped.get() == 1
+            })
+            .await;
+            let decoded = decode_server_frames_with_requests(&state.borrow().writes.concat(), 3);
+            assert_eq!(decoded.body_bytes, if connection { 65_536 } else { 1 });
+            assert_eq!(decoded.body_streams.last(), Some(&StreamId::new(5)));
+            assert!(!decoded.body_streams.contains(&StreamId::new(3)));
+            for reset in [&first, &second] {
+                assert_eq!(reset.completed.get(), 0);
+                assert_eq!(reset.response_complete.get(), 0);
+                assert_eq!(reset.dropped.get(), 1);
+            }
+            assert_eq!(sibling.response_complete.get(), 1);
+            assert_eq!(sibling.dropped.get(), 1);
+            assert!(decoded.resets.is_empty());
+            assert!(decoded.errors.is_empty());
+        },
+    )
+    .await;
+}
+
+#[test]
+fn zero_stream_credit_preserves_ping_reset_and_sibling_progress() {
+    run_on_worker(|context| Box::pin(zero_credit_case(context, false)));
+}
+
+#[test]
+fn zero_connection_credit_preserves_ping_reset_and_sibling_progress() {
+    run_on_worker(|context| Box::pin(zero_credit_case(context, true)));
+}
+
+#[test]
+fn early_response_and_producer_eom_do_not_retire_an_unconsumed_raw_read() {
+    for (incomplete, late_stop) in [(false, false), (true, false), (true, true)] {
+        run_on_worker(move |context| {
+            Box::pin(async move {
+                let send_eom = Arc::new(tokio::sync::Notify::new());
+                let input = if incomplete {
+                    peer_incomplete_post_bytes(1)
+                } else {
+                    peer_request_bytes(HttpMethod::Post, b"x", None, PeerControl::None)
+                };
+                let mut reads = vec![FixtureRead::Data(input)];
+                if incomplete {
+                    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+                    let stream = peer.create_stream();
+                    reads.push(FixtureRead::WaitData(
+                        Arc::clone(&send_eom),
+                        eligibility_frame(&mut peer, EgressFrame::EndOfMessage { stream }),
+                    ));
+                }
+                let (transport, state) = FixtureTransport::new(reads);
+                let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+                application.retain_request = true;
+                let (session, handle) =
+                    OwnedH2Session::new(application, options(context, transport)).unwrap();
+                exercise(session, &handle, &[Arc::clone(&send_eom)], async {
+                    complete_credit_wait(|| {
+                        decode_server_frames(&state.borrow().writes.concat()).header_statuses
+                            == [(StreamId::new(1), 200)]
+                    })
+                    .await;
+                    let probe = Rc::clone(&probes.borrow()[0]);
+                    let completion = probe.ingress.borrow().as_ref().unwrap().clone();
+                    assert_eq!(completion.snapshot().is_none(), incomplete);
+                    assert_eq!(completion.body_bytes_received(), 1);
+                    assert_eq!(probe.response_complete.get(), 1);
+                    assert_eq!(probe.completed.get(), 0);
+                    assert_eq!(probe.dropped.get(), 0);
+                    let mut body = probe.held_body.borrow_mut().take().unwrap();
+                    let raw_read = body.read_body_event(1);
+                    for _ in 0..4 {
+                        tokio::task::yield_now().await;
+                    }
+                    assert_eq!(
+                        probe.completed.get(),
+                        0,
+                        "admitting a read is not consuming its terminal event"
+                    );
+                    assert_eq!(probe.dropped.get(), 0);
+                    let event = raw_read.await.unwrap();
+                    assert_eq!(event.eom(), !incomplete);
+                    assert_eq!(event.as_body().unwrap().coalesce(1).unwrap().as_ref(), b"x");
+                    if incomplete {
+                        match body.read_body_event(1).await.unwrap().into_kind() {
+                            HttpBodyEventKind::Suspend(resume) => drop(resume),
+                            _ => panic!("an empty request body first yields its suspend event"),
+                        }
+                        let mut terminal = body.read_body_event(1);
+                        poll_fn(|context| {
+                            assert!(terminal.as_mut().poll(context).is_pending());
+                            Poll::Ready(())
+                        })
+                        .await;
+                        send_eom.notify_one();
+                        completion.wait().await.unwrap();
+                        assert_eq!(
+                            probe.completed.get(),
+                            0,
+                            "producer EOM cannot consume a retained terminal read"
+                        );
+                        if late_stop {
+                            body.stop_reading(Some(HttpErrorCode::CANCEL));
+                            for _ in 0..4 {
+                                tokio::task::yield_now().await;
+                            }
+                            assert!(completion.snapshot().unwrap().is_ok());
+                            assert_eq!(probe.response_complete.get(), 1);
+                            assert_eq!(probe.completed.get(), 0);
+                            assert_eq!(probe.dropped.get(), 0);
+                            assert!(probe.cancelled.borrow().is_empty());
+                            assert_eq!(
+                                terminal
+                                    .await
+                                    .err()
+                                    .expect("the retained terminal read observes the late stop")
+                                    .code(),
+                                HttpErrorCode::CANCEL
+                            );
+                        } else {
+                            let event = terminal.await.unwrap();
+                            assert!(event.eom());
+                            assert!(event.as_body().unwrap().is_empty());
+                        }
+                    }
+                    drop(body);
+                    complete_credit_wait(|| probe.completed.get() == 1).await;
+                    assert_eq!(probe.dropped.get(), 1);
+                    assert!(probe.cancelled.borrow().is_empty());
+                    assert!(completion.snapshot().unwrap().is_ok());
+                    let decoded = decode_server_frames(&state.borrow().writes.concat());
+                    assert_eq!(decoded.header_statuses, [(StreamId::new(1), 200)]);
+                    assert!(decoded.resets.is_empty());
+                    assert!(decoded.errors.is_empty());
+                })
+                .await;
+            })
+        });
+    }
+}
+
+#[test]
+fn closed_protocol_updates_preserve_terminal_write_ownership_and_sibling_progress() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut preface = BufQueue::new(4096);
+            peer.generate(
+                &mut preface,
+                EgressFrame::ConnectionPreface,
+                &mut IgnoreCodecEvents,
+            )
+            .unwrap();
+            peer.generate_configured_settings(&mut preface, &mut IgnoreCodecEvents)
+                .unwrap();
+            let mut input = preface.coalesce(preface.chain_length()).unwrap().to_vec();
+            input.extend(eligibility_request(&mut peer, 0));
+            input.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::new(1),
+                    amount: 1,
+                },
+            ));
+            let mut closed_updates = eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::new(1),
+                    amount: i32::MAX as u32,
+                },
+            );
+            closed_updates.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::Settings {
+                    settings: &[CodecSetting {
+                        identifier: SettingsId::InitialWindowSize.as_u16(),
+                        value: i32::MAX as u64,
+                    }],
+                },
+            ));
+            closed_updates.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::PingRequest { data: Some(43) },
+            ));
+            closed_updates.extend(eligibility_request(&mut peer, 0));
+            let release_write = Arc::new(tokio::sync::Notify::new());
+            let send_closed_updates = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(input),
+                FixtureRead::WaitData(Arc::clone(&send_closed_updates), closed_updates),
+            ]);
+            state.borrow_mut().write_gate = Some(Arc::clone(&release_write));
+            let (application, probes) = Application::new(vec![Reply::Body(0); 2]);
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            exercise(
+                session,
+                &handle,
+                &[Arc::clone(&release_write), Arc::clone(&send_closed_updates)],
+                async {
+                    complete_credit_wait(|| {
+                        state.borrow().write_gate_pending.is_some()
+                            && probes
+                                .borrow()
+                                .first()
+                                .is_some_and(|probe| probe.response_complete.get() == 1)
+                    })
+                    .await;
+                    let first = Rc::clone(&probes.borrow()[0]);
+                    assert_eq!(first.completed.get(), 0);
+                    assert_eq!(first.dropped.get(), 0);
+                    send_closed_updates.notify_one();
+                    complete_credit_wait(|| {
+                        probes
+                            .borrow()
+                            .get(1)
+                            .is_some_and(|probe| probe.response_complete.get() == 1)
+                    })
+                    .await;
+                    let sibling = Rc::clone(&probes.borrow()[1]);
+                    assert_eq!(first.completed.get(), 0);
+                    assert_eq!(first.dropped.get(), 0);
+                    assert_eq!(sibling.completed.get(), 0);
+                    assert!(state.borrow().writes.is_empty());
+                    release_write.notify_one();
+                    complete_credit_wait(|| {
+                        first.completed.get() == 1 && sibling.completed.get() == 1
+                    })
+                    .await;
+                    assert_eq!(first.response_complete.get(), 1);
+                    assert_eq!(first.dropped.get(), 1);
+                    assert_eq!(sibling.dropped.get(), 1);
+                    assert!(first.cancelled.borrow().is_empty());
+                    assert!(sibling.cancelled.borrow().is_empty());
+                    let decoded =
+                        decode_server_frames_with_requests(&state.borrow().writes.concat(), 2);
+                    assert_eq!(
+                        decoded.header_statuses,
+                        [(StreamId::new(1), 200), (StreamId::new(3), 200)]
+                    );
+                    assert_eq!(decoded.ping_replies, [43]);
+                    assert!(decoded.resets.is_empty());
+                    assert!(decoded.errors.is_empty());
+                },
+            )
+            .await;
+        })
+    });
+}
+
+#[test]
+fn duplicate_content_length_emits_400_without_reset() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_duplicate_content_length_request();
+            let (transport, state) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+            let (application, probes) = Application::new(vec![Reply::Body(0)]);
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .unwrap()
+                .unwrap();
+            let decoded = decode_server_frames(&state.borrow().writes.concat());
+            assert_eq!(decoded.header_statuses, [(StreamId::new(1), 400)]);
+            assert!(decoded.resets.is_empty());
+            assert!(decoded.errors.is_empty());
+            let probes = probes.borrow();
+            assert_eq!(
+                probes.len(),
+                1,
+                "rejected heads still create their accounting owner"
+            );
+            assert_eq!(probes[0].requested.get(), 0);
+            assert_eq!(probes[0].cancelled.borrow().len(), 1);
+            assert_eq!(probes[0].completed.get(), 0);
+            assert_eq!(probes[0].dropped.get(), 1);
+        })
+    });
+}
+
+#[test]
+fn content_length_mismatch_cancels_once_with_the_typed_error() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (transport, state) = FixtureTransport::new([FixtureRead::DataEof(
+                peer_content_length_mismatch_request(),
+            )]);
+            let (application, probes) = Application::new(vec![Reply::Body(0)]);
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .unwrap()
+                .unwrap();
+            let decoded = decode_server_frames(&state.borrow().writes.concat());
+            assert_eq!(
+                decoded.resets,
+                [(StreamId::new(1), H2ErrorCode::INTERNAL_ERROR)]
+            );
+            assert!(decoded.errors.is_empty());
+            let probes = probes.borrow();
+            assert_eq!(probes.len(), 1);
+            assert_eq!(
+                probes[0].cancelled.borrow().as_slice(),
+                &[(HttpErrorCode::CONTENT_LENGTH_MISMATCH, false)]
+            );
+            assert_eq!(probes[0].completed.get(), 0);
+            assert_eq!(probes[0].dropped.get(), 1);
+        })
+    });
+}
+
+#[test]
+fn unsupported_config_is_rejected_before_transport_or_application_work() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            for case in 0..4 {
+                let (transport, state) = FixtureTransport::new([]);
+                let mut config = options(context.clone(), transport);
+                match case {
+                    0 => config.io.read_timeout = Duration::from_secs(1),
+                    1 => config.http2.rate_limits.control_frames.maximum = 100,
+                    2 => config.http2.stream_receive_window = 4096,
+                    3 => state.borrow_mut().capability = ByteEventCapability::TransportEvents,
+                    _ => unreachable!(),
+                }
+                let (application, probes) = Application::new(vec![]);
+                let result = OwnedH2Session::new(application, config);
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("unsupported configuration {case} was silently accepted"),
+                };
+                assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+                assert!(probes.borrow().is_empty());
+                assert!(state.borrow().writes.is_empty());
+            }
+        })
+    });
+}
+
+#[test]
+fn unsupported_push_retires_its_source_and_leaves_the_sibling_usable() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (transport, state) =
+                FixtureTransport::new([FixtureRead::DataEof(peer_two_requests_bytes())]);
+            let (application, probes) = Application::new(vec![Reply::Push, Reply::Body(1)]);
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .unwrap()
+                .unwrap();
+            let probes = probes.borrow();
+            assert_eq!(probes.len(), 2);
+            assert_eq!(probes[0].push_stops.get(), 1);
+            assert_eq!(
+                probes[0].cancelled.borrow().as_slice(),
+                &[(HttpErrorCode::PROTOCOL_ERROR, false)]
+            );
+            assert_eq!(probes[0].completed.get(), 0);
+            assert_eq!(probes[0].dropped.get(), 1);
+            assert_eq!(probes[1].completed.get(), 1);
+            assert_eq!(probes[1].dropped.get(), 1);
+            assert!(probes[1].cancelled.borrow().is_empty());
+            let decoded = decode_server_frames_with_requests(&state.borrow().writes.concat(), 2);
+            assert!(decoded.pushes.is_empty());
+            assert_eq!(
+                decoded.resets,
+                [(StreamId::new(1), H2ErrorCode::INTERNAL_ERROR)]
+            );
+            assert_eq!(decoded.body_streams, [StreamId::new(3)]);
+            assert_eq!(decoded.body_data, b"r");
+            assert!(decoded.errors.is_empty());
+            assert!(
+                decoded
+                    .goaways
+                    .iter()
+                    .all(|(_, code)| *code == H2ErrorCode::NO_ERROR)
+            );
+        })
+    });
+}
+
+#[test]
+fn header_stats_shutdown_skips_encoded_callback_without_byte_events() {
+    use roxygen_core::http::HttpHeaderSize;
+    use roxygen_http2::hpack::HeaderCodecStats;
+    use roxygen_runtime::worker::WorkerHandle;
+
+    struct ShutdownOnEncode {
+        worker: WorkerHandle,
+        encodes: Cell<usize>,
+    }
+
+    impl HeaderCodecStats for ShutdownOnEncode {
+        fn record_encode(&self, _size: HttpHeaderSize) {
+            self.encodes.set(self.encodes.get() + 1);
+            self.worker.begin_shutdown();
+        }
+
+        fn record_decode(&self, _size: HttpHeaderSize) {}
+        fn record_decode_error(&self) {}
+        fn record_decode_too_large(&self) {}
+    }
+
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let (transport, state) =
+                FixtureTransport::new([FixtureRead::SegmentedData(queue(&input))]);
+            let cancel = Rc::new(ReentrantCancel {
+                at: CancelAt::HeaderEncoded,
+                handle: RefCell::new(None),
+                transport: state,
+                writes_at_cancel: Cell::new(None),
+            });
+            let stats = Rc::new(ShutdownOnEncode {
+                worker: context.handle().clone(),
+                encodes: Cell::new(0),
+            });
+            let mut config = options(context, transport);
+            config.http2.header_codec_stats = Some(stats.clone());
+            let (mut application, probes) = Application::new(vec![Reply::Body(1)]);
+            application.reentrant_cancel = Some(Rc::clone(&cancel));
+            let (session, handle) = OwnedH2Session::new(application, config).unwrap();
+            *cancel.handle.borrow_mut() = Some(handle);
+            let error = tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+            assert_eq!(stats.encodes.get(), 1);
+            assert_eq!(cancel.writes_at_cancel.get(), None);
+            let probes = probes.borrow();
+            assert_eq!(probes.len(), 1);
+            assert_eq!(probes[0].body_polls.get(), 0);
+            assert_eq!(probes[0].completed.get(), 0);
+            assert_eq!(probes[0].dropped.get(), 1);
+        })
+    });
+}
+
+#[test]
+fn reentrant_cancellation_stops_writes_before_returning_from_the_driver_turn() {
+    for at in [
+        CancelAt::HeaderPoll,
+        CancelAt::BodyPoll,
+        CancelAt::HeaderEncoded,
+        CancelAt::ResumePoll,
+        CancelAt::ResumeDrop,
+    ] {
+        run_on_worker(move |context| {
+            Box::pin(async move {
+                let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+                let (transport, state) = FixtureTransport::new([FixtureRead::Data(input)]);
+                let cancel = Rc::new(ReentrantCancel {
+                    at,
+                    handle: RefCell::new(None),
+                    transport: Rc::clone(&state),
+                    writes_at_cancel: Cell::new(None),
+                });
+                let (mut application, probes) = Application::new(vec![Reply::Body(1)]);
+                application.reentrant_cancel = Some(Rc::clone(&cancel));
+                let (session, handle) =
+                    OwnedH2Session::new(application, options(context, transport)).unwrap();
+                *cancel.handle.borrow_mut() = Some(handle);
+                let error = tokio::time::timeout(Duration::from_secs(5), session.run())
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+                assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+                assert_eq!(
+                    Some(state.borrow().writes.len()),
+                    cancel.writes_at_cancel.get()
+                );
+                let probes = probes.borrow();
+                assert_eq!(probes.len(), 1);
+                assert_eq!(
+                    probes[0].body_polls.get(),
+                    usize::from(matches!(
+                        at,
+                        CancelAt::BodyPoll | CancelAt::ResumePoll | CancelAt::ResumeDrop,
+                    )),
+                    "a completed or dropped resume must not permit another body poll after cancellation"
+                );
+                assert_eq!(
+                    probes[0].cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::CORO_CANCELLED, false)]
+                );
+                assert_eq!(probes[0].response_complete.get(), 0);
+                assert_eq!(probes[0].completed.get(), 0);
+                assert_eq!(probes[0].dropped.get(), 1);
+            })
+        });
+    }
+}
+
+#[test]
+fn application_callback_panics_cancel_once_and_join_native_io_before_resuming() {
+    for (at, expected_panic) in [
+        (CallbackPanicAt::HeaderPoll, "application header poll"),
+        (
+            CallbackPanicAt::HeaderEncoded,
+            "application encoded headers",
+        ),
+    ] {
+        run_on_worker(move |context| {
+            Box::pin(async move {
+                let release_callback = Arc::new(tokio::sync::Notify::new());
+                let release_write = Arc::new(tokio::sync::Notify::new());
+                let release_read = Arc::new(tokio::sync::Notify::new());
+                let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+                let (transport, state) = FixtureTransport::new([
+                    FixtureRead::SegmentedData(queue(&input)),
+                    FixtureRead::WaitDataEof(Arc::clone(&release_read), Vec::new()),
+                ]);
+                state.borrow_mut().write_gate = Some(Arc::clone(&release_write));
+                let (mut application, probes) = Application::new(vec![Reply::Body(1)]);
+                application.callback_panic = Some((at, Arc::clone(&release_callback)));
+                let (session, handle) =
+                    OwnedH2Session::new(application, options(context, transport)).unwrap();
+                let resumed = Cell::new(false);
+                let run = async {
+                    let result = eligibility_catch_unwind(session.run()).await;
+                    resumed.set(true);
+                    result
+                };
+                let scenario = async {
+                    let outcome = eligibility_catch_unwind(tokio::time::timeout(
+                        Duration::from_secs(5),
+                        async {
+                            complete_credit_wait(|| {
+                                let state = state.borrow();
+                                state.write_gate_pending.is_some_and(|length| length > 0)
+                                    && state.reads.is_empty()
+                                    && probes.borrow().len() == 1
+                            })
+                            .await;
+                            let probe = Rc::clone(&probes.borrow()[0]);
+                            assert!(state.borrow().writes.is_empty());
+                            release_callback.notify_one();
+                            complete_credit_wait(|| !probe.cancelled.borrow().is_empty()).await;
+                            assert_eq!(
+                                probe.cancelled.borrow().as_slice(),
+                                &[(HttpErrorCode::INTERNAL_ERROR, false)]
+                            );
+                            assert!(!resumed.get(), "held I/O retains the original panic");
+                            assert!(state.borrow().writes.is_empty());
+                            release_write.notify_one();
+                            complete_credit_wait(|| state.borrow().writes.len() == 1).await;
+                            assert!(
+                                !resumed.get(),
+                                "write completion alone cannot abandon the admitted read"
+                            );
+                        },
+                    ))
+                    .await;
+                    release_callback.notify_one();
+                    release_write.notify_one();
+                    release_read.notify_one();
+                    if !matches!(&outcome, Ok(Ok(()))) {
+                        handle.cancel();
+                    }
+                    outcome
+                };
+                let (result, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+                    tokio::join!(run, scenario)
+                })
+                .await
+                .expect("callback unwind joins the admitted read and write");
+                match outcome {
+                    Ok(result) => result.expect("callback panic reaches joined cleanup"),
+                    Err(payload) => resume_unwind(payload),
+                }
+                let panic = result.expect_err("the original application panic is resumed");
+                assert_eq!(panic.downcast_ref::<&str>(), Some(&expected_panic));
+                let probes = probes.borrow();
+                assert_eq!(probes.len(), 1);
+                let probe = &probes[0];
+                assert_eq!(probe.requested.get(), 1);
+                assert_eq!(
+                    probe.cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::INTERNAL_ERROR, false)]
+                );
+                assert_eq!(probe.response_complete.get(), 0);
+                assert_eq!(probe.completed.get(), 0);
+                assert_eq!(probe.dropped.get(), 1);
+                assert!(!handle.initiate_drain().unwrap());
+                let state = state.borrow();
+                assert_eq!(state.writes.len(), 1);
+                assert_eq!(Some(state.writes[0].len()), state.write_gate_pending);
+                assert!(state.transport_dropped);
+                assert_eq!(state.close, FixtureClose::Reset);
+            })
+        });
+    }
+}
+
+#[test]
+fn batched_owner_panic_preserves_unvisited_wakes_and_joins_native_io() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let release_write = Arc::new(tokio::sync::Notify::new());
+            let release_read = Arc::new(tokio::sync::Notify::new());
+            let gate = Rc::new(OwnerPollGate {
+                panic_first: Cell::new(true),
+                ..OwnerPollGate::default()
+            });
+            let (_, input) = ready_owner_requests(17);
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitDataEof(Arc::clone(&release_read), Vec::new()),
+            ]);
+            state.borrow_mut().write_gate = Some(Arc::clone(&release_write));
+            let (mut application, probes) = Application::new(vec![Reply::Body(1); 17]);
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let resumed = Cell::new(false);
+            let run = async {
+                let result = eligibility_catch_unwind(session.run()).await;
+                resumed.set(true);
+                result
+            };
+            let scenario = async {
+                let outcome =
+                    eligibility_catch_unwind(tokio::time::timeout(Duration::from_secs(5), async {
+                        complete_credit_wait(|| {
+                            let state = state.borrow();
+                            let wakers = gate.wakers.borrow();
+                            state.write_gate_pending.is_some_and(|length| length > 0)
+                                && state.reads.is_empty()
+                                && wakers.len() == 17
+                                && wakers.iter().all(Option::is_some)
+                        })
+                        .await;
+                        assert!(state.borrow().writes.is_empty());
+                        gate.release();
+                        complete_credit_wait(|| {
+                            probes
+                                .borrow()
+                                .iter()
+                                .all(|probe| !probe.cancelled.borrow().is_empty())
+                        })
+                        .await;
+                        for probe in probes.borrow().iter() {
+                            assert_eq!(
+                                probe.cancelled.borrow().as_slice(),
+                                &[(HttpErrorCode::INTERNAL_ERROR, false)]
+                            );
+                        }
+                        assert!(!resumed.get(), "held I/O retains the original panic");
+                        assert!(state.borrow().writes.is_empty());
+                        release_write.notify_one();
+                        complete_credit_wait(|| state.borrow().writes.len() == 1).await;
+                        assert!(
+                            !resumed.get(),
+                            "write completion alone cannot abandon the admitted read"
+                        );
+                    }))
+                    .await;
+                release_write.notify_one();
+                release_read.notify_one();
+                if !matches!(&outcome, Ok(Ok(()))) {
+                    handle.cancel();
+                }
+                outcome
+            };
+            let (result, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(run, scenario)
+            })
+            .await
+            .expect("every queued owner and both native operations retire after panic");
+            match outcome {
+                Ok(result) => result.expect("ready owner panic reaches joined cleanup"),
+                Err(payload) => resume_unwind(payload),
+            }
+            let panic = result.expect_err("the original owner panic is resumed");
+            assert_eq!(panic.downcast_ref::<&str>(), Some(&"first ready owner"));
+            let probes = probes.borrow();
+            assert_eq!(probes.len(), 17);
+            for probe in probes.iter() {
+                assert_eq!(probe.requested.get(), 1);
+                assert_eq!(
+                    probe.cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::INTERNAL_ERROR, false)]
+                );
+                assert_eq!(probe.body_polls.get(), 0);
+                assert_eq!(probe.response_complete.get(), 0);
+                assert_eq!(probe.completed.get(), 0);
+                assert_eq!(probe.dropped.get(), 1);
+            }
+            let state = state.borrow();
+            assert_eq!(state.writes.len(), 1);
+            assert_eq!(Some(state.writes[0].len()), state.write_gate_pending);
+            assert!(state.transport_dropped);
+            assert_eq!(state.close, FixtureClose::Reset);
+        })
+    });
+}
+
+#[test]
+fn zero_data_request_preserves_trailers_instead_of_becoming_header_eom() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut preface = BufQueue::new(4096);
+            peer.generate(
+                &mut preface,
+                EgressFrame::ConnectionPreface,
+                &mut IgnoreCodecEvents,
+            )
+            .unwrap();
+            peer.generate_configured_settings(&mut preface, &mut IgnoreCodecEvents)
+                .unwrap();
+            let mut input = preface.coalesce(preface.chain_length()).unwrap().to_vec();
+            let stream = peer.create_stream();
+            let mut request = HttpMessage::new();
+            request.set_method(HttpMethod::Post).unwrap();
+            request.set_url(b"/trailers", false).unwrap();
+            request.set_http_version(1, 1);
+            request
+                .headers_mut()
+                .set(HttpHeaderCode::Host, b"example.com");
+            input.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::Headers {
+                    stream,
+                    message: &request,
+                    end_stream: false,
+                    extra_headers: None,
+                },
+            ));
+            let mut trailers = HttpHeaders::new();
+            trailers.set(b"x-check", b"preserved");
+            input.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::Trailers {
+                    stream,
+                    trailers: &trailers,
+                },
+            ));
+            let (transport, state) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+            let (application, probes) = Application::new(vec![Reply::Body(0)]);
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .unwrap()
+                .unwrap();
+            let probes = probes.borrow();
+            assert_eq!(probes.len(), 1);
+            assert!(!probes[0].request_eom.get());
+            assert_eq!(probes[0].request_bytes.get(), 0);
+            assert_eq!(
+                probes[0].request_trailer.borrow().as_deref(),
+                Some(b"preserved".as_slice())
+            );
+            assert_eq!(probes[0].completed.get(), 1);
+            assert_eq!(probes[0].dropped.get(), 1);
+            assert!(probes[0].cancelled.borrow().is_empty());
+            let decoded = decode_server_frames(&state.borrow().writes.concat());
+            assert_eq!(decoded.header_statuses, [(stream, 200)]);
+            assert!(decoded.resets.is_empty());
+            assert!(decoded.errors.is_empty());
+        })
+    });
+}
+
+/// The client preface and a POST's HEADERS without END_STREAM, then its trailers HEADERS frame
+/// (END_STREAM).
+fn trailers_only_request() -> (StreamId, Vec<u8>, Vec<u8>) {
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    let mut preface = BufQueue::new(4096);
+    peer.generate(
+        &mut preface,
+        EgressFrame::ConnectionPreface,
+        &mut IgnoreCodecEvents,
+    )
+    .unwrap();
+    peer.generate_configured_settings(&mut preface, &mut IgnoreCodecEvents)
+        .unwrap();
+    let mut head = preface.coalesce(preface.chain_length()).unwrap().to_vec();
+    let stream = peer.create_stream();
+    let mut request = HttpMessage::new();
+    request.set_method(HttpMethod::Post).unwrap();
+    request.set_url(b"/trailers", false).unwrap();
+    request.set_http_version(1, 1);
+    request
+        .headers_mut()
+        .set(HttpHeaderCode::Host, b"example.com");
+    head.extend(eligibility_frame(
+        &mut peer,
+        EgressFrame::Headers {
+            stream,
+            message: &request,
+            end_stream: false,
+            extra_headers: None,
+        },
+    ));
+    let mut trailers = HttpHeaders::new();
+    trailers.set(b"x-check", b"preserved");
+    let trailers = eligibility_frame(
+        &mut peer,
+        EgressFrame::Trailers {
+            stream,
+            trailers: &trailers,
+        },
+    );
+    (stream, head, trailers)
+}
+
+#[test]
+fn a_dropped_request_body_with_trailers_retires() {
+    // `split`: the trailers arrive in a later read, after the exchange has dropped the body.
+    for split in [false, true] {
+        run_on_worker(move |context| {
+            Box::pin(async move {
+                let (stream, head, trailers) = trailers_only_request();
+                let release_trailers = Arc::new(tokio::sync::Notify::new());
+                let reads = if split {
+                    vec![
+                        FixtureRead::Data(head),
+                        FixtureRead::WaitDataEof(Arc::clone(&release_trailers), trailers),
+                    ]
+                } else {
+                    let mut input = head;
+                    input.extend(trailers);
+                    vec![FixtureRead::DataEof(input)]
+                };
+                let (transport, state) = FixtureTransport::new(reads);
+                let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+                application.drop_request_body = true;
+                let (session, handle) =
+                    OwnedH2Session::new(application, options(context, transport)).unwrap();
+                let probe_reached = |condition: fn(&Probe) -> bool| {
+                    let probes = Rc::clone(&probes);
+                    move || {
+                        probes
+                            .borrow()
+                            .first()
+                            .is_some_and(|probe| condition(probe))
+                    }
+                };
+                let scenario = async {
+                    if split {
+                        let requested = drive_until(
+                            DRIVE_LIMIT,
+                            probe_reached(|probe| probe.requested.get() == 1),
+                        )
+                        .await;
+                        assert!(
+                            requested,
+                            "split={split}: the request head reaches the exchange"
+                        );
+                        assert_eq!(
+                            probes.borrow()[0].completed.get(),
+                            0,
+                            "split={split}: the request stays open until its trailers arrive"
+                        );
+                        release_trailers.notify_one();
+                    }
+                    let completed = drive_until(
+                        DRIVE_LIMIT,
+                        probe_reached(|probe| probe.completed.get() == 1),
+                    )
+                    .await;
+                    if !completed {
+                        handle.cancel();
+                    }
+                    completed
+                };
+                let (result, completed) = tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(session.run(), scenario)
+                })
+                .await
+                .unwrap_or_else(|_| panic!("split={split}: run returns after EOF"));
+                assert!(
+                    completed,
+                    "split={split}: a request whose body was dropped retires on its trailers"
+                );
+                result.unwrap();
+                let probes = probes.borrow();
+                assert_eq!(probes.len(), 1);
+                assert!(!probes[0].request_eom.get());
+                assert_eq!(probes[0].request_trailer.borrow().as_deref(), None);
+                assert_eq!(probes[0].response_complete.get(), 1);
+                assert_eq!(probes[0].completed.get(), 1);
+                assert_eq!(probes[0].dropped.get(), 1);
+                assert!(probes[0].cancelled.borrow().is_empty());
+                let decoded = decode_server_frames(&state.borrow().writes.concat());
+                assert_eq!(decoded.header_statuses, [(stream, 200)]);
+                assert!(decoded.resets.is_empty());
+                assert!(decoded.errors.is_empty());
+            })
+        });
+    }
+}
+
+#[test]
+fn two_stream_local_header_failures_preserve_later_valid_stream_progress() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut preface = BufQueue::new(4096);
+            peer.generate(
+                &mut preface,
+                EgressFrame::ConnectionPreface,
+                &mut IgnoreCodecEvents,
+            )
+            .unwrap();
+            peer.generate_configured_settings(&mut preface, &mut IgnoreCodecEvents)
+                .unwrap();
+            let mut input = preface.coalesce(preface.chain_length()).unwrap().to_vec();
+            for method in [HttpMethod::Trace, HttpMethod::Trace, HttpMethod::Get] {
+                let stream = peer.create_stream();
+                let mut request = HttpMessage::new();
+                request.set_method(method).unwrap();
+                request.set_url(b"/same-read", false).unwrap();
+                request.set_http_version(1, 1);
+                request
+                    .headers_mut()
+                    .set(HttpHeaderCode::Host, b"example.com");
+                if method == HttpMethod::Trace {
+                    request
+                        .headers_mut()
+                        .set(HttpHeaderCode::ContentLength, b"1");
+                }
+                input.extend(eligibility_frame(
+                    &mut peer,
+                    EgressFrame::Headers {
+                        stream,
+                        message: &request,
+                        end_stream: true,
+                        extra_headers: None,
+                    },
+                ));
+            }
+            let (transport, state) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+            let (application, probes) = Application::new(vec![Reply::Body(0); 3]);
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut decoded =
+                decode_server_frames_with_requests(&state.borrow().writes.concat(), 3);
+            decoded.header_statuses.sort_by_key(|(stream, _)| *stream);
+            assert_eq!(
+                decoded.header_statuses,
+                [
+                    (StreamId::new(1), 400),
+                    (StreamId::new(3), 400),
+                    (StreamId::new(5), 200)
+                ]
+            );
+            assert!(decoded.resets.is_empty());
+            assert!(decoded.errors.is_empty());
+            let probes = probes.borrow();
+            assert_eq!(probes.len(), 3);
+            for rejected in &probes[..2] {
+                assert_eq!(rejected.requested.get(), 0);
+                assert_eq!(
+                    rejected.cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::HEADER_PARSE_ERROR, false)]
+                );
+                let ingress = rejected
+                    .ingress
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .snapshot()
+                    .unwrap();
+                assert_eq!(
+                    ingress.unwrap_err().code(),
+                    HttpErrorCode::HEADER_PARSE_ERROR
+                );
+                assert_eq!(rejected.completed.get(), 0);
+                assert_eq!(rejected.dropped.get(), 1);
+            }
+            assert_eq!(probes[2].requested.get(), 1);
+            assert_eq!(probes[2].completed.get(), 1);
+            assert_eq!(probes[2].dropped.get(), 1);
+            assert!(probes[2].cancelled.borrow().is_empty());
+        })
+    });
+}
+
+#[test]
+fn late_peer_reset_overrides_local_cause_without_repeating_source_retirement() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let release_write = Arc::new(tokio::sync::Notify::new());
+            let release_reset = Arc::new(tokio::sync::Notify::new());
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let reset = eligibility_frame(
+                &mut peer,
+                EgressFrame::Reset {
+                    stream: StreamId::new(1),
+                    code: H2ErrorCode::CANCEL,
+                },
+            );
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(input),
+                FixtureRead::WaitData(Arc::clone(&release_reset), reset),
+            ]);
+            state.borrow_mut().write_gate = Some(Arc::clone(&release_write));
+            let (application, probes) = Application::new(vec![Reply::Push]);
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            exercise(
+                session,
+                &handle,
+                &[Arc::clone(&release_write), Arc::clone(&release_reset)],
+                async {
+                    complete_credit_wait(|| {
+                        state.borrow().write_gate_pending.is_some()
+                            && probes
+                                .borrow()
+                                .first()
+                                .is_some_and(|probe| probe.cancelled.borrow().len() == 1)
+                    })
+                    .await;
+                    let probe = Rc::clone(&probes.borrow()[0]);
+                    assert_eq!(
+                        probe.cancelled.borrow().as_slice(),
+                        &[(HttpErrorCode::PROTOCOL_ERROR, false)]
+                    );
+                    assert_eq!(probe.push_stops.get(), 1);
+                    assert_eq!(probe.dropped.get(), 0);
+                    release_reset.notify_one();
+                    complete_credit_wait(|| probe.cancelled.borrow().len() == 2).await;
+                    assert_eq!(
+                        probe.cancelled.borrow().as_slice(),
+                        &[
+                            (HttpErrorCode::PROTOCOL_ERROR, false),
+                            (HttpErrorCode::CANCEL, true),
+                        ]
+                    );
+                    assert_eq!(probe.push_stops.get(), 1);
+                    assert_eq!(probe.dropped.get(), 0);
+                    release_write.notify_one();
+                    complete_credit_wait(|| probe.dropped.get() == 1).await;
+                    assert_eq!(probe.push_stops.get(), 1);
+                    assert_eq!(probe.completed.get(), 0);
+                    assert_eq!(
+                        decode_server_frames(&state.borrow().writes.concat()).resets,
+                        [(StreamId::new(1), H2ErrorCode::INTERNAL_ERROR)]
+                    );
+                },
+            )
+            .await;
+        })
+    });
+}
+
+async fn run_single_read_to_eof(
+    context: WorkerContext,
+    input: Vec<u8>,
+) -> (Rc<Probe>, Rc<OwnerPollGate>, DecodedServerFrames) {
+    let gate = Rc::new(OwnerPollGate {
+        ready: Cell::new(true),
+        ..OwnerPollGate::default()
+    });
+    let (transport, state) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+    let (mut application, probes) = Application::new(vec![Reply::Body(4)]);
+    application.owner_poll_gate = Some(Rc::clone(&gate));
+    let (session, _) = OwnedH2Session::new(application, options(context, transport)).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), session.run())
+        .await
+        .expect("a single scripted read runs to EOF")
+        .unwrap();
+    let probe = {
+        let probes = probes.borrow();
+        assert_eq!(probes.len(), 1, "the HEADERS frame creates one exchange");
+        Rc::clone(&probes[0])
+    };
+    let decoded = decode_server_frames(&state.borrow().writes.concat());
+    (probe, gate, decoded)
+}
+
+#[test]
+fn same_read_peer_reset_retires_the_exchange_before_its_start() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            for (method, body) in [
+                (HttpMethod::Get, b"".as_slice()),
+                (HttpMethod::Post, b"body"),
+            ] {
+                let input =
+                    peer_request_bytes(method, body, None, PeerControl::Reset(H2ErrorCode::CANCEL));
+                let (probe, gate, decoded) = run_single_read_to_eof(context.clone(), input).await;
+
+                // The whole read is parsed before any owner is visited, so the
+                // reset is recorded before the deferred start can run.
+                assert_eq!(probe.requested.get(), 0, "the exchange is never started");
+                assert_eq!(gate.polls.get(), 0, "response headers are never polled");
+                assert_eq!(probe.request_bytes.get(), 0);
+                assert_eq!(probe.body_polls.get(), 0);
+                assert_eq!(
+                    probe.cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::CANCEL, true)]
+                );
+                assert_eq!(probe.response_complete.get(), 0);
+                assert_eq!(probe.completed.get(), 0);
+                assert_eq!(probe.dropped.get(), 1);
+                let completion = probe.ingress.borrow().as_ref().unwrap().clone();
+                assert!(completion.snapshot().unwrap().is_ok());
+                assert_eq!(completion.body_bytes_received(), body.len() as u64);
+
+                assert!(decoded.header_streams.is_empty());
+                assert!(decoded.body_streams.is_empty());
+                assert!(decoded.resets.is_empty(), "a peer reset is not echoed");
+                assert!(decoded.errors.is_empty());
+            }
+        })
+    });
+}
+
+#[test]
+fn split_read_peer_reset_cancels_the_started_exchange() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let release_reset = Arc::new(tokio::sync::Notify::new());
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let reset = eligibility_frame(
+                &mut peer,
+                EgressFrame::Reset {
+                    stream: StreamId::new(1),
+                    code: H2ErrorCode::CANCEL,
+                },
+            );
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(input),
+                FixtureRead::WaitData(Arc::clone(&release_reset), reset),
+            ]);
+            let gate = Rc::new(OwnerPollGate::default());
+            let (mut application, probes) = Application::new(vec![Reply::Body(4)]);
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            exercise(session, &handle, &[Arc::clone(&release_reset)], async {
+                complete_credit_wait(|| gate.polls.get() > 0).await;
+                let probe = Rc::clone(&probes.borrow()[0]);
+                assert_eq!(probe.requested.get(), 1, "the exchange started");
+                assert!(probe.cancelled.borrow().is_empty());
+
+                release_reset.notify_one();
+                complete_credit_wait(|| probe.dropped.get() == 1).await;
+                assert_eq!(probe.requested.get(), 1);
+                assert_eq!(gate.polls.get(), 1);
+                assert_eq!(
+                    probe.cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::CANCEL, true)]
+                );
+                assert_eq!(probe.response_complete.get(), 0);
+                assert_eq!(probe.completed.get(), 0);
+                let decoded = decode_server_frames(&state.borrow().writes.concat());
+                assert!(decoded.header_streams.is_empty());
+                assert!(decoded.body_streams.is_empty());
+                assert!(decoded.resets.is_empty(), "a peer reset is not echoed");
+                assert!(decoded.errors.is_empty());
+            })
+            .await;
+        })
+    });
+}
+
+#[test]
+fn same_read_client_goaway_below_the_stream_does_not_preempt_its_start() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (mut peer, mut input) = ready_owner_requests(1);
+            input.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::Goaway {
+                    last_stream: StreamId::UNSPECIFIED,
+                    code: H2ErrorCode::NO_ERROR,
+                    debug_data: None,
+                },
+            ));
+            let (probe, gate, decoded) = run_single_read_to_eof(context, input).await;
+
+            // A client GOAWAY's last stream bounds server-initiated streams, so
+            // it does not refuse client stream 1 parsed earlier in the read.
+            assert_eq!(probe.requested.get(), 1);
+            assert_eq!(gate.polls.get(), 1);
+            assert!(probe.cancelled.borrow().is_empty());
+            assert_eq!(probe.response_complete.get(), 1);
+            assert_eq!(probe.completed.get(), 1);
+            assert_eq!(probe.dropped.get(), 1);
+            assert_eq!(decoded.header_statuses, [(StreamId::new(1), 200)]);
+            assert_eq!(decoded.body_data, b"rrrr");
+            assert!(decoded.resets.is_empty());
+            assert!(decoded.errors.is_empty());
+            assert_eq!(
+                decoded.goaways,
+                [(StreamId::new(1), H2ErrorCode::NO_ERROR)],
+                "the server's GOAWAY reports stream 1 as processed"
+            );
+        })
+    });
+}
+
+#[test]
+fn peer_reset_discards_a_malformed_head_response_parked_behind_a_held_write() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut preface = BufQueue::new(4096);
+            peer.generate(
+                &mut preface,
+                EgressFrame::ConnectionPreface,
+                &mut IgnoreCodecEvents,
+            )
+            .unwrap();
+            peer.generate_configured_settings(&mut preface, &mut IgnoreCodecEvents)
+                .unwrap();
+            let mut initial = preface.coalesce(preface.chain_length()).unwrap().to_vec();
+            initial.extend(eligibility_request(&mut peer, 0));
+            let rejected_stream = peer.create_stream();
+            assert_eq!(rejected_stream, StreamId::new(3));
+            let mut malformed = HttpMessage::new();
+            malformed.set_method(HttpMethod::Trace).unwrap();
+            malformed.set_url(b"/parked-error", false).unwrap();
+            malformed.set_http_version(1, 1);
+            malformed
+                .headers_mut()
+                .set(HttpHeaderCode::Host, b"example.com");
+            malformed
+                .headers_mut()
+                .set(HttpHeaderCode::ContentLength, b"1");
+            let malformed = eligibility_frame(
+                &mut peer,
+                EgressFrame::Headers {
+                    stream: rejected_stream,
+                    message: &malformed,
+                    end_stream: true,
+                    extra_headers: None,
+                },
+            );
+            let mut reset_and_sibling = eligibility_frame(
+                &mut peer,
+                EgressFrame::Reset {
+                    stream: rejected_stream,
+                    code: H2ErrorCode::CANCEL,
+                },
+            );
+            reset_and_sibling.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::Reset {
+                    stream: rejected_stream,
+                    code: H2ErrorCode::REFUSED_STREAM,
+                },
+            ));
+            reset_and_sibling.extend(eligibility_request(&mut peer, 1));
+            let release_write = Arc::new(tokio::sync::Notify::new());
+            let send_malformed = Arc::new(tokio::sync::Notify::new());
+            let send_reset = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(initial),
+                FixtureRead::WaitData(Arc::clone(&send_malformed), malformed),
+                FixtureRead::WaitData(Arc::clone(&send_reset), reset_and_sibling),
+            ]);
+            state.borrow_mut().write_gate = Some(Arc::clone(&release_write));
+            let (application, probes) =
+                Application::new(vec![Reply::Body(4096), Reply::Body(0), Reply::Body(1)]);
+            let mut config = options(context, transport);
+            config.io.buffer_limit = 16 << 10;
+            config.io.ingress_buffer_limit = 16 << 10;
+            config.io.maximum_write_size = 128;
+            config.io.maximum_read_size = 4096;
+            config.io.read_allocation_size = 4096;
+            let (session, handle) = OwnedH2Session::new(application, config).unwrap();
+            exercise(
+                session,
+                &handle,
+                &[
+                    Arc::clone(&release_write),
+                    Arc::clone(&send_malformed),
+                    Arc::clone(&send_reset),
+                ],
+                async {
+                    complete_credit_wait(|| {
+                        state.borrow().write_gate_pending.is_some()
+                            && probes
+                                .borrow()
+                                .first()
+                                .is_some_and(|probe| probe.produced_bytes.get() == 4096)
+                    })
+                    .await;
+                    let first = Rc::clone(&probes.borrow()[0]);
+                    assert_eq!(first.response_complete.get(), 0);
+                    send_malformed.notify_one();
+                    complete_credit_wait(|| {
+                        probes
+                            .borrow()
+                            .get(1)
+                            .is_some_and(|probe| !probe.cancelled.borrow().is_empty())
+                    })
+                    .await;
+                    let rejected = Rc::clone(&probes.borrow()[1]);
+                    assert_eq!(
+                        rejected.cancelled.borrow().as_slice(),
+                        &[(HttpErrorCode::HEADER_PARSE_ERROR, false)]
+                    );
+                    assert_eq!(rejected.requested.get(), 0);
+                    assert_eq!(rejected.response_complete.get(), 0);
+                    send_reset.notify_one();
+                    complete_credit_wait(|| {
+                        rejected.cancelled.borrow().len() == 2 && probes.borrow().len() == 3
+                    })
+                    .await;
+                    let sibling = Rc::clone(&probes.borrow()[2]);
+                    assert_eq!(
+                        rejected.cancelled.borrow().as_slice(),
+                        &[
+                            (HttpErrorCode::HEADER_PARSE_ERROR, false),
+                            (HttpErrorCode::CANCEL, true),
+                        ]
+                    );
+                    assert_eq!(rejected.response_complete.get(), 0);
+                    assert!(state.borrow().writes.is_empty());
+                    release_write.notify_one();
+                    complete_credit_wait(|| {
+                        first.completed.get() == 1
+                            && sibling.completed.get() == 1
+                            && rejected.dropped.get() == 1
+                    })
+                    .await;
+                    assert_eq!(first.dropped.get(), 1);
+                    assert_eq!(sibling.dropped.get(), 1);
+                    assert!(first.cancelled.borrow().is_empty());
+                    assert!(sibling.cancelled.borrow().is_empty());
+                    assert_eq!(rejected.completed.get(), 0);
+                    assert_eq!(rejected.response_complete.get(), 0);
+                    let mut decoded =
+                        decode_server_frames_with_requests(&state.borrow().writes.concat(), 3);
+                    decoded.header_statuses.sort_by_key(|(stream, _)| *stream);
+                    assert_eq!(
+                        decoded.header_statuses,
+                        [(StreamId::new(1), 200), (StreamId::new(5), 200)]
+                    );
+                    assert_eq!(decoded.body_data, vec![b'r'; 4097]);
+                    assert!(decoded.resets.is_empty());
+                    assert!(decoded.errors.is_empty());
+                },
+            )
+            .await;
+        })
+    });
+}
+
+#[test]
+fn cancellation_waker_panic_waits_for_both_native_io_completions() {
+    use std::task::Wake;
+    use std::task::Waker;
+
+    #[derive(Default)]
+    struct IoReceipt {
+        started: [Cell<bool>; 2],
+        cancelled: [Cell<bool>; 2],
+        completed: [Cell<bool>; 2],
+        allow_completion: Cell<bool>,
+        native_wakers: [RefCell<Option<Waker>>; 2],
+        dropped: [Cell<usize>; 2],
+        closed: Cell<bool>,
+    }
+
+    #[derive(Default)]
+    struct WakeReceipt {
+        calls: [AtomicUsize; 2],
+        total: AtomicUsize,
+    }
+
+    struct CancelWake {
+        direction: usize,
+        receipt: Arc<WakeReceipt>,
+        driver: Waker,
+    }
+
+    impl Wake for CancelWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.receipt.calls[self.direction].fetch_add(1, Ordering::SeqCst);
+            let ordinal = self.receipt.total.fetch_add(1, Ordering::SeqCst);
+            self.driver.wake_by_ref();
+            if ordinal == 0 {
+                panic_any("first native cancellation waker");
+            }
+        }
+    }
+
+    struct IoDrop {
+        direction: usize,
+        receipt: Rc<IoReceipt>,
+    }
+
+    impl Drop for IoDrop {
+        fn drop(&mut self) {
+            let count = &self.receipt.dropped[self.direction];
+            count.set(count.get() + 1);
+        }
+    }
+
+    struct CancellationTransport {
+        inner: Rc<FixtureTransport>,
+        receipt: Rc<IoReceipt>,
+        wakes: Arc<WakeReceipt>,
+    }
+
+    impl CancellationTransport {
+        fn pending(&self, direction: usize, token: CancellationToken) -> LocalTransportFuture<()> {
+            let receipt = Rc::clone(&self.receipt);
+            let wakes = Arc::clone(&self.wakes);
+            Box::pin(async move {
+                let _drop = IoDrop {
+                    direction,
+                    receipt: Rc::clone(&receipt),
+                };
+                let baton = CancellableBaton::new();
+                let mut wait = std::pin::pin!(baton.wait(token.clone()));
+                let result = poll_fn(|context| {
+                    let waker = Waker::from(Arc::new(CancelWake {
+                        direction,
+                        receipt: Arc::clone(&wakes),
+                        driver: context.waker().clone(),
+                    }));
+                    let result = wait.as_mut().poll(&mut Context::from_waker(&waker));
+                    if result.is_pending() {
+                        receipt.started[direction].set(true);
+                    }
+                    result
+                })
+                .await;
+                assert_eq!(result, WaitStatus::Cancelled);
+                assert!(token.is_cancellation_requested());
+                receipt.cancelled[direction].set(true);
+                poll_fn(|context| {
+                    if receipt.allow_completion.get() {
+                        Poll::Ready(())
+                    } else {
+                        *receipt.native_wakers[direction].borrow_mut() =
+                            Some(context.waker().clone());
+                        Poll::Pending
+                    }
+                })
+                .await;
+                receipt.completed[direction].set(true);
+            })
+        }
+    }
+
+    impl UniplexTransport for CancellationTransport {
+        fn read(
+            &self,
+            _context: &WorkerContext,
+            _maximum: usize,
+            _allocation: usize,
+            _timeout: Duration,
+            cancellation: CancellationToken,
+        ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+            let pending = self.pending(0, cancellation);
+            Box::pin(async move {
+                pending.await;
+                Err(HttpError::with_message(
+                    HttpErrorCode::CORO_CANCELLED,
+                    b"native read completed cancellation",
+                ))
+            })
+        }
+
+        fn write(
+            &self,
+            _context: &WorkerContext,
+            data: BufQueue,
+            _flags: ByteEventWriteFlags,
+            _timeout: Duration,
+            cancellation: CancellationToken,
+        ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+            let pending = self.pending(1, cancellation);
+            Box::pin(async move {
+                let _owned_write = data;
+                pending.await;
+                Err(TransportWriteError::new(
+                    HttpError::with_message(
+                        HttpErrorCode::CORO_CANCELLED,
+                        b"native write completed cancellation",
+                    ),
+                    0,
+                ))
+            })
+        }
+
+        fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+            self.receipt.closed.set(true);
+            self.inner.shutdown_write(context)
+        }
+
+        fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+            self.receipt.closed.set(true);
+            self.inner.close(context)
+        }
+
+        fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+            self.receipt.closed.set(true);
+            self.inner.close_with_reset(context)
+        }
+
+        fn byte_event_capability(
+            &self,
+            context: &WorkerContext,
+        ) -> Result<ByteEventCapability, HttpError> {
+            self.inner.byte_event_capability(context)
+        }
+
+        fn register_byte_event(
+            &self,
+            context: &WorkerContext,
+            registration: HttpByteEventRegistration,
+        ) -> Result<(), ByteEventRegistrationError> {
+            self.inner.register_byte_event(context, registration)
+        }
+    }
+
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (inner, state) = FixtureTransport::new([]);
+            let receipt = Rc::new(IoReceipt::default());
+            let wakes = Arc::new(WakeReceipt::default());
+            let transport = Rc::new(CancellationTransport {
+                inner,
+                receipt: Rc::clone(&receipt),
+                wakes: Arc::clone(&wakes),
+            });
+            let (application, probes) = Application::new(vec![]);
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let cancel = async {
+                complete_credit_wait(|| receipt.started.iter().all(Cell::get)).await;
+                handle.cancel();
+                complete_credit_wait(|| {
+                    receipt.closed.get() && receipt.cancelled.iter().all(Cell::get)
+                })
+                .await;
+                assert_eq!([receipt.dropped[0].get(), receipt.dropped[1].get()], [0, 0]);
+                assert!(receipt.completed.iter().all(|completed| !completed.get()));
+                receipt.allow_completion.set(true);
+                for waker in &receipt.native_wakers {
+                    if let Some(waker) = waker.borrow_mut().take() {
+                        waker.wake();
+                    }
+                }
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(eligibility_catch_unwind(session.run()), cancel)
+            })
+            .await
+            .expect("panicking cancellation still joins both real IO futures");
+            let panic = result.expect_err("the original cancellation waker panic is resumed");
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"first native cancellation waker")
+            );
+            assert!(receipt.completed.iter().all(Cell::get));
+            assert_eq!([receipt.dropped[0].get(), receipt.dropped[1].get()], [1, 1]);
+            assert_eq!(
+                [
+                    wakes.calls[0].load(Ordering::SeqCst),
+                    wakes.calls[1].load(Ordering::SeqCst)
+                ],
+                [1, 1]
+            );
+            assert_eq!(state.borrow().close, FixtureClose::Reset);
+            assert!(probes.borrow().is_empty());
+        })
+    });
+}
+
+#[test]
+fn abandoning_a_started_run_signals_io_and_reports_the_missing_join() {
+    struct ObserveCancellation {
+        inner: Rc<FixtureTransport>,
+        read_token: RefCell<Option<CancellationToken>>,
+        write_token: RefCell<Option<CancellationToken>>,
+    }
+
+    impl UniplexTransport for ObserveCancellation {
+        fn read(
+            &self,
+            context: &WorkerContext,
+            maximum: usize,
+            allocation: usize,
+            timeout: Duration,
+            cancellation: CancellationToken,
+        ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+            *self.read_token.borrow_mut() = Some(cancellation.clone());
+            self.inner
+                .read(context, maximum, allocation, timeout, cancellation)
+        }
+
+        fn write(
+            &self,
+            context: &WorkerContext,
+            data: BufQueue,
+            flags: ByteEventWriteFlags,
+            timeout: Duration,
+            cancellation: CancellationToken,
+        ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+            *self.write_token.borrow_mut() = Some(cancellation.clone());
+            self.inner
+                .write(context, data, flags, timeout, cancellation)
+        }
+
+        fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+            self.inner.shutdown_write(context)
+        }
+
+        fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+            self.inner.close(context)
+        }
+
+        fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+            self.inner.close_with_reset(context)
+        }
+
+        fn byte_event_capability(
+            &self,
+            context: &WorkerContext,
+        ) -> Result<ByteEventCapability, HttpError> {
+            self.inner.byte_event_capability(context)
+        }
+
+        fn register_byte_event(
+            &self,
+            context: &WorkerContext,
+            registration: HttpByteEventRegistration,
+        ) -> Result<(), ByteEventRegistrationError> {
+            self.inner.register_byte_event(context, registration)
+        }
+    }
+
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (inner, state) = FixtureTransport::new([]);
+            state.borrow_mut().write_gate = Some(Arc::new(tokio::sync::Notify::new()));
+            let transport = Rc::new(ObserveCancellation {
+                inner,
+                read_token: RefCell::new(None),
+                write_token: RefCell::new(None),
+            });
+            let (application, probes) = Application::new(vec![]);
+            let (session, _) =
+                OwnedH2Session::new(application, options(context.clone(), transport.clone()))
+                    .unwrap();
+            let mut run = Box::pin(session.run());
+            poll_fn(|context| {
+                assert!(run.as_mut().poll(context).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert!(state.borrow().write_gate_pending.is_some());
+            let read = transport.read_token.borrow().as_ref().unwrap().clone();
+            let write = transport.write_token.borrow().as_ref().unwrap().clone();
+            assert!(!read.is_cancellation_requested());
+            assert!(!write.is_cancellation_requested());
+            let panic = catch_unwind(AssertUnwindSafe(|| drop(run)))
+                .expect_err("dropping a started runner must report unjoined native IO");
+            let message = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                .unwrap();
+            assert_eq!(
+                message,
+                "started owned H2 runner dropped before application and native I/O cleanup joined"
+            );
+            assert!(read.is_cancellation_requested());
+            assert!(write.is_cancellation_requested());
+            assert_eq!(state.borrow().close, FixtureClose::Reset);
+            assert!(state.borrow().writes.is_empty());
+            assert!(probes.borrow().is_empty());
+
+            let (transport, _) = FixtureTransport::new([]);
+            let (application, _) = Application::new(vec![]);
+            let (unstarted, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            assert!(catch_unwind(AssertUnwindSafe(|| drop(unstarted.run()))).is_ok());
+        })
+    });
+}
+
+#[test]
+fn synthesized_error_head_waits_for_the_admitted_ingress_read() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut request = HttpMessage::new();
+            request.set_method(HttpMethod::Post).unwrap();
+            request.set_url(b"/incomplete", false).unwrap();
+            request.set_http_version(1, 1);
+            request
+                .headers_mut()
+                .set(HttpHeaderCode::Host, b"example.com");
+            request
+                .headers_mut()
+                .set(HttpHeaderCode::ContentLength, b"1");
+            let input = peer_request_message_bytes(request, None, false);
+            let send_eof = Arc::new(tokio::sync::Notify::new());
+            let release_write = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(input),
+                FixtureRead::WaitDataEof(Arc::clone(&send_eof), Vec::new()),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+            application.retain_request = true;
+            application.hold_headers = true;
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let scenario = async {
+                let outcome =
+                    eligibility_catch_unwind(tokio::time::timeout(Duration::from_secs(5), async {
+                        complete_credit_wait(|| {
+                            probes
+                                .borrow()
+                                .first()
+                                .is_some_and(|probe| probe.held_body.borrow().is_some())
+                        })
+                        .await;
+                        let probe = Rc::clone(&probes.borrow()[0]);
+                        let mut body = probe.held_body.borrow_mut().take().unwrap();
+                        match body.read_body_event(1).await.unwrap().into_kind() {
+                            HttpBodyEventKind::Suspend(resume) => drop(resume),
+                            _ => panic!("an empty request body first yields its suspend event"),
+                        }
+                        let mut read = std::pin::pin!(body.read_body_event_unboxed(1));
+                        poll_fn(|context| {
+                            assert!(read.as_mut().poll(context).is_pending());
+                            Poll::Ready(())
+                        })
+                        .await;
+                        send_eof.notify_one();
+                        complete_credit_wait(|| probe.cancelled.borrow().len() == 1).await;
+                        for _ in 0..4 {
+                            tokio::task::yield_now().await;
+                        }
+                        assert!(
+                            decode_server_frames(&state.borrow().writes.concat())
+                                .header_streams
+                                .is_empty()
+                        );
+                        assert_eq!(probe.dropped.get(), 0);
+                        state.borrow_mut().write_gate = Some(Arc::clone(&release_write));
+                        let error = match read.await {
+                            Err(error) => error,
+                            Ok(_) => panic!("incomplete request must report transport EOF"),
+                        };
+                        assert_eq!(error.code(), HttpErrorCode::TRANSPORT_EOF);
+                        drop(body);
+                        complete_credit_wait(|| state.borrow().write_gate_pending.is_some()).await;
+                        assert_eq!(probe.dropped.get(), 0);
+                        assert_eq!(probe.completed.get(), 0);
+                        release_write.notify_one();
+                        complete_credit_wait(|| probe.dropped.get() == 1).await;
+                        assert_eq!(
+                            probe.cancelled.borrow().as_slice(),
+                            &[(HttpErrorCode::TRANSPORT_EOF, false)]
+                        );
+                        assert_eq!(probe.completed.get(), 0);
+                        let decoded = decode_server_frames(&state.borrow().writes.concat());
+                        assert_eq!(decoded.header_statuses, [(StreamId::new(1), 500)]);
+                        assert!(decoded.errors.is_empty());
+                    }))
+                    .await;
+                send_eof.notify_one();
+                release_write.notify_one();
+                if !matches!(&outcome, Ok(Ok(()))) {
+                    handle.cancel();
+                }
+                outcome
+            };
+            let (result, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(session.run(), scenario)
+            })
+            .await
+            .expect("EOF error response retires its input and write owners");
+            match outcome {
+                Ok(result) => result.expect("EOF error response made progress"),
+                Err(payload) => resume_unwind(payload),
+            }
+            result.unwrap();
+        })
+    });
+}
+
+#[test]
+fn empty_terminal_data_survives_a_negative_stream_window() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut preface = BufQueue::new(4096);
+            peer.generate(
+                &mut preface,
+                EgressFrame::ConnectionPreface,
+                &mut IgnoreCodecEvents,
+            )
+            .unwrap();
+            peer.generate_configured_settings(&mut preface, &mut IgnoreCodecEvents)
+                .unwrap();
+            let mut input = preface.coalesce(preface.chain_length()).unwrap().to_vec();
+            input.extend(eligibility_request(&mut peer, 0));
+            let mut shrink = eligibility_frame(
+                &mut peer,
+                EgressFrame::Settings {
+                    settings: &[CodecSetting {
+                        identifier: SettingsId::InitialWindowSize.as_u16(),
+                        value: 0,
+                    }],
+                },
+            );
+            shrink.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::PingRequest { data: Some(44) },
+            ));
+            shrink.extend(eligibility_request(&mut peer, 1));
+            let send_shrink = Arc::new(tokio::sync::Notify::new());
+            let send_terminal = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(input),
+                FixtureRead::WaitData(Arc::clone(&send_shrink), shrink),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(1), Reply::Body(0)]);
+            application.empty_terminal = Some(Arc::clone(&send_terminal));
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            exercise(
+                session,
+                &handle,
+                &[Arc::clone(&send_shrink), Arc::clone(&send_terminal)],
+                async {
+                    complete_credit_wait(|| {
+                        decode_server_frames_with_requests(&state.borrow().writes.concat(), 2)
+                            .body_bytes
+                            == 1
+                    })
+                    .await;
+                    let first = Rc::clone(&probes.borrow()[0]);
+                    assert_eq!(first.response_complete.get(), 0);
+                    send_shrink.notify_one();
+                    complete_credit_wait(|| {
+                        let wire =
+                            decode_server_frames_with_requests(&state.borrow().writes.concat(), 2);
+                        wire.ping_replies == [44]
+                            && probes
+                                .borrow()
+                                .get(1)
+                                .is_some_and(|probe| probe.completed.get() == 1)
+                    })
+                    .await;
+                    assert_eq!(first.completed.get(), 0);
+                    assert!(first.cancelled.borrow().is_empty());
+                    send_terminal.notify_one();
+                    complete_credit_wait(|| first.completed.get() == 1).await;
+                    assert_eq!(first.response_complete.get(), 1);
+                    assert_eq!(first.dropped.get(), 1);
+                    assert!(first.cancelled.borrow().is_empty());
+                    let decoded =
+                        decode_server_frames_with_requests(&state.borrow().writes.concat(), 2);
+                    assert_eq!(decoded.body_data, b"r");
+                    assert!(decoded.resets.is_empty());
+                    assert!(decoded.errors.is_empty());
+                    let wire = eligibility_wire(&state);
+                    assert!(wire.completed.contains(&StreamId::new(1)));
+                    assert!(wire.completed.contains(&StreamId::new(3)));
+                },
+            )
+            .await;
+        })
+    });
+}
+
+#[test]
+fn ready_small_response_batches_headers_and_body_into_one_transport_write() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let (transport, state) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+            let (application, probes) = Application::new(vec![Reply::Body(1024)]);
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .unwrap()
+                .unwrap();
+            let probes = probes.borrow();
+            assert_eq!(probes.len(), 1);
+            let probe = &probes[0];
+            assert_eq!(probe.completed.get(), 1);
+            assert_eq!(probe.dropped.get(), 1);
+            assert_eq!(probe.body_polls.get(), 1);
+            assert!(probe.cancelled.borrow().is_empty());
+            let state = state.borrow();
+            let decoded = decode_server_frames(&state.writes.concat());
+            assert_eq!(decoded.header_statuses, [(StreamId::new(1), 200)]);
+            assert_eq!(decoded.body_data, vec![b'r'; 1024]);
+            assert!(decoded.resets.is_empty());
+            assert!(decoded.errors.is_empty());
+            let mut header_writes = Vec::new();
+            let mut body_writes = Vec::new();
+            for (write, bytes) in state.writes.iter().enumerate() {
+                let mut offset = 0;
+                while offset < bytes.len() {
+                    assert!(bytes.len() - offset >= FRAME_HEADER_SIZE);
+                    let length = (usize::from(bytes[offset]) << 16)
+                        | (usize::from(bytes[offset + 1]) << 8)
+                        | usize::from(bytes[offset + 2]);
+                    let stream =
+                        u32::from_be_bytes(bytes[offset + 5..offset + 9].try_into().unwrap())
+                            & 0x7fff_ffff;
+                    if stream == 1 {
+                        if bytes[offset + 3] == FrameType::HEADERS.as_u8() {
+                            header_writes.push(write);
+                        } else if bytes[offset + 3] == FrameType::DATA.as_u8() {
+                            body_writes.push(write);
+                        }
+                    }
+                    offset += FRAME_HEADER_SIZE + length;
+                    assert!(
+                        offset <= bytes.len(),
+                        "this small fixture has complete frames"
+                    );
+                }
+            }
+            assert_eq!(header_writes.len(), 1);
+            assert_eq!(body_writes.len(), 1);
+            assert_eq!(
+                header_writes, body_writes,
+                "the already-ready 1 KiB body shares its header's transport write"
+            );
+        })
+    });
+}
+
+#[test]
+fn ready_owner_suffix_precedes_later_cross_thread_wake_after_yield() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::task::Wake;
+
+    struct RecordingWake(AtomicBool);
+    impl Wake for RecordingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let release_write = Arc::new(tokio::sync::Notify::new());
+            let release_read = Arc::new(tokio::sync::Notify::new());
+            let gate = Rc::new(OwnerPollGate {
+                pending_visits: Some(RefCell::new(Vec::new())),
+                ..OwnerPollGate::default()
+            });
+            let (_, input) = ready_owner_requests(66);
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitDataEof(Arc::clone(&release_read), Vec::new()),
+            ]);
+            state.borrow_mut().write_gate = Some(Arc::clone(&release_write));
+            let (mut application, probes) = Application::new(vec![Reply::Body(0); 66]);
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let wake = Arc::new(RecordingWake(AtomicBool::new(false)));
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut run = Box::pin(session.run());
+            let mut finished = None;
+            let outcome = eligibility_catch_unwind(async {
+                let mut poll_pending = || {
+                    wake.0.store(false, Ordering::SeqCst);
+                    if let Poll::Ready(result) = run.as_mut().poll(&mut Context::from_waker(&waker))
+                    {
+                        finished = Some(result);
+                        panic!("held native I/O keeps the session running");
+                    }
+                };
+                for _ in 0..16 {
+                    poll_pending();
+                    if !wake.0.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+                assert!(
+                    !wake.0.load(Ordering::SeqCst),
+                    "initial owner readiness settles"
+                );
+                assert!(state.borrow().reads.is_empty());
+                assert!(
+                    state
+                        .borrow()
+                        .write_gate_pending
+                        .is_some_and(|length| length > 0)
+                );
+                let mut wakers: Vec<_> = gate
+                    .wakers
+                    .borrow()
+                    .iter()
+                    .map(|waker| waker.as_ref().expect("each owner registered").clone())
+                    .collect();
+                assert_eq!(wakers.len(), 66);
+                let late = wakers.pop().unwrap();
+                gate.ready.set(true);
+                for waker in &wakers {
+                    waker.wake_by_ref();
+                }
+                poll_pending();
+                let prefix = gate.pending_visits.as_ref().unwrap().borrow().clone();
+                assert!(
+                    (1..65).contains(&prefix.len()),
+                    "the ready batch spans a yield"
+                );
+                assert_eq!(prefix, (0..prefix.len()).collect::<Vec<_>>());
+                // The budget yield wakes the session once this task returns to the scheduler.
+                tokio::task::yield_now().await;
+                assert!(
+                    wake.0.load(Ordering::SeqCst),
+                    "the suffix requests another poll"
+                );
+
+                let unvisited = wakers[prefix.len()].clone();
+                wake.0.store(false, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    unvisited.wake();
+                    late.wake();
+                })
+                .join()
+                .expect("cross-thread owner wakes complete");
+                assert!(
+                    wake.0.load(Ordering::SeqCst),
+                    "the late owner wakes its session"
+                );
+                for _ in 0..16 {
+                    poll_pending();
+                    if !wake.0.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+                assert!(!wake.0.load(Ordering::SeqCst), "the ready owners settle");
+                assert_eq!(
+                    *gate.pending_visits.as_ref().unwrap().borrow(),
+                    (0..66).collect::<Vec<_>>()
+                );
+            })
+            .await;
+            handle.cancel();
+            release_write.notify_one();
+            release_read.notify_one();
+            let result = match finished {
+                Some(result) => result,
+                None => tokio::time::timeout(Duration::from_secs(5), run.as_mut())
+                    .await
+                    .expect("all owners and both native operations join"),
+            };
+            drop(run);
+            if let Err(payload) = outcome {
+                resume_unwind(payload);
+            }
+            assert_eq!(result.unwrap_err().code(), HttpErrorCode::CORO_CANCELLED);
+            let probes = probes.borrow();
+            assert_eq!(probes.len(), 66);
+            for probe in probes.iter() {
+                assert_eq!(probe.requested.get(), 1);
+                assert_eq!(probe.body_polls.get(), 0);
+                assert_eq!(probe.response_complete.get(), 0);
+                assert_eq!(probe.completed.get(), 0);
+                assert_eq!(probe.dropped.get(), 1);
+                assert_eq!(
+                    probe.cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::CORO_CANCELLED, false)]
+                );
+            }
+            assert!(state.borrow().transport_dropped);
+            assert_eq!(state.borrow().close, FixtureClose::Reset);
+        })
+    });
+}
+
+#[test]
+fn continuously_ready_body_flushes_and_yields_within_one_turn_budget() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::DataEof(Vec::new()),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(1024)]);
+            application.body_chunk = 1;
+            let mut config = options(context, transport);
+            config.io.buffer_limit = 64 << 10;
+            config.io.ingress_buffer_limit = 64 << 10;
+            config.io.maximum_write_size = 64 << 10;
+            config.io.maximum_read_size = 4096;
+            config.io.read_allocation_size = 4096;
+            let (session, _) = OwnedH2Session::new(application, config).unwrap();
+            let mut run = Box::pin(session.run());
+            let first = poll_fn(|context| Poll::Ready(run.as_mut().poll(context))).await;
+            let yielded = first.is_pending();
+            let produced_at_yield = probes
+                .borrow()
+                .first()
+                .map_or(0, |probe| probe.body_polls.get());
+            let written_at_yield = decode_server_frames(&state.borrow().writes.concat()).body_bytes;
+            let result = match first {
+                Poll::Ready(result) => result,
+                Poll::Pending => tokio::time::timeout(Duration::from_secs(5), run)
+                    .await
+                    .unwrap(),
+            };
+            result.unwrap();
+            assert!(yielded, "a ready source longer than one budget must yield");
+            assert!(
+                (1..=64).contains(&produced_at_yield),
+                "one poll must retain the bounded work budget: {produced_at_yield}"
+            );
+            assert!(
+                written_at_yield > 0,
+                "the last productive turn must flush staged DATA before yielding"
+            );
+            assert!(written_at_yield <= produced_at_yield);
+            let probes = probes.borrow();
+            assert_eq!(probes.len(), 1);
+            assert_eq!(probes[0].body_polls.get(), 1024);
+            assert_eq!(probes[0].completed.get(), 1);
+            assert_eq!(probes[0].dropped.get(), 1);
+            assert!(probes[0].cancelled.borrow().is_empty());
+            let decoded = decode_server_frames(&state.borrow().writes.concat());
+            assert_eq!(decoded.header_statuses, [(StreamId::new(1), 200)]);
+            assert_eq!(decoded.body_data, vec![b'r'; 1024]);
+            assert!(decoded.resets.is_empty());
+            assert!(decoded.errors.is_empty());
+        })
+    });
+}
+
+#[test]
+fn continuously_ready_owners_do_not_starve_control_input() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let release_control = Arc::new(tokio::sync::Notify::new());
+            let release_eof = Arc::new(tokio::sync::Notify::new());
+            let gate = Rc::new(OwnerPollGate::default());
+            let (mut peer, input) = ready_owner_requests(17);
+            let mut control =
+                eligibility_frame(&mut peer, EgressFrame::PingRequest { data: Some(43) });
+            control.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::Reset {
+                    stream: StreamId::new(33),
+                    code: H2ErrorCode::CANCEL,
+                },
+            ));
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitData(Arc::clone(&release_control), control),
+                FixtureRead::WaitDataEof(Arc::clone(&release_eof), Vec::new()),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(1024); 17]);
+            application.body_chunk = 1;
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            let mut config = options(context, transport);
+            config.io.buffer_limit = 64 << 10;
+            config.io.ingress_buffer_limit = 64 << 10;
+            config.io.maximum_write_size = 64 << 10;
+            config.io.maximum_read_size = 4096;
+            config.io.read_allocation_size = 4096;
+            let (session, handle) = OwnedH2Session::new(application, config).unwrap();
+            let mut run = Box::pin(session.run());
+            let mut finished = None;
+            let outcome = eligibility_catch_unwind(async {
+                if let Poll::Ready(result) =
+                    poll_fn(|context| Poll::Ready(run.as_mut().poll(context))).await
+                {
+                    finished = Some(result);
+                    return;
+                }
+                assert_eq!(gate.wakers.borrow().len(), 17);
+                assert!(gate.wakers.borrow().iter().all(Option::is_some));
+                assert_eq!(state.borrow().reads.len(), 1);
+                gate.release();
+                if let Poll::Ready(result) =
+                    poll_fn(|context| Poll::Ready(run.as_mut().poll(context))).await
+                {
+                    finished = Some(result);
+                    return;
+                }
+                let polls_at_yield: usize = probes
+                    .borrow()
+                    .iter()
+                    .map(|probe| probe.body_polls.get())
+                    .sum();
+                assert!((1..=64).contains(&polls_at_yield));
+                let decoded =
+                    decode_server_frames_with_requests(&state.borrow().writes.concat(), 17);
+                assert!(decoded.body_bytes > 0);
+                assert!(decoded.ping_replies.is_empty());
+                assert!(
+                    probes
+                        .borrow()
+                        .iter()
+                        .all(|probe| probe.produced_bytes.get() < 1024)
+                );
+                *gate.control_read.borrow_mut() = Some(Arc::clone(&release_control));
+                if let Poll::Ready(result) =
+                    poll_fn(|context| Poll::Ready(run.as_mut().poll(context))).await
+                {
+                    finished = Some(result);
+                    return;
+                }
+                let polls_after_control: usize = probes
+                    .borrow()
+                    .iter()
+                    .map(|probe| probe.body_polls.get())
+                    .sum();
+                assert!((1..=64).contains(&(polls_after_control - polls_at_yield)));
+                assert!(gate.control_read.borrow().is_none());
+                assert_eq!(
+                    probes.borrow()[16].cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::CANCEL, true)]
+                );
+                assert!(
+                    probes
+                        .borrow()
+                        .iter()
+                        .all(|probe| probe.produced_bytes.get() < 1024)
+                );
+                let decoded =
+                    decode_server_frames_with_requests(&state.borrow().writes.concat(), 17);
+                assert_eq!(decoded.ping_replies, [43]);
+                assert!(decoded.errors.is_empty());
+            })
+            .await;
+            release_control.notify_one();
+            release_eof.notify_one();
+            if outcome.is_err() {
+                handle.cancel();
+            }
+            let result = match finished {
+                Some(result) => result,
+                None => tokio::time::timeout(Duration::from_secs(5), run)
+                    .await
+                    .expect("ready responses and control input complete"),
+            };
+            if let Err(payload) = outcome {
+                resume_unwind(payload);
+            }
+            result.unwrap();
+            let probes = probes.borrow();
+            assert_eq!(probes.len(), 17);
+            for probe in &probes[..16] {
+                assert_eq!(probe.produced_bytes.get(), 1024);
+                assert_eq!(probe.response_complete.get(), 1);
+                assert_eq!(probe.completed.get(), 1);
+                assert_eq!(probe.dropped.get(), 1);
+                assert!(probe.cancelled.borrow().is_empty());
+            }
+            assert_eq!(probes[16].completed.get(), 0);
+            assert_eq!(probes[16].dropped.get(), 1);
+            assert_eq!(
+                probes[16].cancelled.borrow().as_slice(),
+                &[(HttpErrorCode::CANCEL, true)]
+            );
+            let decoded = decode_server_frames_with_requests(&state.borrow().writes.concat(), 17);
+            assert_eq!(decoded.ping_replies, [43]);
+            assert!((16 * 1024..17 * 1024).contains(&decoded.body_bytes));
+            assert!(decoded.body_data.iter().all(|byte| *byte == b'r'));
+            assert!(decoded.resets.is_empty());
+            assert!(decoded.errors.is_empty());
+        })
+    });
+}
+
+struct PollCountingTransport {
+    inner: Rc<FixtureTransport>,
+    reads: Rc<RefCell<Vec<usize>>>,
+    writes: Rc<RefCell<Vec<usize>>>,
+    wake_first: bool,
+    read_panic: Option<Rc<ReadPollPanic>>,
+}
+
+#[derive(Default)]
+struct ReadPollPanic {
+    token: RefCell<Option<CancellationToken>>,
+    completed: Cell<bool>,
+    drops: Cell<usize>,
+}
+
+struct ReadPollDrop(Rc<ReadPollPanic>);
+
+impl Drop for ReadPollDrop {
+    fn drop(&mut self) {
+        self.0.drops.set(self.0.drops.get() + 1);
+    }
+}
+
+impl PollCountingTransport {
+    fn counted<T: 'static>(
+        &self,
+        counts: &Rc<RefCell<Vec<usize>>>,
+        mut operation: LocalTransportFuture<T>,
+        read_panic: Option<Rc<ReadPollPanic>>,
+    ) -> LocalTransportFuture<T> {
+        let index = counts.borrow().len();
+        counts.borrow_mut().push(0);
+        let counts = Rc::clone(counts);
+        let wake_first = self.wake_first;
+        let read_panic = read_panic.map(ReadPollDrop);
+        Box::pin(poll_fn(move |context| {
+            let ordinal = {
+                let mut counts = counts.borrow_mut();
+                counts[index] += 1;
+                counts[index]
+            };
+            if read_panic.is_some() {
+                match ordinal {
+                    1 => panic_any("first native read poll"),
+                    2 => panic_any("second native read poll"),
+                    _ => {}
+                }
+            }
+            if wake_first && ordinal == 1 {
+                context.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                let result = operation.as_mut().poll(context);
+                if result.is_ready()
+                    && let Some(probe) = &read_panic
+                {
+                    probe.0.completed.set(true);
+                }
+                result
+            }
+        }))
+    }
+}
+
+impl UniplexTransport for PollCountingTransport {
+    fn read(
+        &self,
+        context: &WorkerContext,
+        maximum: usize,
+        allocation_size: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        if let Some(probe) = &self.read_panic {
+            *probe.token.borrow_mut() = Some(cancellation.clone());
+        }
+        self.counted(
+            &self.reads,
+            self.inner
+                .read(context, maximum, allocation_size, timeout, cancellation),
+            self.read_panic.clone(),
+        )
+    }
+
+    fn write(
+        &self,
+        context: &WorkerContext,
+        data: BufQueue,
+        flags: ByteEventWriteFlags,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        self.counted(
+            &self.writes,
+            self.inner
+                .write(context, data, flags, timeout, cancellation),
+            None,
+        )
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.shutdown_write(context)
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close_with_reset(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.inner.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.inner.register_byte_event(context, registration)
+    }
+}
+
+#[test]
+fn pending_native_io_is_not_repolled_by_ready_body_work() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let finish_read = Arc::new(tokio::sync::Notify::new());
+            let finish_write = Arc::new(tokio::sync::Notify::new());
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let (inner, wire) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitDataEof(Arc::clone(&finish_read), Vec::new()),
+            ]);
+            wire.borrow_mut().write_gate = Some(Arc::clone(&finish_write));
+            let reads = Rc::new(RefCell::new(Vec::new()));
+            let writes = Rc::new(RefCell::new(Vec::new()));
+            let transport = Rc::new(PollCountingTransport {
+                inner,
+                reads: Rc::clone(&reads),
+                writes: Rc::clone(&writes),
+                wake_first: false,
+                read_panic: None,
+            });
+            let (mut application, probes) = Application::new(vec![Reply::Body(1024)]);
+            application.body_chunk = 1;
+            let mut config = options(context, transport);
+            config.io.maximum_write_size = 128;
+            let (session, _) = OwnedH2Session::new(application, config).unwrap();
+            let mut run = Box::pin(session.run());
+            let first = poll_fn(|context| Poll::Ready(run.as_mut().poll(context))).await;
+            let yielded = first.is_pending();
+            let pending_read_polls = reads.borrow().get(1).copied();
+            let pending_write_polls = writes.borrow().first().copied();
+            let write_waiting = wire.borrow().write_gate_pending.is_some();
+            let body_polls = probes
+                .borrow()
+                .first()
+                .map_or(0, |probe| probe.body_polls.get());
+            finish_read.notify_one();
+            finish_write.notify_one();
+            let result = match first {
+                Poll::Ready(result) => result,
+                Poll::Pending => tokio::time::timeout(Duration::from_secs(5), run)
+                    .await
+                    .unwrap(),
+            };
+            result.unwrap();
+            assert!(yielded && write_waiting);
+            assert!(body_polls > 1, "ready body work advances while I/O is held");
+            assert_eq!(
+                (pending_read_polls, pending_write_polls),
+                (Some(1), Some(1)),
+                "the same retained read and write receive no wake before the snapshot"
+            );
+            let probe = Rc::clone(&probes.borrow()[0]);
+            assert_eq!(probe.completed.get(), 1);
+            assert_eq!(probe.dropped.get(), 1);
+            assert!(probe.cancelled.borrow().is_empty());
+            let decoded = decode_server_frames(&wire.borrow().writes.concat());
+            assert_eq!(decoded.body_data, vec![b'r'; 1024]);
+            assert!(decoded.resets.is_empty());
+            assert!(decoded.errors.is_empty());
+        })
+    });
+}
+
+#[test]
+fn native_io_wake_during_poll_preserves_same_turn_progress_and_new_operations() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let finish_read = Arc::new(tokio::sync::Notify::new());
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let (inner, wire) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::SegmentedData(queue(b"")),
+                FixtureRead::WaitDataEof(Arc::clone(&finish_read), Vec::new()),
+            ]);
+            let reads = Rc::new(RefCell::new(Vec::new()));
+            let writes = Rc::new(RefCell::new(Vec::new()));
+            let transport = Rc::new(PollCountingTransport {
+                inner,
+                reads: Rc::clone(&reads),
+                writes: Rc::clone(&writes),
+                wake_first: true,
+                read_panic: None,
+            });
+            let (mut application, probes) = Application::new(vec![Reply::Body(1024)]);
+            application.body_chunk = 1;
+            let mut config = options(context, transport);
+            config.io.maximum_write_size = 128;
+            let (session, _) = OwnedH2Session::new(application, config).unwrap();
+            let mut run = Box::pin(session.run());
+            let first = poll_fn(|context| Poll::Ready(run.as_mut().poll(context))).await;
+            let yielded = first.is_pending();
+            let first_reads = reads.borrow().clone();
+            let first_writes = writes.borrow().clone();
+            finish_read.notify_one();
+            let result = match first {
+                Poll::Ready(result) => result,
+                Poll::Pending => tokio::time::timeout(Duration::from_secs(5), run)
+                    .await
+                    .unwrap(),
+            };
+            result.unwrap();
+            assert!(yielded);
+            assert!(
+                first_reads.first().is_some_and(|polls| *polls >= 2)
+                    && first_reads.get(1).is_some_and(|polls| *polls >= 2),
+                "an in-poll wake permits repoll and the next read's first poll: {first_reads:?}"
+            );
+            assert!(
+                first_writes.first().is_some_and(|polls| *polls >= 2),
+                "an in-poll write wake survives while body work progresses: {first_writes:?}"
+            );
+            let probe = Rc::clone(&probes.borrow()[0]);
+            assert_eq!(probe.completed.get(), 1);
+            assert_eq!(probe.dropped.get(), 1);
+            assert!(probe.cancelled.borrow().is_empty());
+            let decoded = decode_server_frames(&wire.borrow().writes.concat());
+            assert_eq!(decoded.body_data, vec![b'r'; 1024]);
+            assert!(decoded.resets.is_empty());
+            assert!(decoded.errors.is_empty());
+        })
+    });
+}
+
+#[test]
+fn repeated_native_read_poll_panics_still_join_before_resuming_the_first_panic() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (inner, wire) = FixtureTransport::new([]);
+            let reads = Rc::new(RefCell::new(Vec::new()));
+            let probe = Rc::new(ReadPollPanic::default());
+            let transport = Rc::new(PollCountingTransport {
+                inner,
+                reads: Rc::clone(&reads),
+                writes: Rc::new(RefCell::new(Vec::new())),
+                wake_first: false,
+                read_panic: Some(Rc::clone(&probe)),
+            });
+            let (application, streams) = Application::new(Vec::new());
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                eligibility_catch_unwind(session.run()),
+            )
+            .await
+            .expect("repeated pre-registration read panics still join cancellation");
+            let panic = result.expect_err("the first transport poll panic is resumed");
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"first native read poll")
+            );
+            assert_eq!(&*reads.borrow(), &[3]);
+            assert!(
+                probe
+                    .token
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .is_cancellation_requested()
+            );
+            assert!(probe.completed.get());
+            assert_eq!(probe.drops.get(), 1);
+            assert!(!handle.initiate_drain().unwrap());
+            assert_eq!(wire.borrow().close, FixtureClose::Reset);
+            assert!(streams.borrow().is_empty());
+        })
+    });
+}
+
+#[test]
+fn response_header_priorities_preserve_wire_order_and_paused_cleanup() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut input = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+            input.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::Settings {
+                    settings: &[CodecSetting {
+                        identifier: SettingsId::InitialWindowSize.as_u16(),
+                        value: 0,
+                    }],
+                },
+            ));
+            let mut request = HttpMessage::new();
+            request.set_method(HttpMethod::Get).unwrap();
+            request.set_url(b"/priority", false).unwrap();
+            request.set_http_version(1, 1);
+            request
+                .headers_mut()
+                .set(HttpHeaderCode::Host, b"example.com");
+            for urgency in [6, 7, 1, 1] {
+                let stream = peer.create_stream();
+                request
+                    .set_http_priority(HttpPriority::from_urgency_and_incremental(urgency, true));
+                input.extend(eligibility_frame(
+                    &mut peer,
+                    EgressFrame::Headers {
+                        stream,
+                        message: &request,
+                        end_stream: true,
+                        extra_headers: None,
+                    },
+                ));
+            }
+            let credit = eligibility_frame(
+                &mut peer,
+                EgressFrame::Settings {
+                    settings: &[CodecSetting {
+                        identifier: SettingsId::InitialWindowSize.as_u16(),
+                        value: 1,
+                    }],
+                },
+            );
+            let mut reset = eligibility_frame(
+                &mut peer,
+                EgressFrame::Reset {
+                    stream: StreamId::new(7),
+                    code: H2ErrorCode::CANCEL,
+                },
+            );
+            reset.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::PingRequest { data: Some(97) },
+            ));
+            let send_credit = Arc::new(tokio::sync::Notify::new());
+            let send_reset = Arc::new(tokio::sync::Notify::new());
+            let (transport, wire) = FixtureTransport::new([
+                FixtureRead::Data(input),
+                FixtureRead::WaitData(Arc::clone(&send_credit), credit),
+                FixtureRead::WaitData(Arc::clone(&send_reset), reset),
+            ]);
+            let owner_gate = Rc::new(OwnerPollGate {
+                ready: Cell::new(true),
+                ..OwnerPollGate::default()
+            });
+            let (mut application, probes) = Application::new(vec![Reply::Body(1); 4]);
+            application.owner_poll_gate = Some(Rc::clone(&owner_gate));
+            application.response_priorities = vec![
+                Some(HttpPriority::new(2, false, 20, false, 0)),
+                Some(HttpPriority::new(2, false, 10, false, 0)),
+                None,
+                Some(HttpPriority::new(0, true, 0, true, 0)),
+            ];
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let decode = || {
+                let bytes = wire.borrow().writes.concat();
+                let mut codec = Http2Codec::new(TransportDirection::Upstream);
+                for id in [1, 3, 5, 7] {
+                    assert_eq!(codec.create_stream(), StreamId::new(id));
+                }
+                let mut decoded = CompleteCreditWire::default();
+                let mut output = BufQueue::new(4096);
+                let result = codec.on_ingress(&queue(&bytes), &mut decoded, &mut output);
+                assert_eq!(result.consumed, bytes.len());
+                assert!(result.egress_results.iter().all(Result::is_ok));
+                decoded
+            };
+            exercise(
+                session,
+                &handle,
+                &[Arc::clone(&send_credit), Arc::clone(&send_reset)],
+                async {
+                    complete_credit_wait(|| {
+                        let probes = probes.borrow();
+                        probes.len() == 4
+                            && probes.iter().all(|probe| probe.produced_bytes.get() == 1)
+                            && decode().frames.header_streams.len() == 4
+                    })
+                    .await;
+                    let probes = probes.borrow().clone();
+                    assert_eq!(decode().frames.body_bytes, 0);
+                    assert!(probes.iter().all(|probe| probe.completed.get() == 0));
+                    let ready_owner = owner_gate.wakers.borrow()[0].as_ref().unwrap().clone();
+                    send_credit.notify_one();
+                    ready_owner.wake_by_ref();
+                    complete_credit_wait(|| {
+                        probes[..3].iter().all(|probe| probe.completed.get() == 1)
+                    })
+                    .await;
+                    let expected = [StreamId::new(5), StreamId::new(3), StreamId::new(1)];
+                    let sent = decode();
+                    assert_eq!(sent.frames.body_streams, expected);
+                    assert_eq!(sent.frames.body_data, b"rrr");
+                    assert_eq!(sent.completed, expected);
+                    assert_eq!(probes[3].response_complete.get(), 0);
+                    assert_eq!(probes[3].completed.get(), 0);
+                    assert_eq!(probes[3].dropped.get(), 0);
+                    send_reset.notify_one();
+                    complete_credit_wait(|| {
+                        probes[3].dropped.get() == 1 && decode().frames.ping_replies == [97]
+                    })
+                    .await;
+                    for probe in &probes[..3] {
+                        assert_eq!(probe.response_complete.get(), 1);
+                        assert_eq!(probe.completed.get(), 1);
+                        assert_eq!(probe.dropped.get(), 1);
+                        assert!(probe.cancelled.borrow().is_empty());
+                    }
+                    assert_eq!(probes[3].completed.get(), 0);
+                    assert_eq!(
+                        probes[3].cancelled.borrow().as_slice(),
+                        &[(HttpErrorCode::CANCEL, true)]
+                    );
+                    let sent = decode();
+                    assert_eq!(sent.frames.body_streams, expected);
+                    assert_eq!(sent.completed, expected);
+                    assert!(sent.frames.resets.is_empty());
+                    assert!(sent.frames.errors.is_empty());
+                },
+            )
+            .await;
+        })
+    });
+}
+
+#[test]
+fn reentrant_parent_wake_preserves_queued_owners_after_panic() {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::Wake;
+
+    struct ParentWakePanic(Arc<()>);
+
+    struct ReentrantWake {
+        delegate: Waker,
+        armed: Arc<AtomicBool>,
+        notifications: Arc<AtomicUsize>,
+        second: Arc<Mutex<Option<Waker>>>,
+        marker: Arc<()>,
+    }
+
+    impl Wake for ReentrantWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.notifications.fetch_add(1, Ordering::SeqCst);
+            if self.armed.swap(false, Ordering::SeqCst) {
+                let second = self.second.lock().unwrap().take();
+                if let Some(second) = second {
+                    second.wake_by_ref();
+                }
+                panic_any(ParentWakePanic(Arc::clone(&self.marker)));
+            }
+            self.delegate.wake_by_ref();
+        }
+    }
+
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let release_eof = Arc::new(tokio::sync::Notify::new());
+            let gate = Rc::new(OwnerPollGate::default());
+            let (mut peer, input) = ready_owner_requests(2);
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitDataEof(Arc::clone(&release_eof), Vec::new()),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(1); 2]);
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let armed = Arc::new(AtomicBool::new(false));
+            let notifications = Arc::new(AtomicUsize::new(0));
+            let second = Arc::new(Mutex::new(None));
+            let marker = Arc::new(());
+            let scenario = async {
+                let outcome =
+                    eligibility_catch_unwind(tokio::time::timeout(Duration::from_secs(5), async {
+                        complete_credit_wait(|| {
+                            let state = state.borrow();
+                            let wakers = gate.wakers.borrow();
+                            state.reads.is_empty()
+                                && !state.writes.is_empty()
+                                && wakers.len() == 2
+                                && wakers.iter().all(Option::is_some)
+                        })
+                        .await;
+                        let first = {
+                            let wakers = gate.wakers.borrow();
+                            *second.lock().unwrap() = Some(wakers[1].as_ref().unwrap().clone());
+                            wakers[0].as_ref().unwrap().clone()
+                        };
+                        gate.ready.set(true);
+                        let before = notifications.load(Ordering::SeqCst);
+                        armed.store(true, Ordering::SeqCst);
+                        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            first.wake_by_ref();
+                        }))
+                        .expect_err("the parent notification panic escapes the external wake");
+                        assert!(Arc::ptr_eq(
+                            &panic.downcast_ref::<ParentWakePanic>().unwrap().0,
+                            &marker,
+                        ));
+                        assert!(!armed.load(Ordering::SeqCst));
+                        assert_eq!(
+                            notifications.load(Ordering::SeqCst) - before,
+                            2,
+                            "the second owner must enqueue and notify during parent reentry"
+                        );
+                        drop(panic);
+                        complete_credit_wait(|| {
+                            probes
+                                .borrow()
+                                .iter()
+                                .all(|probe| probe.completed.get() == 1 && probe.dropped.get() == 1)
+                        })
+                        .await;
+                        let probes = probes.borrow();
+                        assert_eq!(probes.len(), 2);
+                        for probe in probes.iter() {
+                            assert_eq!(probe.requested.get(), 1);
+                            assert_eq!(probe.response_complete.get(), 1);
+                            assert_eq!(probe.produced_bytes.get(), 1);
+                            assert!(probe.cancelled.borrow().is_empty());
+                        }
+                    }))
+                    .await;
+                armed.store(false, Ordering::SeqCst);
+                let remaining_waker = second.lock().unwrap().take();
+                drop(remaining_waker);
+                gate.ready.set(true);
+                gate.wakers
+                    .borrow()
+                    .iter()
+                    .flatten()
+                    .for_each(Waker::wake_by_ref);
+                release_eof.notify_one();
+                if !matches!(&outcome, Ok(Ok(()))) {
+                    handle.cancel();
+                }
+                outcome
+            };
+            let mut run = Box::pin(session.run());
+            let (result, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(
+                    poll_fn(|context| {
+                        let waker = Waker::from(Arc::new(ReentrantWake {
+                            delegate: context.waker().clone(),
+                            armed: Arc::clone(&armed),
+                            notifications: Arc::clone(&notifications),
+                            second: Arc::clone(&second),
+                            marker: Arc::clone(&marker),
+                        }));
+                        run.as_mut().poll(&mut Context::from_waker(&waker))
+                    }),
+                    scenario,
+                )
+            })
+            .await
+            .expect("both queued owners and native I/O join after parent wake reentry");
+            drop(run);
+            gate.wakers.borrow_mut().clear();
+            match outcome {
+                Ok(result) => result.expect("queued owners progress without a fallback wake"),
+                Err(payload) => resume_unwind(payload),
+            }
+            result.unwrap();
+            let wire = state.borrow().writes.concat();
+            let mut decoded = CompleteCreditWire::default();
+            let mut output = BufQueue::new(1 << 20);
+            let parsed = peer.on_ingress(&queue(&wire), &mut decoded, &mut output);
+            assert_eq!(parsed.consumed, wire.len());
+            assert!(parsed.egress_results.iter().all(Result::is_ok));
+            assert_eq!(
+                decoded.frames.header_statuses,
+                [(StreamId::new(1), 200), (StreamId::new(3), 200)]
+            );
+            assert_eq!(
+                decoded.frames.body_streams,
+                [StreamId::new(1), StreamId::new(3)]
+            );
+            assert_eq!(decoded.frames.body_data, vec![b'r'; 2]);
+            assert_eq!(decoded.completed, [StreamId::new(1), StreamId::new(3)]);
+            assert!(decoded.frames.resets.is_empty());
+            assert!(decoded.frames.errors.is_empty());
+            assert!(state.borrow().transport_dropped);
+        })
+    });
+}
+
+#[test]
+fn pending_headers_ignore_credit_notifications_without_blocking_control() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let gate = Rc::new(OwnerPollGate::default());
+            let ping_gates: Vec<_> = (0..3)
+                .map(|_| Arc::new(tokio::sync::Notify::new()))
+                .collect();
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut reads = vec![FixtureRead::Data(peer_incomplete_post_bytes(3 * 16_384))];
+            for (ordinal, release) in ping_gates.iter().enumerate() {
+                reads.push(FixtureRead::WaitData(
+                    Arc::clone(release),
+                    eligibility_frame(
+                        &mut peer,
+                        EgressFrame::PingRequest {
+                            data: Some(40 + ordinal as u64),
+                        },
+                    ),
+                ));
+            }
+            let (transport, state) = FixtureTransport::new(reads);
+            let (mut application, probes) = Application::new(vec![Reply::Body(1)]);
+            application.retain_request = true;
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            exercise(session, &handle, &ping_gates, async {
+                complete_credit_wait(|| {
+                    gate.polls.get() == 1
+                        && probes.borrow()[0]
+                            .ingress
+                            .borrow()
+                            .as_ref()
+                            .unwrap()
+                            .body_bytes_received()
+                            == 3 * 16_384
+                })
+                .await;
+                let probe = Rc::clone(&probes.borrow()[0]);
+                let mut body = probe.held_body.borrow_mut().take().unwrap();
+                for (ordinal, release) in ping_gates.iter().enumerate() {
+                    let event = body.read_body_event(16_384).await.unwrap();
+                    assert_eq!(event.as_body().unwrap().chain_length(), 16_384);
+                    assert!(!event.eom());
+                    release.notify_one();
+                    complete_credit_wait(|| {
+                        decode_server_frames(&state.borrow().writes.concat())
+                            .ping_replies
+                            .len()
+                            == ordinal + 1
+                    })
+                    .await;
+                    assert_eq!(gate.polls.get(), 1);
+                    assert_eq!(probe.body_polls.get(), 0);
+                }
+                let decoded = decode_server_frames(&state.borrow().writes.concat());
+                assert_eq!(decoded.ping_replies, [40, 41, 42]);
+                assert!(
+                    decoded
+                        .window_updates
+                        .contains(&(StreamId::UNSPECIFIED, 32_768))
+                );
+                assert!(decoded.header_statuses.is_empty());
+                assert!(decoded.errors.is_empty());
+                drop(body);
+                handle.cancel();
+                complete_credit_wait(|| probe.dropped.get() == 1).await;
+                assert_eq!(gate.polls.get(), 1);
+                assert_eq!(probe.response_complete.get(), 0);
+                assert_eq!(probe.completed.get(), 0);
+                assert_eq!(
+                    probe.cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::CORO_CANCELLED, false)]
+                );
+            })
+            .await;
+            assert!(state.borrow().transport_dropped);
+        })
+    });
+}
+
+#[test]
+fn pending_headers_preserve_coalesced_and_self_wakes() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let gate = Rc::new(OwnerPollGate::default());
+            let input = peer_request_bytes(HttpMethod::Post, b"x", None, PeerControl::None);
+            let (transport, state) = FixtureTransport::new([FixtureRead::Data(input)]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(2)]);
+            application.retain_request = true;
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            exercise(session, &handle, &[], async {
+                complete_credit_wait(|| {
+                    gate.polls.get() == 1
+                        && probes.borrow()[0]
+                            .ingress
+                            .borrow()
+                            .as_ref()
+                            .unwrap()
+                            .body_bytes_received()
+                            == 1
+                })
+                .await;
+                let probe = Rc::clone(&probes.borrow()[0]);
+                let mut body = probe.held_body.borrow_mut().take().unwrap();
+                let event = body.read_body_event(1).await.unwrap();
+                assert_eq!(event.as_body().unwrap().chain_length(), 1);
+                assert!(event.eom());
+                // The read queued credit/completion before this future wake, with no yield.
+                gate.self_wake_once.set(true);
+                gate.release();
+                drop(body);
+                complete_credit_wait(|| probe.completed.get() == 1 && probe.dropped.get() == 1)
+                    .await;
+                assert_eq!(gate.polls.get(), 3);
+                assert_eq!(probe.response_complete.get(), 1);
+                assert_eq!(probe.produced_bytes.get(), 2);
+                assert!(probe.cancelled.borrow().is_empty());
+                let decoded = complete_credit_wire(false, &state);
+                assert_eq!(decoded.frames.header_statuses, [(StreamId::new(1), 200)]);
+                assert_eq!(decoded.frames.body_data, b"rr");
+                assert_eq!(decoded.completed, [StreamId::new(1)]);
+                assert!(decoded.frames.errors.is_empty());
+            })
+            .await;
+        })
+    });
+}
+
+#[test]
+fn informational_headers_continue_without_an_external_wake() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let gate = Rc::new(OwnerPollGate {
+                ready: Cell::new(true),
+                informational: Cell::new(true),
+                ..OwnerPollGate::default()
+            });
+            let (_, input) = ready_owner_requests(1);
+            let (transport, state) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(2)]);
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            application.body_chunk = 1;
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .expect("informational headers and ready body events continue")
+                .unwrap();
+            assert_eq!(gate.polls.get(), 2);
+            let probe = Rc::clone(&probes.borrow()[0]);
+            assert_eq!(probe.body_polls.get(), 2);
+            assert_eq!(probe.completed.get(), 1);
+            assert_eq!(probe.dropped.get(), 1);
+            assert!(probe.cancelled.borrow().is_empty());
+            let decoded = complete_credit_wire(false, &state);
+            assert_eq!(
+                decoded.frames.header_statuses,
+                [(StreamId::new(1), 103), (StreamId::new(1), 200)]
+            );
+            assert_eq!(decoded.frames.body_data, b"rr");
+            assert_eq!(decoded.completed, [StreamId::new(1)]);
+            assert!(decoded.frames.errors.is_empty());
+        })
+    });
+}
+
+#[test]
+fn cross_thread_stream_wake_resumes_after_ready_queue_drain() {
+    use std::thread;
+
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let release_eof = Arc::new(tokio::sync::Notify::new());
+            let terminal = Arc::new(tokio::sync::Notify::new());
+            let gate = Rc::new(OwnerPollGate::default());
+            let (_, input) = ready_owner_requests(1);
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitDataEof(Arc::clone(&release_eof), Vec::new()),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(2)]);
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            application.empty_terminal = Some(Arc::clone(&terminal));
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let run = tokio::task::spawn_local(session.run());
+            let outcome =
+                eligibility_catch_unwind(tokio::time::timeout(Duration::from_secs(5), async {
+                    complete_credit_wait(|| {
+                        let state = state.borrow();
+                        let wakers = gate.wakers.borrow();
+                        state.reads.is_empty()
+                            && !state.writes.is_empty()
+                            && wakers.len() == 1
+                            && wakers[0].is_some()
+                    })
+                    .await;
+                    let probe = Rc::clone(&probes.borrow()[0]);
+                    assert_eq!(probe.body_polls.get(), 0);
+                    let waker = gate.wakers.borrow()[0].as_ref().unwrap().clone();
+                    gate.ready.set(true);
+                    thread::spawn(move || waker.wake())
+                        .join()
+                        .expect("the external header wake returns");
+
+                    complete_credit_wait(|| {
+                        probe.produced_bytes.get() == 2 && probe.body_polls.get() >= 2
+                    })
+                    .await;
+                    let decoded = complete_credit_wire(false, &state);
+                    assert_eq!(decoded.frames.header_statuses, [(StreamId::new(1), 200)]);
+                    assert_eq!(decoded.frames.body_data, vec![b'r'; 2]);
+                    assert!(decoded.completed.is_empty());
+                    assert_eq!(probe.response_complete.get(), 0);
+                    assert_eq!(probe.completed.get(), 0);
+                    assert_eq!(probe.dropped.get(), 0);
+                    assert!(probe.cancelled.borrow().is_empty());
+
+                    let terminal = Arc::clone(&terminal);
+                    thread::spawn(move || terminal.notify_one())
+                        .join()
+                        .expect("the external terminal-body wake returns");
+                    complete_credit_wait(|| probe.completed.get() == 1 && probe.dropped.get() == 1)
+                        .await;
+                    assert_eq!(probe.requested.get(), 1);
+                    assert_eq!(probe.produced_bytes.get(), 2);
+                    assert_eq!(probe.response_complete.get(), 1);
+                    assert!(probe.cancelled.borrow().is_empty());
+                    assert_eq!(
+                        complete_credit_wire(false, &state).completed,
+                        [StreamId::new(1)]
+                    );
+                }))
+                .await;
+            if !matches!(&outcome, Ok(Ok(()))) {
+                gate.ready.set(true);
+                gate.wakers
+                    .borrow()
+                    .iter()
+                    .flatten()
+                    .for_each(Waker::wake_by_ref);
+                terminal.notify_one();
+                handle.cancel();
+            }
+            release_eof.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the independently scheduled driver joins its native I/O");
+            gate.wakers.borrow_mut().clear();
+            match outcome {
+                Ok(result) => result.expect("both cross-thread stream wakes make progress"),
+                Err(payload) => resume_unwind(payload),
+            }
+            result.expect("the driver does not panic").unwrap();
+            let decoded = complete_credit_wire(false, &state);
+            assert_eq!(decoded.frames.header_statuses, [(StreamId::new(1), 200)]);
+            assert_eq!(decoded.frames.body_data, vec![b'r'; 2]);
+            assert_eq!(decoded.completed, [StreamId::new(1)]);
+            assert!(decoded.frames.resets.is_empty());
+            assert!(decoded.frames.errors.is_empty());
+            assert!(state.borrow().transport_dropped);
+        })
+    });
+}
+
+#[test]
+#[ignore = "manual fixed-work dispatch mechanism measurement"]
+fn measure_owned_h2_dispatch() {
+    use std::env;
+    use std::hint::black_box;
+
+    const CONCURRENCY: usize = 16;
+    const BODY_BYTES: usize = 1024;
+    const WARMUP: usize = 64;
+    const RESPONSE_DATE: &[u8] = b"Thu, 01 Jan 1970 00:00:00 GMT";
+
+    #[derive(Default)]
+    struct DispatchWire {
+        decoded: CompleteCreditWire,
+        date_headers: usize,
+    }
+
+    impl HttpCodecCallback for DispatchWire {
+        fn on_event(&mut self, event: CodecEvent<'_>) {
+            if let CodecEvent::HeadersComplete { message, .. } = &event {
+                assert_eq!(message.headers().number_of_values(HttpHeaderCode::Date), 1);
+                assert_eq!(
+                    message.headers().get_single_or_empty(HttpHeaderCode::Date),
+                    RESPONSE_DATE,
+                );
+                self.date_headers += 1;
+            }
+            self.decoded.on_event(event);
+        }
+    }
+
+    fn process_cpu_ns() -> u64 {
+        let mut stamp = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime writes one timespec to an aligned, initialized
+        // local whose exclusive borrow remains valid for the entire call.
+        let result = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut stamp) };
+        assert_eq!(result, 0, "the process CPU clock must be available");
+        u64::try_from(stamp.tv_sec)
+            .expect("nonnegative CPU seconds")
+            .checked_mul(1_000_000_000)
+            .and_then(|seconds| seconds.checked_add(u64::try_from(stamp.tv_nsec).ok()?))
+            .expect("process CPU time fits in nanoseconds")
+    }
+
+    let validation_only = env::var_os("COMPONENT_BENCH_VALIDATE").is_some_and(|value| value == "1");
+    assert!(
+        !cfg!(debug_assertions) || validation_only,
+        "use the optimized test image or explicit validation mode"
+    );
+    let arm = env::var("COMPONENT_BENCH_ARM").expect("COMPONENT_BENCH_ARM");
+    assert!(matches!(arm.as_str(), "baseline" | "candidate"));
+    let pair = env::var("COMPONENT_BENCH_PAIR")
+        .expect("COMPONENT_BENCH_PAIR")
+        .parse::<u32>()
+        .expect("integer pair");
+    assert!((1..=10).contains(&pair));
+    let case = env::var("COMPONENT_BENCH_CASE").expect("COMPONENT_BENCH_CASE");
+    let blocked = match case.as_str() {
+        "ready_c16" => false,
+        "blocked_c16" => true,
+        _ => panic!("expected ready_c16 or blocked_c16"),
+    };
+    let operations = 2048;
+
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let total = WARMUP + operations;
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut request = HttpMessage::new();
+            request.set_method(HttpMethod::Post).unwrap();
+            request.set_url(b"/dispatch-component", false).unwrap();
+            request.set_http_version(1, 1);
+            request
+                .headers_mut()
+                .set(HttpHeaderCode::Host, b"example.com");
+            request
+                .headers_mut()
+                .set(HttpHeaderCode::ContentLength, b"1024");
+            request.set_http_priority(HttpPriority::from_urgency_and_incremental(0, true));
+            let payload = vec![b'q'; BODY_BYTES];
+            let mut reads = Vec::new();
+            let mut waves = Vec::new();
+            for wave in 0..total / CONCURRENCY {
+                let mut input = BufQueue::new(1 << 20);
+                if wave == 0 {
+                    peer.generate(
+                        &mut input,
+                        EgressFrame::ConnectionPreface,
+                        &mut IgnoreCodecEvents,
+                    )
+                    .unwrap();
+                    peer.generate_configured_settings(&mut input, &mut IgnoreCodecEvents)
+                        .unwrap();
+                }
+                peer.generate(
+                    &mut input,
+                    EgressFrame::WindowUpdate {
+                        stream: StreamId::UNSPECIFIED,
+                        amount: (CONCURRENCY * BODY_BYTES) as u32,
+                    },
+                    &mut IgnoreCodecEvents,
+                )
+                .unwrap();
+                if blocked {
+                    peer.generate(
+                        &mut input,
+                        EgressFrame::Settings {
+                            settings: &[CodecSetting {
+                                identifier: SettingsId::InitialWindowSize.as_u16(),
+                                value: 0,
+                            }],
+                        },
+                        &mut IgnoreCodecEvents,
+                    )
+                    .unwrap();
+                }
+                for _ in 0..CONCURRENCY {
+                    let stream = peer.create_stream();
+                    peer.generate(
+                        &mut input,
+                        EgressFrame::Headers {
+                            stream,
+                            message: &request,
+                            end_stream: false,
+                            extra_headers: None,
+                        },
+                        &mut IgnoreCodecEvents,
+                    )
+                    .unwrap();
+                    peer.generate(
+                        &mut input,
+                        EgressFrame::Body {
+                            stream,
+                            body: queue(&payload),
+                            padding: None,
+                            end_stream: true,
+                        },
+                        &mut IgnoreCodecEvents,
+                    )
+                    .unwrap();
+                }
+                let admit = Arc::new(tokio::sync::Notify::new());
+                reads.push(FixtureRead::WaitSegmentedData(
+                    Arc::clone(&admit),
+                    black_box(input),
+                ));
+                let release = blocked.then(|| {
+                    let release = Arc::new(tokio::sync::Notify::new());
+                    let mut credit = BufQueue::new(4096);
+                    peer.generate(
+                        &mut credit,
+                        EgressFrame::Settings {
+                            settings: &[CodecSetting {
+                                identifier: SettingsId::InitialWindowSize.as_u16(),
+                                value: BODY_BYTES as u64,
+                            }],
+                        },
+                        &mut IgnoreCodecEvents,
+                    )
+                    .unwrap();
+                    reads.push(FixtureRead::WaitSegmentedData(Arc::clone(&release), credit));
+                    release
+                });
+                waves.push((admit, release));
+            }
+            let eof = Arc::new(tokio::sync::Notify::new());
+            reads.push(FixtureRead::WaitDataEof(Arc::clone(&eof), Vec::new()));
+            let (transport, state) = FixtureTransport::new(black_box(reads));
+            let owner_gate = Rc::new(OwnerPollGate {
+                ready: Cell::new(true),
+                ..OwnerPollGate::default()
+            });
+            let (mut application, probes) = Application::new(vec![Reply::Body(BODY_BYTES); total]);
+            application.body_chunk = BODY_BYTES;
+            application.response_date = Some(RESPONSE_DATE);
+            application.owner_poll_gate = Some(Rc::clone(&owner_gate));
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let feeder = async {
+                let mut start = None;
+                for (wave, (admit, release)) in waves.iter().enumerate() {
+                    let begin = wave * CONCURRENCY;
+                    let end = begin + CONCURRENCY;
+                    if begin == WARMUP {
+                        let state = state.borrow();
+                        let warmup_writes = state.writes.len();
+                        let warmup_bytes = state.writes.iter().map(Vec::len).sum::<usize>();
+                        start = Some((
+                            Instant::now(),
+                            process_cpu_ns(),
+                            warmup_writes,
+                            warmup_bytes,
+                        ));
+                    }
+                    admit.notify_one();
+                    if let Some(release) = release {
+                        while {
+                            let probes = probes.borrow();
+                            probes.len() < end
+                                || probes[begin..end]
+                                    .iter()
+                                    .any(|probe| probe.produced_bytes.get() != BODY_BYTES)
+                        } {
+                            tokio::task::yield_now().await;
+                        }
+                        let other_owner = owner_gate.wakers.borrow()[end - 1]
+                            .as_ref()
+                            .unwrap()
+                            .clone();
+                        release.notify_one();
+                        other_owner.wake_by_ref();
+                    }
+                    while {
+                        let probes = probes.borrow();
+                        probes.len() < end
+                            || probes[begin..end]
+                                .iter()
+                                .any(|probe| probe.completed.get() != 1 || probe.dropped.get() != 1)
+                    } {
+                        tokio::task::yield_now().await;
+                    }
+                    owner_gate.wakers.borrow_mut()[begin..end]
+                        .iter_mut()
+                        .for_each(|waker| drop(waker.take()));
+                    probes.borrow()[begin..end].iter().for_each(|probe| {
+                        drop(probe.ingress.borrow_mut().take());
+                    });
+                }
+                eof.notify_one();
+                start.expect("the measured waves were reached")
+            };
+            let (run, (start, cpu_start, warmup_writes, warmup_bytes)) =
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    tokio::join!(session.run(), feeder)
+                })
+                .await
+                .expect("fixed work and session teardown complete");
+            let cpu_ns = process_cpu_ns().checked_sub(cpu_start).unwrap();
+            let elapsed_ns = start.elapsed().as_nanos();
+            let summary = black_box(run.expect("session completes successfully"));
+
+            let probes = probes.borrow();
+            assert_eq!(probes.len(), total);
+            assert!(probes.iter().all(|probe| {
+                probe.requested.get() == 1
+                    && probe.request_bytes.get() == BODY_BYTES
+                    && probe.produced_bytes.get() == BODY_BYTES
+                    && probe.body_polls.get() == 1
+                    && probe.response_complete.get() == 1
+                    && probe.completed.get() == 1
+                    && probe.dropped.get() == 1
+                    && probe.cancelled.borrow().is_empty()
+            }));
+            let state = state.borrow();
+            assert!(state.transport_dropped);
+            assert_ne!(state.close, FixtureClose::Reset);
+            let wire = state.writes.concat();
+            let mut decoder = DispatchWire::default();
+            let mut output = BufQueue::new(1 << 20);
+            let mut input = BufQueue::copy_from_slice(&wire, wire.len()).unwrap();
+            let mut consumed = 0;
+            while !input.is_empty() {
+                let parsed = peer.on_ingress(&input, &mut decoder, &mut output);
+                assert!(parsed.consumed > 0, "the peer decoder must make progress");
+                input.trim_start(parsed.consumed).unwrap();
+                consumed += parsed.consumed;
+                assert!(parsed.egress_results.iter().all(Result::is_ok));
+            }
+            assert_eq!(consumed, wire.len());
+            let DispatchWire {
+                decoded,
+                date_headers,
+            } = decoder;
+            assert_eq!(date_headers, total);
+            assert_eq!(decoded.frames.header_statuses.len(), total);
+            assert!(
+                decoded
+                    .frames
+                    .header_statuses
+                    .iter()
+                    .all(|(_, status)| *status == 200)
+            );
+            assert_eq!(decoded.frames.body_bytes, total * BODY_BYTES);
+            assert!(decoded.frames.body_data.iter().all(|byte| *byte == b'r'));
+            assert_eq!(decoded.frames.body_streams.len(), total);
+            if blocked {
+                for (wave, streams) in decoded
+                    .frames
+                    .body_streams
+                    .as_chunks::<CONCURRENCY>()
+                    .0
+                    .iter()
+                    .enumerate()
+                {
+                    let first = StreamId::new((2 * wave * CONCURRENCY + 1) as u64);
+                    let woken = StreamId::new((2 * (wave + 1) * CONCURRENCY - 1) as u64);
+                    assert_eq!(streams[0], first);
+                    assert_ne!(streams[0], woken);
+                }
+            }
+            assert_eq!(decoded.completed.len(), total);
+            assert!(decoded.frames.resets.is_empty());
+            assert!(decoded.frames.errors.is_empty());
+            let checksum = black_box(wire.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            }));
+            let write_submissions = state.writes.len() - warmup_writes;
+            let written_bytes = wire.len() - warmup_bytes;
+            black_box(summary);
+            println!(
+                "COMPONENT_BENCH_JSON {{\"schema\":\"component-bench-v1\",\"event\":\"batch\",\"mechanism\":\"dispatch\",\"arm\":\"{arm}\",\"pair\":{pair},\"case\":\"{case}\",\"operations\":{operations},\"warmup_operations\":{WARMUP},\"elapsed_ns\":{elapsed_ns},\"cpu_ns\":{cpu_ns},\"cpu_clock\":\"process\",\"checksum\":{checksum},\"assertions_passed\":true,\"validation_only\":{validation_only},\"counts\":{{\"sessions\":1,\"lifetime_requests\":{total},\"completed_requests\":{total},\"dropped_exchanges\":{total},\"fixed_date_headers\":{date_headers},\"max_concurrency\":{CONCURRENCY},\"request_body_bytes\":{BODY_BYTES},\"response_body_bytes\":{BODY_BYTES},\"measured_write_submissions\":{write_submissions},\"measured_written_bytes\":{written_bytes}}}}}"
+            );
+        })
+    });
+}
+
+#[derive(Default)]
+pub(super) struct QueuedWriteProbe {
+    pub(super) accepted: Vec<Vec<u8>>,
+    held: VecDeque<BufQueue>,
+    pub(super) released: usize,
+    pub(super) retired: usize,
+    blocked_nonempty: usize,
+    pub(super) complete_inline: bool,
+    acquired: bool,
+    pub(super) dropped: usize,
+    waker: Option<Waker>,
+    /// Released writes complete with `TRANSPORT_WRITE_ERROR`.
+    pub(super) fail_released: bool,
+    /// A [`ReportingWriteQueue`]'s `start_write` reports saturation from then on.
+    pub(super) saturate_on_write: bool,
+}
+
+pub(super) fn release_queued_writes(probe: &Rc<RefCell<QueuedWriteProbe>>, count: usize) {
+    let (waker, retired) = {
+        let mut probe = probe.borrow_mut();
+        assert!(probe.released + count <= probe.accepted.len());
+        probe.released += count;
+        let retired: Vec<_> = probe.held.drain(..count).collect();
+        (probe.waker.take(), retired)
+    };
+    drop(retired);
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+}
+
+pub(super) fn finish_queued_writes(probe: &Rc<RefCell<QueuedWriteProbe>>) {
+    let count = {
+        let mut probe = probe.borrow_mut();
+        probe.complete_inline = true;
+        probe.accepted.len() - probe.released
+    };
+    release_queued_writes(probe, count);
+}
+
+pub(super) struct QueuedFixtureTransport {
+    inner: Rc<FixtureTransport>,
+    pub(super) probe: Rc<RefCell<QueuedWriteProbe>>,
+    /// `Some` selects a [`ReportingWriteQueue`] that answers `is_saturated` from the cell.
+    saturation: Option<Rc<Cell<bool>>>,
+    pub(super) saturation_queries: Rc<Cell<usize>>,
+    panic_on_saturation_query: bool,
+}
+
+impl QueuedFixtureTransport {
+    pub(super) fn new(reads: impl IntoIterator<Item = FixtureRead>) -> Rc<Self> {
+        Self::reporting(reads, None, false)
+    }
+
+    /// `saturation` and `panic_on_query` configure the [`ReportingWriteQueue`]; `None`
+    /// keeps the [`FixtureWriteQueue`] and its default answer.
+    pub(super) fn reporting(
+        reads: impl IntoIterator<Item = FixtureRead>,
+        saturation: Option<Rc<Cell<bool>>>,
+        panic_on_query: bool,
+    ) -> Rc<Self> {
+        let (inner, _) = FixtureTransport::new(reads);
+        Rc::new(Self {
+            inner,
+            probe: Rc::new(RefCell::new(QueuedWriteProbe::default())),
+            saturation,
+            saturation_queries: Rc::default(),
+            panic_on_saturation_query: panic_on_query,
+        })
+    }
+}
+
+pub(super) struct FixtureWriteQueue {
+    probe: Rc<RefCell<QueuedWriteProbe>>,
+    cancellation: CancellationToken,
+}
+
+/// Forwards to a [`FixtureWriteQueue`] and answers `is_saturated` from its cell, counting
+/// queries; it can panic when queried.
+struct ReportingWriteQueue {
+    inner: FixtureWriteQueue,
+    saturation: Rc<Cell<bool>>,
+    queries: Rc<Cell<usize>>,
+    panic_on_query: bool,
+}
+
+impl crate::uniplex::UniplexWriteQueue for ReportingWriteQueue {
+    fn can_write(&self, bytes: usize) -> bool {
+        self.inner.can_write(bytes)
+    }
+
+    fn start_write(&mut self, data: BufQueue) -> Result<(), HttpError> {
+        if self.inner.probe.borrow().saturate_on_write {
+            self.saturation.set(true);
+        }
+        self.inner.start_write(data)
+    }
+
+    fn poll_complete(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<crate::uniplex::UniplexWriteCompletion> {
+        self.inner.poll_complete(context)
+    }
+
+    fn is_idle(&self) -> bool {
+        self.inner.is_idle()
+    }
+
+    fn is_saturated(&self) -> bool {
+        self.queries.set(self.queries.get() + 1);
+        assert!(
+            !self.panic_on_query,
+            "this session must not query saturation"
+        );
+        self.saturation.get()
+    }
+}
+
+impl crate::uniplex::UniplexWriteQueue for FixtureWriteQueue {
+    fn can_write(&self, bytes: usize) -> bool {
+        let mut probe = self.probe.borrow_mut();
+        let pending = probe.accepted.len() - probe.retired;
+        let admitted = pending < 2 && (bytes != 0 || pending == 0);
+        if !admitted && bytes != 0 {
+            probe.blocked_nonempty += 1;
+        }
+        admitted
+    }
+
+    fn start_write(&mut self, data: BufQueue) -> Result<(), HttpError> {
+        assert!(self.can_write(data.chain_length()));
+        let bytes = data
+            .segments()
+            .flat_map(|segment| segment.iter().copied())
+            .collect();
+        let complete_inline = {
+            let mut probe = self.probe.borrow_mut();
+            probe.accepted.push(bytes);
+            probe.held.push_back(data);
+            probe.complete_inline
+        };
+        if complete_inline {
+            release_queued_writes(&self.probe, 1);
+        }
+        Ok(())
+    }
+
+    fn poll_complete(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<crate::uniplex::UniplexWriteCompletion> {
+        let waker = context.waker().clone();
+        let old_waker = self.probe.borrow_mut().waker.replace(waker);
+        drop(old_waker);
+        let requested_bytes = {
+            let mut probe = self.probe.borrow_mut();
+            if probe.retired == probe.released {
+                return Poll::Pending;
+            }
+            let bytes = probe.accepted[probe.retired].len();
+            probe.retired += 1;
+            bytes
+        };
+        let result = if self.cancellation.is_cancellation_requested() {
+            Err(TransportWriteError::new(
+                HttpError::with_message(HttpErrorCode::CORO_CANCELLED, b"queued fixture cancelled"),
+                requested_bytes,
+            ))
+        } else if self.probe.borrow().fail_released {
+            Err(TransportWriteError::new(
+                HttpError::with_message(
+                    HttpErrorCode::TRANSPORT_WRITE_ERROR,
+                    b"queued fixture write failed",
+                ),
+                0,
+            ))
+        } else {
+            Ok(WriteInfo {
+                bytes_written: requested_bytes,
+            })
+        };
+        Poll::Ready(crate::uniplex::UniplexWriteCompletion {
+            requested_bytes,
+            result,
+        })
+    }
+
+    fn is_idle(&self) -> bool {
+        let probe = self.probe.borrow();
+        probe.retired == probe.accepted.len()
+    }
+}
+
+impl Drop for FixtureWriteQueue {
+    fn drop(&mut self) {
+        self.probe.borrow_mut().dropped += 1;
+    }
+}
+
+impl UniplexTransport for QueuedFixtureTransport {
+    fn try_write_queue(
+        &self,
+        _context: &WorkerContext,
+        _maximum_write_size: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<Option<Box<dyn crate::uniplex::UniplexWriteQueue>>, HttpError> {
+        assert!(timeout.is_zero());
+        assert!(!std::mem::replace(
+            &mut self.probe.borrow_mut().acquired,
+            true
+        ));
+        let queue = FixtureWriteQueue {
+            probe: Rc::clone(&self.probe),
+            cancellation,
+        };
+        Ok(Some(match &self.saturation {
+            None => Box::new(queue),
+            Some(saturation) => Box::new(ReportingWriteQueue {
+                inner: queue,
+                saturation: Rc::clone(saturation),
+                queries: Rc::clone(&self.saturation_queries),
+                panic_on_query: self.panic_on_saturation_query,
+            }),
+        }))
+    }
+
+    fn read(
+        &self,
+        context: &WorkerContext,
+        maximum: usize,
+        allocation_size: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        self.inner
+            .read(context, maximum, allocation_size, timeout, cancellation)
+    }
+
+    fn write(
+        &self,
+        _context: &WorkerContext,
+        _data: BufQueue,
+        _flags: ByteEventWriteFlags,
+        _timeout: Duration,
+        _cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        panic!("the opt-in fixture must use its queued writer")
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.shutdown_write(context)
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close_with_reset(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.inner.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.inner.register_byte_event(context, registration)
+    }
+}
+
+async fn exercise_queued<A: OwnedH2Application>(
+    session: OwnedH2Session<A>,
+    handle: &OwnedH2Handle,
+    probe: &Rc<RefCell<QueuedWriteProbe>>,
+    operation: impl Future<Output = ()>,
+) {
+    let scenario = async {
+        let result =
+            eligibility_catch_unwind(tokio::time::timeout(Duration::from_secs(5), operation)).await;
+        handle.cancel();
+        finish_queued_writes(probe);
+        result
+    };
+    let (result, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(session.run(), scenario)
+    })
+    .await
+    .expect("queued writes and native reads are joined");
+    match outcome {
+        Ok(result) => result.expect("queued write scenario made progress"),
+        Err(payload) => resume_unwind(payload),
+    }
+    assert_eq!(result.unwrap_err().code(), HttpErrorCode::CORO_CANCELLED);
+    let probe = probe.borrow();
+    assert_eq!(probe.retired, probe.accepted.len());
+    assert!(probe.held.is_empty());
+    assert_eq!(probe.dropped, 1);
+}
+
+#[test]
+fn queued_writes_bound_admission_and_retire_observers_and_eom_in_order() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let transport = QueuedFixtureTransport::new([FixtureRead::Data(input)]);
+            let queue = Rc::clone(&transport.probe);
+            let (mut application, probes) = Application::new(vec![Reply::Body(8192)]);
+            application.body_chunk = 512;
+            let events = Rc::new(ByteEventProbe::default());
+            application.byte_events = Some(Rc::clone(&events));
+            let mut config = options(context, transport);
+            config.io.maximum_write_size = 1024;
+            let (session, handle) = OwnedH2Session::new(application, config).unwrap();
+            exercise_queued(session, &handle, &queue, async {
+                complete_credit_wait(|| {
+                    let queue = queue.borrow();
+                    queue.accepted.len() == 2 && queue.blocked_nonempty > 0
+                })
+                .await;
+                let probe = Rc::clone(&probes.borrow()[0]);
+                assert_eq!(queue.borrow().retired, 0);
+                assert!(!events.delivered.borrow().is_empty());
+                assert!(
+                    events
+                        .delivered
+                        .borrow()
+                        .iter()
+                        .all(|event| event.event_type == ByteEventType::TransportWrite)
+                );
+                assert_eq!(probe.completed.get(), 0);
+                assert_eq!(probe.dropped.get(), 0);
+                release_queued_writes(&queue, 1);
+                complete_credit_wait(|| queue.borrow().accepted.len() == 3).await;
+                assert_eq!(queue.borrow().retired, 1);
+                assert_eq!(queue.borrow().released, 1);
+                assert_eq!(probe.completed.get(), 0);
+                release_queued_writes(&queue, 2);
+                complete_credit_wait(|| queue.borrow().retired == 3).await;
+                while probe.completed.get() == 0 {
+                    complete_credit_wait(|| {
+                        let queue = queue.borrow();
+                        probe.completed.get() != 0 || queue.accepted.len() > queue.released
+                    })
+                    .await;
+                    if probe.completed.get() != 0 {
+                        break;
+                    }
+                    let expected = queue.borrow().released + 1;
+                    release_queued_writes(&queue, 1);
+                    complete_credit_wait(|| queue.borrow().retired >= expected).await;
+                    let (accepted_offset, completed_offset) = {
+                        let queue = queue.borrow();
+                        let sum = |writes: &[Vec<u8>]| {
+                            writes.iter().map(|bytes| bytes.len() as u64).sum::<u64>()
+                        };
+                        (sum(&queue.accepted), sum(&queue.accepted[..queue.retired]))
+                    };
+                    assert!(
+                        events
+                            .delivered
+                            .borrow()
+                            .iter()
+                            .all(|event| event.transport_offset
+                                <= match event.event_type {
+                                    ByteEventType::TransportWrite => accepted_offset,
+                                    ByteEventType::KernelWrite => completed_offset,
+                                    _ => panic!("the native byte bridge has no TX/ACK observer"),
+                                })
+                    );
+                    if !events
+                        .delivered
+                        .borrow()
+                        .iter()
+                        .any(|event| event.event_type == ByteEventType::KernelWrite && event.eom)
+                    {
+                        assert_eq!(probe.completed.get(), 0);
+                    }
+                }
+                assert_eq!(probe.response_complete.get(), 1);
+                assert_eq!(probe.completed.get(), 1);
+                assert_eq!(probe.dropped.get(), 1);
+                assert!(probe.cancelled.borrow().is_empty());
+                assert!(events.cancelled.borrow().is_empty());
+                let wire = queue.borrow().accepted.concat();
+                assert_eq!(decode_server_frames(&wire).body_data, vec![b'r'; 8192]);
+                let mut expected = Vec::new();
+                let mut offset = 0;
+                let mut body_offset = 0;
+                while offset < wire.len() {
+                    let length = (usize::from(wire[offset]) << 16)
+                        | (usize::from(wire[offset + 1]) << 8)
+                        | usize::from(wire[offset + 2]);
+                    let data = wire[offset + 3] == FrameType::DATA.as_u8();
+                    offset += FRAME_HEADER_SIZE + length;
+                    if data {
+                        body_offset += length as u64;
+                        if probe.body_event_ends.borrow().contains(&body_offset) {
+                            expected.push((body_offset, offset as u64));
+                        }
+                    }
+                }
+                assert_eq!(expected.len(), probe.body_event_ends.borrow().len());
+                for kind in [ByteEventType::TransportWrite, ByteEventType::KernelWrite] {
+                    let events = events.delivered.borrow();
+                    let actual: Vec<_> = events
+                        .iter()
+                        .filter(|event| event.event_type == kind)
+                        .map(|event| (event.body_offset, event.transport_offset))
+                        .collect();
+                    assert_eq!(actual, expected);
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| event.event_type == kind && event.eom)
+                            .count(),
+                        1
+                    );
+                }
+            })
+            .await;
+        })
+    });
+}
+
+#[test]
+fn queued_write_cancellation_joins_both_accepted_writes_before_retiring_the_owner() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let transport = QueuedFixtureTransport::new([FixtureRead::Data(input)]);
+            let queue = Rc::clone(&transport.probe);
+            let wire = Rc::clone(&transport.inner.state);
+            let (application, probes) = Application::new(vec![Reply::Body(8192)]);
+            let mut config = options(context, transport);
+            config.io.maximum_write_size = 1024;
+            let (session, handle) = OwnedH2Session::new(application, config).unwrap();
+            exercise_queued(session, &handle, &queue, async {
+                complete_credit_wait(|| queue.borrow().accepted.len() == 2).await;
+                let probe = Rc::clone(&probes.borrow()[0]);
+                handle.cancel();
+                complete_credit_wait(|| probe.cancelled.borrow().len() == 1).await;
+                assert_eq!(probe.dropped.get(), 0);
+                assert_eq!(queue.borrow().dropped, 0);
+                assert_eq!(queue.borrow().retired, 0);
+                release_queued_writes(&queue, 1);
+                complete_credit_wait(|| queue.borrow().retired == 1).await;
+                assert_eq!(queue.borrow().accepted.len(), 2);
+                assert_eq!(queue.borrow().dropped, 0);
+                assert_eq!(probe.dropped.get(), 0);
+                release_queued_writes(&queue, 1);
+                complete_credit_wait(|| probe.dropped.get() == 1).await;
+                assert_eq!(queue.borrow().retired, 2);
+                assert_eq!(probe.completed.get(), 0);
+                assert_eq!(
+                    probe.cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::CORO_CANCELLED, false)]
+                );
+                assert_eq!(wire.borrow().close, FixtureClose::Reset);
+            })
+            .await;
+        })
+    });
+}
+
+struct ZeroBarrierApplication {
+    inner: Application,
+    first: Arc<tokio::sync::Notify>,
+    empty: Arc<tokio::sync::Notify>,
+    emitted: Rc<Cell<bool>>,
+}
+
+struct ZeroBarrierExchange {
+    inner: Exchange,
+    first: Option<LocalSourceFuture<()>>,
+    empty: LocalSourceFuture<()>,
+    emitted: Rc<Cell<bool>>,
+}
+
+impl OwnedH2Application for ZeroBarrierApplication {
+    type Exchange = ZeroBarrierExchange;
+
+    fn new_exchange(&self, stream: StreamId, ingress: IngressCompletion) -> Self::Exchange {
+        let first = Arc::clone(&self.first);
+        let empty = Arc::clone(&self.empty);
+        ZeroBarrierExchange {
+            inner: self.inner.new_exchange(stream, ingress),
+            first: Some(Box::pin(async move { first.notified().await })),
+            empty: Box::pin(async move { empty.notified().await }),
+            emitted: Rc::clone(&self.emitted),
+        }
+    }
+}
+
+impl OwnedH2Exchange for ZeroBarrierExchange {
+    fn request(&mut self, head: Box<HttpMessage>, body: HttpStreamSourceOwner, eom: bool) {
+        self.inner.request(head, body, eom);
+    }
+
+    fn poll_headers(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        self.inner.poll_headers(context)
+    }
+
+    fn poll_body(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        if let Some(first) = &mut self.first {
+            if first.as_mut().poll(context).is_pending() {
+                return Poll::Pending;
+            }
+            self.first.take();
+            return self.inner.poll_body(context, maximum);
+        }
+        if self.emitted.get() || self.empty.as_mut().poll(context).is_pending() {
+            return Poll::Pending;
+        }
+        self.emitted.set(true);
+        let mut event = HttpBodyEvent::padding(0, false);
+        event
+            .byte_event_registrations_mut()
+            .push(HttpByteEventRegistration::new(
+                None,
+                ByteEventType::TransportWrite.bit(),
+                self.inner.byte_events.as_ref().unwrap(),
+            ));
+        Poll::Ready(Ok(event))
+    }
+
+    fn cancel(&mut self, error: &HttpError, peer_reset: bool) {
+        self.inner.cancel(error, peer_reset);
+    }
+
+    fn response_complete(&mut self) {
+        self.inner.response_complete();
+    }
+
+    fn complete(self) {
+        self.inner.complete();
+    }
+}
+
+#[test]
+fn queued_zero_byte_barrier_waits_for_all_prior_accepts_to_retire() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let transport =
+                QueuedFixtureTransport::new([FixtureRead::SegmentedData(queue(&input))]);
+            let queue = Rc::clone(&transport.probe);
+            let (mut inner, _) = Application::new(vec![Reply::Body(2)]);
+            inner.body_chunk = 1;
+            inner.byte_events = Some(Rc::new(ByteEventProbe::default()));
+            let first = Arc::new(tokio::sync::Notify::new());
+            let empty = Arc::new(tokio::sync::Notify::new());
+            let emitted = Rc::new(Cell::new(false));
+            let application = ZeroBarrierApplication {
+                inner,
+                first: Arc::clone(&first),
+                empty: Arc::clone(&empty),
+                emitted: Rc::clone(&emitted),
+            };
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            exercise_queued(session, &handle, &queue, async {
+                complete_credit_wait(|| queue.borrow().accepted.len() == 1).await;
+                first.notify_one();
+                complete_credit_wait(|| queue.borrow().accepted.len() == 2).await;
+                assert_eq!(
+                    decode_server_frames(&queue.borrow().accepted.concat()).body_data,
+                    b"r"
+                );
+                empty.notify_one();
+                complete_credit_wait(|| emitted.get()).await;
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(queue.borrow().accepted.len(), 2);
+                release_queued_writes(&queue, 1);
+                complete_credit_wait(|| queue.borrow().retired == 1).await;
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(queue.borrow().accepted.len(), 2);
+                release_queued_writes(&queue, 1);
+                complete_credit_wait(|| queue.borrow().accepted.len() == 3).await;
+                assert_eq!(queue.borrow().retired, 2);
+                assert!(queue.borrow().accepted[2].is_empty());
+                release_queued_writes(&queue, 1);
+                complete_credit_wait(|| queue.borrow().retired == 3).await;
+            })
+            .await;
+        })
+    });
+}
+
+fn padding_post_headers(peer: &mut Http2Codec) -> (StreamId, Vec<u8>) {
+    let stream = peer.create_stream();
+    let mut request = HttpMessage::new();
+    request.set_method(HttpMethod::Post).unwrap();
+    request.set_url(b"/padded", false).unwrap();
+    request.set_http_version(1, 1);
+    request
+        .headers_mut()
+        .set(HttpHeaderCode::Host, b"example.com");
+    let bytes = eligibility_frame(
+        peer,
+        EgressFrame::Headers {
+            stream,
+            message: &request,
+            end_stream: false,
+            extra_headers: None,
+        },
+    );
+    (stream, bytes)
+}
+
+fn padding_data(
+    peer: &mut Http2Codec,
+    stream: StreamId,
+    length: usize,
+    padding: Option<u8>,
+) -> Vec<u8> {
+    eligibility_frame(
+        peer,
+        EgressFrame::Body {
+            stream,
+            body: queue(&vec![b'p'; length]),
+            padding,
+            end_stream: false,
+        },
+    )
+}
+
+#[test]
+fn owned_h2_padding_does_not_widen_the_connection_receive_window() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            const PADDED_FRAMES: usize = 3;
+            const PADDED_BODY: usize = 11_000;
+            let send_overrun = Arc::new(tokio::sync::Notify::new());
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut first = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+            let mut output = BufQueue::new(1 << 20);
+            peer.generate_configured_settings(&mut output, &mut IgnoreCodecEvents)
+                .unwrap();
+            first.extend_from_slice(&output.coalesce(output.chain_length()).unwrap());
+            let (padded, headers) = padding_post_headers(&mut peer);
+            first.extend(headers);
+            for _ in 0..PADDED_FRAMES {
+                first.extend(padding_data(&mut peer, padded, PADDED_BODY, Some(255)));
+            }
+            let (bulk, headers) = padding_post_headers(&mut peer);
+            let mut overrun = headers;
+            let mut remaining = 65_535usize;
+            while remaining != 0 {
+                let length = remaining.min(16_384);
+                overrun.extend(padding_data(&mut peer, bulk, length, None));
+                remaining -= length;
+            }
+            overrun.extend(padding_data(&mut peer, padded, 1, None));
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(first),
+                FixtureRead::WaitData(Arc::clone(&send_overrun), overrun),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0); 2]);
+            application.retain_request = true;
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let acknowledged = (PADDED_BODY + 256) * PADDED_FRAMES;
+            let operation = async {
+                complete_credit_wait(|| {
+                    probes
+                        .borrow()
+                        .first()
+                        .is_some_and(|probe| probe.held_body.borrow().is_some())
+                })
+                .await;
+                let probe = Rc::clone(&probes.borrow()[0]);
+                let mut body = probe.held_body.borrow_mut().take().unwrap();
+                let mut consumed = 0;
+                while consumed < PADDED_BODY * PADDED_FRAMES {
+                    let event = body.read_body_event(PADDED_BODY as u32).await.unwrap();
+                    if let Some(bytes) = event.as_body() {
+                        consumed += bytes.chain_length();
+                    }
+                }
+                let connection_updates = || {
+                    decode_server_frames(&state.borrow().writes.concat())
+                        .window_updates
+                        .into_iter()
+                        .filter(|(stream, _)| stream.is_unspecified())
+                        .collect::<Vec<_>>()
+                };
+                complete_credit_wait(|| !connection_updates().is_empty()).await;
+                assert_eq!(
+                    connection_updates(),
+                    [(StreamId::UNSPECIFIED, acknowledged as u32)]
+                );
+                send_overrun.notify_one();
+                complete_credit_wait(|| {
+                    !decode_server_frames(&state.borrow().writes.concat())
+                        .goaways
+                        .is_empty()
+                        || probe
+                            .ingress
+                            .borrow()
+                            .as_ref()
+                            .unwrap()
+                            .body_bytes_received()
+                            == (PADDED_BODY * PADDED_FRAMES + 1) as u64
+                })
+                .await;
+                drop(body);
+                handle.cancel();
+            };
+            let (_, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(
+                    session.run(),
+                    eligibility_catch_unwind(tokio::time::timeout(
+                        Duration::from_secs(5),
+                        operation
+                    ))
+                )
+            })
+            .await
+            .expect("the connection joins its transport operations");
+            match outcome {
+                Ok(result) => result.expect("the padded exchange made progress"),
+                Err(payload) => resume_unwind(payload),
+            }
+            let decoded = decode_server_frames(&state.borrow().writes.concat());
+            assert!(
+                decoded
+                    .goaways
+                    .iter()
+                    .any(|(_, code)| *code == H2ErrorCode::FLOW_CONTROL_ERROR),
+                "one byte beyond the granted connection window must be a FLOW_CONTROL_ERROR, \
+                 goaways={:?}",
+                decoded.goaways
+            );
+        })
+    });
+}
+
+#[test]
+fn owned_h2_round_trip_runs_without_tokio_runtime() {
+    for size in [0, 1, 1024] {
+        crate::external_host_tests::run_on_host(move |context| {
+            Box::pin(async move {
+                assert!(tokio::runtime::Handle::try_current().is_err());
+                let input = peer_request_bytes(
+                    HttpMethod::Post,
+                    &vec![b'q'; size],
+                    None,
+                    PeerControl::None,
+                );
+                let reads = input
+                    .chunks(7)
+                    .map(|chunk| FixtureRead::Data(chunk.to_vec()));
+                let (transport, state) =
+                    FixtureTransport::new(reads.chain([FixtureRead::DataEof(Vec::new())]));
+                let (application, probes) = Application::new(vec![Reply::Body(size)]);
+                let (session, _) =
+                    OwnedH2Session::new(application, options(context, transport)).unwrap();
+                session.run().await.unwrap();
+                let probes = probes.borrow();
+                assert_eq!(probes.len(), 1);
+                let probe = &probes[0];
+                assert_eq!(probe.requested.get(), 1);
+                assert_eq!(probe.request_eom.get(), size == 0);
+                assert_eq!(probe.request_bytes.get(), size);
+                assert_eq!(probe.response_complete.get(), 1);
+                assert_eq!(probe.completed.get(), 1);
+                assert_eq!(probe.dropped.get(), 1);
+                assert!(probe.cancelled.borrow().is_empty());
+                let decoded = decode_server_frames(&state.borrow().writes.concat());
+                assert_eq!(decoded.header_statuses, [(StreamId::new(1), 200)]);
+                assert_eq!(decoded.body_data, vec![b'r'; size]);
+                assert!(decoded.resets.is_empty());
+                assert!(decoded.errors.is_empty());
+            })
+        });
+    }
+}
+
+/// Ends a scripted `WaitData` read on transport cancellation, as a parked socket read does. The
+/// shared fixture's `WaitData` waits only for its notification.
+struct CancellableWaitData(Rc<FixtureTransport>);
+
+impl UniplexTransport for CancellableWaitData {
+    fn read(
+        &self,
+        context: &WorkerContext,
+        maximum: usize,
+        allocation: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        let parked = {
+            let mut state = self.0.state.borrow_mut();
+            match state.reads.front() {
+                Some(FixtureRead::WaitData(..)) => state.reads.pop_front(),
+                _ => None,
+            }
+        };
+        let Some(FixtureRead::WaitData(ready, bytes)) = parked else {
+            return self
+                .0
+                .read(context, maximum, allocation, timeout, cancellation);
+        };
+        let baton = CancellableBaton::with_host(context.host().clone());
+        Box::pin(async move {
+            match select(
+                std::pin::pin!(ready.notified()),
+                std::pin::pin!(baton.wait(cancellation)),
+            )
+            .await
+            {
+                Either::Left(_) => Ok(UniplexRead::new(queue(&bytes), false)),
+                Either::Right(_) => Err(HttpError::with_message(
+                    HttpErrorCode::CORO_CANCELLED,
+                    b"scripted H2 read cancelled",
+                )),
+            }
+        })
+    }
+
+    fn write(
+        &self,
+        context: &WorkerContext,
+        data: BufQueue,
+        flags: ByteEventWriteFlags,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        self.0.write(context, data, flags, timeout, cancellation)
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.0.shutdown_write(context)
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.0.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.0.close_with_reset(context)
+    }
+
+    fn peer_identity(&self, context: &WorkerContext) -> Result<Option<PeerIdentity>, HttpError> {
+        self.0.peer_identity(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.0.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.0.register_byte_event(context, registration)
+    }
+}
+
+#[test]
+fn owned_h2_scope_joins_on_worker_shutdown_with_cleanup_cancel() {
+    let done = Arc::new(AtomicBool::new(false));
+    let finished = Arc::clone(&done);
+    crate::external_host_tests::run_on_host(move |context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(0);
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(preface),
+                FixtureRead::WaitData(Arc::new(tokio::sync::Notify::new()), Vec::new()),
+            ]);
+            let (application, probes) = Application::new(Vec::new());
+            let transport = Rc::new(CancellableWaitData(transport));
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context.clone(), transport)).unwrap();
+            // Dropping the registration leaves the cleanup armed.
+            let _ = context
+                .register_cleanup(move || handle.cancel())
+                .expect("the worker is open");
+            context
+                .register_scope(async move {
+                    let _ = session.run().await;
+                    finished.store(true, Ordering::SeqCst);
+                })
+                .and_then(|scope| scope.activate())
+                .expect("the worker is open");
+            // Return only once the session is parked on the never-notified read: the turn that
+            // issued it left the session woken, so let that wake run before shutdown starts.
+            complete_credit_wait(|| state.borrow().reads.is_empty()).await;
+            context.host().yield_to_io().await;
+            assert!(
+                !state.borrow().writes.is_empty(),
+                "the server SETTINGS was written"
+            );
+            assert!(probes.borrow().is_empty());
+        })
+    });
+    assert!(
+        done.load(Ordering::SeqCst),
+        "worker shutdown joins the session scope after the cleanup cancels it"
+    );
+}
+
+/// Runs one continuously ready 1024-chunk response body, longer than one turn budget, to
+/// completion and checks the response.
+async fn continuously_ready_body_round_trip(context: WorkerContext) {
+    let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+    let (transport, state) = FixtureTransport::new([
+        FixtureRead::SegmentedData(queue(&input)),
+        FixtureRead::DataEof(Vec::new()),
+    ]);
+    let (mut application, probes) = Application::new(vec![Reply::Body(1024)]);
+    application.body_chunk = 1;
+    let mut config = options(context, transport);
+    config.io.buffer_limit = 64 << 10;
+    config.io.ingress_buffer_limit = 64 << 10;
+    config.io.maximum_write_size = 64 << 10;
+    config.io.maximum_read_size = 4096;
+    config.io.read_allocation_size = 4096;
+    let (session, _) = OwnedH2Session::new(application, config).unwrap();
+    session.run().await.unwrap();
+    let probes = probes.borrow();
+    assert_eq!(probes.len(), 1);
+    assert_eq!(probes[0].body_polls.get(), 1024);
+    assert_eq!(probes[0].completed.get(), 1);
+    assert_eq!(probes[0].dropped.get(), 1);
+    assert!(probes[0].cancelled.borrow().is_empty());
+    let decoded = decode_server_frames(&state.borrow().writes.concat());
+    assert_eq!(decoded.header_statuses, [(StreamId::new(1), 200)]);
+    assert_eq!(decoded.body_data, vec![b'r'; 1024]);
+    assert!(decoded.resets.is_empty());
+    assert!(decoded.errors.is_empty());
+}
+
+#[test]
+fn budget_exhaustion_yields_to_host_io_without_tokio() {
+    crate::external_host_tests::run_on_host_with(|host, context| {
+        Box::pin(async move {
+            continuously_ready_body_round_trip(context).await;
+            assert!(
+                host.yields() >= 1,
+                "a ready source longer than one budget must yield to host I/O: yields={}",
+                host.yields()
+            );
+        })
+    });
+}
+
+#[test]
+fn budget_exhaustion_self_wakes_when_host_yield_completes_immediately() {
+    crate::external_host_tests::run_on_host_with(|host, context| {
+        Box::pin(async move {
+            host.set_yield_mode(YieldMode::Immediate);
+            continuously_ready_body_round_trip(context).await;
+            assert!(
+                host.yields() >= 1,
+                "the driver still asks the host to yield: yields={}",
+                host.yields()
+            );
+        })
+    });
+}
+
+#[test]
+fn budget_exhaustion_holds_the_driver_until_the_host_yield_completes() {
+    crate::external_host_tests::run_on_host_with(|host, context| {
+        Box::pin(async move {
+            host.set_yield_mode(YieldMode::Deferred);
+            continuously_ready_body_round_trip(context).await;
+            assert!(host.yields() >= 1, "the driver yields at budget exhaustion");
+            assert_eq!(
+                host.completed_yields(),
+                host.yields(),
+                "the driver resumes only through a completed yield, never re-yielding over one"
+            );
+        })
+    });
+}
+
+/// 64-bit FNV-1a, for wire-identity goldens.
+pub(super) fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// Which way a recorded frame crossed the session's transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WireDirection {
+    /// Scripted peer bytes the session read.
+    Read,
+    /// Bytes the session wrote.
+    Written,
+}
+
+/// One HTTP/2 frame: its header fields and the FNV-1a digest of its payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct WireFrame {
+    pub(super) direction: WireDirection,
+    pub(super) frame_type: u8,
+    pub(super) flags: u8,
+    pub(super) stream: u32,
+    pub(super) length: u32,
+    pub(super) payload: u64,
+}
+
+impl WireFrame {
+    fn digest_bytes(&self) -> impl Iterator<Item = u8> {
+        [self.direction as u8, self.frame_type, self.flags]
+            .into_iter()
+            .chain(self.stream.to_be_bytes())
+            .chain(self.length.to_be_bytes())
+            .chain(self.payload.to_be_bytes())
+    }
+}
+
+/// The frames of one direction of an HTTP/2 connection, in wire order.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct WireTranscript {
+    /// Whether the bytes start with the client connection preface.
+    pub(super) preface: bool,
+    pub(super) frames: Vec<WireFrame>,
+}
+
+impl WireTranscript {
+    /// Splits `wire` into whole frames after an optional client connection
+    /// preface.
+    pub(super) fn new(direction: WireDirection, wire: &[u8]) -> Self {
+        let preface = wire.starts_with(CONNECTION_PREFACE);
+        let mut rest = if preface {
+            &wire[CONNECTION_PREFACE.len()..]
+        } else {
+            wire
+        };
+        let mut frames = Vec::new();
+        while !rest.is_empty() {
+            assert!(
+                rest.len() >= FRAME_HEADER_SIZE,
+                "the wire ends inside a frame header"
+            );
+            let length = u32::from_be_bytes([0, rest[0], rest[1], rest[2]]);
+            let end = FRAME_HEADER_SIZE + length as usize;
+            assert!(rest.len() >= end, "the wire ends inside a frame payload");
+            frames.push(WireFrame {
+                direction,
+                frame_type: rest[3],
+                flags: rest[4],
+                stream: u32::from_be_bytes([rest[5], rest[6], rest[7], rest[8]]) & 0x7fff_ffff,
+                length,
+                payload: fnv1a64(&rest[FRAME_HEADER_SIZE..end]),
+            });
+            rest = &rest[end..];
+        }
+        Self { preface, frames }
+    }
+
+    /// Frame count and FNV-1a digest over every recorded field.
+    pub(super) fn digest(&self) -> (usize, u64) {
+        let bytes: Vec<u8> = std::iter::once(u8::from(self.preface))
+            .chain(self.frames.iter().flat_map(WireFrame::digest_bytes))
+            .collect();
+        (self.frames.len(), fnv1a64(&bytes))
+    }
+
+    /// Number of `frame_type` frames with every bit of `flags` set.
+    pub(super) fn count(&self, frame_type: FrameType, flags: u8) -> usize {
+        self.frames
+            .iter()
+            .filter(|frame| frame.frame_type == frame_type.as_u8() && frame.flags & flags == flags)
+            .count()
+    }
+}
+
+const TRANSCRIPT_BODY: usize = 128;
+const TRANSCRIPT_PADDING: u8 = 200;
+const TRANSCRIPT_PING: u64 = 0x0102_0304_0506_0708;
+const TRANSCRIPT_DATE: &[u8] = b"Thu, 01 Jan 1970 00:00:00 GMT";
+const TRANSCRIPT_WAIT: Duration = Duration::from_secs(5);
+const END_STREAM: u8 = 0x1;
+const ACK: u8 = 0x1;
+const PADDED: u8 = 0x8;
+
+pub(super) fn written_transcript(state: &RefCell<FixtureTransportState>) -> WireTranscript {
+    WireTranscript::new(WireDirection::Written, &state.borrow().writes.concat())
+}
+
+/// Waits for a written-wire condition; on timeout the caller's transcript
+/// assertion reports the difference instead.
+async fn wait_for_written(
+    state: &RefCell<FixtureTransportState>,
+    condition: impl Fn(&WireTranscript) -> bool,
+) {
+    let _ = tokio::time::timeout(
+        TRANSCRIPT_WAIT,
+        complete_credit_wait(|| condition(&written_transcript(state))),
+    )
+    .await;
+}
+
+fn transcript_settings(peer: &mut Http2Codec) -> Vec<u8> {
+    let mut output = BufQueue::new(1 << 20);
+    peer.generate_configured_settings(&mut output, &mut IgnoreCodecEvents)
+        .unwrap();
+    output.coalesce(output.chain_length()).unwrap().to_vec()
+}
+
+fn transcript_data(peer: &mut Http2Codec, stream: StreamId, byte: u8, padded: bool) -> Vec<u8> {
+    eligibility_frame(
+        peer,
+        EgressFrame::Body {
+            stream,
+            body: queue(&[byte; TRANSCRIPT_BODY]),
+            padding: padded.then_some(TRANSCRIPT_PADDING),
+            end_stream: true,
+        },
+    )
+}
+
+/// Client bytes: preface, SETTINGS and three POSTs with 128-byte bodies (the
+/// second DATA padded by 200 bytes); then a PING; then a GOAWAY.
+fn downstream_transcript_input() -> [Vec<u8>; 3] {
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    let mut requests = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+    requests.extend(transcript_settings(&mut peer));
+    requests.extend((0..3).flat_map(|index| {
+        let stream = peer.create_stream();
+        let mut request = HttpMessage::new();
+        request.set_method(HttpMethod::Post).unwrap();
+        request
+            .set_url(format!("/transcript/{index}").as_bytes(), false)
+            .unwrap();
+        request.set_http_version(1, 1);
+        request
+            .headers_mut()
+            .set(HttpHeaderCode::Host, b"example.com");
+        request
+            .headers_mut()
+            .set(HttpHeaderCode::ContentLength, b"128");
+        let headers = eligibility_frame(
+            &mut peer,
+            EgressFrame::Headers {
+                stream,
+                message: &request,
+                end_stream: false,
+                extra_headers: None,
+            },
+        );
+        [
+            headers,
+            transcript_data(&mut peer, stream, b'q', index == 1),
+        ]
+        .concat()
+    }));
+    let ping = eligibility_frame(
+        &mut peer,
+        EgressFrame::PingRequest {
+            data: Some(TRANSCRIPT_PING),
+        },
+    );
+    let goaway = eligibility_frame(
+        &mut peer,
+        EgressFrame::Goaway {
+            last_stream: StreamId::new(0),
+            code: H2ErrorCode::NO_ERROR,
+            debug_data: None,
+        },
+    );
+    [requests, ping, goaway]
+}
+
+/// The `index`th of three 200 responses with 128-byte bodies, on stream
+/// `1 + 2 * index`; the second DATA is padded by 200 bytes.
+fn transcript_response(peer: &mut Http2Codec, index: u64) -> Vec<u8> {
+    let stream = StreamId::new(1 + 2 * index);
+    let mut response = HttpMessage::new();
+    response.set_status_code(200).unwrap();
+    response.set_http_version(1, 1);
+    response
+        .headers_mut()
+        .set(HttpHeaderCode::ContentLength, b"128");
+    response
+        .headers_mut()
+        .set(HttpHeaderCode::Date, TRANSCRIPT_DATE);
+    let headers = eligibility_frame(
+        peer,
+        EgressFrame::Headers {
+            stream,
+            message: &response,
+            end_stream: false,
+            extra_headers: None,
+        },
+    );
+    [headers, transcript_data(peer, stream, b'r', index == 1)].concat()
+}
+
+/// Server bytes: SETTINGS; then three 200 responses with 128-byte bodies (the
+/// second DATA padded by 200 bytes); then a PING; then a GOAWAY.
+fn upstream_transcript_input() -> [Vec<u8>; 4] {
+    let [settings, first, second, third, ping, goaway] = sequential_upstream_input();
+    [settings, [first, second, third].concat(), ping, goaway]
+}
+
+/// [`upstream_transcript_input`] with each response separate.
+fn sequential_upstream_input() -> [Vec<u8>; 6] {
+    let mut peer = Http2Codec::new(TransportDirection::Downstream);
+    let settings = transcript_settings(&mut peer);
+    let [first, second, third] = [0, 1, 2].map(|index| transcript_response(&mut peer, index));
+    let ping = eligibility_frame(
+        &mut peer,
+        EgressFrame::PingRequest {
+            data: Some(TRANSCRIPT_PING),
+        },
+    );
+    let goaway = eligibility_frame(
+        &mut peer,
+        EgressFrame::Goaway {
+            last_stream: StreamId::new(5),
+            code: H2ErrorCode::NO_ERROR,
+            debug_data: None,
+        },
+    );
+    [settings, first, second, third, ping, goaway]
+}
+
+/// Read and written transcripts, and how the session's run ended.
+type TranscriptRun = (WireTranscript, WireTranscript, Result<(), HttpErrorCode>);
+
+/// Runs the downstream fixture.
+async fn downstream_transcripts(context: WorkerContext) -> TranscriptRun {
+    let [requests, ping, goaway] = downstream_transcript_input();
+    let read = WireTranscript::new(
+        WireDirection::Read,
+        &[requests.as_slice(), &ping, &goaway].concat(),
+    );
+    let ping_gate = Arc::new(tokio::sync::Notify::new());
+    let goaway_gate = Arc::new(tokio::sync::Notify::new());
+    let (transport, state) = FixtureTransport::new([
+        FixtureRead::Data(requests),
+        FixtureRead::WaitData(Arc::clone(&ping_gate), ping),
+        FixtureRead::WaitDataEof(Arc::clone(&goaway_gate), goaway),
+    ]);
+    let (mut application, _probes) = Application::new(vec![Reply::Body(TRANSCRIPT_BODY); 3]);
+    application.response_date = Some(TRANSCRIPT_DATE);
+    let (session, _handle) = OwnedH2Session::new(application, options(context, transport)).unwrap();
+    let script = async {
+        wait_for_written(&state, |wire| {
+            wire.count(FrameType::DATA, END_STREAM) + wire.count(FrameType::RST_STREAM, 0) == 3
+        })
+        .await;
+        ping_gate.notify_one();
+        wait_for_written(&state, |wire| wire.count(FrameType::PING, ACK) == 1).await;
+        goaway_gate.notify_one();
+    };
+    let (run, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(session.run(), script)
+    })
+    .await
+    .expect("the downstream transcript fixture finishes at EOF");
+    let run = run.map(drop).map_err(|error| error.code());
+    (read, written_transcript(&state), run)
+}
+
+/// Runs the upstream fixture.
+async fn upstream_transcripts(context: WorkerContext) -> TranscriptRun {
+    let [settings, responses, ping, goaway] = upstream_transcript_input();
+    let read = WireTranscript::new(
+        WireDirection::Read,
+        &[settings.as_slice(), &responses, &ping, &goaway].concat(),
+    );
+    let responses_gate = Arc::new(tokio::sync::Notify::new());
+    let ping_gate = Arc::new(tokio::sync::Notify::new());
+    let goaway_gate = Arc::new(tokio::sync::Notify::new());
+    let (transport, state) = FixtureTransport::new([
+        FixtureRead::Data(settings),
+        FixtureRead::WaitData(Arc::clone(&responses_gate), responses),
+        FixtureRead::WaitData(Arc::clone(&ping_gate), ping),
+        FixtureRead::WaitDataEof(Arc::clone(&goaway_gate), goaway),
+    ]);
+    let mut config = options(context, transport);
+    config.io.drain_request_body_on_drop = false;
+    config.http2.settings = vec![CodecSetting {
+        identifier: SettingsId::EnablePush.as_u16(),
+        value: 0,
+    }];
+    config.http2.double_goaway_drain = false;
+    let (session, handle) = OwnedH2UpstreamSession::new(config).unwrap();
+    let submissions: Vec<_> = (0..3)
+        .map(|index| {
+            let mut head = committed_test_headers(format!("/transcript/{index}").as_bytes(), false);
+            head.headers_mut()
+                .headers_mut()
+                .set(HttpHeaderCode::ContentLength, b"128");
+            let body = HttpFixedSource::make_fixed_body(queue(&[b'u'; TRANSCRIPT_BODY]));
+            handle.reserve_request().unwrap().submit(
+                head,
+                HttpSourceHolder::new(Box::new(body)),
+                CancellationToken::never(),
+            )
+        })
+        .collect();
+    let script = async {
+        wait_for_written(&state, |wire| wire.count(FrameType::DATA, END_STREAM) == 3).await;
+        responses_gate.notify_one();
+        for submission in submissions {
+            let Ok(response) = submission.await else {
+                continue;
+            };
+            let (_, mut source, _request) = response.into_source_parts();
+            if source.read_header_event().await.is_err() {
+                continue;
+            }
+            while let Ok(event) = source.read_body_event(u32::MAX).await
+                && !event.eom()
+            {}
+        }
+        ping_gate.notify_one();
+        wait_for_written(&state, |wire| wire.count(FrameType::PING, ACK) == 1).await;
+        goaway_gate.notify_one();
+    };
+    let (run, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(session.run(), script)
+    })
+    .await
+    .expect("the upstream transcript fixture finishes at EOF");
+    let run = run.map(drop).map_err(|error| error.code());
+    (read, written_transcript(&state), run)
+}
+
+/// Both fixtures carry three exchanges with 128-byte bodies, one padded DATA,
+/// a PING with its ACK, and a peer GOAWAY.
+pub(super) fn assert_transcript_scenario(read: &WireTranscript, written: &WireTranscript) {
+    for transcript in [read, written] {
+        assert_eq!(transcript.count(FrameType::HEADERS, 0), 3);
+        assert_eq!(transcript.count(FrameType::DATA, END_STREAM), 3);
+        assert_eq!(transcript.count(FrameType::RST_STREAM, 0), 0);
+    }
+    let padded = read.frames.iter().filter(|frame| {
+        frame.frame_type == FrameType::DATA.as_u8()
+            && frame.flags & PADDED != 0
+            && frame.length as usize == 1 + TRANSCRIPT_BODY + usize::from(TRANSCRIPT_PADDING)
+    });
+    assert_eq!(padded.count(), 1);
+    assert_eq!(read.count(FrameType::PING, 0), 1);
+    assert_eq!(written.count(FrameType::PING, ACK), 1);
+    assert_eq!(read.count(FrameType::GOAWAY, 0), 1);
+}
+
+#[test]
+fn owned_h2_transcripts_are_unchanged() {
+    let (read, written, run) = run_on_worker(|context| Box::pin(downstream_transcripts(context)));
+    assert_eq!(
+        [read.digest(), written.digest()],
+        [
+            (9, 11_231_806_118_693_533_887),
+            (10, 7_227_848_528_293_173_899)
+        ],
+        "downstream transcripts recorded at 775385963702; read: {read:#?}; written: {written:#?}"
+    );
+    assert_transcript_scenario(&read, &written);
+    assert_eq!(run, Ok(()), "the downstream session closes cleanly at EOF");
+    let (read, written, run) = run_on_worker(|context| Box::pin(upstream_transcripts(context)));
+    assert_eq!(
+        [read.digest(), written.digest()],
+        [
+            (9, 3_188_096_049_290_309_849),
+            (10, 2_096_194_806_515_092_526)
+        ],
+        "upstream transcripts recorded at 775385963702; read: {read:#?}; written: {written:#?}"
+    );
+    assert_transcript_scenario(&read, &written);
+    assert_eq!(run, Ok(()), "the upstream session closes cleanly at EOF");
+}
+
+/// Receipts an [`InlineWriteQueue`] holds before `can_write` refuses more.
+const INLINE_OUTSTANDING_WRITES: usize = 8;
+
+/// What an [`InlineWriteQueue`] was given and still owes the session.
+#[derive(Default)]
+pub(super) struct InlineWriteState {
+    /// The bytes of each accepted write, in order.
+    pub(super) writes: Vec<Vec<u8>>,
+    /// The requested size of each completed receipt not yet polled.
+    receipts: VecDeque<usize>,
+    /// The waker of the last `poll_complete` that found no receipt.
+    writer: Option<Waker>,
+    /// `is_saturated` calls, and whether one panics.
+    saturation_queries: usize,
+    panic_on_saturation_query: bool,
+}
+
+/// A capacity-only queued writer: it admits writes whatever their size
+/// until `INLINE_OUTSTANDING_WRITES` receipts are held, completes each write
+/// inside `start_write` as an inline physical write does, and wakes only the
+/// waker of the last `poll_complete` that found no completed receipt.
+struct InlineWriteQueue(Rc<RefCell<InlineWriteState>>);
+
+impl crate::uniplex::UniplexWriteQueue for InlineWriteQueue {
+    fn can_write(&self, _bytes: usize) -> bool {
+        self.0.borrow().receipts.len() < INLINE_OUTSTANDING_WRITES
+    }
+
+    fn start_write(&mut self, data: BufQueue) -> Result<(), HttpError> {
+        let bytes: Vec<u8> = data
+            .segments()
+            .flat_map(|segment| segment.iter().copied())
+            .collect();
+        let writer = {
+            let mut state = self.0.borrow_mut();
+            state.receipts.push_back(bytes.len());
+            state.writes.push(bytes);
+            state.writer.take()
+        };
+        if let Some(writer) = writer {
+            writer.wake();
+        }
+        Ok(())
+    }
+
+    fn poll_complete(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<crate::uniplex::UniplexWriteCompletion> {
+        let mut state = self.0.borrow_mut();
+        if let Some(requested_bytes) = state.receipts.pop_front() {
+            return Poll::Ready(crate::uniplex::UniplexWriteCompletion {
+                requested_bytes,
+                result: Ok(WriteInfo {
+                    bytes_written: requested_bytes,
+                }),
+            });
+        }
+        let replaced = state.writer.replace(context.waker().clone());
+        drop(state);
+        drop(replaced);
+        Poll::Pending
+    }
+
+    fn is_idle(&self) -> bool {
+        self.0.borrow().receipts.is_empty()
+    }
+
+    /// The default answer, counted.
+    fn is_saturated(&self) -> bool {
+        let mut state = self.0.borrow_mut();
+        state.saturation_queries += 1;
+        assert!(
+            !state.panic_on_saturation_query,
+            "this session must not query saturation"
+        );
+        true
+    }
+}
+
+/// Reads through a [`FixtureTransport`] and writes through an
+/// [`InlineWriteQueue`].
+pub(super) struct InlineWriteTransport {
+    inner: Rc<FixtureTransport>,
+    pub(super) state: Rc<RefCell<InlineWriteState>>,
+}
+
+impl InlineWriteTransport {
+    pub(super) fn new(reads: impl IntoIterator<Item = FixtureRead>) -> Rc<Self> {
+        let (inner, _) = FixtureTransport::new(reads);
+        Rc::new(Self {
+            inner,
+            state: Rc::default(),
+        })
+    }
+}
+
+impl UniplexTransport for InlineWriteTransport {
+    fn try_write_queue(
+        &self,
+        _context: &WorkerContext,
+        _maximum_write_size: usize,
+        timeout: Duration,
+        _cancellation: CancellationToken,
+    ) -> Result<Option<Box<dyn crate::uniplex::UniplexWriteQueue>>, HttpError> {
+        assert!(timeout.is_zero());
+        Ok(Some(Box::new(InlineWriteQueue(Rc::clone(&self.state)))))
+    }
+
+    fn read(
+        &self,
+        context: &WorkerContext,
+        maximum: usize,
+        allocation_size: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        self.inner
+            .read(context, maximum, allocation_size, timeout, cancellation)
+    }
+
+    fn write(
+        &self,
+        _context: &WorkerContext,
+        _data: BufQueue,
+        _flags: ByteEventWriteFlags,
+        _timeout: Duration,
+        _cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        panic!("the inline fixture writes only through its queue")
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.shutdown_write(context)
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close_with_reset(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.inner.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.inner.register_byte_event(context, registration)
+    }
+}
+
+pub(super) fn inline_transcript(state: &RefCell<InlineWriteState>) -> WireTranscript {
+    WireTranscript::new(WireDirection::Written, &state.borrow().writes.concat())
+}
+
+/// Waits for `condition` on the transcript `written` returns; on timeout the
+/// caller's transcript assertion reports the difference instead.
+async fn wait_for_transcript(
+    written: impl Fn() -> WireTranscript,
+    condition: impl Fn(&WireTranscript) -> bool,
+) {
+    let _ = tokio::time::timeout(
+        TRANSCRIPT_WAIT,
+        complete_credit_wait(|| condition(&written())),
+    )
+    .await;
+}
+
+/// Runs three upstream POSTs one after another over the inline queued writer,
+/// each 128-byte request written before its response is read, then a PING once
+/// the session is idle, then a GOAWAY and EOF. Also returns whether the
+/// session published idleness before the PING.
+async fn unarmed_upstream_transcripts(context: WorkerContext) -> (TranscriptRun, bool) {
+    let (run, idle, _) = unarmed_upstream_transcripts_with(context, false).await;
+    (run, idle)
+}
+
+/// [`unarmed_upstream_transcripts`], whose write queue panics if `panic_on_saturation_query`
+/// and the session queries saturation. Also returns the number of queries.
+pub(super) async fn unarmed_upstream_transcripts_with(
+    context: WorkerContext,
+    panic_on_saturation_query: bool,
+) -> (TranscriptRun, bool, usize) {
+    let [settings, first, second, third, ping, goaway] = sequential_upstream_input();
+    let read = WireTranscript::new(
+        WireDirection::Read,
+        &[settings.as_slice(), &first, &second, &third, &ping, &goaway].concat(),
+    );
+    let response_gates: [_; 3] = std::array::from_fn(|_| Arc::new(tokio::sync::Notify::new()));
+    let ping_gate = Arc::new(tokio::sync::Notify::new());
+    let goaway_gate = Arc::new(tokio::sync::Notify::new());
+    let transport = InlineWriteTransport::new([
+        FixtureRead::Data(settings),
+        FixtureRead::WaitData(Arc::clone(&response_gates[0]), first),
+        FixtureRead::WaitData(Arc::clone(&response_gates[1]), second),
+        FixtureRead::WaitData(Arc::clone(&response_gates[2]), third),
+        FixtureRead::WaitData(Arc::clone(&ping_gate), ping),
+        FixtureRead::WaitDataEof(Arc::clone(&goaway_gate), goaway),
+    ]);
+    let state = Rc::clone(&transport.state);
+    state.borrow_mut().panic_on_saturation_query = panic_on_saturation_query;
+    let written = || inline_transcript(&state);
+    let mut config = options(context, transport);
+    config.io.drain_request_body_on_drop = false;
+    config.http2.settings = vec![CodecSetting {
+        identifier: SettingsId::EnablePush.as_u16(),
+        value: 0,
+    }];
+    config.http2.double_goaway_drain = false;
+    let (session, handle) = OwnedH2UpstreamSession::new(config).unwrap();
+    let idle_before_ping = Cell::new(false);
+    let script = async {
+        wait_for_transcript(written, |wire| wire.count(FrameType::SETTINGS, ACK) == 1).await;
+        for (index, gate) in response_gates.iter().enumerate() {
+            let mut head = committed_test_headers(format!("/transcript/{index}").as_bytes(), false);
+            head.headers_mut()
+                .headers_mut()
+                .set(HttpHeaderCode::ContentLength, b"128");
+            let body = HttpFixedSource::make_fixed_body(queue(&[b'u'; TRANSCRIPT_BODY]));
+            let submission = handle.reserve_request().unwrap().submit(
+                head,
+                HttpSourceHolder::new(Box::new(body)),
+                CancellationToken::never(),
+            );
+            wait_for_transcript(written, |wire| {
+                wire.count(FrameType::DATA, END_STREAM) == index + 1
+            })
+            .await;
+            gate.notify_one();
+            let Ok(response) = submission.await else {
+                continue;
+            };
+            let (_, mut source, _request) = response.into_source_parts();
+            if source.read_header_event().await.is_err() {
+                continue;
+            }
+            while let Ok(event) = source.read_body_event(u32::MAX).await
+                && !event.eom()
+            {}
+        }
+        idle_before_ping.set(
+            tokio::time::timeout(TRANSCRIPT_WAIT, complete_credit_wait(|| handle.is_idle()))
+                .await
+                .is_ok(),
+        );
+        ping_gate.notify_one();
+        wait_for_transcript(written, |wire| wire.count(FrameType::PING, ACK) == 1).await;
+        goaway_gate.notify_one();
+    };
+    let (run, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(session.run(), script)
+    })
+    .await
+    .expect("the unarmed upstream transcript fixture finishes at EOF");
+    let run = run.map(drop).map_err(|error| error.code());
+    let queries = state.borrow().saturation_queries;
+    ((read, written(), run), idle_before_ping.get(), queries)
+}
+
+#[test]
+fn upstream_transcript_is_unchanged_by_unarmed_writes() {
+    let ((read, written, run), idle_before_ping) =
+        run_on_worker(|context| Box::pin(unarmed_upstream_transcripts(context)));
+    assert_eq!(
+        [read.digest(), written.digest()],
+        [
+            (9, 3_188_096_049_290_309_849),
+            (10, 18_252_902_388_575_904_042)
+        ],
+        "unarmed upstream transcripts recorded at da1228fe4a74; read: {read:#?}; written: {written:#?}"
+    );
+    assert_transcript_scenario(&read, &written);
+    assert!(idle_before_ping, "the session is idle before the PING");
+    assert_eq!(run, Ok(()), "the upstream session closes cleanly at EOF");
+}
+
+/// Polls its future only on the first poll and after the future woke its own
+/// waker, as a separately scheduled task is polled, however often the enclosing
+/// task is polled. Under `tokio::join!` with a script that yields, a session
+/// would otherwise be polled at every yield, which hides lost wakes.
+pub(super) struct OwnWakes<F> {
+    inner: Pin<Box<F>>,
+    wake: Arc<OwnWake>,
+}
+
+struct OwnWake {
+    woken: AtomicBool,
+    wakes: AtomicUsize,
+    outer: std::sync::Mutex<Option<Waker>>,
+}
+
+/// How many times an [`OwnWakes`] future has woken its own waker.
+#[derive(Clone)]
+pub(super) struct WakeCount(Arc<OwnWake>);
+
+impl WakeCount {
+    pub(super) fn get(&self) -> usize {
+        self.0.wakes.load(Ordering::SeqCst)
+    }
+}
+
+impl std::task::Wake for OwnWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+        self.woken.store(true, Ordering::SeqCst);
+        let outer = self.outer.lock().unwrap().clone();
+        if let Some(outer) = outer {
+            outer.wake();
+        }
+    }
+}
+
+impl<F: Future> OwnWakes<F> {
+    pub(super) fn new(inner: F) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            wake: Arc::new(OwnWake {
+                woken: AtomicBool::new(true),
+                wakes: AtomicUsize::new(0),
+                outer: std::sync::Mutex::new(None),
+            }),
+        }
+    }
+
+    pub(super) fn wake_count(&self) -> WakeCount {
+        WakeCount(Arc::clone(&self.wake))
+    }
+}
+
+impl<F: Future> Future for OwnWakes<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<F::Output> {
+        let previous = self
+            .wake
+            .outer
+            .lock()
+            .unwrap()
+            .replace(context.waker().clone());
+        drop(previous);
+        if !self.wake.woken.swap(false, Ordering::SeqCst) {
+            return Poll::Pending;
+        }
+        let waker = Waker::from(Arc::clone(&self.wake));
+        self.inner.as_mut().poll(&mut Context::from_waker(&waker))
+    }
+}
+
+/// Opens the response gate of [`KernelWriteExchange`] when its body's kernel
+/// write is reported.
+#[derive(Default)]
+struct KernelWriteGate {
+    written: Cell<bool>,
+    waker: RefCell<Option<Waker>>,
+}
+
+impl HttpByteEventCallback for KernelWriteGate {
+    fn on_byte_event(&self, event: HttpByteEvent) {
+        if event.event_type == ByteEventType::KernelWrite {
+            self.written.set(true);
+            let waker = self.waker.borrow_mut().take();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+    }
+
+    fn on_byte_event_cancelled(&self, _event: HttpByteEvent, _error: HttpError) {}
+}
+
+struct KernelWriteApplication(Rc<KernelWriteGate>);
+
+/// Answers with one body byte that registers a kernel-write event, and ends the
+/// response only once that event is reported. The request stays open.
+struct KernelWriteExchange {
+    gate: Rc<KernelWriteGate>,
+    sent: bool,
+    _request: Option<HttpSourceHolder>,
+}
+
+impl OwnedH2Application for KernelWriteApplication {
+    type Exchange = KernelWriteExchange;
+
+    fn new_exchange(&self, _stream: StreamId, _ingress: IngressCompletion) -> KernelWriteExchange {
+        KernelWriteExchange {
+            gate: Rc::clone(&self.0),
+            sent: false,
+            _request: None,
+        }
+    }
+}
+
+impl OwnedH2Exchange for KernelWriteExchange {
+    fn request(&mut self, _head: Box<HttpMessage>, body: HttpStreamSourceOwner, _eom: bool) {
+        self._request = Some(body.into_source_holder());
+    }
+
+    fn poll_headers(
+        &mut self,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        let mut response = HttpMessage::new();
+        response.set_status_code(200).unwrap();
+        response.set_http_version(1, 1);
+        Poll::Ready(Ok(HttpHeaderEvent::new(response, false).unwrap()))
+    }
+
+    fn poll_body(
+        &mut self,
+        context: &mut Context<'_>,
+        _maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        if !self.sent {
+            self.sent = true;
+            let mut event = HttpBodyEvent::body(queue(b"a"), false);
+            event
+                .byte_event_registrations_mut()
+                .push(HttpByteEventRegistration::new(
+                    None,
+                    ByteEventType::KernelWrite.bit(),
+                    &self.gate,
+                ));
+            return Poll::Ready(Ok(event));
+        }
+        if !self.gate.written.get() {
+            *self.gate.waker.borrow_mut() = Some(context.waker().clone());
+            return Poll::Pending;
+        }
+        Poll::Ready(Ok(HttpBodyEvent::body(queue(&[]), true)))
+    }
+
+    fn cancel(&mut self, _error: &HttpError, _peer_reset: bool) {}
+
+    fn response_complete(&mut self) {}
+
+    fn complete(self) {}
+}
+
+#[test]
+fn kernel_write_waiter_arms_the_writer() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut input = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+            input.extend(transcript_settings(&mut peer));
+            let (_stream, headers) = padding_post_headers(&mut peer);
+            input.extend(headers);
+            let transport = InlineWriteTransport::new([FixtureRead::Data(input)]);
+            let state = Rc::clone(&transport.state);
+            let gate = Rc::new(KernelWriteGate::default());
+            let (session, handle) = OwnedH2Session::new(
+                KernelWriteApplication(Rc::clone(&gate)),
+                options(context, transport),
+            )
+            .unwrap();
+            let script = async {
+                let ended = tokio::time::timeout(
+                    TRANSCRIPT_WAIT,
+                    complete_credit_wait(|| {
+                        inline_transcript(&state).count(FrameType::DATA, END_STREAM) == 1
+                    }),
+                )
+                .await
+                .is_ok();
+                handle.cancel();
+                ended
+            };
+            let (run, ended) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(OwnWakes::new(session.run()), script)
+            })
+            .await
+            .expect("the cancelled session joins its transport operations");
+            assert!(
+                ended,
+                "while the request is still open, the response's kernel-write event arms the \
+                 writer, so the response ends"
+            );
+            assert!(gate.written.get());
+            assert_eq!(run.unwrap_err().code(), HttpErrorCode::CORO_CANCELLED);
+        })
+    });
+}
+
+/// Per-stream control for [`ScanApplication`]: each exchange holds its response
+/// until the test releases it.
+#[derive(Default)]
+struct ScanControl {
+    released: RefCell<std::collections::BTreeSet<StreamId>>,
+    wakers: RefCell<std::collections::BTreeMap<StreamId, Waker>>,
+    completed: Cell<usize>,
+    cancelled: Cell<usize>,
+}
+
+impl ScanControl {
+    fn release(&self, stream: StreamId) {
+        self.released.borrow_mut().insert(stream);
+        let waker = self.wakers.borrow_mut().remove(&stream);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+struct ScanApplication(Rc<ScanControl>);
+
+/// Holds its request body and its response until released; a released exchange
+/// stops reading its request with `NO_ERROR` and answers 200 with no body, so a
+/// stream whose request has not ended retires without ending or resetting it.
+struct ScanExchange {
+    stream: StreamId,
+    control: Rc<ScanControl>,
+    request: Option<HttpSourceHolder>,
+}
+
+impl OwnedH2Application for ScanApplication {
+    type Exchange = ScanExchange;
+
+    fn new_exchange(&self, stream: StreamId, _ingress: IngressCompletion) -> ScanExchange {
+        ScanExchange {
+            stream,
+            control: Rc::clone(&self.0),
+            request: None,
+        }
+    }
+}
+
+impl OwnedH2Exchange for ScanExchange {
+    fn request(&mut self, _head: Box<HttpMessage>, body: HttpStreamSourceOwner, _eom: bool) {
+        self.request = Some(body.into_source_holder());
+    }
+
+    fn poll_headers(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        if !self.control.released.borrow().contains(&self.stream) {
+            self.control
+                .wakers
+                .borrow_mut()
+                .insert(self.stream, context.waker().clone());
+            return Poll::Pending;
+        }
+        if let Some(mut request) = self.request.take() {
+            request.stop_reading(Some(HttpErrorCode::NO_ERROR));
+        }
+        let mut response = HttpMessage::new();
+        response.set_status_code(200).unwrap();
+        response.set_http_version(1, 1);
+        response
+            .headers_mut()
+            .set(HttpHeaderCode::ContentLength, b"0");
+        Poll::Ready(Ok(HttpHeaderEvent::new(response, true).unwrap()))
+    }
+
+    fn poll_body(
+        &mut self,
+        _context: &mut Context<'_>,
+        _maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        unreachable!("the response ends with its head")
+    }
+
+    fn cancel(&mut self, _error: &HttpError, _peer_reset: bool) {
+        self.control.cancelled.set(self.control.cancelled.get() + 1);
+    }
+
+    fn response_complete(&mut self) {}
+
+    fn complete(self) {
+        self.control.completed.set(self.control.completed.get() + 1);
+    }
+}
+
+/// One step of `awaiting_ingress_counter_matches_a_scan`.
+#[derive(Clone, Copy)]
+enum ScanStep {
+    /// Releases the client bytes behind this read gate.
+    Ingress(usize),
+    /// Releases this stream's response.
+    Respond(StreamId),
+}
+
+/// A deterministic sequence of `operations` create (HEADERS without
+/// END_STREAM), END_STREAM (empty DATA), client reset and response steps over at
+/// most 64 open streams, then responses for the streams still open. Returns the
+/// client bytes (the first is the connection preface, read at once; each later
+/// one sits behind a gate), the steps, and the numbers of streams created,
+/// ended, reset by the client and answered.
+fn scan_steps(operations: usize) -> (Vec<Vec<u8>>, Vec<ScanStep>, [usize; 4]) {
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    let mut preface = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+    preface.extend(transcript_settings(&mut peer));
+    let mut chunks = vec![preface];
+    let mut steps = Vec::new();
+    let mut open: Vec<(StreamId, bool)> = Vec::new();
+    let [mut created, mut ended, mut reset, mut answered] = [0; 4];
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = |bound: usize| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) as usize % bound
+    };
+    for _ in 0..operations {
+        let kind = next(4);
+        let unended: Vec<usize> = (0..open.len()).filter(|index| !open[*index].1).collect();
+        let create =
+            open.is_empty() || (kind == 0 && open.len() < 64) || (kind == 1 && unended.is_empty());
+        if create {
+            let (stream, headers) = padding_post_headers(&mut peer);
+            chunks.push(headers);
+            steps.push(ScanStep::Ingress(chunks.len() - 1));
+            open.push((stream, false));
+            created += 1;
+            continue;
+        }
+        match kind {
+            1 => {
+                let index = unended[next(unended.len())];
+                open[index].1 = true;
+                ended += 1;
+                chunks.push(eligibility_frame(
+                    &mut peer,
+                    EgressFrame::Body {
+                        stream: open[index].0,
+                        body: queue(&[]),
+                        padding: None,
+                        end_stream: true,
+                    },
+                ));
+                steps.push(ScanStep::Ingress(chunks.len() - 1));
+            }
+            2 => {
+                let (stream, _) = open.swap_remove(next(open.len()));
+                chunks.push(eligibility_frame(
+                    &mut peer,
+                    EgressFrame::Reset {
+                        stream,
+                        code: H2ErrorCode::CANCEL,
+                    },
+                ));
+                steps.push(ScanStep::Ingress(chunks.len() - 1));
+                reset += 1;
+            }
+            _ => {
+                let (stream, _) = open.swap_remove(next(open.len()));
+                steps.push(ScanStep::Respond(stream));
+                answered += 1;
+            }
+        }
+    }
+    for (stream, _) in open {
+        steps.push(ScanStep::Respond(stream));
+        answered += 1;
+    }
+    (chunks, steps, [created, ended, reset, answered])
+}
+
+#[test]
+fn awaiting_ingress_counter_matches_a_scan() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (chunks, steps, [created, ended, reset, answered]) = scan_steps(500);
+            assert_eq!(created, reset + answered, "every created stream ends");
+            assert_eq!(
+                [created, ended, reset, answered],
+                [211, 79, 99, 112],
+                "the deterministic sequence covers every kind of step"
+            );
+            let mut chunks = chunks.into_iter();
+            let mut reads = vec![FixtureRead::Data(chunks.next().unwrap())];
+            let gates: Vec<_> = chunks
+                .map(|chunk| {
+                    let gate = Arc::new(tokio::sync::Notify::new());
+                    reads.push(FixtureRead::WaitData(Arc::clone(&gate), chunk));
+                    gate
+                })
+                .collect();
+            let transport = InlineWriteTransport::new(reads);
+            let control = Rc::new(ScanControl::default());
+            let (session, handle) = OwnedH2Session::new(
+                ScanApplication(Rc::clone(&control)),
+                options(context, transport),
+            )
+            .unwrap();
+            let script = async {
+                for step in steps {
+                    match step {
+                        ScanStep::Ingress(chunk) => gates[chunk - 1].notify_one(),
+                        ScanStep::Respond(stream) => control.release(stream),
+                    }
+                    for _ in 0..8 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                let retired = tokio::time::timeout(
+                    TRANSCRIPT_WAIT,
+                    complete_credit_wait(|| {
+                        control.completed.get() + control.cancelled.get() == created
+                    }),
+                )
+                .await
+                .is_ok();
+                handle.cancel();
+                retired
+            };
+            let (run, retired) = tokio::time::timeout(Duration::from_secs(20), async {
+                tokio::join!(OwnWakes::new(session.run()), script)
+            })
+            .await
+            .expect("the cancelled session joins its transport operations");
+            assert!(
+                retired,
+                "every stream retires: {} completed and {} cancelled of {created}",
+                control.completed.get(),
+                control.cancelled.get()
+            );
+            assert_eq!(
+                (control.completed.get(), control.cancelled.get()),
+                (answered, reset)
+            );
+            assert_eq!(run.unwrap_err().code(), HttpErrorCode::CORO_CANCELLED);
+        })
+    });
+}
+
+/// Scheduler turns a writer-arming check may take before it reports a lost wake.
+pub(super) const WRITER_DRIVE_LIMIT: usize = 20_000;
+
+/// Scheduler turns that let a session settle before a check that nothing more happens.
+pub(super) const WRITER_SETTLE: usize = 100;
+
+/// Yields up to `WRITER_DRIVE_LIMIT` times for `condition`, so a lost wake fails instead of
+/// hanging.
+pub(super) async fn writer_drive_until(condition: impl Fn() -> bool) -> bool {
+    for _ in 0..WRITER_DRIVE_LIMIT {
+        if condition() {
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    condition()
+}
+
+pub(super) async fn writer_settle() {
+    for _ in 0..WRITER_SETTLE {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The session polls and wakes a [`CountedWakes`] observed.
+pub(super) struct WakeCounts {
+    woken: AtomicBool,
+    polling: AtomicBool,
+    polls: AtomicUsize,
+    wakes: AtomicUsize,
+    in_poll_wakes: AtomicUsize,
+    outer: std::sync::Mutex<Option<Waker>>,
+}
+
+impl WakeCounts {
+    pub(super) fn polls(&self) -> usize {
+        self.polls.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn wakes(&self) -> usize {
+        self.wakes.load(Ordering::SeqCst)
+    }
+
+    /// Wakes that arrived inside the future's own poll, which a host defers to its next loop
+    /// iteration.
+    pub(super) fn in_poll_wakes(&self) -> usize {
+        self.in_poll_wakes.load(Ordering::SeqCst)
+    }
+
+    /// Whether the future is being polled now.
+    pub(super) fn polling(&self) -> bool {
+        self.polling.load(Ordering::SeqCst)
+    }
+}
+
+impl std::task::Wake for WakeCounts {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+        if self.polling.load(Ordering::SeqCst) {
+            self.in_poll_wakes.fetch_add(1, Ordering::SeqCst);
+        }
+        self.woken.store(true, Ordering::SeqCst);
+        let outer = self.outer.lock().unwrap().clone();
+        if let Some(outer) = outer {
+            outer.wake();
+        }
+    }
+}
+
+/// [`OwnWakes`] that counts the polls of its future and the wakes of its own waker, as a host
+/// counts the polls and wakes of a separately scheduled task.
+pub(super) struct CountedWakes<F> {
+    inner: Pin<Box<F>>,
+    counts: Arc<WakeCounts>,
+}
+
+impl<F: Future> CountedWakes<F> {
+    pub(super) fn new(inner: F) -> (Self, Arc<WakeCounts>) {
+        let counts = Arc::new(WakeCounts {
+            woken: AtomicBool::new(true),
+            polling: AtomicBool::new(false),
+            polls: AtomicUsize::new(0),
+            wakes: AtomicUsize::new(0),
+            in_poll_wakes: AtomicUsize::new(0),
+            outer: std::sync::Mutex::new(None),
+        });
+        (
+            Self {
+                inner: Box::pin(inner),
+                counts: Arc::clone(&counts),
+            },
+            counts,
+        )
+    }
+}
+
+impl<F: Future> Future for CountedWakes<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<F::Output> {
+        let previous = self
+            .counts
+            .outer
+            .lock()
+            .unwrap()
+            .replace(context.waker().clone());
+        drop(previous);
+        if !self.counts.woken.swap(false, Ordering::SeqCst) {
+            return Poll::Pending;
+        }
+        self.counts.polls.fetch_add(1, Ordering::SeqCst);
+        let waker = Waker::from(Arc::clone(&self.counts));
+        self.counts.polling.store(true, Ordering::SeqCst);
+        let polled = self.inner.as_mut().poll(&mut Context::from_waker(&waker));
+        self.counts.polling.store(false, Ordering::SeqCst);
+        polled
+    }
+}
+
+/// How a [`ScriptedWriteQueue`] answers one accepted write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ScriptedWrite {
+    /// Physically complete at the transport's next flush, which runs once the session's poll
+    /// returns, as a hosting event loop writes inline when it flushes after its callbacks.
+    Complete,
+    /// Physically outstanding until the test completes or fails it.
+    Pending,
+}
+
+/// Where one accepted write of a [`ScriptedWriteQueue`] stands.
+enum ScriptedReceipt {
+    /// Waits for the transport's next flush.
+    Flushing,
+    /// Waits for the test.
+    Pending,
+    /// Physically complete with this result.
+    Settled(Result<(), HttpError>),
+}
+
+/// What a [`ScriptedWriteQueue`] was given and still owes the session.
+pub(super) struct ScriptedWriteState {
+    /// The bytes of each accepted write, in order.
+    pub(super) writes: Vec<Vec<u8>>,
+    script: VecDeque<ScriptedWrite>,
+    after_script: ScriptedWrite,
+    /// Unconsumed receipts the queue holds before `can_write` refuses more.
+    capacity: usize,
+    /// Accepted writes whose receipts are unconsumed, oldest first, with their requested
+    /// sizes.
+    receipts: VecDeque<(usize, ScriptedReceipt)>,
+    /// A flush is scheduled.
+    flush_scheduled: bool,
+    /// The waker of the last `poll_complete` that found no completed receipt.
+    writer: Option<Waker>,
+    /// Runs inside every `start_write`, before the queue wakes a writer.
+    pub(super) on_write: Option<Box<dyn FnMut()>>,
+    /// The fixture's tasks (the flushes and the test's own), joined after the session.
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// The queue's `is_saturated` answer; `true`, the trait's default, unless the test clears
+    /// it.
+    pub(super) saturated: bool,
+}
+
+impl ScriptedWriteState {
+    /// Answers every write after the script with `answer`.
+    pub(super) fn set_after_script(&mut self, answer: ScriptedWrite) {
+        self.after_script = answer;
+    }
+
+    /// Accepted writes that are not yet physically complete.
+    pub(super) fn pending(&self) -> usize {
+        self.receipts
+            .iter()
+            .filter(|(_, receipt)| matches!(receipt, ScriptedReceipt::Pending))
+            .count()
+    }
+
+    /// Whole frames of `frame_type` with every bit of `flags` set in the writes so far.
+    pub(super) fn frames(&self, frame_type: FrameType, flags: u8) -> usize {
+        let wire = self.writes.concat();
+        let mut rest = wire.strip_prefix(CONNECTION_PREFACE).unwrap_or(&wire);
+        let mut count = 0;
+        while rest.len() >= FRAME_HEADER_SIZE {
+            let end =
+                FRAME_HEADER_SIZE + u32::from_be_bytes([0, rest[0], rest[1], rest[2]]) as usize;
+            if rest.len() < end {
+                break;
+            }
+            if rest[3] == frame_type.as_u8() && rest[4] & flags == flags {
+                count += 1;
+            }
+            rest = &rest[end..];
+        }
+        count
+    }
+}
+
+/// Settles the oldest `count` physically outstanding writes with `result`, then wakes the
+/// registered writer.
+fn settle_scripted_writes(
+    state: &RefCell<ScriptedWriteState>,
+    count: usize,
+    result: impl Fn() -> Result<(), HttpError>,
+) {
+    let writer = {
+        let mut state = state.borrow_mut();
+        let mut outstanding = state
+            .receipts
+            .iter_mut()
+            .filter(|(_, receipt)| matches!(receipt, ScriptedReceipt::Pending));
+        for _ in 0..count {
+            outstanding
+                .next()
+                .expect("the test settles only outstanding writes")
+                .1 = ScriptedReceipt::Settled(result());
+        }
+        state.writer.take()
+    };
+    if let Some(writer) = writer {
+        writer.wake();
+    }
+}
+
+/// Completes the oldest `count` physically outstanding writes.
+pub(super) fn complete_scripted_writes(state: &RefCell<ScriptedWriteState>, count: usize) {
+    settle_scripted_writes(state, count, || Ok(()));
+}
+
+/// Fails the oldest physically outstanding write with `error`.
+pub(super) fn fail_scripted_write(state: &RefCell<ScriptedWriteState>, error: HttpError) {
+    settle_scripted_writes(state, 1, || Err(error.clone()));
+}
+
+/// Completes every outstanding write now, and every later write at its flush, so a cancelled
+/// session joins its writer.
+pub(super) fn finish_scripted_writes(state: &RefCell<ScriptedWriteState>) {
+    let count = {
+        let mut state = state.borrow_mut();
+        state.script.clear();
+        state.after_script = ScriptedWrite::Complete;
+        state.pending()
+    };
+    complete_scripted_writes(state, count);
+}
+
+/// Runs `task` on its own task, recorded so [`join_scripted_tasks`] joins it.
+pub(super) fn spawn_scripted_task(
+    state: &RefCell<ScriptedWriteState>,
+    task: impl Future<Output = ()> + 'static,
+) {
+    let handle = tokio::task::spawn_local(task);
+    state.borrow_mut().tasks.push(handle);
+}
+
+/// Joins every task [`spawn_scripted_task`] recorded, including any a joined task recorded.
+pub(super) async fn join_scripted_tasks(state: &RefCell<ScriptedWriteState>) {
+    loop {
+        let tasks = std::mem::take(&mut state.borrow_mut().tasks);
+        if tasks.is_empty() {
+            return;
+        }
+        for task in tasks {
+            task.await.expect("a fixture task completes");
+        }
+    }
+}
+
+/// The transport's flush: completes every write accepted for it, then wakes the registered
+/// writer.
+fn flush_scripted_writes(state: &RefCell<ScriptedWriteState>) {
+    let writer = {
+        let mut state = state.borrow_mut();
+        state.flush_scheduled = false;
+        for (_, receipt) in &mut state.receipts {
+            if matches!(receipt, ScriptedReceipt::Flushing) {
+                *receipt = ScriptedReceipt::Settled(Ok(()));
+            }
+        }
+        state.writer.take()
+    };
+    if let Some(writer) = writer {
+        writer.wake();
+    }
+}
+
+/// A capacity-only queued writer: it admits writes whatever their size until `capacity`
+/// receipts are unconsumed, completes each write at the next flush or holds it physically
+/// outstanding as its script says, delivers receipts in write order, and wakes only the waker
+/// of the last `poll_complete` that found no completed receipt.
+struct ScriptedWriteQueue(Rc<RefCell<ScriptedWriteState>>);
+
+impl crate::uniplex::UniplexWriteQueue for ScriptedWriteQueue {
+    fn can_write(&self, _bytes: usize) -> bool {
+        let state = self.0.borrow();
+        state.receipts.len() < state.capacity
+    }
+
+    fn start_write(&mut self, data: BufQueue) -> Result<(), HttpError> {
+        let bytes: Vec<u8> = data
+            .segments()
+            .flat_map(|segment| segment.iter().copied())
+            .collect();
+        let (flush, on_write) = {
+            let mut state = self.0.borrow_mut();
+            let receipt = match state.script.pop_front().unwrap_or(state.after_script) {
+                ScriptedWrite::Complete => ScriptedReceipt::Flushing,
+                ScriptedWrite::Pending => ScriptedReceipt::Pending,
+            };
+            let flush = matches!(receipt, ScriptedReceipt::Flushing) && !state.flush_scheduled;
+            state.flush_scheduled |= flush;
+            state.receipts.push_back((bytes.len(), receipt));
+            state.writes.push(bytes);
+            (flush, state.on_write.take())
+        };
+        if flush {
+            let state = Rc::clone(&self.0);
+            spawn_scripted_task(&self.0, async move { flush_scripted_writes(&state) });
+        }
+        if let Some(mut on_write) = on_write {
+            on_write();
+            self.0.borrow_mut().on_write = Some(on_write);
+        }
+        Ok(())
+    }
+
+    fn poll_complete(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<crate::uniplex::UniplexWriteCompletion> {
+        let mut state = self.0.borrow_mut();
+        if let Some((_, ScriptedReceipt::Settled(_))) = state.receipts.front() {
+            let Some((requested_bytes, ScriptedReceipt::Settled(result))) =
+                state.receipts.pop_front()
+            else {
+                unreachable!("the front receipt is settled")
+            };
+            let result = match result {
+                Ok(()) => Ok(WriteInfo {
+                    bytes_written: requested_bytes,
+                }),
+                Err(error) => Err(TransportWriteError::new(error, 0)),
+            };
+            return Poll::Ready(crate::uniplex::UniplexWriteCompletion {
+                requested_bytes,
+                result,
+            });
+        }
+        let replaced = state.writer.replace(context.waker().clone());
+        drop(state);
+        drop(replaced);
+        Poll::Pending
+    }
+
+    fn is_idle(&self) -> bool {
+        self.0.borrow().receipts.is_empty()
+    }
+
+    fn is_saturated(&self) -> bool {
+        self.0.borrow().saturated
+    }
+}
+
+/// Reads through a [`FixtureTransport`], then, when its reads run out, fails one read once its
+/// gate opens; writes through a [`ScriptedWriteQueue`].
+pub(super) struct ScriptedWriteTransport {
+    inner: Rc<FixtureTransport>,
+    reads: Rc<RefCell<FixtureTransportState>>,
+    failing_read: RefCell<Option<(Arc<tokio::sync::Notify>, HttpErrorCode)>>,
+    pub(super) state: Rc<RefCell<ScriptedWriteState>>,
+}
+
+impl ScriptedWriteTransport {
+    pub(super) fn new(
+        reads: impl IntoIterator<Item = FixtureRead>,
+        script: impl IntoIterator<Item = ScriptedWrite>,
+        after_script: ScriptedWrite,
+        capacity: usize,
+        failing_read: Option<(Arc<tokio::sync::Notify>, HttpErrorCode)>,
+    ) -> Rc<Self> {
+        let (inner, reads) = FixtureTransport::new(reads);
+        Rc::new(Self {
+            inner,
+            reads,
+            failing_read: RefCell::new(failing_read),
+            state: Rc::new(RefCell::new(ScriptedWriteState {
+                writes: Vec::new(),
+                script: script.into_iter().collect(),
+                after_script,
+                capacity,
+                receipts: VecDeque::new(),
+                flush_scheduled: false,
+                writer: None,
+                on_write: None,
+                tasks: Vec::new(),
+                saturated: true,
+            })),
+        })
+    }
+}
+
+impl UniplexTransport for ScriptedWriteTransport {
+    fn try_write_queue(
+        &self,
+        _context: &WorkerContext,
+        _maximum_write_size: usize,
+        timeout: Duration,
+        _cancellation: CancellationToken,
+    ) -> Result<Option<Box<dyn crate::uniplex::UniplexWriteQueue>>, HttpError> {
+        assert!(timeout.is_zero());
+        Ok(Some(Box::new(ScriptedWriteQueue(Rc::clone(&self.state)))))
+    }
+
+    fn read(
+        &self,
+        context: &WorkerContext,
+        maximum: usize,
+        allocation_size: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        if self.reads.borrow().reads.is_empty()
+            && let Some((gate, code)) = self.failing_read.borrow_mut().take()
+        {
+            return Box::pin(async move {
+                gate.notified().await;
+                Err(HttpError::with_message(code, b"scripted read failure"))
+            });
+        }
+        self.inner
+            .read(context, maximum, allocation_size, timeout, cancellation)
+    }
+
+    fn write(
+        &self,
+        _context: &WorkerContext,
+        _data: BufQueue,
+        _flags: ByteEventWriteFlags,
+        _timeout: Duration,
+        _cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        panic!("the scripted fixture writes only through its queue")
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.shutdown_write(context)
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close_with_reset(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.inner.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.inner.register_byte_event(context, registration)
+    }
+}
+
+/// Opens the gated [`ArmingExchange`] answers once the test releases them.
+#[derive(Default)]
+struct ResponseGate {
+    open: Cell<bool>,
+    waker: RefCell<Option<Waker>>,
+}
+
+impl ResponseGate {
+    fn release(&self) {
+        self.open.set(true);
+        let waker = self.waker.borrow_mut().take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+/// Every exchange holds its request body unread, so the body source never wakes the session,
+/// and answers `200` with a fixed date and no body, ending the response with its head. The
+/// exchange for `held` never answers; with a `gate`, every other answer waits for it. Counts
+/// the exchanges that retire after answering.
+struct ArmingApplication {
+    completes: Rc<Cell<usize>>,
+    gate: Option<Rc<ResponseGate>>,
+    held: Option<StreamId>,
+}
+
+struct ArmingExchange {
+    held: bool,
+    gate: Option<Rc<ResponseGate>>,
+    completes: Rc<Cell<usize>>,
+    _ingress: IngressCompletion,
+    _body: Option<HttpStreamSourceOwner>,
+}
+
+impl ArmingApplication {
+    fn new(completes: &Rc<Cell<usize>>) -> Self {
+        Self {
+            completes: Rc::clone(completes),
+            gate: None,
+            held: None,
+        }
+    }
+}
+
+impl OwnedH2Application for ArmingApplication {
+    type Exchange = ArmingExchange;
+
+    fn new_exchange(&self, stream: StreamId, ingress: IngressCompletion) -> ArmingExchange {
+        ArmingExchange {
+            held: self.held == Some(stream),
+            gate: self.gate.clone(),
+            completes: Rc::clone(&self.completes),
+            _ingress: ingress,
+            _body: None,
+        }
+    }
+}
+
+impl OwnedH2Exchange for ArmingExchange {
+    fn request(&mut self, _head: Box<HttpMessage>, body: HttpStreamSourceOwner, _eom: bool) {
+        self._body = Some(body);
+    }
+
+    fn poll_headers(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        if self.held {
+            return Poll::Pending;
+        }
+        if let Some(gate) = &self.gate
+            && !gate.open.get()
+        {
+            *gate.waker.borrow_mut() = Some(context.waker().clone());
+            return Poll::Pending;
+        }
+        let mut response = HttpMessage::new();
+        response.set_status_code(200).unwrap();
+        response.set_http_version(1, 1);
+        // A fixed date keeps the encoded head, and so `ANSWER_BYTES`, constant.
+        response
+            .headers_mut()
+            .set(HttpHeaderCode::Date, TRANSCRIPT_DATE);
+        Poll::Ready(Ok(HttpHeaderEvent::new(response, true).unwrap()))
+    }
+
+    fn poll_body(
+        &mut self,
+        _context: &mut Context<'_>,
+        _maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        unreachable!("the head ends the response")
+    }
+
+    fn cancel(&mut self, _error: &HttpError, _peer_reset: bool) {}
+
+    fn response_complete(&mut self) {}
+
+    fn complete(self) {
+        if !self.held {
+            self.completes.set(self.completes.get() + 1);
+        }
+    }
+}
+
+/// Bytes the session writes to answer with [`ArmingExchange`]: one HEADERS frame.
+const ANSWER_BYTES: usize = 34;
+
+/// The client connection preface and SETTINGS.
+fn arming_preface(peer: &mut Http2Codec) -> Vec<u8> {
+    let mut preface = eligibility_frame(peer, EgressFrame::ConnectionPreface);
+    preface.extend(transcript_settings(peer));
+    preface
+}
+
+/// A GET that ends its stream with its HEADERS.
+fn arming_get(peer: &mut Http2Codec) -> (StreamId, Vec<u8>) {
+    let stream = peer.create_stream();
+    let mut request = HttpMessage::new();
+    request.set_method(HttpMethod::Get).unwrap();
+    request.set_url(b"/", false).unwrap();
+    request.set_http_version(1, 1);
+    request
+        .headers_mut()
+        .set(HttpHeaderCode::Host, b"example.com");
+    let bytes = eligibility_frame(
+        peer,
+        EgressFrame::Headers {
+            stream,
+            message: &request,
+            end_stream: true,
+            extra_headers: None,
+        },
+    );
+    (stream, bytes)
+}
+
+/// Runs a downstream session for `application` over `transport` beside `script`, polling the
+/// session only on its own wakes. Then cancels it, opens `gates` and finishes every write so
+/// the session joins, and returns what the script observed.
+async fn run_downstream_arming<T>(
+    context: WorkerContext,
+    application: ArmingApplication,
+    transport: Rc<ScriptedWriteTransport>,
+    configure: impl FnOnce(&mut OwnedH2Options),
+    gates: &[Arc<tokio::sync::Notify>],
+    script: impl AsyncFnOnce(&RefCell<ScriptedWriteState>, &WakeCounts) -> T,
+) -> T {
+    let state = Rc::clone(&transport.state);
+    let mut config = options(context, transport);
+    configure(&mut config);
+    let (session, handle) = OwnedH2Session::new(application, config).unwrap();
+    let (run, counts) = CountedWakes::new(session.run());
+    let script = async {
+        let observed = script(&state, &counts).await;
+        handle.cancel();
+        gates.iter().for_each(|gate| gate.notify_one());
+        finish_scripted_writes(&state);
+        observed
+    };
+    let (_run, observed) = tokio::time::timeout(Duration::from_secs(10), async {
+        let joined = tokio::join!(run, script);
+        join_scripted_tasks(&state).await;
+        joined
+    })
+    .await
+    .expect("the cancelled session joins its transport operations and the fixture's tasks");
+    observed
+}
+
+/// Once the server SETTINGS and the SETTINGS ACK are written, opens `gate`, behind which the
+/// client's requests wait, and returns the number of writes before them.
+async fn release_requests(
+    state: &RefCell<ScriptedWriteState>,
+    gate: &tokio::sync::Notify,
+) -> Option<usize> {
+    let ready = writer_drive_until(|| state.borrow().frames(FrameType::SETTINGS, ACK) == 1).await;
+    let writes = state.borrow().writes.len();
+    gate.notify_one();
+    ready.then_some(writes)
+}
+
+#[test]
+fn stream_retirement_waits_for_physical_completion() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let preface = arming_preface(&mut peer);
+            let (_, get) = arming_get(&mut peer);
+            let requests = Arc::new(tokio::sync::Notify::new());
+            let transport = ScriptedWriteTransport::new(
+                [
+                    FixtureRead::Data(preface),
+                    FixtureRead::WaitData(Arc::clone(&requests), get),
+                ],
+                [],
+                ScriptedWrite::Complete,
+                INLINE_OUTSTANDING_WRITES,
+                None,
+            );
+            let completes = Rc::new(Cell::new(0));
+            let (before, answered, held, retired) = run_downstream_arming(
+                context,
+                ArmingApplication::new(&completes),
+                transport,
+                |_| {},
+                &[Arc::clone(&requests)],
+                async |state, _counts| {
+                    let before = release_requests(state, &requests).await;
+                    state.borrow_mut().set_after_script(ScriptedWrite::Pending);
+                    let answered = writer_drive_until(|| {
+                        state.borrow().frames(FrameType::HEADERS, END_STREAM) == 1
+                    })
+                    .await;
+                    writer_settle().await;
+                    let held = (
+                        state.borrow().writes.len(),
+                        state.borrow().pending(),
+                        completes.get(),
+                    );
+                    complete_scripted_writes(state, 1);
+                    let retired = writer_drive_until(|| completes.get() == 1).await;
+                    (before, answered, held, retired)
+                },
+            )
+            .await;
+            let before = before.expect("the session exchanges SETTINGS");
+            assert!(answered, "the session answers the GET");
+            assert_eq!(
+                held,
+                (before + 1, 1, 0),
+                "the response's write is pending, and the consumed, response-complete stream \
+                 waits for its physical write"
+            );
+            assert!(retired, "the stream retires once its write completes");
+        })
+    });
+}
+
+/// While another request stays open, so some stream still awaits ingress, a stream that was
+/// consumed before it answered retires once its response's pending write completes. The
+/// answer comes from the application's own wake, so no self-wake follows the write.
+#[test]
+fn retirement_behind_an_open_request_waits_for_physical_completion() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let preface = arming_preface(&mut peer);
+            let (held, open) = padding_post_headers(&mut peer);
+            assert_eq!(held, StreamId::new(1), "the held request is stream 1");
+            let (_, get) = arming_get(&mut peer);
+            let requests = Arc::new(tokio::sync::Notify::new());
+            let transport = ScriptedWriteTransport::new(
+                [
+                    FixtureRead::Data(preface),
+                    FixtureRead::WaitData(Arc::clone(&requests), [open, get].concat()),
+                ],
+                [],
+                ScriptedWrite::Complete,
+                INLINE_OUTSTANDING_WRITES,
+                None,
+            );
+            let completes = Rc::new(Cell::new(0));
+            let gate = Rc::new(ResponseGate::default());
+            let application = ArmingApplication {
+                gate: Some(Rc::clone(&gate)),
+                held: Some(held),
+                ..ArmingApplication::new(&completes)
+            };
+            let (before, gated, answered, held_write, retired) = run_downstream_arming(
+                context,
+                application,
+                transport,
+                |_| {},
+                &[Arc::clone(&requests)],
+                async |state, _counts| {
+                    let before = release_requests(state, &requests).await;
+                    writer_settle().await;
+                    let gated = (gate.waker.borrow().is_some(), state.borrow().writes.len());
+                    state.borrow_mut().set_after_script(ScriptedWrite::Pending);
+                    gate.release();
+                    let answered = writer_drive_until(|| {
+                        state.borrow().frames(FrameType::HEADERS, END_STREAM) == 1
+                    })
+                    .await;
+                    writer_settle().await;
+                    let held_write = (
+                        state.borrow().writes.len(),
+                        state.borrow().pending(),
+                        completes.get(),
+                    );
+                    complete_scripted_writes(state, 1);
+                    let retired = writer_drive_until(|| completes.get() == 1).await;
+                    (before, gated, answered, held_write, retired)
+                },
+            )
+            .await;
+            let before = before.expect("the session exchanges SETTINGS");
+            assert_eq!(
+                gated,
+                (true, before),
+                "the GET waits for the gate, and nothing is written"
+            );
+            assert!(answered, "the session answers the GET");
+            assert_eq!(
+                held_write,
+                (before + 1, 1, 0),
+                "the response's write is pending, and the consumed, response-complete stream \
+                 waits for its physical write"
+            );
+            assert!(retired, "the stream retires once its write completes");
+        })
+    });
+}
+
+/// The response's write starts unarmed while its request is still open. Later in the same
+/// session poll the request's END_STREAM is read, so no stream awaits ingress, and the write's
+/// completion must wake the session.
+#[test]
+fn ingress_end_after_an_unarmed_write_arms_the_writer() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let preface = arming_preface(&mut peer);
+            let (stream, open) = padding_post_headers(&mut peer);
+            let end = eligibility_frame(
+                &mut peer,
+                EgressFrame::Body {
+                    stream,
+                    body: queue(&[]),
+                    padding: None,
+                    end_stream: true,
+                },
+            );
+            let requests = Arc::new(tokio::sync::Notify::new());
+            // One read takes the open request. The next, which completes when first polled,
+            // takes its END_STREAM in the turn after the one that answers it.
+            let transport = ScriptedWriteTransport::new(
+                [
+                    FixtureRead::Data(preface),
+                    FixtureRead::WaitData(Arc::clone(&requests), open),
+                    FixtureRead::SegmentedData(queue(&end)),
+                ],
+                [],
+                ScriptedWrite::Complete,
+                INLINE_OUTSTANDING_WRITES,
+                None,
+            );
+            let completes = Rc::new(Cell::new(0));
+            let (before, answered, response, woken) = run_downstream_arming(
+                context,
+                ArmingApplication::new(&completes),
+                transport,
+                // A write limit of exactly the answer's egress starts that write, whole, in the
+                // turn that serializes it, before the turn that reads the END_STREAM.
+                |config| config.io.maximum_write_size = ANSWER_BYTES,
+                &[Arc::clone(&requests)],
+                async |state, counts| {
+                    let before = release_requests(state, &requests).await;
+                    state.borrow_mut().set_after_script(ScriptedWrite::Pending);
+                    let answered = writer_drive_until(|| {
+                        state.borrow().frames(FrameType::HEADERS, END_STREAM) == 1
+                    })
+                    .await;
+                    writer_settle().await;
+                    let response = {
+                        let state = state.borrow();
+                        (
+                            state.writes.len(),
+                            state.writes.last().map_or(0, Vec::len),
+                            state.pending(),
+                        )
+                    };
+                    let polls = counts.polls();
+                    complete_scripted_writes(state, 1);
+                    writer_settle().await;
+                    (before, answered, response, counts.polls() > polls)
+                },
+            )
+            .await;
+            let before = before.expect("the session exchanges SETTINGS");
+            assert!(answered, "the session answers the POST");
+            assert_eq!(
+                response,
+                (before + 1, ANSWER_BYTES, 1),
+                "the response's HEADERS, which end it, are one pending write"
+            );
+            assert!(
+                woken,
+                "with no stream awaiting ingress, the write's completion wakes the session"
+            );
+        })
+    });
+}
+
+#[test]
+fn scripted_write_fixture_joins_its_tasks() {
+    run_on_worker(|_context| {
+        Box::pin(async move {
+            let transport = ScriptedWriteTransport::new([], [], ScriptedWrite::Complete, 1, None);
+            let state = Rc::clone(&transport.state);
+            drop(transport);
+            let mut writer = ScriptedWriteQueue(Rc::clone(&state));
+            crate::uniplex::UniplexWriteQueue::start_write(&mut writer, queue(b"w")).unwrap();
+            drop(writer);
+            let ran = Rc::new(Cell::new(false));
+            let marked = Rc::clone(&ran);
+            spawn_scripted_task(&state, async move {
+                tokio::task::yield_now().await;
+                marked.set(true);
+            });
+            join_scripted_tasks(&state).await;
+            assert!(
+                ran.get(),
+                "a recorded task runs to completion before the join returns"
+            );
+            assert!(
+                matches!(
+                    state.borrow().receipts.front(),
+                    Some((1, ScriptedReceipt::Settled(Ok(()))))
+                ),
+                "the write's flush task completes it before the join returns"
+            );
+            assert_eq!(
+                Rc::strong_count(&state),
+                1,
+                "no fixture task holds the fixture after the join"
+            );
+        })
+    });
+}
+
+#[test]
+fn downstream_arming_harness_joins_fixture_tasks() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let transport = ScriptedWriteTransport::new(
+                [FixtureRead::Data(arming_preface(&mut peer))],
+                [],
+                ScriptedWrite::Complete,
+                INLINE_OUTSTANDING_WRITES,
+                None,
+            );
+            let teardown = Arc::new(tokio::sync::Notify::new());
+            let ran = Rc::new(Cell::new(false));
+            let completes = Rc::new(Cell::new(0));
+            let settled = run_downstream_arming(
+                context,
+                ArmingApplication::new(&completes),
+                transport,
+                |_| {},
+                &[Arc::clone(&teardown)],
+                async |state, _counts| {
+                    let settled =
+                        writer_drive_until(|| state.borrow().frames(FrameType::SETTINGS, ACK) == 1)
+                            .await;
+                    let marked = Rc::clone(&ran);
+                    let teardown = Arc::clone(&teardown);
+                    spawn_scripted_task(state, async move {
+                        teardown.notified().await;
+                        writer_settle().await;
+                        marked.set(true);
+                    });
+                    settled
+                },
+            )
+            .await;
+            assert!(settled, "the session exchanges SETTINGS");
+            assert!(
+                ran.get(),
+                "the harness joins a task that runs on past the session's teardown"
+            );
+        })
+    });
+}
+
+/// Streams the stream-table order tests open.
+const ORDER_STREAMS: [u64; 5] = [1, 3, 5, 7, 9];
+
+/// A fixed stream-table seed under which the table does not iterate the
+/// order tests' streams in id order.
+pub(super) const ORDER_SEED: u64 = 0x5EED_0048;
+
+/// Asserts the order tests' precondition: under `ORDER_SEED`, a table holding
+/// `streams` does not iterate them in id order.
+pub(super) fn assert_seed_reorders(streams: &[u64]) {
+    assert_ne!(
+        stream_seed_order(ORDER_SEED, streams),
+        streams,
+        "precondition: the seeded stream table iterates out of id order"
+    );
+}
+
+/// Client preface and SETTINGS (`settings`, or the codec's configured set
+/// when empty), then [`order_followups`].
+fn order_requests(
+    peer: &mut Http2Codec,
+    settings: &[CodecSetting],
+    count: usize,
+    complete: bool,
+) -> Vec<u8> {
+    let mut requests = eligibility_frame(peer, EgressFrame::ConnectionPreface);
+    if settings.is_empty() {
+        requests.extend(transcript_settings(peer));
+    } else {
+        requests.extend(eligibility_frame(peer, EgressFrame::Settings { settings }));
+    }
+    requests.extend(order_followups(peer, count, complete));
+    requests
+}
+
+/// One request per new stream: GETs ending the stream, or POSTs whose bodies
+/// never arrive.
+fn order_followups(peer: &mut Http2Codec, count: usize, complete: bool) -> Vec<u8> {
+    let mut requests = Vec::new();
+    for _ in 0..count {
+        let stream = peer.create_stream();
+        let mut request = HttpMessage::new();
+        request
+            .set_method(if complete {
+                HttpMethod::Get
+            } else {
+                HttpMethod::Post
+            })
+            .unwrap();
+        request
+            .set_url(format!("/order/{}", stream.get()).as_bytes(), false)
+            .unwrap();
+        request.set_http_version(1, 1);
+        request
+            .headers_mut()
+            .set(HttpHeaderCode::Host, b"example.com");
+        requests.extend(eligibility_frame(
+            peer,
+            EgressFrame::Headers {
+                stream,
+                message: &request,
+                end_stream: complete,
+                extra_headers: None,
+            },
+        ));
+    }
+    requests
+}
+
+/// Bytes of the 65,535-byte response that takes the connection's whole send
+/// credit ahead of the 64 consumer-shaped exchanges.
+const CREDIT_FILLER: usize = 65_535;
+
+#[test]
+fn sixty_four_stream_transcript_is_unchanged() {
+    let (written, run) = run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let filler = order_requests(&mut peer, &[], 1, true);
+            let exchanges = order_followups(&mut peer, 64, true);
+            let credit = eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::UNSPECIFIED,
+                    amount: (64 * TRANSCRIPT_BODY) as u32,
+                },
+            );
+            let goaway = eligibility_frame(
+                &mut peer,
+                EgressFrame::Goaway {
+                    last_stream: StreamId::new(0),
+                    code: H2ErrorCode::NO_ERROR,
+                    debug_data: None,
+                },
+            );
+            let exchanges_gate = Arc::new(tokio::sync::Notify::new());
+            let credit_gate = Arc::new(tokio::sync::Notify::new());
+            let goaway_gate = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(filler),
+                FixtureRead::WaitData(Arc::clone(&exchanges_gate), exchanges),
+                FixtureRead::WaitData(Arc::clone(&credit_gate), credit),
+                FixtureRead::WaitDataEof(Arc::clone(&goaway_gate), goaway),
+            ]);
+            let mut replies = vec![Reply::Body(CREDIT_FILLER)];
+            replies.extend([Reply::Body(TRANSCRIPT_BODY); 64]);
+            let (mut application, probes) = Application::new(replies);
+            application.response_date = Some(TRANSCRIPT_DATE);
+            assert_seed_reorders(&(0..65).map(|index| 1 + 2 * index).collect::<Vec<_>>());
+            let (session, _handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let session = session.with_stream_seed(ORDER_SEED);
+            let script = async {
+                wait_for_written(&state, |wire| wire.count(FrameType::DATA, END_STREAM) == 1).await;
+                exchanges_gate.notify_one();
+                wait_for_written(&state, |wire| wire.count(FrameType::HEADERS, 0) == 65).await;
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                let blocked = written_transcript(&state);
+                assert_eq!(
+                    (
+                        blocked.count(FrameType::HEADERS, 0),
+                        blocked.count(FrameType::DATA, END_STREAM),
+                        probes.borrow()[1..]
+                            .iter()
+                            .map(|probe| probe.produced_bytes.get())
+                            .sum::<usize>(),
+                    ),
+                    (65, 1, 64 * TRANSCRIPT_BODY),
+                    "every consumer-shaped response is produced and waits on connection send credit"
+                );
+                credit_gate.notify_one();
+                wait_for_written(&state, |wire| wire.count(FrameType::DATA, END_STREAM) == 65)
+                    .await;
+                goaway_gate.notify_one();
+            };
+            let (run, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(session.run(), script)
+            })
+            .await
+            .expect("the 64-stream fixture finishes at EOF");
+            (
+                written_transcript(&state),
+                run.map(drop).map_err(|error| error.code()),
+            )
+        })
+    });
+    assert_eq!(
+        written.digest(),
+        (149, 9_009_706_708_975_363_477),
+        "written transcript recorded at 3ef2675c725b; written: {written:#?}"
+    );
+    assert_eq!(written.count(FrameType::HEADERS, 0), 65);
+    assert_eq!(written.count(FrameType::DATA, END_STREAM), 65);
+    assert_eq!(written.count(FrameType::RST_STREAM, 0), 0);
+    assert_eq!(run, Ok(()), "the session closes cleanly at EOF");
+}
+
+/// Runs `ORDER_STREAMS.len()` requests (`complete` GETs or bodiless POSTs)
+/// whose owners hold their responses, logging cancellations and drops in
+/// `order`. Once every request has reached its owner, `failure` delivers peer
+/// bytes, or the handle cancels the connection when `failure` is `None`.
+/// With `eof`, the requests arrive with EOF instead. Returns the written
+/// transcript and how the run ended.
+async fn ordered_owner_failure(
+    context: WorkerContext,
+    order: Rc<StreamOrderProbe>,
+    reads: Vec<u8>,
+    failure: Option<Vec<u8>>,
+    eof: bool,
+) -> (WireTranscript, Result<(), HttpErrorCode>) {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let mut script = vec![if eof {
+        FixtureRead::DataEof(reads)
+    } else {
+        FixtureRead::Data(reads)
+    }];
+    if let Some(bytes) = &failure {
+        script.push(FixtureRead::WaitData(Arc::clone(&gate), bytes.clone()));
+    }
+    let (transport, state) = FixtureTransport::new(script);
+    let (mut application, probes) = Application::new(vec![Reply::Body(0); ORDER_STREAMS.len()]);
+    application.hold_headers = true;
+    application.stream_order = Some(order);
+    assert_seed_reorders(&ORDER_STREAMS);
+    let (session, handle) = OwnedH2Session::new(application, options(context, transport)).unwrap();
+    let session = session.with_stream_seed(ORDER_SEED);
+    let operation = async {
+        if eof {
+            return;
+        }
+        complete_credit_wait(|| {
+            let probes = probes.borrow();
+            probes.len() == ORDER_STREAMS.len()
+                && probes.iter().all(|probe| probe.requested.get() == 1)
+        })
+        .await;
+        if failure.is_some() {
+            gate.notify_one();
+        } else {
+            handle.cancel();
+        }
+    };
+    let (run, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(session.run(), operation)
+    })
+    .await
+    .expect("the failed connection retires every owner");
+    drop(probes);
+    (
+        written_transcript(&state),
+        run.map(drop).map_err(|error| error.code()),
+    )
+}
+
+#[test]
+fn eof_fails_incomplete_streams_in_id_order() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let order = Rc::new(StreamOrderProbe::default());
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let requests = order_requests(&mut peer, &[], ORDER_STREAMS.len(), false);
+            let (written, run) =
+                ordered_owner_failure(context, Rc::clone(&order), requests, None, true).await;
+            assert_eq!(
+                run,
+                Ok(()),
+                "the session closes at EOF once every stream failed"
+            );
+            assert_eq!(order.cancelled.borrow().as_slice(), &ORDER_STREAMS);
+            let headers: Vec<_> = written
+                .frames
+                .iter()
+                .filter(|frame| frame.frame_type == FrameType::HEADERS.as_u8())
+                .map(|frame| u64::from(frame.stream))
+                .collect();
+            assert_eq!(
+                headers, ORDER_STREAMS,
+                "the 500 responses go out in id order"
+            );
+        })
+    });
+}
+
+#[test]
+fn connection_failure_fails_streams_in_id_order() {
+    for peer_error in [true, false] {
+        run_on_worker(move |context| {
+            Box::pin(async move {
+                let order = Rc::new(StreamOrderProbe::default());
+                let mut peer = Http2Codec::new(TransportDirection::Upstream);
+                let requests = order_requests(&mut peer, &[], ORDER_STREAMS.len(), true);
+                // A connection WINDOW_UPDATE past 2^31 - 1 fails the connection
+                // (`fail_connection`); handle cancellation aborts it (`abort`).
+                let failure = peer_error.then(|| {
+                    eligibility_frame(
+                        &mut peer,
+                        EgressFrame::WindowUpdate {
+                            stream: StreamId::UNSPECIFIED,
+                            amount: i32::MAX as u32,
+                        },
+                    )
+                });
+                let (_, run) =
+                    ordered_owner_failure(context, Rc::clone(&order), requests, failure, false)
+                        .await;
+                assert_eq!(
+                    run,
+                    Err(if peer_error {
+                        HttpErrorCode::FLOW_CONTROL_ERROR
+                    } else {
+                        HttpErrorCode::CORO_CANCELLED
+                    })
+                );
+                assert_eq!(order.cancelled.borrow().as_slice(), &ORDER_STREAMS);
+            })
+        });
+    }
+}
+
+#[test]
+fn wake_all_polls_owners_in_id_order() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let order = Rc::new(StreamOrderProbe::default());
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let requests = order_requests(&mut peer, &[], ORDER_STREAMS.len(), true);
+            let (_, run) =
+                ordered_owner_failure(context, Rc::clone(&order), requests, None, false).await;
+            assert_eq!(run, Err(HttpErrorCode::CORO_CANCELLED));
+            // `abort` wakes every owner from `reset_transport` before it resets
+            // them, so the owner polls that retire them follow the wake order.
+            assert_eq!(
+                order.dropped.borrow().as_slice(),
+                ORDER_STREAMS.map(|stream| (stream, false))
+            );
+        })
+    });
+}
+
+/// Four GETs under a peer initial stream window of 0, so their 128-byte
+/// responses wait on stream credit; then `update` (peer bytes); then, unless
+/// the update fails the connection, a GOAWAY and EOF.
+async fn initial_window_case(
+    context: WorkerContext,
+    overflow: bool,
+) -> (WireTranscript, Result<(), HttpErrorCode>) {
+    let initial = |value| CodecSetting {
+        identifier: SettingsId::InitialWindowSize.as_u16(),
+        value,
+    };
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    let requests = order_requests(&mut peer, &[initial(0)], 4, true);
+    let mut update = Vec::new();
+    if overflow {
+        update.extend(eligibility_frame(
+            &mut peer,
+            EgressFrame::WindowUpdate {
+                stream: StreamId::new(5),
+                amount: i32::MAX as u32,
+            },
+        ));
+    }
+    update.extend(eligibility_frame(
+        &mut peer,
+        EgressFrame::Settings {
+            settings: &[initial(if overflow { 1 } else { TRANSCRIPT_BODY as u64 })],
+        },
+    ));
+    let goaway = eligibility_frame(
+        &mut peer,
+        EgressFrame::Goaway {
+            last_stream: StreamId::new(0),
+            code: H2ErrorCode::NO_ERROR,
+            debug_data: None,
+        },
+    );
+    let update_gate = Arc::new(tokio::sync::Notify::new());
+    let goaway_gate = Arc::new(tokio::sync::Notify::new());
+    let (transport, state) = FixtureTransport::new([
+        FixtureRead::Data(requests),
+        FixtureRead::WaitData(Arc::clone(&update_gate), update),
+        FixtureRead::WaitDataEof(Arc::clone(&goaway_gate), goaway),
+    ]);
+    let (mut application, _probes) = Application::new(vec![Reply::Body(TRANSCRIPT_BODY); 4]);
+    application.response_date = Some(TRANSCRIPT_DATE);
+    assert_seed_reorders(&[1, 3, 5, 7]);
+    let (session, _handle) = OwnedH2Session::new(application, options(context, transport)).unwrap();
+    let session = session.with_stream_seed(ORDER_SEED);
+    let script = async {
+        wait_for_written(&state, |wire| wire.count(FrameType::HEADERS, 0) == 4).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            written_transcript(&state).count(FrameType::DATA, 0),
+            0,
+            "every response waits on stream credit"
+        );
+        update_gate.notify_one();
+        if overflow {
+            return;
+        }
+        wait_for_written(&state, |wire| wire.count(FrameType::DATA, END_STREAM) == 4).await;
+        goaway_gate.notify_one();
+    };
+    let (run, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(session.run(), script)
+    })
+    .await
+    .expect("the initial-window fixture finishes");
+    (
+        written_transcript(&state),
+        run.map(drop).map_err(|error| error.code()),
+    )
+}
+
+#[test]
+fn initial_window_change_reaches_every_stream() {
+    let (written, run) = run_on_worker(|context| Box::pin(initial_window_case(context, false)));
+    let data: Vec<_> = written
+        .frames
+        .iter()
+        .filter(|frame| frame.frame_type == FrameType::DATA.as_u8())
+        .map(|frame| (frame.stream, frame.length, frame.flags & END_STREAM))
+        .collect();
+    assert_eq!(
+        data,
+        [1, 3, 5, 7].map(|stream| (stream, TRANSCRIPT_BODY as u32, END_STREAM)),
+        "the new initial window reaches every stream"
+    );
+    assert_eq!(run, Ok(()));
+    let (written, run) = run_on_worker(|context| Box::pin(initial_window_case(context, true)));
+    assert_eq!(
+        written.digest(),
+        (8, 8_117_510_642_420_668_309),
+        "overflow transcript recorded at 3ef2675c725b; written: {written:#?}"
+    );
+    assert_eq!(run, Err(HttpErrorCode::FLOW_CONTROL_ERROR));
+}
+
+thread_local! {
+    /// `yield_to_io` futures that [`FoldHost`] holds until [`release_held_yields`].
+    static HELD_YIELDS: RefCell<Option<Vec<Rc<HeldYield>>>> = const { RefCell::new(None) };
+}
+
+#[derive(Default)]
+struct HeldYield {
+    released: Cell<bool>,
+    waker: RefCell<Option<Waker>>,
+}
+
+/// Holds every later `yield_to_io` of a [`FoldHost`] on this thread until
+/// [`release_held_yields`], so a budget yield wakes nothing by itself.
+fn hold_yields() {
+    HELD_YIELDS.set(Some(Vec::new()));
+}
+
+/// Completes the held yields and stops holding new ones.
+fn release_held_yields() {
+    for held in HELD_YIELDS.take().unwrap_or_default() {
+        held.released.set(true);
+        if let Some(waker) = held.waker.borrow_mut().take() {
+            waker.wake();
+        }
+    }
+}
+
+/// The Tokio host, with yields that a test can hold, that runs wakes in the current iteration.
+struct FoldHost;
+
+impl roxygen_runtime::host::LocalHost for FoldHost {
+    fn runs_wakes_this_iteration(&self) -> bool {
+        true
+    }
+
+    fn spawn_local(&self, future: roxygen_runtime::host::LocalFuture) {
+        roxygen_runtime::host::TokioHost.spawn_local(future);
+    }
+
+    fn now(&self) -> Instant {
+        roxygen_runtime::host::TokioHost.now()
+    }
+
+    fn sleep_until(&self, deadline: Instant) -> roxygen_runtime::host::LocalFuture {
+        roxygen_runtime::host::TokioHost.sleep_until(deadline)
+    }
+
+    fn yield_to_io(&self) -> roxygen_runtime::host::LocalFuture {
+        let held = HELD_YIELDS.with_borrow_mut(|held| {
+            held.as_mut().map(|held| {
+                let entry = Rc::new(HeldYield::default());
+                held.push(Rc::clone(&entry));
+                entry
+            })
+        });
+        let Some(held) = held else {
+            return roxygen_runtime::host::TokioHost.yield_to_io();
+        };
+        Box::pin(poll_fn(move |context| {
+            if held.released.get() {
+                Poll::Ready(())
+            } else {
+                *held.waker.borrow_mut() = Some(context.waker().clone());
+                Poll::Pending
+            }
+        }))
+    }
+}
+
+/// [`run_on_worker`] on a worker whose host is a [`FoldHost`].
+fn run_on_fold_worker<T: Send + 'static>(
+    test: impl FnOnce(WorkerContext) -> Pin<Box<dyn Future<Output = T>>> + Send + 'static,
+) -> T {
+    let result = Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("current-thread runtime")
+        .block_on(LocalSet::new().run_until(async move {
+            let host = Host::new(Rc::new(FoldHost));
+            let (worker, driver) = WorkerDriver::with_host(16, host).expect("worker driver");
+            let call = worker
+                .call_local(move |context| {
+                    let worker = context.handle().clone();
+                    async move {
+                        let result = test(context).await;
+                        worker.begin_shutdown();
+                        result
+                    }
+                })
+                .expect("worker call");
+            let (_, result) = tokio::join!(driver, call);
+            result.expect("worker call completed")
+        }));
+    release_held_yields();
+    result
+}
+
+/// Counts wakes delivered to the session's own waker and marks the session runnable; the
+/// task's waker still runs.
+struct CountingWake {
+    delegate: Waker,
+    wakes: Arc<AtomicUsize>,
+    woken: Arc<AtomicBool>,
+}
+
+impl std::task::Wake for CountingWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+        self.woken.store(true, Ordering::SeqCst);
+        self.delegate.wake_by_ref();
+    }
+}
+
+#[derive(Default)]
+struct SessionCounts {
+    wakes: Arc<AtomicUsize>,
+    polls: Cell<usize>,
+}
+
+impl SessionCounts {
+    fn wakes(&self) -> usize {
+        self.wakes.load(Ordering::SeqCst)
+    }
+}
+
+/// Polls the session only after its own waker fired, as a host does. `tokio::join!` alone
+/// polls every branch whenever any branch wakes, which would hide a lost session wake.
+fn gated_run(
+    session: OwnedH2Session<Application>,
+    counts: &SessionCounts,
+) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> + '_ {
+    let mut run = Box::pin(session.run());
+    let woken = Arc::new(AtomicBool::new(true));
+    poll_fn(move |context| {
+        if !woken.swap(false, Ordering::SeqCst) {
+            return Poll::Pending;
+        }
+        counts.polls.set(counts.polls.get() + 1);
+        let waker = Waker::from(Arc::new(CountingWake {
+            delegate: context.waker().clone(),
+            wakes: Arc::clone(&counts.wakes),
+            woken: Arc::clone(&woken),
+        }));
+        run.as_mut().poll(&mut Context::from_waker(&waker))
+    })
+}
+
+/// Runs the wake-gated `session` beside `scenario`, counting its polls and wakes, then
+/// cancels it.
+async fn counted_exercise(
+    session: OwnedH2Session<Application>,
+    handle: &OwnedH2Handle,
+    counts: &SessionCounts,
+    scenario: impl Future<Output = ()>,
+) {
+    let session = gated_run(session, counts);
+    let scenario = async {
+        let outcome =
+            eligibility_catch_unwind(tokio::time::timeout(Duration::from_secs(5), scenario)).await;
+        handle.cancel();
+        outcome
+    };
+    let (result, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(session, scenario)
+    })
+    .await
+    .expect("the cancelled connection joins its transport operations");
+    match outcome {
+        Ok(result) => result.expect("the scenario made progress"),
+        Err(payload) => resume_unwind(payload),
+    }
+    assert_eq!(
+        result
+            .expect_err("the scenario ends by cancellation")
+            .code(),
+        HttpErrorCode::CORO_CANCELLED
+    );
+}
+
+/// Reads a retained request body to its terminal event without yielding, so every read
+/// runs outside the session's poll. The whole body must already be buffered.
+fn read_buffered_body(body: &mut HttpSourceHolder) -> usize {
+    let mut bytes = 0;
+    loop {
+        let event = body
+            .read_body_event(1 << 16)
+            .now_or_never()
+            .expect("the request body is already buffered")
+            .expect("the buffered request body reads");
+        bytes += event.as_body().map_or(0, BufQueue::chain_length);
+        if event.eom() {
+            return bytes;
+        }
+    }
+}
+
+fn held_body_buffered(probes: &RefCell<Vec<Rc<Probe>>>, ordinal: usize, bytes: u64) -> bool {
+    probes.borrow().get(ordinal).is_some_and(|probe| {
+        probe.held_body.borrow().is_some()
+            && probe
+                .ingress
+                .borrow()
+                .as_ref()
+                .is_some_and(|ingress| ingress.body_bytes_received() == bytes)
+    })
+}
+
+/// Scheduler turns a liveness check may take before it reports a lost wake.
+pub(super) const DRIVE_LIMIT: usize = 64;
+
+/// Yields up to `limit` times for `condition`, so a lost wake fails instead of hanging.
+pub(super) async fn drive_until(limit: usize, condition: impl Fn() -> bool) -> bool {
+    for _ in 0..limit {
+        if condition() {
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    condition()
+}
+
+async fn settle_turns(turns: usize) {
+    for _ in 0..turns {
+        tokio::task::yield_now().await;
+    }
+}
+
+type WindowUpdates = Vec<(StreamId, u32)>;
+
+/// `(body bytes, maximum DATA payload, padding per DATA frame)`.
+type PeerBody = (usize, usize, Option<u8>);
+
+/// The client preface plus one POST per body. Each body ends with END_STREAM and goes out as
+/// DATA frames of at most the given payload, each padded when padding is given.
+fn peer_posts(bodies: &[PeerBody]) -> Vec<u8> {
+    let mut codec = Http2Codec::new(TransportDirection::Upstream);
+    let mut output = BufQueue::new(1 << 20);
+    codec
+        .generate(
+            &mut output,
+            EgressFrame::ConnectionPreface,
+            &mut IgnoreCodecEvents,
+        )
+        .unwrap();
+    codec
+        .generate_configured_settings(&mut output, &mut IgnoreCodecEvents)
+        .unwrap();
+    for &(length, frame, padding) in bodies {
+        let stream = codec.create_stream();
+        let mut request = HttpMessage::new();
+        request.set_method(HttpMethod::Post).unwrap();
+        request.set_url(b"/credit", false).unwrap();
+        request.set_http_version(1, 1);
+        request
+            .headers_mut()
+            .set(HttpHeaderCode::Host, b"example.com");
+        codec
+            .generate(
+                &mut output,
+                EgressFrame::Headers {
+                    stream,
+                    message: &request,
+                    end_stream: false,
+                    extra_headers: None,
+                },
+                &mut IgnoreCodecEvents,
+            )
+            .unwrap();
+        let mut remaining = length;
+        while remaining != 0 {
+            let chunk = remaining.min(frame);
+            remaining -= chunk;
+            codec
+                .generate(
+                    &mut output,
+                    EgressFrame::Body {
+                        stream,
+                        body: queue(&vec![b'c'; chunk]),
+                        padding,
+                        end_stream: remaining == 0,
+                    },
+                    &mut IgnoreCodecEvents,
+                )
+                .unwrap();
+        }
+    }
+    output.coalesce(output.chain_length()).unwrap().to_vec()
+}
+
+/// Reads the retained bodies outside the session's poll, one group of back-to-back reads per
+/// step. Returns the WINDOW_UPDATEs on the wire after each step has had 16 scheduler turns to
+/// settle, and the written transcript after the last step.
+fn window_updates_after_reads(
+    bodies: Vec<PeerBody>,
+    reads: Vec<Vec<usize>>,
+) -> (Vec<WindowUpdates>, (usize, u64)) {
+    run_on_fold_worker(move |context| {
+        Box::pin(async move {
+            let (transport, state) =
+                FixtureTransport::new([FixtureRead::Data(peer_posts(&bodies))]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0); bodies.len()]);
+            application.retain_request = true;
+            application.hold_headers = true;
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let observed = RefCell::new(Vec::new());
+            let written = Cell::new((0, 0));
+            let counts = SessionCounts::default();
+            counted_exercise(session, &handle, &counts, async {
+                complete_credit_wait(|| {
+                    !state.borrow().writes.is_empty()
+                        && bodies.iter().enumerate().all(|(ordinal, (length, ..))| {
+                            held_body_buffered(&probes, ordinal, *length as u64)
+                        })
+                })
+                .await;
+                let mut held = Vec::new();
+                for group in &reads {
+                    for &ordinal in group {
+                        let probe = Rc::clone(&probes.borrow()[ordinal]);
+                        let mut body = probe.held_body.borrow_mut().take().unwrap();
+                        assert_eq!(read_buffered_body(&mut body), bodies[ordinal].0);
+                        held.push(body);
+                    }
+                    settle_turns(16).await;
+                    observed.borrow_mut().push(
+                        decode_server_frames_with_requests(
+                            &state.borrow().writes.concat(),
+                            bodies.len(),
+                        )
+                        .window_updates,
+                    );
+                }
+                written.set(written_transcript(&state).digest());
+                drop(held);
+            })
+            .await;
+            (observed.into_inner(), written.get())
+        })
+    })
+}
+
+fn connection_update(amount: u32) -> (StreamId, u32) {
+    (StreamId::UNSPECIFIED, amount)
+}
+
+#[test]
+fn window_update_offsets_are_unchanged_around_the_threshold() {
+    // Default 65,535-byte windows: the connection update goes out once more than 32,767 bytes
+    // of credit are pending. Every body ends with END_STREAM, so no stream credit is returned.
+    type Case = (
+        &'static str,
+        Vec<PeerBody>,
+        Vec<Vec<usize>>,
+        Vec<WindowUpdates>,
+        (usize, u64),
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "(a) one 30,000 B body stays below the threshold",
+            vec![(30_000, 16_384, None)],
+            vec![vec![0]],
+            vec![vec![]],
+            (2, 7_026_372_957_147_746_794),
+        ),
+        (
+            "(b) one 40,000 B body crosses it",
+            vec![(40_000, 16_384, None)],
+            vec![vec![0]],
+            vec![vec![connection_update(40_000)]],
+            (3, 10_471_453_527_199_536_510),
+        ),
+        (
+            "(c) two 20,000 B bodies cross it together, at the second read",
+            vec![(20_000, 16_384, None), (20_000, 16_384, None)],
+            vec![vec![0], vec![1]],
+            vec![vec![], vec![connection_update(40_000)]],
+            (3, 10_471_453_527_199_536_510),
+        ),
+        (
+            // 12 frames of 2,500 B, each charged 255 B of padding plus its pad-length byte when
+            // it arrives: 30,000 + 12 * 256 = 33,072.
+            "(d) received padding plus a 30,000 B body cross it",
+            vec![(30_000, 2_500, Some(255))],
+            vec![vec![0]],
+            vec![vec![connection_update(33_072)]],
+            (3, 1_153_870_922_662_416_260),
+        ),
+        (
+            // Both reads happen before the session runs; the first crosses on its own.
+            "(e) a body read right after a crossing read keeps the woken order",
+            vec![(40_000, 16_384, None), (20_000, 16_384, None)],
+            vec![vec![0, 1]],
+            vec![vec![connection_update(40_000)]],
+            (3, 10_471_453_527_199_536_510),
+        ),
+    ];
+    let mismatches: Vec<String> = cases
+        .into_iter()
+        .filter_map(|(name, bodies, reads, updates, digest)| {
+            let observed = window_updates_after_reads(bodies, reads);
+            (observed != (updates.clone(), digest)).then(|| {
+                format!(
+                    "{name}: expected {:?}, observed {observed:?}",
+                    (updates, digest)
+                )
+            })
+        })
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "transcripts recorded at 7eddd4a0506c: {mismatches:#?}"
+    );
+}
+
+/// The client preface and SETTINGS, then D (a POST with a 1,000 B body and END_STREAM) and
+/// the head of R, a POST whose body is still to come. Also returns R's 40,000 B of DATA.
+fn deferred_and_rejected_posts() -> (StreamId, StreamId, Vec<u8>, Vec<u8>) {
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    let mut input = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+    input.extend(transcript_settings(&mut peer));
+    let mut request = HttpMessage::new();
+    request.set_method(HttpMethod::Post).unwrap();
+    request.set_url(b"/credit", false).unwrap();
+    request.set_http_version(1, 1);
+    request
+        .headers_mut()
+        .set(HttpHeaderCode::Host, b"example.com");
+    let deferring = peer.create_stream();
+    input.extend(eligibility_frame(
+        &mut peer,
+        EgressFrame::Headers {
+            stream: deferring,
+            message: &request,
+            end_stream: false,
+            extra_headers: None,
+        },
+    ));
+    input.extend(eligibility_frame(
+        &mut peer,
+        EgressFrame::Body {
+            stream: deferring,
+            body: queue(&[b'd'; 1_000]),
+            padding: None,
+            end_stream: true,
+        },
+    ));
+    let rejected = peer.create_stream();
+    input.extend(eligibility_frame(
+        &mut peer,
+        EgressFrame::Headers {
+            stream: rejected,
+            message: &request,
+            end_stream: false,
+            extra_headers: None,
+        },
+    ));
+    let mut rejected_data = Vec::new();
+    for chunk in [16_384, 16_384, 7_232] {
+        rejected_data.extend(eligibility_frame(
+            &mut peer,
+            EgressFrame::Body {
+                stream: rejected,
+                body: queue(&vec![b'r'; chunk]),
+                padding: None,
+                end_stream: false,
+            },
+        ));
+    }
+    (deferring, rejected, input, rejected_data)
+}
+
+#[test]
+fn folded_credit_precedes_rejected_data_parsed_in_the_next_poll() {
+    let (updates, written) = run_on_fold_worker(|context| {
+        Box::pin(async move {
+            let (_, rejected, input, rejected_data) = deferred_and_rejected_posts();
+            let send_rejected = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(input),
+                FixtureRead::WaitData(Arc::clone(&send_rejected), rejected_data),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0); 2]);
+            application.retain_request = true;
+            application.hold_headers = true;
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let counts = SessionCounts::default();
+            let observed = RefCell::new((Vec::new(), (0, 0)));
+            counted_exercise(session, &handle, &counts, async {
+                complete_credit_wait(|| {
+                    !state.borrow().writes.is_empty()
+                        && held_body_buffered(&probes, 0, 1_000)
+                        && held_body_buffered(&probes, 1, 0)
+                })
+                .await;
+                let r = Rc::clone(&probes.borrow()[1]);
+                let mut r = r.held_body.borrow_mut().take().unwrap();
+                r.stop_reading(Some(HttpErrorCode::CANCEL));
+                let reset = drive_until(DRIVE_LIMIT, || {
+                    decode_server_frames_with_requests(&state.borrow().writes.concat(), 2).resets
+                        == [(rejected, H2ErrorCode::CANCEL)]
+                })
+                .await;
+                assert!(reset, "R is reset, so its later DATA is rejected");
+                settle_turns(16).await;
+                // D's 1,000 B are read while the session is idle, and the session settles
+                // before R's 40,000 B arrive in the next read.
+                let d = Rc::clone(&probes.borrow()[0]);
+                let mut d = d.held_body.borrow_mut().take().unwrap();
+                assert_eq!(read_buffered_body(&mut d), 1_000);
+                settle_turns(16).await;
+                send_rejected.notify_one();
+                settle_turns(16).await;
+                *observed.borrow_mut() = (
+                    decode_server_frames_with_requests(&state.borrow().writes.concat(), 2)
+                        .window_updates,
+                    written_transcript(&state).digest(),
+                );
+                drop((d, r));
+            })
+            .await;
+            observed.into_inner()
+        })
+    });
+    assert_eq!(
+        (updates, written),
+        (
+            vec![connection_update(41_000)],
+            (4, 4_371_259_458_476_961_168)
+        ),
+        "transcript recorded at 7eddd4a0506c"
+    );
+}
+
+#[test]
+fn credit_below_headroom_does_not_wake_an_idle_session() {
+    run_on_fold_worker(|context| {
+        Box::pin(async move {
+            let input = peer_request_bytes(HttpMethod::Post, &[b'q'; 128], None, PeerControl::None);
+            let (transport, state) = FixtureTransport::new([FixtureRead::Data(input)]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+            application.retain_request = true;
+            application.hold_headers = true;
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let counts = SessionCounts::default();
+            counted_exercise(session, &handle, &counts, async {
+                complete_credit_wait(|| {
+                    held_body_buffered(&probes, 0, 128) && !state.borrow().writes.is_empty()
+                })
+                .await;
+                settle_turns(16).await;
+                let probe = Rc::clone(&probes.borrow()[0]);
+                let mut body = probe.held_body.borrow_mut().take().unwrap();
+                let before = counts.wakes();
+                assert_eq!(read_buffered_body(&mut body), 128);
+                assert_eq!(
+                    counts.wakes() - before,
+                    0,
+                    "128 bytes of credit and the source's completion, with no response yet, \
+                     need no session poll"
+                );
+                drop(body);
+            })
+            .await;
+        })
+    });
+}
+
+#[test]
+fn credit_behind_a_queued_owner_is_not_folded() {
+    let (wakes, updates, written) = run_on_fold_worker(|context| {
+        Box::pin(async move {
+            let gate = Rc::new(OwnerPollGate {
+                pending_visits: Some(RefCell::new(Vec::new())),
+                ..OwnerPollGate::default()
+            });
+            // X (40,000 B) and D (20,000 B).
+            let bodies = [(40_000, 16_384, None), (20_000, 16_384, None)];
+            let (transport, state) =
+                FixtureTransport::new([FixtureRead::Data(peer_posts(&bodies))]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0); 2]);
+            application.retain_request = true;
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let counts = SessionCounts::default();
+            let observed = RefCell::new((0, Vec::new(), (0, 0)));
+            counted_exercise(session, &handle, &counts, async {
+                complete_credit_wait(|| {
+                    !state.borrow().writes.is_empty()
+                        && held_body_buffered(&probes, 0, 40_000)
+                        && held_body_buffered(&probes, 1, 20_000)
+                        && gate.wakers.borrow().iter().all(Option::is_some)
+                })
+                .await;
+                settle_turns(16).await;
+                // Before the session runs: X's owner is queued by its header wake, then D's
+                // 20,000 B are read, then X's 40,000 B. D's credit must keep its place behind
+                // X, so X's poll returns 40,000 alone and crosses the threshold.
+                gate.ready.set(true);
+                let x_waker = gate.wakers.borrow()[0].clone().unwrap();
+                x_waker.wake_by_ref();
+                let d = Rc::clone(&probes.borrow()[1]);
+                let mut d = d.held_body.borrow_mut().take().unwrap();
+                let before = counts.wakes();
+                assert_eq!(read_buffered_body(&mut d), 20_000);
+                let wakes = counts.wakes() - before;
+                let x = Rc::clone(&probes.borrow()[0]);
+                let mut x = x.held_body.borrow_mut().take().unwrap();
+                assert_eq!(read_buffered_body(&mut x), 40_000);
+                settle_turns(32).await;
+                assert_eq!(*gate.pending_visits.as_ref().unwrap().borrow(), [0]);
+                *observed.borrow_mut() = (
+                    wakes,
+                    decode_server_frames_with_requests(&state.borrow().writes.concat(), 2)
+                        .window_updates,
+                    written_transcript(&state).digest(),
+                );
+                drop((x, d));
+            })
+            .await;
+            observed.into_inner()
+        })
+    });
+    assert_eq!(
+        (wakes, updates, written),
+        (
+            1,
+            vec![connection_update(40_000)],
+            (3, 10_471_453_527_199_536_510)
+        ),
+        "D's read wakes the session as before; transcript recorded at 7eddd4a0506c"
+    );
+}
+
+/// The client preface and SETTINGS, then a POST with a 5-byte body and END_STREAM. Also
+/// returns 4 bytes of DATA for that stream after its END_STREAM.
+fn post_then_late_data() -> (StreamId, Vec<u8>, Vec<u8>) {
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    let mut input = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+    input.extend(transcript_settings(&mut peer));
+    let stream = peer.create_stream();
+    let mut request = HttpMessage::new();
+    request.set_method(HttpMethod::Post).unwrap();
+    request.set_url(b"/late", false).unwrap();
+    request.set_http_version(1, 1);
+    request
+        .headers_mut()
+        .set(HttpHeaderCode::Host, b"example.com");
+    input.extend(eligibility_frame(
+        &mut peer,
+        EgressFrame::Headers {
+            stream,
+            message: &request,
+            end_stream: false,
+            extra_headers: None,
+        },
+    ));
+    input.extend(eligibility_frame(
+        &mut peer,
+        EgressFrame::Body {
+            stream,
+            body: queue(b"hello"),
+            padding: None,
+            end_stream: true,
+        },
+    ));
+    // DATA after the client's END_STREAM is a stream error for a live stream, and is ignored
+    // once both directions are complete.
+    let late = eligibility_frame(
+        &mut peer,
+        EgressFrame::Body {
+            stream,
+            body: queue(b"late"),
+            padding: None,
+            end_stream: false,
+        },
+    );
+    (stream, input, late)
+}
+
+#[test]
+fn late_request_data_after_a_folded_end_is_ignored() {
+    let written = run_on_fold_worker(|context| {
+        Box::pin(async move {
+            let (stream, input, late) = post_then_late_data();
+            let send_late = Arc::new(tokio::sync::Notify::new());
+            let release_write = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(input),
+                FixtureRead::WaitData(Arc::clone(&send_late), late),
+            ]);
+            let gate = Rc::new(OwnerPollGate::default());
+            let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+            application.response_date = Some(TRANSCRIPT_DATE);
+            application.retain_request = true;
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let counts = SessionCounts::default();
+            let written = Cell::new((0, 0));
+            counted_exercise(session, &handle, &counts, async {
+                complete_credit_wait(|| {
+                    gate.polls.get() == 1
+                        && held_body_buffered(&probes, 0, 5)
+                        && !state.borrow().writes.is_empty()
+                })
+                .await;
+                settle_turns(16).await;
+                // The request ends while the session is idle and no response is pending.
+                let probe = Rc::clone(&probes.borrow()[0]);
+                let mut body = probe.held_body.borrow_mut().take().unwrap();
+                assert_eq!(read_buffered_body(&mut body), 5);
+                drop(body);
+                settle_turns(16).await;
+                // The terminal 200's write is held, so the exchange stays live while the late
+                // DATA arrives.
+                state.borrow_mut().write_gate = Some(Arc::clone(&release_write));
+                gate.release();
+                complete_credit_wait(|| {
+                    probe.response_complete.get() == 1
+                        && state.borrow().write_gate_pending.is_some()
+                })
+                .await;
+                send_late.notify_one();
+                settle_turns(16).await;
+                release_write.notify_one();
+                let settled = drive_until(DRIVE_LIMIT, || {
+                    probe.completed.get() == 1 || !probe.cancelled.borrow().is_empty()
+                })
+                .await;
+                assert!(settled, "the exchange either completes or is reset");
+                settle_turns(16).await;
+                let decoded = decode_server_frames(&state.borrow().writes.concat());
+                assert_eq!(
+                    (decoded.resets, probe.cancelled.borrow().clone()),
+                    (vec![], vec![]),
+                    "late DATA for a completed exchange is ignored, not reset"
+                );
+                assert_eq!(probe.completed.get(), 1);
+                assert_eq!(decoded.header_statuses, [(stream, 200)]);
+                written.set(written_transcript(&state).digest());
+            })
+            .await;
+            written.get()
+        })
+    });
+    assert_eq!(
+        written,
+        (3, 10_517_397_198_046_951_649),
+        "transcript recorded at 7eddd4a0506c"
+    );
+}
+
+/// Two POST heads, then 20,000 B with END_STREAM for each in one later read. Each exchange
+/// reads its whole body, and so completes its source, inside its own owner poll. Returns the
+/// WINDOW_UPDATEs and the written transcript once both exchanges are complete.
+async fn in_poll_credit_updates(context: WorkerContext) -> (WindowUpdates, (usize, u64)) {
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    let mut heads = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+    heads.extend(transcript_settings(&mut peer));
+    let mut request = HttpMessage::new();
+    request.set_method(HttpMethod::Post).unwrap();
+    request.set_url(b"/credit", false).unwrap();
+    request.set_http_version(1, 1);
+    request
+        .headers_mut()
+        .set(HttpHeaderCode::Host, b"example.com");
+    let streams = [peer.create_stream(), peer.create_stream()];
+    for stream in streams {
+        heads.extend(eligibility_frame(
+            &mut peer,
+            EgressFrame::Headers {
+                stream,
+                message: &request,
+                end_stream: false,
+                extra_headers: None,
+            },
+        ));
+    }
+    let mut bodies = Vec::new();
+    for stream in streams {
+        for (chunk, end_stream) in [(16_384, false), (3_616, true)] {
+            bodies.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::Body {
+                    stream,
+                    body: queue(&vec![b'c'; chunk]),
+                    padding: None,
+                    end_stream,
+                },
+            ));
+        }
+    }
+    let send_bodies = Arc::new(tokio::sync::Notify::new());
+    let (transport, state) = FixtureTransport::new([
+        FixtureRead::Data(heads),
+        FixtureRead::WaitData(Arc::clone(&send_bodies), bodies),
+    ]);
+    let (mut application, probes) = Application::new(vec![Reply::Body(0); 2]);
+    application.response_date = Some(TRANSCRIPT_DATE);
+    let (session, handle) = OwnedH2Session::new(application, options(context, transport)).unwrap();
+    let counts = SessionCounts::default();
+    let observed = RefCell::new((Vec::new(), (0, 0)));
+    counted_exercise(session, &handle, &counts, async {
+        complete_credit_wait(|| !state.borrow().writes.is_empty() && probes.borrow().len() == 2)
+            .await;
+        settle_turns(16).await;
+        send_bodies.notify_one();
+        let completed = drive_until(DRIVE_LIMIT, || {
+            probes
+                .borrow()
+                .iter()
+                .all(|probe| probe.request_bytes.get() == 20_000 && probe.completed.get() == 1)
+        })
+        .await;
+        assert!(completed, "both exchanges read their bodies and complete");
+        settle_turns(16).await;
+        *observed.borrow_mut() = (
+            decode_server_frames_with_requests(&state.borrow().writes.concat(), 2).window_updates,
+            written_transcript(&state).digest(),
+        );
+    })
+    .await;
+    observed.into_inner()
+}
+
+#[test]
+fn completion_inside_the_owner_poll_is_not_folded() {
+    assert_eq!(
+        run_on_fold_worker(|context| Box::pin(in_poll_credit_updates(context))),
+        (
+            vec![connection_update(40_000)],
+            (5, 12_085_380_293_361_417_345)
+        ),
+        "credit and completions inside owner polls keep their order; transcript recorded at \
+         7eddd4a0506c"
+    );
+    let written = run_on_fold_worker(|context| {
+        Box::pin(async move {
+            let (stream, input, late) = post_then_late_data();
+            let send_late = Arc::new(tokio::sync::Notify::new());
+            let release_write = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(input),
+                FixtureRead::WaitData(Arc::clone(&send_late), late),
+            ]);
+            // Holding the first write keeps write completion from polling the owner before the
+            // late DATA arrives.
+            state.borrow_mut().write_gate = Some(Arc::clone(&release_write));
+            // The exchange reads the whole buffered request inside its header poll, so the
+            // request source completes during the owner poll that returns the terminal 200.
+            let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+            application.response_date = Some(TRANSCRIPT_DATE);
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let counts = SessionCounts::default();
+            let written = Cell::new((0, 0));
+            counted_exercise(session, &handle, &counts, async {
+                complete_credit_wait(|| {
+                    probes.borrow().first().is_some_and(|probe| {
+                        probe.request_bytes.get() == 5 && probe.response_complete.get() == 1
+                    }) && state.borrow().write_gate_pending.is_some()
+                })
+                .await;
+                let probe = Rc::clone(&probes.borrow()[0]);
+                settle_turns(16).await;
+                send_late.notify_one();
+                settle_turns(16).await;
+                release_write.notify_one();
+                let settled = drive_until(DRIVE_LIMIT, || {
+                    probe.completed.get() == 1 || !probe.cancelled.borrow().is_empty()
+                })
+                .await;
+                assert!(settled, "the exchange either completes or is reset");
+                settle_turns(16).await;
+                let decoded = decode_server_frames(&state.borrow().writes.concat());
+                assert_eq!(
+                    (decoded.resets, probe.cancelled.borrow().clone()),
+                    (vec![], vec![]),
+                    "late DATA for a completed exchange is ignored, not reset"
+                );
+                assert_eq!(probe.completed.get(), 1);
+                assert_eq!(decoded.header_statuses, [(stream, 200)]);
+                written.set(written_transcript(&state).digest());
+            })
+            .await;
+            written.get()
+        })
+    });
+    assert_eq!(
+        written,
+        (3, 10_517_397_198_046_951_649),
+        "transcript recorded at 7eddd4a0506c"
+    );
+}
+
+/// Counts wakes of a session polled by hand.
+#[derive(Default)]
+struct HandWake {
+    woken: AtomicBool,
+    wakes: AtomicUsize,
+}
+
+impl std::task::Wake for HandWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+        self.woken.store(true, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn credit_during_a_budget_yield_is_not_folded() {
+    let (wakes, updates, written) = run_on_fold_worker(|context| {
+        Box::pin(async move {
+            let gate = Rc::new(OwnerPollGate {
+                pending_visits: Some(RefCell::new(Vec::new())),
+                ..OwnerPollGate::default()
+            });
+            // 64 one-byte bodies fill one turn budget of owner polls; then A (40,000 B) and
+            // B (20,000 B). Nothing is ever read from the 64.
+            let mut bodies = vec![(1, 16_384, None); 64];
+            bodies.extend([(40_000, 16_384, None), (20_000, 16_384, None)]);
+            let (transport, state) =
+                FixtureTransport::new([FixtureRead::Data(peer_posts(&bodies))]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0); bodies.len()]);
+            application.retain_request = true;
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let wake = Arc::new(HandWake::default());
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut run = Box::pin(session.run());
+            let updates = || decode_server_frames(&state.borrow().writes.concat()).window_updates;
+            let outcome = eligibility_catch_unwind(async {
+                let mut poll = || {
+                    wake.woken.store(false, Ordering::SeqCst);
+                    assert!(
+                        run.as_mut()
+                            .poll(&mut Context::from_waker(&waker))
+                            .is_pending(),
+                        "the held bodies keep the session running"
+                    );
+                };
+                let mut settled = false;
+                for _ in 0..DRIVE_LIMIT {
+                    poll();
+                    if !wake.woken.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                        if !wake.woken.load(Ordering::SeqCst) {
+                            settled = true;
+                            break;
+                        }
+                    }
+                }
+                assert!(settled, "the requests settle");
+                assert!(bodies.iter().enumerate().all(|(ordinal, (length, ..))| {
+                    held_body_buffered(&probes, ordinal, *length as u64)
+                }));
+                let wakers: Vec<_> = gate
+                    .wakers
+                    .borrow()
+                    .iter()
+                    .map(|waker| waker.as_ref().expect("each owner registered").clone())
+                    .collect();
+                assert_eq!(wakers.len(), 66);
+
+                // Queue the 64, then read A outside the poll: its 40,000 B cross the 32,767 B
+                // threshold, so its owner is queued behind them with that credit.
+                gate.ready.set(true);
+                for waker in &wakers[..64] {
+                    waker.wake_by_ref();
+                }
+                let a = Rc::clone(&probes.borrow()[64]);
+                let mut a = a.held_body.borrow_mut().take().unwrap();
+                assert_eq!(read_buffered_body(&mut a), 40_000);
+                wakers[64].wake_by_ref();
+
+                // One poll spends its turn budget on the 64 and yields, with A still queued;
+                // the held yield wakes nothing.
+                hold_yields();
+                poll();
+                assert_eq!(
+                    *gate.pending_visits.as_ref().unwrap().borrow(),
+                    (0..64).collect::<Vec<_>>()
+                );
+                assert!(updates().is_empty());
+                assert!(!wake.woken.load(Ordering::SeqCst));
+
+                // B is read during the yield. A's credit still waits in its owner, so B's
+                // 20,000 must reach the codec behind it.
+                let b = Rc::clone(&probes.borrow()[65]);
+                let mut b = b.held_body.borrow_mut().take().unwrap();
+                let before = wake.wakes.load(Ordering::SeqCst);
+                assert_eq!(read_buffered_body(&mut b), 20_000);
+                let wakes = wake.wakes.load(Ordering::SeqCst) - before;
+                release_held_yields();
+                let mut settled = false;
+                for _ in 0..DRIVE_LIMIT {
+                    poll();
+                    if !wake.woken.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                        if !wake.woken.load(Ordering::SeqCst) {
+                            settled = true;
+                            break;
+                        }
+                    }
+                }
+                assert!(settled, "A and B settle");
+                assert_eq!(
+                    *gate.pending_visits.as_ref().unwrap().borrow(),
+                    (0..65).collect::<Vec<_>>()
+                );
+                drop((a, b));
+                (wakes, updates())
+            })
+            .await;
+            let written = written_transcript(&state).digest();
+            handle.cancel();
+            let result = tokio::time::timeout(Duration::from_secs(5), run.as_mut())
+                .await
+                .expect("the cancelled session joins");
+            drop(run);
+            let (wakes, updates) = match outcome {
+                Ok(observed) => observed,
+                Err(payload) => resume_unwind(payload),
+            };
+            assert_eq!(result.unwrap_err().code(), HttpErrorCode::CORO_CANCELLED);
+            (wakes, updates, written)
+        })
+    });
+    assert_eq!(
+        (wakes, updates, written),
+        (
+            1,
+            vec![connection_update(40_000)],
+            (3, 10_471_453_527_199_536_510)
+        ),
+        "B's read wakes the session as before; transcript recorded at 7eddd4a0506c"
+    );
+}
+
+/// Reads a retained 128 B body outside the poll of an idle session on `context`'s host and
+/// returns the session wakes the read caused.
+async fn small_body_read_wakes(context: WorkerContext) -> usize {
+    let input = peer_request_bytes(HttpMethod::Post, &[b'q'; 128], None, PeerControl::None);
+    let (transport, state) = FixtureTransport::new([FixtureRead::Data(input)]);
+    let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+    application.retain_request = true;
+    application.hold_headers = true;
+    let (session, handle) = OwnedH2Session::new(application, options(context, transport)).unwrap();
+    let counts = SessionCounts::default();
+    let wakes = Cell::new(usize::MAX);
+    counted_exercise(session, &handle, &counts, async {
+        complete_credit_wait(|| {
+            held_body_buffered(&probes, 0, 128) && !state.borrow().writes.is_empty()
+        })
+        .await;
+        settle_turns(16).await;
+        let probe = Rc::clone(&probes.borrow()[0]);
+        let mut body = probe.held_body.borrow_mut().take().unwrap();
+        let before = counts.wakes();
+        assert_eq!(read_buffered_body(&mut body), 128);
+        wakes.set(counts.wakes() - before);
+        drop(body);
+    })
+    .await;
+    wakes.get()
+}
+
+#[test]
+fn host_without_the_hook_never_folds() {
+    assert_eq!(
+        run_on_worker(|context| Box::pin(small_body_read_wakes(context))),
+        1,
+        "a host that does not run wakes in this iteration keeps the wake"
+    );
+}
+
+#[test]
+fn response_headers_after_folded_credit_still_wake_the_session() {
+    run_on_fold_worker(|context| {
+        Box::pin(async move {
+            let gate = Rc::new(OwnerPollGate::default());
+            let input = peer_request_bytes(HttpMethod::Post, &[b'q'; 128], None, PeerControl::None);
+            let (transport, state) = FixtureTransport::new([FixtureRead::Data(input)]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+            application.retain_request = true;
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let counts = SessionCounts::default();
+            counted_exercise(session, &handle, &counts, async {
+                complete_credit_wait(|| {
+                    gate.polls.get() == 1
+                        && held_body_buffered(&probes, 0, 128)
+                        && !state.borrow().writes.is_empty()
+                })
+                .await;
+                settle_turns(16).await;
+                let probe = Rc::clone(&probes.borrow()[0]);
+                let mut body = probe.held_body.borrow_mut().take().unwrap();
+                assert_eq!(read_buffered_body(&mut body), 128);
+                drop(body);
+                let polls = counts.polls.get();
+                gate.release();
+                let responded = drive_until(DRIVE_LIMIT, || {
+                    decode_server_frames(&state.borrow().writes.concat()).header_statuses
+                        == [(StreamId::new(1), 200)]
+                        && probe.completed.get() == 1
+                })
+                .await;
+                assert!(
+                    responded,
+                    "the response wake must reach the owner after its credit was folded"
+                );
+                let used = counts.polls.get() - polls;
+                assert!(
+                    used <= 2,
+                    "the response and retirement take at most 2 session polls, took {used}"
+                );
+                assert_eq!(gate.polls.get(), 2);
+                assert!(probe.cancelled.borrow().is_empty());
+            })
+            .await;
+        })
+    });
+}
+
+/// [`WireTranscript::digest`] of `wire` with the `date` value in each HEADERS frame replaced by
+/// [`TRANSCRIPT_DATE`] (same literal encoding, frame length adjusted): the codec adds the current
+/// `date` to a response the session synthesizes. Every other byte is digested as written.
+fn dateless_digest(wire: &[u8]) -> (usize, u64) {
+    let literal = |value: &[u8]| {
+        let mut buffer = HpackEncodeBuffer::new(true);
+        buffer.encode_literal(value);
+        buffer.into_bytes()
+    };
+    let mut decoder = HpackDecoder::new();
+    let mut normalized = Vec::with_capacity(wire.len());
+    let mut rest = wire;
+    while !rest.is_empty() {
+        let length = u32::from_be_bytes([0, rest[0], rest[1], rest[2]]) as usize;
+        let (frame, tail) = rest.split_at(FRAME_HEADER_SIZE + length);
+        rest = tail;
+        let (header, payload) = frame.split_at(FRAME_HEADER_SIZE);
+        if header[3] != FrameType::HEADERS.as_u8() {
+            normalized.extend_from_slice(frame);
+            continue;
+        }
+        let mut payload = payload.to_vec();
+        let block = decoder
+            .decode(&payload)
+            .expect("a written header block decodes");
+        let date = HeaderName::from_code(HttpHeaderCode::Date);
+        for field in block.headers.iter().filter(|field| field.name == date) {
+            let written = literal(&field.value);
+            let at = payload
+                .windows(written.len())
+                .position(|bytes| bytes == written.as_slice())
+                .expect("the date is a literal in its header block");
+            payload.splice(at..at + written.len(), literal(TRANSCRIPT_DATE));
+        }
+        normalized.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes()[1..]);
+        normalized.extend_from_slice(&header[3..]);
+        normalized.extend_from_slice(&payload);
+    }
+    WireTranscript::new(WireDirection::Written, &normalized).digest()
+}
+
+/// One HEADERS frame on stream 1 that ends the stream and carries `headers`.
+fn headers_frame(headers: &[HpackHeader]) -> Vec<u8> {
+    const END_HEADERS: u8 = 0x4;
+    let block = HpackEncoder::new(true).encode(headers);
+    let mut frame = u32::try_from(block.len()).unwrap().to_be_bytes()[1..].to_vec();
+    frame.extend_from_slice(&[
+        FrameType::HEADERS.as_u8(),
+        END_HEADERS | END_STREAM,
+        0,
+        0,
+        0,
+        1,
+    ]);
+    frame.extend_from_slice(&block);
+    frame
+}
+
+#[test]
+fn dateless_digest_ignores_only_the_date() {
+    let digest = dateless_digest;
+    let response = |date: &str, content_length: &str| {
+        headers_frame(&[
+            HpackHeader::new(":status", "500"),
+            HpackHeader::new("content-length", content_length),
+            HpackHeader::new("date", date),
+        ])
+    };
+    let early = response("Mon, 01 Jan 2001 00:00:00 GMT", "0");
+    let late = response("Wed, 29 Sep 2099 19:59:59 GMT", "0");
+    assert_ne!(
+        early.len(),
+        late.len(),
+        "the two dates' Huffman literals differ in length"
+    );
+    assert_eq!(
+        digest(&early),
+        digest(&late),
+        "the date alone does not change the digest"
+    );
+    assert_ne!(
+        digest(&early),
+        digest(&response("Mon, 01 Jan 2001 00:00:00 GMT", "1")),
+        "any other header byte changes the digest"
+    );
+}
+
+#[test]
+fn deferred_completion_still_sends_a_pending_error_response() {
+    let written = run_on_fold_worker(|context| {
+        Box::pin(async move {
+            let send_eof = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(peer_incomplete_post_bytes(5)),
+                FixtureRead::WaitDataEof(Arc::clone(&send_eof), Vec::new()),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+            application.retain_request = true;
+            application.hold_headers = true;
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let counts = SessionCounts::default();
+            let finished = RefCell::new(None);
+            let run = async {
+                let result = gated_run(session, &counts).await;
+                *finished.borrow_mut() = Some(result);
+            };
+            let scenario = async {
+                let outcome =
+                    eligibility_catch_unwind(tokio::time::timeout(Duration::from_secs(5), async {
+                        complete_credit_wait(|| held_body_buffered(&probes, 0, 5)).await;
+                        let probe = Rc::clone(&probes.borrow()[0]);
+                        let mut body = probe.held_body.borrow_mut().take().unwrap();
+                        let event = body
+                            .read_body_event(16)
+                            .now_or_never()
+                            .expect("the partial body is buffered")
+                            .expect("the partial body reads");
+                        assert_eq!(event.as_body().map(BufQueue::chain_length), Some(5));
+                        assert!(!event.eom());
+                        match body
+                            .read_body_event(16)
+                            .now_or_never()
+                            .expect("the drained body yields its suspend event")
+                            .expect("the suspend event reads")
+                            .into_kind()
+                        {
+                            HttpBodyEventKind::Suspend(resume) => drop(resume),
+                            _ => panic!("a drained incomplete body first yields its suspend event"),
+                        }
+                        {
+                            let mut read = std::pin::pin!(body.read_body_event_unboxed(16));
+                            poll_fn(|context| {
+                                assert!(read.as_mut().poll(context).is_pending());
+                                Poll::Ready(())
+                            })
+                            .await;
+                            send_eof.notify_one();
+                            complete_credit_wait(|| probe.cancelled.borrow().len() == 1).await;
+                            settle_turns(16).await;
+                            assert!(
+                                decode_server_frames(&state.borrow().writes.concat())
+                                    .header_streams
+                                    .is_empty(),
+                                "the error response waits for the admitted read"
+                            );
+                        }
+                        let ended = drive_until(DRIVE_LIMIT, || finished.borrow().is_some()).await;
+                        assert!(
+                            ended,
+                            "dropping the read completes the source, which must wake the owner \
+                             of the pending 500"
+                        );
+                        let decoded = decode_server_frames(&state.borrow().writes.concat());
+                        assert_eq!(decoded.header_statuses, [(StreamId::new(1), 500)]);
+                        assert!(decoded.errors.is_empty());
+                        assert_eq!(
+                            probe.cancelled.borrow().as_slice(),
+                            &[(HttpErrorCode::TRANSPORT_EOF, false)]
+                        );
+                        assert_eq!(probe.completed.get(), 0);
+                        assert_eq!(probe.dropped.get(), 1);
+                        drop(body);
+                    }))
+                    .await;
+                if !matches!(&outcome, Ok(Ok(()))) {
+                    handle.cancel();
+                }
+                outcome
+            };
+            let ((), outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(run, scenario)
+            })
+            .await
+            .expect("the session and the scenario join");
+            match outcome {
+                Ok(result) => result.expect("the error response made progress"),
+                Err(payload) => resume_unwind(payload),
+            }
+            finished
+                .into_inner()
+                .expect("the session finished")
+                .expect("EOF closes the connection once the error response retires");
+            dateless_digest(&state.borrow().writes.concat())
+        })
+    });
+    assert_eq!(
+        written,
+        (3, 9_837_321_972_108_583_545),
+        "transcript recorded at 7eddd4a0506c"
+    );
+}
+
+#[test]
+fn errored_request_body_still_wakes_the_session() {
+    run_on_fold_worker(|context| {
+        Box::pin(async move {
+            let (transport, state) =
+                FixtureTransport::new([FixtureRead::Data(peer_incomplete_post_bytes(5))]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+            application.retain_request = true;
+            application.hold_headers = true;
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let counts = SessionCounts::default();
+            counted_exercise(session, &handle, &counts, async {
+                complete_credit_wait(|| {
+                    held_body_buffered(&probes, 0, 5) && !state.borrow().writes.is_empty()
+                })
+                .await;
+                settle_turns(16).await;
+                let probe = Rc::clone(&probes.borrow()[0]);
+                let mut body = probe.held_body.borrow_mut().take().unwrap();
+                body.stop_reading(Some(HttpErrorCode::CANCEL));
+                let reset = drive_until(DRIVE_LIMIT, || {
+                    decode_server_frames(&state.borrow().writes.concat()).resets
+                        == [(StreamId::new(1), H2ErrorCode::CANCEL)]
+                })
+                .await;
+                assert!(
+                    reset,
+                    "a failed request body must wake its owner to reset the stream"
+                );
+                assert_eq!(
+                    probe.cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::CANCEL, false)]
+                );
+                drop(body);
+            })
+            .await;
+        })
+    });
+}
+
+#[test]
+fn owner_poll_without_eom_reads_no_write_state() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let gate = Rc::new(OwnerPollGate::default());
+            let (_, input) = ready_owner_requests(1);
+            let (transport, _state) = FixtureTransport::new([FixtureRead::Data(input)]);
+            let (mut application, _probes) = Application::new(vec![Reply::Body(0)]);
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            exercise(session, &handle, &[], async {
+                complete_credit_wait(|| gate.polls.get() == 1).await;
+                let before = crate::owned_h2::owner_write_state_reads();
+                gate.wakers.borrow()[0].as_ref().unwrap().wake_by_ref();
+                complete_credit_wait(|| gate.polls.get() == 2).await;
+                assert_eq!(
+                    crate::owned_h2::owner_write_state_reads() - before,
+                    0,
+                    "an owner poll whose headers stay pending serializes no EOM or reset, so it \
+                     reads no write state"
+                );
+            })
+            .await;
+        })
+    });
+}
+
+/// One input of [`early_retirement_transcript`]; each runs in its own session.
+#[derive(Clone, Copy, Debug)]
+enum RetirementInput {
+    /// Three GETs with 128-byte responses.
+    Gets,
+    /// A POST with a 40,000-byte body that the application drains inside the poll that
+    /// produces the response's final body event.
+    DrainedPost,
+    /// A WINDOW_UPDATE, a PRIORITY, a DATA and a HEADERS frame on stream 1 while the write
+    /// holding its response's END_STREAM is held.
+    EndedStreamFrames,
+    /// `MAX_CONCURRENT_STREAMS` 2, and a third request while two responses are held.
+    ConcurrencyLimit,
+    /// A GET, then a PING, then a GOAWAY.
+    PingGoaway,
+}
+
+const RETIREMENT_POST_BODY: usize = 40_000;
+
+/// Raw client frame bytes, so that frames on an ended stream bypass the peer codec's
+/// stream state.
+fn raw_frame(frame_type: FrameType, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let length = payload.len() as u32;
+    let mut frame = length.to_be_bytes()[1..].to_vec();
+    frame.extend([frame_type.as_u8(), flags]);
+    frame.extend(stream.to_be_bytes());
+    frame.extend(payload);
+    frame
+}
+
+/// The client preface and SETTINGS, then `gets` GETs on streams 1, 3, ...
+fn retirement_requests(peer: &mut Http2Codec, gets: usize) -> Vec<u8> {
+    let mut bytes = eligibility_frame(peer, EgressFrame::ConnectionPreface);
+    bytes.extend(transcript_settings(peer));
+    for _ in 0..gets {
+        bytes.extend(retirement_get(peer));
+    }
+    bytes
+}
+
+fn retirement_get(peer: &mut Http2Codec) -> Vec<u8> {
+    let stream = peer.create_stream();
+    let mut request = HttpMessage::new();
+    request.set_method(HttpMethod::Get).unwrap();
+    request.set_url(b"/retirement", false).unwrap();
+    request.set_http_version(1, 1);
+    request
+        .headers_mut()
+        .set(HttpHeaderCode::Host, b"example.com");
+    eligibility_frame(
+        peer,
+        EgressFrame::Headers {
+            stream,
+            message: &request,
+            end_stream: true,
+            extra_headers: None,
+        },
+    )
+}
+
+/// Whether a written chunk carries a frame with END_STREAM on any stream.
+fn carries_end_stream(write: &[u8]) -> bool {
+    let wire = WireTranscript::new(WireDirection::Written, write);
+    wire.count(FrameType::DATA, END_STREAM) + wire.count(FrameType::HEADERS, END_STREAM) != 0
+}
+
+/// Yields until `condition` holds, releasing held writes front to back every four yields
+/// and stopping at the first write `hold` keeps. `false` if the bound is hit.
+async fn pump_queued(
+    probe: &Rc<RefCell<QueuedWriteProbe>>,
+    hold: impl Fn(&[u8]) -> bool,
+    condition: impl Fn() -> bool,
+) -> bool {
+    for _ in 0..1000 {
+        if condition() {
+            return true;
+        }
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        let releasable = {
+            let probe = probe.borrow();
+            probe.accepted[probe.released..]
+                .iter()
+                .take_while(|write| !hold(write))
+                .count()
+        };
+        if releasable != 0 {
+            release_queued_writes(probe, releasable);
+        }
+    }
+    condition()
+}
+
+fn queued_transcript(probe: &RefCell<QueuedWriteProbe>) -> WireTranscript {
+    WireTranscript::new(WireDirection::Written, &probe.borrow().accepted.concat())
+}
+
+/// Runs `input` over a [`QueuedFixtureTransport`] whose writes complete only when the
+/// script releases them. Returns the written transcript, how the session ended, and how
+/// many exchanges had completed when the frames held behind an END_STREAM write arrived.
+async fn early_retirement_transcript(
+    context: WorkerContext,
+    input: RetirementInput,
+    saturation: Option<Rc<Cell<bool>>>,
+) -> (WireTranscript, Result<(), HttpErrorCode>, usize) {
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let end = Arc::new(tokio::sync::Notify::new());
+    let (reads, replies) = match input {
+        RetirementInput::Gets => (
+            vec![
+                FixtureRead::Data(retirement_requests(&mut peer, 3)),
+                FixtureRead::WaitDataEof(Arc::clone(&end), Vec::new()),
+            ],
+            3,
+        ),
+        RetirementInput::DrainedPost => {
+            let mut bytes = retirement_requests(&mut peer, 0);
+            let stream = peer.create_stream();
+            let mut request = HttpMessage::new();
+            request.set_method(HttpMethod::Post).unwrap();
+            request.set_url(b"/retirement", false).unwrap();
+            request.set_http_version(1, 1);
+            request
+                .headers_mut()
+                .set(HttpHeaderCode::Host, b"example.com");
+            request.headers_mut().set(
+                HttpHeaderCode::ContentLength,
+                RETIREMENT_POST_BODY.to_string().as_bytes(),
+            );
+            bytes.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::Headers {
+                    stream,
+                    message: &request,
+                    end_stream: false,
+                    extra_headers: None,
+                },
+            ));
+            for (index, chunk) in vec![b'q'; RETIREMENT_POST_BODY].chunks(16_000).enumerate() {
+                bytes.extend(eligibility_frame(
+                    &mut peer,
+                    EgressFrame::Body {
+                        stream,
+                        body: queue(chunk),
+                        padding: None,
+                        end_stream: (index + 1) * 16_000 >= RETIREMENT_POST_BODY,
+                    },
+                ));
+            }
+            (
+                vec![
+                    FixtureRead::Data(bytes),
+                    FixtureRead::WaitDataEof(Arc::clone(&end), Vec::new()),
+                ],
+                1,
+            )
+        }
+        RetirementInput::EndedStreamFrames => {
+            // `:method GET`, `:scheme http`, `:path /` and a literal `:authority` without
+            // indexing: no dynamic-table change.
+            let mut block = vec![0x82, 0x86, 0x84, 0x01, 11];
+            block.extend(b"example.com");
+            let frames = [
+                raw_frame(FrameType::WINDOW_UPDATE, 0, 1, &1000u32.to_be_bytes()),
+                raw_frame(FrameType::PRIORITY, 0, 1, &[0, 0, 0, 0, 15]),
+                raw_frame(FrameType::DATA, 0, 1, b"late"),
+                raw_frame(FrameType::HEADERS, 0x4 | END_STREAM, 1, &block),
+            ]
+            .concat();
+            (
+                vec![
+                    FixtureRead::Data(retirement_requests(&mut peer, 1)),
+                    FixtureRead::WaitData(Arc::clone(&gate), frames),
+                    FixtureRead::WaitDataEof(Arc::clone(&end), Vec::new()),
+                ],
+                1,
+            )
+        }
+        RetirementInput::ConcurrencyLimit => {
+            let requests = retirement_requests(&mut peer, 2);
+            let third = retirement_get(&mut peer);
+            (
+                vec![
+                    FixtureRead::Data(requests),
+                    FixtureRead::WaitData(Arc::clone(&gate), third),
+                    FixtureRead::WaitDataEof(Arc::clone(&end), Vec::new()),
+                ],
+                3,
+            )
+        }
+        RetirementInput::PingGoaway => {
+            let requests = retirement_requests(&mut peer, 1);
+            let ping = eligibility_frame(
+                &mut peer,
+                EgressFrame::PingRequest {
+                    data: Some(TRANSCRIPT_PING),
+                },
+            );
+            let goaway = eligibility_frame(
+                &mut peer,
+                EgressFrame::Goaway {
+                    last_stream: StreamId::new(0),
+                    code: H2ErrorCode::NO_ERROR,
+                    debug_data: None,
+                },
+            );
+            (
+                vec![
+                    FixtureRead::Data(requests),
+                    FixtureRead::WaitData(Arc::clone(&gate), ping),
+                    FixtureRead::WaitDataEof(Arc::clone(&end), goaway),
+                ],
+                1,
+            )
+        }
+    };
+    let transport = QueuedFixtureTransport::reporting(reads, saturation, false);
+    let queue = Rc::clone(&transport.probe);
+    let (mut application, probes) = Application::new(vec![Reply::Body(TRANSCRIPT_BODY); replies]);
+    application.response_date = Some(TRANSCRIPT_DATE);
+    application.drain_request_last = matches!(input, RetirementInput::DrainedPost);
+    let mut config = options(context, transport);
+    if matches!(input, RetirementInput::ConcurrencyLimit) {
+        config.http2.settings.push(CodecSetting {
+            identifier: SettingsId::MaxConcurrentStreams.as_u16(),
+            value: 2,
+        });
+    }
+    let (session, _handle) = OwnedH2Session::new(application, config).unwrap();
+    let completed = |count: usize| {
+        let probes = probes.borrow();
+        probes.len() == count && probes.iter().all(|probe| probe.completed.get() == 1)
+    };
+    let ended =
+        |count: usize| queued_transcript(&queue).count(FrameType::DATA, END_STREAM) == count;
+    let completed_while_held = Cell::new(0);
+    let held_arrival = || {
+        completed_while_held.set(
+            probes
+                .borrow()
+                .iter()
+                .filter(|probe| probe.completed.get() == 1)
+                .count(),
+        );
+        gate.notify_one();
+    };
+    let script = async {
+        match input {
+            RetirementInput::Gets | RetirementInput::DrainedPost => {
+                pump_queued(&queue, |_| false, || completed(replies)).await;
+            }
+            RetirementInput::EndedStreamFrames => {
+                pump_queued(&queue, carries_end_stream, || ended(1)).await;
+                held_arrival();
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                }
+                pump_queued(&queue, |_| false, || completed(1)).await;
+            }
+            RetirementInput::ConcurrencyLimit => {
+                pump_queued(&queue, carries_end_stream, || ended(2)).await;
+                held_arrival();
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                }
+                pump_queued(&queue, |_| false, || completed(3)).await;
+            }
+            RetirementInput::PingGoaway => {
+                pump_queued(&queue, |_| false, || completed(1)).await;
+                gate.notify_one();
+                pump_queued(
+                    &queue,
+                    |_| false,
+                    || queued_transcript(&queue).count(FrameType::PING, ACK) == 1,
+                )
+                .await;
+            }
+        }
+        end.notify_one();
+        finish_queued_writes(&queue);
+    };
+    let (run, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(session.run(), script)
+    })
+    .await
+    .expect("the early-retirement fixture finishes");
+    let run = run.map(drop).map_err(|error| error.code());
+    (queued_transcript(&queue), run, completed_while_held.get())
+}
+
+const RETIREMENT_INPUTS: [RetirementInput; 5] = [
+    RetirementInput::Gets,
+    RetirementInput::DrainedPost,
+    RetirementInput::EndedStreamFrames,
+    RetirementInput::ConcurrencyLimit,
+    RetirementInput::PingGoaway,
+];
+
+#[test]
+fn downstream_transcripts_are_unchanged_by_early_retirement() {
+    // `None` keeps the default answer, so every stream keeps its fence; `Some(false)` lets
+    // eligible streams retire at END_STREAM serialization.
+    for (unsaturated, completed_while_held) in [(false, [0, 0, 0, 0, 0]), (true, [0, 0, 1, 2, 0])] {
+        let runs: Vec<_> = RETIREMENT_INPUTS
+            .into_iter()
+            .map(|input| {
+                let (written, run, completed) = run_on_worker(move |context| {
+                    let saturation = unsaturated.then(|| Rc::new(Cell::new(false)));
+                    Box::pin(early_retirement_transcript(context, input, saturation))
+                });
+                (written.digest(), run, completed, written)
+            })
+            .collect();
+        assert_eq!(
+            runs.iter()
+                .map(|(_, _, completed, _)| *completed)
+                .collect::<Vec<_>>(),
+            completed_while_held,
+            "exchanges completed when the held-back input arrives (unsaturated: {unsaturated})"
+        );
+        let recorded: Vec<_> = runs
+            .iter()
+            .map(|(digest, run, _, _)| (*digest, *run))
+            .collect();
+        assert_eq!(
+            recorded,
+            [
+                ((8, 234_198_259_703_760_995), Ok(())),
+                ((5, 12_245_000_780_145_702_999), Ok(())),
+                ((5, 5_501_662_039_820_430_337), Ok(())),
+                ((8, 15_476_332_832_309_872_086), Ok(())),
+                ((6, 11_756_098_851_954_770_615), Ok(())),
+            ],
+            "downstream transcripts recorded at 9d58c4aa0c67 (unsaturated: {unsaturated}); \
+             written (type, flags, stream, length): {:?}",
+            runs.iter()
+                .map(|(_, _, _, written)| written
+                    .frames
+                    .iter()
+                    .map(|frame| (frame.frame_type, frame.flags, frame.stream, frame.length))
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn write_queue_defaults_to_saturated() {
+    use crate::uniplex::UniplexWriteQueue;
+    let queue = FixtureWriteQueue {
+        probe: Rc::default(),
+        cancellation: CancellationToken::never(),
+    };
+    assert!(
+        queue.is_saturated(),
+        "a queue that cannot report saturation keeps every stream's write fence"
+    );
+}
+
+/// A downstream session over a [`ReportingWriteQueue`] answering from `saturation`, whose
+/// writes the script releases; each exchange answers 128 bytes.
+fn reporting_session(
+    context: WorkerContext,
+    reads: Vec<FixtureRead>,
+    replies: usize,
+    saturation: &Rc<Cell<bool>>,
+    configure: impl FnOnce(&mut Application),
+) -> (
+    OwnedH2Session<Application>,
+    OwnedH2Handle,
+    Rc<RefCell<QueuedWriteProbe>>,
+    Rc<RefCell<Vec<Rc<Probe>>>>,
+) {
+    let transport = QueuedFixtureTransport::reporting(reads, Some(Rc::clone(saturation)), false);
+    let queue = Rc::clone(&transport.probe);
+    let (mut application, probes) = Application::new(vec![Reply::Body(TRANSCRIPT_BODY); replies]);
+    application.response_date = Some(TRANSCRIPT_DATE);
+    configure(&mut application);
+    let (session, handle) = OwnedH2Session::new(application, options(context, transport)).unwrap();
+    (session, handle, queue, probes)
+}
+
+/// [`reporting_session`] for one GET.
+fn reporting_get(
+    context: WorkerContext,
+    saturated: bool,
+) -> (
+    OwnedH2Session<Application>,
+    OwnedH2Handle,
+    Rc<RefCell<QueuedWriteProbe>>,
+    Rc<RefCell<Vec<Rc<Probe>>>>,
+) {
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    reporting_session(
+        context,
+        vec![FixtureRead::Data(retirement_requests(&mut peer, 1))],
+        1,
+        &Rc::new(Cell::new(saturated)),
+        |_| {},
+    )
+}
+
+/// Releases every held write.
+fn release_all_queued_writes(queue: &Rc<RefCell<QueuedWriteProbe>>) {
+    let held = {
+        let queue = queue.borrow();
+        queue.accepted.len() - queue.released
+    };
+    release_queued_writes(queue, held);
+}
+
+/// Whether the queue has accepted a write carrying stream `stream`'s END_STREAM.
+fn end_stream_accepted(queue: &RefCell<QueuedWriteProbe>, stream: u32) -> bool {
+    queued_transcript(queue).frames.iter().any(|frame| {
+        frame.stream == stream
+            && frame.flags & END_STREAM != 0
+            && (frame.frame_type == FrameType::DATA.as_u8()
+                || frame.frame_type == FrameType::HEADERS.as_u8())
+    })
+}
+
+#[test]
+fn unsaturated_downstream_stream_retires_before_its_write_completes() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (session, handle, queue, probes) = reporting_get(context, false);
+            exercise_queued(session, &handle, &queue, async {
+                complete_credit_wait(|| end_stream_accepted(&queue, 1)).await;
+                let probe = Rc::clone(&probes.borrow()[0]);
+                drive_until(DRIVE_LIMIT, || probe.completed.get() == 1).await;
+                assert_eq!(queue.borrow().released, 0, "every write is still held");
+                assert_eq!(
+                    probe.completed.get(),
+                    1,
+                    "the unsaturated stream completes before its END_STREAM is written"
+                );
+                assert!(probe.cancelled.borrow().is_empty());
+                assert_eq!(probe.dropped.get(), 1, "the retired exchange is dropped");
+                assert_eq!(queue.borrow().dropped, 0, "the write queue lives on");
+            })
+            .await;
+        })
+    });
+}
+
+#[test]
+fn saturated_downstream_stream_keeps_its_write_fence() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (session, handle, queue, probes) = reporting_get(context, true);
+            exercise_queued(session, &handle, &queue, async {
+                complete_credit_wait(|| end_stream_accepted(&queue, 1)).await;
+                let probe = Rc::clone(&probes.borrow()[0]);
+                settle_turns(DRIVE_LIMIT).await;
+                assert_eq!(
+                    probe.completed.get(),
+                    0,
+                    "a saturated queue keeps the stream behind its write fence"
+                );
+                release_all_queued_writes(&queue);
+                let completed = drive_until(DRIVE_LIMIT, || probe.completed.get() == 1).await;
+                assert!(
+                    completed,
+                    "the stream retires once the receipt covering its END_STREAM is consumed"
+                );
+                assert_eq!(queue.borrow().retired, queue.borrow().accepted.len());
+                assert!(probe.cancelled.borrow().is_empty());
+            })
+            .await;
+        })
+    });
+}
+
+#[test]
+fn own_write_saturating_the_transport_does_not_hold_the_stream() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let preface = retirement_requests(&mut peer, 0);
+            let mut first = Vec::new();
+            let stream = peer.create_stream();
+            let mut request = HttpMessage::new();
+            request.set_method(HttpMethod::Post).unwrap();
+            request.set_url(b"/retirement", false).unwrap();
+            request.set_http_version(1, 1);
+            request
+                .headers_mut()
+                .set(HttpHeaderCode::Host, b"example.com");
+            first.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::Headers {
+                    stream,
+                    message: &request,
+                    end_stream: false,
+                    extra_headers: None,
+                },
+            ));
+            first.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::Body {
+                    stream,
+                    body: queue(b"body"),
+                    padding: None,
+                    end_stream: true,
+                },
+            ));
+            let second = retirement_get(&mut peer);
+            let first_gate = Arc::new(tokio::sync::Notify::new());
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let saturation = Rc::new(Cell::new(false));
+            let (session, handle, queue, probes) = reporting_session(
+                context,
+                vec![
+                    FixtureRead::Data(preface),
+                    FixtureRead::WaitData(Arc::clone(&first_gate), first),
+                    FixtureRead::WaitData(Arc::clone(&gate), second),
+                ],
+                2,
+                &saturation,
+                |application| application.retain_request = true,
+            );
+            exercise_queued(session, &handle, &queue, async {
+                // The connection's own SETTINGS and their ACK are written first.
+                let settled = pump_queued(
+                    &queue,
+                    |_| false,
+                    || {
+                        let queue_state = queue.borrow();
+                        queue_state.released == queue_state.accepted.len()
+                            && queued_transcript(&queue).count(FrameType::SETTINGS, ACK) == 1
+                    },
+                )
+                .await;
+                assert!(settled, "the connection preface exchange completes");
+                let released = queue.borrow().released;
+                queue.borrow_mut().saturate_on_write = true;
+                first_gate.notify_one();
+                complete_credit_wait(|| end_stream_accepted(&queue, 1)).await;
+                assert!(
+                    saturation.get(),
+                    "the write carrying END_STREAM saturated the queue"
+                );
+                let first = Rc::clone(&probes.borrow()[0]);
+                assert_eq!(
+                    first.completed.get(),
+                    0,
+                    "the request body is not consumed yet"
+                );
+                let mut body = first.held_body.borrow_mut().take().unwrap();
+                while !body.read_body_event(u32::MAX).await.unwrap().eom() {}
+                drop(body);
+                drive_until(DRIVE_LIMIT, || first.completed.get() == 1).await;
+                assert_eq!(
+                    queue.borrow().released,
+                    released,
+                    "the write carrying END_STREAM is still held"
+                );
+                assert_eq!(
+                    first.completed.get(),
+                    1,
+                    "saturation is sampled when END_STREAM is serialized, before the stream's \
+                     own write saturates the queue"
+                );
+                gate.notify_one();
+                complete_credit_wait(|| end_stream_accepted(&queue, 3)).await;
+                let second = Rc::clone(&probes.borrow()[1]);
+                settle_turns(DRIVE_LIMIT).await;
+                assert_eq!(
+                    second.completed.get(),
+                    0,
+                    "a stream whose END_STREAM is serialized behind a saturating write keeps \
+                     its fence"
+                );
+                release_all_queued_writes(&queue);
+                let completed = drive_until(DRIVE_LIMIT, || second.completed.get() == 1).await;
+                assert!(completed, "the fenced stream retires at its receipt");
+            })
+            .await;
+        })
+    });
+}
+
+#[test]
+fn byte_event_stream_keeps_its_write_fence() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let events = Rc::new(ByteEventProbe::default());
+            let (session, handle, queue, probes) = reporting_session(
+                context,
+                vec![FixtureRead::Data(retirement_requests(&mut peer, 1))],
+                1,
+                &Rc::new(Cell::new(false)),
+                |application| {
+                    application.byte_events = Some(Rc::clone(&events));
+                    application.transport_write_events = true;
+                },
+            );
+            exercise_queued(session, &handle, &queue, async {
+                complete_credit_wait(|| end_stream_accepted(&queue, 1)).await;
+                let probe = Rc::clone(&probes.borrow()[0]);
+                settle_turns(DRIVE_LIMIT).await;
+                assert_eq!(
+                    probe.completed.get(),
+                    0,
+                    "a stream that registered a byte event keeps its write fence"
+                );
+                release_all_queued_writes(&queue);
+                let completed = drive_until(DRIVE_LIMIT, || probe.completed.get() == 1).await;
+                assert!(completed, "the stream retires at its receipt");
+                assert!(
+                    events
+                        .delivered
+                        .borrow()
+                        .iter()
+                        .any(|event| event.event_type == ByteEventType::TransportWrite),
+                    "the byte event is delivered before the exchange completes"
+                );
+                assert!(events.cancelled.borrow().is_empty());
+            })
+            .await;
+        })
+    });
+}
+
+#[test]
+fn peer_reset_after_retirement_is_ignored() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let requests = retirement_requests(&mut peer, 1);
+            let reset = raw_frame(
+                FrameType::RST_STREAM,
+                0,
+                1,
+                &H2ErrorCode::CANCEL.as_u32().to_be_bytes(),
+            );
+            let next = retirement_get(&mut peer);
+            let reset_gate = Arc::new(tokio::sync::Notify::new());
+            let next_gate = Arc::new(tokio::sync::Notify::new());
+            let (session, handle, queue, probes) = reporting_session(
+                context,
+                vec![
+                    FixtureRead::Data(requests),
+                    FixtureRead::WaitData(Arc::clone(&reset_gate), reset),
+                    FixtureRead::WaitData(Arc::clone(&next_gate), next),
+                ],
+                2,
+                &Rc::new(Cell::new(false)),
+                |_| {},
+            );
+            exercise_queued(session, &handle, &queue, async {
+                complete_credit_wait(|| end_stream_accepted(&queue, 1)).await;
+                let first = Rc::clone(&probes.borrow()[0]);
+                drive_until(DRIVE_LIMIT, || first.completed.get() == 1).await;
+                assert_eq!(queue.borrow().released, 0, "every write is still held");
+                assert_eq!(
+                    first.completed.get(),
+                    1,
+                    "the stream retired at END_STREAM serialization"
+                );
+                let before_reset = queue.borrow().accepted.len();
+                reset_gate.notify_one();
+                settle_turns(DRIVE_LIMIT).await;
+                release_all_queued_writes(&queue);
+                next_gate.notify_one();
+                let answered = pump_queued(
+                    &queue,
+                    |_| false,
+                    || {
+                        probes
+                            .borrow()
+                            .get(1)
+                            .is_some_and(|probe| probe.completed.get() == 1)
+                    },
+                )
+                .await;
+                assert!(answered, "a following request on stream 3 is answered");
+                assert!(
+                    first.cancelled.borrow().is_empty(),
+                    "the peer's RST_STREAM does not reach the retired exchange"
+                );
+                assert_eq!(first.completed.get(), 1);
+                let after_reset = WireTranscript::new(
+                    WireDirection::Written,
+                    &queue.borrow().accepted[before_reset..].concat(),
+                );
+                assert!(
+                    after_reset.frames.iter().all(|frame| frame.stream != 1),
+                    "nothing is written for the retired stream after the RST: {after_reset:?}"
+                );
+            })
+            .await;
+        })
+    });
+}
+
+#[test]
+fn write_failure_after_retirement_leaves_the_stream_complete() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut requests = retirement_requests(&mut peer, 1);
+            let open = peer.create_stream();
+            let mut request = HttpMessage::new();
+            request.set_method(HttpMethod::Post).unwrap();
+            request.set_url(b"/open", false).unwrap();
+            request.set_http_version(1, 1);
+            request
+                .headers_mut()
+                .set(HttpHeaderCode::Host, b"example.com");
+            requests.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::Headers {
+                    stream: open,
+                    message: &request,
+                    end_stream: false,
+                    extra_headers: None,
+                },
+            ));
+            let (session, _handle, queue, probes) = reporting_session(
+                context,
+                vec![FixtureRead::Data(requests)],
+                2,
+                &Rc::new(Cell::new(false)),
+                |_| {},
+            );
+            let ended = Cell::new(false);
+            let run = async {
+                let result = session.run().await;
+                ended.set(true);
+                result
+            };
+            let script = async {
+                complete_credit_wait(|| end_stream_accepted(&queue, 1)).await;
+                let first = Rc::clone(&probes.borrow()[0]);
+                drive_until(DRIVE_LIMIT, || first.completed.get() == 1).await;
+                assert_eq!(queue.borrow().released, 0, "every write is still held");
+                assert_eq!(
+                    first.completed.get(),
+                    1,
+                    "the stream retired at END_STREAM serialization"
+                );
+                queue.borrow_mut().fail_released = true;
+                pump_queued(&queue, |_| false, || ended.get()).await;
+            };
+            let (result, ()) =
+                tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(run, script) })
+                    .await
+                    .expect("the failed connection ends");
+            assert_eq!(
+                result.expect_err("the held write failed").code(),
+                HttpErrorCode::TRANSPORT_WRITE_ERROR
+            );
+            let probes = probes.borrow();
+            assert_eq!(probes[0].completed.get(), 1);
+            assert!(
+                probes[0].cancelled.borrow().is_empty(),
+                "the failed write does not reach the retired exchange"
+            );
+            assert_eq!(probes[1].completed.get(), 0);
+            assert_eq!(
+                probes[1].cancelled.borrow().as_slice(),
+                &[(HttpErrorCode::TRANSPORT_WRITE_ERROR, false)],
+                "the open stream is reset by the failure"
+            );
+        })
+    });
+}
+
+/// A downstream session with no stream left does not arm the writer for the completion of a
+/// write nothing waits for (`DIV-028`). Every write completes at the transport's flush, after
+/// the session's poll, and the queue is unsaturated, so each GET's stream retires when its
+/// END_STREAM is serialized. The third of three sequential GETs then takes two polls and two
+/// wakes: the read's wake, and the request source's self-wake inside the poll that reads the
+/// GET. No wake follows the response's write. The receipt it leaves is consumed before the
+/// session ends at EOF.
+#[test]
+fn retired_downstream_stream_needs_no_write_completion_poll() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let gates: [Arc<tokio::sync::Notify>; 4] =
+                std::array::from_fn(|_| Arc::new(tokio::sync::Notify::new()));
+            let mut reads = vec![FixtureRead::Data(arming_preface(&mut peer))];
+            for gate in &gates[..3] {
+                let (_, get) = arming_get(&mut peer);
+                reads.push(FixtureRead::WaitData(Arc::clone(gate), get));
+            }
+            reads.push(FixtureRead::WaitDataEof(Arc::clone(&gates[3]), Vec::new()));
+            let transport = ScriptedWriteTransport::new(
+                reads,
+                [],
+                ScriptedWrite::Complete,
+                INLINE_OUTSTANDING_WRITES,
+                None,
+            );
+            transport.state.borrow_mut().saturated = false;
+            let state = Rc::clone(&transport.state);
+            let completes = Rc::new(Cell::new(0));
+            let (session, _handle) = OwnedH2Session::new(
+                ArmingApplication::new(&completes),
+                options(context, transport),
+            )
+            .unwrap();
+            let (run, counts) = CountedWakes::new(session.run());
+            let script = async {
+                let counted = || (counts.polls(), counts.wakes(), counts.in_poll_wakes());
+                let mut answered = Vec::new();
+                let mut per_request = Vec::new();
+                for (index, gate) in gates[..3].iter().enumerate() {
+                    let before = counted();
+                    gate.notify_one();
+                    answered.push(
+                        writer_drive_until(|| {
+                            completes.get() == index + 1
+                                && state.borrow().frames(FrameType::HEADERS, END_STREAM)
+                                    == index + 1
+                        })
+                        .await,
+                    );
+                    writer_settle().await;
+                    let after = counted();
+                    per_request.push((after.0 - before.0, after.1 - before.1, after.2 - before.2));
+                }
+                gates[3].notify_one();
+                (answered, per_request)
+            };
+            let (result, (answered, per_request)) =
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let joined = tokio::join!(run, script);
+                    join_scripted_tasks(&state).await;
+                    joined
+                })
+                .await
+                .expect("the session ends at EOF");
+            assert_eq!(answered, [true; 3], "every GET is answered and retires");
+            assert_eq!(
+                per_request[2],
+                (2, 2, 1),
+                "the third GET's session (polls, wakes, in-poll wakes): no wake follows its \
+                 response's write"
+            );
+            let summary = result.expect("EOF at idle ends the session cleanly");
+            assert_eq!(
+                summary.bytes_written, summary.bytes_scheduled,
+                "the receipt the last retired stream left is consumed before the session ends"
+            );
+            assert_eq!(completes.get(), 3);
+        })
+    });
+}
+
+const END_HEADERS: u8 = 0x4;
+const GRPC_OK: &[(&str, &str)] = &[("grpc-status", "0")];
+
+/// One written frame with its payload bytes.
+#[derive(Debug)]
+struct RawFrame {
+    frame_type: u8,
+    flags: u8,
+    stream: u32,
+    payload: Vec<u8>,
+}
+
+/// Splits written bytes into whole frames, keeping each payload.
+fn raw_frames(wire: &[u8]) -> Vec<RawFrame> {
+    let mut frames = Vec::new();
+    let mut rest = wire;
+    while !rest.is_empty() {
+        let length = u32::from_be_bytes([0, rest[0], rest[1], rest[2]]) as usize;
+        let (frame, tail) = rest.split_at(FRAME_HEADER_SIZE + length);
+        frames.push(RawFrame {
+            frame_type: frame[3],
+            flags: frame[4],
+            stream: u32::from_be_bytes([frame[5], frame[6], frame[7], frame[8]]) & 0x7fff_ffff,
+            payload: frame[FRAME_HEADER_SIZE..].to_vec(),
+        });
+        rest = tail;
+    }
+    frames
+}
+
+/// Every HEADERS frame of `wire` in order, as `(stream, flags, block, fields)`, decoded
+/// with one decoder so later blocks see the dynamic table earlier blocks built.
+fn decoded_header_blocks(wire: &[u8]) -> Vec<(u32, u8, Vec<u8>, Vec<HpackHeader>)> {
+    let mut decoder = HpackDecoder::new();
+    raw_frames(wire)
+        .into_iter()
+        .filter(|frame| frame.frame_type == FrameType::HEADERS.as_u8())
+        .map(|frame| {
+            assert_eq!(
+                frame.flags & !(END_STREAM | END_HEADERS),
+                0,
+                "a written HEADERS frame carries no padding or priority"
+            );
+            assert_ne!(frame.flags & END_HEADERS, 0, "no CONTINUATION follows");
+            let fields = decoder
+                .decode(&frame.payload)
+                .expect("a written header block decodes")
+                .headers;
+            (frame.stream, frame.flags, frame.payload, fields)
+        })
+        .collect()
+}
+
+/// `(type, flags)` of each frame written on `stream`.
+fn stream_frame_kinds(wire: &[u8], stream: u32) -> Vec<(u8, u8)> {
+    raw_frames(wire)
+        .iter()
+        .filter(|frame| frame.stream == stream)
+        .map(|frame| (frame.frame_type, frame.flags))
+        .collect()
+}
+
+/// The fields of the HEADERS frame that ends `stream`.
+fn trailer_fields(wire: &[u8], stream: u32) -> Option<Vec<HpackHeader>> {
+    decoded_header_blocks(wire)
+        .into_iter()
+        .find(|(id, flags, _, _)| *id == stream && flags & END_STREAM != 0)
+        .map(|(_, _, _, fields)| fields)
+}
+
+/// Runs one GET on stream 1 whose exchange answers `reply`, and returns the bytes written
+/// once the exchange has completed and the session has settled.
+async fn single_reply_wire(context: WorkerContext, reply: Reply) -> Vec<u8> {
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    let (transport, state) =
+        FixtureTransport::new([FixtureRead::Data(retirement_requests(&mut peer, 1))]);
+    let (application, probes) = Application::new(vec![reply]);
+    let (session, handle) = OwnedH2Session::new(application, options(context, transport)).unwrap();
+    exercise(session, &handle, &[], async {
+        complete_credit_wait(|| {
+            probes
+                .borrow()
+                .first()
+                .is_some_and(|probe| probe.completed.get() == 1)
+        })
+        .await;
+        settle_turns(DRIVE_LIMIT).await;
+    })
+    .await;
+    let probe = Rc::clone(&probes.borrow()[0]);
+    assert_eq!(probe.response_complete.get(), 1);
+    assert!(probe.cancelled.borrow().is_empty());
+    state.borrow().writes.concat()
+}
+
+#[test]
+fn response_trailers_end_the_stream_on_their_headers_frame() {
+    let wire = run_on_worker(|context| {
+        Box::pin(single_reply_wire(
+            context,
+            Reply::BodyThenTrailers(5, GRPC_OK),
+        ))
+    });
+    let headers = FrameType::HEADERS.as_u8();
+    assert_eq!(
+        stream_frame_kinds(&wire, 1),
+        [
+            (headers, END_HEADERS),
+            (FrameType::DATA.as_u8(), 0),
+            (headers, END_HEADERS | END_STREAM),
+        ],
+        "head, body, then trailers carrying END_STREAM, and nothing after them"
+    );
+    let blocks: Vec<_> = decoded_header_blocks(&wire)
+        .into_iter()
+        .filter(|(stream, _, _, _)| *stream == 1)
+        .collect();
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[1].3, [HpackHeader::new("grpc-status", "0")]);
+}
+
+const GRPC_MESSAGE: &str = "upstream request timed out after 15000ms";
+const GRPC_FAILURE: &[(&str, &str)] = &[("grpc-status", "9"), ("grpc-message", GRPC_MESSAGE)];
+
+#[test]
+fn response_trailers_keep_field_order_and_values() {
+    assert_eq!(GRPC_MESSAGE.len(), 40);
+    let wire = run_on_worker(|context| {
+        Box::pin(single_reply_wire(
+            context,
+            Reply::BodyThenTrailers(5, GRPC_FAILURE),
+        ))
+    });
+    assert_eq!(
+        trailer_fields(&wire, 1).expect("a HEADERS frame ends the stream"),
+        [
+            HpackHeader::new("grpc-status", "9"),
+            HpackHeader::new("grpc-message", GRPC_MESSAGE),
+        ]
+    );
+}
+
+fn completions(probes: &RefCell<Vec<Rc<Probe>>>) -> Vec<usize> {
+    probes
+        .borrow()
+        .iter()
+        .map(|probe| probe.completed.get())
+        .collect()
+}
+
+/// Two GETs over a [`ReportingWriteQueue`] reporting `saturated`: stream 1 ends on
+/// trailers, stream 3 on a DATA END_STREAM. Returns the exchanges' completions while every
+/// write carrying an END_STREAM is held, then after every write is released.
+async fn trailers_retirement(context: WorkerContext, saturated: bool) -> [Vec<usize>; 2] {
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    let (session, handle, queue, probes) = reporting_session(
+        context,
+        vec![FixtureRead::Data(retirement_requests(&mut peer, 2))],
+        2,
+        &Rc::new(Cell::new(saturated)),
+        |application| {
+            application.replies = vec![
+                Reply::BodyThenTrailers(5, GRPC_OK),
+                Reply::Body(TRANSCRIPT_BODY),
+            ];
+        },
+    );
+    let held = RefCell::new(Vec::new());
+    let released = RefCell::new(Vec::new());
+    exercise_queued(session, &handle, &queue, async {
+        let ended = pump_queued(&queue, carries_end_stream, || {
+            end_stream_accepted(&queue, 1) && end_stream_accepted(&queue, 3)
+        })
+        .await;
+        assert!(ended, "both streams' END_STREAM writes are accepted");
+        settle_turns(DRIVE_LIMIT).await;
+        {
+            let queue = queue.borrow();
+            let first_end = queue
+                .accepted
+                .iter()
+                .position(|write| carries_end_stream(write))
+                .unwrap();
+            assert!(
+                queue.released <= first_end,
+                "no write carrying an END_STREAM has completed"
+            );
+        }
+        *held.borrow_mut() = completions(&probes);
+        release_all_queued_writes(&queue);
+        drive_until(DRIVE_LIMIT, || completions(&probes) == [1, 1]).await;
+        *released.borrow_mut() = completions(&probes);
+    })
+    .await;
+    let trailers = queued_transcript(&queue)
+        .frames
+        .into_iter()
+        .filter(|frame| frame.stream == 1 && frame.flags & END_STREAM != 0)
+        .map(|frame| frame.frame_type)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        trailers,
+        [FrameType::HEADERS.as_u8()],
+        "stream 1 ends on its trailers HEADERS frame"
+    );
+    for probe in probes.borrow().iter() {
+        assert!(probe.cancelled.borrow().is_empty());
+        assert_eq!(probe.dropped.get(), 1);
+    }
+    [held.into_inner(), released.into_inner()]
+}
+
+#[test]
+fn trailers_end_stream_retires_early_when_unsaturated() {
+    let unsaturated = run_on_worker(|context| Box::pin(trailers_retirement(context, false)));
+    assert_eq!(
+        unsaturated,
+        [vec![1, 1], vec![1, 1]],
+        "unsaturated: the trailers-ended stream retires at serialization, as the DATA-ended \
+         sibling does"
+    );
+    let saturated = run_on_worker(|context| Box::pin(trailers_retirement(context, true)));
+    assert_eq!(
+        saturated,
+        [vec![0, 0], vec![1, 1]],
+        "saturated: both streams wait for the physical write"
+    );
+}
+
+#[test]
+fn response_trailers_wait_behind_flow_controlled_data() {
+    const WINDOW: usize = 16;
+    const BODY: usize = 40;
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            peer.egress_settings_mut()
+                .set(SettingsId::InitialWindowSize, WINDOW as u64);
+            let input = retirement_requests(&mut peer, 1);
+            let credit = eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::new(1),
+                    amount: 1000,
+                },
+            );
+            let send_credit = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(input),
+                FixtureRead::WaitData(Arc::clone(&send_credit), credit),
+            ]);
+            let (application, probes) =
+                Application::new(vec![Reply::BodyThenTrailers(BODY, GRPC_OK)]);
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let headers = FrameType::HEADERS.as_u8();
+            let data = FrameType::DATA.as_u8();
+            exercise(session, &handle, &[Arc::clone(&send_credit)], async {
+                complete_credit_wait(|| {
+                    decode_server_frames(&state.borrow().writes.concat()).body_bytes == WINDOW
+                })
+                .await;
+                settle_turns(DRIVE_LIMIT).await;
+                let blocked = state.borrow().writes.concat();
+                assert_eq!(
+                    stream_frame_kinds(&blocked, 1),
+                    [(headers, END_HEADERS), (data, 0)],
+                    "no trailers frame is written while body bytes wait for credit"
+                );
+                let probe = Rc::clone(&probes.borrow()[0]);
+                assert_eq!(probe.response_complete.get(), 0);
+                send_credit.notify_one();
+                complete_credit_wait(|| probe.completed.get() == 1).await;
+            })
+            .await;
+            let wire = state.borrow().writes.concat();
+            assert_eq!(
+                stream_frame_kinds(&wire, 1),
+                [
+                    (headers, END_HEADERS),
+                    (data, 0),
+                    (data, 0),
+                    (headers, END_HEADERS | END_STREAM),
+                ],
+                "the window's DATA, the remaining DATA, then the trailers"
+            );
+            let lengths: Vec<_> = raw_frames(&wire)
+                .into_iter()
+                .filter(|frame| frame.stream == 1 && frame.frame_type == data)
+                .map(|frame| frame.payload.len())
+                .collect();
+            assert_eq!(lengths, [WINDOW, BODY - WINDOW]);
+            assert_eq!(
+                trailer_fields(&wire, 1).unwrap(),
+                [HpackHeader::new("grpc-status", "0")]
+            );
+        })
+    });
+}
+
+#[test]
+fn trailer_blocks_share_the_dynamic_table() {
+    let wire = run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let first = retirement_requests(&mut peer, 1);
+            let second = retirement_get(&mut peer);
+            let send_second = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(first),
+                FixtureRead::WaitData(Arc::clone(&send_second), second),
+            ]);
+            let (application, probes) = Application::new(vec![
+                Reply::BodyThenTrailers(5, GRPC_OK),
+                Reply::BodyThenTrailers(5, GRPC_OK),
+            ]);
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            exercise(session, &handle, &[Arc::clone(&send_second)], async {
+                complete_credit_wait(|| completions(&probes) == [1]).await;
+                send_second.notify_one();
+                complete_credit_wait(|| completions(&probes) == [1, 1]).await;
+            })
+            .await;
+            state.borrow().writes.concat()
+        })
+    });
+    let trailers: Vec<_> = decoded_header_blocks(&wire)
+        .into_iter()
+        .filter(|(_, flags, _, _)| flags & END_STREAM != 0)
+        .collect();
+    assert_eq!(
+        trailers
+            .iter()
+            .map(|(stream, ..)| *stream)
+            .collect::<Vec<_>>(),
+        [1, 3],
+        "each response ends on its trailers block, in order"
+    );
+    for (_, _, _, fields) in &trailers {
+        assert_eq!(fields, &[HpackHeader::new("grpc-status", "0")]);
+    }
+    let (first, second) = (&trailers[0].2, &trailers[1].2);
+    assert_eq!(
+        second.len(),
+        1,
+        "the second block is one representation: {second:02x?}"
+    );
+    assert_eq!(
+        second[0] & 0x80,
+        0x80,
+        "the second block is an indexed field (RFC 7541 §6.1): {second:02x?}"
+    );
+    assert!(
+        second[0] & 0x7f > 61,
+        "the index refers to the dynamic table: {second:02x?}"
+    );
+    assert_eq!(
+        first[0] & 0xc0,
+        0x40,
+        "the first block inserts the field (literal with incremental indexing, RFC 7541 §6.2.1): {first:02x?}"
+    );
+}
+
+#[test]
+fn downstream_trailers_transcript_is_unchanged_by_early_retirement() {
+    let wire = run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut input = arming_preface(&mut peer);
+            for _ in 0..2 {
+                input.extend(arming_get(&mut peer).1);
+            }
+            let (transport, state) = FixtureTransport::new([FixtureRead::Data(input)]);
+            let (mut application, probes) =
+                Application::new(vec![Reply::BodyThenTrailers(5, GRPC_OK), Reply::Body(5)]);
+            application.response_date = Some(TRANSCRIPT_DATE);
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let wire = RefCell::new(Vec::new());
+            exercise(session, &handle, &[], async {
+                complete_credit_wait(|| completions(&probes) == [1, 1]).await;
+                settle_turns(DRIVE_LIMIT).await;
+                for probe in probes.borrow().iter() {
+                    assert_eq!(probe.response_complete.get(), 1);
+                    assert!(probe.cancelled.borrow().is_empty());
+                }
+                *wire.borrow_mut() = state.borrow().writes.concat();
+            })
+            .await;
+            wire.into_inner()
+        })
+    });
+    let (headers, data) = (FrameType::HEADERS.as_u8(), FrameType::DATA.as_u8());
+    assert_eq!(
+        stream_frame_kinds(&wire, 1),
+        [
+            (headers, END_HEADERS),
+            (data, 0),
+            (headers, END_HEADERS | END_STREAM),
+        ],
+        "stream 1: head, body, then trailers carrying END_STREAM"
+    );
+    assert_eq!(
+        stream_frame_kinds(&wire, 3),
+        [(headers, END_HEADERS), (data, END_STREAM)],
+        "stream 3: head, then its body carrying END_STREAM"
+    );
+    let written = WireTranscript::new(WireDirection::Written, &wire);
+    assert_eq!(
+        written.digest(),
+        (7, 17_566_401_009_799_498_029),
+        "written transcript recorded before streams retired at END_STREAM framing; written: {written:#?}"
+    );
+}
+
+/// A wrapper typed only against the protocol-neutral contract.
+struct GenericApplication(Application);
+
+struct GenericExchange(Exchange);
+
+impl crate::owned::OwnedApplication for GenericApplication {
+    type Exchange = GenericExchange;
+
+    fn new_exchange(&self, stream: StreamId, ingress: IngressCompletion) -> GenericExchange {
+        GenericExchange(self.0.new_exchange(stream, ingress))
+    }
+}
+
+impl crate::owned::OwnedExchange for GenericExchange {
+    fn request(&mut self, head: Box<HttpMessage>, body: HttpStreamSourceOwner, eom: bool) {
+        self.0.request(head, body, eom);
+    }
+
+    fn poll_headers(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        self.0.poll_headers(context)
+    }
+
+    fn poll_body(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        self.0.poll_body(context, maximum)
+    }
+
+    fn cancel(&mut self, error: &HttpError, peer_reset: bool) {
+        self.0.cancel(error, peer_reset);
+    }
+
+    fn response_complete(&mut self) {
+        self.0.response_complete();
+    }
+
+    fn complete(self) {
+        self.0.complete();
+    }
+}
+
+#[test]
+fn generic_exchange_contract_drives_owned_h2() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let (transport, state) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+            let (application, probes) = Application::new(vec![Reply::Body(3)]);
+            let (session, _) =
+                OwnedH2Session::new(GenericApplication(application), options(context, transport))
+                    .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .expect("the generic exchange finishes its one GET")
+                .unwrap();
+            let probes = probes.borrow();
+            assert_eq!(probes.len(), 1);
+            let probe = &probes[0];
+            assert_eq!(probe.requested.get(), 1);
+            assert!(probe.request_eom.get());
+            assert_eq!(probe.response_complete.get(), 1);
+            assert_eq!(probe.completed.get(), 1, "complete runs exactly once");
+            assert!(probe.cancelled.borrow().is_empty());
+            let decoded = decode_server_frames(&state.borrow().writes.concat());
+            assert_eq!(decoded.header_statuses, [(StreamId::new(1), 200)]);
+            assert_eq!(decoded.body_data, b"rrr");
+            assert!(decoded.resets.is_empty());
+            assert!(decoded.errors.is_empty());
+        })
+    });
+}
+
+#[test]
+fn h2_contract_names_are_aliases() {
+    fn generic_exchange<E: crate::owned::OwnedExchange>() {}
+    fn h2_exchange<E: OwnedH2Exchange>() {}
+    fn generic_application<A: crate::owned::OwnedApplication>() {}
+    fn h2_application<A: OwnedH2Application>() {}
+
+    generic_exchange::<Exchange>();
+    h2_exchange::<GenericExchange>();
+    generic_application::<Application>();
+    h2_application::<GenericApplication>();
+}
+
+/// A draining idle connection's close parks while its outstanding read has yet to complete, and
+/// finishes once that read completes.
+#[test]
+fn drain_close_parks_until_the_read_completes() {
+    crate::external_host_tests::run_on_host_with(|host, context| {
+        Box::pin(async move {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            // The read ignores cancellation: it completes only when the test releases it.
+            let (transport, state) =
+                FixtureTransport::new([FixtureRead::WaitData(Arc::clone(&gate), Vec::new())]);
+            let (application, probes) = Application::new(Vec::new());
+            let mut config = options(context, transport);
+            config.http2.double_goaway_drain = false;
+            let (session, handle) = OwnedH2Session::new(application, config).unwrap();
+            let (run, ()) = futures::join!(session.run(), async {
+                assert!(handle.initiate_drain().unwrap());
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                let yields = host.yields();
+                for _ in 0..1000 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    host.yields(),
+                    yields,
+                    "the drain's close kept polling while its read was outstanding"
+                );
+                assert_eq!(state.borrow().close, FixtureClose::Open);
+                gate.notify_one();
+            });
+            run.unwrap();
+            assert!(probes.borrow().is_empty());
+            assert_eq!(state.borrow().close, FixtureClose::Closed);
+            let decoded = decode_server_frames(&state.borrow().writes.concat());
+            assert_eq!(
+                decoded.goaways,
+                [(StreamId::UNSPECIFIED, H2ErrorCode::NO_ERROR)]
+            );
+        })
+    });
+}
+
+/// Writes and closes through a [`FixtureTransport`]; each read observes its cancellation only
+/// when polled, and arranges no wake for it.
+pub(super) struct PolledCancellationTransport(pub(super) Rc<FixtureTransport>);
+
+impl UniplexTransport for PolledCancellationTransport {
+    fn read(
+        &self,
+        _context: &WorkerContext,
+        _maximum: usize,
+        _allocation_size: usize,
+        _timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        Box::pin(std::future::poll_fn(move |_| {
+            if cancellation.is_cancellation_requested() {
+                Poll::Ready(Err(HttpError::with_message(
+                    HttpErrorCode::CORO_CANCELLED,
+                    b"read cancelled",
+                )))
+            } else {
+                Poll::Pending
+            }
+        }))
+    }
+
+    fn write(
+        &self,
+        context: &WorkerContext,
+        data: BufQueue,
+        flags: ByteEventWriteFlags,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        self.0.write(context, data, flags, timeout, cancellation)
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.0.shutdown_write(context)
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.0.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.0.close_with_reset(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.0.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.0.register_byte_event(context, registration)
+    }
+}
+
+/// A draining idle connection's close polls the outstanding read again after requesting its
+/// cancellation, so a read that observes cancellation only when polled still completes the close.
+#[test]
+fn drain_close_polls_the_read_again_after_cancelling_it() {
+    crate::external_host_tests::run_on_host(|context| {
+        Box::pin(async move {
+            let (inner, state) = FixtureTransport::new([]);
+            let transport = Rc::new(PolledCancellationTransport(inner));
+            let (application, probes) = Application::new(Vec::new());
+            let mut config = options(context, transport);
+            config.http2.double_goaway_drain = false;
+            let (session, handle) = OwnedH2Session::new(application, config).unwrap();
+            let (run, ()) = futures::join!(session.run(), async {
+                assert!(handle.initiate_drain().unwrap());
+            });
+            run.unwrap();
+            assert!(probes.borrow().is_empty());
+            assert_eq!(state.borrow().close, FixtureClose::Closed);
+        })
+    });
+}
