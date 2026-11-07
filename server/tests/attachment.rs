@@ -1801,3 +1801,193 @@ fn owned_http1_abandoned_run_contains_a_retained_callback_panic() {
     wait(runtime.quiesce(TIMEOUT)).expect("cleanup joins");
     assert_eq!(owner.join().expect("physical join").workers_forced, 0);
 }
+
+/// An untimed session configuration with the given owned modes on.
+fn untimed_owned(owned_http1: bool, owned_http2: bool) -> crate::acceptor::ServerSessionConfig {
+    crate::acceptor::ServerSessionConfig {
+        stream_read_timeout: Duration::ZERO,
+        connection_idle_timeout: Duration::ZERO,
+        write_timeout: Duration::ZERO,
+        owned_http1,
+        owned_http2,
+        ..crate::acceptor::ServerSessionConfig::default()
+    }
+}
+
+#[test]
+fn owned_http2_dispatches_by_protocol() {
+    use crate::acceptor::ServerSessionKind;
+    assert_eq!(
+        session_kind_on_worker(CodecProtocol::Http2, untimed_owned(false, true)),
+        ServerSessionKind::OwnedHttp2
+    );
+    // Each owned flag leaves the other protocol on the managed session.
+    assert_eq!(
+        session_kind_on_worker(CodecProtocol::Http11, untimed_owned(false, true)),
+        ServerSessionKind::Uniplex
+    );
+    assert_eq!(
+        session_kind_on_worker(CodecProtocol::Http2, untimed_owned(true, false)),
+        ServerSessionKind::Uniplex
+    );
+    assert_eq!(
+        session_kind_on_worker(CodecProtocol::Http11, untimed_owned(true, true)),
+        ServerSessionKind::OwnedHttp1
+    );
+    assert_eq!(
+        session_kind_on_worker(CodecProtocol::Http2, untimed_owned(true, true)),
+        ServerSessionKind::OwnedHttp2
+    );
+}
+
+#[test]
+fn owned_http2_attachment_rejects_unsupported_configuration() {
+    let mut owner = RuntimeOwner::start(RuntimeConfig {
+        workers: 1,
+        command_capacity: 4,
+    })
+    .expect("owner starts");
+    let runtime = owner.handle();
+    let worker = runtime.worker(0).expect("worker exists");
+    wait(
+        worker
+            .call_local(move |context| async move {
+                let mut stats = untimed_owned(false, true);
+                stats.stats_factory = Some(Arc::new(|_: &ConnectionInfo| {
+                    unreachable!("a refused configuration builds no recorder")
+                }));
+                let mut timed = untimed_owned(false, true);
+                timed.stream_read_timeout = Duration::from_secs(1);
+                for (session, message) in [
+                    (stats, &b"owned_http2 does not support stats_factory"[..]),
+                    (
+                        timed,
+                        &b"owned_http2 is untimed: stream_read_timeout must be zero"[..],
+                    ),
+                ] {
+                    let (io, _peer) = tokio::io::duplex(64);
+                    let transport = adopt_local(
+                        &context,
+                        EstablishedIo::new(
+                            io,
+                            TransportEndpoint::Unknown,
+                            TransportEndpoint::Unknown,
+                            None,
+                        ),
+                        limits(),
+                    )
+                    .expect("I/O adopted");
+                    let mut options = ServeTransportOptions::new(
+                        CodecProtocol::Http2,
+                        TransportSecurity::Plaintext,
+                    );
+                    options.session = session;
+                    let error = serve_transport(
+                        &context,
+                        transport,
+                        Rc::new(RecordingHandler(Arc::new(Evidence::default()))),
+                        options,
+                    )
+                    .err()
+                    .expect("the unsupported configuration is refused");
+                    assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+                    assert_eq!(error.message(), message);
+                }
+            })
+            .expect("initializer admitted"),
+    )
+    .expect("initializer finishes");
+    wait(runtime.quiesce(TIMEOUT)).expect("cleanup joins");
+    assert_eq!(owner.join().expect("physical join").workers_forced, 0);
+}
+
+/// Answers every request with a fixed body, after draining it.
+struct FixedHandler;
+
+impl HttpHandler for FixedHandler {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        mut request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        Box::pin(async move {
+            let head = request.read_header_event().await?;
+            if !head.eom() {
+                loop {
+                    let event = request.read_body_event(1024).await?;
+                    if event.eom() {
+                        break;
+                    }
+                }
+            }
+            let body = BufQueue::copy_from_slice(b"owned-http2", 11).expect("fixed body fits");
+            Ok(HttpSourceHolder::new(Box::new(
+                HttpFixedSource::make_fixed_response(200, Some(body)).expect("valid response"),
+            )))
+        })
+    }
+}
+
+#[test]
+fn owned_http2_serves_a_fixed_get_and_drains() {
+    let mut owner = RuntimeOwner::start(RuntimeConfig {
+        workers: 1,
+        command_capacity: 4,
+    })
+    .expect("owner starts");
+    let runtime = owner.handle();
+    let worker = runtime.worker(0).expect("worker exists");
+    wait(
+        worker
+            .call_local(move |context| async move {
+                let (io, peer) = tokio::io::duplex(64 * 1024);
+                let accepted = attach_for_test(
+                    &context,
+                    CodecProtocol::Http2,
+                    untimed_owned(false, true),
+                    io,
+                    Rc::new(FixedHandler),
+                );
+                assert_eq!(
+                    accepted.session.kind(),
+                    crate::acceptor::ServerSessionKind::OwnedHttp2
+                );
+                let control = accepted.control;
+                let run = tokio::task::spawn_local(accepted.session.run());
+                let (client, connection) = h2::client::handshake(peer).await.expect("H2 handshake");
+                let connection = tokio::task::spawn_local(connection);
+                let mut client = client.ready().await.expect("H2 client ready");
+                let request = http::Request::builder()
+                    .method("GET")
+                    .uri("http://localhost/fixed")
+                    .body(())
+                    .expect("request builds");
+                let (response, _stream) = client.send_request(request, true).expect("request sent");
+                let response = response.await.expect("response head");
+                assert_eq!(response.status(), http::StatusCode::OK);
+                let mut body = response.into_body();
+                let mut bytes = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk.expect("response chunk");
+                    bytes.extend_from_slice(&chunk);
+                    body.flow_control()
+                        .release_capacity(chunk.len())
+                        .expect("capacity released");
+                }
+                assert_eq!(bytes, b"owned-http2");
+                control.drain();
+                drop(client);
+                connection.abort();
+                let summary = run
+                    .await
+                    .expect("owned run task joins")
+                    .expect("owned run completes");
+                assert!(summary.bytes_written > 0);
+                assert!(control.is_finished());
+            })
+            .expect("initializer admitted"),
+    )
+    .expect("initializer finishes");
+    wait(runtime.quiesce(TIMEOUT)).expect("cleanup joins");
+    assert_eq!(owner.join().expect("physical join").workers_forced, 0);
+}

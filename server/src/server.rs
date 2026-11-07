@@ -270,7 +270,7 @@ impl AdmissionProbe {
     fn publish(&self, event: AdmissionEvent) {
         if !self.confirm(
             self.records
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                     count
                         .checked_add(1)
                         .filter(|count| *count <= ADMISSION_EVENT_LIMIT)
@@ -296,7 +296,7 @@ impl AdmissionProbe {
     fn session_registered(&self) {
         let _ = self
             .registrations
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_add(1)
             });
         self.confirm(false);
@@ -424,7 +424,7 @@ impl SessionRetirementProbe {
     fn publish(&self, key: SessionRetirementKey, record: SessionRetirementRecord) {
         if !self.confirm(
             self.records
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |records| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |records| {
                     records
                         .checked_add(1)
                         .filter(|records| *records <= SESSION_RETIREMENT_EVENT_LIMIT)
@@ -740,7 +740,7 @@ impl HttpServer {
         }
         config
             .session
-            .check_owned_http1()
+            .check_owned()
             .map_err(HttpServerError::InvalidConfig)?;
         let num_io_threads = if config.num_io_threads == 0 {
             std::thread::available_parallelism()

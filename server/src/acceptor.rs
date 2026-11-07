@@ -24,10 +24,14 @@ use roxygen_core::http::TransportDirection;
 use roxygen_core::message::SocketAddress;
 use roxygen_runtime::cancellation::CancellationSource;
 use roxygen_runtime::worker::WorkerContext;
+use roxygen_session::http2::DEFAULT_STREAM_WINDOW;
 use roxygen_session::http2::Http2SessionConfig;
 use roxygen_session::http2::StreamReceiveWindowMode;
+use roxygen_session::http2::rate_limit::Http2RateLimitConfig;
+use roxygen_session::http2::rate_limit::RateLimitConfig;
 use roxygen_session::http2::stats::Http2SessionStats;
 use roxygen_session::owned_h1::OwnedH1Handle;
+use roxygen_session::owned_h2::OwnedH2Handle;
 use roxygen_session::session::LifecycleObserver;
 use roxygen_session::uniplex::UniplexConfig;
 use roxygen_session::uniplex::UniplexHandle;
@@ -48,9 +52,12 @@ use crate::server::ServerCallbackStage;
 use crate::server::discard_panicking_value;
 use crate::server::record_callback_failure;
 
+mod handler_application;
 mod owned_http1;
+mod owned_http2;
 
 use owned_http1::OwnedHttp1Session;
+use owned_http2::OwnedHttp2Session;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectionInfo {
@@ -126,6 +133,18 @@ pub struct ServerSessionConfig {
     /// else with the reason, as `HttpServerError::InvalidConfig` (or, for `serve_transport`,
     /// `INVALID_STATE_TRANSITION`).
     pub owned_http1: bool,
+    /// Experimental, default off: serves HTTP/2 connections on the owned driver
+    /// (`roxygen_session::owned_h2`) instead of `UniplexSession`, with no task per
+    /// request. HTTP/1.1 connections are unchanged. The owned mode is untimed,
+    /// unbounded-rate and stat-less: `stream_read_timeout`, `connection_idle_timeout`
+    /// and `write_timeout` must be zero (which also leaves HTTP/1.1 sessions and TLS
+    /// handshakes untimed), and `stats_factory` and `lifecycle_observer_factory`
+    /// must be `None`. Server construction refuses anything else with the reason, as
+    /// `HttpServerError::InvalidConfig` (or, for `serve_transport`,
+    /// `INVALID_STATE_TRANSITION`). The driver requires the configured stream
+    /// receive window to equal the advertised `INITIAL_WINDOW_SIZE`; the acceptor
+    /// aligns the two (see `owned_http2_session_config`).
+    pub owned_http2: bool,
     #[cfg(test)]
     pub(crate) accepted_socket_profile: Option<Arc<AcceptedSocketProfile>>,
 }
@@ -163,6 +182,7 @@ impl Default for ServerSessionConfig {
             lifecycle_observer_factory: None,
             stats_factory: None,
             owned_http1: false,
+            owned_http2: false,
             #[cfg(test)]
             accepted_socket_profile: None,
         }
@@ -191,6 +211,35 @@ impl ServerSessionConfig {
             return Err("owned_http1 is untimed: write_timeout must be zero");
         }
         Ok(())
+    }
+
+    /// Refuses what the owned HTTP/2 mode cannot honor, instead of ignoring it.
+    pub(crate) fn check_owned_http2(&self) -> Result<(), &'static str> {
+        if !self.owned_http2 {
+            return Ok(());
+        }
+        if self.stats_factory.is_some() {
+            return Err("owned_http2 does not support stats_factory");
+        }
+        if self.lifecycle_observer_factory.is_some() {
+            return Err("owned_http2 does not support lifecycle_observer_factory");
+        }
+        if !self.stream_read_timeout.is_zero() {
+            return Err("owned_http2 is untimed: stream_read_timeout must be zero");
+        }
+        if !self.connection_idle_timeout.is_zero() {
+            return Err("owned_http2 is untimed: connection_idle_timeout must be zero");
+        }
+        if !self.write_timeout.is_zero() {
+            return Err("owned_http2 is untimed: write_timeout must be zero");
+        }
+        Ok(())
+    }
+
+    /// Refuses what either owned mode cannot honor.
+    pub(crate) fn check_owned(&self) -> Result<(), &'static str> {
+        self.check_owned_http1()?;
+        self.check_owned_http2()
     }
 }
 
@@ -277,6 +326,10 @@ enum SessionHandle {
         handle: OwnedH1Handle,
         finished: Rc<Cell<bool>>,
     },
+    OwnedHttp2 {
+        handle: OwnedH2Handle,
+        finished: Rc<Cell<bool>>,
+    },
 }
 
 #[derive(Clone)]
@@ -291,6 +344,7 @@ impl SessionControl {
         match &self.handle {
             SessionHandle::Uniplex(handle) => handle.is_finished(),
             SessionHandle::OwnedHttp1 { finished, .. } => finished.get(),
+            SessionHandle::OwnedHttp2 { finished, .. } => finished.get(),
         }
     }
 
@@ -302,6 +356,7 @@ impl SessionControl {
         match &self.handle {
             SessionHandle::Uniplex(handle) => handle.initiate_drain(),
             SessionHandle::OwnedHttp1 { handle, .. } => handle.initiate_drain(),
+            SessionHandle::OwnedHttp2 { handle, .. } => handle.initiate_drain(),
         }
     }
 
@@ -314,6 +369,7 @@ impl SessionControl {
 pub(crate) enum ServerSession {
     Uniplex(UniplexSession),
     OwnedHttp1(OwnedHttp1Session),
+    OwnedHttp2(OwnedHttp2Session),
 }
 
 #[cfg(test)]
@@ -321,6 +377,7 @@ pub(crate) enum ServerSession {
 pub(crate) enum ServerSessionKind {
     Uniplex,
     OwnedHttp1,
+    OwnedHttp2,
 }
 
 impl ServerSession {
@@ -330,6 +387,7 @@ impl ServerSession {
         match self {
             Self::Uniplex(session) => session.run(),
             Self::OwnedHttp1(session) => Box::pin(session.run()),
+            Self::OwnedHttp2(session) => Box::pin(session.run()),
         }
     }
 
@@ -338,6 +396,7 @@ impl ServerSession {
         match self {
             Self::Uniplex(_) => ServerSessionKind::Uniplex,
             Self::OwnedHttp1(_) => ServerSessionKind::OwnedHttp1,
+            Self::OwnedHttp2(_) => ServerSessionKind::OwnedHttp2,
         }
     }
 }
@@ -506,7 +565,7 @@ pub(crate) fn attach_session(
         worker_index,
         callback_failure,
     } = attachment;
-    config.session.check_owned_http1().map_err(|message| {
+    config.session.check_owned().map_err(|message| {
         HttpError::with_message(HttpErrorCode::INVALID_STATE_TRANSITION, message.as_bytes())
     })?;
     if !context.handle().is_accepting() || context.is_cancelled() {
@@ -579,6 +638,32 @@ pub(crate) fn attach_session(
             ServerSession::OwnedHttp1(session),
             SessionControl {
                 handle: SessionHandle::OwnedHttp1 { handle, finished },
+                transport,
+                context: context.clone(),
+            },
+            #[cfg(test)]
+            retirement,
+        );
+    }
+    if config.session.owned_http2 && connection.protocol == CodecProtocol::Http2 {
+        let io = UniplexConfig {
+            drain_request_body_on_drop: true,
+            ..uniplex
+        };
+        let (session, handle, finished) = OwnedHttp2Session::new(
+            context,
+            Rc::clone(&transport),
+            handler,
+            &connection.context,
+            io,
+            owned_http2_session_config(&config.session),
+        )?;
+        return admit_session(
+            context,
+            draining,
+            ServerSession::OwnedHttp2(session),
+            SessionControl {
+                handle: SessionHandle::OwnedHttp2 { handle, finished },
                 transport,
                 context: context.clone(),
             },
@@ -709,6 +794,39 @@ pub(crate) fn http2_session_config(config: &ServerSessionConfig) -> Http2Session
         stream_receive_window_mode: StreamReceiveWindowMode::PreserveConfigured,
         max_concurrent_outgoing_streams: config.max_concurrent_outgoing_streams,
         ..Http2SessionConfig::default()
+    }
+}
+
+/// The owned driver's HTTP/2 configuration: the managed session's, with the parts
+/// the driver cannot honor turned off instead of silently kept. It is untimed and
+/// unbounded-rate and records no statistics, so the GOAWAY timeout is zero, every
+/// rate maximum is `u64::MAX` and stats and ping probes are `None`. The driver
+/// also requires its stream receive window to equal the advertised
+/// `INITIAL_WINDOW_SIZE`, so the window follows the advertised setting (the
+/// protocol default when `settings` carries none); where the setting is present,
+/// as the parity server sets it, this is the managed value unchanged.
+fn owned_http2_session_config(config: &ServerSessionConfig) -> Http2SessionConfig {
+    let mut http2 = http2_session_config(config);
+    let advertised = http2
+        .settings
+        .iter()
+        .rev()
+        .find(|setting| setting.identifier == 4)
+        .and_then(|setting| u32::try_from(setting.value).ok())
+        .unwrap_or(DEFAULT_STREAM_WINDOW);
+    http2.stream_receive_window = advertised;
+    let unbounded = RateLimitConfig::new(u64::MAX, Duration::from_millis(100), 0);
+    Http2SessionConfig {
+        rate_limits: Http2RateLimitConfig {
+            control_frames: unbounded,
+            header_frames: unbounded,
+            resets: unbounded,
+            direct_errors: unbounded,
+        },
+        stats: None,
+        goaway_timeout: Duration::ZERO,
+        ping_probes: None,
+        ..http2
     }
 }
 
