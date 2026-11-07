@@ -102,6 +102,7 @@ use crate::server::SessionRetirementRecord;
 use crate::server::SessionRunGate;
 use crate::server::SessionRunOutcome;
 use crate::server::TlsCredentialProvider;
+use crate::server::accept_retry_delay;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -3593,4 +3594,131 @@ fn owned_http1_response_source_panic_keeps_the_worker_serving() {
     assert!(server.drain());
     assert!(server.wait_for_stop().expect("the worker stops cleanly"));
     assert_eq!(server.state(), HttpServerState::Stopped);
+}
+
+#[test]
+fn accept_retry_delay_pauses_only_for_errors_that_outlast_one_connection() {
+    for errno in [
+        libc::ECONNABORTED,
+        libc::EINTR,
+        libc::EPERM,
+        libc::EPROTO,
+        libc::ENETUNREACH,
+        libc::EHOSTUNREACH,
+    ] {
+        assert_eq!(
+            accept_retry_delay(&std::io::Error::from_raw_os_error(errno)),
+            None,
+            "errno {errno} belongs to one pending connection, so accept retries at once"
+        );
+    }
+    for errno in [
+        libc::EMFILE,
+        libc::ENFILE,
+        libc::ENOBUFS,
+        libc::ENOMEM,
+        libc::EINVAL,
+    ] {
+        assert_eq!(
+            accept_retry_delay(&std::io::Error::from_raw_os_error(errno)),
+            Some(Duration::from_secs(1)),
+            "errno {errno} outlasts one connection, so accept pauses"
+        );
+    }
+    assert_eq!(
+        accept_retry_delay(&std::io::Error::other("no errno")),
+        Some(Duration::from_secs(1)),
+        "an error without an errno pauses"
+    );
+}
+
+#[cfg(target_os = "linux")]
+const DESCRIPTOR_EXHAUSTION_CHILD: &str = "ROXYGEN_DESCRIPTOR_EXHAUSTION_CHILD";
+
+#[cfg(target_os = "linux")]
+#[test]
+fn listener_keeps_accepting_after_descriptor_exhaustion() {
+    if std::env::var_os(DESCRIPTOR_EXHAUSTION_CHILD).is_some() {
+        exhaust_descriptors_with_a_queued_connection();
+        return;
+    }
+    // RLIMIT_NOFILE is process-wide, so only this test runs under the lowered limit.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "lifecycle_tests::listener_keeps_accepting_after_descriptor_exhaustion",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(DESCRIPTOR_EXHAUSTION_CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "the child runs exactly this test and passes\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn exhaust_descriptors_with_a_queued_connection() {
+    let server = start_plain(ServerConfig::default(), Arc::new(HandlerStats::default()));
+    let address = server.address().unwrap();
+    // Connecting an existing socket allocates no descriptor.
+    let client = socket2::Socket::new(
+        socket2::Domain::for_address(address),
+        socket2::Type::STREAM,
+        None,
+    )
+    .unwrap();
+
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is initialized storage of the type getrlimit writes.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) },
+        0
+    );
+    let lowered = libc::rlimit {
+        rlim_cur: limit.rlim_cur.min(512),
+        ..limit
+    };
+    // SAFETY: `lowered` is an initialized rlimit.
+    assert_eq!(
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lowered) },
+        0
+    );
+    let mut held = Vec::new();
+    let exhausted = loop {
+        match std::fs::File::open("/dev/null") {
+            Ok(file) => held.push(file),
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(exhausted.raw_os_error(), Some(libc::EMFILE));
+
+    client.connect(&address.into()).unwrap();
+    // The idle acceptor wakes for the queued connection and fails with EMFILE.
+    thread::sleep(Duration::from_millis(200));
+    drop(held);
+    // SAFETY: `limit` is the initialized rlimit read above.
+    assert_eq!(
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) },
+        0
+    );
+
+    let mut queued = TcpStream::from(client);
+    queued
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    queued
+        .write_all(b"GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut response = Vec::new();
+    queued.read_to_end(&mut response).unwrap();
+    assert_ok_response(&response);
+    assert_ok_response(&get_request(address));
 }

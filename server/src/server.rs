@@ -20,6 +20,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::SyncSender;
+use std::time::Duration;
 
 use roxygen_core::error::HttpError;
 use roxygen_core::filter_factory::FilterFactory;
@@ -58,6 +59,8 @@ pub use crate::connection::serve_transport;
 
 const DEFAULT_COMMAND_CAPACITY: usize = 1_024;
 const DEFAULT_BACKLOG: i32 = 1_024;
+/// Matches folly `AsyncServerSocket`'s accept backoff.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
 pub(crate) const ADMISSION_EVENT_LIMIT: usize = 8;
@@ -1168,7 +1171,10 @@ async fn worker_loop(
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         tokio::task::yield_now().await;
                     }
-                    Err(_) => break,
+                    Err(error) => match accept_retry_delay(&error) {
+                        Some(delay) => tokio::time::sleep(delay).await,
+                        None => tokio::task::yield_now().await,
+                    },
                 }
             }
         });
@@ -1485,6 +1491,35 @@ async fn worker_loop(
     sessions.abort_all();
     while sessions.join_next().await.is_some() {}
     context.handle().begin_shutdown();
+}
+
+/// Returns how long the acceptor waits before accepting again after `error`,
+/// or `None` to retry at once.
+///
+/// accept(2) reports some errors of a single pending connection (the peer
+/// aborted, a firewall refused it, a network error was already pending), and
+/// the listener stays healthy. Any other error, such as descriptor exhaustion
+/// (`EMFILE`, `ENFILE`) or memory pressure, persists until something else
+/// changes, so the acceptor pauses instead of spinning on it.
+pub(crate) fn accept_retry_delay(error: &io::Error) -> Option<Duration> {
+    let per_connection = match error.raw_os_error() {
+        Some(
+            libc::ECONNABORTED
+            | libc::EINTR
+            | libc::EPERM
+            | libc::EPROTO
+            | libc::ENOPROTOOPT
+            | libc::ENETDOWN
+            | libc::ENETUNREACH
+            | libc::EHOSTDOWN
+            | libc::EHOSTUNREACH
+            | libc::EOPNOTSUPP,
+        ) => true,
+        #[cfg(target_os = "linux")]
+        Some(libc::ENONET) => true,
+        _ => false,
+    };
+    (!per_connection).then_some(ACCEPT_ERROR_BACKOFF)
 }
 
 fn build_handler(
