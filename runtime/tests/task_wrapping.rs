@@ -2909,21 +2909,24 @@ mod task_wrapping {
         }
     }
 
-    /// The context installs and task-wrapper `catch_unwind` calls of one
-    /// pending poll of a `TaskGroup` task, of a command on
-    /// `WorkerDriver::new`, and of a command on `WorkerDriver::with_host`.
-    fn pending_poll_work() -> [(usize, usize); 3] {
+    /// The context installs, task-wrapper `catch_unwind` calls, and task
+    /// body dispatches of one pending poll of a `TaskGroup` task, of a
+    /// command on `WorkerDriver::new`, of a command on
+    /// `WorkerDriver::with_host`, and of an activated cleanup on
+    /// `WorkerDriver::with_host`.
+    fn pending_poll_work() -> [(usize, usize, usize); 4] {
         let counts = || {
             (
                 crate::context::context_installs(),
                 crate::observability::task_catch_unwinds(),
+                crate::task_group::task_body_dispatches(),
             )
         };
         let measure = |poll: &dyn Fn()| {
             let before = counts();
             poll();
             let after = counts();
-            (after.0 - before.0, after.1 - before.1)
+            (after.0 - before.0, after.1 - before.1, after.2 - before.2)
         };
 
         let host = ManualHost::default();
@@ -2956,10 +2959,27 @@ mod task_wrapping {
             rig.into_inner().finish();
             work
         };
+
+        let pending_cleanup = || {
+            let cast = Cast::new();
+            let mut rig = DriverRig::new(&cast, Driving::Hosted);
+            let cleanup = rig
+                .context()
+                .register_cleanup_task(Plan::never().probe("cleanup"))
+                .expect("cleanup registers on the owner while open")
+                .activate()
+                .expect("cleanup activates while open");
+            rig.turn();
+            let work = measure(&|| rig.host.as_ref().expect("a hosted driver").run());
+            drop(cleanup);
+            rig.finish();
+            work
+        };
         [
             task,
             pending_command(Driving::Owner),
             pending_command(Driving::Hosted),
+            pending_cleanup(),
         ]
     }
 
@@ -2974,21 +2994,88 @@ mod task_wrapping {
 
     #[test]
     fn each_pending_poll_counts_its_context_installs() {
-        let installs = pending_poll_work().map(|(installs, _)| installs);
+        let installs = pending_poll_work().map(|(installs, ..)| installs);
         assert_eq!(
             installs,
-            [1, 1, HOSTED_POLL_WORK],
-            "a TaskGroup task, a WorkerDriver::new command, and a with_host command"
+            [1, 1, HOSTED_POLL_WORK, 1],
+            "a TaskGroup task, a WorkerDriver::new command, a with_host command, and a with_host cleanup"
         );
     }
 
     #[test]
     fn each_pending_poll_counts_its_catch_unwind_calls() {
-        let catches = pending_poll_work().map(|(_, catches)| catches);
+        let catches = pending_poll_work().map(|(_, catches, _)| catches);
         assert_eq!(
             catches,
-            [1, 1, HOSTED_POLL_WORK],
-            "a TaskGroup task, a WorkerDriver::new command, and a with_host command"
+            [1, 1, HOSTED_POLL_WORK, 1],
+            "a TaskGroup task, a WorkerDriver::new command, a with_host command, and a with_host cleanup"
+        );
+    }
+
+    /// Dropping the host's wrapper of a pending hosted cleanup finishes the
+    /// cleanup at that drop, as dropping a `TaskGroup` task's wrapper finishes
+    /// its task: the cleanup future is destroyed and its task reports finished.
+    #[test]
+    fn dropping_a_pending_hosted_cleanup_wrapper_finishes_the_cleanup() {
+        struct SetOnDrop(Rc<Cell<bool>>);
+
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let cast = Cast::new();
+        let mut rig = DriverRig::new(&cast, Driving::Hosted);
+        let dropped = Rc::new(Cell::new(false));
+        let guard = SetOnDrop(Rc::clone(&dropped));
+        let cleanup = rig
+            .context()
+            .register_cleanup_task(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            })
+            .expect("cleanup registers on the owner while open")
+            .activate()
+            .expect("cleanup activates while open");
+        rig.turn();
+        assert!(
+            !cleanup.is_finished(),
+            "the cleanup is pending after its poll"
+        );
+
+        let wrappers: Vec<_> = rig
+            .host
+            .as_ref()
+            .expect("a hosted driver")
+            .tasks
+            .borrow_mut()
+            .drain(..)
+            .collect();
+        assert_eq!(wrappers.len(), 1, "the host holds the cleanup's wrapper");
+        drop(wrappers);
+        assert!(
+            dropped.get(),
+            "dropping the wrapper destroys the cleanup future"
+        );
+        assert!(
+            cleanup.is_finished(),
+            "dropping the wrapper finishes the cleanup"
+        );
+        drop(cleanup);
+        rig.finish();
+    }
+
+    /// A hosted cleanup's wrapper polls a cleanup body without choosing among
+    /// the body kinds; a `TaskGroup` task's and a hosted command's wrapper
+    /// choose once per poll, and an owner-polled command has no wrapper.
+    #[test]
+    fn each_pending_poll_counts_its_task_body_dispatches() {
+        let dispatches = pending_poll_work().map(|(.., dispatches)| dispatches);
+        assert_eq!(
+            dispatches,
+            [1, 0, 1, 0],
+            "a TaskGroup task, a WorkerDriver::new command, a with_host command, and a with_host cleanup"
         );
     }
 

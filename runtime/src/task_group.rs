@@ -361,6 +361,41 @@ impl TaskState {
         drop(previous);
     }
 
+    /// One host poll of the task's wrapper, with `poll_body` polling the body
+    /// under its own `catch_unwind`.
+    #[inline(always)]
+    fn poll_hosted(
+        &self,
+        context: &mut Context<'_>,
+        poll_body: impl FnOnce(&mut TaskBody, &mut Context<'_>) -> Result<Poll<()>, Payload>,
+    ) -> Poll<()> {
+        if self.completed.get() {
+            return Poll::Ready(());
+        }
+        let waker = context.waker();
+        match self.host_waker.take() {
+            Some(current) if current.will_wake(waker) => self.host_waker.set(Some(current)),
+            previous => self.replace_host_waker(previous, waker),
+        }
+        self.polling.set(true);
+        let polled = {
+            // While `polling` is set, `finish` defers instead of borrowing the body.
+            let mut body = self.body.borrow_mut();
+            poll_body(
+                body.as_mut().expect("a live task retains its body"),
+                context,
+            )
+        };
+        self.polling.set(false);
+        match polled {
+            Ok(Poll::Pending) if !self.abort_requested.get() => Poll::Pending,
+            polled => {
+                self.finish_polled(polled);
+                Poll::Ready(())
+            }
+        }
+    }
+
     fn retain_panic(&self, payload: Box<dyn Any + Send>) {
         if self.panic.borrow().is_some() {
             crate::panic::discard_panic(payload);
@@ -385,10 +420,21 @@ impl Drop for TaskState {
 
 struct HostedTask(Rc<TaskState>);
 
+/// The wrapper that a task group spawns for an activated hosted cleanup. Its
+/// poll reaches the cleanup body without choosing among the body kinds.
+struct HostedCleanupTask(Rc<TaskState>);
+
 #[cfg(test)]
 thread_local! {
     static GROUP_STATE_ALLOCATIONS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
     static BOXED_TASK_FUTURES: Cell<usize> = const { Cell::new(0) };
+    static TASK_BODY_DISPATCHES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// How many host polls on this thread have chosen among the task body kinds.
+#[cfg(test)]
+pub(crate) fn task_body_dispatches() -> usize {
+    TASK_BODY_DISPATCHES.get()
 }
 
 /// How many `Completions` and group `CancellationSource`s this thread's task
@@ -457,35 +503,34 @@ impl Future for HostedTask {
 
     #[inline(never)]
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
-        if self.0.completed.get() {
-            return Poll::Ready(());
-        }
-        let waker = context.waker();
-        match self.0.host_waker.take() {
-            Some(current) if current.will_wake(waker) => self.0.host_waker.set(Some(current)),
-            previous => self.0.replace_host_waker(previous, waker),
-        }
-        self.0.polling.set(true);
-        let polled = {
-            // While `polling` is set, `finish` defers instead of borrowing the body.
-            let mut body = self.0.body.borrow_mut();
-            match body.as_mut().expect("a live task retains its body") {
+        self.0.poll_hosted(context, |body, context| {
+            #[cfg(test)]
+            TASK_BODY_DISPATCHES.set(TASK_BODY_DISPATCHES.get() + 1);
+            match body {
                 TaskBody::Task(task) => poll_observed(task, context),
-                TaskBody::Cleanup(cleanup) => poll_cleanup(cleanup, context),
                 #[cfg(feature = "observability")]
                 TaskBody::Command(command) => poll_observed(command, context),
                 #[cfg(not(feature = "observability"))]
                 TaskBody::Command(command) => poll_command(command, context),
+                TaskBody::Cleanup(_) => {
+                    unreachable!("a hosted cleanup is spawned as a `HostedCleanupTask`")
+                }
             }
-        };
-        self.0.polling.set(false);
-        match polled {
-            Ok(Poll::Pending) if !self.0.abort_requested.get() => Poll::Pending,
-            polled => {
-                self.0.finish_polled(polled);
-                Poll::Ready(())
-            }
-        }
+        })
+    }
+}
+
+impl Future for HostedCleanupTask {
+    type Output = ();
+
+    #[inline(never)]
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+        self.0.poll_hosted(context, |body, context| {
+            let TaskBody::Cleanup(cleanup) = body else {
+                unreachable!("a `HostedCleanupTask` holds a cleanup body")
+            };
+            poll_observed(cleanup, context)
+        })
     }
 }
 
@@ -515,16 +560,6 @@ where
         Err(payload) if !finishing => Err(clean_up_panic(payload, || task.finish_unwind())),
         polled => polled,
     }
-}
-
-/// `poll_observed` for an activated hosted cleanup, out of line so that the
-/// cleanup's poll does not grow `HostedTask::poll`.
-#[inline(never)]
-fn poll_cleanup(
-    cleanup: &mut ObservedTask<HostedCleanup>,
-    context: &mut Context<'_>,
-) -> Result<Poll<()>, Payload> {
-    poll_observed(cleanup, context)
 }
 
 #[cfg(not(feature = "observability"))]
@@ -628,6 +663,12 @@ impl Drop for HostedTask {
     }
 }
 
+impl Drop for HostedCleanupTask {
+    fn drop(&mut self) {
+        self.0.finish(Err(TaskGroupError::TaskCancelled));
+    }
+}
+
 /// Owner-local structured task set for non-`Send` work.
 ///
 /// Closing admission precedes cancellation. Dropping a join future retains
@@ -721,11 +762,16 @@ impl TaskGroup {
         F: FnOnce(CancellationToken) -> Fut,
         Fut: Future<Output = ()> + 'static,
     {
-        self.spawn_body(factory, tracked, |task, future| {
-            #[cfg(test)]
-            BOXED_TASK_FUTURES.set(BOXED_TASK_FUTURES.get() + 1);
-            TaskBody::Task(ObservedTask::new(task, Box::pin(future)))
-        })
+        self.spawn_body(
+            factory,
+            tracked,
+            |task, future| {
+                #[cfg(test)]
+                BOXED_TASK_FUTURES.set(BOXED_TASK_FUTURES.get() + 1);
+                TaskBody::Task(ObservedTask::new(task, Box::pin(future)))
+            },
+            HostedTask,
+        )
     }
 
     /// Admits a worker command, tracked, as `spawn_local_tracked` does with
@@ -735,6 +781,7 @@ impl TaskGroup {
             move |_| command,
             true,
             |task, command| TaskBody::Command(ObservedTask::new(task, command)),
+            HostedTask,
         )
     }
 
@@ -748,18 +795,23 @@ impl TaskGroup {
             move |_| cleanup,
             true,
             |task, cleanup| TaskBody::Cleanup(ObservedTask::new(task, cleanup)),
+            HostedCleanupTask,
         )
     }
 
+    /// Admits the body that `body` builds and spawns `wrapper` around its
+    /// state on the host.
     #[inline(always)]
-    fn spawn_body<F, T>(
+    fn spawn_body<F, T, W>(
         &mut self,
         factory: F,
         tracked: bool,
         body: impl FnOnce(OperationSpan, T) -> TaskBody,
+        wrapper: impl FnOnce(Rc<TaskState>) -> W,
     ) -> Result<TaskId, TaskGroupError>
     where
         F: FnOnce(CancellationToken) -> T,
+        W: Future<Output = ()> + 'static,
     {
         self.assert_owner_thread();
         let context = ContextEnvelope::capture();
@@ -806,7 +858,7 @@ impl TaskGroup {
         });
         let slot = self.tasks.insert(seq, Rc::clone(&state));
         debug_assert_eq!(slot, id.slot);
-        self.host.spawn_unboxed(HostedTask(state));
+        self.host.spawn_unboxed(wrapper(state));
         Ok(id)
     }
 
