@@ -1759,6 +1759,7 @@ impl Http1xCodec {
         self.expect_http_09_response = rollback.expect_http_09_response;
     }
 
+    #[inline(never)]
     fn generate_headers(
         &mut self,
         message: &HttpMessage,
