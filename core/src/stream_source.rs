@@ -557,6 +557,7 @@ impl HttpResponseSource {
                 admitted: false,
                 completed: true,
                 body_started: false,
+                suspend_free: false,
             },
         )
     }
@@ -630,6 +631,8 @@ pub struct HttpResponseReader {
     admitted: bool,
     completed: bool,
     body_started: bool,
+    /// Empty body reads wait instead of suspending (`DIV-045`).
+    suspend_free: bool,
 }
 
 impl HttpResponseReader {
@@ -640,6 +643,18 @@ impl HttpResponseReader {
     /// Whether an armed or pending operation retains the original source state.
     pub fn is_active(&self) -> bool {
         self.active.is_some()
+    }
+
+    /// Makes an empty body read wait in place for the next event instead of
+    /// returning `HttpBodyEvent::suspend`, the ported `SUSPEND` (`DIV-045`).
+    /// The default, `false`, keeps the ported protocol. The setting belongs to
+    /// this reader: header reads and a source converted by
+    /// `try_into_source_holder` are unchanged. A change does not interrupt a
+    /// read that is already waiting: that read still completes with its next
+    /// event, error or read timeout, and the setting applies when a body read
+    /// next finds no event queued.
+    pub fn set_suspend_free(&mut self, suspend_free: bool) {
+        self.suspend_free = suspend_free;
     }
 
     /// Arms a header read without validation, wait registration, or callbacks.
@@ -749,7 +764,9 @@ impl HttpResponseReader {
         }
         ReadOperation {
             shared,
-            role: ExclusiveRead,
+            role: ExclusiveRead {
+                suspend_free: self.suspend_free,
+            },
             kind,
             maximum: self.maximum,
             wait: &mut self.wait,
@@ -768,7 +785,9 @@ impl HttpResponseReader {
         let mut first = if admitted {
             ReadOperation {
                 shared: &shared,
-                role: ExclusiveRead,
+                role: ExclusiveRead {
+                    suspend_free: self.suspend_free,
+                },
                 kind: self.kind,
                 maximum: self.maximum,
                 wait: &mut self.wait,
@@ -1808,6 +1827,9 @@ trait ReadRole {
     fn finish(&self, shared: &Rc<StreamShared>, eom: bool);
 
     fn wait_token(&self) -> CancellationToken;
+
+    /// Whether an empty body read may return `Suspend` instead of waiting.
+    fn suspends(&self) -> bool;
 }
 
 struct GeneralRead<'a> {
@@ -1823,9 +1845,15 @@ impl ReadRole for GeneralRead<'_> {
     fn wait_token(&self) -> CancellationToken {
         self.cancellation.clone()
     }
+
+    fn suspends(&self) -> bool {
+        true
+    }
 }
 
-struct ExclusiveRead;
+struct ExclusiveRead {
+    suspend_free: bool,
+}
 
 impl ReadRole for ExclusiveRead {
     fn finish(&self, shared: &Rc<StreamShared>, eom: bool) {
@@ -1834,6 +1862,10 @@ impl ReadRole for ExclusiveRead {
 
     fn wait_token(&self) -> CancellationToken {
         CancellationToken::never()
+    }
+
+    fn suspends(&self) -> bool {
+        !self.suspend_free
     }
 }
 
@@ -1864,7 +1896,7 @@ impl<R: ReadRole> ReadOperation<'_, R> {
             return Some(result);
         }
 
-        if matches!(self.kind, ReadKind::Body) {
+        if matches!(self.kind, ReadKind::Body) && self.role.suspends() {
             let suspend = {
                 let mut state = self.shared.state.borrow_mut();
                 if state.can_suspend {

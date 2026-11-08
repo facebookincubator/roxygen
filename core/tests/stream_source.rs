@@ -45,7 +45,9 @@ use crate::source_holder::HttpSourceHolder;
 use crate::stream_source::DeferredReadTimeout;
 use crate::stream_source::FlowControlState;
 use crate::stream_source::HttpIngressBody;
+use crate::stream_source::HttpResponseReader;
 use crate::stream_source::HttpResponseSource;
+use crate::stream_source::HttpResponseSourceOwner;
 use crate::stream_source::HttpStreamSource;
 use crate::stream_source::HttpStreamSourceCallback;
 use crate::stream_source::HttpStreamSourceOwner;
@@ -2619,6 +2621,201 @@ mod stream_source {
             drop((source, other));
             assert!(!producer.is_live());
             assert!(!other_producer.is_live());
+        });
+    }
+
+    struct Wakes(AtomicUsize);
+
+    impl Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A response source split after its 200 head was read through the reader.
+    fn reading_response() -> (
+        HttpResponseSourceOwner,
+        HttpResponseReader,
+        HttpStreamSourceProducer,
+    ) {
+        let source =
+            HttpResponseSource::new(StreamId::new(1), None, 65_535, Host::tokio()).unwrap();
+        let producer = source.producer();
+        let (owner, mut reader) = source.split();
+        reader.arm_header(&owner).unwrap();
+        assert!(producer.headers(response(200, None), false));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            reader.poll_header(&mut context),
+            Poll::Ready(Ok(header)) if !header.eom()
+        ));
+        (owner, reader, producer)
+    }
+
+    /// Reads `bodies` paced bodies through one exclusive reader, producing each
+    /// only after a poll returned `Pending`, and returns every event's type.
+    /// `None` leaves the reader's suspend setting at its default.
+    fn paced_exclusive_reads(suspend_free: Option<bool>, bodies: usize) -> Vec<HttpBodyEventType> {
+        let (owner, mut reader, producer) = reading_response();
+        if let Some(suspend_free) = suspend_free {
+            reader.set_suspend_free(suspend_free);
+        }
+        let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut context = Context::from_waker(&waker);
+        let mut events = Vec::new();
+        let mut produced = 0;
+        loop {
+            if !reader.is_active() {
+                reader.arm_body(&owner, u32::MAX).unwrap();
+            }
+            match reader.poll_body(&mut context) {
+                Poll::Ready(Ok(event)) => {
+                    events.push(event.event_type());
+                    if event.eom() {
+                        return events;
+                    }
+                }
+                Poll::Ready(Err(error)) => panic!("paced read failed: {error:?}"),
+                Poll::Pending => {
+                    assert!(
+                        produced < bodies,
+                        "a pending read outlived the paced bodies"
+                    );
+                    produced += 1;
+                    let woken = wakes.0.load(Ordering::SeqCst);
+                    assert_eq!(
+                        producer.body(body(b"token"), 0, produced == bodies),
+                        FlowControlState::Open
+                    );
+                    assert_eq!(
+                        wakes.0.load(Ordering::SeqCst),
+                        woken + 1,
+                        "each body must wake the pending read once"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn suspend_free_exclusive_reads_wait_through_paced_bodies() {
+        run_paused(async {
+            // Each empty read stays pending in place until its body arrives.
+            assert_eq!(
+                paced_exclusive_reads(Some(true), 4),
+                [HttpBodyEventType::Body; 4]
+            );
+        });
+    }
+
+    #[test]
+    fn default_exclusive_reads_suspend_before_each_paced_body() {
+        run_paused(async {
+            // The first empty read, and each empty read after a wait, suspends,
+            // by default and after an explicit opt-out.
+            let suspending = [
+                HttpBodyEventType::Suspend,
+                HttpBodyEventType::Body,
+                HttpBodyEventType::Suspend,
+                HttpBodyEventType::Body,
+                HttpBodyEventType::Suspend,
+                HttpBodyEventType::Body,
+            ];
+            assert_eq!(paced_exclusive_reads(None, 3), suspending);
+            assert_eq!(paced_exclusive_reads(Some(false), 3), suspending);
+        });
+    }
+
+    #[test]
+    fn suspend_free_pending_read_fails_with_the_producer_abort() {
+        run_paused(async {
+            let (owner, mut reader, producer) = reading_response();
+            reader.set_suspend_free(true);
+            let mut context = Context::from_waker(Waker::noop());
+            reader.arm_body(&owner, u32::MAX).unwrap();
+            assert!(reader.poll_body(&mut context).is_pending());
+
+            assert!(producer.abort(HttpErrorCode::TRANSPORT_READ_ERROR, b""));
+            let Poll::Ready(Err(error)) = reader.poll_body(&mut context) else {
+                panic!("the abort must fail the pending read");
+            };
+            assert_eq!(error.code(), HttpErrorCode::TRANSPORT_READ_ERROR);
+        });
+    }
+
+    #[test]
+    fn suspend_free_pending_read_times_out_with_the_source_timeout() {
+        run_paused(async {
+            let (owner, mut reader, producer) = reading_response();
+            reader.set_suspend_free(true);
+            assert!(producer.set_read_timeout(Duration::from_secs(2)));
+            reader.arm_body(&owner, u32::MAX).unwrap();
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(reader.poll_body(&mut context).is_pending());
+
+            time::advance(Duration::from_secs(2)).await;
+            let error = match std::future::poll_fn(|context| reader.poll_body(context)).await {
+                Err(error) => error,
+                Ok(event) => panic!("expected a read timeout, got {:?}", event.event_type()),
+            };
+            assert_eq!(error.code(), HttpErrorCode::READ_TIMEOUT);
+            assert_eq!(error.message(), b"Read timeout after 2000");
+        });
+    }
+
+    #[test]
+    fn turning_suspend_free_off_does_not_interrupt_a_pending_read() {
+        run_paused(async {
+            let (owner, mut reader, producer) = reading_response();
+            reader.set_suspend_free(true);
+            let mut context = Context::from_waker(Waker::noop());
+            reader.arm_body(&owner, u32::MAX).unwrap();
+            assert!(reader.poll_body(&mut context).is_pending());
+
+            reader.set_suspend_free(false);
+            assert!(
+                reader.poll_body(&mut context).is_pending(),
+                "the read already waiting keeps waiting instead of suspending"
+            );
+            assert_eq!(
+                producer.body(body(b"token"), 0, false),
+                FlowControlState::Open
+            );
+            let Poll::Ready(Ok(event)) = reader.poll_body(&mut context) else {
+                panic!("the body must complete the pending read");
+            };
+            assert_eq!(event.event_type(), HttpBodyEventType::Body);
+
+            // The next empty body read follows the new setting.
+            assert!(!reader.is_active(), "a default reader retires its read");
+            reader.arm_body(&owner, u32::MAX).unwrap();
+            let Poll::Ready(Ok(event)) = reader.poll_body(&mut context) else {
+                panic!("an empty read of a default reader must suspend");
+            };
+            assert_eq!(event.event_type(), HttpBodyEventType::Suspend);
+        });
+    }
+
+    #[test]
+    fn suspend_free_reader_leaves_the_converted_source_suspending() {
+        run_paused(async {
+            let (owner, mut reader, producer) = reading_response();
+            reader.set_suspend_free(true);
+            let Ok(mut source) = owner.try_into_source_holder(reader) else {
+                panic!("an idle reader after final headers must convert");
+            };
+            // The opt-in belongs to the exclusive reader, not to the source.
+            let event = ready(source.read_body_event(16)).unwrap();
+            assert_eq!(event.event_type(), HttpBodyEventType::Suspend);
+            drop(event);
+
+            assert_eq!(
+                producer.body(body(b"body"), 0, true),
+                FlowControlState::Open
+            );
+            let event = ready(source.read_body_event(16)).unwrap();
+            assert!(event.eom());
         });
     }
 }
