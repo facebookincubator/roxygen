@@ -62,6 +62,8 @@ use crate::acceptor::ConnectionInfo;
 use crate::connection::CompletionPauseForTest;
 use crate::connection::ServeTransportOptions;
 use crate::connection::ServerConnection;
+use crate::connection::cancellation_listener_updates_for_test;
+use crate::connection::run_session_for_test;
 use crate::connection::serve_transport;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -1990,4 +1992,275 @@ fn owned_http2_serves_a_fixed_get_and_drains() {
     .expect("initializer finishes");
     wait(runtime.quiesce(TIMEOUT)).expect("cleanup joins");
     assert_eq!(owner.join().expect("physical join").workers_forced, 0);
+}
+
+/// Counts the wakes delivered to it.
+#[derive(Default)]
+struct WakeCount(AtomicUsize);
+
+impl WakeCount {
+    fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl std::task::Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// The session configuration of a served connection, owned or not.
+fn served_session(owned_http1: bool) -> crate::acceptor::ServerSessionConfig {
+    if owned_http1 {
+        crate::acceptor::ServerSessionConfig {
+            stream_read_timeout: Duration::ZERO,
+            connection_idle_timeout: Duration::ZERO,
+            write_timeout: Duration::ZERO,
+            owned_http1: true,
+            ..crate::acceptor::ServerSessionConfig::default()
+        }
+    } else {
+        crate::acceptor::ServerSessionConfig::default()
+    }
+}
+
+/// Runs `test` on the owner thread of a fresh one-worker runtime, then joins it.
+fn on_worker<Test, Work>(test: Test)
+where
+    Test: FnOnce(roxygen_runtime::worker::WorkerContext, RuntimeHandle) -> Work + Send + 'static,
+    Work: Future<Output = ()> + 'static,
+{
+    let mut owner = RuntimeOwner::start(RuntimeConfig {
+        workers: 1,
+        command_capacity: 4,
+    })
+    .expect("owner starts");
+    let runtime = owner.handle();
+    let worker = runtime.worker(0).expect("worker exists");
+    let quiescing = runtime.clone();
+    wait(
+        worker
+            .call_local(move |context| test(context, quiescing))
+            .expect("initializer admitted"),
+    )
+    .expect("initializer finishes");
+    wait(runtime.quiesce(TIMEOUT)).expect("cleanup joins");
+    assert_eq!(owner.join().expect("physical join").workers_forced, 0);
+}
+
+/// A served connection updates its two cancellation listeners when its run
+/// first registers them, not on each wake: three keep-alive exchanges, each
+/// waking the run several times, leave one update per listener.
+#[test]
+fn a_served_connection_updates_its_cancellation_listeners_once() {
+    for owned_http1 in [false, true] {
+        on_worker(move |context, _runtime| async move {
+            use tokio::io::AsyncReadExt;
+            use tokio::io::AsyncWriteExt;
+            let (io, mut peer) = tokio::io::duplex(4096);
+            let transport = adopt_local(
+                &context,
+                EstablishedIo::new(
+                    io,
+                    TransportEndpoint::Unknown,
+                    TransportEndpoint::Unknown,
+                    None,
+                ),
+                limits(),
+            )
+            .expect("I/O adopted");
+            let mut options =
+                ServeTransportOptions::new(CodecProtocol::Http11, TransportSecurity::Plaintext);
+            options.session = served_session(owned_http1);
+            let before = cancellation_listener_updates_for_test();
+            let connection = serve_transport(
+                &context,
+                transport,
+                Rc::new(CompletionResponseHandler),
+                options,
+            )
+            .expect("connection attaches");
+            for _ in 0..3 {
+                peer.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .await
+                    .expect("request written");
+                let mut response = Vec::new();
+                while !response.ends_with(b"response") {
+                    let mut chunk = [0; 1024];
+                    let read = peer.read(&mut chunk).await.expect("response read");
+                    assert_ne!(read, 0, "the connection stays open between exchanges");
+                    response.extend_from_slice(&chunk[..read]);
+                }
+                assert!(response.starts_with(b"HTTP/1.1 200"));
+            }
+            drop(peer);
+            connection
+                .wait_closed()
+                .await
+                .expect("the peer's close ends the session");
+            assert_eq!(
+                cancellation_listener_updates_for_test() - before,
+                2,
+                "owned_http1={owned_http1}: each cancellation listener is updated once",
+            );
+        });
+    }
+}
+
+/// External cancellation wins over local cancellation when both are
+/// requested before the run's first poll.
+#[test]
+fn a_server_run_reports_external_cancellation_over_local() {
+    on_worker(|context, _runtime| async move {
+        let (io, _peer) = tokio::io::duplex(4096);
+        let accepted = attach_for_test(
+            &context,
+            CodecProtocol::Http11,
+            crate::acceptor::ServerSessionConfig::default(),
+            io,
+            Rc::new(CompletionResponseHandler),
+        );
+        let external = CancellationSource::new();
+        let local = CancellationSource::new();
+        let run = run_session_for_test(
+            &context,
+            accepted.control,
+            external.token(),
+            local.token(),
+            accepted.session,
+        );
+        local.request_cancellation();
+        external.request_cancellation();
+        let error = run.await.expect_err("cancellation fails the run");
+        assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+        assert_eq!(error.message(), b"server connection cancelled");
+    });
+}
+
+/// A cancellation after worker quiescence started a drain still aborts the
+/// run, and its failure replaces the drain's outcome.
+#[test]
+fn a_server_run_cancelled_while_draining_reports_the_cancellation() {
+    for external_source in [true, false] {
+        on_worker(move |context, runtime| async move {
+            use tokio::io::AsyncWriteExt;
+            let (io, mut peer) = tokio::io::duplex(4096);
+            let invoked = Rc::new(std::cell::Cell::new(false));
+            let accepted = attach_for_test(
+                &context,
+                CodecProtocol::Http11,
+                crate::acceptor::ServerSessionConfig::default(),
+                io,
+                Rc::new(PendingHandler(Rc::clone(&invoked))),
+            );
+            let external = CancellationSource::new();
+            let local = CancellationSource::new();
+            let mut run = run_session_for_test(
+                &context,
+                accepted.control,
+                external.token(),
+                local.token(),
+                accepted.session,
+            );
+            peer.write_all(b"GET /pending HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .expect("request written");
+            std::future::poll_fn(|poll_context| {
+                assert!(run.as_mut().poll(poll_context).is_pending());
+                if invoked.get() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            drop(runtime.quiesce(TIMEOUT));
+            assert!(!context.handle().is_accepting());
+            assert!(
+                run.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending(),
+                "the drain waits for the pending exchange"
+            );
+            if external_source {
+                external.request_cancellation();
+            } else {
+                local.request_cancellation();
+            }
+            let error = run.await.expect_err("cancellation fails the draining run");
+            assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+            assert_eq!(
+                error.message(),
+                if external_source {
+                    &b"server connection cancelled"[..]
+                } else {
+                    b"server connection dropped or cancelled"
+                }
+            );
+        });
+    }
+}
+
+/// A cancellation wakes the waker of the run's latest poll, after polls that
+/// kept and then changed it, and not an earlier one.
+#[test]
+fn a_server_run_cancellation_wakes_its_latest_waker() {
+    for external_source in [true, false] {
+        on_worker(move |context, _runtime| async move {
+            let (io, _peer) = tokio::io::duplex(4096);
+            let accepted = attach_for_test(
+                &context,
+                CodecProtocol::Http11,
+                crate::acceptor::ServerSessionConfig::default(),
+                io,
+                Rc::new(CompletionResponseHandler),
+            );
+            let external = CancellationSource::new();
+            let local = CancellationSource::new();
+            let mut run = run_session_for_test(
+                &context,
+                accepted.control,
+                external.token(),
+                local.token(),
+                accepted.session,
+            );
+            let earlier = Arc::new(WakeCount::default());
+            let later = Arc::new(WakeCount::default());
+            let earlier_waker = Waker::from(Arc::clone(&earlier));
+            let later_waker = Waker::from(Arc::clone(&later));
+            for waker in [&earlier_waker, &earlier_waker, &later_waker, &later_waker] {
+                assert!(
+                    run.as_mut()
+                        .poll(&mut Context::from_waker(waker))
+                        .is_pending()
+                );
+            }
+            let (earlier_wakes, later_wakes) = (earlier.count(), later.count());
+            if external_source {
+                external.request_cancellation();
+            } else {
+                local.request_cancellation();
+            }
+            assert_eq!(
+                later.count(),
+                later_wakes + 1,
+                "the cancellation wakes the latest waker"
+            );
+            assert_eq!(
+                earlier.count(),
+                earlier_wakes,
+                "the cancellation does not wake an earlier waker"
+            );
+            let error = run.await.expect_err("cancellation fails the run");
+            assert_eq!(
+                error.message(),
+                if external_source {
+                    &b"server connection cancelled"[..]
+                } else {
+                    b"server connection dropped or cancelled"
+                }
+            );
+        });
+    }
 }

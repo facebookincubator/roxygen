@@ -7,6 +7,9 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 
 use roxygen_core::connection::ConnectionContext;
 use roxygen_core::connection::TransportSecurity;
@@ -21,9 +24,10 @@ use roxygen_core::http::CodecProtocol;
 use roxygen_core::source_holder::HttpSourceHolder;
 use roxygen_runtime::cancellation::CancellationSource;
 use roxygen_runtime::cancellation::CancellationToken;
-use roxygen_runtime::wait::CancellableBaton;
+use roxygen_runtime::cancellation::CancellationWakeRegistration;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_runtime::worker::WorkerHandle;
+use roxygen_runtime::worker::WorkerQuiescing;
 use roxygen_session::uniplex::UniplexRunSummary;
 use roxygen_transport::byte_stream::OwnedByteStream;
 use tokio::sync::watch;
@@ -221,15 +225,14 @@ pub fn serve_transport(
     )?;
     check_admission(worker, &options.cancellation)?;
     let (completed, completion) = watch::channel(None);
-    let running = ServerSessionRun {
-        context: worker.clone(),
-        control: accepted.control.clone(),
-        external: options.cancellation,
-        local: cancellation.token(),
-    };
+    let control = accepted.control.clone();
+    let external = options.cancellation;
+    let local = cancellation.token();
+    let quiescing = worker.quiescing();
     let registration = worker
         .register_scope(async move {
-            let result = running.run(accepted.session).await;
+            let result =
+                ServerSessionRun::new(control, external, local, quiescing, accepted.session).await;
             #[cfg(test)]
             if let Some(pause) = completion_pause {
                 let _ = pause.entered.send(());
@@ -329,47 +332,99 @@ impl HttpHandler for AdmissionHandler {
     }
 }
 
+/// Polls one served session while observing its cancellation and worker
+/// quiescence. External cancellation wins over local cancellation, and either
+/// wins over quiescence, which a cancellation still follows. The cancellation
+/// listeners are updated only when the task's waker changes, so a wake reads
+/// their flags and polls the quiescence observation and the session.
+///
+/// Fields drop in declaration order: the stop observers, then the session
+/// future, then its control.
 struct ServerSessionRun {
-    context: WorkerContext,
+    quiescing: WorkerQuiescing,
+    local_listener: CancellationWakeRegistration,
+    external_listener: CancellationWakeRegistration,
+    running: Pin<Box<dyn Future<Output = Result<UniplexRunSummary, HttpError>> + 'static>>,
     control: SessionControl,
     external: CancellationToken,
     local: CancellationToken,
+    /// The waker both cancellation listeners hold.
+    waker: Option<Waker>,
+    draining: bool,
+    aborting: bool,
+    failure: Option<HttpError>,
 }
 
 impl ServerSessionRun {
-    async fn run(self, session: ServerSession) -> Result<UniplexRunSummary, HttpError> {
-        let mut running = session.run();
-        let external_baton = CancellableBaton::new();
-        let local_baton = CancellableBaton::new();
-        let external = external_baton.wait(self.external.clone());
-        let local = local_baton.wait(self.local.clone());
-        let quiescing = self.context.quiescing();
-        tokio::pin!(external, local, quiescing);
-        let mut draining = false;
-        let mut aborting = false;
-        let mut failure = None;
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut external, if !aborting => {
-                    aborting = true;
-                    draining = true;
-                    failure = Some(connection_error(HttpErrorCode::CORO_CANCELLED, b"server connection cancelled"));
-                    let _ = self.stop(true);
-                }
-                _ = &mut local, if !aborting => {
-                    aborting = true;
-                    draining = true;
-                    failure = Some(connection_error(HttpErrorCode::CORO_CANCELLED, b"server connection dropped or cancelled"));
-                    let _ = self.stop(true);
-                }
-                () = &mut quiescing, if !draining => {
-                    draining = true;
-                    failure = self.stop(false);
-                }
-                result = &mut running => return failure.map_or(result, Err),
-            }
+    fn new(
+        control: SessionControl,
+        external: CancellationToken,
+        local: CancellationToken,
+        quiescing: WorkerQuiescing,
+        session: ServerSession,
+    ) -> Self {
+        Self {
+            quiescing,
+            local_listener: local.wake_registration(),
+            external_listener: external.wake_registration(),
+            running: session.run(),
+            control,
+            external,
+            local,
+            waker: None,
+            draining: false,
+            aborting: false,
+            failure: None,
         }
+    }
+
+    fn poll_stop(&mut self, context: &mut Context<'_>) {
+        if !self.aborting
+            && !self
+                .waker
+                .as_ref()
+                .is_some_and(|registered| registered.will_wake(context.waker()))
+        {
+            self.register(context.waker());
+        }
+        loop {
+            if !self.aborting && self.external.is_cancellation_requested() {
+                self.abort(b"server connection cancelled");
+            } else if !self.aborting && self.local.is_cancellation_requested() {
+                self.abort(b"server connection dropped or cancelled");
+            } else if !self.draining && Pin::new(&mut self.quiescing).poll(context).is_ready() {
+                self.draining = true;
+                self.failure = self.stop(false);
+                continue;
+            }
+            return;
+        }
+    }
+
+    /// Points both cancellation listeners at `waker`, and caches it only once
+    /// both hold it. A listener that observes its cancellation stops the
+    /// update; the flag checks then abort.
+    #[inline(never)]
+    fn register(&mut self, waker: &Waker) {
+        drop(self.waker.take());
+        #[cfg(test)]
+        record_cancellation_listener_update();
+        if self.external_listener.update_waker(waker) {
+            return;
+        }
+        #[cfg(test)]
+        record_cancellation_listener_update();
+        if self.local_listener.update_waker(waker) {
+            return;
+        }
+        self.waker = Some(waker.clone());
+    }
+
+    fn abort(&mut self, message: &[u8]) {
+        self.aborting = true;
+        self.draining = true;
+        self.failure = Some(connection_error(HttpErrorCode::CORO_CANCELLED, message));
+        let _ = self.stop(true);
     }
 
     fn stop(&self, reset: bool) -> Option<HttpError> {
@@ -390,6 +445,50 @@ impl ServerSessionRun {
         }
         failure
     }
+}
+
+impl Future for ServerSessionRun {
+    type Output = Result<UniplexRunSummary, HttpError>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.poll_stop(context);
+        let result = std::task::ready!(this.running.as_mut().poll(context));
+        Poll::Ready(this.failure.take().map_or(result, Err))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CANCELLATION_LISTENER_UPDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_cancellation_listener_update() {
+    CANCELLATION_LISTENER_UPDATES.with(|count| count.set(count.get() + 1));
+}
+
+/// How many times server session runs on this thread updated a cancellation
+/// listener.
+#[cfg(test)]
+pub(crate) fn cancellation_listener_updates_for_test() -> usize {
+    CANCELLATION_LISTENER_UPDATES.with(std::cell::Cell::get)
+}
+
+/// Runs `session` as `serve_transport`'s scope does, observing `external` and
+/// `local` cancellation and `context`'s quiescence.
+#[cfg(test)]
+pub(crate) fn run_session_for_test(
+    context: &WorkerContext,
+    control: SessionControl,
+    external: CancellationToken,
+    local: CancellationToken,
+    session: ServerSession,
+) -> Pin<Box<dyn Future<Output = Result<UniplexRunSummary, HttpError>>>> {
+    let quiescing = context.quiescing();
+    Box::pin(
+        async move { ServerSessionRun::new(control, external, local, quiescing, session).await },
+    )
 }
 
 fn connection_error(code: HttpErrorCode, message: &[u8]) -> HttpError {
