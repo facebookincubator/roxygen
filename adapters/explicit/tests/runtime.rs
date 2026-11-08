@@ -3474,8 +3474,8 @@ mod runtime {
                 Some(code)
             })
             .count();
-        // The common-header table names 59 of `http`'s headers.
-        assert_eq!(named, 59);
+        // The common-header table names 49 of `http`'s headers.
+        assert_eq!(named, 49);
     }
 
     #[test]
@@ -3600,8 +3600,8 @@ mod runtime {
                     .any(|constant| constant.as_str().as_bytes() == name)
             })
             .collect();
-        // The common-header table names 22 headers that `http` has no constant for.
-        assert_eq!(without_constant.len(), 22, "{without_constant:?}");
+        // The common-header table names 20 headers that `http` has no constant for.
+        assert_eq!(without_constant.len(), 20, "{without_constant:?}");
         without_constant.iter().for_each(|code| {
             let mut headers = HttpHeaders::new();
             headers.add(*code, "value");
@@ -3817,7 +3817,7 @@ mod runtime {
         let mut headers = HttpHeaders::new();
         regular_common_codes().for_each(|code| headers.add(code, "value"));
         let (converted, dropped) = convert_headers(&headers);
-        assert_eq!((converted.len(), dropped), (81, 0));
+        assert_eq!((converted.len(), dropped), (69, 0));
         assert_eq!(name_parses_converting(&headers), 0);
 
         // The pseudo-header codes are still parsed, and dropped.
@@ -3830,6 +3830,51 @@ mod runtime {
             .for_each(|code| pseudo.add(*code, "value"));
         assert_eq!(name_parses_converting(&pseudo), 6);
         assert_eq!(convert_headers(&pseudo).1, 6);
+    }
+
+    /// A head holding `name` with `value`, added by name as a request's headers are.
+    fn head_from_name(name: &HeaderName, value: &str) -> HttpHeaders {
+        let mut headers = HttpHeaders::new();
+        headers.add(name.as_str(), value);
+        headers
+    }
+
+    #[test]
+    fn x_robots_tag_round_trips_without_a_name_parse() {
+        on_new_thread(|| {
+            let name = HeaderName::from_static("x-robots-tag");
+            let headers = head_from_name(&name, "noindex");
+            assert_eq!(name_parses_converting(&headers), 0);
+            let (converted, dropped) = convert_headers(&headers);
+            assert_eq!(dropped, 0);
+            assert_eq!(converted.keys().collect::<Vec<_>>(), [&name]);
+            assert_eq!(
+                converted.get(&name).map(HeaderValue::as_bytes),
+                Some(&b"noindex"[..])
+            );
+        });
+    }
+
+    #[test]
+    fn x_forwarded_proto_round_trips_as_an_uncommon_name() {
+        on_new_thread(|| {
+            let name = HeaderName::from_static("x-forwarded-proto");
+            let headers = head_from_name(&name, "https");
+            assert_eq!(
+                headers
+                    .iter()
+                    .map(|(code, name, _)| (code, name.to_vec()))
+                    .collect::<Vec<_>>(),
+                [(HttpHeaderCode::Other, b"x-forwarded-proto".to_vec())]
+            );
+            let (converted, dropped) = convert_headers(&headers);
+            assert_eq!(dropped, 0);
+            assert_eq!(converted.keys().collect::<Vec<_>>(), [&name]);
+            assert_eq!(
+                converted.get(&name).map(HeaderValue::as_bytes),
+                Some(&b"https"[..])
+            );
+        });
     }
 
     /// Asserts that `RawHeaders` drops as many headers as `convert_headers`, and reads each of

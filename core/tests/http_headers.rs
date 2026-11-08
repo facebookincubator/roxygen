@@ -18,7 +18,7 @@ fn httpcommon_headers_tests_test_hashing() {
     assert_ne!(common_code1, HttpHeaderCode::Other);
     assert_eq!(common_code1, common_code2);
     assert_eq!(std::mem::size_of::<HttpHeaderCode>(), 1);
-    assert_eq!(HttpCommonHeaders::NUM_CODES, 89);
+    assert_eq!(HttpCommonHeaders::NUM_CODES, 77);
 
     for value in HttpHeaderCode::COMMON_OFFSET..HttpCommonHeaders::NUM_CODES as u8 {
         let code = HttpHeaderCode::from_u8(value).unwrap();
@@ -116,6 +116,161 @@ fn httpcommon_headers_tests_test_get_header_code_from_table_common_header_name()
         HttpCommonHeaders::code_from_table_name(None, table),
         HttpHeaderCode::None,
     );
+}
+
+#[test]
+fn removed_common_names_keep_their_spelling() {
+    let names: [&[u8]; 4] = [
+        b"expect",
+        b"link",
+        b"x-forwarded-proto",
+        b"WWW-Authenticate",
+    ];
+    let expected: Vec<_> = names
+        .iter()
+        .map(|name| (HttpHeaderCode::Other, name.to_vec()))
+        .collect();
+    let hashed: Vec<_> = names
+        .iter()
+        .map(|name| (HttpCommonHeaders::hash(name), name.to_vec()))
+        .collect();
+    assert_eq!(hashed, expected);
+    let mut headers = HttpHeaders::new();
+    names.iter().for_each(|name| headers.add(*name, b"v"));
+    let stored: Vec<_> = headers
+        .iter()
+        .map(|(code, name, _)| (code, name.to_vec()))
+        .collect();
+    assert_eq!(stored, expected);
+}
+
+#[test]
+fn added_common_names_use_the_table_spelling() {
+    // Each name's code is its line in `HTTPCommonHeaders.txt` plus one.
+    let added: [(&[u8], u8, &[u8]); 3] = [
+        (b"No-Vary-Search", 45, b"no-vary-search"),
+        (b"Reporting-Endpoints", 57, b"reporting-endpoints"),
+        (b"X-Robots-Tag", 75, b"x-robots-tag"),
+    ];
+    let hashed: Vec<_> = added
+        .iter()
+        .map(|(name, _, _)| HttpCommonHeaders::hash(name).as_u8())
+        .collect();
+    assert_eq!(hashed, [45, 57, 75]);
+    let mut headers = HttpHeaders::new();
+    added
+        .iter()
+        .for_each(|(name, _, _)| headers.add(*name, b"v"));
+    let printed: Vec<_> = headers
+        .iter()
+        .map(|(code, name, _)| (code.as_u8(), name.to_vec()))
+        .collect();
+    let expected: Vec<_> = added
+        .iter()
+        .map(|(_, code, spelling)| (*code, spelling.to_vec()))
+        .collect();
+    assert_eq!(printed, expected);
+}
+
+/// Proxygen's `HTTPCommonHeaders.txt` at `9d6c281ba22e`, verbatim.
+const COMMON_HEADER_LIST: &str = "\
+:Authority
+:Method
+:Path
+:Scheme
+:Status
+:Protocol
+Accept
+Accept-Encoding
+Accept-Language
+Accept-Ranges
+Access-Control-Allow-Credentials
+Access-Control-Allow-Methods
+Access-Control-Allow-Origin
+Access-Control-Expose-Headers
+Age
+Alt-Svc
+Authorization
+Cache-Control
+client_timeout
+Connection
+content-digest
+Content-Disposition
+Content-Encoding
+Content-Language
+Content-Length
+Content-Range
+content-security-policy
+Content-Type
+Cookie
+cross-origin-embedder-policy-report-only
+cross-origin-opener-policy
+cross-origin-resource-policy
+Date
+document-policy
+Edge-Control
+ETag
+Expires
+Host
+If-Modified-Since
+If-None-Match
+Keep-Alive
+Last-Modified
+Location
+no-vary-search
+permissions-policy
+Pragma
+Priority
+Proxy-Authenticate
+Proxy-Authorization
+Proxy-Connection
+Proxy-Status
+queue_timeout
+Range
+Referer
+report-to
+reporting-endpoints
+rpckind
+Sec-WebSocket-Accept
+Sec-WebSocket-Key
+Server
+Set-Cookie
+Strict-Transport-Security
+TE
+timing-allow-origin
+Trailer
+Transfer-Encoding
+Upgrade
+User-Agent
+Vary
+Via
+X-Content-Type-Options
+X-Forwarded-For
+X-Frame-Options
+x-robots-tag
+X-XSS-Protection
+";
+
+#[test]
+fn common_header_table_matches_proxygens_list() {
+    let table: Vec<(u8, &str)> = HttpHeaderCode::ALL[2..]
+        .iter()
+        .map(|code| {
+            let camel = HttpCommonHeaders::name(*code, HttpCommonHeaderTable::CamelCase);
+            (code.as_u8(), std::str::from_utf8(camel).unwrap())
+        })
+        .collect();
+    let expected: Vec<(u8, &str)> = (HttpHeaderCode::COMMON_OFFSET..)
+        .zip(COMMON_HEADER_LIST.lines())
+        .collect();
+    assert_eq!(table, expected);
+    for code in &HttpHeaderCode::ALL[2..] {
+        assert_eq!(
+            HttpCommonHeaders::name(*code, HttpCommonHeaderTable::Lowercase),
+            HttpCommonHeaders::name(*code, HttpCommonHeaderTable::CamelCase).to_ascii_lowercase(),
+            "{code:?}"
+        );
+    }
 }
 
 #[test]

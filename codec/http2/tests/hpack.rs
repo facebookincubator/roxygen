@@ -1718,7 +1718,10 @@ mod hpack_context {
                 );
             }
         }
-        assert_eq!(uncommon, [22, 29, 37, 39, 42, 43, 47, 52]);
+        assert_eq!(
+            uncommon,
+            [15, 22, 29, 35, 37, 39, 42, 43, 45, 47, 52, 53, 61]
+        );
         for name in [
             HeaderName::from_code(HttpHeaderCode::ColonProtocol),
             HeaderName::new("x-no-static-match"),
@@ -1823,6 +1826,8 @@ mod hpack_context {
 
     #[test]
     fn static_table_header_names_are_common() {
+        // Static-table names outside the common-header table. They are still found, by name
+        // rather than by code.
         let uncommon = [
             b"allow".as_slice(),
             b"content-location",
@@ -1832,6 +1837,11 @@ mod hpack_context {
             b"max-forwards",
             b"if-range",
             b"refresh",
+            b"accept-charset",
+            b"expect",
+            b"link",
+            b"retry-after",
+            b"www-authenticate",
         ];
         assert!(StaticHeaderTable::get().iter().all(|header| {
             header.name.is_common_header() || uncommon.contains(&header.name.as_bytes())

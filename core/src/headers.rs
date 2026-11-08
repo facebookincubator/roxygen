@@ -57,216 +57,174 @@ define_common_headers!(
     (ColonStatus, 6, ":Status", ":status"),
     (ColonProtocol, 7, ":Protocol", ":protocol"),
     (Accept, 8, "Accept", "accept"),
-    (AcceptCharset, 9, "Accept-Charset", "accept-charset"),
-    (AcceptEncoding, 10, "Accept-Encoding", "accept-encoding"),
-    (AcceptLanguage, 11, "Accept-Language", "accept-language"),
-    (AcceptRanges, 12, "Accept-Ranges", "accept-ranges"),
+    (AcceptEncoding, 9, "Accept-Encoding", "accept-encoding"),
+    (AcceptLanguage, 10, "Accept-Language", "accept-language"),
+    (AcceptRanges, 11, "Accept-Ranges", "accept-ranges"),
     (
         AccessControlAllowCredentials,
-        13,
+        12,
         "Access-Control-Allow-Credentials",
         "access-control-allow-credentials"
     ),
     (
-        AccessControlAllowHeaders,
-        14,
-        "Access-Control-Allow-Headers",
-        "access-control-allow-headers"
-    ),
-    (
         AccessControlAllowMethods,
-        15,
+        13,
         "Access-Control-Allow-Methods",
         "access-control-allow-methods"
     ),
     (
         AccessControlAllowOrigin,
-        16,
+        14,
         "Access-Control-Allow-Origin",
         "access-control-allow-origin"
     ),
     (
         AccessControlExposeHeaders,
-        17,
+        15,
         "Access-Control-Expose-Headers",
         "access-control-expose-headers"
     ),
-    (
-        AccessControlMaxAge,
-        18,
-        "Access-Control-Max-Age",
-        "access-control-max-age"
-    ),
-    (
-        AccessControlRequestHeaders,
-        19,
-        "Access-Control-Request-Headers",
-        "access-control-request-headers"
-    ),
-    (
-        AccessControlRequestMethod,
-        20,
-        "Access-Control-Request-Method",
-        "access-control-request-method"
-    ),
-    (Age, 21, "Age", "age"),
-    (AltSvc, 22, "Alt-Svc", "alt-svc"),
-    (Authorization, 23, "Authorization", "authorization"),
-    (CacheControl, 24, "Cache-Control", "cache-control"),
-    (ClientTimeout, 25, "client_timeout", "client_timeout"),
-    (Connection, 26, "Connection", "connection"),
-    (ContentDigest, 27, "content-digest", "content-digest"),
+    (Age, 16, "Age", "age"),
+    (AltSvc, 17, "Alt-Svc", "alt-svc"),
+    (Authorization, 18, "Authorization", "authorization"),
+    (CacheControl, 19, "Cache-Control", "cache-control"),
+    (ClientTimeout, 20, "client_timeout", "client_timeout"),
+    (Connection, 21, "Connection", "connection"),
+    (ContentDigest, 22, "content-digest", "content-digest"),
     (
         ContentDisposition,
-        28,
+        23,
         "Content-Disposition",
         "content-disposition"
     ),
-    (ContentEncoding, 29, "Content-Encoding", "content-encoding"),
-    (ContentLanguage, 30, "Content-Language", "content-language"),
-    (ContentLength, 31, "Content-Length", "content-length"),
-    (ContentRange, 32, "Content-Range", "content-range"),
+    (ContentEncoding, 24, "Content-Encoding", "content-encoding"),
+    (ContentLanguage, 25, "Content-Language", "content-language"),
+    (ContentLength, 26, "Content-Length", "content-length"),
+    (ContentRange, 27, "Content-Range", "content-range"),
     (
         ContentSecurityPolicy,
-        33,
+        28,
         "content-security-policy",
         "content-security-policy"
     ),
-    (ContentType, 34, "Content-Type", "content-type"),
-    (Cookie, 35, "Cookie", "cookie"),
+    (ContentType, 29, "Content-Type", "content-type"),
+    (Cookie, 30, "Cookie", "cookie"),
     (
         CrossOriginEmbedderPolicyReportOnly,
-        36,
+        31,
         "cross-origin-embedder-policy-report-only",
         "cross-origin-embedder-policy-report-only"
     ),
     (
         CrossOriginOpenerPolicy,
-        37,
+        32,
         "cross-origin-opener-policy",
         "cross-origin-opener-policy"
     ),
     (
         CrossOriginResourcePolicy,
-        38,
+        33,
         "cross-origin-resource-policy",
         "cross-origin-resource-policy"
     ),
-    (Date, 39, "Date", "date"),
-    (DocumentPolicy, 40, "document-policy", "document-policy"),
-    (EdgeControl, 41, "Edge-Control", "edge-control"),
-    (Etag, 42, "ETag", "etag"),
-    (Expect, 43, "Expect", "expect"),
-    (Expires, 44, "Expires", "expires"),
-    (
-        FacebookApiVersion,
-        45,
-        "facebook-api-version",
-        "facebook-api-version"
-    ),
-    (Host, 46, "Host", "host"),
+    (Date, 34, "Date", "date"),
+    (DocumentPolicy, 35, "document-policy", "document-policy"),
+    (EdgeControl, 36, "Edge-Control", "edge-control"),
+    (Etag, 37, "ETag", "etag"),
+    (Expires, 38, "Expires", "expires"),
+    (Host, 39, "Host", "host"),
     (
         IfModifiedSince,
-        47,
+        40,
         "If-Modified-Since",
         "if-modified-since"
     ),
-    (IfNoneMatch, 48, "If-None-Match", "if-none-match"),
-    (KeepAlive, 49, "Keep-Alive", "keep-alive"),
-    (LastModified, 50, "Last-Modified", "last-modified"),
-    (Link, 51, "Link", "link"),
-    (Location, 52, "Location", "location"),
-    (Origin, 53, "Origin", "origin"),
-    (OriginTrial, 54, "origin-trial", "origin-trial"),
+    (IfNoneMatch, 41, "If-None-Match", "if-none-match"),
+    (KeepAlive, 42, "Keep-Alive", "keep-alive"),
+    (LastModified, 43, "Last-Modified", "last-modified"),
+    (Location, 44, "Location", "location"),
+    (NoVarySearch, 45, "no-vary-search", "no-vary-search"),
     (
         PermissionsPolicy,
-        55,
+        46,
         "permissions-policy",
         "permissions-policy"
     ),
-    (Pragma, 56, "Pragma", "pragma"),
-    (Priority, 57, "Priority", "priority"),
+    (Pragma, 47, "Pragma", "pragma"),
+    (Priority, 48, "Priority", "priority"),
     (
         ProxyAuthenticate,
-        58,
+        49,
         "Proxy-Authenticate",
         "proxy-authenticate"
     ),
     (
         ProxyAuthorization,
-        59,
+        50,
         "Proxy-Authorization",
         "proxy-authorization"
     ),
-    (ProxyConnection, 60, "Proxy-Connection", "proxy-connection"),
-    (ProxyStatus, 61, "Proxy-Status", "proxy-status"),
-    (QueueTimeout, 62, "queue_timeout", "queue_timeout"),
-    (Range, 63, "Range", "range"),
-    (Referer, 64, "Referer", "referer"),
-    (ReportTo, 65, "report-to", "report-to"),
-    (RetryAfter, 66, "Retry-After", "retry-after"),
-    (RpcKind, 67, "rpckind", "rpckind"),
+    (ProxyConnection, 51, "Proxy-Connection", "proxy-connection"),
+    (ProxyStatus, 52, "Proxy-Status", "proxy-status"),
+    (QueueTimeout, 53, "queue_timeout", "queue_timeout"),
+    (Range, 54, "Range", "range"),
+    (Referer, 55, "Referer", "referer"),
+    (ReportTo, 56, "report-to", "report-to"),
     (
-        SecWebSocketKey,
-        68,
-        "Sec-WebSocket-Key",
-        "sec-websocket-key"
+        ReportingEndpoints,
+        57,
+        "reporting-endpoints",
+        "reporting-endpoints"
     ),
+    (RpcKind, 58, "rpckind", "rpckind"),
     (
         SecWebSocketAccept,
-        69,
+        59,
         "Sec-WebSocket-Accept",
         "sec-websocket-accept"
     ),
-    (Server, 70, "Server", "server"),
-    (SetCookie, 71, "Set-Cookie", "set-cookie"),
+    (
+        SecWebSocketKey,
+        60,
+        "Sec-WebSocket-Key",
+        "sec-websocket-key"
+    ),
+    (Server, 61, "Server", "server"),
+    (SetCookie, 62, "Set-Cookie", "set-cookie"),
     (
         StrictTransportSecurity,
-        72,
+        63,
         "Strict-Transport-Security",
         "strict-transport-security"
     ),
-    (Te, 73, "TE", "te"),
-    (ThriftPriority, 74, "thrift_priority", "thrift_priority"),
+    (Te, 64, "TE", "te"),
     (
         TimingAllowOrigin,
-        75,
+        65,
         "timing-allow-origin",
         "timing-allow-origin"
     ),
-    (Trailer, 76, "Trailer", "trailer"),
+    (Trailer, 66, "Trailer", "trailer"),
     (
         TransferEncoding,
-        77,
+        67,
         "Transfer-Encoding",
         "transfer-encoding"
     ),
-    (Upgrade, 78, "Upgrade", "upgrade"),
-    (UserAgent, 79, "User-Agent", "user-agent"),
-    (Vary, 80, "Vary", "vary"),
-    (Via, 81, "Via", "via"),
-    (WwwAuthenticate, 82, "WWW-Authenticate", "www-authenticate"),
+    (Upgrade, 68, "Upgrade", "upgrade"),
+    (UserAgent, 69, "User-Agent", "user-agent"),
+    (Vary, 70, "Vary", "vary"),
+    (Via, 71, "Via", "via"),
     (
         XContentTypeOptions,
-        83,
+        72,
         "X-Content-Type-Options",
         "x-content-type-options"
     ),
-    (XForwardedFor, 84, "X-Forwarded-For", "x-forwarded-for"),
-    (
-        XForwardedProto,
-        85,
-        "X-Forwarded-Proto",
-        "x-forwarded-proto"
-    ),
-    (XFrameOptions, 86, "X-Frame-Options", "x-frame-options"),
-    (
-        XThriftProtocol,
-        87,
-        "X-Thrift-Protocol",
-        "x-thrift-protocol"
-    ),
-    (XXssProtection, 88, "X-XSS-Protection", "x-xss-protection"),
+    (XForwardedFor, 73, "X-Forwarded-For", "x-forwarded-for"),
+    (XFrameOptions, 74, "X-Frame-Options", "x-frame-options"),
+    (XRobotsTag, 75, "x-robots-tag", "x-robots-tag"),
+    (XXssProtection, 76, "X-XSS-Protection", "x-xss-protection"),
 );
 
 const MAX_COMMON_HEADER_NAME_LENGTH: usize = {

@@ -7897,6 +7897,12 @@ pub(crate) fn consumer_response_fields(sequence: u64) -> Vec<HpackHeader> {
     ]
 }
 
+/// A delivered name as it was spelled when the digests were recorded. `origin` was then in the
+/// common-header table, which spelled it `Origin`; it is now delivered as received.
+fn recorded_spelling(name: &[u8]) -> &[u8] {
+    if name == b"origin" { b"Origin" } else { name }
+}
+
 /// The delivered heads' `(name, value)` lists, in order, and the bytes of re-encoding each head
 /// through a fresh egress codec.
 fn delivered_and_reencoded(messages: &[HttpMessage], direction: TransportDirection) -> [u64; 4] {
@@ -7904,7 +7910,7 @@ fn delivered_and_reencoded(messages: &[HttpMessage], direction: TransportDirecti
     let mut reencoded = Vec::new();
     for message in messages {
         for (_, name, value) in message.headers().iter() {
-            heads.extend_from_slice(name);
+            heads.extend_from_slice(recorded_spelling(name));
             heads.push(0);
             heads.extend_from_slice(value);
             heads.push(0);
@@ -7997,6 +8003,17 @@ fn consumer_shaped_heads_decode_and_reencode_identically() {
             [0x5cda_4c4c_cb54_073c, 18_048, 0x9e92_dae2_96f8_4ff5, 11_789],
         ),
         "recorded before any header-map pre-size"
+    );
+    let origin = (
+        HttpHeaderCode::Other,
+        &b"origin"[..],
+        &b"https://client.example.com"[..],
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|message| message.headers().iter().any(|header| header == origin)),
+        "`origin` is delivered as received"
     );
     assert!(requests.iter().all(|message| message.headers().len() > 16));
     assert!(responses.iter().all(|message| message.headers().len() > 16));

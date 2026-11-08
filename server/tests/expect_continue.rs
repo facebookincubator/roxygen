@@ -48,7 +48,14 @@ fn body(bytes: &[u8]) -> BufQueue {
     BufQueue::from_bytes(Bytes::copy_from_slice(bytes), bytes.len()).unwrap()
 }
 
+/// Not in the common-header table, so addressed by name.
+const EXPECT: &str = "Expect";
+
 fn request_message(expectation: Option<&[u8]>) -> HttpMessage {
+    request_message_named(EXPECT, expectation)
+}
+
+fn request_message_named(expect_name: &str, expectation: Option<&[u8]>) -> HttpMessage {
     let mut request = HttpMessage::new();
     request.set_method(HttpMethod::Post).unwrap();
     request
@@ -56,9 +63,7 @@ fn request_message(expectation: Option<&[u8]>) -> HttpMessage {
         .unwrap();
     request.set_http_version(1, 1);
     if let Some(expectation) = expectation {
-        request
-            .headers_mut()
-            .add(HttpHeaderCode::Expect, expectation);
+        request.headers_mut().add(expect_name, expectation);
     }
     request
         .headers_mut()
@@ -97,7 +102,7 @@ impl HttpHandler for RecordingHandler {
         Box::pin(async move {
             let request = request_source.read_header_event().await?;
             request_headers.borrow_mut().push((
-                request.headers().headers().raw_get(HttpHeaderCode::Expect),
+                request.headers().headers().raw_get(EXPECT),
                 request.headers().headers().raw_get(HttpHeaderCode::Host),
                 request.eom(),
             ));
@@ -326,6 +331,29 @@ fn send_continue_response() {
         b"MOCK BODY"
     );
     assert!(final_body.eom());
+}
+
+#[test]
+fn send_continue_response_for_a_lowercase_expect_name() {
+    let harness = Harness::new(None);
+    let mut response = harness.invoke(HttpSourceHolder::new(Box::new(HttpFixedSource::new(
+        request_message_named("expect", Some(b"100-continue")),
+        None,
+    ))));
+
+    let mut interim = ready(response.read_header_event()).unwrap();
+    assert_eq!(interim.headers_mut().status_code().unwrap(), 100);
+    assert_eq!(harness.calls.get(), 0);
+    let mut final_headers = ready(response.read_header_event()).unwrap();
+    assert_eq!(final_headers.headers_mut().status_code().unwrap(), 200);
+    assert_eq!(
+        harness.request_headers.borrow().as_slice(),
+        &[(
+            Box::from(&b""[..]),
+            Box::from(&b"test.facebook.com"[..]),
+            true
+        )]
+    );
 }
 
 #[test]

@@ -1212,18 +1212,13 @@ pub(crate) fn convert_headers(headers: &HttpHeaders) -> (HeaderMap, usize) {
 fn header_name(code: HttpHeaderCode, name: &[u8]) -> Option<HeaderName> {
     let constant = match code {
         HttpHeaderCode::Accept => header::ACCEPT,
-        HttpHeaderCode::AcceptCharset => header::ACCEPT_CHARSET,
         HttpHeaderCode::AcceptEncoding => header::ACCEPT_ENCODING,
         HttpHeaderCode::AcceptLanguage => header::ACCEPT_LANGUAGE,
         HttpHeaderCode::AcceptRanges => header::ACCEPT_RANGES,
         HttpHeaderCode::AccessControlAllowCredentials => header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
-        HttpHeaderCode::AccessControlAllowHeaders => header::ACCESS_CONTROL_ALLOW_HEADERS,
         HttpHeaderCode::AccessControlAllowMethods => header::ACCESS_CONTROL_ALLOW_METHODS,
         HttpHeaderCode::AccessControlAllowOrigin => header::ACCESS_CONTROL_ALLOW_ORIGIN,
         HttpHeaderCode::AccessControlExposeHeaders => header::ACCESS_CONTROL_EXPOSE_HEADERS,
-        HttpHeaderCode::AccessControlMaxAge => header::ACCESS_CONTROL_MAX_AGE,
-        HttpHeaderCode::AccessControlRequestHeaders => header::ACCESS_CONTROL_REQUEST_HEADERS,
-        HttpHeaderCode::AccessControlRequestMethod => header::ACCESS_CONTROL_REQUEST_METHOD,
         HttpHeaderCode::Age => header::AGE,
         HttpHeaderCode::AltSvc => header::ALT_SVC,
         HttpHeaderCode::Authorization => header::AUTHORIZATION,
@@ -1248,18 +1243,14 @@ fn header_name(code: HttpHeaderCode, name: &[u8]) -> Option<HeaderName> {
         HttpHeaderCode::DocumentPolicy => DOCUMENT_POLICY,
         HttpHeaderCode::EdgeControl => EDGE_CONTROL,
         HttpHeaderCode::Etag => header::ETAG,
-        HttpHeaderCode::Expect => header::EXPECT,
         HttpHeaderCode::Expires => header::EXPIRES,
-        HttpHeaderCode::FacebookApiVersion => FACEBOOK_API_VERSION,
         HttpHeaderCode::Host => header::HOST,
         HttpHeaderCode::IfModifiedSince => header::IF_MODIFIED_SINCE,
         HttpHeaderCode::IfNoneMatch => header::IF_NONE_MATCH,
         HttpHeaderCode::KeepAlive => KEEP_ALIVE,
         HttpHeaderCode::LastModified => header::LAST_MODIFIED,
-        HttpHeaderCode::Link => header::LINK,
         HttpHeaderCode::Location => header::LOCATION,
-        HttpHeaderCode::Origin => header::ORIGIN,
-        HttpHeaderCode::OriginTrial => ORIGIN_TRIAL,
+        HttpHeaderCode::NoVarySearch => NO_VARY_SEARCH,
         HttpHeaderCode::PermissionsPolicy => PERMISSIONS_POLICY,
         HttpHeaderCode::Pragma => header::PRAGMA,
         HttpHeaderCode::Priority => PRIORITY,
@@ -1271,7 +1262,7 @@ fn header_name(code: HttpHeaderCode, name: &[u8]) -> Option<HeaderName> {
         HttpHeaderCode::Range => header::RANGE,
         HttpHeaderCode::Referer => header::REFERER,
         HttpHeaderCode::ReportTo => REPORT_TO,
-        HttpHeaderCode::RetryAfter => header::RETRY_AFTER,
+        HttpHeaderCode::ReportingEndpoints => REPORTING_ENDPOINTS,
         HttpHeaderCode::RpcKind => RPC_KIND,
         HttpHeaderCode::SecWebSocketKey => header::SEC_WEBSOCKET_KEY,
         HttpHeaderCode::SecWebSocketAccept => header::SEC_WEBSOCKET_ACCEPT,
@@ -1279,7 +1270,6 @@ fn header_name(code: HttpHeaderCode, name: &[u8]) -> Option<HeaderName> {
         HttpHeaderCode::SetCookie => header::SET_COOKIE,
         HttpHeaderCode::StrictTransportSecurity => header::STRICT_TRANSPORT_SECURITY,
         HttpHeaderCode::Te => header::TE,
-        HttpHeaderCode::ThriftPriority => THRIFT_PRIORITY,
         HttpHeaderCode::TimingAllowOrigin => TIMING_ALLOW_ORIGIN,
         HttpHeaderCode::Trailer => header::TRAILER,
         HttpHeaderCode::TransferEncoding => header::TRANSFER_ENCODING,
@@ -1287,12 +1277,10 @@ fn header_name(code: HttpHeaderCode, name: &[u8]) -> Option<HeaderName> {
         HttpHeaderCode::UserAgent => header::USER_AGENT,
         HttpHeaderCode::Vary => header::VARY,
         HttpHeaderCode::Via => header::VIA,
-        HttpHeaderCode::WwwAuthenticate => header::WWW_AUTHENTICATE,
         HttpHeaderCode::XContentTypeOptions => header::X_CONTENT_TYPE_OPTIONS,
         HttpHeaderCode::XForwardedFor => X_FORWARDED_FOR,
-        HttpHeaderCode::XForwardedProto => X_FORWARDED_PROTO,
         HttpHeaderCode::XFrameOptions => header::X_FRAME_OPTIONS,
-        HttpHeaderCode::XThriftProtocol => X_THRIFT_PROTOCOL,
+        HttpHeaderCode::XRobotsTag => X_ROBOTS_TAG,
         HttpHeaderCode::XXssProtection => header::X_XSS_PROTECTION,
         HttpHeaderCode::Other => return custom_name(name),
         _ => return parse_name(name),
@@ -1312,21 +1300,19 @@ const CROSS_ORIGIN_RESOURCE_POLICY: HeaderName =
     HeaderName::from_static("cross-origin-resource-policy");
 const DOCUMENT_POLICY: HeaderName = HeaderName::from_static("document-policy");
 const EDGE_CONTROL: HeaderName = HeaderName::from_static("edge-control");
-const FACEBOOK_API_VERSION: HeaderName = HeaderName::from_static("facebook-api-version");
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
-const ORIGIN_TRIAL: HeaderName = HeaderName::from_static("origin-trial");
+const NO_VARY_SEARCH: HeaderName = HeaderName::from_static("no-vary-search");
 const PERMISSIONS_POLICY: HeaderName = HeaderName::from_static("permissions-policy");
 const PRIORITY: HeaderName = HeaderName::from_static("priority");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
 const PROXY_STATUS: HeaderName = HeaderName::from_static("proxy-status");
 const QUEUE_TIMEOUT: HeaderName = HeaderName::from_static("queue_timeout");
 const REPORT_TO: HeaderName = HeaderName::from_static("report-to");
+const REPORTING_ENDPOINTS: HeaderName = HeaderName::from_static("reporting-endpoints");
 const RPC_KIND: HeaderName = HeaderName::from_static("rpckind");
-const THRIFT_PRIORITY: HeaderName = HeaderName::from_static("thrift_priority");
 const TIMING_ALLOW_ORIGIN: HeaderName = HeaderName::from_static("timing-allow-origin");
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
-const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
-const X_THRIFT_PROTOCOL: HeaderName = HeaderName::from_static("x-thrift-protocol");
+const X_ROBOTS_TAG: HeaderName = HeaderName::from_static("x-robots-tag");
 
 /// The most names that a thread's `NameCache` holds.
 const NAME_CACHE_CAPACITY: usize = 64;

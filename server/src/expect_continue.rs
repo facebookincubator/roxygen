@@ -17,7 +17,6 @@ use roxygen_core::handler::HandlerSessionContext;
 use roxygen_core::handler::HttpHandler;
 use roxygen_core::handler::HttpHandlerRef;
 use roxygen_core::handler::LocalHandlerFuture;
-use roxygen_core::headers::HttpHeaderCode;
 use roxygen_core::hybrid_source::HttpHybridSource;
 use roxygen_core::ids::StreamId;
 use roxygen_core::message::HttpMessage;
@@ -25,6 +24,8 @@ use roxygen_core::source::HttpSource;
 use roxygen_core::source::LocalSourceFuture;
 use roxygen_core::source_holder::HttpSourceHolder;
 
+/// Not in the common-header table, so addressed by name.
+const EXPECT: &str = "Expect";
 const CONTINUE_EXPECTATION: &[u8] = b"100-continue";
 const CONTINUE_STATUS: u16 = 100;
 const EXPECTATION_FAILED_STATUS: u16 = 417;
@@ -51,14 +52,12 @@ impl HttpHandler for ExpectContinueWrapperHandler {
         Box::pin(async move {
             let header_event = request_source.read_header_event().await?;
             let mut request = header_event.into_headers();
-            if !request.headers().exists(HttpHeaderCode::Expect) {
+            if !request.headers().exists(EXPECT) {
                 let request = hybrid_holder(request, request_source)?;
                 return next_handler.handle_request(context, request).await;
             }
 
-            let expectation = request
-                .headers()
-                .get_single_or_empty(HttpHeaderCode::Expect);
+            let expectation = request.headers().get_single_or_empty(EXPECT);
             if !expectation.eq_ignore_ascii_case(CONTINUE_EXPECTATION) {
                 let body = BufQueue::from_bytes(
                     Bytes::from_static(EXPECTATION_FAILED_BODY),
@@ -71,7 +70,7 @@ impl HttpHandler for ExpectContinueWrapperHandler {
                 return Ok(HttpSourceHolder::new(Box::new(response)));
             }
 
-            request.headers_mut().remove(HttpHeaderCode::Expect);
+            request.headers_mut().remove(EXPECT);
             let request = hybrid_holder(request, request_source)?;
             Ok(HttpSourceHolder::new(Box::new(
                 ExpectContinueWrapperResponse::new(context, request, next_handler),

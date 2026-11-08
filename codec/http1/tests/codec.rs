@@ -7701,3 +7701,21 @@ fn default_upstream_upgrade_handling_is_unchanged() {
         );
     }
 }
+
+#[test]
+fn generated_head_keeps_uncommon_spelling() {
+    // Names outside the common-header table are written as the message spells them.
+    let mut message = request(HttpMethod::Get, b"/", (1, 1));
+    message.headers_mut().add(HttpHeaderCode::Host, b"a");
+    message.headers_mut().add("expect", b"100-continue");
+    message.headers_mut().add("x-forwarded-proto", b"https");
+    message.headers_mut().add("link", b"<a>");
+    let mut codec = Http1xCodec::new(TransportDirection::Upstream);
+    let wire = generate_request(&mut codec, &message, true);
+    assert_eq!(
+        wire,
+        b"GET / HTTP/1.1\r\nHost: a\r\nexpect: 100-continue\r\nx-forwarded-proto: https\r\nlink: <a>\r\nConnection: keep-alive\r\n\r\n",
+        "{}",
+        wire.escape_ascii()
+    );
+}
