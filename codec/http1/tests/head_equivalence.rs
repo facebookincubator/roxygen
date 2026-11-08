@@ -5,12 +5,13 @@
 //! `scan_head_counting_line_feeds`, `PrefixMatch`, `parse_head`,
 //! `add_validated_header`, `HeaderLines`, `request_line_is_http_09`,
 //! `valid_header_value` and `parse_version` as they stood before R6, with the
-//! test-only work counters removed. `drive` runs `on_ingress`'s `Idle` and
-//! `Head` arms over a sequence of reads with either head path, so the two runs
-//! differ only below `ingress_head`. The tests compare every callback, every
-//! ingress result, and every codec field that the head path reads or writes,
-//! over generated heads, valid and malformed, in both directions, read whole
-//! and split.
+//! test-only work counters removed and `old_parse_head` boxing the message it
+//! returns, as `ParsedHead` now holds it. `drive` runs `on_ingress`'s `Idle`
+//! and `Head` arms over a sequence of reads with either head path, so the two
+//! runs differ only below `ingress_head`. The tests compare every callback,
+//! every ingress result, and every codec field that the head path reads or
+//! writes, over generated heads, valid and malformed, in both directions, read
+//! whole and split.
 
 use std::borrow::Cow;
 
@@ -581,7 +582,7 @@ fn old_parse_head(
         IngressBody::None
     };
     Ok(ParsedHead {
-        message,
+        message: Box::new(message),
         body,
         informational,
         upgrade: codec.ingress_upgrade,

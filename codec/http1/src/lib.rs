@@ -535,7 +535,7 @@ impl MessageEnd {
 
 #[derive(Debug)]
 struct ParsedHead {
-    message: HttpMessage,
+    message: Box<HttpMessage>,
     body: IngressBody,
     informational: bool,
     upgrade: bool,
@@ -1602,7 +1602,7 @@ impl Http1xCodec {
             IngressBody::None
         };
         Ok(ParsedHead {
-            message,
+            message: Box::new(message),
             body,
             informational,
             upgrade: self.ingress_upgrade,
@@ -1640,7 +1640,7 @@ impl Http1xCodec {
             callback_egress,
             CodecEvent::HeadersComplete {
                 stream,
-                message: Box::new(parsed.message),
+                message: parsed.message,
             },
             result,
         );

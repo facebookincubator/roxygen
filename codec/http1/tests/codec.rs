@@ -1,10 +1,12 @@
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
 use std::alloc::System;
+use std::borrow::Borrow;
 use std::cell::Cell;
 use std::fmt::Write as _;
 use std::hint::black_box;
 use std::ops::Range;
+use std::ptr;
 use std::sync::LazyLock;
 
 use base64::Engine as _;
@@ -12,6 +14,7 @@ use bytes::Bytes;
 use roxygen_codec::CodecCallbackAction;
 use roxygen_codec::CodecCallbackActions;
 use roxygen_codec::CodecEvent;
+use roxygen_codec::CodecIngressResult;
 use roxygen_codec::EgressFrame;
 use roxygen_codec::GeneratedFrame;
 use roxygen_codec::H2ErrorCode;
@@ -8816,6 +8819,114 @@ fn chunk_headers_and_terminators_allocate_nothing_after_warm_up() {
             }
         }
     }
+}
+
+/// Counts `HeadersComplete` events and notes where the last one's message
+/// lives, without allocating.
+#[derive(Debug, Default)]
+struct HeadAddresses {
+    heads: usize,
+    last: Option<*const HttpMessage>,
+}
+
+impl HttpCodecCallback for HeadAddresses {
+    fn on_event(&mut self, event: CodecEvent<'_>) {
+        if let CodecEvent::HeadersComplete { message, .. } = event {
+            self.heads += 1;
+            self.last = Some(ptr::from_ref(message.as_ref()));
+        }
+    }
+}
+
+/// A codec ready for each path through `install_parsed_head`, with its head:
+/// a request with a body, a bodiless request that completes at once, and a
+/// chunked response.
+fn parsed_head_cases() -> [(&'static str, Http1xCodec, &'static [u8]); 3] {
+    let mut upstream = Http1xCodec::new(TransportDirection::Upstream);
+    send_trace_request(&mut upstream);
+    [
+        (
+            "request with a body",
+            Http1xCodec::new(TransportDirection::Downstream),
+            b"POST /c HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\n",
+        ),
+        (
+            "bodiless request",
+            Http1xCodec::new(TransportDirection::Downstream),
+            b"GET /g HTTP/1.1\r\nHost: a\r\nUser-Agent: t\r\n\r\n",
+        ),
+        ("chunked response", upstream, CHUNKED_RESPONSE_HEAD),
+    ]
+}
+
+#[test]
+fn a_parsed_head_reaches_headers_complete_in_the_box_it_was_parsed_into() {
+    for (name, mut codec, head) in parsed_head_cases() {
+        let parsed = codec.parse_head(head, None, None).expect("the head parses");
+        let parsed_message: &HttpMessage = parsed.message.borrow();
+        let parsed_at = ptr::from_ref(parsed_message);
+        let mut delivered = HeadAddresses::default();
+        let mut egress = BufQueue::new(QUEUE_LIMIT);
+        let mut result = CodecIngressResult::new(0);
+        codec.install_parsed_head(parsed, &mut delivered, &mut egress, &mut result);
+        assert_eq!(delivered.heads, 1, "{name}");
+        assert_eq!(
+            delivered.last,
+            Some(parsed_at),
+            "{name}: HeadersComplete carries the message where the parse left it"
+        );
+    }
+}
+
+#[test]
+fn delivering_a_parsed_head_allocates_nothing() {
+    for (name, mut codec, head) in parsed_head_cases() {
+        let parsed = codec.parse_head(head, None, None).expect("the head parses");
+        let mut delivered = HeadAddresses::default();
+        let mut egress = BufQueue::new(QUEUE_LIMIT);
+        let mut result = CodecIngressResult::new(0);
+        let ((), allocations) = count_allocations(|| {
+            codec.install_parsed_head(parsed, &mut delivered, &mut egress, &mut result);
+        });
+        assert_eq!(delivered.heads, 1, "{name}");
+        if std_allocations_observable() {
+            assert_eq!(allocations, 0, "{name}: delivering a parsed head allocates");
+        } else {
+            eprintln!("{name}: allocation counts need a static std, as in @fbcode//mode/opt");
+        }
+    }
+}
+
+#[test]
+fn parsing_and_delivering_a_head_allocates_as_before() {
+    let allocations = parsed_head_cases().map(|(name, mut codec, head)| {
+        let read = ingress_queue(head);
+        let mut delivered = HeadAddresses::default();
+        let mut egress = BufQueue::new(QUEUE_LIMIT);
+        let (consumed, allocations) = count_allocations(|| {
+            codec
+                .on_ingress(&read, &mut delivered, &mut egress)
+                .consumed
+        });
+        assert_eq!(consumed, head.len(), "{name}");
+        assert_eq!(delivered.heads, 1, "{name}");
+        (name, allocations)
+    });
+    if !std_allocations_observable() {
+        eprintln!("allocation counts need a static std, as in @fbcode//mode/opt");
+        return;
+    }
+    // Each head: its header list's reservation and its message's box. The
+    // codec also keeps a copy of the first User-Agent.
+    assert_eq!(
+        allocations,
+        [
+            ("request with a body", 2),
+            ("bodiless request", 3),
+            ("chunked response", 2),
+        ],
+        "allocations to parse and deliver each head"
+    );
 }
 
 /// Whether a `T` can own heap memory: a type without drop glue cannot.
