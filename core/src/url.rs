@@ -355,6 +355,12 @@ impl PartialEq for Url {
 
 impl Eq for Url {}
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of the `://` searches `parse_components` runs.
+    static ABSOLUTE_URL_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn parse_components(url: &[u8], strict: bool) -> Components {
     if url == b"/" {
         return Components {
@@ -364,6 +370,12 @@ fn parse_components(url: &[u8], strict: bool) -> Components {
         };
     }
 
+    if url.first() == Some(&b'/') {
+        return parse_non_fully_formed(url, strict);
+    }
+
+    #[cfg(test)]
+    ABSOLUTE_URL_SCANS.with(|scans| scans.set(scans.get() + 1));
     match find_bytes(url, b"://") {
         Some(scheme_end)
             if scheme_end != 0
@@ -716,3 +728,7 @@ fn earliest(left: Option<usize>, right: Option<usize>) -> Option<usize> {
         (None, None) => None,
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/url_dispatch.rs"]
+mod dispatch_tests;
