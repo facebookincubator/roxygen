@@ -3722,3 +3722,307 @@ fn exhaust_descriptors_with_a_queued_connection() {
     assert_ok_response(&response);
     assert_ok_response(&get_request(address));
 }
+
+/// Events of the pushed `/sse` response, as the parity benchmark's conformance check sends.
+const PUSHED_EVENTS: usize = 5;
+const PUSHED_EVENT_SIZE: usize = 64;
+/// Larger than the request window and one read, as the conformance check's `/echo` body.
+const ECHO_BODY_SIZE: usize = 1_000_003;
+
+/// The parity benchmark's `/sse` and `/echo` shapes: `/sse` pushes its events from a task
+/// into a response source with no `Content-Length`, and `/echo` streams the request body back
+/// as it arrives, with the request's `Content-Length` if it has one.
+struct StreamingHandler {
+    producer_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl HttpHandler for StreamingHandler {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        mut request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        let producer_tasks = Arc::clone(&self.producer_tasks);
+        Box::pin(async move {
+            let head = request.read_header_event().await?;
+            let mut response = roxygen_core::message::HttpMessage::new();
+            response.set_status_code(200).unwrap();
+            response.set_status_message(b"OK").unwrap();
+            response.set_http_version(1, 1);
+            if head.headers().request_url() == Some(&b"/echo"[..]) {
+                if let Some(length) = head
+                    .headers()
+                    .headers()
+                    .get_single(roxygen_core::headers::HttpHeaderCode::ContentLength)
+                    .value
+                {
+                    response
+                        .headers_mut()
+                        .set(roxygen_core::headers::HttpHeaderCode::ContentLength, length);
+                }
+                let head = HttpHeaderEvent::new(response, false).unwrap();
+                return Ok(HttpSourceHolder::new(Box::new(
+                    roxygen_core::hybrid_source::HttpHybridSource::from_header_event(head, request),
+                )));
+            }
+            assert!(head.eom(), "the pushed response's request has no body");
+            drop(request);
+            let source =
+                roxygen_core::stream_source::HttpStreamSource::new_async(None, None, 65_535)
+                    .unwrap();
+            let producer = source.producer();
+            assert!(producer.headers(response, false));
+            let task = tokio::task::spawn_local(async move {
+                for sent in 1..=PUSHED_EVENTS {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let body = BufQueue::from_vec(vec![b'e'; PUSHED_EVENT_SIZE], PUSHED_EVENT_SIZE)
+                        .unwrap();
+                    producer.body(body, 0, sent == PUSHED_EVENTS);
+                }
+            });
+            producer_tasks.lock().unwrap().push(task);
+            Ok(HttpSourceHolder::new(Box::new(source)))
+        })
+    }
+}
+
+/// The `/sse` producer tasks of one server's `StreamingHandler`s. A test joins them with
+/// `join`; dropping joins any that a failed test left.
+#[derive(Default)]
+struct ProducerTasks(Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>);
+
+impl ProducerTasks {
+    /// Joins every task spawned so far and returns how many there were. A task's panic
+    /// resumes here.
+    fn join(&self) -> usize {
+        let results = self.join_all();
+        let count = results.len();
+        for result in results {
+            if let Err(error) = result {
+                assert!(error.is_panic(), "a producer task did not finish: {error}");
+                resume_unwind(error.into_panic());
+            }
+        }
+        count
+    }
+
+    fn join_all(&self) -> Vec<Result<(), tokio::task::JoinError>> {
+        let tasks = std::mem::take(&mut *self.0.lock().unwrap());
+        if tasks.is_empty() {
+            return Vec::new();
+        }
+        let runtime = Builder::new_current_thread().build().unwrap();
+        tasks
+            .into_iter()
+            .map(|task| runtime.block_on(task))
+            .collect()
+    }
+}
+
+impl Drop for ProducerTasks {
+    fn drop(&mut self) {
+        drop(self.join_all());
+    }
+}
+
+/// A server with the parity benchmark's HTTP/1.1 windows, untimed so both modes accept it.
+fn streaming_server(owned_http1: bool, producers: &ProducerTasks) -> ScopedHttpServer {
+    let config = ServerConfig {
+        session: crate::acceptor::ServerSessionConfig {
+            stream_flow_control: 262_144,
+            connection_flow_control: 5_242_880,
+            ..untimed_session(owned_http1)
+        },
+        ..ServerConfig::default()
+    };
+    let producer_tasks = Arc::clone(&producers.0);
+    let factory: HandlerFactory = Arc::new(move |_| {
+        Rc::new(StreamingHandler {
+            producer_tasks: Arc::clone(&producer_tasks),
+        }) as HttpHandlerRef
+    });
+    ScopedHttpServer::start(config, factory, None).expect("server starts")
+}
+
+fn streaming_client(server: &ScopedHttpServer) -> TcpStream {
+    let stream = TcpStream::connect_timeout(&server.address().unwrap(), REQUEST_TIMEOUT).unwrap();
+    stream.set_read_timeout(Some(REQUEST_TIMEOUT)).unwrap();
+    stream.set_write_timeout(Some(REQUEST_TIMEOUT)).unwrap();
+    stream
+}
+
+/// Reads until `wire` ends with `end`; a reset or EOF first fails with what arrived.
+fn read_until_end(stream: &mut TcpStream, end: impl Fn(&[u8]) -> bool) -> Vec<u8> {
+    let mut wire = Vec::new();
+    let mut chunk = [0_u8; 65_536];
+    while !end(&wire) {
+        match stream.read(&mut chunk) {
+            Ok(0) => panic!(
+                "EOF after {} response bytes: {:?}",
+                wire.len(),
+                String::from_utf8_lossy(&wire[..wire.len().min(200)])
+            ),
+            Ok(count) => wire.extend_from_slice(&chunk[..count]),
+            Err(error) => panic!(
+                "{error} after {} response bytes: {:?}",
+                wire.len(),
+                String::from_utf8_lossy(&wire[..wire.len().min(200)])
+            ),
+        }
+    }
+    wire
+}
+
+/// Requests the pushed response twice on one connection and returns each response's head and
+/// decoded body: events the session reads together share a chunk.
+fn serve_pushed_response(owned_http1: bool) -> Vec<(String, Vec<u8>)> {
+    let producers = ProducerTasks::default();
+    let server = streaming_server(owned_http1, &producers);
+    let mut stream = streaming_client(&server);
+    let mut responses = Vec::new();
+    for _ in 0..2 {
+        stream
+            .write_all(b"GET /sse HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let wire = normalize_date(&read_until_end(&mut stream, |wire| {
+            wire.ends_with(b"\r\n0\r\n\r\n")
+        }));
+        let (head, body) = dechunk(&wire);
+        responses.push((String::from_utf8_lossy(head).into_owned(), body));
+    }
+    assert_eq!(producers.join(), 2, "each response's producer finished");
+    drop(stream);
+    drop(server);
+    responses
+}
+
+#[test]
+fn owned_http1_serves_a_pushed_chunked_response() {
+    let native = serve_pushed_response(false);
+    let owned = serve_pushed_response(true);
+    for (head, body) in &native {
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head:?}");
+        assert!(head.contains("Transfer-Encoding: chunked\r\n"), "{head:?}");
+        assert!(*body == [b'e'; PUSHED_EVENTS * PUSHED_EVENT_SIZE]);
+    }
+    assert_eq!(owned, native);
+}
+
+/// Echoes a 1 MB request body, written by another thread while the response is read, and
+/// returns the response. A `chunked` request is sent in 64 KiB chunks, and its echo is chunked.
+fn serve_large_echo(owned_http1: bool, body: &Arc<Vec<u8>>, chunked: bool) -> Vec<u8> {
+    let producers = ProducerTasks::default();
+    let server = streaming_server(owned_http1, &producers);
+    let mut stream = streaming_client(&server);
+    let mut writer = stream.try_clone().unwrap();
+    let request_body = Arc::clone(body);
+    let sender = thread::spawn(move || {
+        if !chunked {
+            let head = format!(
+                "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+                request_body.len()
+            );
+            writer.write_all(head.as_bytes())?;
+            return writer.write_all(&request_body);
+        }
+        writer.write_all(
+            b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )?;
+        for chunk in request_body.chunks(65_536) {
+            writer.write_all(format!("{:x}\r\n", chunk.len()).as_bytes())?;
+            writer.write_all(chunk)?;
+            writer.write_all(b"\r\n")?;
+        }
+        writer.write_all(b"0\r\n\r\n")
+    });
+    let length = body.len();
+    let wire = read_until_end(&mut stream, |wire| {
+        if chunked {
+            return wire.ends_with(b"\r\n0\r\n\r\n");
+        }
+        wire.windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .is_some_and(|end| wire.len() >= end + 4 + length)
+    });
+    sender.join().unwrap().expect("the request body is sent");
+    drop(stream);
+    drop(server);
+    normalize_date(&wire)
+}
+
+fn echo_body() -> Arc<Vec<u8>> {
+    Arc::new(
+        (0..ECHO_BODY_SIZE)
+            .map(|index| (index * 7 % 251) as u8)
+            .collect(),
+    )
+}
+
+/// Splits a chunked response into its head and its decoded body.
+fn dechunk(wire: &[u8]) -> (&[u8], Vec<u8>) {
+    let end = wire
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("a response head")
+        + 4;
+    let (head, mut rest) = wire.split_at(end);
+    let mut body = Vec::new();
+    loop {
+        let line = rest
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .expect("a chunk size line");
+        let size = usize::from_str_radix(std::str::from_utf8(&rest[..line]).unwrap(), 16).unwrap();
+        rest = &rest[line + 2..];
+        if size == 0 {
+            assert_eq!(rest, b"\r\n", "nothing follows the last chunk");
+            return (head, body);
+        }
+        body.extend_from_slice(&rest[..size]);
+        assert_eq!(&rest[size..size + 2], b"\r\n");
+        rest = &rest[size + 2..];
+    }
+}
+
+#[test]
+fn owned_http1_echoes_a_large_body_as_it_arrives() {
+    let body = echo_body();
+    let native = serve_large_echo(false, &body, false);
+    let owned = serve_large_echo(true, &body, false);
+    assert!(native.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(native.ends_with(&body[..]));
+    assert_eq!(owned.len(), native.len());
+    assert!(
+        owned == native,
+        "the owned echo differs from the native one"
+    );
+}
+
+/// As `owned_http1_echoes_a_large_body_as_it_arrives`, for a chunked request; the echo's chunk
+/// sizes follow the reads, so the bodies are compared decoded.
+#[test]
+fn owned_http1_echoes_a_large_chunked_body_as_it_arrives() {
+    let body = echo_body();
+    let native = serve_large_echo(false, &body, true);
+    let owned = serve_large_echo(true, &body, true);
+    let (native_head, native_body) = dechunk(&native);
+    let (owned_head, owned_body) = dechunk(&owned);
+    assert!(native_head.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(
+        String::from_utf8_lossy(native_head).contains("Transfer-Encoding: chunked\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(native_head)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(owned_head),
+        String::from_utf8_lossy(native_head)
+    );
+    assert!(
+        native_body == body[..],
+        "the native echo differs from the request body"
+    );
+    assert!(
+        owned_body == body[..],
+        "the owned echo differs from the request body"
+    );
+}

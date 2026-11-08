@@ -62,6 +62,7 @@ use roxygen_core::error::HttpError;
 use roxygen_core::error::HttpErrorCode;
 use roxygen_core::events::HttpBodyEventKind;
 use roxygen_core::events::HttpHeaderEvent;
+use roxygen_core::events::ResumeFuture;
 use roxygen_core::fixed_source::get_error_response;
 use roxygen_core::http::TransportDirection;
 use roxygen_core::ids::StreamId;
@@ -301,6 +302,8 @@ struct Exchange<E: OwnedExchange> {
     consumed: bool,
     response_headers: bool,
     response_complete: bool,
+    /// A suspended response body read's resume, awaited before the body is read again.
+    resume: Option<ResumeFuture>,
     write_boundary: u64,
     /// The response registered a byte event (each is refused); it keeps the write fence.
     registered_byte_events: bool,
@@ -314,6 +317,7 @@ impl<E: OwnedExchange> Drop for Exchange<E> {
         capture(&mut panic, || drop(self.application.take()));
         capture(&mut panic, || drop(self.source.take()));
         capture(&mut panic, || drop(self.drain.take()));
+        capture(&mut panic, || drop(self.resume.take()));
         capture(&mut panic, || drop(self.head.take()));
         if let Some(panic) = panic {
             if std::thread::panicking() {
@@ -574,6 +578,7 @@ impl<A: OwnedApplication> CodecInput<'_, A> {
             consumed: false,
             response_headers: false,
             response_complete: false,
+            resume: None,
             write_boundary: 0,
             registered_byte_events: false,
             retires_at_serialization: false,
@@ -1152,6 +1157,15 @@ impl<A: OwnedApplication> Driver<A> {
             }
             eom
         } else {
+            // As `UniplexSession`'s egress read, a suspended read is read again once it resumes,
+            // whatever its status. The resume future is caller code.
+            if let Some(resume) = &mut exchange.resume {
+                if resume.as_mut().poll(&mut context).is_pending() {
+                    return Ok(());
+                }
+                exchange.resume = None;
+                check_cancel(&self.control, &self.context)?;
+            }
             // As OwnedH2's serialization budget: what is already queued and the framing count
             // against one write.
             let room = self
@@ -1196,6 +1210,7 @@ impl<A: OwnedApplication> Driver<A> {
                         &mut NoopCallback,
                     )?;
                 }
+                HttpBodyEventKind::Suspend(resume) => exchange.resume = Some(resume),
                 _ => {
                     return Err(failure(
                         HttpErrorCode::PROTOCOL_ERROR,

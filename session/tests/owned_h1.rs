@@ -55,6 +55,8 @@ struct Response {
     tunnel: bool,
     /// The head accepts a WebSocket upgrade.
     websocket: bool,
+    /// A suspension precedes the body, and resumes with this status on its second poll.
+    suspend: Option<ResumeStatus>,
 }
 
 impl Response {
@@ -68,6 +70,7 @@ impl Response {
             interim: Vec::new(),
             tunnel: false,
             websocket: false,
+            suspend: None,
         }
     }
 
@@ -122,6 +125,12 @@ impl Response {
         let header_eom = self.body.is_empty() && self.trailers.is_empty();
         let header = HttpHeaderEvent::new(message, header_eom).unwrap();
         let mut body = VecDeque::new();
+        if let Some(status) = self.suspend {
+            body.push_back(HttpBodyEvent::suspend(Box::pin(ResumeAfterWake {
+                status,
+                polls: 0,
+            })));
+        }
         if !self.body.is_empty() {
             body.push_back(HttpBodyEvent::body(
                 queue(&self.body),
@@ -136,6 +145,35 @@ impl Response {
             body.push_back(HttpBodyEvent::trailers(trailers));
         }
         (header, body)
+    }
+}
+
+/// Resumes with `status` on its second poll, after waking its first poller, as a source's
+/// suspension resumes once its producer pushes. It must be awaited to completion.
+struct ResumeAfterWake {
+    status: ResumeStatus,
+    polls: u8,
+}
+
+impl Future for ResumeAfterWake {
+    type Output = ResumeStatus;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<ResumeStatus> {
+        self.polls += 1;
+        if self.polls > 1 {
+            return Poll::Ready(self.status);
+        }
+        context.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
+impl Drop for ResumeAfterWake {
+    fn drop(&mut self) {
+        assert!(
+            self.polls > 1 || std::thread::panicking(),
+            "the body was read again before its suspension resumed"
+        );
     }
 }
 
@@ -1146,6 +1184,38 @@ fn response_without_length_is_chunked_on_http11() {
     );
     assert_eq!(text, String::from_utf8_lossy(&uniplex.output));
     assert_eq!(owned.close, uniplex.close);
+}
+
+/// A response body read that suspends is resumed and read again, as `UniplexSession` reads
+/// it, with either framing; any resume status reads on, as Uniplex's does.
+#[test]
+fn a_suspended_response_body_is_read_after_it_resumes_as_uniplex() {
+    let reads = || {
+        vec![
+            ReadAction::Data(b"GET /stream HTTP/1.1\r\nHost: a\r\n\r\n".to_vec()),
+            ReadAction::Eof,
+        ]
+    };
+    for content_length in [false, true] {
+        for status in [ResumeStatus::Signalled, ResumeStatus::Cancelled] {
+            let responses = vec![Response {
+                content_length,
+                suspend: Some(status),
+                ..Response::fixed(200, b"event: one\n\n")
+            }];
+            let (owned, probes) = owned_wire(reads(), responses.clone());
+            let uniplex = uniplex_wire(reads(), responses);
+            let case = format!("content_length {content_length}, {status:?}");
+            assert_eq!(owned.error, None, "{case}");
+            assert_eq!(probes[0].completed, 1, "{case}");
+            assert!(probes[0].cancelled.is_empty(), "{case}");
+            let text = String::from_utf8_lossy(&owned.output);
+            assert!(text.contains("event: one\n\n"), "{case}: {text:?}");
+            assert_eq!(text, String::from_utf8_lossy(&uniplex.output), "{case}");
+            assert_eq!(owned.close, uniplex.close, "{case}");
+            assert_eq!(uniplex.error, None, "{case}");
+        }
+    }
 }
 
 /// Serves one request that selects connection close; no peer EOF follows.
