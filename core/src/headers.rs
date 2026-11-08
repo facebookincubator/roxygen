@@ -240,39 +240,241 @@ const MAX_COMMON_HEADER_NAME_LENGTH: usize = {
     maximum
 };
 
+/// The common-header slot table has `1 << COMMON_HEADER_SLOT_BITS` slots.
+const COMMON_HEADER_SLOT_BITS: u32 = 11;
+const COMMON_HEADER_SLOTS: usize = 1 << COMMON_HEADER_SLOT_BITS;
+/// A slot that holds no common name. It is not a valid entry index.
+const EMPTY_COMMON_HEADER_SLOT: u8 = u8::MAX;
+const _: () = assert!(COMMON_HEADER_DEFINITIONS.len() < EMPTY_COMMON_HEADER_SLOT as usize);
+/// The most words a common name has between its first and last 8 bytes.
+const COMMON_HEADER_MIDDLE_WORDS: usize = common_header_middle_words(MAX_COMMON_HEADER_NAME_LENGTH);
+
+/// The number of 8-byte words that cover the bytes of a `length`-byte name
+/// between its first and last 8 bytes.
+const fn common_header_middle_words(length: usize) -> usize {
+    length.saturating_sub(9) / 8
+}
+
+/// The little-endian 8-byte word at `offset` in `name`.
+#[inline]
+const fn common_header_word(name: &[u8], offset: usize) -> u64 {
+    match name.split_at(offset).1.first_chunk::<8>() {
+        Some(word) => u64::from_le_bytes(*word),
+        None => panic!("a common-header word lies inside the name"),
+    }
+}
+
+/// The two words that a name is hashed by and compared on first, as
+/// little-endian integers.
+///
+/// A name of 8 or more bytes gives its first and last 8 bytes, which cover a
+/// name of up to 16 bytes. A shorter name is packed whole into the first word
+/// from its overlapping first and last halves (4 bytes each, or 2 for a name
+/// of 2 or 3 bytes); the remaining bytes are zero.
+#[inline]
+const fn common_header_end_words(name: &[u8]) -> [u64; 2] {
+    if let (Some(first), Some(last)) = (name.first_chunk::<8>(), name.last_chunk::<8>()) {
+        return [u64::from_le_bytes(*first), u64::from_le_bytes(*last)];
+    }
+    if let (Some(first), Some(last)) = (name.first_chunk::<4>(), name.last_chunk::<4>()) {
+        let first = u32::from_le_bytes(*first) as u64;
+        let last = u32::from_le_bytes(*last) as u64;
+        return [first | last << 32, 0];
+    }
+    if let (Some(first), Some(last)) = (name.first_chunk::<2>(), name.last_chunk::<2>()) {
+        let first = u16::from_le_bytes(*first) as u64;
+        let last = u16::from_le_bytes(*last) as u64;
+        return [first | last << 16, 0];
+    }
+    match name.first() {
+        Some(byte) => [*byte as u64, 0],
+        None => [0, 0],
+    }
+}
+
+/// The slot of a name of `length` bytes with end words `words` (see
+/// `common_header_end_words`).
+///
+/// Each byte is ORed with 0x20 first, so names equal under ASCII case folding
+/// share a slot.
+#[inline]
+const fn common_header_slot(seed: u64, length: usize, words: [u64; 2]) -> usize {
+    const FOLD: u64 = u64::from_ne_bytes([0x20; 8]);
+    let key = (words[0] | FOLD).wrapping_mul(seed) ^ (words[1] | FOLD) ^ length as u64;
+    (key.wrapping_mul(seed) >> (u64::BITS - COMMON_HEADER_SLOT_BITS)) as usize
+}
+
+/// Places every common name in its own slot under `seed`, or returns `None`
+/// when two names share a slot.
+const fn place_common_headers(seed: u64) -> Option<[u8; COMMON_HEADER_SLOTS]> {
+    let mut slots = [EMPTY_COMMON_HEADER_SLOT; COMMON_HEADER_SLOTS];
+    let mut index = 0;
+    while index < COMMON_HEADER_DEFINITIONS.len() {
+        let name = COMMON_HEADER_DEFINITIONS[index].1.as_bytes();
+        let slot = common_header_slot(seed, name.len(), common_header_end_words(name));
+        if slots[slot] != EMPTY_COMMON_HEADER_SLOT {
+            return None;
+        }
+        slots[slot] = index as u8;
+        index += 1;
+    }
+    Some(slots)
+}
+
+/// The first seed of a fixed odd sequence (splitmix64) under which every
+/// common name has its own slot.
+const COMMON_HEADER_SLOT_SEED: u64 = {
+    let mut attempt = 1_u64;
+    loop {
+        assert!(
+            attempt <= 4096,
+            "no seed within 4096 places every common header name in its own slot"
+        );
+        let mut seed = attempt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        seed = (seed ^ (seed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        seed = (seed ^ (seed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        seed = (seed ^ (seed >> 31)) | 1;
+        if place_common_headers(seed).is_some() {
+            break seed;
+        }
+        attempt += 1;
+    }
+};
+
+/// One 8-byte word of a common name, prepared for an ASCII case-insensitive
+/// comparison with a word of a candidate name.
+#[derive(Clone, Copy)]
+struct CommonHeaderWord {
+    /// The word of the name's ASCII-lowercase spelling.
+    lower: u64,
+    /// 0x20 in each byte that holds a letter in the name, zero elsewhere.
+    letters: u64,
+}
+
+impl CommonHeaderWord {
+    const ZERO: Self = Self {
+        lower: 0,
+        letters: 0,
+    };
+
+    /// Zero exactly when each byte of `word` equals this word's byte, or is
+    /// its uppercase letter: ORing 0x20 lowercases a letter, and only a
+    /// letter's two cases differ in that bit alone.
+    #[inline]
+    fn difference(self, word: u64) -> u64 {
+        (word | self.letters) ^ self.lower
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CommonHeaderEntry {
+    code: HttpHeaderCode,
+    length: u8,
+    /// The words `common_header_end_words` gives for the name.
+    ends: [CommonHeaderWord; 2],
+}
+
+/// A perfect hash of the common names: each name has its own slot, which
+/// holds the index of its entry; every other slot is empty.
 struct CommonHeaderLookup {
-    starts: [u8; MAX_COMMON_HEADER_NAME_LENGTH + 2],
-    indices: [u8; COMMON_HEADER_DEFINITIONS.len()],
-    /// The first and last bytes of each name in `indices`, ORed with 0x20.
-    /// Names equal under ASCII case folding have equal folded bytes.
-    folded_ends: [[u8; 2]; COMMON_HEADER_DEFINITIONS.len()],
+    slots: [u8; COMMON_HEADER_SLOTS],
+    entries: [CommonHeaderEntry; COMMON_HEADER_DEFINITIONS.len()],
+    /// Each name's words between its first and last 8 bytes, at offsets 8,
+    /// 16, and so on.
+    middles: [[CommonHeaderWord; COMMON_HEADER_MIDDLE_WORDS]; COMMON_HEADER_DEFINITIONS.len()],
 }
 
 static COMMON_HEADER_LOOKUP: CommonHeaderLookup = {
-    let mut lookup = CommonHeaderLookup {
-        starts: [0; MAX_COMMON_HEADER_NAME_LENGTH + 2],
-        indices: [0; COMMON_HEADER_DEFINITIONS.len()],
-        folded_ends: [[0; 2]; COMMON_HEADER_DEFINITIONS.len()],
+    let Some(slots) = place_common_headers(COMMON_HEADER_SLOT_SEED) else {
+        panic!("the slot seed places every common header name in its own slot");
     };
-    let mut length = 0;
-    let mut next = 0;
-    while length <= MAX_COMMON_HEADER_NAME_LENGTH {
-        lookup.starts[length] = next as u8;
-        let mut index = 0;
-        while index < COMMON_HEADER_DEFINITIONS.len() {
-            let name = COMMON_HEADER_DEFINITIONS[index].1.as_bytes();
-            if name.len() == length {
-                lookup.indices[next] = index as u8;
-                lookup.folded_ends[next] = [name[0] | 0x20, name[length - 1] | 0x20];
-                next += 1;
+    let mut lookup = CommonHeaderLookup {
+        slots,
+        entries: [CommonHeaderEntry {
+            code: HttpHeaderCode::Other,
+            length: 0,
+            ends: [CommonHeaderWord::ZERO; 2],
+        }; COMMON_HEADER_DEFINITIONS.len()],
+        middles: [[CommonHeaderWord::ZERO; COMMON_HEADER_MIDDLE_WORDS];
+            COMMON_HEADER_DEFINITIONS.len()],
+    };
+    let mut index = 0;
+    while index < COMMON_HEADER_DEFINITIONS.len() {
+        let (code, camel, _) = COMMON_HEADER_DEFINITIONS[index];
+        let camel = camel.as_bytes();
+        let mut lower = [0; MAX_COMMON_HEADER_NAME_LENGTH];
+        let mut letters = [0; MAX_COMMON_HEADER_NAME_LENGTH];
+        let mut byte = 0;
+        while byte < camel.len() {
+            lower[byte] = camel[byte].to_ascii_lowercase();
+            if camel[byte].is_ascii_alphabetic() {
+                letters[byte] = 0x20;
             }
-            index += 1;
+            byte += 1;
         }
-        length += 1;
+        let lower = lower.split_at(camel.len()).0;
+        let letters = letters.split_at(camel.len()).0;
+        let lower_ends = common_header_end_words(lower);
+        let letter_ends = common_header_end_words(letters);
+        lookup.entries[index] = CommonHeaderEntry {
+            code,
+            length: camel.len() as u8,
+            ends: [
+                CommonHeaderWord {
+                    lower: lower_ends[0],
+                    letters: letter_ends[0],
+                },
+                CommonHeaderWord {
+                    lower: lower_ends[1],
+                    letters: letter_ends[1],
+                },
+            ],
+        };
+        let mut middle = 0;
+        while middle < common_header_middle_words(camel.len()) {
+            lookup.middles[index][middle] = CommonHeaderWord {
+                lower: common_header_word(lower, 8 + 8 * middle),
+                letters: common_header_word(letters, 8 + 8 * middle),
+            };
+            middle += 1;
+        }
+        index += 1;
     }
-    lookup.starts[MAX_COMMON_HEADER_NAME_LENGTH + 1] = next as u8;
     lookup
 };
+
+/// Test-only counts of the work `HttpCommonHeaders::hash` does.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CommonHeaderLookupWork {
+    /// Lookup-table positions examined.
+    pub(crate) probes: usize,
+    /// Loads from the looked-up name: one per byte, or one per word of up to
+    /// 8 bytes.
+    pub(crate) name_reads: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static COMMON_HEADER_LOOKUP_WORK: std::cell::Cell<CommonHeaderLookupWork> =
+        std::cell::Cell::new(CommonHeaderLookupWork::default());
+}
+
+#[cfg(test)]
+fn count_common_header_lookup_work(probes: usize, name_reads: usize) {
+    COMMON_HEADER_LOOKUP_WORK.with(|work| {
+        let mut counted = work.get();
+        counted.probes += probes;
+        counted.name_reads += name_reads;
+        work.set(counted);
+    });
+}
+
+/// Returns and resets this thread's `HttpCommonHeaders::hash` work counts.
+#[cfg(test)]
+pub(crate) fn take_common_header_lookup_work() -> CommonHeaderLookupWork {
+    COMMON_HEADER_LOOKUP_WORK.take()
+}
 
 /// Selects one of the generated common-header spelling tables.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -293,26 +495,38 @@ impl HttpCommonHeaders {
     /// Returns the generated code for `name`, using ASCII-insensitive matching.
     pub fn hash(name: impl AsRef<[u8]>) -> HttpHeaderCode {
         let name = name.as_ref();
-        if name.len() > MAX_COMMON_HEADER_NAME_LENGTH {
+        if name.is_empty() || name.len() > MAX_COMMON_HEADER_NAME_LENGTH {
             return HttpHeaderCode::Other;
         }
-        let (Some(first), Some(last)) = (name.first(), name.last()) else {
+        let words = common_header_end_words(name);
+        #[cfg(test)]
+        count_common_header_lookup_work(1, if name.len() == 1 { 1 } else { 2 });
+        let lookup = &COMMON_HEADER_LOOKUP;
+        let index = usize::from(
+            lookup.slots[common_header_slot(COMMON_HEADER_SLOT_SEED, name.len(), words)],
+        );
+        let Some(entry) = lookup.entries.get(index) else {
             return HttpHeaderCode::Other;
         };
-        let folded_ends = [first | 0x20, last | 0x20];
-        let start = usize::from(COMMON_HEADER_LOOKUP.starts[name.len()]);
-        let end = usize::from(COMMON_HEADER_LOOKUP.starts[name.len() + 1]);
-        COMMON_HEADER_LOOKUP.folded_ends[start..end]
-            .iter()
-            .zip(&COMMON_HEADER_LOOKUP.indices[start..end])
-            .find_map(|(candidate, &index)| {
-                if *candidate != folded_ends {
-                    return None;
-                }
-                let (code, camel, _) = COMMON_HEADER_DEFINITIONS[usize::from(index)];
-                name.eq_ignore_ascii_case(camel.as_bytes()).then_some(code)
-            })
-            .unwrap_or(HttpHeaderCode::Other)
+        if usize::from(entry.length) != name.len() {
+            return HttpHeaderCode::Other;
+        }
+        let mut difference =
+            entry.ends[0].difference(words[0]) | entry.ends[1].difference(words[1]);
+        for (middle, word) in lookup.middles[index].iter().enumerate() {
+            let offset = 8 + 8 * middle;
+            if offset + 8 >= name.len() {
+                break;
+            }
+            #[cfg(test)]
+            count_common_header_lookup_work(0, 1);
+            difference |= word.difference(common_header_word(name, offset));
+        }
+        if difference == 0 {
+            entry.code
+        } else {
+            HttpHeaderCode::Other
+        }
     }
 
     /// Returns the static spelling for `code` in the selected table.

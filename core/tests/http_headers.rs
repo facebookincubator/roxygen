@@ -1115,6 +1115,139 @@ fn common_header_hash_matches_a_brute_force_lookup() {
     assert_eq!(HttpCommonHeaders::hash(b""), HttpHeaderCode::Other);
 }
 
+fn common_header_names() -> Vec<&'static [u8]> {
+    HttpHeaderCode::ALL[2..]
+        .iter()
+        .map(|code| HttpCommonHeaders::name(*code, HttpCommonHeaderTable::CamelCase))
+        .collect()
+}
+
+#[test]
+fn common_header_hash_matches_brute_force_for_every_single_byte_edit() {
+    let inserted = [b'a', b'A', b'-', b'_', 0x00, 0x0d, 0xff];
+    for name in common_header_names() {
+        for index in 0..name.len() {
+            for byte in 0..=u8::MAX {
+                let mut substituted = name.to_vec();
+                substituted[index] = byte;
+                assert_hash_matches_brute_force(&substituted);
+            }
+            let mut deleted = name.to_vec();
+            deleted.remove(index);
+            assert_hash_matches_brute_force(&deleted);
+            for byte in inserted.into_iter().chain([name[index]]) {
+                let mut extended = name.to_vec();
+                extended.insert(index, byte);
+                assert_hash_matches_brute_force(&extended);
+            }
+        }
+        for length in 0..name.len() {
+            assert_hash_matches_brute_force(&name[..length]);
+            assert_hash_matches_brute_force(&name[name.len() - length..]);
+        }
+    }
+}
+
+#[test]
+fn common_header_hash_matches_brute_force_for_every_short_name() {
+    for first in 0..=u8::MAX {
+        assert_hash_matches_brute_force(&[first]);
+        for second in 0..=u8::MAX {
+            assert_hash_matches_brute_force(&[first, second]);
+        }
+    }
+    let mut alphabet: Vec<u8> = common_header_names()
+        .into_iter()
+        .flatten()
+        .flat_map(|byte| [byte.to_ascii_lowercase(), byte.to_ascii_uppercase()])
+        .chain([0x00, 0x0d, 0x7f, 0xff])
+        .collect();
+    alphabet.sort_unstable();
+    alphabet.dedup();
+    for &first in &alphabet {
+        for &second in &alphabet {
+            for &third in &alphabet {
+                assert_hash_matches_brute_force(&[first, second, third]);
+            }
+        }
+    }
+}
+
+#[test]
+fn common_header_lookup_probes_one_slot_and_reads_names_a_word_at_a_time() {
+    use crate::headers::CommonHeaderLookupWork;
+    use crate::headers::take_common_header_lookup_work;
+
+    fn work(name: &[u8]) -> (HttpHeaderCode, CommonHeaderLookupWork) {
+        take_common_header_lookup_work();
+        let code = HttpCommonHeaders::hash(name);
+        (code, take_common_header_lookup_work())
+    }
+    let expected = |probes, name_reads| CommonHeaderLookupWork { probes, name_reads };
+    // One slot, then two overlapping reads for a name of up to 16 bytes and
+    // one more read per further 8 bytes.
+    let literals = [
+        (b"TE".as_slice(), HttpHeaderCode::Te, 2),
+        (b"date", HttpHeaderCode::Date, 2),
+        (b"Content-Type", HttpHeaderCode::ContentType, 2),
+        (b"content-length", HttpHeaderCode::ContentLength, 2),
+        (
+            b"ACCESS-CONTROL-ALLOW-METHODS",
+            HttpHeaderCode::AccessControlAllowMethods,
+            4,
+        ),
+        (
+            b"cross-origin-embedder-policy-report-only",
+            HttpHeaderCode::CrossOriginEmbedderPolicyReportOnly,
+            5,
+        ),
+    ];
+    assert_eq!(
+        literals.map(|(name, _, _)| work(name)),
+        literals.map(|(_, code, name_reads)| (code, expected(1, name_reads))),
+    );
+
+    let words = |length: usize| length.div_ceil(8).max(2);
+    let mut lookups = 0;
+    let mut over = Vec::new();
+    for name in common_header_names() {
+        for spelling in [
+            name.to_vec(),
+            name.to_ascii_lowercase(),
+            name.to_ascii_uppercase(),
+        ] {
+            lookups += 1;
+            let (_, counted) = work(&spelling);
+            if counted != expected(1, words(spelling.len())) {
+                over.push((spelling.escape_ascii().to_string(), counted));
+            }
+        }
+    }
+    for name in BENCH_HEADER_NAMES
+        .iter()
+        .map(|name| name.as_bytes().to_vec())
+        .chain(common_header_names().into_iter().flat_map(|name| {
+            let mut near_miss = name.to_vec();
+            near_miss[name.len() / 2] ^= 0x20;
+            [near_miss, [name, b"!".as_slice()].concat()]
+        }))
+    {
+        lookups += 1;
+        let (_, counted) = work(&name);
+        if counted.probes > 1 || counted.name_reads > words(name.len()) {
+            over.push((name.escape_ascii().to_string(), counted));
+        }
+    }
+    assert!(
+        over.is_empty(),
+        "{} of {lookups} lookups probe more than one slot or read the name more than twice or \
+         more than once per 8 bytes; the first: {:?}",
+        over.len(),
+        &over[..over.len().min(6)],
+    );
+    assert_eq!(work(b""), (HttpHeaderCode::Other, expected(0, 0)));
+}
+
 #[test]
 fn empty_and_near_miss_names_keep_their_query_results() {
     use std::panic::AssertUnwindSafe;
