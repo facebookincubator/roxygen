@@ -1094,3 +1094,11 @@ mod native_staged_cleanup_tests;
 #[cfg(test)]
 #[path = "../tests/ping_probes.rs"]
 mod ping_probes_tests;
+
+#[cfg(test)]
+#[path = "../tests/idle_sweep_cost.rs"]
+mod idle_sweep_cost_tests;
+
+#[cfg(test)]
+#[path = "../tests/pool_idle_timeout.rs"]
+mod pool_idle_timeout_tests;

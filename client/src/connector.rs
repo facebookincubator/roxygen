@@ -1860,6 +1860,12 @@ impl ClientSession {
         self.inner.handle.initiate_drain()
     }
 
+    /// Refuses new reservations and requests ahead of `initiate_drain`, so that
+    /// callbacks run by another session's drain cannot reserve this one.
+    pub(crate) fn close_admission(&self) {
+        self.inner.draining.set(true);
+    }
+
     pub fn close_when_idle(&self) -> Result<bool, HttpError> {
         self.inner.draining.set(true);
         self.inner.handle.close_when_idle()
@@ -1889,6 +1895,12 @@ impl ClientSession {
 
     pub fn active_transactions(&self) -> u32 {
         self.inner.active_transactions.get()
+    }
+
+    /// Reserved and active transactions as the session counts them, before the
+    /// lifecycle events that `active_transactions` follows are delivered.
+    pub(crate) fn admitted_transactions(&self) -> u32 {
+        self.inner.outgoing_activity.admitted_transactions()
     }
 
     pub fn supports_more_transactions(&self) -> bool {

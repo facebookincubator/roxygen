@@ -112,6 +112,46 @@ pub struct PoolParams {
     pub connect_timeout: Duration,
     pub max_age: Duration,
     pub max_waiters: u16,
+    /// Roxygen-only (`DIV-032`): retires a session once it has had no active or reserved
+    /// exchange for this long, through a pool task and again at acquisition; zero, the
+    /// default, disables it. A session with an active or reserved exchange is never retired,
+    /// however long the exchange runs. Native pools only: an attached pool's
+    /// [`AttachedPoolParams`] has no idle timeout.
+    pub idle_timeout: Duration,
+    /// Roxygen-only (`DIV-032`): which idle session an acquisition takes when no busy
+    /// session can take another exchange. Native pools only.
+    pub reuse_order: SessionReuseOrder,
+    /// Roxygen-only (`DIV-032`): when the pool task and acquisitions retire
+    /// sessions idle for `idle_timeout`.
+    pub idle_sweep: IdleSweep,
+}
+
+/// When idle retirement retires sessions (`DIV-032`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum IdleSweep {
+    /// The pool task retires each session when it has been idle for
+    /// `idle_timeout`, and an acquisition retires every such session it finds.
+    #[default]
+    AtExpiry,
+    /// As hyper-util 0.1.20's legacy pool (reqwest 0.12.28): the pool task sweeps
+    /// every `max(idle_timeout, 90 ms)`, from when a session first became idle with
+    /// no waiter to take it until the pool drains, retiring the sessions idle for
+    /// longer than `idle_timeout`, so a session closes up to one period after that.
+    /// An acquisition retires expired sessions only in reuse order until it finds
+    /// one that is not, and leaves the others to the sweep.
+    Interval,
+}
+
+/// The idle session that a pool acquisition reuses (`DIV-032`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SessionReuseOrder {
+    /// The frozen order: the session given an exchange least recently.
+    #[default]
+    LeastRecentlyUsed,
+    /// The session that most recently lost its last active or reserved exchange, as
+    /// hyper-util's legacy pool (reqwest) reuses the connection returned last, so that
+    /// sessions beyond what the traffic needs stay idle and reach `idle_timeout`.
+    MostRecentlyUsed,
 }
 
 impl Default for PoolParams {
@@ -123,6 +163,9 @@ impl Default for PoolParams {
             connect_timeout: Duration::from_secs(2),
             max_age: Duration::from_secs(10 * 60),
             max_waiters: u16::MAX,
+            idle_timeout: Duration::ZERO,
+            reuse_order: SessionReuseOrder::LeastRecentlyUsed,
+            idle_sweep: IdleSweep::AtExpiry,
         }
     }
 }
@@ -463,6 +506,44 @@ struct SessionEntry {
     session: ClientSession,
     max_age: Duration,
     ownership: Option<Rc<SessionOwnership>>,
+    /// When the session last lost its last active or reserved exchange, while it has none.
+    idle_since: Option<Instant>,
+}
+
+impl SessionEntry {
+    fn new(
+        session: ClientSession,
+        max_age: Duration,
+        ownership: Option<Rc<SessionOwnership>>,
+    ) -> Self {
+        Self {
+            session,
+            max_age,
+            ownership,
+            idle_since: None,
+        }
+    }
+
+    /// When the session became idle, while it has no active or reserved exchange.
+    /// The session's own count decides, as a callback run by a new reservation
+    /// can reach the pool before the reservation's `TransactionAttached` does.
+    fn idle_since(&self) -> Option<Instant> {
+        self.idle_since
+            .filter(|_| self.session.admitted_transactions() == 0)
+    }
+
+    /// Whether the session has been idle for `timeout`: at least that long at
+    /// expiry, longer on an interval, as hyper-util's checkout and sweep compare.
+    fn idle_expired(&self, now: Instant, timeout: Duration, sweep: IdleSweep) -> bool {
+        !timeout.is_zero()
+            && self.idle_since().is_some_and(|since| {
+                let idle = now.saturating_duration_since(since);
+                match sweep {
+                    IdleSweep::AtExpiry => idle >= timeout,
+                    IdleSweep::Interval => idle > timeout,
+                }
+            })
+    }
 }
 
 /// Waiting acquisitions credited to a pending connect, including the one that
@@ -625,6 +706,97 @@ async fn supervise_pool(
         .send_replace(Some(tasks.failure.borrow().clone().map_or(Ok(()), Err)));
 }
 
+/// The shortest period of `IdleSweep::Interval`, as hyper-util's `MIN_CHECK`.
+const MIN_IDLE_SWEEP_PERIOD: Duration = Duration::from_millis(90);
+
+/// Retires sessions that keep no active or reserved exchange for the pool's
+/// `idle_timeout` (`DIV-032`): with `IdleSweep::AtExpiry` when the longest-idle
+/// session expires, with `IdleSweep::Interval` every `max(idle_timeout, 90 ms)`
+/// from when a session first became idle with no waiter to take it, as hyper-util
+/// 0.1.20's `IdleTask`.
+///
+/// At expiry, a session that becomes idle expires after every session already
+/// idle, so the task is signalled only while it waits without a deadline because
+/// no session was idle; otherwise it wakes only at its deadline. Every pass scans
+/// all pooled sessions. A pass retires every session expired by then, or finds that
+/// the session it waited for was reused and recomputes from the longest-idle
+/// session left; idle periods that end at k distinct times cost up to k retiring
+/// passes, each followed by a recompute, even within one `idle_timeout`. Apart from
+/// those, steady traffic, which reuses sessions idle only briefly, costs about one
+/// or two passes per `idle_timeout` rather than one per request. On an interval,
+/// the task is signalled once, to start, and then sweeps once per period until the
+/// pool drains, whether or not any session is idle.
+async fn retire_idle_sessions(
+    state: Weak<RefCell<PoolState>>,
+    wake: Rc<CancellableBaton>,
+    cancellation: CancellationToken,
+) {
+    // `IdleSweep::Interval`: when the next sweep runs, once started.
+    let mut sweep_at: Option<Option<Instant>> = None;
+    loop {
+        let (deadline, now, sweep, period) = {
+            let Some(pool) = state.upgrade() else {
+                return;
+            };
+            let mut pool = pool.borrow_mut();
+            #[cfg(test)]
+            pool.idle_retirement_passes
+                .set(pool.idle_retirement_passes.get() + 1);
+            let now = Instant::now();
+            let timeout = pool.pool_params.idle_timeout;
+            let sweep = pool.pool_params.idle_sweep;
+            let period = timeout.max(MIN_IDLE_SWEEP_PERIOD);
+            // A deadline past `Instant`'s range never comes: wait unparked, unsignalled.
+            let deadline = match sweep {
+                IdleSweep::AtExpiry => {
+                    let longest_idle = pool.longest_idle_since();
+                    pool.idle_retirement_parked = longest_idle.is_none();
+                    longest_idle.and_then(|since| since.checked_add(timeout))
+                }
+                IdleSweep::Interval => {
+                    if sweep_at.is_none() {
+                        sweep_at = pool.idle_sweep_from.map(|from| from.checked_add(period));
+                    }
+                    sweep_at.flatten()
+                }
+            };
+            (deadline, now, sweep, period)
+        };
+        if let Some(deadline) = deadline
+            && deadline <= now
+        {
+            let Some(pool) = state.upgrade() else {
+                return;
+            };
+            let expired = pool.borrow_mut().take_idle_expired(now);
+            #[cfg(test)]
+            if !expired.is_empty() {
+                let passes = &pool.borrow().idle_retirement_retiring_passes;
+                passes.set(passes.get() + 1);
+            }
+            drop(pool);
+            match sweep {
+                IdleSweep::AtExpiry if expired.is_empty() => {
+                    // Unreachable while expiry and retirement share their predicate.
+                    tokio::task::yield_now().await;
+                }
+                IdleSweep::AtExpiry => {}
+                // As hyper-util, from when the sweep ends.
+                IdleSweep::Interval => sweep_at = Some(Instant::now().checked_add(period)),
+            }
+            drop(expired);
+            continue;
+        }
+        // A zero baton timeout waits without a deadline.
+        let remaining = deadline.map_or(Duration::ZERO, |deadline| deadline - now);
+        let status = wake.timed_wait(remaining, cancellation.clone()).await;
+        match status {
+            WaitStatus::Signalled | WaitStatus::TimedOut => wake.reset(),
+            WaitStatus::Cancelled | WaitStatus::NotReady => return,
+        }
+    }
+}
+
 pub(crate) struct PoolState {
     context: WorkerContext,
     pool_params: PoolParams,
@@ -640,6 +812,17 @@ pub(crate) struct PoolState {
     observed_capacity: Option<u32>,
     owned_connections: u64,
     tasks: Rc<PoolTasks>,
+    /// Wakes the idle-retirement task when a session becomes idle while it waits
+    /// without a deadline (`idle_retirement_parked`), or, on an interval, to start.
+    idle_wake: Rc<CancellableBaton>,
+    idle_retirement_parked: bool,
+    /// `IdleSweep::Interval`: when a session first became idle with no waiter to
+    /// take it, as hyper-util's first `put` onto its idle list spawns its sweep.
+    idle_sweep_from: Option<Instant>,
+    #[cfg(test)]
+    idle_retirement_passes: Cell<u64>,
+    #[cfg(test)]
+    idle_retirement_retiring_passes: Cell<u64>,
     next_waiter_id: u64,
     pooling_enabled: bool,
     draining: bool,
@@ -791,6 +974,115 @@ impl PoolState {
     fn take_all_waiters(&mut self) -> Vec<Rc<Waiter>> {
         self.waiters.drain(..).collect()
     }
+
+    /// Stamps when each session lost its last active or reserved exchange, for idle
+    /// retirement and the most-recently-used order, and reports whether idle retirement
+    /// must wake for a session that became idle: at expiry while it waits without a
+    /// deadline; on an interval to start sweeping, the first time no waiter is
+    /// `handed` a session as one becomes idle.
+    fn track_idle_sessions(&mut self, handed: bool) -> bool {
+        if self.pool_params.idle_timeout.is_zero()
+            && self.pool_params.reuse_order == SessionReuseOrder::LeastRecentlyUsed
+        {
+            return false;
+        }
+        let mut now = None;
+        self.sessions.iter_mut().for_each(|entry| {
+            entry.idle_since = if entry.session.admitted_transactions() == 0 {
+                entry
+                    .idle_since
+                    .or_else(|| Some(*now.get_or_insert_with(Instant::now)))
+            } else {
+                None
+            };
+        });
+        let Some(now) = now.filter(|_| !self.pool_params.idle_timeout.is_zero()) else {
+            return false;
+        };
+        match self.pool_params.idle_sweep {
+            IdleSweep::AtExpiry => std::mem::take(&mut self.idle_retirement_parked),
+            IdleSweep::Interval => {
+                let start = !handed && self.idle_sweep_from.is_none();
+                if start {
+                    self.idle_sweep_from = Some(now);
+                }
+                start
+            }
+        }
+    }
+
+    /// When the longest-idle session became idle; `None` while no session is idle.
+    fn longest_idle_since(&self) -> Option<Instant> {
+        self.sessions
+            .iter()
+            .filter_map(SessionEntry::idle_since)
+            .min()
+    }
+
+    /// Removes the idle-expired sessions and closes their admission before any is
+    /// drained: a drain runs callbacks, which must not reserve a session that a
+    /// later drain in the same batch would then refuse.
+    fn take_idle_expired(&mut self, now: Instant) -> RetiredSessions {
+        let timeout = self.pool_params.idle_timeout;
+        let sweep = self.pool_params.idle_sweep;
+        let mut expired = RetiredSessions::default();
+        self.sessions.retain(|entry| {
+            let retain = !entry.idle_expired(now, timeout, sweep);
+            if !retain {
+                entry.session.close_admission();
+                expired.push(entry.session.clone());
+            }
+            retain
+        });
+        expired
+    }
+
+    /// The session an acquisition reuses when no busy session can take another
+    /// exchange, in reuse order. On an interval (`checkout_at`), as hyper-util's
+    /// checkout pops its idle list from the end: it retires expired candidates
+    /// into `retired`, closing their admission, until it finds one that is not,
+    /// and leaves older expired sessions to the sweep.
+    fn select_idle_session(
+        &mut self,
+        checkout_at: Option<Instant>,
+        retired: &mut RetiredSessions,
+    ) -> Option<usize> {
+        let timeout = self.pool_params.idle_timeout;
+        let sweep = self.pool_params.idle_sweep;
+        loop {
+            let index = match self.pool_params.reuse_order {
+                SessionReuseOrder::LeastRecentlyUsed => None,
+                SessionReuseOrder::MostRecentlyUsed => self.most_recently_idle_session(),
+            }
+            .or_else(|| {
+                self.sessions
+                    .iter()
+                    .position(|entry| entry.session.supports_more_transactions())
+            })?;
+            if !checkout_at
+                .is_some_and(|now| self.sessions[index].idle_expired(now, timeout, sweep))
+            {
+                return Some(index);
+            }
+            let entry = self
+                .sessions
+                .remove(index)
+                .expect("an indexed session remains in the pool");
+            entry.session.close_admission();
+            retired.push(entry.session);
+        }
+    }
+
+    /// The selectable session that most recently became idle.
+    fn most_recently_idle_session(&self) -> Option<usize> {
+        self.sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.session.supports_more_transactions())
+            .filter_map(|(index, entry)| entry.idle_since().map(|since| (since, index)))
+            .max()
+            .map(|(_, index)| index)
+    }
 }
 
 fn signal_waiters(waiters: Vec<Rc<Waiter>>) {
@@ -810,6 +1102,50 @@ fn drain_sessions(sessions: Vec<ClientSession>) {
     sessions.into_iter().for_each(|session| {
         let _ = catch_callback(|| session.initiate_drain());
     });
+}
+
+/// Sessions removed from the pool whose drains are still owed. Dropping the
+/// batch, also while unwinding from a panicking callback, drains every session
+/// left in it: the pool no longer reaches them, so a skipped drain would leave
+/// the connection open and the pool's drain waiting for it.
+#[derive(Default)]
+struct RetiredSessions(Vec<ClientSession>);
+
+impl RetiredSessions {
+    fn push(&mut self, session: ClientSession) {
+        self.0.push(session);
+    }
+
+    fn append(&mut self, other: &mut Self) {
+        self.0.append(&mut other.0);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Drains every session, in order, then resumes the first panic a drain raised.
+    fn drain_propagating_panics(mut self) {
+        let mut first_panic = None;
+        std::mem::take(&mut self.0).into_iter().for_each(|session| {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| session.initiate_drain())) {
+                if first_panic.is_none() {
+                    first_panic = Some(payload);
+                } else {
+                    drop_caught(payload);
+                }
+            }
+        });
+        if let Some(payload) = first_panic {
+            resume_unwind(payload);
+        }
+    }
+}
+
+impl Drop for RetiredSessions {
+    fn drop(&mut self) {
+        drain_sessions(std::mem::take(&mut self.0));
+    }
 }
 
 fn pop_next_session_for_teardown(state: &mut PoolState) -> Option<SessionEntry> {
@@ -835,7 +1171,7 @@ pub(crate) fn notify_session_event(
     wake_count: usize,
     release_idle: bool,
 ) {
-    let (sessions_to_drain, waiters, idle_changed) = {
+    let (sessions_to_drain, waiters, idle_changed, idle_wake) = {
         let mut state = pool.borrow_mut();
         if state.context.worker_id() != worker {
             return;
@@ -889,8 +1225,19 @@ pub(crate) fn notify_session_event(
             wake_count
         };
         let waiters = state.take_waiters(wake_count);
-        (sessions_to_drain, waiters, prior_idle.abs_diff(idle))
+        let idle_wake = state
+            .track_idle_sessions(!waiters.is_empty())
+            .then(|| Rc::clone(&state.idle_wake));
+        (
+            sessions_to_drain,
+            waiters,
+            prior_idle.abs_diff(idle),
+            idle_wake,
+        )
     };
+    if let Some(idle_wake) = idle_wake {
+        let _ = catch_callback(|| idle_wake.signal());
+    }
     signal_waiters(waiters);
     drain_sessions(sessions_to_drain);
     for _ in 0..idle_changed {
@@ -1076,7 +1423,12 @@ struct ConnectionAttempt {
 }
 
 enum AcquireStep {
-    Session(ClientSession),
+    /// `retired`: idle-expired sessions to drain once `session` is reserved, so
+    /// that no callback their drain runs can reserve `session` first.
+    Session {
+        session: ClientSession,
+        retired: RetiredSessions,
+    },
     StartAndWait {
         attempt: ConnectionAttempt,
         waiter: Rc<Waiter>,
@@ -1137,6 +1489,8 @@ impl HttpSessionPool {
             let tasks = Rc::clone(&pool.state.borrow().tasks);
             tasks.fail(error.clone());
             tasks.completion.send_replace(Some(Err(error)));
+        } else if !pool_params.idle_timeout.is_zero() {
+            pool.start_idle_retirement();
         }
         pool
     }
@@ -1190,6 +1544,9 @@ impl HttpSessionPool {
                 connect_timeout: params.connect_timeout,
                 max_age: params.max_age,
                 max_waiters: params.max_waiters,
+                idle_timeout: Duration::ZERO,
+                reuse_order: SessionReuseOrder::LeastRecentlyUsed,
+                idle_sweep: IdleSweep::AtExpiry,
             },
             PoolBackend::Attached {
                 security,
@@ -1232,6 +1589,13 @@ impl HttpSessionPool {
                 observed_capacity: None,
                 owned_connections: 0,
                 tasks: Rc::clone(&tasks),
+                idle_wake: Rc::new(CancellableBaton::new()),
+                idle_retirement_parked: false,
+                idle_sweep_from: None,
+                #[cfg(test)]
+                idle_retirement_passes: Cell::default(),
+                #[cfg(test)]
+                idle_retirement_retiring_passes: Cell::default(),
                 next_waiter_id: 1,
                 pooling_enabled,
                 draining: false,
@@ -1240,6 +1604,18 @@ impl HttpSessionPool {
             })),
             drain_on_drop: true,
         }
+    }
+
+    fn start_idle_retirement(&self) {
+        let (tasks, wake) = {
+            let state = self.state.borrow();
+            (Rc::clone(&state.tasks), Rc::clone(&state.idle_wake))
+        };
+        let state = Rc::downgrade(&self.state);
+        // A refused spawn means the pool is already draining, which retires every session.
+        let _ = spawn_pool_task(&tasks, move |cancellation| {
+            retire_idle_sessions(state, wake, cancellation)
+        });
     }
 
     fn install_supervisor(&self) -> Result<(), PoolError> {
@@ -1689,11 +2065,9 @@ impl HttpSessionPool {
             let wake_count = session.available_transactions();
             let worker = state.context.worker_id();
             let max_age = sampled_max_age(state.pool_params.max_age);
-            state.sessions.push_back(SessionEntry {
-                session,
-                max_age,
-                ownership: Some(ownership),
-            });
+            state
+                .sessions
+                .push_back(SessionEntry::new(session, max_age, Some(ownership)));
             (worker, wake_count)
         };
         notify_session_event(&self.state, worker, None, false, wake_count, true);
@@ -1740,8 +2114,76 @@ impl HttpSessionPool {
     }
 
     #[cfg(test)]
+    pub(crate) fn expire_session_for_test(&self, session: &ClientSession) {
+        let mut state = self.state.borrow_mut();
+        let entry = state
+            .sessions
+            .iter_mut()
+            .find(|entry| entry.session.is_same_session(session))
+            .expect("the session is pooled");
+        let age = entry.session.age();
+        assert!(!age.is_zero(), "the fixture established an aged session");
+        entry.max_age = age;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_idle_sessions_for_test(&self, by: Duration) {
+        self.state
+            .borrow_mut()
+            .sessions
+            .iter_mut()
+            .for_each(|entry| {
+                let since = entry.idle_since.expect("the fixture left the session idle");
+                entry.idle_since = since.checked_sub(by);
+            });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_idle_session_for_test(&self, session: &ClientSession, by: Duration) {
+        let mut state = self.state.borrow_mut();
+        let entry = state
+            .sessions
+            .iter_mut()
+            .find(|entry| entry.session.is_same_session(session))
+            .expect("the session is pooled");
+        let since = entry.idle_since.expect("the fixture left the session idle");
+        entry.idle_since = since.checked_sub(by);
+    }
+
+    /// Stamps every session idle since `by` ago, active or not, and wakes idle
+    /// retirement, as a missed session event would leave them.
+    #[cfg(test)]
+    pub(crate) fn stamp_sessions_idle_for_test(&self, by: Duration) {
+        let wake = {
+            let mut state = self.state.borrow_mut();
+            let since = Instant::now().checked_sub(by);
+            state
+                .sessions
+                .iter_mut()
+                .for_each(|entry| entry.idle_since = since);
+            Rc::clone(&state.idle_wake)
+        };
+        wake.signal();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn idle_retirement_passes_for_test(&self) -> u64 {
+        self.state.borrow().idle_retirement_passes.get()
+    }
+
+    /// Idle-retirement passes that retired at least one session.
+    #[cfg(test)]
+    pub(crate) fn idle_retirement_retiring_passes_for_test(&self) -> u64 {
+        self.state.borrow().idle_retirement_retiring_passes.get()
+    }
+
+    #[cfg(test)]
     pub(crate) fn acquisition_step_for_test(&self, started: Instant) -> Result<(), PoolError> {
-        next_step(&self.state, started, false).map(|_| ())
+        next_step(&self.state, started, false).map(|step| {
+            if let AcquireStep::Session { retired, .. } = step {
+                retired.drain_propagating_panics();
+            }
+        })
     }
 
     #[cfg(test)]
@@ -1751,11 +2193,9 @@ impl HttpSessionPool {
         if session.is_idle() {
             state.idle_sessions = state.idle_sessions.saturating_add(1);
         }
-        state.sessions.push_back(SessionEntry {
-            session,
-            max_age: Duration::ZERO,
-            ownership: None,
-        });
+        state
+            .sessions
+            .push_back(SessionEntry::new(session, Duration::ZERO, None));
     }
 }
 
@@ -1800,15 +2240,17 @@ fn acquire_session(
             }
             let step = next_step(&state, started, woken)?;
             match step {
-                AcquireStep::Session(session) => match session.reserve_request() {
-                    Ok(reservation) => {
-                        return Ok(GetSessionResult {
+                AcquireStep::Session { session, retired } => {
+                    let reservation = session.reserve_request();
+                    retired.drain_propagating_panics();
+                    return match reservation {
+                        Ok(reservation) => Ok(GetSessionResult {
                             reservation,
                             session,
-                        });
-                    }
-                    Err(source) => return Err(PoolError::ReservationFailed { source }),
-                },
+                        }),
+                        Err(source) => Err(PoolError::ReservationFailed { source }),
+                    };
+                }
                 AcquireStep::StartAndWait {
                     attempt,
                     waiter,
@@ -1991,11 +2433,11 @@ async fn run_connection_attempt(
                 connected.bind_pool(Rc::downgrade(&pool));
                 let wake_count = connected.available_transactions();
                 let max_age = sampled_max_age(pool.borrow().pool_params.max_age);
-                pool.borrow_mut().sessions.push_back(SessionEntry {
-                    session: connected,
+                pool.borrow_mut().sessions.push_back(SessionEntry::new(
+                    connected,
                     max_age,
-                    ownership: Some(Rc::clone(ownership)),
-                });
+                    Some(Rc::clone(ownership)),
+                ));
                 notify_session_event(&pool, context.worker_id(), None, false, wake_count, false);
                 if let Some(credit) = &guard.credit {
                     let credited = {
@@ -2054,7 +2496,8 @@ fn next_step(
     started: Instant,
     woken: bool,
 ) -> Result<AcquireStep, PoolError> {
-    let mut expired = Vec::new();
+    let mut expired = RetiredSessions::default();
+    let mut idle_expired = RetiredSessions::default();
     let mut relayed = None;
     let step = (|| {
         let mut pool = state.borrow_mut();
@@ -2062,10 +2505,18 @@ fn next_step(
         pool.sessions
             .retain(|entry| !entry.session.is_finished() && !entry.session.is_draining());
         let bounded = pool.ownership_bound().is_some();
+        let idle_timeout = pool.pool_params.idle_timeout;
+        let idle_sweep = pool.pool_params.idle_sweep;
+        let now = (!idle_timeout.is_zero()).then(Instant::now);
+        // At expiry, every expired session is retired here; on an interval, selection
+        // below retires them as hyper-util's checkout does.
+        let expired_at = now.filter(|_| idle_sweep == IdleSweep::AtExpiry);
+        let checkout_at = now.filter(|_| idle_sweep == IdleSweep::Interval);
         while let Some(index) = pool.sessions.iter().position(|entry| {
-            entry.max_age != Duration::ZERO
+            (entry.max_age != Duration::ZERO
                 && entry.session.supports_more_transactions()
-                && entry.session.age() >= entry.max_age
+                && entry.session.age() >= entry.max_age)
+                || expired_at.is_some_and(|now| entry.idle_expired(now, idle_timeout, idle_sweep))
         }) {
             let Some(entry) = pool.sessions.remove(index) else {
                 break;
@@ -2081,16 +2532,19 @@ fn next_step(
                 pool.sessions.insert(index, entry);
                 break;
             }
-            expired.push(entry.session);
+            if expired_at.is_some_and(|now| entry.idle_expired(now, idle_timeout, idle_sweep)) {
+                // As `take_idle_expired`: no drain may let a callback reserve it.
+                entry.session.close_admission();
+                idle_expired.push(entry.session);
+            } else {
+                expired.push(entry.session);
+            }
         }
         let available = pool.sessions.iter().position(|entry| {
             !entry.session.is_idle() && entry.session.supports_more_transactions()
         });
-        let selected = available.or_else(|| {
-            pool.sessions
-                .iter()
-                .position(|entry| entry.session.supports_more_transactions())
-        });
+        let selected =
+            available.or_else(|| pool.select_idle_session(checkout_at, &mut idle_expired));
         Ok(if let Some(index) = selected {
             let session = pool
                 .sessions
@@ -2098,7 +2552,10 @@ fn next_step(
                 .expect("an indexed session remains in the pool")
                 .session
                 .clone();
-            AcquireStep::Session(session)
+            AcquireStep::Session {
+                session,
+                retired: RetiredSessions::default(),
+            }
         } else {
             let wait_timeout = pool.pool_params.connect_timeout;
             if (!pool.backend.is_attached() || !wait_timeout.is_zero())
@@ -2190,19 +2647,17 @@ fn next_step(
         })
     })();
     signal_waiters(relayed.into_iter().collect());
-    let mut first_panic = None;
-    expired.into_iter().for_each(|session| {
-        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| session.initiate_drain())) {
-            if first_panic.is_none() {
-                first_panic = Some(payload);
-            } else {
-                drop_caught(payload);
-            }
+    let step = match step {
+        Ok(AcquireStep::Session { session, .. }) => Ok(AcquireStep::Session {
+            session,
+            retired: idle_expired,
+        }),
+        step => {
+            expired.append(&mut idle_expired);
+            step
         }
-    });
-    if let Some(payload) = first_panic {
-        resume_unwind(payload);
-    }
+    };
+    expired.drain_propagating_panics();
     step
 }
 

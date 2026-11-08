@@ -303,6 +303,12 @@ impl OutgoingTransactionActivity {
     pub fn supports_more(&self) -> bool {
         self.available() != 0
     }
+
+    /// Reserved and active transactions, counted before any lifecycle callback
+    /// hears of the change.
+    pub fn admitted_transactions(&self) -> u32 {
+        self.shared.total_transactions()
+    }
 }
 
 impl SharedSessionState {
