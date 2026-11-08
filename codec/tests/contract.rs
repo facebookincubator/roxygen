@@ -1263,3 +1263,75 @@ fn spike_cannot_own_session_or_source() {
     assert_eq!(source_drops.get(), 1);
     assert_eq!(HttpCodec::create_stream(codec.as_mut()), StreamId::new(1));
 }
+
+#[test]
+fn an_emptied_action_list_yields_a_result_without_a_buffer() {
+    let mut codec = SpikeCodec::default();
+    let mut callback = EventNames::default();
+    let mut callback_egress = BufQueue::new(0);
+    // A filter that rejects every action leaves an empty list that keeps its
+    // buffer.
+    let mut actions = CodecCallbackActions::from(vec![
+        CodecCallbackAction::SetParserPaused(true),
+        CodecCallbackAction::Generate(OwnedEgressFrame::ConnectionPreface),
+    ]);
+    actions.retain(|_| false);
+
+    let result =
+        HttpCodec::apply_callback_actions(&mut codec, actions, &mut callback, &mut callback_egress);
+
+    assert!(result.egress_results.is_empty());
+    assert_eq!(
+        result.egress_results.capacity(),
+        0,
+        "an empty action list yields a result without a heap buffer"
+    );
+    assert!(!HttpCodec::is_parser_paused(&codec));
+    assert!(callback_egress.is_empty());
+    assert!(callback.names.is_empty());
+}
+
+fn written(bytes_written: usize) -> Result<GeneratedFrame, HttpError> {
+    Ok(GeneratedFrame {
+        bytes_written,
+        ..GeneratedFrame::default()
+    })
+}
+
+fn bytes_written(result: &CodecIngressResult) -> Vec<usize> {
+    result
+        .egress_results
+        .iter()
+        .map(|generated| generated.as_ref().expect("written").bytes_written)
+        .collect()
+}
+
+#[test]
+fn empty_callback_results_leave_the_ingress_results_unchanged() {
+    let mut result = CodecIngressResult::new(3);
+
+    result.append_callback_result(CodecCallbackResult::default());
+    assert!(result.egress_results.is_empty());
+    assert_eq!(result.egress_results.capacity(), 0);
+
+    result.append_callback_result(CodecCallbackResult {
+        egress_results: vec![written(1)],
+    });
+    let capacity = result.egress_results.capacity();
+    result.append_callback_result(CodecCallbackResult::default());
+    result.append_callback_result(CodecCallbackResult {
+        egress_results: Vec::with_capacity(4),
+    });
+    assert_eq!(bytes_written(&result), [1]);
+    assert_eq!(result.egress_results.capacity(), capacity);
+
+    result.append_callback_result(CodecCallbackResult {
+        egress_results: vec![written(2), written(3)],
+    });
+    assert_eq!(result.consumed, 3);
+    assert_eq!(
+        bytes_written(&result),
+        [1, 2, 3],
+        "later results follow earlier ones"
+    );
+}

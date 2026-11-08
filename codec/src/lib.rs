@@ -441,6 +441,9 @@ impl CodecIngressResult {
 
     /// Appends results from the next callback emitted by this parse call.
     pub fn append_callback_result(&mut self, result: CodecCallbackResult) {
+        if result.egress_results.is_empty() {
+            return;
+        }
         self.egress_results.extend(result.egress_results);
     }
 }
@@ -652,6 +655,9 @@ pub trait HttpCodec {
         callback: &mut dyn HttpCodecCallback,
         callback_egress: &mut BufQueue,
     ) -> CodecCallbackResult {
+        if actions.is_empty() {
+            return CodecCallbackResult::default();
+        }
         let egress_results = actions
             .into_iter()
             .filter_map(|action| match action {

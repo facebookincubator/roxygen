@@ -130,13 +130,105 @@ enum ParseState {
     Idle,
     Head(Vec<u8>),
     FixedBody(u64),
-    ChunkSize(Vec<u8>),
+    ChunkSize(ChunkSizeLine),
     ChunkBody(u64),
-    ChunkDelimiter(Vec<u8>),
+    /// Whether the chunk terminator's CR has been read.
+    ChunkDelimiter(bool),
     Trailers(Vec<u8>),
     UntilEof,
     Upgraded,
     MessageComplete(bool),
+}
+
+/// The longest chunk-size line, its LF included.
+const MAX_CHUNK_HEADER_BYTES: u8 = 128;
+
+/// A chunk-size line read so far, kept as what its parse needs once its LF
+/// arrives.
+#[derive(Clone, Copy, Debug, Default)]
+struct ChunkSizeLine {
+    /// Bytes read, the LF included.
+    length: u8,
+    size: ChunkSizeToken,
+    /// Whether the last byte read was a CR.
+    after_cr: bool,
+    /// Whether a CR was followed by a byte other than the line's LF, so that the
+    /// line holds a CR besides one just before its LF.
+    stray_cr: bool,
+}
+
+/// Why [`ChunkSizeLine::read`] stopped before the end of its input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChunkSizeLineEnd {
+    /// The line's LF was read.
+    Lf,
+    /// The last byte read took the line past `MAX_CHUNK_HEADER_BYTES`.
+    TooLarge,
+}
+
+impl ChunkSizeLine {
+    /// Reads `input` up to and including the line's LF, or up to the byte that
+    /// takes the line past `MAX_CHUNK_HEADER_BYTES`, LF or not. Returns the
+    /// bytes read and why reading stopped, or `None` when the input ran out.
+    fn read(&mut self, input: &[u8]) -> (usize, Option<ChunkSizeLineEnd>) {
+        for (index, byte) in input.iter().enumerate() {
+            self.length += 1;
+            if self.length > MAX_CHUNK_HEADER_BYTES {
+                return (index + 1, Some(ChunkSizeLineEnd::TooLarge));
+            }
+            if *byte == b'\n' {
+                return (index + 1, Some(ChunkSizeLineEnd::Lf));
+            }
+            self.stray_cr |= self.after_cr;
+            self.after_cr = *byte == b'\r';
+            self.size = self.size.push(*byte);
+        }
+        (input.len(), None)
+    }
+}
+
+/// The chunk size read so far, from the line's bytes before its first `;`
+/// with HTTP whitespace trimmed from both ends: nonempty hex digits whose value
+/// fits a `u64`, or invalid. A CR counts as whitespace, as the trim treats it;
+/// the line is rejected for any CR but one just before its LF.
+#[derive(Clone, Copy, Debug, Default)]
+enum ChunkSizeToken {
+    /// Whitespace only.
+    #[default]
+    Leading,
+    /// Hex digits after any leading whitespace.
+    Digits(u64),
+    /// Hex digits followed by whitespace.
+    Trailing(u64),
+    /// Not a hex number that fits a `u64`.
+    Invalid,
+    /// The size as it stood at the first `;`.
+    Ended(Option<u64>),
+}
+
+impl ChunkSizeToken {
+    fn push(self, byte: u8) -> Self {
+        let whitespace = matches!(byte, b' ' | b'\t' | b'\r' | b'\n');
+        match self {
+            Self::Ended(_) => self,
+            _ if byte == b';' => Self::Ended(self.value()),
+            Self::Digits(size) if whitespace => Self::Trailing(size),
+            Self::Leading | Self::Trailing(_) | Self::Invalid if whitespace => self,
+            Self::Leading => hex_digit(byte).map_or(Self::Invalid, Self::Digits),
+            Self::Digits(size) => hex_digit(byte)
+                .and_then(|digit| size.checked_mul(16)?.checked_add(digit))
+                .map_or(Self::Invalid, Self::Digits),
+            Self::Trailing(_) | Self::Invalid => Self::Invalid,
+        }
+    }
+
+    fn value(self) -> Option<u64> {
+        match self {
+            Self::Digits(size) | Self::Trailing(size) => Some(size),
+            Self::Ended(size) => size,
+            Self::Leading | Self::Invalid => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1367,7 +1459,7 @@ impl Http1xCodec {
         self.state = match parsed.body {
             IngressBody::None => ParseState::MessageComplete(parsed.upgrade),
             IngressBody::Fixed(length) => ParseState::FixedBody(length),
-            IngressBody::Chunked => ParseState::ChunkSize(Vec::new()),
+            IngressBody::Chunked => ParseState::ChunkSize(ChunkSizeLine::default()),
             IngressBody::UntilEof => ParseState::UntilEof,
         };
         if parsed.body == IngressBody::None && !self.parser_paused {
@@ -2145,10 +2237,13 @@ impl HttpCodec for Http1xCodec {
                         }
                     }
                     ParseState::ChunkSize(mut line) => {
-                        let byte = input[result.consumed];
-                        result.consumed += 1;
-                        line.push(byte);
-                        if line.len() > 128 {
+                        let (read, end) = line.read(&input[result.consumed..]);
+                        result.consumed += read;
+                        let Some(end) = end else {
+                            self.state = ParseState::ChunkSize(line);
+                            continue;
+                        };
+                        if end == ChunkSizeLineEnd::TooLarge {
                             self.state = ParseState::ChunkSize(line);
                             self.fail(
                                 ParseErrorKind::Body,
@@ -2159,13 +2254,7 @@ impl HttpCodec for Http1xCodec {
                             );
                             continue;
                         }
-                        if byte != b'\n' {
-                            self.state = ParseState::ChunkSize(line);
-                            continue;
-                        }
-                        let line_without_lf = &line[..line.len() - 1];
-                        let line_without_cr = trim_trailing_cr(line_without_lf);
-                        if line_without_cr.contains(&b'\r') {
+                        if line.stray_cr {
                             self.state = ParseState::ChunkSize(line);
                             self.fail(
                                 ParseErrorKind::Body,
@@ -2176,11 +2265,7 @@ impl HttpCodec for Http1xCodec {
                             );
                             continue;
                         }
-                        let size_token = line_without_cr
-                            .split(|byte| *byte == b';')
-                            .next()
-                            .unwrap_or_default();
-                        let Some(size) = parse_hex_u64(trim_http_whitespace(size_token)) else {
+                        let Some(size) = line.size.value() else {
                             self.state = ParseState::ChunkSize(line);
                             self.fail(
                                 ParseErrorKind::Body,
@@ -2223,7 +2308,7 @@ impl HttpCodec for Http1xCodec {
                         result.consumed += amount;
                         remaining -= amount as u64;
                         self.state = if remaining == 0 {
-                            ParseState::ChunkDelimiter(Vec::new())
+                            ParseState::ChunkDelimiter(false)
                         } else {
                             ParseState::ChunkBody(remaining)
                         };
@@ -2234,23 +2319,11 @@ impl HttpCodec for Http1xCodec {
                             &mut result,
                         );
                     }
-                    ParseState::ChunkDelimiter(mut delimiter) => {
+                    ParseState::ChunkDelimiter(after_cr) => {
                         let byte = input[result.consumed];
                         result.consumed += 1;
-                        delimiter.push(byte);
-                        let valid_prefix =
-                            b"\r\n".starts_with(&delimiter) || b"\n".starts_with(&delimiter);
-                        if !valid_prefix {
-                            self.state = ParseState::ChunkDelimiter(delimiter);
-                            self.fail(
-                                ParseErrorKind::Body,
-                                b"invalid HTTP chunk terminator",
-                                callback,
-                                callback_egress,
-                                &mut result,
-                            );
-                        } else if delimiter == b"\r\n" || delimiter == b"\n" {
-                            self.state = ParseState::ChunkSize(Vec::new());
+                        if byte == b'\n' {
+                            self.state = ParseState::ChunkSize(ChunkSizeLine::default());
                             self.dispatch(
                                 callback,
                                 callback_egress,
@@ -2259,8 +2332,17 @@ impl HttpCodec for Http1xCodec {
                                 },
                                 &mut result,
                             );
+                        } else if byte == b'\r' && !after_cr {
+                            self.state = ParseState::ChunkDelimiter(true);
                         } else {
-                            self.state = ParseState::ChunkDelimiter(delimiter);
+                            self.state = ParseState::ChunkDelimiter(after_cr);
+                            self.fail(
+                                ParseErrorKind::Body,
+                                b"invalid HTTP chunk terminator",
+                                callback,
+                                callback_egress,
+                                &mut result,
+                            );
                         }
                     }
                     ParseState::Trailers(mut trailers) => {
@@ -2686,19 +2768,13 @@ fn parse_decimal_u64(value: &[u8]) -> Option<u64> {
     })
 }
 
-fn parse_hex_u64(value: &[u8]) -> Option<u64> {
-    if value.is_empty() {
-        return None;
+fn hex_digit(byte: u8) -> Option<u64> {
+    match byte {
+        b'0'..=b'9' => Some(u64::from(byte - b'0')),
+        b'a'..=b'f' => Some(u64::from(byte - b'a' + 10)),
+        b'A'..=b'F' => Some(u64::from(byte - b'A' + 10)),
+        _ => None,
     }
-    value.iter().try_fold(0_u64, |current, byte| {
-        let digit = match byte {
-            b'0'..=b'9' => u64::from(byte - b'0'),
-            b'a'..=b'f' => u64::from(byte - b'a' + 10),
-            b'A'..=b'F' => u64::from(byte - b'A' + 10),
-            _ => return None,
-        };
-        current.checked_mul(16)?.checked_add(digit)
-    })
 }
 
 fn trim_trailing_cr(value: &[u8]) -> &[u8] {

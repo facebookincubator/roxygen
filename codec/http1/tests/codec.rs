@@ -1,5 +1,11 @@
+use std::alloc::GlobalAlloc;
+use std::alloc::Layout;
+use std::alloc::System;
+use std::cell::Cell;
 use std::fmt::Write as _;
+use std::hint::black_box;
 use std::ops::Range;
+use std::sync::LazyLock;
 
 use base64::Engine as _;
 use bytes::Bytes;
@@ -2388,6 +2394,8 @@ enum PauseAt {
     LaterMessageBegin,
     HeadersComplete,
     Body,
+    ChunkHeader,
+    ChunkComplete,
     MessageComplete,
 }
 
@@ -3405,6 +3413,8 @@ impl TraceRecorder {
             }
             CodecEvent::HeadersComplete { stream, .. } => (PauseAt::HeadersComplete, *stream),
             CodecEvent::Body { stream, .. } => (PauseAt::Body, *stream),
+            CodecEvent::ChunkHeader { stream, .. } => (PauseAt::ChunkHeader, *stream),
+            CodecEvent::ChunkComplete { stream } => (PauseAt::ChunkComplete, *stream),
             CodecEvent::MessageComplete { stream, .. } => (PauseAt::MessageComplete, *stream),
             _ => return None,
         };
@@ -7717,5 +7727,897 @@ fn generated_head_keeps_uncommon_spelling() {
         b"GET / HTTP/1.1\r\nHost: a\r\nexpect: 100-continue\r\nx-forwarded-proto: https\r\nlink: <a>\r\nConnection: keep-alive\r\n\r\n",
         "{}",
         wire.escape_ascii()
+    );
+}
+
+// Chunked ingress oracles (`repair.http1_chunked_ingress`). The golden traces
+// were recorded from the codec at `62d2959bb6d3`, whose chunk-size and
+// chunk-terminator states pushed each byte into a vector.
+
+const CHUNKED_REQUEST_HEAD: &[u8] = b"POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+const CHUNKED_RESPONSE_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+const CHUNKED_POST_WITH_EXTENSION_THEN_GET: &[u8] =
+    b"3\r\nabc\r\n2;x\r\nde\r\n0\r\n\r\nGET /g HTTP/1.1\r\n\r\n";
+const CHUNK_ERRORS: &[&str] = &[
+    "HTTP chunk header is too large",
+    "invalid HTTP chunk delimiter",
+    "invalid HTTP chunk length",
+    "HTTP chunk length overflow",
+    "invalid HTTP chunk terminator",
+];
+
+/// A chunked message's head followed by `body`. [`CHUNKED_TRACE_CASES`] keeps
+/// every case, so each leaked wire stays reachable for the whole test run.
+fn chunked_case(
+    name: &'static str,
+    upstream: bool,
+    pause: &'static [PauseAt],
+    body: &[u8],
+) -> TraceCase {
+    let head = if upstream {
+        CHUNKED_RESPONSE_HEAD
+    } else {
+        CHUNKED_REQUEST_HEAD
+    };
+    TraceCase {
+        name,
+        upstream,
+        strict: false,
+        pause,
+        generate: false,
+        wire: [head, body].concat().leak(),
+    }
+}
+
+/// A chunk-size line of `length` bytes: size 1, then an extension padded to
+/// end with `terminator`.
+fn padded_chunk_line(length: usize, terminator: &[u8]) -> Vec<u8> {
+    let mut line = b"1;".to_vec();
+    line.resize(length - terminator.len(), b'a');
+    line.extend_from_slice(terminator);
+    line
+}
+
+static CHUNKED_TRACE_CASES: LazyLock<Vec<TraceCase>> = LazyLock::new(chunked_trace_cases);
+
+fn chunked_trace_cases() -> Vec<TraceCase> {
+    let down = |name, body: &[u8]| chunked_case(name, false, &[], body);
+    let up = |name, body: &[u8]| chunked_case(name, true, &[], body);
+    vec![
+        down("crlf chunks", b"5\r\nhello\r\n0\r\n\r\n"),
+        down("bare lf chunks", b"5\nhello\n0\n\n"),
+        down(
+            "chunk extensions",
+            b"5;name=value\r\nhello\r\n3 ; a=b;c\r\nabc\r\n0;last\r\n\r\n",
+        ),
+        down(
+            "whitespace around chunk sizes",
+            b" 5 \t\r\nhello\r\n\t3\t;x\r\nabc\r\n0 \r\n\r\n",
+        ),
+        down("trailing space before a bare lf", b"5 \nhello\n0\n\n"),
+        down(
+            "hex digits of either case after leading zeros",
+            b"0000000000000000000000000001a\r\nabcdefghijklmnopqrstuvwxyz\r\nA\r\n0123456789\r\n00\r\n\r\n",
+        ),
+        down("largest chunk length", b"7fffffffffffffff\r\nab"),
+        down(
+            "largest chunk length after leading zeros",
+            b"00000000000000000007FFFFFFFFFFFFFFF\r\nab",
+        ),
+        down("chunk length past i64", b"8000000000000000\r\nab"),
+        down("chunk length of u64 max", b"ffffffffffffffff\r\n"),
+        down("chunk length past u64", b"10000000000000000\r\n"),
+        down(
+            "chunk length past u64 before an extension",
+            b"10000000000000000;x\r\n",
+        ),
+        down("invalid chunk length digit", b"5x\r\nhello\r\n"),
+        down("space inside a chunk length", b"5 5\r\n"),
+        down("empty chunk length", b"\r\n"),
+        down("whitespace-only chunk length", b" \t \r\n"),
+        down("extension without a chunk length", b";ext\r\n"),
+        down("0x chunk length", b"0x5\r\n"),
+        down("signed chunk length", b"+5\r\n"),
+        down("vertical tab after a chunk length", b"5\x0b\r\n"),
+        down("high byte after a chunk length", b"5\xff\r\n"),
+        down("cr cr lf after a chunk length", b"5\r\r\nhello\r\n"),
+        down("cr inside a chunk length", b"5\rx\n"),
+        down("cr before a chunk length", b"\r5\r\n"),
+        down("cr inside a chunk extension", b"5;a\rb\r\n"),
+        down("cr before a chunk extension", b"5\r;x\r\n"),
+        down("stray cr before an invalid length", b"zz\rq\r\n"),
+        down(
+            "stray cr before a length overflow",
+            b"8000000000000000\r\r\n",
+        ),
+        down(
+            "chunk header at the size limit",
+            &[padded_chunk_line(128, b"\r\n").as_slice(), b"a\r\n0\r\n\r\n"].concat(),
+        ),
+        down(
+            "bare lf chunk header at the size limit",
+            &[padded_chunk_line(128, b"\n").as_slice(), b"a\r\n0\r\n\r\n"].concat(),
+        ),
+        down(
+            "chunk header lf past the size limit",
+            &[padded_chunk_line(129, b"\r\n").as_slice(), b"a\r\n"].concat(),
+        ),
+        down(
+            "chunk header byte past the size limit",
+            &padded_chunk_line(129, b"a"),
+        ),
+        down("invalid terminator byte", b"1\r\naX"),
+        down("cr then an invalid terminator byte", b"1\r\na\rX"),
+        down("cr cr terminator", b"1\r\na\r\r\n"),
+        down("bare lf terminator", b"1\r\na\n0\r\n\r\n"),
+        down("lf then cr lf after a chunk", b"1\r\na\n\r\n"),
+        down("eof inside a chunk length", b"5"),
+        down("eof after a chunk length cr", b"5\r"),
+        down("eof inside a chunk extension", b"5;ext"),
+        down("eof before a chunk terminator", b"1\r\na"),
+        down("eof inside a chunk terminator", b"1\r\na\r"),
+        down(
+            "last chunk extension and trailers",
+            b"0;ext=1\r\nX-T: 1\r\n\r\n",
+        ),
+        down(
+            "chunked request then a get",
+            CHUNKED_POST_WITH_EXTENSION_THEN_GET,
+        ),
+        up("chunked response with an extension", b"3;x\r\nabc\r\n0\r\n\r\n"),
+        up("chunked response with an invalid length", b"g\r\n"),
+        chunked_case(
+            "paused at chunk headers",
+            false,
+            &[PauseAt::ChunkHeader],
+            CHUNKED_POST_WITH_EXTENSION_THEN_GET,
+        ),
+        chunked_case(
+            "paused at chunk completions",
+            false,
+            &[PauseAt::ChunkComplete],
+            CHUNKED_POST_WITH_EXTENSION_THEN_GET,
+        ),
+    ]
+}
+
+const CHUNKED_GOLDEN_TRACES: &[(&str, &str)] = &[
+    (
+        "crlf chunks",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 5
+body 1 "hello"
+chunk_complete 1
+complete 1 upgraded=false
+consumed 63
+eof
+"##,
+    ),
+    (
+        "bare lf chunks",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 5
+body 1 "hello"
+chunk_complete 1
+complete 1 upgraded=false
+consumed 59
+eof
+"##,
+    ),
+    (
+        "chunk extensions",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 5
+body 1 "hello"
+chunk_complete 1
+chunk_header 1 3
+body 1 "abc"
+chunk_complete 1
+complete 1 upgraded=false
+consumed 95
+eof
+"##,
+    ),
+    (
+        "whitespace around chunk sizes",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 5
+body 1 "hello"
+chunk_complete 1
+chunk_header 1 3
+body 1 "abc"
+chunk_complete 1
+complete 1 upgraded=false
+consumed 79
+eof
+"##,
+    ),
+    (
+        "trailing space before a bare lf",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 5
+body 1 "hello"
+chunk_complete 1
+complete 1 upgraded=false
+consumed 60
+eof
+"##,
+    ),
+    (
+        "hex digits of either case after leading zeros",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 26
+body 1 "abcdefghijklmnopqrstuvwxyz"
+chunk_complete 1
+chunk_header 1 10
+body 1 "0123456789"
+chunk_complete 1
+complete 1 upgraded=false
+consumed 128
+eof
+"##,
+    ),
+    (
+        "largest chunk length",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 9223372036854775807
+body 1 "ab"
+consumed 68
+eof
+error 1 proxygen=18 "unexpected EOF" status=Some(400) new_stream=false partial=none
+"##,
+    ),
+    (
+        "largest chunk length after leading zeros",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 9223372036854775807
+body 1 "ab"
+consumed 87
+eof
+error 1 proxygen=18 "unexpected EOF" status=Some(400) new_stream=false partial=none
+"##,
+    ),
+    (
+        "chunk length past i64",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "HTTP chunk length overflow" status=Some(400) new_stream=false partial=none
+consumed 66
+eof
+"##,
+    ),
+    (
+        "chunk length of u64 max",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "HTTP chunk length overflow" status=Some(400) new_stream=false partial=none
+consumed 66
+eof
+"##,
+    ),
+    (
+        "chunk length past u64",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
+consumed 67
+eof
+"##,
+    ),
+    (
+        "chunk length past u64 before an extension",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
+consumed 69
+eof
+"##,
+    ),
+    (
+        "invalid chunk length digit",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
+consumed 52
+eof
+"##,
+    ),
+    (
+        "space inside a chunk length",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
+consumed 53
+eof
+"##,
+    ),
+    (
+        "empty chunk length",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
+consumed 50
+eof
+"##,
+    ),
+    (
+        "whitespace-only chunk length",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
+consumed 53
+eof
+"##,
+    ),
+    (
+        "extension without a chunk length",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
+consumed 54
+eof
+"##,
+    ),
+    (
+        "0x chunk length",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
+consumed 53
+eof
+"##,
+    ),
+    (
+        "signed chunk length",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
+consumed 52
+eof
+"##,
+    ),
+    (
+        "vertical tab after a chunk length",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
+consumed 52
+eof
+"##,
+    ),
+    (
+        "high byte after a chunk length",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
+consumed 52
+eof
+"##,
+    ),
+    (
+        "cr cr lf after a chunk length",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk delimiter" status=Some(400) new_stream=false partial=none
+consumed 52
+eof
+"##,
+    ),
+    (
+        "cr inside a chunk length",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk delimiter" status=Some(400) new_stream=false partial=none
+consumed 52
+eof
+"##,
+    ),
+    (
+        "cr before a chunk length",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk delimiter" status=Some(400) new_stream=false partial=none
+consumed 52
+eof
+"##,
+    ),
+    (
+        "cr inside a chunk extension",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk delimiter" status=Some(400) new_stream=false partial=none
+consumed 55
+eof
+"##,
+    ),
+    (
+        "cr before a chunk extension",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk delimiter" status=Some(400) new_stream=false partial=none
+consumed 54
+eof
+"##,
+    ),
+    (
+        "stray cr before an invalid length",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk delimiter" status=Some(400) new_stream=false partial=none
+consumed 54
+eof
+"##,
+    ),
+    (
+        "stray cr before a length overflow",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk delimiter" status=Some(400) new_stream=false partial=none
+consumed 67
+eof
+"##,
+    ),
+    (
+        "chunk header at the size limit",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 1
+body 1 "a"
+chunk_complete 1
+complete 1 upgraded=false
+consumed 184
+eof
+"##,
+    ),
+    (
+        "bare lf chunk header at the size limit",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 1
+body 1 "a"
+chunk_complete 1
+complete 1 upgraded=false
+consumed 184
+eof
+"##,
+    ),
+    (
+        "chunk header lf past the size limit",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "HTTP chunk header is too large" status=Some(400) new_stream=false partial=none
+consumed 177
+eof
+"##,
+    ),
+    (
+        "chunk header byte past the size limit",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "HTTP chunk header is too large" status=Some(400) new_stream=false partial=none
+consumed 177
+eof
+"##,
+    ),
+    (
+        "invalid terminator byte",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 1
+body 1 "a"
+error 1 proxygen=17 "invalid HTTP chunk terminator" status=Some(400) new_stream=false partial=none
+consumed 53
+eof
+"##,
+    ),
+    (
+        "cr then an invalid terminator byte",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 1
+body 1 "a"
+error 1 proxygen=17 "invalid HTTP chunk terminator" status=Some(400) new_stream=false partial=none
+consumed 54
+eof
+"##,
+    ),
+    (
+        "cr cr terminator",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 1
+body 1 "a"
+error 1 proxygen=17 "invalid HTTP chunk terminator" status=Some(400) new_stream=false partial=none
+consumed 54
+eof
+"##,
+    ),
+    (
+        "bare lf terminator",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 1
+body 1 "a"
+chunk_complete 1
+complete 1 upgraded=false
+consumed 58
+eof
+"##,
+    ),
+    (
+        "lf then cr lf after a chunk",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 1
+body 1 "a"
+chunk_complete 1
+error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
+consumed 55
+eof
+"##,
+    ),
+    (
+        "eof inside a chunk length",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+consumed 49
+eof
+error 1 proxygen=18 "unexpected EOF" status=Some(400) new_stream=false partial=none
+"##,
+    ),
+    (
+        "eof after a chunk length cr",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+consumed 50
+eof
+error 1 proxygen=18 "unexpected EOF" status=Some(400) new_stream=false partial=none
+"##,
+    ),
+    (
+        "eof inside a chunk extension",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+consumed 53
+eof
+error 1 proxygen=18 "unexpected EOF" status=Some(400) new_stream=false partial=none
+"##,
+    ),
+    (
+        "eof before a chunk terminator",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 1
+body 1 "a"
+consumed 52
+eof
+error 1 proxygen=18 "unexpected EOF" status=Some(400) new_stream=false partial=none
+"##,
+    ),
+    (
+        "eof inside a chunk terminator",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 1
+body 1 "a"
+consumed 53
+eof
+error 1 proxygen=18 "unexpected EOF" status=Some(400) new_stream=false partial=none
+"##,
+    ),
+    (
+        "last chunk extension and trailers",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+trailers 1 ["X-T": "1"]
+complete 1 upgraded=false
+consumed 67
+eof
+"##,
+    ),
+    (
+        "chunked request then a get",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 3
+body 1 "abc"
+chunk_complete 1
+chunk_header 1 2
+body 1 "de"
+chunk_complete 1
+complete 1 upgraded=false
+begin 2
+headers 2 request method=Some("GET") url="/g" version=1.1 headers=[] size=19/19 upgraded=false websocket=false keepalive=true chunked=false
+complete 2 upgraded=false
+consumed 89
+eof
+"##,
+    ),
+    (
+        "chunked response with an extension",
+        r##"begin 1
+headers 1 response status=200 reason="OK" version=1.1 headers=["Transfer-Encoding": "chunked"] size=47/47 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 3
+body 1 "abc"
+chunk_complete 1
+complete 1 upgraded=false
+consumed 62
+eof
+"##,
+    ),
+    (
+        "chunked response with an invalid length",
+        r##"begin 1
+headers 1 response status=200 reason="OK" version=1.1 headers=["Transfer-Encoding": "chunked"] size=47/47 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "invalid HTTP chunk length" status=None new_stream=false partial=none
+consumed 50
+eof
+"##,
+    ),
+    (
+        "paused at chunk headers",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 3
+pause ChunkHeader at 51
+body 1 "abc"
+chunk_complete 1
+chunk_header 1 2
+pause ChunkHeader at 61
+body 1 "de"
+chunk_complete 1
+complete 1 upgraded=false
+begin 2
+headers 2 request method=Some("GET") url="/g" version=1.1 headers=[] size=19/19 upgraded=false websocket=false keepalive=true chunked=false
+complete 2 upgraded=false
+consumed 89
+eof
+"##,
+    ),
+    (
+        "paused at chunk completions",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 3
+body 1 "abc"
+chunk_complete 1
+pause ChunkComplete at 56
+chunk_header 1 2
+body 1 "de"
+chunk_complete 1
+pause ChunkComplete at 65
+complete 1 upgraded=false
+begin 2
+headers 2 request method=Some("GET") url="/g" version=1.1 headers=[] size=19/19 upgraded=false websocket=false keepalive=true chunked=false
+complete 2 upgraded=false
+consumed 89
+eof
+"##,
+    ),
+];
+
+fn chunked_golden_trace(name: &str) -> &'static str {
+    CHUNKED_GOLDEN_TRACES
+        .iter()
+        .find(|(golden, _)| *golden == name)
+        .map(|(_, trace)| *trace)
+        .unwrap_or_else(|| panic!("no chunked golden trace for {name}"))
+}
+
+#[test]
+fn chunked_ingress_matches_the_recorded_traces_at_every_split() {
+    assert_eq!(
+        CHUNKED_TRACE_CASES.len(),
+        CHUNKED_GOLDEN_TRACES.len(),
+        "one golden trace per chunked case"
+    );
+    for error in CHUNK_ERRORS {
+        assert!(
+            CHUNKED_GOLDEN_TRACES
+                .iter()
+                .any(|(_, trace)| trace.contains(&format!("\"{error}\""))),
+            "the chunked cases reach \"{error}\""
+        );
+    }
+    for case in CHUNKED_TRACE_CASES.iter() {
+        let golden = chunked_golden_trace(case.name);
+        for_every_delivery(case, |context, outcome| {
+            assert_eq!(outcome.trace, golden, "{context}");
+        });
+    }
+}
+
+/// Counts heap allocations made on a thread while its counter is enabled. It
+/// serves every test in this crate and only counts inside
+/// [`count_allocations`].
+struct CountingAllocator;
+
+std::thread_local! {
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+fn record_allocation() {
+    if COUNTING.with(Cell::get) {
+        ALLOCATIONS.with(|count| count.set(count.get() + 1));
+    }
+}
+
+// SAFETY: every method passes its arguments unchanged to the same `System`
+// method, so `System` upholds the `GlobalAlloc` contract. Counting touches only
+// const-initialized thread-local cells, which neither allocate nor register
+// destructors.
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        record_allocation();
+        // SAFETY: this call's caller upheld `alloc`'s layout precondition.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        record_allocation();
+        // SAFETY: this call's caller upheld `alloc_zeroed`'s layout precondition.
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        record_allocation();
+        // SAFETY: `pointer` came from this allocator, which is `System`, with
+        // `layout`, and this call's caller upheld `realloc`'s size precondition.
+        unsafe { System.realloc(pointer, layout, new_size) }
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        // SAFETY: `pointer` came from this allocator, which is `System`, with
+        // `layout`.
+        unsafe { System.dealloc(pointer, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+/// Runs `run` and returns its value and the allocations it made on this
+/// thread, reallocations included.
+fn count_allocations<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    ALLOCATIONS.with(|count| count.set(0));
+    COUNTING.with(|counting| counting.set(true));
+    let value = run();
+    COUNTING.with(|counting| counting.set(false));
+    (value, ALLOCATIONS.with(Cell::get))
+}
+
+/// Whether this build's std allocates through [`ALLOCATOR`]. Dev builds link a
+/// shared std whose own allocations, `Vec` growth among them, bypass it.
+fn std_allocations_observable() -> bool {
+    count_allocations(|| drop(black_box(Vec::<u8>::with_capacity(4_096)))).1 == 1
+}
+
+/// Counts chunk events and body bytes without allocating.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ChunkCounter {
+    chunk_headers: usize,
+    chunk_bytes: usize,
+    chunk_completions: usize,
+    body_bytes: usize,
+    errors: usize,
+}
+
+impl HttpCodecCallback for ChunkCounter {
+    fn on_event(&mut self, event: CodecEvent<'_>) {
+        match event {
+            CodecEvent::ChunkHeader { length, .. } => {
+                self.chunk_headers += 1;
+                self.chunk_bytes += length;
+            }
+            CodecEvent::ChunkComplete { .. } => self.chunk_completions += 1,
+            CodecEvent::Body { body, .. } => self.body_bytes += body.chain_length(),
+            CodecEvent::Error { .. } => self.errors += 1,
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn chunk_headers_and_terminators_allocate_nothing_after_warm_up() {
+    const CHUNKS: usize = 8;
+    // Each framing ends one 5-byte chunk and begins the next.
+    let framings: [&[u8]; 3] = [b"\r\n5\r\n", b"\n5\n", b"\r\n5;name=value\r\n"];
+    for framing in framings {
+        for byte_by_byte in [false, true] {
+            let context = format!("{} byte_by_byte={byte_by_byte}", framing.escape_ascii());
+            let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+            let mut counter = ChunkCounter::default();
+            let mut egress = BufQueue::new(QUEUE_LIMIT);
+            let mut ingress = |codec: &mut Http1xCodec, read: &BufQueue| {
+                codec.on_ingress(read, &mut counter, &mut egress).consumed
+            };
+            let warm_up = [CHUNKED_REQUEST_HEAD, b"5\r\nhello"].concat();
+            assert_eq!(ingress(&mut codec, &ingress_queue(&warm_up)), warm_up.len());
+            let framing_reads = if byte_by_byte {
+                framing.chunks(1).map(ingress_queue).collect::<Vec<_>>()
+            } else {
+                vec![ingress_queue(framing)]
+            };
+            let body = ingress_queue(b"hello");
+            let mut allocations = 0;
+            for _ in 0..CHUNKS {
+                let (consumed, counted) = count_allocations(|| {
+                    framing_reads
+                        .iter()
+                        .map(|read| ingress(&mut codec, read))
+                        .sum::<usize>()
+                });
+                assert_eq!(consumed, framing.len(), "{context}");
+                allocations += counted;
+                assert_eq!(ingress(&mut codec, &body), body.chain_length(), "{context}");
+            }
+            assert_eq!(
+                counter,
+                ChunkCounter {
+                    chunk_headers: CHUNKS + 1,
+                    chunk_bytes: 5 * (CHUNKS + 1),
+                    chunk_completions: CHUNKS,
+                    body_bytes: 5 * (CHUNKS + 1),
+                    errors: 0,
+                },
+                "{context}"
+            );
+            if std_allocations_observable() {
+                assert_eq!(
+                    allocations, 0,
+                    "{context}: chunk terminators and chunk-size lines allocate nothing"
+                );
+            } else {
+                eprintln!(
+                    "{context}: allocation counts need a static std, as in @fbcode//mode/opt"
+                );
+            }
+        }
+    }
+}
+
+/// Whether a `T` can own heap memory: a type without drop glue cannot.
+fn may_own_heap<T>(_: &T) -> bool {
+    std::mem::needs_drop::<T>()
+}
+
+#[test]
+fn chunk_size_and_terminator_progress_holds_no_heap_buffer() {
+    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+    let mut counter = ChunkCounter::default();
+    let mut egress = BufQueue::new(QUEUE_LIMIT);
+    let reads: [&[u8]; 3] = [CHUNKED_REQUEST_HEAD, b"5;na", b"me=value\r\nhello\r"];
+    let mut ingress = |codec: &mut Http1xCodec, read: &[u8]| {
+        codec
+            .on_ingress(&ingress_queue(read), &mut counter, &mut egress)
+            .consumed
+    };
+
+    assert_eq!(ingress(&mut codec, reads[0]), reads[0].len());
+    assert_eq!(ingress(&mut codec, reads[1]), reads[1].len());
+    let ParseState::ChunkSize(progress) = &codec.state else {
+        panic!("a partial chunk-size line leaves the codec in ChunkSize");
+    };
+    assert!(
+        !may_own_heap(progress),
+        "chunk-size progress holds no heap buffer"
+    );
+
+    assert_eq!(ingress(&mut codec, reads[2]), reads[2].len());
+    let ParseState::ChunkDelimiter(progress) = &codec.state else {
+        panic!("a partial chunk terminator leaves the codec in ChunkDelimiter");
+    };
+    assert!(
+        !may_own_heap(progress),
+        "chunk-terminator progress holds no heap buffer"
     );
 }
