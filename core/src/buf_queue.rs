@@ -32,6 +32,34 @@ pub enum BufQueueError {
     CoalesceLimitExceeded { limit: usize, length: usize },
 }
 
+/// Per-segment steps that tests count on their own thread.
+#[cfg(test)]
+mod steps {
+    use std::cell::Cell;
+    use std::thread::LocalKey;
+
+    std::thread_local! {
+        /// Segments pushed through `Segments::push_back`.
+        pub(super) static SEGMENT_PUSHES: Cell<usize> = const { Cell::new(0) };
+        /// Segments that the general trim loop measures and pops.
+        pub(super) static SEGMENT_TRIMS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn count(counter: &'static LocalKey<Cell<usize>>) {
+        counter.with(|count| count.set(count.get() + 1));
+    }
+
+    /// Runs `run` and returns its value and how often it took `counter`'s step.
+    pub(super) fn counted<T>(
+        counter: &'static LocalKey<Cell<usize>>,
+        run: impl FnOnce() -> T,
+    ) -> (T, usize) {
+        let before = counter.with(Cell::get);
+        let value = run();
+        (value, counter.with(Cell::get) - before)
+    }
+}
+
 /// A queue of immutable byte segments bounded by their visible logical length.
 #[derive(Debug)]
 pub struct BufQueue {
@@ -194,6 +222,8 @@ fn reserve_hinted(segments: &mut VecDeque<Bytes>, incoming: usize, hint: usize) 
 
 impl Segments {
     fn push_back(&mut self, bytes: Bytes) {
+        #[cfg(test)]
+        steps::count(&steps::SEGMENT_PUSHES);
         match self {
             Self::Inline(segment, _) if segment.is_empty() => *segment = bytes,
             Self::Inline(segment, hint) => {
@@ -494,10 +524,29 @@ impl BufQueue {
     }
 
     /// Moves `bytes` into a queue while preserving its shared backing storage.
+    ///
+    /// Builds the queue in place, as [`new`](Self::new) then
+    /// [`push_bytes`](Self::push_bytes) would leave it, so an inlined call
+    /// whose `limit` is the segment's length cannot fail.
+    #[inline]
     pub fn from_bytes(bytes: Bytes, limit: usize) -> Result<Self, BufQueueError> {
-        let mut queue = Self::new(limit);
-        queue.push_bytes(bytes)?;
-        Ok(queue)
+        let length = bytes.len();
+        if length > limit {
+            return Err(BufQueueError::LimitExceeded {
+                limit,
+                current: 0,
+                incoming: length,
+            });
+        }
+        if length == 0 {
+            return Ok(Self::new(limit));
+        }
+        Ok(Self {
+            segments: Segments::Inline(bytes, 0),
+            length,
+            limit,
+            backing_capacity: None,
+        })
     }
 
     /// Moves a vector without copying and records its full backing capacity.
@@ -867,14 +916,29 @@ impl BufQueue {
         }
     }
 
+    /// Inlined, so that a caller in another crate makes one call, to the loop
+    /// that the trim needs.
+    #[inline]
     pub fn trim_start_at_most(&mut self, amount: usize) -> usize {
         let trim_length = amount.min(self.length);
         if trim_length == 0 {
             return 0;
         }
+        if trim_length == self.length {
+            self.release_segments();
+        } else {
+            self.trim_segments(trim_length);
+        }
+        trim_length
+    }
 
+    /// Trims the first `trim_length` bytes, measuring each segment against the
+    /// amount left to trim.
+    fn trim_segments(&mut self, trim_length: usize) {
         let mut remaining = trim_length;
         while remaining != 0 {
+            #[cfg(test)]
+            steps::count(&steps::SEGMENT_TRIMS);
             let mut segment = self
                 .segments
                 .pop_front()
@@ -893,10 +957,33 @@ impl BufQueue {
                 }
             }
         }
-
-        trim_length
     }
 
+    /// Trims every segment, in order, as the general trim loop would, but
+    /// without measuring each one against the amount left to trim. The queue
+    /// keeps its container. A segment drop that panics leaves the segments
+    /// after it queued and counted, as the general loop does.
+    fn release_segments(&mut self) {
+        match &mut self.segments {
+            Segments::Inline(segment, _) => {
+                let segment = std::mem::take(segment);
+                self.length = 0;
+                self.backing_capacity = Some(0);
+                drop(segment);
+            }
+            Segments::Many(segments, _) => {
+                while let Some(segment) = segments.pop_front() {
+                    self.length -= segment.len();
+                    if self.length == 0 {
+                        self.backing_capacity = Some(0);
+                    }
+                    drop(segment);
+                }
+            }
+        }
+    }
+
+    #[inline]
     pub fn trim_start(&mut self, amount: usize) -> Result<(), BufQueueError> {
         if amount > self.length {
             return Err(BufQueueError::TrimUnderflow {
@@ -1010,11 +1097,16 @@ mod tests {
     use std::mem::ManuallyDrop;
     use std::panic::AssertUnwindSafe;
     use std::panic::catch_unwind;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
+    use bytes::Buf;
     use bytes::Bytes;
 
     use super::BufQueue;
     use super::Segments;
+    use super::steps;
 
     static STATIC_BYTES: [u8; 20_000] = [0x5a; 20_000];
 
@@ -1321,6 +1413,452 @@ mod tests {
                 }
                 assert_eq!(observe(&actual), observe(&expected), "step {step}");
             }
+        }
+    }
+
+    /// The `from_bytes` this module used before it built its queue in place.
+    fn reference_from_bytes(bytes: Bytes, limit: usize) -> Result<BufQueue, super::BufQueueError> {
+        let mut queue = BufQueue::new(limit);
+        queue.push_bytes(bytes)?;
+        Ok(queue)
+    }
+
+    /// A segment owner that records when it is released.
+    struct ReleaseFlag(Arc<AtomicBool>);
+
+    impl AsRef<[u8]> for ReleaseFlag {
+        fn as_ref(&self) -> &[u8] {
+            b"flagged"
+        }
+    }
+
+    impl Drop for ReleaseFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A segment that holds a [`ReleaseFlag`] owner, with its flag.
+    fn flagged_segment() -> (Bytes, Arc<AtomicBool>) {
+        let released = Arc::new(AtomicBool::new(false));
+        (Bytes::from_owner(ReleaseFlag(released.clone())), released)
+    }
+
+    #[test]
+    fn from_bytes_stores_its_segment_without_a_segment_push() {
+        // The HTTP/1.1 codec's ingress body: a view of a read, limited to its
+        // own length.
+        let read = Bytes::from(vec![0x42; 134]);
+        let body = read.slice(4..132);
+        let (queue, pushes) = steps::counted(&steps::SEGMENT_PUSHES, || {
+            BufQueue::from_bytes(body.clone(), 128)
+        });
+        let queue = queue.expect("an exactly sized queue accepts its segment");
+        assert_eq!(pushes, 0, "from_bytes stores its one segment in place");
+        assert_eq!(
+            queue
+                .segments()
+                .map(|segment| segment.as_ptr())
+                .collect::<Vec<_>>(),
+            [body.as_ptr()],
+            "the queue shares the view's backing"
+        );
+    }
+
+    #[test]
+    fn from_bytes_matches_a_push_onto_a_new_queue() {
+        let shared = Bytes::from(vec![0x42; 64]);
+        let cases = [
+            (shared.slice(8..40), 32),
+            (shared.slice(8..40), 1 << 20),
+            (shared.slice(8..40), 31),
+            (shared.slice(8..40), 0),
+            (Bytes::from_static(&STATIC_BYTES[..5]), 5),
+            (Bytes::from(vec![1, 2, 3]), 3),
+            (Bytes::from(Vec::with_capacity(16)), 0),
+            (Bytes::from_owner(Owner(vec![9; 7])), 7),
+            (Bytes::new(), 0),
+            (Bytes::new(), 8),
+            (shared.slice(8..8), 8),
+        ];
+        for (index, (bytes, limit)) in cases.into_iter().enumerate() {
+            let actual = BufQueue::from_bytes(bytes.clone(), limit);
+            let expected = reference_from_bytes(bytes, limit);
+            match (actual, expected) {
+                (Ok(actual), Ok(expected)) => {
+                    assert_eq!(observe(&actual), observe(&expected), "case {index}");
+                    assert_eq!(many_capacity(&actual), many_capacity(&expected));
+                    assert_eq!(queue_hint(&actual), queue_hint(&expected), "case {index}");
+                }
+                (actual, expected) => assert_eq!(
+                    actual.map(|queue| observe(&queue)).unwrap_err(),
+                    expected.map(|queue| observe(&queue)).unwrap_err(),
+                    "case {index}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn from_bytes_releases_an_empty_or_rejected_segment_at_once() {
+        let (mut empty, released) = flagged_segment();
+        empty.truncate(0);
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "the empty view holds its owner"
+        );
+        let queue = BufQueue::from_bytes(empty, 8).expect("an empty segment fits");
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the empty view is released"
+        );
+        assert_eq!(observe(&queue), observe(&BufQueue::new(8)));
+
+        let (rejected, released) = flagged_segment();
+        let error = BufQueue::from_bytes(rejected, 6).expect_err("7 bytes exceed 6");
+        assert_eq!(
+            error,
+            super::BufQueueError::LimitExceeded {
+                limit: 6,
+                current: 0,
+                incoming: 7,
+            }
+        );
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the rejected segment is released"
+        );
+    }
+
+    /// The trim this module used before whole-queue trims skipped its general
+    /// loop.
+    fn reference_trim_start_at_most(queue: &mut BufQueue, amount: usize) -> usize {
+        let trim_length = amount.min(queue.length);
+        let mut remaining = trim_length;
+        while remaining != 0 {
+            let mut segment = queue
+                .segments
+                .pop_front()
+                .expect("cached nonzero length requires a front segment");
+            let consumed = remaining.min(segment.len());
+            remaining -= consumed;
+            queue.length -= consumed;
+            if queue.is_empty() {
+                queue.backing_capacity = Some(0);
+            }
+            if consumed < segment.len() {
+                segment.advance(consumed);
+                match &mut queue.segments {
+                    Segments::Inline(front, _) => *front = segment,
+                    Segments::Many(segments, _) => segments.push_front(segment),
+                }
+            }
+        }
+        trim_length
+    }
+
+    /// Builds a queue of static segments of `lengths` whose container, when
+    /// it has one, starts at slot `rotation`, and which carries a refill hint
+    /// when `hinted`. Equal arguments build equal twins, each with its own
+    /// container.
+    fn rotated_queue(lengths: &[usize], rotation: usize, hinted: bool) -> BufQueue {
+        let mut queue = BufQueue::new(1 << 20);
+        if hinted {
+            refill(&mut queue, 9);
+            drop(queue.take());
+        }
+        refill(&mut queue, rotation);
+        let mut offset = 64;
+        for length in lengths {
+            queue
+                .push_static(&STATIC_BYTES[offset..][..*length])
+                .unwrap();
+            offset += length;
+        }
+        queue.trim_start_at_most(rotation * 4);
+        queue
+    }
+
+    /// Builds twin queues to trim, each with its own container.
+    type TwinBuilder = Box<dyn Fn() -> (BufQueue, BufQueue)>;
+
+    /// Twin builders: static queues of one to six segments with each container
+    /// rotation, with and without a refill hint, and shared clones of random
+    /// queues that mix every segment kind.
+    fn trim_twins(rng: &mut Rng) -> Vec<TwinBuilder> {
+        let mut twins: Vec<TwinBuilder> = Vec::new();
+        for count in 1..=6 {
+            let lengths: Vec<usize> = (0..count).map(|_| rng.range(1, 40)).collect();
+            for rotation in 0..4 {
+                for hinted in [false, true] {
+                    let lengths = lengths.clone();
+                    twins.push(Box::new(move || {
+                        (
+                            rotated_queue(&lengths, rotation, hinted),
+                            rotated_queue(&lengths, rotation, hinted),
+                        )
+                    }));
+                }
+            }
+        }
+        for _ in 0..8 {
+            let queue = random_queue(rng, 8, 300);
+            twins.push(Box::new(move || {
+                (queue.clone_shared(), queue.clone_shared())
+            }));
+        }
+        twins
+    }
+
+    #[test]
+    fn whole_trims_skip_the_general_trim_loop() {
+        for count in [1, 3, 5] {
+            let mut queue = four_byte_segments(count);
+            let length = queue.chain_length();
+            let (result, trims) =
+                steps::counted(&steps::SEGMENT_TRIMS, || queue.trim_start(length));
+            assert_eq!(result, Ok(()));
+            assert_eq!(trims, 0, "trim_start of all {count} segments");
+            assert!(queue.is_empty());
+
+            let mut queue = four_byte_segments(count);
+            let (trimmed, trims) = steps::counted(&steps::SEGMENT_TRIMS, || {
+                queue.trim_start_at_most(length + 1)
+            });
+            assert_eq!(trimmed, length);
+            assert_eq!(trims, 0, "trim_start_at_most past all {count} segments");
+        }
+        let mut queue = four_byte_segments(3);
+        let (trimmed, trims) =
+            steps::counted(&steps::SEGMENT_TRIMS, || queue.trim_start_at_most(6));
+        assert_eq!(
+            (trimmed, trims),
+            (6, 2),
+            "a partial trim still measures each segment it reaches"
+        );
+    }
+
+    #[test]
+    fn trims_match_the_reference_trim() {
+        let mut rng = Rng(0x6a09_e667_f3bc_c908);
+        for _ in 0..10 {
+            for twins in trim_twins(&mut rng) {
+                let (queue, _) = twins();
+                for amount in split_amounts(&queue) {
+                    let (mut actual, mut expected) = twins();
+                    assert_eq!(
+                        actual.trim_start_at_most(amount),
+                        reference_trim_start_at_most(&mut expected, amount),
+                        "trim of {amount}"
+                    );
+                    assert_trimmed_alike(&mut actual, &mut expected, amount);
+                }
+                for amount in [0, 1, queue.chain_length(), queue.chain_length() + 1] {
+                    let (mut actual, mut expected) = twins();
+                    let expected_result = if amount > expected.chain_length() {
+                        Err(super::BufQueueError::TrimUnderflow {
+                            requested: amount,
+                            available: expected.chain_length(),
+                        })
+                    } else {
+                        reference_trim_start_at_most(&mut expected, amount);
+                        Ok(())
+                    };
+                    assert_eq!(actual.trim_start(amount), expected_result);
+                    assert_trimmed_alike(&mut actual, &mut expected, amount);
+                }
+            }
+        }
+    }
+
+    /// Asserts that two trimmed queues look alike, and still do after the
+    /// same refill, split and take.
+    fn assert_trimmed_alike(actual: &mut BufQueue, expected: &mut BufQueue, amount: usize) {
+        assert_eq!(observe(actual), observe(expected), "trim of {amount}");
+        assert_eq!(
+            many_capacity(actual),
+            many_capacity(expected),
+            "trim of {amount}"
+        );
+        assert_eq!(queue_hint(actual), queue_hint(expected), "trim of {amount}");
+        for length in [3, 5, 7] {
+            actual.push_static(&STATIC_BYTES[..length]).unwrap();
+            expected.push_static(&STATIC_BYTES[..length]).unwrap();
+        }
+        assert_eq!(observe(actual), observe(expected), "refill after {amount}");
+        assert_eq!(
+            many_capacity(actual),
+            many_capacity(expected),
+            "refill after {amount}"
+        );
+        let split = actual.chain_length() / 2;
+        assert_eq!(
+            observe(&actual.split_at_most(split)),
+            observe(&expected.split_at_most(split)),
+            "split after {amount}"
+        );
+        assert_eq!(
+            observe(&actual.take()),
+            observe(&expected.take()),
+            "take after {amount}"
+        );
+        assert_eq!(
+            queue_hint(actual),
+            queue_hint(expected),
+            "take after {amount}"
+        );
+    }
+
+    #[test]
+    fn whole_trims_release_every_segment_in_order() {
+        for count in [1, 2, 5] {
+            let (segments, flags): (Vec<_>, Vec<_>) = (0..count).map(|_| flagged_segment()).unzip();
+            let mut queue = BufQueue::new(1 << 10);
+            segments
+                .into_iter()
+                .for_each(|segment| queue.push_bytes(segment).unwrap());
+            queue.trim_start(queue.chain_length()).unwrap();
+            assert!(
+                flags.iter().all(|flag| flag.load(Ordering::SeqCst)),
+                "every one of {count} segments is released by the trim"
+            );
+            assert_eq!(observe(&queue), observe(&BufQueue::new(1 << 10)));
+        }
+    }
+
+    /// A segment owner whose drop panics.
+    struct PanickingOwner;
+
+    impl AsRef<[u8]> for PanickingOwner {
+        fn as_ref(&self) -> &[u8] {
+            b"panics"
+        }
+    }
+
+    impl Drop for PanickingOwner {
+        fn drop(&mut self) {
+            panic!("the segment owner's drop panics");
+        }
+    }
+
+    /// A queue of a static segment, then `owners` segments whose owners are
+    /// flagged, with the owner at `panicking` panicking instead, and the flags.
+    fn queue_with_a_panicking_owner(
+        owners: usize,
+        panicking: usize,
+    ) -> (BufQueue, Vec<Arc<AtomicBool>>) {
+        let mut queue = BufQueue::new(1 << 10);
+        queue.push_static(&STATIC_BYTES[..4]).unwrap();
+        let flags = (0..owners)
+            .map(|index| {
+                let (segment, released) = if index == panicking {
+                    (
+                        Bytes::from_owner(PanickingOwner),
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                } else {
+                    flagged_segment()
+                };
+                queue.push_bytes(segment).unwrap();
+                released
+            })
+            .collect();
+        (queue, flags)
+    }
+
+    #[test]
+    fn a_whole_trim_whose_segment_drop_panics_stops_as_the_reference_trim_does() {
+        for (owners, panicking) in [(1, 0), (3, 0), (3, 1), (3, 2)] {
+            let (mut actual, actual_flags) = queue_with_a_panicking_owner(owners, panicking);
+            let (mut expected, expected_flags) = queue_with_a_panicking_owner(owners, panicking);
+            let length = actual.chain_length();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| actual.trim_start(length)))
+                .expect_err("a segment owner's drop panics");
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reference_trim_start_at_most(&mut expected, length)
+            }))
+            .expect_err("a segment owner's drop panics");
+            let case = format!("owner {panicking} of {owners} panics");
+            let view = |queue: &BufQueue| {
+                let mut observed = observe(queue);
+                observed
+                    .segments
+                    .iter_mut()
+                    .for_each(|(pointer, _)| *pointer = 0);
+                observed
+                    .front
+                    .iter_mut()
+                    .for_each(|(pointer, _)| *pointer = 0);
+                observed
+                    .iovecs
+                    .iter_mut()
+                    .for_each(|(pointer, _)| *pointer = 0);
+                observed
+            };
+            assert_eq!(view(&actual), view(&expected), "{case}");
+            let released = |flags: &[Arc<AtomicBool>]| -> Vec<bool> {
+                flags
+                    .iter()
+                    .map(|flag| flag.load(Ordering::SeqCst))
+                    .collect()
+            };
+            assert_eq!(released(&actual_flags), released(&expected_flags), "{case}");
+            assert_eq!(
+                actual.segment_count(),
+                owners - panicking - 1,
+                "{case}: the segments after the panicking one stay queued"
+            );
+        }
+    }
+
+    /// A queue holding only a segment whose owner panics, pushed onto a new
+    /// queue or built in place by `from_bytes`.
+    fn lone_panicking_queue(built_in_place: bool) -> BufQueue {
+        let segment = Bytes::from_owner(PanickingOwner);
+        if built_in_place {
+            return BufQueue::from_bytes(segment, 1 << 10).unwrap();
+        }
+        let mut queue = BufQueue::new(1 << 10);
+        queue.push_bytes(segment).unwrap();
+        queue
+    }
+
+    #[test]
+    fn a_whole_trim_of_a_lone_panicking_segment_resets_the_queue_before_the_panic_escapes() {
+        for built_in_place in [false, true] {
+            let case = if built_in_place {
+                "built by from_bytes"
+            } else {
+                "pushed onto a new queue"
+            };
+            let mut actual = lone_panicking_queue(built_in_place);
+            let mut expected = lone_panicking_queue(built_in_place);
+            assert!(
+                matches!(actual.segments, Segments::Inline(..)),
+                "{case}: the lone segment is held inline"
+            );
+            assert_eq!(actual.chain_length(), 6, "{case}");
+            catch_unwind(AssertUnwindSafe(|| actual.trim_start(6)))
+                .expect_err("the segment owner's drop panics");
+            catch_unwind(AssertUnwindSafe(|| {
+                reference_trim_start_at_most(&mut expected, 6)
+            }))
+            .expect_err("the segment owner's drop panics");
+            assert_eq!(actual.chain_length(), 0, "{case}: the length is reset");
+            assert_eq!(
+                actual.backing_capacity_upper_bound(),
+                Some(0),
+                "{case}: the backing bound is reset"
+            );
+            assert_eq!(actual.segment_count(), 0, "{case}");
+            assert_eq!(observe(&actual), observe(&expected), "{case}");
+        }
+    }
+
+    /// The refill hint that a queue's segments carry.
+    fn queue_hint(queue: &BufQueue) -> u16 {
+        match &queue.segments {
+            Segments::Inline(_, hint) | Segments::Many(_, hint) => *hint,
         }
     }
 
