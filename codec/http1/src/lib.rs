@@ -255,6 +255,91 @@ struct HeadScan {
     stop: Option<HeadScanStop>,
 }
 
+/// The most LF positions a head scan records.
+const RECORDED_LINE_FEEDS: usize = 32;
+
+const _: () = assert!(MAX_HEADER_BYTES <= u32::MAX as usize);
+
+/// The positions of the LFs a head scan reads, the first
+/// `RECORDED_LINE_FEEDS` of them, so that a head parsed in place is split into
+/// lines without another search.
+struct LineFeedPositions {
+    positions: [u32; RECORDED_LINE_FEEDS],
+    count: usize,
+}
+
+impl LineFeedPositions {
+    fn new() -> Self {
+        Self {
+            positions: [0; RECORDED_LINE_FEEDS],
+            count: 0,
+        }
+    }
+
+    /// Records the next LF, at `index`, which is inside a head and so below
+    /// `MAX_HEADER_BYTES`.
+    #[inline]
+    fn record(&mut self, index: usize) {
+        if let Some(position) = self.positions.get_mut(self.count) {
+            *position = index as u32;
+        }
+        self.count += 1;
+    }
+
+    /// The recorded LFs of a head of `length` bytes whose LFs this recorded,
+    /// each of them in order.
+    fn known(&self, length: usize) -> KnownLineFeeds<'_> {
+        match self.positions.get(..self.count) {
+            Some(positions) => KnownLineFeeds {
+                positions,
+                searched_to: length,
+            },
+            None => KnownLineFeeds {
+                positions: &self.positions,
+                searched_to: self.positions[RECORDED_LINE_FEEDS - 1] as usize + 1,
+            },
+        }
+    }
+}
+
+/// LF positions in a head: every LF before `searched_to`, in order.
+#[derive(Clone, Copy, Debug)]
+struct KnownLineFeeds<'a> {
+    positions: &'a [u32],
+    searched_to: usize,
+}
+
+/// The slot of `byte` in a [`METHOD_BYTE_MASKS`] row. Every byte of a frozen
+/// method name is an uppercase letter or `-`.
+const fn method_byte_slot(byte: u8) -> Option<usize> {
+    match byte {
+        b'A'..=b'Z' => Some((byte - b'A') as usize),
+        b'-' => Some(26),
+        _ => None,
+    }
+}
+
+/// For each index into a frozen method name and each byte slot, the methods,
+/// one bit per entry of `FROZEN_HTTP_METHODS`, whose name holds that byte at
+/// that index.
+static METHOD_BYTE_MASKS: [[u32; 27]; INITIAL_PREFIX_LIMIT - 1] = {
+    let mut masks = [[0; 27]; INITIAL_PREFIX_LIMIT - 1];
+    let mut method = 0;
+    while method < FROZEN_HTTP_METHODS.len() {
+        let name = FROZEN_HTTP_METHODS[method];
+        let mut index = 0;
+        while index < name.len() {
+            let Some(slot) = method_byte_slot(name[index]) else {
+                panic!("a frozen method name holds a byte without a slot");
+            };
+            masks[index][slot] |= 1 << method;
+            index += 1;
+        }
+        method += 1;
+    }
+    masks
+};
+
 /// `valid_initial_prefix` of a head that grows one byte at a time, with each
 /// byte read once. Downstream it keeps the frozen methods that the method token
 /// still prefixes and whether a delimiter has ended the token; upstream, which
@@ -279,6 +364,19 @@ impl PrefixMatch {
         }
     }
 
+    /// Whether every longer head passes as well: the head passes, and
+    /// downstream a delimiter has ended the method token, or upstream the head
+    /// holds all of `HTTP/`.
+    #[inline]
+    fn settled(&self) -> bool {
+        self.valid
+            && if self.upstream {
+                self.length >= b"HTTP/".len()
+            } else {
+                self.delimited
+            }
+    }
+
     /// Appends `byte` to the head, and returns whether the head passes
     /// `valid_initial_prefix`.
     #[inline]
@@ -294,14 +392,13 @@ impl PrefixMatch {
             if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
                 self.delimited = true;
             } else {
-                let mut remaining = self.candidates;
-                while remaining != 0 {
-                    let method = remaining.trailing_zeros() as usize;
-                    remaining &= remaining - 1;
-                    if FROZEN_HTTP_METHODS[method].get(index) != Some(&byte) {
-                        self.candidates &= !(1 << method);
-                    }
-                }
+                #[cfg(test)]
+                count_helper_work(|work| &work.prefix_method_steps, 1);
+                let matching = match (METHOD_BYTE_MASKS.get(index), method_byte_slot(byte)) {
+                    (Some(row), Some(slot)) => row[slot],
+                    _ => 0,
+                };
+                self.candidates &= matching;
                 self.valid = self.candidates != 0;
             }
         }
@@ -320,6 +417,9 @@ struct HeadWork {
     prefix_copies: Cell<usize>,
     /// `word_scan::count_lf` passes over a parsed head.
     line_feed_counts: Cell<usize>,
+    /// Steps of the head scan's main loop: a byte checked on its own, or a
+    /// search for the next control byte.
+    scan_steps: Cell<usize>,
     /// Owned copies of a parsed request's method name.
     method_copies: Cell<usize>,
     /// Nonempty Upgrade values that `parse_head` reads from anywhere but the
@@ -353,6 +453,43 @@ fn formatted_strings() -> usize {
 #[cfg(test)]
 fn count_work(counter: &Cell<usize>, amount: usize) {
     counter.set(counter.get() + amount);
+}
+
+/// Work counts of the head-path helpers that run without a codec, read by the
+/// count oracles.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct HelperWork {
+    /// Frozen methods that `PrefixMatch::push` matches a byte against.
+    prefix_method_steps: Cell<usize>,
+    /// Request-line bytes that `request_line_is_http_09` checks for a
+    /// delimiter.
+    http_09_delimiter_reads: Cell<usize>,
+    /// Bytes that `HeaderLines` searches for an LF.
+    line_search_bytes: Cell<usize>,
+    /// Header-value bytes that `valid_header_value` checks one at a time.
+    value_byte_checks: Cell<usize>,
+    /// Version numbers that `parse_version` parses as decimal digits.
+    version_number_parses: Cell<usize>,
+    /// Loads that `generate_headers` makes to check header values for a CR or
+    /// an LF: a byte, or a word of eight.
+    egress_cr_lf_loads: Cell<usize>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static HELPER_WORK: HelperWork = HelperWork::default();
+}
+
+/// The count `counter` selects from this thread's `HelperWork`.
+#[cfg(test)]
+fn helper_work(counter: fn(&HelperWork) -> &Cell<usize>) -> usize {
+    HELPER_WORK.with(|work| counter(work).get())
+}
+
+#[cfg(test)]
+fn count_helper_work(counter: fn(&HelperWork) -> &Cell<usize>, amount: usize) {
+    HELPER_WORK.with(|work| count_work(counter(work), amount));
 }
 
 /// The bytes that end an egress message: none, or for chunked egress the final
@@ -896,7 +1033,7 @@ impl Http1xCodec {
     /// The scan of `scan_head_counting_line_feeds`, without its count.
     #[cfg(test)]
     fn scan_head(&self, buffered: &[u8], segment: &[u8], from: usize) -> HeadScan {
-        self.scan_head_counting_line_feeds(buffered, segment, from)
+        self.scan_head_counting_line_feeds(buffered, segment, from, &mut LineFeedPositions::new())
             .0
     }
 
@@ -909,12 +1046,14 @@ impl Http1xCodec {
     ///
     /// The prefix check reads each head byte inside its window once per call,
     /// the bytes before `from` included. The scan also returns the number of
-    /// LFs in `segment[from..end]`, each of which it visits.
+    /// LFs in `segment[from..end]`, each of which it visits, and records their
+    /// positions in `segment` in `line_feed_positions`.
     fn scan_head_counting_line_feeds(
         &self,
         buffered: &[u8],
         segment: &[u8],
         from: usize,
+        line_feed_positions: &mut LineFeedPositions,
     ) -> (HeadScan, usize) {
         let base = buffered.len();
         let head_byte = |index: usize| {
@@ -930,8 +1069,7 @@ impl Http1xCodec {
         } else {
             INITIAL_PREFIX_LIMIT
         };
-        let mut prefix = PrefixMatch::new(self.direction.is_upstream());
-        let mut push_prefix = |byte: &u8| {
+        let push_prefix = |prefix: &mut PrefixMatch, byte: &u8| {
             #[cfg(test)]
             {
                 count_work(&self.head_work.prefix_reads, 1);
@@ -942,41 +1080,62 @@ impl Http1xCodec {
             }
             prefix.push(*byte)
         };
+        // The position of the first byte this call reaches that fails the
+        // start-line prefix check. Bytes past it are not scanned.
+        let mut prefix_stop = None;
         if base + from < prefix_limit {
-            for byte in buffered.iter().chain(&segment[..from]) {
-                push_prefix(byte);
+            let mut prefix = PrefixMatch::new(self.direction.is_upstream());
+            for byte in buffered {
+                push_prefix(&mut prefix, byte);
+            }
+            for byte in &segment[..from] {
+                push_prefix(&mut prefix, byte);
+            }
+            let window = segment
+                .get(from..limit.min(prefix_limit - base))
+                .unwrap_or_default();
+            for (offset, byte) in window.iter().enumerate() {
+                if !push_prefix(&mut prefix, byte) {
+                    prefix_stop = Some(from + offset);
+                    break;
+                }
+                if prefix.settled() {
+                    break;
+                }
             }
         }
+        let search_end = prefix_stop.unwrap_or(limit);
         let mut line_feeds = 0;
         let mut earlier_newline = None;
         let mut position = from;
-        while position < limit {
-            let index = if base + position < prefix_limit {
-                if !push_prefix(&segment[position]) {
-                    let scan = HeadScan {
-                        end: position + 1,
-                        stop: Some(HeadScanStop::InvalidStartLine),
-                    };
-                    return (scan, line_feeds);
-                }
-                position
-            } else {
-                let Some(offset) = word_scan::find_control(&segment[position..limit]) else {
-                    position = limit;
-                    break;
-                };
-                position + offset
+        while position < search_end {
+            #[cfg(test)]
+            count_work(&self.head_work.scan_steps, 1);
+            let Some(offset) = word_scan::find_control(&segment[position..search_end]) else {
+                position = search_end;
+                break;
             };
+            let mut index = position + offset;
+            // A CR passes every check, so the LF of a CRLF is checked at once.
+            if segment[index] == b'\r' && index + 1 < search_end && segment[index + 1] == b'\n' {
+                index += 1;
+            }
             position = index + 1;
             let stop = match segment[index] {
                 b'\n' => {
                     line_feeds += 1;
+                    line_feed_positions.record(index);
                     let length = base + position;
-                    let terminated = (length >= 2 && head_byte(length - 2) == b'\n')
-                        || (length >= 4
-                            && head_byte(length - 4) == b'\r'
-                            && head_byte(length - 3) == b'\n'
-                            && head_byte(length - 2) == b'\r');
+                    let terminated = if index >= 3 {
+                        let end = &segment[index - 3..index];
+                        end[2] == b'\n' || *end == *b"\r\n\r"
+                    } else {
+                        (length >= 2 && head_byte(length - 2) == b'\n')
+                            || (length >= 4
+                                && head_byte(length - 4) == b'\r'
+                                && head_byte(length - 3) == b'\n'
+                                && head_byte(length - 2) == b'\r')
+                    };
                     let http_09 = self.direction.is_downstream()
                         && !earlier_newline.replace(true).unwrap_or_else(|| {
                             buffered.contains(&b'\n') || segment[..from].contains(&b'\n')
@@ -995,6 +1154,13 @@ impl Http1xCodec {
                 };
                 return (scan, line_feeds);
             }
+        }
+        if let Some(stop) = prefix_stop {
+            let scan = HeadScan {
+                end: stop + 1,
+                stop: Some(HeadScanStop::InvalidStartLine),
+            };
+            return (scan, line_feeds);
         }
         if position < segment.len() {
             let scan = HeadScan {
@@ -1025,8 +1191,9 @@ impl Http1xCodec {
     ) {
         let segment = &input[head_start..];
         let from = result.consumed - head_start;
+        let mut line_feed_positions = LineFeedPositions::new();
         let (scan, scanned_line_feeds) =
-            self.scan_head_counting_line_feeds(&buffered, segment, from);
+            self.scan_head_counting_line_feeds(&buffered, segment, from, &mut line_feed_positions);
         result.consumed = head_start + scan.end;
         let accepted = &segment[..scan.end];
         let message: &'static [u8] = match scan.stop {
@@ -1037,15 +1204,20 @@ impl Http1xCodec {
             }
             Some(HeadScanStop::Complete) => {
                 let parsed = if buffered.is_empty() {
-                    let line_feeds = scanned_line_feeds
-                        + segment[..from]
-                            .iter()
-                            .filter(|byte| **byte == b'\n')
-                            .count();
-                    self.parse_head(accepted, Some(line_feeds))
+                    let earlier_line_feeds = segment[..from]
+                        .iter()
+                        .filter(|byte| **byte == b'\n')
+                        .count();
+                    let known = (earlier_line_feeds == 0)
+                        .then(|| line_feed_positions.known(accepted.len()));
+                    self.parse_head(
+                        accepted,
+                        Some(scanned_line_feeds + earlier_line_feeds),
+                        known,
+                    )
                 } else {
                     buffered.extend_from_slice(accepted);
-                    self.parse_head(&buffered, None)
+                    self.parse_head(&buffered, None, None)
                 };
                 match parsed {
                     Ok(parsed) => {
@@ -1080,11 +1252,12 @@ impl Http1xCodec {
     }
 
     /// Parses the complete head `raw`, which holds `line_feeds` LFs when the
-    /// scan counted them.
+    /// scan counted them, at `known` when the scan recorded them.
     fn parse_head(
         &mut self,
         raw: &[u8],
         line_feeds: Option<usize>,
+        known: Option<KnownLineFeeds<'_>>,
     ) -> Result<ParsedHead, (ParseErrorKind, &'static [u8])> {
         let mut message = self.current_message.take().unwrap_or_default();
         let line_feeds = line_feeds.unwrap_or_else(|| {
@@ -1101,7 +1274,10 @@ impl Http1xCodec {
             self.head_reserve = Some((reserve, message.headers().len()));
         }
         message.headers_mut().reserve(reserve);
-        let mut lines = header_lines(raw);
+        let mut lines = match known {
+            Some(known) => HeaderLines::with_known(raw, known),
+            None => header_lines(raw),
+        };
         let start_line = trim_trailing_cr(lines.next().unwrap_or_default());
         let mut inferred_host = None;
         let (version, informational) = if self.direction.is_downstream() {
@@ -1810,7 +1986,7 @@ impl Http1xCodec {
             {
                 continue;
             }
-            if value.iter().any(|byte| matches!(*byte, b'\r' | b'\n')) {
+            if holds_cr_or_lf(value) {
                 continue;
             }
             output.extend_from_slice(name);
@@ -2748,10 +2924,21 @@ fn is_frozen_http_method(method: &[u8]) -> bool {
 }
 
 fn parse_version(value: &[u8]) -> Option<(u8, u8)> {
+    const HTTP_1_1: u64 = u64::from_le_bytes(*b"HTTP/1.1");
+    const HTTP_1_0: u64 = u64::from_le_bytes(*b"HTTP/1.0");
+    if let Ok(word) = <[u8; 8]>::try_from(value) {
+        match u64::from_le_bytes(word) {
+            HTTP_1_1 => return Some((1, 1)),
+            HTTP_1_0 => return Some((1, 0)),
+            _ => {}
+        }
+    }
     let value = value.strip_prefix(b"HTTP/")?;
     let separator = value.iter().position(|byte| *byte == b'.')?;
     let (major, minor_with_separator) = value.split_at(separator);
     let minor = minor_with_separator.get(1..)?;
+    #[cfg(test)]
+    count_helper_work(|work| &work.version_number_parses, 2);
     let major = parse_decimal_u64(major)?;
     let minor = parse_decimal_u64(minor)?;
     Some((u8::try_from(major).ok()?, u8::try_from(minor).ok()?))
@@ -2785,32 +2972,63 @@ fn trim_trailing_cr(value: &[u8]) -> &[u8] {
 /// backslash, CR, backslash, which stays in its line. It yields at least one
 /// line, and an empty line after a final LF.
 fn header_lines(value: &[u8]) -> HeaderLines<'_> {
-    HeaderLines {
+    HeaderLines::with_known(
         value,
-        start: 0,
-        finished: false,
-    }
+        KnownLineFeeds {
+            positions: &[],
+            searched_to: 0,
+        },
+    )
 }
 
 struct HeaderLines<'a> {
     value: &'a [u8],
     start: usize,
     finished: bool,
+    /// LF positions not yet split at or skipped, which hold every LF from
+    /// `start` to `searched_to`.
+    known: &'a [u32],
+    searched_to: usize,
 }
 
-impl<'a> Iterator for HeaderLines<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<&'a [u8]> {
-        if self.finished {
-            return None;
+impl<'a> HeaderLines<'a> {
+    /// The lines of `value`, whose LFs before `known.searched_to` are
+    /// `known.positions`.
+    fn with_known(value: &'a [u8], known: KnownLineFeeds<'a>) -> Self {
+        Self {
+            value,
+            start: 0,
+            finished: false,
+            known: known.positions,
+            searched_to: known.searched_to,
         }
+    }
+
+    /// Whether the LF at `index` ends a line rather than an escaped newline.
+    #[inline]
+    fn ends_line(&self, index: usize) -> bool {
+        !(index >= 3
+            && self.value[index - 1] == b'\\'
+            && self.value[index - 2] == b'\r'
+            && self.value[index - 3] == b'\\')
+    }
+
+    /// The offset of the first LF in `value[search..]`.
+    #[inline]
+    fn find_lf_from(&self, search: usize) -> Option<usize> {
+        #[cfg(test)]
+        count_helper_work(|work| &work.line_search_bytes, self.value.len() - search);
+        word_scan::find_lf(&self.value[search..])
+    }
+
+    /// The next line, past the known LFs.
+    fn search(&mut self) -> Option<&'a [u8]> {
         let value = self.value;
-        let mut search = self.start;
-        while let Some(offset) = word_scan::find_lf(&value[search..]) {
+        let mut search = self.start.max(self.searched_to);
+        while let Some(offset) = self.find_lf_from(search) {
             let index = search + offset;
             search = index + 1;
-            if index < 3 || value[index - 3..index] != *b"\\\r\\" {
+            if self.ends_line(index) {
                 let line = &value[self.start..index];
                 self.start = search;
                 return Some(line);
@@ -2821,11 +3039,36 @@ impl<'a> Iterator for HeaderLines<'a> {
     }
 }
 
+impl<'a> Iterator for HeaderLines<'a> {
+    type Item = &'a [u8];
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.finished {
+            return None;
+        }
+        while let Some((&index, known)) = self.known.split_first() {
+            self.known = known;
+            let index = index as usize;
+            if self.ends_line(index) {
+                let line = &self.value[self.start..index];
+                self.start = index + 1;
+                return Some(line);
+            }
+        }
+        self.search()
+    }
+}
+
 /// Whether the request line that ends a head at its first LF, `first` followed
 /// by `second`, is HTTP/0.9. Split at each SP and TAB after one trailing CR is
 /// trimmed, it holds two words, the first nonempty, or three, the last
-/// `HTTP/0.9`.
+/// `HTTP/0.9`. A last word equal to `HTTP/0.9` holds no SP or TAB, so the
+/// split stops at the second delimiter.
 fn request_line_is_http_09(first: &[u8], second: &[u8]) -> bool {
+    if first.is_empty() {
+        return line_is_http_09(second);
+    }
     let byte = |index: usize| {
         if index < first.len() {
             first[index]
@@ -2837,21 +3080,40 @@ fn request_line_is_http_09(first: &[u8], second: &[u8]) -> bool {
     if length > 0 && byte(length - 1) == b'\r' {
         length -= 1;
     }
-    let mut delimiters = (0..length).filter(|index| matches!(byte(*index), b' ' | b'\t'));
+    let mut delimiters = (0..length).filter(|index| {
+        #[cfg(test)]
+        count_helper_work(|work| &work.http_09_delimiter_reads, 1);
+        matches!(byte(*index), b' ' | b'\t')
+    });
     let Some(method_end) = delimiters.next() else {
         return false;
     };
     let Some(url_end) = delimiters.next() else {
         return method_end > 0;
     };
-    if delimiters.next().is_some() {
-        return false;
-    }
     let version = url_end + 1..length;
     version.len() == b"HTTP/0.9".len()
         && version
             .zip(b"HTTP/0.9")
             .all(|(index, expected)| byte(index) == *expected)
+}
+
+/// [`request_line_is_http_09`] of a request line in one slice.
+fn line_is_http_09(line: &[u8]) -> bool {
+    let line = trim_trailing_cr(line);
+    let delimiter = |byte: &u8| {
+        #[cfg(test)]
+        count_helper_work(|work| &work.http_09_delimiter_reads, 1);
+        matches!(*byte, b' ' | b'\t')
+    };
+    let Some(method_end) = line.iter().position(delimiter) else {
+        return false;
+    };
+    let words = &line[method_end + 1..];
+    let Some(url_length) = words.iter().position(delimiter) else {
+        return method_end > 0;
+    };
+    words[url_length + 1..] == *b"HTTP/0.9"
 }
 
 fn trim_http_whitespace(value: &[u8]) -> &[u8] {
@@ -2922,18 +3184,32 @@ const fn is_header_name_byte(byte: u8) -> bool {
 /// ASCII and spaces passes in both modes without the per-byte check.
 #[inline]
 fn valid_header_value(value: &[u8], strict: bool) -> bool {
-    let (words, tail) = value.as_chunks::<8>();
-    let visible = words.iter().all(|word| {
-        let word = u64::from_le_bytes(*word);
+    let visible = word_scan::all_words(value, |word| {
         (word_scan::has_less(word, b' ')
             | (word & word_scan::HIGH)
             | word_scan::has_zero(word ^ word_scan::repeat(0x7f)))
             == 0
-    }) && tail.iter().all(|byte| matches!(*byte, b' '..=b'~'));
+    });
     visible || valid_header_value_exact(value, strict)
 }
 
+/// Whether `value` holds a CR or an LF.
+#[inline]
+fn holds_cr_or_lf(value: &[u8]) -> bool {
+    !word_scan::all_words(value, |word| {
+        #[cfg(test)]
+        count_helper_work(|work| &work.egress_cr_lf_loads, 1);
+        // CR and LF are below 0x0e: most words hold no such byte.
+        word_scan::has_less(word, 0x0e) == 0
+            || (word_scan::has_zero(word ^ word_scan::repeat(b'\r'))
+                | word_scan::has_zero(word ^ word_scan::repeat(b'\n')))
+                == 0
+    })
+}
+
 fn valid_header_value_exact(value: &[u8], strict: bool) -> bool {
+    #[cfg(test)]
+    count_helper_work(|work| &work.value_byte_checks, value.len());
     value.iter().enumerate().all(|(index, byte)| {
         if *byte >= 0x80 {
             return !strict;
@@ -3079,6 +3355,35 @@ mod word_scan {
             .map(|offset| words.len() * 8 + offset)
     }
 
+    /// Whether `test` holds for each of a set of words that covers every
+    /// byte of `bytes`: its whole words and its last eight bytes, or for
+    /// fewer than eight bytes one word built from them. A byte class that
+    /// `test` checks in every byte of a word is thus checked in every byte of
+    /// `bytes`, with no byte checked on its own.
+    #[inline]
+    pub(super) fn all_words(bytes: &[u8], test: impl Fn(u64) -> bool) -> bool {
+        if let Some(last) = bytes.last_chunk::<8>() {
+            let (words, _) = bytes.as_chunks::<8>();
+            return words.iter().all(|word| test(u64::from_le_bytes(*word)))
+                && test(u64::from_le_bytes(*last));
+        }
+        if let (Some(first), Some(last)) = (bytes.first_chunk::<4>(), bytes.last_chunk::<4>()) {
+            let word = u64::from(u32::from_le_bytes(*first))
+                | (u64::from(u32::from_le_bytes(*last)) << 32);
+            return test(word);
+        }
+        match bytes {
+            [] => true,
+            [first, ..] => {
+                let middle = bytes[bytes.len() / 2];
+                let last = bytes[bytes.len() - 1];
+                test(u64::from_le_bytes([
+                    *first, middle, last, *first, *first, *first, *first, *first,
+                ]))
+            }
+        }
+    }
+
     /// The index of the first LF in `bytes`.
     #[inline]
     pub(super) fn find_lf(bytes: &[u8]) -> Option<usize> {
@@ -3122,3 +3427,7 @@ mod head_scan;
 #[cfg(test)]
 #[path = "../tests/generate_copies.rs"]
 mod generate_copies;
+
+#[cfg(test)]
+#[path = "../tests/head_equivalence.rs"]
+mod head_equivalence;

@@ -228,10 +228,10 @@ fn reference_scan(upstream: bool, head: &[u8]) -> HeadScan {
 }
 
 /// A deterministic linear congruential generator.
-struct Generator(u64);
+pub(super) struct Generator(pub(super) u64);
 
 impl Generator {
-    fn next(&mut self, bound: usize) -> usize {
+    pub(super) fn next(&mut self, bound: usize) -> usize {
         self.0 = self
             .0
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -302,7 +302,7 @@ const STARTS: &[&[u8]] = &[
 
 /// Heads built from start lines and pieces, with no leading CR or LF, which
 /// `ParseState::Idle` skips before a head begins.
-fn generated_heads() -> Vec<Vec<u8>> {
+pub(super) fn generated_heads() -> Vec<Vec<u8>> {
     let mut generator = Generator(0x5eed);
     let mut heads = Vec::new();
     for _ in 0..1_500 {
