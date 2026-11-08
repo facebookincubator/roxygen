@@ -84,6 +84,7 @@ mod byte_stream {
         complete_write_at: Option<usize>,
         excess_write_progress: Option<usize>,
         cancel_write_progress: Option<usize>,
+        on_next_write_poll: Option<Box<dyn FnOnce()>>,
         active_write_progress: Option<WriteProgress>,
         write_waker: Option<Waker>,
         writes_started: usize,
@@ -108,6 +109,7 @@ mod byte_stream {
                 complete_write_at: None,
                 excess_write_progress: None,
                 cancel_write_progress: None,
+                on_next_write_poll: None,
                 active_write_progress: None,
                 write_waker: None,
                 writes_started: 0,
@@ -294,6 +296,11 @@ mod byte_stream {
             state.pending_write_progress = progress;
         }
 
+        /// Runs `hook` inside the next backend write poll, before its result.
+        fn on_next_write_poll(&self, hook: impl FnOnce() + 'static) {
+            self.state.borrow_mut().on_next_write_poll = Some(Box::new(hook));
+        }
+
         fn report_write_progress_on_cancel(&self, progress: usize) {
             self.state.borrow_mut().cancel_write_progress = Some(progress);
         }
@@ -418,6 +425,10 @@ mod byte_stream {
             );
             let mut recorded = 0;
             Box::pin(std::future::poll_fn(move |context| {
+                let hook = state.borrow_mut().on_next_write_poll.take();
+                if let Some(hook) = hook {
+                    hook();
+                }
                 let mut state = state.borrow_mut();
                 if recorded == 0 {
                     if let Some(excess) = state.excess_write_progress.take() {
@@ -3500,5 +3511,325 @@ mod byte_stream {
             drop(write);
             assert_eq!(errors(), before + 1);
         });
+    }
+
+    mod manual_host {
+        use std::cell::Cell;
+        use std::future::poll_fn;
+        use std::rc::Weak;
+        use std::time::Instant;
+
+        use roxygen_runtime::host::Host;
+        use roxygen_runtime::host::LocalFuture;
+        use roxygen_runtime::host::LocalHost;
+
+        use super::*;
+
+        struct ManualTimer {
+            deadline: Instant,
+            waker: RefCell<Option<Waker>>,
+        }
+
+        /// A host on the running `LocalSet` whose clock moves only when a test
+        /// advances it, and which counts its clock reads. Its clock runs a day
+        /// ahead of Tokio's, which these tests leave unpaused, so a Tokio timer
+        /// armed for a test's timeout never fires during it.
+        struct ManualHost {
+            now: Rc<Cell<Instant>>,
+            reads: Cell<usize>,
+            timers: RefCell<Vec<Weak<ManualTimer>>>,
+        }
+
+        impl ManualHost {
+            fn advance(&self, duration: Duration) {
+                self.now.set(self.now.get() + duration);
+                let now = self.now.get();
+                let ready: Vec<Waker> = self
+                    .timers
+                    .borrow()
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .filter(|timer| timer.deadline <= now)
+                    .filter_map(|timer| timer.waker.borrow_mut().take())
+                    .collect();
+                ready.into_iter().for_each(Waker::wake);
+            }
+
+            fn reads(&self) -> usize {
+                self.reads.get()
+            }
+        }
+
+        impl LocalHost for ManualHost {
+            fn spawn_local(&self, future: LocalFuture) {
+                tokio::task::spawn_local(future);
+            }
+
+            fn now(&self) -> Instant {
+                self.reads.set(self.reads.get() + 1);
+                self.now.get()
+            }
+
+            fn sleep_until(&self, deadline: Instant) -> LocalFuture {
+                let timer = Rc::new(ManualTimer {
+                    deadline,
+                    waker: RefCell::new(None),
+                });
+                {
+                    let mut timers = self.timers.borrow_mut();
+                    timers.retain(|timer| timer.strong_count() != 0);
+                    timers.push(Rc::downgrade(&timer));
+                }
+                let now = Rc::clone(&self.now);
+                Box::pin(poll_fn(move |context| {
+                    if now.get() >= timer.deadline {
+                        Poll::Ready(())
+                    } else {
+                        *timer.waker.borrow_mut() = Some(context.waker().clone());
+                        Poll::Pending
+                    }
+                }))
+            }
+
+            fn yield_to_io(&self) -> LocalFuture {
+                Box::pin(tokio::task::yield_now())
+            }
+        }
+
+        std::thread_local! {
+            static MANUAL_HOST: RefCell<Option<Rc<ManualHost>>> = const { RefCell::new(None) };
+        }
+
+        /// The running test's host. A worker command must be `Send`, so the
+        /// `!Send` host reaches the test through its thread.
+        fn manual_host() -> Rc<ManualHost> {
+            MANUAL_HOST.with_borrow(|host| {
+                Rc::clone(host.as_ref().expect("the test runs on its manual host"))
+            })
+        }
+
+        fn run_manual_worker<F, Fut>(test: F)
+        where
+            F: FnOnce(WorkerContext) -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + 'static,
+        {
+            Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("current-thread runtime")
+                .block_on(LocalSet::new().run_until(async move {
+                    let manual = Rc::new(ManualHost {
+                        now: Rc::new(Cell::new(Instant::now() + Duration::from_secs(86_400))),
+                        reads: Cell::new(0),
+                        timers: RefCell::new(Vec::new()),
+                    });
+                    MANUAL_HOST.set(Some(Rc::clone(&manual)));
+                    let (worker, driver) = WorkerDriver::with_host(32, Host::new(manual)).unwrap();
+                    let call = worker.call_local(test).unwrap();
+                    let driver_task = tokio::task::spawn_local(driver);
+                    call.await.unwrap();
+                    worker.begin_shutdown();
+                    driver_task.await.unwrap();
+                    MANUAL_HOST.set(None);
+                }));
+        }
+
+        #[test]
+        fn a_pending_write_times_out_on_its_hosts_manual_clock() {
+            run_manual_worker(|context| async move {
+                let owner = std::thread::current().id();
+                let manual = manual_host();
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                control.block_writes(3);
+                let timeout = Duration::from_secs(60);
+                let mut write = transport.write(
+                    &context,
+                    queue(&[b"pending"], 7),
+                    timeout,
+                    CancellationToken::never(),
+                );
+                let signal = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&signal));
+                assert!(poll_once_with_waker(write.as_mut(), &waker).is_pending());
+
+                manual.advance(timeout - Duration::from_millis(1));
+                assert!(
+                    !signal.take(),
+                    "the write is not woken one millisecond short of its deadline",
+                );
+                manual.advance(Duration::from_millis(1));
+                assert!(
+                    signal.take(),
+                    "the host's clock passing the deadline wakes the write",
+                );
+                let error = write.await.err().unwrap();
+                assert_eq!(error.code(), HttpErrorCode::WRITE_TIMEOUT);
+                assert_eq!(error.bytes_written(), 3);
+                assert_eq!(
+                    control.actions(),
+                    vec![IoAction::CancelWrite(HttpErrorCode::WRITE_TIMEOUT, owner)],
+                );
+                transport.close(&context).unwrap();
+            });
+        }
+
+        #[test]
+        fn a_pending_read_times_out_on_its_hosts_manual_clock() {
+            run_manual_worker(|context| async move {
+                let owner = std::thread::current().id();
+                let manual = manual_host();
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                let timeout = Duration::from_secs(60);
+                let mut read =
+                    transport.read(&context, 1_024, 1_024, timeout, CancellationToken::never());
+                let signal = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&signal));
+                assert!(poll_once_with_waker(read.as_mut(), &waker).is_pending());
+
+                manual.advance(timeout - Duration::from_millis(1));
+                assert!(
+                    !signal.take(),
+                    "the read is not woken one millisecond short of its deadline",
+                );
+                manual.advance(Duration::from_millis(1));
+                assert!(
+                    signal.take(),
+                    "the host's clock passing the deadline wakes the read",
+                );
+                assert_eq!(
+                    read.await.err().unwrap().code(),
+                    HttpErrorCode::READ_TIMEOUT
+                );
+                assert_eq!(
+                    control.actions(),
+                    vec![IoAction::CancelRead(HttpErrorCode::READ_TIMEOUT, owner)],
+                );
+                transport.close(&context).unwrap();
+            });
+        }
+
+        #[test]
+        fn a_write_reads_its_hosts_clock_only_for_a_nonzero_timeout() {
+            run_manual_worker(|context| async move {
+                let manual = manual_host();
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                let timed = Duration::from_secs(60);
+
+                for (timeout, reads, why) in [
+                    (
+                        Duration::ZERO,
+                        0,
+                        "an immediate write reads no clock at a zero timeout",
+                    ),
+                    (
+                        timed,
+                        1,
+                        "an immediate timed write reads its first poll's time",
+                    ),
+                ] {
+                    let before = manual.reads();
+                    let mut write = transport.write(
+                        &context,
+                        queue(&[b"ready"], 5),
+                        timeout,
+                        CancellationToken::never(),
+                    );
+                    assert!(matches!(
+                        poll_once(write.as_mut()),
+                        Poll::Ready(Ok(info)) if info.bytes_written == 5
+                    ));
+                    drop(write);
+                    assert_eq!(manual.reads() - before, reads, "{why}");
+                }
+
+                for (timeout, first_poll_reads, why) in [
+                    (
+                        Duration::ZERO,
+                        0,
+                        "a pending write reads no clock at a zero timeout",
+                    ),
+                    (
+                        timed,
+                        3,
+                        "a pending timed write reads its first poll's time, its remaining time \
+                         and its deadline's registration time",
+                    ),
+                ] {
+                    control.block_writes(1);
+                    let before = manual.reads();
+                    let mut write = transport.write(
+                        &context,
+                        queue(&[b"pending"], 7),
+                        timeout,
+                        CancellationToken::never(),
+                    );
+                    assert!(poll_once(write.as_mut()).is_pending());
+                    assert_eq!(manual.reads() - before, first_poll_reads, "{why}");
+                    assert!(poll_once(write.as_mut()).is_pending());
+                    control.unblock_write();
+                    assert!(matches!(
+                        poll_once(write.as_mut()),
+                        Poll::Ready(Ok(info)) if info.bytes_written == 7
+                    ));
+                    drop(write);
+                    assert_eq!(
+                        manual.reads() - before,
+                        first_poll_reads,
+                        "a re-poll and the completion read no clock",
+                    );
+                }
+                transport.close(&context).unwrap();
+            });
+        }
+
+        #[test]
+        fn a_write_deadline_is_anchored_at_its_first_polls_start() {
+            run_manual_worker(|context| async move {
+                let owner = std::thread::current().id();
+                let manual = manual_host();
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                control.block_writes(2);
+                let timeout = Duration::from_secs(60);
+                let backend_poll = Duration::from_secs(10);
+                let polled_host = Rc::clone(&manual);
+                control.on_next_write_poll(move || polled_host.advance(backend_poll));
+                let mut write = transport.write(
+                    &context,
+                    queue(&[b"pending"], 7),
+                    timeout,
+                    CancellationToken::never(),
+                );
+                let signal = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&signal));
+                assert!(poll_once_with_waker(write.as_mut(), &waker).is_pending());
+
+                // The first backend poll took `backend_poll`. A TLS backend
+                // arms its ciphertext deadline inside that poll, so a write
+                // deadline anchored at the pending result would fire after it.
+                manual.advance(timeout - backend_poll - Duration::from_millis(1));
+                assert!(
+                    !signal.take(),
+                    "the write is not woken one millisecond before its first poll's start \
+                     plus its timeout",
+                );
+                manual.advance(Duration::from_millis(1));
+                assert!(
+                    signal.take(),
+                    "the deadline runs from the start of the first poll, not its pending result",
+                );
+                let error = write.await.err().unwrap();
+                assert_eq!(error.code(), HttpErrorCode::WRITE_TIMEOUT);
+                assert_eq!(error.bytes_written(), 2);
+                assert_eq!(
+                    control.actions(),
+                    vec![IoAction::CancelWrite(HttpErrorCode::WRITE_TIMEOUT, owner)],
+                );
+                transport.close(&context).unwrap();
+            });
+        }
     }
 }

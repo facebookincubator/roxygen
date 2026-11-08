@@ -784,7 +784,8 @@ struct ActiveWrite {
 /// first backend poll that panics also builds it before the panic resumes, so
 /// that a re-poll finds the deadline and cancellation registered.
 enum WriteWait {
-    /// `started`, the first poll's time, anchors the deadline.
+    /// `started`, the first poll's time, anchors a nonzero timeout's deadline.
+    /// A zero timeout reads no clock.
     Unarmed {
         timeout: Duration,
         cancellation: CancellationToken,
@@ -811,9 +812,14 @@ impl Drop for CompletionWake {
     }
 }
 
-/// Arms an unarmed write's deadline at `started` plus its timeout and polls
-/// the wait once to register it.
-fn arm_write_deadline(wait: &mut WriteWait, started: Instant, context: &mut Context<'_>) {
+/// Arms an unarmed write's deadline at `started` plus its timeout on `host`
+/// and polls the wait once to register it.
+fn arm_write_deadline(
+    wait: &mut WriteWait,
+    started: Option<Instant>,
+    host: &Host,
+    context: &mut Context<'_>,
+) {
     let WriteWait::Unarmed {
         timeout,
         cancellation,
@@ -827,13 +833,14 @@ fn arm_write_deadline(wait: &mut WriteWait, started: Instant, context: &mut Cont
     let remaining = if timeout.is_zero() {
         Duration::ZERO
     } else {
+        let started = started.expect("a timed write reads its first poll's time");
         timeout
-            .saturating_sub(Host::tokio().now().saturating_duration_since(started))
+            .saturating_sub(host.now().saturating_duration_since(started))
             .max(Duration::from_nanos(1))
     };
     #[cfg(test)]
     record_write_deadline_baton();
-    let deadline = TimedBaton::new(Some(remaining));
+    let deadline = TimedBaton::with_host(Some(remaining), host.clone());
     let timed_wait = Box::pin(deadline.wait(std::mem::take(cancellation)));
     *wait = WriteWait::Armed {
         deadline,
@@ -855,6 +862,10 @@ struct PendingByteEventRegistration {
 
 struct TransportState {
     owner_thread: ThreadId,
+    /// The host of the worker context that built the transport, which every
+    /// operation's context shares (`check_transport_context`). Writes time out
+    /// on it.
+    host: Host,
     next_operation: u64,
     active_read: Option<ActiveRead>,
     active_write: Option<ActiveWrite>,
@@ -866,9 +877,10 @@ struct TransportState {
 }
 
 impl TransportState {
-    fn new(owner_thread: ThreadId) -> Self {
+    fn new(owner_thread: ThreadId, host: Host) -> Self {
         Self {
             owner_thread,
+            host,
             next_operation: 1,
             active_read: None,
             active_write: None,
@@ -1041,7 +1053,10 @@ impl OwnedByteStream {
         if worker.state() != WorkerState::Open {
             return Err(dropped_error());
         }
-        let state = Rc::new(RefCell::new(TransportState::new(owner_thread)));
+        let state = Rc::new(RefCell::new(TransportState::new(
+            owner_thread,
+            context.host().clone(),
+        )));
         let cleanup_io = Rc::clone(&io);
         let cleanup_state = Rc::clone(&state);
         let cleanup_registration = context
@@ -1250,7 +1265,7 @@ impl OwnedByteStream {
             return Box::pin(std::future::ready(Err(dropped_error())));
         };
         let io_future = io.read(maximum, allocation_size);
-        let deadline = TimedBaton::new(Some(timeout));
+        let deadline = TimedBaton::with_host(Some(timeout), context.host().clone());
         let wait = Box::pin(deadline.wait(cancellation));
         self.state.borrow_mut().active_read = Some(ActiveRead {
             operation,
@@ -1890,35 +1905,40 @@ impl Future for WriteOperation {
         }
         let outcome = {
             let mut state = self.state.borrow_mut();
-            let active = state
-                .active_write
+            let TransportState {
+                active_write, host, ..
+            } = &mut *state;
+            let active = active_write
                 .as_mut()
                 .filter(|active| active.operation == self.operation)
                 .expect("an open write operation remains registered with its transport");
             active.waker = Some(context.waker().clone());
             match &mut active.wait {
                 WriteWait::Unarmed {
+                    timeout,
                     cancellation,
                     started,
-                    ..
                 } => {
                     if cancellation.is_cancellation_requested() {
                         WritePoll::Cancelled
                     } else {
-                        let started = *started.get_or_insert_with(|| Host::tokio().now());
+                        if started.is_none() && !timeout.is_zero() {
+                            *started = Some(host.now());
+                        }
+                        let started = *started;
                         let io = catch_unwind(AssertUnwindSafe(|| {
                             active.io_future.as_mut().poll(context)
                         }));
                         match io {
                             Ok(Poll::Ready(result)) => WritePoll::Io(result),
                             Ok(Poll::Pending) => {
-                                arm_write_deadline(&mut active.wait, started, context);
+                                arm_write_deadline(&mut active.wait, started, host, context);
                                 WritePoll::Pending
                             }
                             Err(panic) => {
                                 // A re-poll after a contained backend panic
                                 // finds its deadline and cancellation armed.
-                                arm_write_deadline(&mut active.wait, started, context);
+                                arm_write_deadline(&mut active.wait, started, host, context);
                                 resume_unwind(panic);
                             }
                         }
