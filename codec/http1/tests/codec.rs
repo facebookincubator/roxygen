@@ -6166,3 +6166,1538 @@ fn ordinary_upgrade_option_keeps_connection_close() {
         assert!(!codec.is_reusable(), "{context}");
     }
 }
+
+/// The CONNECT request a downstream consumer's origin reads.
+const CONSUMER_CONNECT_WIRE: &[u8] =
+    b"CONNECT h:443 HTTP/1.1\r\nHost: h:443\r\nConnection: keep-alive\r\n\r\n";
+const UPSTREAM_OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+
+/// An upstream codec that sends upgrade and CONNECT requests as ordinary requests.
+fn upstream_ordinary_codec() -> Http1xCodec {
+    let mut codec = Http1xCodec::new(TransportDirection::Upstream);
+    codec.set_upstream_upgrade_as_ordinary(true);
+    codec
+}
+
+/// `CONNECT h:443` with `Host: h:443`.
+fn upstream_connect() -> HttpMessage {
+    let mut message = request(HttpMethod::Connect, b"h:443", (1, 1));
+    message.headers_mut().set(HttpHeaderCode::Host, b"h:443");
+    message
+}
+
+/// Generates `message`'s head on the codec's next stream and returns its bytes.
+fn generate_request(codec: &mut Http1xCodec, message: &HttpMessage, end_stream: bool) -> Vec<u8> {
+    let stream = codec.create_stream();
+    generate(
+        codec,
+        EgressFrame::Headers {
+            stream,
+            message,
+            end_stream,
+            extra_headers: None,
+        },
+    )
+}
+
+/// An upstream codec with the option set that has sent `message` as a whole request.
+fn upstream_ordinary_codec_after(message: &HttpMessage) -> Http1xCodec {
+    let mut codec = upstream_ordinary_codec();
+    generate_request(&mut codec, message, true);
+    codec
+}
+
+/// Events other than body and chunk framing events.
+fn framing_events(recorder: &Recorder) -> Vec<&'static str> {
+    recorder
+        .events
+        .iter()
+        .filter(|event| !matches!(**event, "body" | "chunk_header" | "chunk_complete"))
+        .copied()
+        .collect()
+}
+
+/// Asserts that a run read one ordinary, complete response with `body`, and that the codec
+/// stays reusable and reads the 200 to a GET generated next.
+fn assert_ordinary_response_then_reuse(
+    context: &str,
+    codec: &mut Http1xCodec,
+    recorder: &Recorder,
+    consumed: usize,
+    input_len: usize,
+    status: u16,
+    body: &[u8],
+) {
+    assert_eq!(consumed, input_len, "{context}: every byte is parsed");
+    assert!(
+        recorder.errors.is_empty(),
+        "{context}: {:?}",
+        recorder.error_messages
+    );
+    assert_eq!(
+        framing_events(recorder),
+        ["begin", "headers", "complete"],
+        "{context}"
+    );
+    assert_eq!(recorder.completions, [false], "{context}");
+    let mut message = recorder.messages[0].clone();
+    assert_eq!(message.status_code().unwrap(), status, "{context}");
+    assert!(!message.is_upgraded(), "{context}: not upgraded");
+    assert_eq!(recorder.bodies, body, "{context}");
+    assert!(
+        codec.is_reusable(),
+        "{context}: reusable after the response"
+    );
+    let get = request(HttpMethod::Get, b"/next", (1, 1));
+    let get_wire = generate_request(codec, &get, true);
+    assert!(get_wire.starts_with(b"GET /next HTTP/1.1\r\n"), "{context}");
+    let mut next = Recorder::default();
+    assert_eq!(
+        parse(codec, &mut next, UPSTREAM_OK),
+        UPSTREAM_OK.len(),
+        "{context}"
+    );
+    assert!(next.errors.is_empty(), "{context}");
+    assert_eq!(next.completions, [false], "{context}");
+    assert_eq!(next.bodies, b"ok", "{context}");
+    assert!(
+        codec.is_reusable(),
+        "{context}: reusable after the next response"
+    );
+}
+
+#[test]
+fn upstream_ordinary_connect_reads_a_framed_response() {
+    // The CONNECT is written as the default writes it, the consumer's bytes, and leaves the codec
+    // reusable after its end of message.
+    let mut default_codec = Http1xCodec::new(TransportDirection::Upstream);
+    assert_eq!(
+        generate_request(&mut default_codec, &upstream_connect(), true),
+        CONSUMER_CONNECT_WIRE
+    );
+    let mut codec = upstream_ordinary_codec();
+    let wire = generate_request(&mut codec, &upstream_connect(), true);
+    assert_eq!(wire, CONSUMER_CONNECT_WIRE, "{}", wire.escape_ascii());
+    assert!(!codec.close_on_egress_complete());
+    assert!(codec.is_reusable());
+    // A CONNECT with an empty URL still takes its Host as the target.
+    let mut empty_url = request(HttpMethod::Connect, b"", (1, 1));
+    empty_url.headers_mut().set(HttpHeaderCode::Host, b"h:443");
+    let mut default_codec = Http1xCodec::new(TransportDirection::Upstream);
+    let default_wire = generate_request(&mut default_codec, &empty_url, true);
+    assert!(default_wire.starts_with(b"CONNECT h:443 HTTP/1.1\r\n"));
+    assert_eq!(
+        generate_request(&mut upstream_ordinary_codec(), &empty_url, true),
+        default_wire
+    );
+
+    let make = || upstream_ordinary_codec_after(&upstream_connect());
+    for (response, status, body) in [
+        (UPSTREAM_OK, 200, b"ok".as_slice()),
+        (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n".as_slice(),
+            200,
+            b"ok",
+        ),
+        (
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 5\r\n\r\nnope!",
+            403,
+            b"nope!",
+        ),
+    ] {
+        for_each_ingress_delivery(response, make, |delivery, codec, recorder, consumed| {
+            let context = format!("{}: {delivery}", response.escape_ascii());
+            assert_ordinary_response_then_reuse(
+                &context,
+                codec,
+                recorder,
+                consumed,
+                response.len(),
+                status,
+                body,
+            );
+        });
+    }
+
+    // The 200 completes at its second body byte, not at its head.
+    let mut codec = make();
+    let mut recorder = Recorder::default();
+    let held = UPSTREAM_OK.len() - 1;
+    assert_eq!(parse(&mut codec, &mut recorder, &UPSTREAM_OK[..held]), held);
+    assert!(recorder.completions.is_empty());
+    assert_eq!(recorder.bodies, b"o");
+    assert_eq!(parse(&mut codec, &mut recorder, &UPSTREAM_OK[held..]), 1);
+    assert_eq!(recorder.completions, [false]);
+
+    // A response without a length is read to EOF, as any such response is.
+    let until_eof = b"HTTP/1.1 200 OK\r\n\r\ntunnel-free bytes";
+    for_each_ingress_delivery(until_eof, make, |delivery, codec, recorder, consumed| {
+        assert_eq!(consumed, until_eof.len(), "{delivery}");
+        assert!(recorder.completions.is_empty(), "{delivery}");
+        let _ = codec.on_ingress_eof(recorder, &mut BufQueue::new(QUEUE_LIMIT));
+        assert!(recorder.errors.is_empty(), "{delivery}");
+        assert_eq!(recorder.completions, [false], "{delivery}");
+        assert_eq!(recorder.bodies, b"tunnel-free bytes", "{delivery}");
+        assert!(!recorder.messages[0].is_upgraded(), "{delivery}");
+    });
+
+    // EOF inside the body fails as the same response to a GET truncated there does.
+    let head_len = UPSTREAM_OK.len() - 2;
+    for received in [0, 1] {
+        let truncated = &UPSTREAM_OK[..head_len + received];
+        let mut reference = upstream_ordinary_codec_after(&request(HttpMethod::Get, b"/", (1, 1)));
+        let mut expected = Recorder::default();
+        parse(&mut reference, &mut expected, truncated);
+        let _ = reference.on_ingress_eof(&mut expected, &mut BufQueue::new(QUEUE_LIMIT));
+        assert_eq!(
+            expected.error_messages,
+            [b"unexpected EOF".to_vec()],
+            "received {received}"
+        );
+        for_each_ingress_delivery(truncated, make, |delivery, codec, recorder, consumed| {
+            let context = format!("received {received}, {delivery}");
+            assert_eq!(consumed, truncated.len(), "{context}");
+            let _ = codec.on_ingress_eof(recorder, &mut BufQueue::new(QUEUE_LIMIT));
+            assert_eq!(recorder.bodies, &b"ok"[..received], "{context}");
+            assert!(recorder.completions.is_empty(), "{context}");
+            assert_eq!(
+                recorder.error_messages, expected.error_messages,
+                "{context}"
+            );
+            assert_eq!(recorder.errors.len(), 1, "{context}");
+            assert_eq!(recorder.errors[0].0, expected.errors[0].0, "{context}");
+            assert_eq!(recorder.errors[0].1, expected.errors[0].1, "{context}");
+            assert_eq!(
+                recorder.errors[0].2.as_ref().map(render_message),
+                expected.errors[0].2.as_ref().map(render_message),
+                "{context}"
+            );
+        });
+    }
+}
+
+/// Generates `message` with `body` and, when chunked, a trailer section, and returns the bytes.
+fn generate_request_with_body(
+    codec: &mut Http1xCodec,
+    message: &HttpMessage,
+    body: &'static [u8],
+    trailers: bool,
+) -> Vec<u8> {
+    let stream = codec.create_stream();
+    let mut wire = generate(
+        codec,
+        EgressFrame::Headers {
+            stream,
+            message,
+            end_stream: false,
+            extra_headers: None,
+        },
+    );
+    let body = BufQueue::from_bytes(Bytes::from_static(body), body.len()).unwrap();
+    wire.extend(generate(
+        codec,
+        EgressFrame::Body {
+            stream,
+            body,
+            padding: None,
+            end_stream: !trailers,
+        },
+    ));
+    if trailers {
+        let mut section = HttpHeaders::new();
+        section.add(b"X-Trailer", b"t");
+        wire.extend(generate(
+            codec,
+            EgressFrame::Trailers {
+                stream,
+                trailers: &section,
+            },
+        ));
+    }
+    wire
+}
+
+/// `message` with its request line's method replaced by GET.
+fn as_get(message: &HttpMessage) -> HttpMessage {
+    let mut get = message.clone();
+    get.set_method(HttpMethod::Get).unwrap();
+    get
+}
+
+/// The bytes behind the request line.
+fn after_request_line(wire: &[u8]) -> &[u8] {
+    &wire[find_bytes(wire, b"\r\n").unwrap() + 2..]
+}
+
+#[test]
+fn upstream_ordinary_connect_frames_its_body() {
+    // Content-Length: 5: the head, then exactly the five body bytes.
+    let mut length = upstream_connect();
+    length
+        .headers_mut()
+        .set(HttpHeaderCode::ContentLength, b"5");
+    let mut codec = upstream_ordinary_codec();
+    let wire = generate_request_with_body(&mut codec, &length, b"hello", false);
+    assert_eq!(
+        wire,
+        b"CONNECT h:443 HTTP/1.1\r\nHost: h:443\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\nhello",
+        "{}",
+        wire.escape_ascii()
+    );
+    assert!(!codec.close_on_egress_complete());
+
+    // Chunked: chunk framing, the last chunk and the trailers, as the same message with GET.
+    let mut chunked = upstream_connect();
+    chunked
+        .headers_mut()
+        .set(HttpHeaderCode::TransferEncoding, b"chunked");
+    chunked.set_chunked(true);
+    let mut codec = upstream_ordinary_codec();
+    let wire = generate_request_with_body(&mut codec, &chunked, b"hello", true);
+    assert!(wire.starts_with(b"CONNECT h:443 HTTP/1.1\r\n"));
+    let get_wire = generate_request_with_body(
+        &mut upstream_ordinary_codec(),
+        &as_get(&chunked),
+        b"hello",
+        true,
+    );
+    assert_eq!(
+        after_request_line(&wire),
+        after_request_line(&get_wire),
+        "{}",
+        wire.escape_ascii()
+    );
+    assert!(
+        wire.ends_with(b"\r\n\r\n5\r\nhello\r\n0\r\nX-Trailer: t\r\n\r\n"),
+        "{}",
+        wire.escape_ascii()
+    );
+    assert!(!codec.close_on_egress_complete());
+    assert!(codec.is_reusable());
+
+    // Without the option the same CONNECT's body is tunnel bytes, with no chunk framing.
+    let default_wire = generate_request_with_body(
+        &mut Http1xCodec::new(TransportDirection::Upstream),
+        &chunked,
+        b"hello",
+        false,
+    );
+    assert!(
+        default_wire.ends_with(b"\r\n\r\nhello"),
+        "{}",
+        default_wire.escape_ascii()
+    );
+}
+
+/// The WebSocket GET a downstream consumer's origin reads, ending the message at its head.
+fn consumer_websocket_get() -> HttpMessage {
+    let mut message = request(HttpMethod::Get, b"/ws", (1, 1));
+    let headers = message.headers_mut();
+    headers.add(b"Host", b"c1");
+    headers.add(b"Upgrade", b"websocket");
+    headers.add(b"Sec-WebSocket-Key", b"dGhlIHNhbXBsZSBub25jZQ==");
+    headers.add(b"sec-websocket-version", b"13");
+    headers.add(b"Connection", b"upgrade");
+    message
+}
+
+/// The bytes a downstream consumer's origin reads for `consumer_websocket_get`.
+const CONSUMER_WEBSOCKET_WIRE: &[u8] = b"GET /ws HTTP/1.1\r\nHost: c1\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\nConnection: upgrade, keep-alive\r\n\r\n";
+
+#[test]
+fn upstream_ordinary_response_upgrade_header_is_ordinary() {
+    for request_message in [
+        consumer_websocket_get(),
+        request(HttpMethod::Get, b"/", (1, 1)),
+    ] {
+        for response in [
+            b"HTTP/1.1 200 OK\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-WebSocket-Accept: d3Jvbmc=\r\nContent-Length: 2\r\n\r\nok".as_slice(),
+            b"HTTP/1.1 200 OK\r\nUpgrade: websocket\r\nContent-Length: 2\r\n\r\nok",
+            b"HTTP/1.1 200 OK\r\nUpgrade: h2c\r\nContent-Length: 2\r\n\r\nok",
+        ] {
+            let make = || upstream_ordinary_codec_after(&request_message);
+            for_each_ingress_delivery(response, make, |delivery, codec, recorder, consumed| {
+                let context = format!("{}: {delivery}", response.escape_ascii());
+                let message = &recorder.messages.first().cloned();
+                assert_ordinary_response_then_reuse(
+                    &context,
+                    codec,
+                    recorder,
+                    consumed,
+                    response.len(),
+                    200,
+                    b"ok",
+                );
+                let message = message.as_ref().expect("a response");
+                assert!(!message.is_ingress_websocket_upgrade(), "{context}");
+                assert_eq!(
+                    header_pairs(message),
+                    wire_header_pairs(response),
+                    "{context}: every header, the Upgrade header included"
+                );
+            });
+        }
+        // The frozen TestIgnoreUpstreamUpgrade response is read to EOF and closes, as without
+        // the option.
+        let ignored =
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\nUpgrade: h2,h2c\r\n\r\n<!DOCTYPE html>";
+        let mut default_codec = Http1xCodec::new(TransportDirection::Upstream);
+        generate_request(&mut default_codec, &request_message, true);
+        let mut expected = Recorder::default();
+        parse(&mut default_codec, &mut expected, ignored);
+        let _ = default_codec.on_ingress_eof(&mut expected, &mut BufQueue::new(QUEUE_LIMIT));
+        let make = || upstream_ordinary_codec_after(&request_message);
+        for_each_ingress_delivery(ignored, make, |delivery, codec, recorder, consumed| {
+            assert_eq!(consumed, ignored.len(), "{delivery}");
+            let _ = codec.on_ingress_eof(recorder, &mut BufQueue::new(QUEUE_LIMIT));
+            assert!(recorder.errors.is_empty(), "{delivery}");
+            assert_eq!(recorder.bodies, b"<!DOCTYPE html>", "{delivery}");
+            assert_eq!(recorder.bodies, expected.bodies, "{delivery}");
+            assert_eq!(recorder.completions, [false], "{delivery}");
+            assert_eq!(recorder.completions, expected.completions, "{delivery}");
+            assert!(!codec.is_reusable(), "{delivery}: Connection: close");
+        });
+    }
+}
+
+/// A GET with `Upgrade: h2c`, ending the message at its head.
+fn upstream_h2c_get() -> HttpMessage {
+    let mut message = request(HttpMethod::Get, b"/", (1, 1));
+    message.headers_mut().add(b"Host", b"a");
+    message.headers_mut().add(b"Connection", b"Upgrade");
+    message.headers_mut().add(b"Upgrade", b"h2c");
+    message
+}
+
+/// The message `upstream_ordinary_option_refuses_a_101` expects for a refused 101.
+const ORDINARY_101_REFUSAL: &[u8] = b"switching protocols refused for an ordinary request";
+
+#[test]
+fn upstream_ordinary_option_refuses_a_101() {
+    // The kind and status of the default's `upgrade protocol mismatch`.
+    let mut mismatch = Http1xCodec::new(TransportDirection::Upstream);
+    generate_request(&mut mismatch, &upstream_h2c_get(), true);
+    let mut reference = Recorder::default();
+    parse(
+        &mut mismatch,
+        &mut reference,
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n",
+    );
+    assert_eq!(
+        reference.error_messages,
+        [b"upgrade protocol mismatch".to_vec()]
+    );
+    for (request_message, upgrade) in [
+        (consumer_websocket_get(), "websocket"),
+        (upstream_h2c_get(), "h2c"),
+        (upstream_connect(), "websocket"),
+        (request(HttpMethod::Get, b"/", (1, 1)), "websocket"),
+    ] {
+        let switching = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: {upgrade}\r\nConnection: Upgrade\r\n\r\nraw bytes behind the 101"
+        );
+        let make = || upstream_ordinary_codec_after(&request_message);
+        for_each_ingress_delivery(
+            switching.as_bytes(),
+            make,
+            |delivery, codec, recorder, _consumed| {
+                let context = format!("{}: {delivery}", switching.escape_default());
+                assert_eq!(recorder.events, ["begin", "error"], "{context}");
+                assert_eq!(
+                    recorder.error_messages,
+                    [ORDINARY_101_REFUSAL.to_vec()],
+                    "{context}"
+                );
+                assert_eq!(recorder.errors[0].0, reference.errors[0].0, "{context}");
+                assert_eq!(recorder.errors[0].1, reference.errors[0].1, "{context}");
+                assert!(recorder.bodies.is_empty(), "{context}: no tunnel");
+                assert!(!codec.is_reusable(), "{context}");
+            },
+        );
+        // A 100 Continue and a 103 before the final 200 are informational, as without the option.
+        let interim = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let mut default_codec = Http1xCodec::new(TransportDirection::Upstream);
+        generate_request(
+            &mut default_codec,
+            &request(HttpMethod::Get, b"/", (1, 1)),
+            true,
+        );
+        let mut expected = Recorder::default();
+        assert_eq!(
+            parse(&mut default_codec, &mut expected, interim),
+            interim.len()
+        );
+        for_each_ingress_delivery(interim, make, |delivery, codec, recorder, consumed| {
+            assert_eq!(consumed, interim.len(), "{delivery}");
+            assert!(recorder.errors.is_empty(), "{delivery}");
+            assert_eq!(
+                framing_events(recorder),
+                framing_events(&expected),
+                "{delivery}"
+            );
+            assert_eq!(recorder.completions, expected.completions, "{delivery}");
+            let statuses: Vec<_> = recorder
+                .messages
+                .iter()
+                .map(|message| message.clone().status_code().unwrap())
+                .collect();
+            assert_eq!(statuses, [100, 103, 200], "{delivery}");
+            assert_eq!(recorder.bodies, b"ok", "{delivery}");
+            assert!(codec.is_reusable(), "{delivery}");
+        });
+    }
+}
+
+/// Asserts that generating `message` on a fresh upstream codec with the option set fails with
+/// `INVALID_STATE_TRANSITION` and writes nothing, and that a GET generated next for the same
+/// stream is written as on a fresh codec with the option set.
+fn assert_upstream_ordinary_refusal(
+    context: &str,
+    message: &HttpMessage,
+    end_stream: bool,
+    extra_headers: Option<&HttpHeaders>,
+) {
+    let mut codec = upstream_ordinary_codec();
+    let stream = codec.create_stream();
+    let mut output = BufQueue::new(QUEUE_LIMIT);
+    let error = codec
+        .generate(
+            &mut output,
+            EgressFrame::Headers {
+                stream,
+                message,
+                end_stream,
+                extra_headers,
+            },
+            &mut Recorder::default(),
+        )
+        .expect_err(context);
+    assert_eq!(
+        error.code(),
+        roxygen_core::error::HttpErrorCode::INVALID_STATE_TRANSITION,
+        "{context}"
+    );
+    assert!(output.is_empty(), "{context}: writes nothing");
+    let get = request(HttpMethod::Get, b"/after", (1, 1));
+    let after = generate(
+        &mut codec,
+        EgressFrame::Headers {
+            stream,
+            message: &get,
+            end_stream: true,
+            extra_headers: None,
+        },
+    );
+    let fresh = generate_request(&mut upstream_ordinary_codec(), &get, true);
+    assert_eq!(after, fresh, "{context}: the codec's state rolled back");
+    assert!(codec.is_reusable(), "{context}");
+}
+
+#[test]
+fn upstream_ordinary_option_refuses_the_egress_websocket_flag() {
+    let mut flagged = request(HttpMethod::Get, b"/websocket", (1, 1));
+    flagged.set_egress_websocket_upgrade();
+    let mut with_upgrade = flagged.clone();
+    with_upgrade
+        .headers_mut()
+        .set(HttpHeaderCode::Upgrade, b"websocket");
+    for (name, message) in [
+        ("flag alone", &flagged),
+        ("flag with Upgrade", &with_upgrade),
+    ] {
+        for end_stream in [true, false] {
+            assert_upstream_ordinary_refusal(
+                &format!("{name}, end_stream {end_stream}"),
+                message,
+                end_stream,
+                None,
+            );
+        }
+    }
+}
+
+/// A GET to `/` with `headers`, ending the message at its head.
+fn upstream_get_with(headers: &[(&str, &str)]) -> HttpMessage {
+    let mut message = request(HttpMethod::Get, b"/", (1, 1));
+    for (name, value) in headers {
+        message.headers_mut().add(name.as_bytes(), value.as_bytes());
+    }
+    message
+}
+
+#[test]
+fn upstream_ordinary_upgrade_request_is_unchanged_and_reusable() {
+    let mut consumer = upstream_ordinary_codec();
+    assert_eq!(
+        generate_request(&mut consumer, &consumer_websocket_get(), true),
+        CONSUMER_WEBSOCKET_WIRE
+    );
+    for message in [
+        consumer_websocket_get(),
+        upstream_get_with(&[
+            ("Host", "a"),
+            ("Connection", "Upgrade, HTTP2-Settings"),
+            ("Upgrade", "h2c"),
+            ("HTTP2-Settings", "AAMAAABkAARAAAAAAAIAAAAA"),
+        ]),
+        upstream_get_with(&[("Host", "a"), ("Upgrade", "h2c")]),
+        upstream_get_with(&[
+            ("Host", "a"),
+            ("Connection", "Upgrade"),
+            ("Upgrade", "h2c, websocket"),
+        ]),
+    ] {
+        let default_wire = generate_request(
+            &mut Http1xCodec::new(TransportDirection::Upstream),
+            &message,
+            true,
+        );
+        let mut codec = upstream_ordinary_codec();
+        let wire = generate_request(&mut codec, &message, true);
+        assert_eq!(wire, default_wire, "{}", wire.escape_ascii());
+        assert!(
+            find_bytes(&wire, b"\r\nUpgrade: ").is_some(),
+            "{}",
+            wire.escape_ascii()
+        );
+        let context = wire.escape_ascii().to_string();
+        let make = || upstream_ordinary_codec_after(&message);
+        for_each_ingress_delivery(UPSTREAM_OK, make, |delivery, codec, recorder, consumed| {
+            let context = format!("{context}: {delivery}");
+            assert!(recorder.messages[0].wants_keepalive(), "{context}");
+            assert_ordinary_response_then_reuse(
+                &context,
+                codec,
+                recorder,
+                consumed,
+                UPSTREAM_OK.len(),
+                200,
+                b"ok",
+            );
+        });
+    }
+    // The option never forces keep-alive.
+    let closing = upstream_get_with(&[
+        ("Host", "a"),
+        ("Connection", "Upgrade, close"),
+        ("Upgrade", "h2c"),
+    ]);
+    let mut codec = upstream_ordinary_codec();
+    let wire = generate_request(&mut codec, &closing, true);
+    assert!(
+        find_bytes(&wire, b"\r\nConnection: Upgrade, close\r\n").is_some(),
+        "{}",
+        wire.escape_ascii()
+    );
+    let mut recorder = Recorder::default();
+    assert_eq!(
+        parse(&mut codec, &mut recorder, UPSTREAM_OK),
+        UPSTREAM_OK.len()
+    );
+    assert_eq!(recorder.completions, [false]);
+    assert!(!codec.is_reusable());
+}
+
+/// Headers holding `lines`, for a frame's `extra_headers`.
+fn extra(lines: &[(&str, &str)]) -> HttpHeaders {
+    let mut headers = HttpHeaders::new();
+    for (name, value) in lines {
+        headers.add(name.as_bytes(), value.as_bytes());
+    }
+    headers
+}
+
+/// `message` with `lines` added and, with `chunked`, marked chunked.
+fn with_lines(message: &HttpMessage, lines: &[(&str, &str)], chunked: bool) -> HttpMessage {
+    let mut message = message.clone();
+    for (name, value) in lines {
+        message.headers_mut().add(name.as_bytes(), value.as_bytes());
+    }
+    if chunked {
+        message.set_chunked(true);
+    }
+    message
+}
+
+/// Generates `message` with `extra_headers` on the codec's next stream, then, unless `body` is
+/// `None` (a head that ends the message), one body frame with `body` that ends the message.
+fn generate_upstream_exchange(
+    codec: &mut Http1xCodec,
+    message: &HttpMessage,
+    extra_headers: Option<&HttpHeaders>,
+    body: Option<&'static [u8]>,
+) -> (Vec<u8>, Vec<u8>) {
+    let stream = codec.create_stream();
+    let head = generate(
+        codec,
+        EgressFrame::Headers {
+            stream,
+            message,
+            end_stream: body.is_none(),
+            extra_headers,
+        },
+    );
+    let Some(body) = body else {
+        return (head, Vec::new());
+    };
+    let queue = BufQueue::from_bytes(Bytes::from_static(body), body.len().max(1)).unwrap();
+    let rest = generate(
+        codec,
+        EgressFrame::Body {
+            stream,
+            body: queue,
+            padding: None,
+            end_stream: true,
+        },
+    );
+    (head, rest)
+}
+
+/// A case for the framing rule: a name, the message, its extra headers, and whether its head
+/// ends the message.
+type FramingCase<'a> = (&'a str, HttpMessage, Option<HttpHeaders>, bool);
+
+/// Asserts each case is refused under the option, and generated as today without it.
+fn assert_framing_refusals(cases: &[FramingCase<'_>]) {
+    for (name, message, extra_headers, end_stream) in cases {
+        assert_upstream_ordinary_refusal(name, message, *end_stream, extra_headers.as_ref());
+        let mut default_codec = Http1xCodec::new(TransportDirection::Upstream);
+        let stream = default_codec.create_stream();
+        let mut output = BufQueue::new(QUEUE_LIMIT);
+        default_codec
+            .generate(
+                &mut output,
+                EgressFrame::Headers {
+                    stream,
+                    message,
+                    end_stream: *end_stream,
+                    extra_headers: extra_headers.as_ref(),
+                },
+                &mut Recorder::default(),
+            )
+            .unwrap_or_else(|error| panic!("{name}: generated without the option: {error:?}"));
+        assert!(!output.is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn upstream_ordinary_option_refuses_an_unframed_connect_body() {
+    let connect = upstream_connect();
+    let mut connect_10 = connect.clone();
+    connect_10.set_http_version(1, 0);
+    let te = ("Transfer-Encoding", "chunked");
+    let gzip = ("Transfer-Encoding", "gzip");
+    let cl5 = ("Content-Length", "5");
+    let cases: Vec<FramingCase<'_>> = vec![
+        // (d): an unframed body.
+        ("neither framing header", connect.clone(), None, false),
+        (
+            "HTTP/1.0, marked chunked",
+            with_lines(&connect_10, &[te], true),
+            None,
+            false,
+        ),
+        (
+            "Transfer-Encoding: chunked, not marked chunked",
+            with_lines(&connect, &[te], false),
+            None,
+            false,
+        ),
+        (
+            "Transfer-Encoding: chunked only in the extra headers, not marked chunked",
+            connect.clone(),
+            Some(extra(&[te])),
+            false,
+        ),
+        // (a): the Content-Length.
+        (
+            "two equal Content-Length lines",
+            with_lines(&connect, &[cl5, cl5], false),
+            None,
+            false,
+        ),
+        (
+            "a second Content-Length only in the extra headers",
+            with_lines(&connect, &[cl5], false),
+            Some(extra(&[cl5])),
+            false,
+        ),
+        (
+            "Content-Length: 5, 5",
+            with_lines(&connect, &[("Content-Length", "5, 5")], false),
+            None,
+            false,
+        ),
+        (
+            "Content-Length: +5",
+            with_lines(&connect, &[("Content-Length", "+5")], false),
+            None,
+            false,
+        ),
+        // (c): both headers.
+        (
+            "Transfer-Encoding: chunked and Content-Length, not marked chunked",
+            with_lines(&connect, &[te, cl5], false),
+            None,
+            false,
+        ),
+        (
+            "Transfer-Encoding: chunked and Content-Length, marked chunked",
+            with_lines(&connect, &[te, cl5], true),
+            None,
+            false,
+        ),
+        (
+            "marked chunked, Content-Length only in the extra headers",
+            with_lines(&connect, &[te], true),
+            Some(extra(&[cl5])),
+            false,
+        ),
+        (
+            "HTTP/1.0, a written gzip line beside Content-Length",
+            with_lines(&connect_10, &[te, gzip, cl5], false),
+            None,
+            false,
+        ),
+        (
+            "HTTP/1.0, the gzip line only in the extra headers",
+            with_lines(&connect_10, &[te, cl5], false),
+            Some(extra(&[gzip])),
+            false,
+        ),
+        // A written Transfer-Encoding line needs the codec's chunk framing.
+        (
+            "HTTP/1.0, a written gzip line on a head that ends the message",
+            with_lines(&connect_10, &[te, gzip], false),
+            None,
+            true,
+        ),
+        // A head that ends the message declares no Content-Length but 0.
+        (
+            "Content-Length: 5 on a head that ends the message",
+            with_lines(&connect, &[cl5], false),
+            None,
+            true,
+        ),
+        (
+            "Content-Length: 5 only in the extra headers on a head that ends the message",
+            connect.clone(),
+            Some(extra(&[cl5])),
+            true,
+        ),
+    ];
+    assert_framing_refusals(&cases);
+
+    // Well-formed heads are written, byte for byte as without the option, and leave the
+    // codec reusable.
+    let accepted: [(&str, HttpMessage, Option<HttpHeaders>, Option<&'static [u8]>, &[u8]); 3] = [
+        (
+            "Content-Length: 0",
+            with_lines(&connect, &[("Content-Length", "0")], false),
+            None,
+            Some(b""),
+            b"CONNECT h:443 HTTP/1.1\r\nHost: h:443\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n",
+        ),
+        (
+            "marked chunked, Transfer-Encoding: chunked only in the extra headers",
+            with_lines(&connect, &[], true),
+            Some(extra(&[te])),
+            Some(b"hello"),
+            b"CONNECT h:443 HTTP/1.1\r\nHost: h:443\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        ),
+        (
+            "HTTP/1.0, a dropped chunked line and Content-Length: 2",
+            with_lines(&connect_10, &[te, ("Content-Length", "2")], false),
+            None,
+            Some(b"ok"),
+            b"CONNECT h:443 HTTP/1.0\r\nHost: h:443\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nok",
+        ),
+    ];
+    for (name, message, extra_headers, body, expected) in accepted {
+        let mut codec = upstream_ordinary_codec();
+        let (head, rest) =
+            generate_upstream_exchange(&mut codec, &message, extra_headers.as_ref(), body);
+        let wire = [head.as_slice(), &rest].concat();
+        assert_eq!(wire, expected, "{name}: {}", wire.escape_ascii());
+        if body == Some(b"") {
+            assert!(rest.is_empty(), "{name}: the end of message adds no byte");
+        }
+        // As the same message with GET writes it after its request line.
+        let (get_head, get_rest) = generate_upstream_exchange(
+            &mut Http1xCodec::new(TransportDirection::Upstream),
+            &as_get(&message),
+            extra_headers.as_ref(),
+            body,
+        );
+        assert_eq!(
+            after_request_line(&wire),
+            after_request_line(&[get_head.as_slice(), &get_rest].concat()),
+            "{name}"
+        );
+        assert!(codec.is_reusable(), "{name}");
+    }
+}
+
+#[test]
+fn upstream_ordinary_option_refuses_an_unframed_upgrade_body() {
+    let websocket = consumer_websocket_get();
+    let mut websocket_10 = websocket.clone();
+    websocket_10.set_http_version(1, 0);
+    let h2c = upstream_get_with(&[("Host", "a"), ("Upgrade", "h2c")]);
+    let mut post_h2c_10 = with_lines(
+        &request(HttpMethod::Post, b"/", (1, 0)),
+        &[("Host", "a"), ("Upgrade", "h2c")],
+        false,
+    );
+    post_h2c_10.set_http_version(1, 0);
+    let plain = upstream_get_with(&[("Host", "a")]);
+    let te = ("Transfer-Encoding", "chunked");
+    let gzip = ("Transfer-Encoding", "gzip");
+    let upgrade_h2c = ("Upgrade", "h2c");
+    let cl0 = ("Content-Length", "0");
+    let cl2 = ("Content-Length", "2");
+    let cases: Vec<FramingCase<'_>> = vec![
+        // (d): an unframed body.
+        (
+            "WebSocket GET, neither framing header",
+            websocket.clone(),
+            None,
+            false,
+        ),
+        ("h2c GET, neither framing header", h2c.clone(), None, false),
+        (
+            "HTTP/1.0 WebSocket GET, marked chunked",
+            with_lines(&websocket_10, &[te], true),
+            None,
+            false,
+        ),
+        (
+            "HTTP/1.0 POST with Upgrade: h2c",
+            post_h2c_10.clone(),
+            None,
+            false,
+        ),
+        (
+            "Upgrade: h2c only in the extra headers",
+            plain.clone(),
+            Some(extra(&[upgrade_h2c])),
+            false,
+        ),
+        (
+            "Transfer-Encoding: chunked, not marked chunked",
+            with_lines(&websocket, &[te], false),
+            None,
+            false,
+        ),
+        (
+            "Transfer-Encoding: chunked only in the extra headers, not marked chunked",
+            websocket.clone(),
+            Some(extra(&[te])),
+            false,
+        ),
+        // A written chunked line on a head that ends the message: no last chunk follows.
+        (
+            "Transfer-Encoding: chunked, not marked chunked, on a head that ends the message",
+            with_lines(&websocket, &[te], false),
+            None,
+            true,
+        ),
+        // (c).
+        (
+            "Transfer-Encoding: chunked and Content-Length, not marked chunked",
+            with_lines(&websocket, &[te, cl2], false),
+            None,
+            false,
+        ),
+        // (b): a second written Transfer-Encoding line.
+        (
+            "chunked then gzip, marked chunked",
+            with_lines(&websocket, &[te, gzip], true),
+            None,
+            false,
+        ),
+        // (a) on a head that ends the message.
+        (
+            "two Content-Length: 0 lines on a head that ends the message",
+            with_lines(&websocket, &[cl0, cl0], false),
+            None,
+            true,
+        ),
+        // A non-zero Content-Length on a head that ends the message.
+        (
+            "Content-Length: 2 on a head that ends the message",
+            with_lines(&websocket, &[cl2], false),
+            None,
+            true,
+        ),
+    ];
+    assert_framing_refusals(&cases);
+
+    // Well-formed heads are written byte for byte as without the option, and leave the codec
+    // reusable after their end of message.
+    let accepted: Vec<(
+        &str,
+        HttpMessage,
+        Option<HttpHeaders>,
+        Option<&'static [u8]>,
+    )> = vec![
+        (
+            "WebSocket GET ending at its head",
+            websocket.clone(),
+            None,
+            None,
+        ),
+        (
+            "WebSocket GET, Content-Length: 0",
+            with_lines(&websocket, &[cl0], false),
+            None,
+            Some(b""),
+        ),
+        (
+            "WebSocket GET, Content-Length: 2",
+            with_lines(&websocket, &[cl2], false),
+            None,
+            Some(b"ok"),
+        ),
+        (
+            "WebSocket GET, marked chunked",
+            with_lines(&websocket, &[te], true),
+            None,
+            Some(b"hello"),
+        ),
+        (
+            "HTTP/1.1 POST with Upgrade: h2c",
+            with_lines(
+                &request(HttpMethod::Post, b"/", (1, 1)),
+                &[("Host", "a"), upgrade_h2c],
+                false,
+            ),
+            None,
+            Some(b"hello"),
+        ),
+        (
+            "Upgrade: h2c only in the extra headers, Content-Length: 2",
+            with_lines(&plain, &[cl2], false),
+            Some(extra(&[upgrade_h2c])),
+            Some(b"ok"),
+        ),
+        (
+            "Upgrade: h2c and Content-Length: 2 only in the extra headers",
+            plain.clone(),
+            Some(extra(&[upgrade_h2c, cl2])),
+            Some(b"ok"),
+        ),
+        (
+            "WebSocket GET, marked chunked, the chunked line only in the extra headers",
+            with_lines(&websocket, &[], true),
+            Some(extra(&[te])),
+            Some(b"hello"),
+        ),
+        (
+            "WebSocket GET, marked chunked, a dropped gzip line before the chunked one",
+            with_lines(&websocket, &[gzip, te], true),
+            None,
+            Some(b"hello"),
+        ),
+        (
+            "WebSocket GET, marked chunked, ending at its head",
+            with_lines(&websocket, &[te], true),
+            None,
+            None,
+        ),
+    ];
+    for (name, message, extra_headers, body) in accepted {
+        let mut codec = upstream_ordinary_codec();
+        let (head, rest) =
+            generate_upstream_exchange(&mut codec, &message, extra_headers.as_ref(), body);
+        let (default_head, default_rest) = generate_upstream_exchange(
+            &mut Http1xCodec::new(TransportDirection::Upstream),
+            &message,
+            extra_headers.as_ref(),
+            body,
+        );
+        let wire = [head.as_slice(), &rest].concat();
+        assert_eq!(
+            wire,
+            [default_head.as_slice(), &default_rest].concat(),
+            "{name}: {}",
+            wire.escape_ascii()
+        );
+        assert_eq!(
+            find_bytes(&wire, b"Transfer-Encoding").is_some(),
+            find_bytes(&wire, b"\r\n0\r\n\r\n").is_some(),
+            "{name}: chunked framing under its one Transfer-Encoding line"
+        );
+        if body == Some(b"") {
+            assert!(rest.is_empty(), "{name}: the end of message adds no byte");
+        }
+        assert!(codec.is_reusable(), "{name}");
+    }
+}
+
+#[test]
+fn clearing_the_upstream_ordinary_option_keeps_an_earlier_request_ordinary() {
+    for (request_message, upgrade) in [
+        (upstream_connect(), "websocket"),
+        (upstream_h2c_get(), "h2c"),
+    ] {
+        let sent_then_cleared = || {
+            let mut codec = upstream_ordinary_codec_after(&request_message);
+            codec.set_upstream_upgrade_as_ordinary(false);
+            codec
+        };
+        let context = format!("{:?}", request_message.request_method());
+        // A 2xx is still read as a framed ordinary response.
+        let mut codec = sent_then_cleared();
+        let mut recorder = Recorder::default();
+        let consumed = parse(&mut codec, &mut recorder, UPSTREAM_OK);
+        assert_eq!(consumed, UPSTREAM_OK.len(), "{context}");
+        assert!(recorder.errors.is_empty(), "{context}");
+        assert_eq!(recorder.completions, [false], "{context}");
+        assert_eq!(recorder.bodies, b"ok", "{context}");
+        assert!(codec.is_reusable(), "{context}");
+        // A 101 is still refused.
+        let mut codec = sent_then_cleared();
+        let mut recorder = Recorder::default();
+        let switching = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: {upgrade}\r\nConnection: Upgrade\r\n\r\nraw"
+        );
+        parse(&mut codec, &mut recorder, switching.as_bytes());
+        assert_eq!(recorder.events, ["begin", "error"], "{context}");
+        assert_eq!(
+            recorder.error_messages,
+            [ORDINARY_101_REFUSAL.to_vec()],
+            "{context}"
+        );
+        assert!(recorder.bodies.is_empty(), "{context}");
+        assert!(!codec.is_reusable(), "{context}");
+    }
+}
+
+#[test]
+fn clearing_the_upstream_ordinary_option_restores_upgrades_for_later_requests() {
+    let get = request(HttpMethod::Get, b"/", (1, 1));
+    let cleared_after_a_get = || {
+        let mut codec = upstream_ordinary_codec_after(&get);
+        let mut recorder = Recorder::default();
+        assert_eq!(
+            parse(&mut codec, &mut recorder, UPSTREAM_OK),
+            UPSTREAM_OK.len()
+        );
+        assert_eq!(recorder.completions, [false]);
+        codec.set_upstream_upgrade_as_ordinary(false);
+        codec
+    };
+    // A CONNECT generated next is an egress upgrade whose 2xx starts the tunnel.
+    let mut codec = cleared_after_a_get();
+    generate_request(&mut codec, &upstream_connect(), true);
+    assert!(codec.close_on_egress_complete(), "an egress upgrade");
+    let mut recorder = Recorder::default();
+    let accepted = b"HTTP/1.1 200 OK\r\n\r\n";
+    assert_eq!(parse(&mut codec, &mut recorder, accepted), accepted.len());
+    assert_eq!(recorder.completions, [true]);
+    assert!(recorder.messages[0].is_upgraded());
+    codec.set_parser_paused(false);
+    assert_eq!(parse(&mut codec, &mut recorder, b"tunnel"), 6);
+    assert_eq!(recorder.bodies, b"tunnel");
+
+    // A request with Upgrade: h2c generated next is accepted by a matching 101.
+    let mut codec = cleared_after_a_get();
+    generate_request(&mut codec, &upstream_h2c_get(), true);
+    let mut recorder = Recorder::default();
+    let switching =
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n";
+    assert_eq!(parse(&mut codec, &mut recorder, switching), switching.len());
+    assert!(recorder.errors.is_empty(), "{:?}", recorder.error_messages);
+    assert_eq!(recorder.completions, [true]);
+    codec.set_parser_paused(false);
+    assert_eq!(parse(&mut codec, &mut recorder, b"frames"), 6);
+    assert_eq!(recorder.bodies, b"frames");
+    assert!(!codec.is_reusable());
+}
+
+/// What a downstream codec did with `input` and a `response` to its first request.
+#[derive(Debug, PartialEq)]
+struct DownstreamUpgradeRun {
+    consumed: usize,
+    events: Vec<&'static str>,
+    completions: Vec<bool>,
+    bodies: Vec<u8>,
+    errors: Vec<Vec<u8>>,
+    generated: Result<Vec<u8>, roxygen_core::error::HttpErrorCode>,
+    reusable: bool,
+}
+
+fn downstream_upgrade_run(
+    upstream_option: bool,
+    downstream_option: bool,
+    input: &[u8],
+    response: &HttpMessage,
+) -> DownstreamUpgradeRun {
+    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+    codec.set_upstream_upgrade_as_ordinary(upstream_option);
+    codec.set_downstream_upgrade_as_ordinary(downstream_option);
+    let mut recorder = Recorder::default();
+    let mut consumed = parse(&mut codec, &mut recorder, input);
+    let mut output = BufQueue::new(QUEUE_LIMIT);
+    let generated = codec
+        .generate(
+            &mut output,
+            EgressFrame::Headers {
+                stream: StreamId::new(1),
+                message: response,
+                end_stream: false,
+                extra_headers: None,
+            },
+            &mut Recorder::default(),
+        )
+        .map(|_| queue_bytes(&output))
+        .map_err(|error| error.code());
+    codec.set_parser_paused(false);
+    consumed += parse(&mut codec, &mut recorder, &input[consumed..]);
+    DownstreamUpgradeRun {
+        consumed,
+        events: recorder.events,
+        completions: recorder.completions,
+        bodies: recorder.bodies,
+        errors: recorder.error_messages,
+        generated,
+        reusable: codec.is_reusable(),
+    }
+}
+
+#[test]
+fn upstream_ordinary_option_does_not_affect_downstream() {
+    let mut connect_ok = response(200, (1, 1));
+    connect_ok.headers_mut().set(HttpHeaderCode::Date, b"fixed");
+    let mut switching = response(101, (1, 1));
+    switching.set_egress_websocket_upgrade();
+    switching.headers_mut().set(HttpHeaderCode::Date, b"fixed");
+    let behind = b"bytes behind the request";
+    for (head, accepting) in [
+        (ORDINARY_CONNECT_HEAD, &connect_ok),
+        (ORDINARY_WEBSOCKET_HEAD, &switching),
+    ] {
+        let input = [head, behind.as_slice()].concat();
+        for downstream_option in [false, true] {
+            let expected = downstream_upgrade_run(false, downstream_option, &input, accepting);
+            let actual = downstream_upgrade_run(true, downstream_option, &input, accepting);
+            assert_eq!(
+                actual,
+                expected,
+                "{} with the downstream option {downstream_option}",
+                head.escape_ascii()
+            );
+        }
+    }
+}
+
+#[test]
+fn upstream_ordinary_option_keeps_response_parse_errors() {
+    let responses: [&[u8]; 6] = [
+        b"HTTP/1.1 2x0 OK\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nok",
+        b"HTTP/1.1 200 OK\r\nX-Bad: a\x01b\r\nContent-Length: 2\r\n\r\nok",
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nX-Bad: a\x01b\r\n\r\n",
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nok\r\n0\r\n\r\n",
+    ];
+    for response in responses {
+        let run = |message: &HttpMessage| {
+            let mut codec = upstream_ordinary_codec_after(message);
+            let mut recorder = Recorder::default();
+            let consumed = parse(&mut codec, &mut recorder, response);
+            (consumed, recorder, codec.is_reusable())
+        };
+        let (expected_consumed, expected, _) = run(&request(HttpMethod::Get, b"/", (1, 1)));
+        assert_eq!(expected.errors.len(), 1, "{}", response.escape_ascii());
+        for message in [
+            upstream_connect(),
+            consumer_websocket_get(),
+            upstream_h2c_get(),
+        ] {
+            let context = format!(
+                "{} to {:?}",
+                response.escape_ascii(),
+                message.request_method()
+            );
+            let (consumed, actual, reusable) = run(&message);
+            assert_eq!(consumed, expected_consumed, "{context}");
+            assert_eq!(actual.events, expected.events, "{context}");
+            assert_eq!(actual.error_messages, expected.error_messages, "{context}");
+            assert_eq!(actual.errors.len(), 1, "{context}");
+            assert_eq!(actual.errors[0].0, expected.errors[0].0, "{context}");
+            assert_eq!(actual.errors[0].1, expected.errors[0].1, "{context}");
+            assert_eq!(
+                actual.errors[0].2.as_ref().map(render_message),
+                expected.errors[0].2.as_ref().map(render_message),
+                "{context}"
+            );
+            assert!(!reusable, "{context}");
+        }
+    }
+}
+
+/// Pauses the parser at each callback whose event name is in `at`.
+struct PauseAtEvents {
+    recorder: Recorder,
+    at: &'static [&'static str],
+}
+
+impl HttpCodecCallback for PauseAtEvents {
+    fn on_event(&mut self, event: CodecEvent<'_>) {
+        self.recorder.on_event(event);
+    }
+
+    fn on_ingress_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
+        let recorded = self.recorder.events.len();
+        self.recorder.on_event(event);
+        if self.recorder.events[recorded..]
+            .iter()
+            .any(|name| self.at.contains(name))
+        {
+            vec![CodecCallbackAction::SetParserPaused(true)].into()
+        } else {
+            CodecCallbackActions::new()
+        }
+    }
+}
+
+/// Parses `input` with a pause at each event in `at`, resuming after each, and returns the
+/// pause offsets, the final consumed count, the events and the body bytes.
+fn response_pause_offsets(
+    mut codec: Http1xCodec,
+    input: &[u8],
+    at: &'static [&'static str],
+) -> (Vec<usize>, usize, Vec<&'static str>, Vec<u8>) {
+    let mut callback = PauseAtEvents {
+        recorder: Recorder::default(),
+        at,
+    };
+    let mut callback_egress = BufQueue::new(QUEUE_LIMIT);
+    let mut consumed = 0;
+    let mut pauses = Vec::new();
+    for _ in 0..=2 * input.len() {
+        let result = codec.on_ingress(
+            &ingress_queue(&input[consumed..]),
+            &mut callback,
+            &mut callback_egress,
+        );
+        consumed += result.consumed;
+        if !codec.is_parser_paused() {
+            break;
+        }
+        pauses.push(consumed);
+        codec.set_parser_paused(false);
+    }
+    (
+        pauses,
+        consumed,
+        callback.recorder.events,
+        callback.recorder.bodies,
+    )
+}
+
+#[test]
+fn upstream_ordinary_option_pauses_at_the_ordinary_offsets() {
+    let responses: [&[u8]; 4] = [
+        UPSTREAM_OK,
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n3\r\nabc\r\n0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nUpgrade: websocket\r\nConnection: upgrade\r\nContent-Length: 2\r\n\r\nok",
+        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 3\r\n\r\nno!",
+    ];
+    let pause_sets: [&'static [&'static str]; 4] = [
+        &["headers"],
+        &["body"],
+        &["complete"],
+        &["headers", "body", "complete"],
+    ];
+    let get = request(HttpMethod::Get, b"/", (1, 1));
+    for response in responses {
+        for at in pause_sets {
+            let mut plain = Http1xCodec::new(TransportDirection::Upstream);
+            generate_request(&mut plain, &get, true);
+            let expected = response_pause_offsets(plain, response, at);
+            assert!(!expected.0.is_empty(), "{}", response.escape_ascii());
+            assert_eq!(expected.1, response.len(), "{}", response.escape_ascii());
+            for message in [
+                upstream_connect(),
+                consumer_websocket_get(),
+                upstream_h2c_get(),
+            ] {
+                let context = format!(
+                    "{} to {:?} pausing at {at:?}",
+                    response.escape_ascii(),
+                    message.request_method()
+                );
+                let actual =
+                    response_pause_offsets(upstream_ordinary_codec_after(&message), response, at);
+                assert_eq!(actual, expected, "{context}");
+            }
+        }
+        // An external pause stops parsing before the first byte, and resuming parses it all.
+        for message in [
+            upstream_connect(),
+            consumer_websocket_get(),
+            upstream_h2c_get(),
+        ] {
+            let context = format!(
+                "{} to {:?}",
+                response.escape_ascii(),
+                message.request_method()
+            );
+            let mut codec = upstream_ordinary_codec_after(&message);
+            let mut recorder = Recorder::default();
+            codec.set_parser_paused(true);
+            assert_eq!(parse(&mut codec, &mut recorder, response), 0, "{context}");
+            assert!(recorder.events.is_empty(), "{context}");
+            codec.set_parser_paused(false);
+            assert_eq!(
+                parse(&mut codec, &mut recorder, response),
+                response.len(),
+                "{context}"
+            );
+            assert_eq!(recorder.completions, [false], "{context}");
+            assert!(codec.is_reusable(), "{context}");
+        }
+    }
+}
+
+#[test]
+fn default_upstream_upgrade_handling_is_unchanged() {
+    let makers: [(&str, fn() -> Http1xCodec); 2] = [
+        ("never set", || {
+            Http1xCodec::new(TransportDirection::Upstream)
+        }),
+        ("set then cleared", || {
+            let mut codec = Http1xCodec::new(TransportDirection::Upstream);
+            codec.set_upstream_upgrade_as_ordinary(true);
+            codec.set_upstream_upgrade_as_ordinary(false);
+            codec
+        }),
+    ];
+    let get = request(HttpMethod::Get, b"/", (1, 1));
+    let mut chunked_connect = upstream_connect();
+    chunked_connect
+        .headers_mut()
+        .set(HttpHeaderCode::TransferEncoding, b"chunked");
+    chunked_connect.set_chunked(true);
+    let mut flagged = request(HttpMethod::Get, b"/websocket", (1, 1));
+    flagged.set_egress_websocket_upgrade();
+    for (name, make) in makers {
+        // A chunked CONNECT's body is tunnel bytes, and the connection closes after it.
+        let mut codec = make();
+        let wire = generate_request_with_body(&mut codec, &chunked_connect, b"hello", false);
+        assert!(
+            wire.ends_with(b"\r\n\r\nhello"),
+            "{name}: {}",
+            wire.escape_ascii()
+        );
+        assert!(codec.close_on_egress_complete(), "{name}");
+
+        // A 2xx to a CONNECT is upgraded, and the bytes behind it are tunnel body.
+        let mut codec = make();
+        generate_request(&mut codec, &upstream_connect(), true);
+        let mut recorder = Recorder::default();
+        let accepted = b"HTTP/1.1 200 OK\r\n\r\n";
+        assert_eq!(
+            parse(&mut codec, &mut recorder, accepted),
+            accepted.len(),
+            "{name}"
+        );
+        assert_eq!(recorder.completions, [true], "{name}");
+        assert!(recorder.messages[0].is_upgraded(), "{name}");
+        codec.set_parser_paused(false);
+        assert_eq!(parse(&mut codec, &mut recorder, b"tunnel"), 6, "{name}");
+        assert_eq!(recorder.bodies, b"tunnel", "{name}");
+
+        // A matching 101 to an h2c request is accepted; a websocket 101 is a mismatch.
+        let mut codec = make();
+        generate_request(&mut codec, &upstream_h2c_get(), true);
+        let mut recorder = Recorder::default();
+        let switching =
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n";
+        assert_eq!(
+            parse(&mut codec, &mut recorder, switching),
+            switching.len(),
+            "{name}"
+        );
+        assert!(
+            recorder.errors.is_empty(),
+            "{name}: {:?}",
+            recorder.error_messages
+        );
+        assert_eq!(recorder.completions, [true], "{name}");
+        let mut codec = make();
+        generate_request(&mut codec, &upstream_h2c_get(), true);
+        let mut recorder = Recorder::default();
+        parse(
+            &mut codec,
+            &mut recorder,
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+        );
+        assert_eq!(
+            recorder.error_messages,
+            [b"upgrade protocol mismatch".to_vec()],
+            "{name}"
+        );
+
+        // A 200 with an Upgrade header ends keep-alive.
+        let mut codec = make();
+        generate_request(&mut codec, &get, true);
+        let mut recorder = Recorder::default();
+        let upgrade_ok = b"HTTP/1.1 200 OK\r\nUpgrade: h2c\r\nContent-Length: 2\r\n\r\nok";
+        assert_eq!(
+            parse(&mut codec, &mut recorder, upgrade_ok),
+            upgrade_ok.len(),
+            "{name}"
+        );
+        assert_eq!(recorder.completions, [false], "{name}");
+        assert_eq!(recorder.bodies, b"ok", "{name}");
+        assert!(!codec.is_reusable(), "{name}");
+
+        // A 200 with Upgrade: websocket is marked as a websocket upgrade.
+        let mut codec = make();
+        generate_request(&mut codec, &get, true);
+        let mut recorder = Recorder::default();
+        parse(
+            &mut codec,
+            &mut recorder,
+            b"HTTP/1.1 200 OK\r\nUpgrade: websocket\r\nContent-Length: 2\r\n\r\nok",
+        );
+        assert!(
+            recorder.errors.is_empty(),
+            "{name}: {:?}",
+            recorder.error_messages
+        );
+        assert!(
+            recorder.messages[0].is_ingress_websocket_upgrade(),
+            "{name}"
+        );
+
+        // The egress flag writes the handshake, and a wrong accept key fails its 101.
+        let mut codec = make();
+        let wire = generate_request(&mut codec, &flagged, false);
+        assert!(
+            find_bytes(&wire, b"\r\nUpgrade: websocket\r\n").is_some(),
+            "{name}: {}",
+            wire.escape_ascii()
+        );
+        assert!(
+            find_bytes(&wire, b"\r\nSec-WebSocket-Key: ").is_some(),
+            "{name}: {}",
+            wire.escape_ascii()
+        );
+        let mut recorder = Recorder::default();
+        parse(
+            &mut codec,
+            &mut recorder,
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: wrong\r\n\r\n",
+        );
+        assert_eq!(
+            recorder.error_messages,
+            [b"invalid websocket accept key".to_vec()],
+            "{name}"
+        );
+    }
+}

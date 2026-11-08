@@ -316,6 +316,10 @@ pub struct Http1xCodec {
     downstream_upgrade_as_ordinary: bool,
     /// The last request stream parsed under `downstream_upgrade_as_ordinary`, or unspecified.
     last_ordinary_request: StreamId,
+    upstream_upgrade_as_ordinary: bool,
+    /// The last request an upstream codec generated was generated under
+    /// `upstream_upgrade_as_ordinary`, so its response is read as an ordinary response.
+    ordinary_request_sent: bool,
     release_egress_after_request: bool,
     state: ParseState,
     current_message: Option<HttpMessage>,
@@ -365,6 +369,7 @@ struct EgressRollback {
     keepalive: bool,
     disable_keepalive_pending: bool,
     connect_request: bool,
+    ordinary_request_sent: bool,
     head_request: bool,
     expect_no_response_body: bool,
     may_chunk_egress: bool,
@@ -394,6 +399,8 @@ impl Http1xCodec {
             strict_validation,
             downstream_upgrade_as_ordinary: false,
             last_ordinary_request: StreamId::UNSPECIFIED,
+            upstream_upgrade_as_ordinary: false,
+            ordinary_request_sent: false,
             release_egress_after_request: false,
             state: ParseState::Idle,
             current_message: None,
@@ -449,6 +456,14 @@ impl Http1xCodec {
     /// codec's upgrade handling. It has no effect on an upstream codec.
     pub fn set_downstream_upgrade_as_ordinary(&mut self, enabled: bool) {
         self.downstream_upgrade_as_ordinary = enabled;
+    }
+
+    /// Roxygen-only (`DIV-031`): sends each request an upstream codec generates after this call,
+    /// including one with an `Upgrade` header or a `CONNECT` method, as an ordinary request, and
+    /// reads its response as an ordinary response. Off by default, which is the reference
+    /// codec's upgrade handling. It has no effect on a downstream codec.
+    pub fn set_upstream_upgrade_as_ordinary(&mut self, enabled: bool) {
+        self.upstream_upgrade_as_ordinary = enabled;
     }
 
     /// Releases upstream egress ownership as soon as the request completes.
@@ -1195,9 +1210,13 @@ impl Http1xCodec {
                             .as_ptr(),
             ),
         );
-        // `DIV-030`: so is its `Upgrade` header an ordinary header.
-        let websocket = !ordinary && upgrade.eq_ignore_ascii_case(b"websocket");
-        self.keepalive &= ordinary || upgrade.is_empty();
+        // `DIV-031`: a response to a request an upstream codec sent under the option is read as
+        // an ordinary response.
+        let ordinary_response = self.direction.is_upstream() && self.ordinary_request_sent;
+        // `DIV-030`, `DIV-031`: so is its `Upgrade` header an ordinary header.
+        let websocket =
+            !(ordinary || ordinary_response) && upgrade.eq_ignore_ascii_case(b"websocket");
+        self.keepalive &= ordinary || ordinary_response || upgrade.is_empty();
         self.keepalive &= !self.connect_request;
         if websocket {
             message.set_ingress_websocket_upgrade();
@@ -1225,6 +1244,14 @@ impl Http1xCodec {
             if self.connect_request && (200..300).contains(&status) {
                 self.ingress_upgrade = true;
             } else if status == 101 {
+                // `DIV-031`: the request was sent as ordinary, so nothing can switch.
+                if ordinary_response {
+                    self.current_message = Some(message);
+                    return Err((
+                        ParseErrorKind::Header,
+                        b"switching protocols refused for an ordinary request",
+                    ));
+                }
                 let server_upgrade = message
                     .headers()
                     .get_single_or_empty(HttpHeaderCode::Upgrade);
@@ -1417,6 +1444,7 @@ impl Http1xCodec {
             keepalive: self.keepalive,
             disable_keepalive_pending: self.disable_keepalive_pending,
             connect_request: self.connect_request,
+            ordinary_request_sent: self.ordinary_request_sent,
             head_request: self.head_request,
             expect_no_response_body: self.expect_no_response_body,
             may_chunk_egress: self.may_chunk_egress,
@@ -1439,6 +1467,7 @@ impl Http1xCodec {
         self.keepalive = rollback.keepalive;
         self.disable_keepalive_pending = rollback.disable_keepalive_pending;
         self.connect_request = rollback.connect_request;
+        self.ordinary_request_sent = rollback.ordinary_request_sent;
         self.head_request = rollback.head_request;
         self.expect_no_response_body = rollback.expect_no_response_body;
         self.may_chunk_egress = rollback.may_chunk_egress;
@@ -1469,11 +1498,28 @@ impl Http1xCodec {
             if stream != self.egress_stream {
                 return Err(invalid_state(b"HTTP/1 request stream is out of order"));
             }
+            // `DIV-031`: the flag asks for a handshake whose 101 an ordinary request refuses.
+            if self.upstream_upgrade_as_ordinary && message.is_egress_websocket_upgrade() {
+                return Err(invalid_state(
+                    b"HTTP/1 egress websocket upgrade on a request sent as ordinary",
+                ));
+            }
+            if self.upstream_upgrade_as_ordinary
+                && !self.frames_ordinary_request(message, extra_headers, end_stream)
+            {
+                return Err(invalid_state(
+                    b"HTTP/1 request sent as ordinary has ambiguous framing",
+                ));
+            }
             self.request_pending = true;
             self.response_pending = true;
             request = request_fields(message);
             method = request.and_then(|(name, _)| HttpMethod::from_bytes(name.as_bytes()));
-            self.connect_request = method == Some(HttpMethod::Connect);
+            // `DIV-031`: under the option a CONNECT is an ordinary request, with no egress
+            // upgrade, no tunnel and a response read by its own framing.
+            self.ordinary_request_sent = self.upstream_upgrade_as_ordinary;
+            self.connect_request =
+                method == Some(HttpMethod::Connect) && !self.ordinary_request_sent;
             self.head_request = method == Some(HttpMethod::Head);
             self.expect_no_response_body = self.connect_request || self.head_request;
         } else {
@@ -1505,16 +1551,7 @@ impl Http1xCodec {
                 || rfc2616::response_body_must_be_empty(u32::from(response.0));
         }
 
-        let mut version = message.http_version();
-        if version > (1, 1) {
-            version = (1, 1);
-        }
-        if self.force_1_1
-            && version < (1, 1)
-            && !(self.direction.is_downstream() && version == (0, 9))
-        {
-            version = (1, 1);
-        }
+        let version = self.egress_version(message);
         let egress_websocket = message.is_egress_websocket_upgrade();
         let status = if upstream {
             0
@@ -1554,7 +1591,7 @@ impl Http1xCodec {
             let url = request
                 .ok_or_else(|| invalid_state(b"HTTP/1 request requires a URL"))?
                 .1;
-            let target = if self.connect_request && url.is_empty() {
+            let target = if method == Some(HttpMethod::Connect) && url.is_empty() {
                 message.headers().get_single_or_empty(HttpHeaderCode::Host)
             } else {
                 url
@@ -1764,6 +1801,108 @@ impl Http1xCodec {
         }
         let size = header_size(output.len());
         Ok((output, size))
+    }
+
+    /// The HTTP version `generate_headers` writes for `message`.
+    fn egress_version(&self, message: &HttpMessage) -> (u8, u8) {
+        let mut version = message.http_version();
+        if version > (1, 1) {
+            version = (1, 1);
+        }
+        if self.force_1_1
+            && version < (1, 1)
+            && !(self.direction.is_downstream() && version == (0, 9))
+        {
+            version = (1, 1);
+        }
+        version
+    }
+
+    /// Roxygen-only (`DIV-031`): whether the head of a request that the upstream option sends
+    /// as ordinary, read as `generate_headers` writes it (`message`'s headers, then
+    /// `extra_headers`), tells the origin where the request ends exactly as this codec frames
+    /// it: at most one `Content-Length`, a decimal length that is 0 on a head that ends the
+    /// message; at most one written `Transfer-Encoding` line, never beside a `Content-Length`
+    /// and only over this codec's chunk framing; and, behind a head that does not end the
+    /// message, a body framed by that length or that chunking. Under the option, generating a
+    /// request for which this is false fails. It is true for every other request, which is
+    /// written as without the option.
+    pub fn frames_ordinary_request(
+        &self,
+        message: &HttpMessage,
+        extra_headers: Option<&HttpHeaders>,
+        end_stream: bool,
+    ) -> bool {
+        let method =
+            request_fields(message).and_then(|(name, _)| HttpMethod::from_bytes(name.as_bytes()));
+        let headers = || {
+            message
+                .headers()
+                .iter()
+                .chain(extra_headers.into_iter().flat_map(HttpHeaders::iter))
+        };
+        if method != Some(HttpMethod::Connect)
+            && !headers().any(|(code, _, _)| code == HttpHeaderCode::Upgrade)
+        {
+            return true;
+        }
+        let version = self.egress_version(message);
+        if version == (0, 9) {
+            // No header line is written, so nothing frames a body.
+            return end_stream;
+        }
+        let may_chunk = version.0 == 1 && version.1 >= 1;
+        let mut lengths = Vec::new();
+        let mut chunked_seen = false;
+        let mut transfer_encodings = 0_usize;
+        // As the header loop of `generate_headers`: the last `Content-Length` is written; a
+        // `Transfer-Encoding` line before the first chunked one is dropped, as is that line
+        // on HTTP/1.0, and every later line without CR or LF is written verbatim.
+        for (code, _, value) in headers() {
+            if code == HttpHeaderCode::ContentLength {
+                lengths.push(value);
+            } else if code == HttpHeaderCode::TransferEncoding {
+                if !chunked_seen {
+                    if !value.eq_ignore_ascii_case(b"chunked") {
+                        continue;
+                    }
+                    chunked_seen = true;
+                    if !may_chunk {
+                        continue;
+                    }
+                }
+                if !value.iter().any(|byte| matches!(*byte, b'\r' | b'\n')) {
+                    transfer_encodings += 1;
+                }
+            }
+        }
+        // As `generate_headers`: a message marked chunked is chunked under its chunked line,
+        // and a POST or such a message with neither framing header gets a generated one.
+        let marked = message.is_chunked() && may_chunk;
+        let generated = (method == Some(HttpMethod::Post) || marked)
+            && !chunked_seen
+            && lengths.is_empty()
+            && may_chunk;
+        let chunk_framed = (marked && chunked_seen) || generated;
+        transfer_encodings += usize::from(generated);
+        let length = match lengths.as_slice() {
+            [] => None,
+            [value] => match parse_decimal_u64(value) {
+                Some(length) => Some(length),
+                None => return false,
+            },
+            _ => return false,
+        };
+        if transfer_encodings > 1
+            || (transfer_encodings != 0 && (length.is_some() || !chunk_framed))
+        {
+            return false;
+        }
+        if end_stream {
+            length.is_none_or(|length| length == 0)
+        } else {
+            length.is_some() || chunk_framed
+        }
     }
 
     /// Bytes for every header line and generated line that can follow a start

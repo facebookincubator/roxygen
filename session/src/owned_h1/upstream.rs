@@ -14,16 +14,19 @@
 //! before both messages end resets the connection. A request body that does not match its declared `Content-Length` fails the
 //! request with `CONTENT_LENGTH_MISMATCH`, and no byte past that length or after a short end is
 //! written. Trailers on a `Content-Length` request have no HTTP/1.1 encoding and are dropped.
-//! Peer EOF closes admission. A request that can switch protocols (CONNECT, an `Upgrade`
-//! header or the egress websocket flag) is refused, byte events are cancelled, never fired,
-//! and the driver is untimed. A cancel from any callback the driver runs, including a request
-//! body's resume future and a waker that a response event's publication runs, is observed at the
-//! end of that phase, before it reads more of the request, parses the next response event,
-//! writes or closes normally. As in `UniplexSession`, a failed read fails the connection only
-//! after every byte read before it is parsed, flow control included.
+//! Peer EOF closes admission. Under [`Http1UpgradePolicy::Proxygen`] a request that can switch
+//! protocols (CONNECT, an `Upgrade` header or the egress websocket flag) is refused. Under
+//! [`Http1UpgradePolicy::AsOrdinaryRequest`] CONNECT and `Upgrade` requests are sent as
+//! ordinary requests, a head that does not frame its body as the codec writes it is refused, a
+//! `101` fails the connection, and the egress websocket flag is still refused (`DIV-031`).
+//! Byte events are cancelled, never fired, and the driver is untimed. A cancel from any
+//! callback the driver runs, including a request body's resume future and a waker that a
+//! response event's publication runs, is observed at the end of that phase, before it reads
+//! more of the request, parses the next response event, writes or closes normally. As in
+//! `UniplexSession`, a failed read fails the connection only after every byte read before it is
+//! parsed, flow control included.
 //! [`OwnedH1UpstreamSession::new`] validates [`UniplexConfig`] as [`OwnedH1Session::new`]
-//! does, except that `drain_request_body_on_drop` must be false and
-//! [`Http1UpgradePolicy::Proxygen`] is the only upgrade policy. DIV-029 lists where this
+//! does, except that `drain_request_body_on_drop` must be false. DIV-029 lists where this
 //! driver differs from `UniplexSession`'s client.
 
 use std::cell::RefCell;
@@ -1065,6 +1068,9 @@ struct UpstreamDriver {
     summary: UniplexRunSummary,
     budget_yield: Option<LocalFuture>,
     started: bool,
+    /// `Http1UpgradePolicy::AsOrdinaryRequest`: CONNECT and `Upgrade` requests are sent as
+    /// ordinary requests (`DIV-031`).
+    ordinary_upgrades: bool,
 }
 
 /// The codec callback: borrows what one response `on_ingress` call may change.
@@ -1181,8 +1187,7 @@ impl UpstreamDriver {
         } = options;
         let io = io.validate()?;
         // As `OwnedH1Session::new`, except that an upstream request body is never drained
-        // on drop (the rule of `OwnedH2Session::new` upstream) and the downstream upgrade
-        // policy has nothing to apply to.
+        // on drop (the rule of `OwnedH2Session::new` upstream).
         if !context.is_owner_thread()
             || context.is_cancelled()
             || io.maximum_write_size > io.buffer_limit
@@ -1192,7 +1197,6 @@ impl UpstreamDriver {
             || !io.write_timeout.is_zero()
             || io.drain_request_body_on_drop
             || io.wait_for_http1_response_on_drain
-            || http1.upgrade_policy != Http1UpgradePolicy::Proxygen
             || transport.byte_event_capability(&context)? != ByteEventCapability::Unsupported
         {
             return Err(failure(
@@ -1225,8 +1229,10 @@ impl UpstreamDriver {
             io.write_timeout,
             write_cancellation.token(),
         )?;
-        let codec =
+        let mut codec =
             Http1xCodec::with_options(TransportDirection::Upstream, false, http1.strict_validation);
+        let ordinary_upgrades = http1.upgrade_policy == Http1UpgradePolicy::AsOrdinaryRequest;
+        codec.set_upstream_upgrade_as_ordinary(ordinary_upgrades);
         Ok((
             Self {
                 context,
@@ -1262,6 +1268,7 @@ impl UpstreamDriver {
                 summary: UniplexRunSummary::default(),
                 budget_yield: None,
                 started: false,
+                ordinary_upgrades,
             },
             OwnedH1UpstreamHandle(shared),
         ))
@@ -1492,10 +1499,13 @@ impl UpstreamDriver {
         // This driver carries no tunnel: a request that can switch protocols is refused before
         // any byte is written (`DIV-029`). The codec switches on a CONNECT method, on an
         // `Upgrade` header that a `101` accepts, and on the egress websocket flag, for which it
-        // writes the `Upgrade` header itself.
-        if method == Some(HttpMethod::Connect)
-            || headers.headers().headers().exists(HttpHeaderCode::Upgrade)
-            || headers.headers().is_egress_websocket_upgrade()
+        // writes the `Upgrade` header itself. Under `AsOrdinaryRequest` the codec sends CONNECT
+        // and `Upgrade` requests as ordinary requests (`DIV-031`), but the flag still asks for
+        // a handshake.
+        if headers.headers().is_egress_websocket_upgrade()
+            || (!self.ordinary_upgrades
+                && (method == Some(HttpMethod::Connect)
+                    || headers.headers().headers().exists(HttpHeaderCode::Upgrade)))
         {
             return Err(failure(
                 HttpErrorCode::HEADER_PARSE_ERROR,
@@ -1506,6 +1516,18 @@ impl UpstreamDriver {
         // A head that ends the request cannot carry the body it declares (`DIV-029`).
         if headers.eom() && expected_request_length.is_some_and(|expected| expected != 0) {
             return Err(request_length_mismatch());
+        }
+        // `DIV-031`: a CONNECT or `Upgrade` request sent as ordinary whose head does not frame
+        // its body as the codec writes it is refused before any byte.
+        if self.ordinary_upgrades
+            && !self
+                .codec
+                .frames_ordinary_request(headers.headers(), None, headers.eom())
+        {
+            return Err(failure(
+                HttpErrorCode::HEADER_PARSE_ERROR,
+                b"owned H1 upstream request sent as ordinary has ambiguous framing",
+            ));
         }
         let head_request = method == Some(HttpMethod::Head);
         let id = self.codec.create_stream();

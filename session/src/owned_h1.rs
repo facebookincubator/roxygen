@@ -119,23 +119,28 @@ pub struct OwnedH1Options {
 pub struct Http1DriverConfig {
     /// `Http1xCodec::set_strict_validation`; off by default, as the codec is.
     pub strict_validation: bool,
-    /// How a downstream upgrade or CONNECT request is handled.
+    /// How an upgrade or CONNECT request is handled.
     pub upgrade_policy: Http1UpgradePolicy,
 }
 
-/// How a downstream upgrade or CONNECT request is handled.
+/// How an upgrade or CONNECT request is handled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Http1UpgradePolicy {
-    /// As `UniplexSession`: parsing waits for the final response head, which accepts the
-    /// upgrade (the bytes that follow are the request body, through EOF, and the response body
-    /// is sent unframed) or refuses it (the request ends and the connection closes after the
-    /// response).
+    /// Downstream, as `UniplexSession`: parsing waits for the final response head, which
+    /// accepts the upgrade (the bytes that follow are the request body, through EOF, and the
+    /// response body is sent unframed) or refuses it (the request ends and the connection
+    /// closes after the response). Upstream, the owned driver carries no tunnel and refuses
+    /// the request before any byte (`DIV-029`).
     #[default]
     Proxygen,
-    /// Roxygen-only (`DIV-030`): the request is handed over as an ordinary request, with its
-    /// method, target and headers unchanged, and parsing continues behind it as HTTP/1.1
-    /// (`Http1xCodec::set_downstream_upgrade_as_ordinary`). No tunnel is carried, and a response
-    /// that switches protocols is refused.
+    /// Roxygen-only: the request is an ordinary request, with its method, target and headers
+    /// unchanged, and no tunnel is carried. Downstream (`DIV-030`), it is handed over and
+    /// parsing continues behind it as HTTP/1.1
+    /// (`Http1xCodec::set_downstream_upgrade_as_ordinary`), and a response that switches
+    /// protocols is refused. Upstream (`DIV-031`), it is sent and its response read by their
+    /// own framing (`Http1xCodec::set_upstream_upgrade_as_ordinary`); a head that does not
+    /// frame its body as the codec writes it and the egress websocket flag are refused before
+    /// any byte, and a `101` fails the connection.
     AsOrdinaryRequest,
 }
 
