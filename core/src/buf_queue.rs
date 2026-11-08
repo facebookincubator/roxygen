@@ -1,6 +1,11 @@
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::collections::vec_deque::Iter;
+use std::fmt;
 use std::io::IoSlice;
+use std::mem::ManuallyDrop;
+use std::ops::Deref;
+use std::ops::DerefMut;
 
 use bytes::Buf;
 use bytes::Bytes;
@@ -36,8 +41,15 @@ pub struct BufQueue {
     backing_capacity: Option<usize>,
 }
 
+// Queues move by value on every event; a larger queue adds copying to each move.
+const _: () = assert!(size_of::<BufQueue>() <= 72);
+
 /// The smallest capacity `VecDeque` growth allocates for `Bytes` segments.
 const MIN_SEGMENT_CAPACITY: usize = 4;
+
+/// The most containers of [`MIN_SEGMENT_CAPACITY`] a thread keeps, bounding
+/// them at 1 KiB per thread.
+const KEPT_CONTAINERS: usize = 8;
 
 /// The largest refill hint, bounding a hinted container at 2 KiB.
 const MAX_SEGMENT_HINT: u16 = 64;
@@ -52,7 +64,119 @@ enum Segments {
     /// its first growth past that jumps to the hint, so fills of at most
     /// [`MIN_SEGMENT_CAPACITY`] segments allocate exactly as unhinted queues
     /// do, and such a fill leaves a small hint behind.
-    Many(VecDeque<Bytes>, u16),
+    Many(Container, u16),
+}
+
+/// A segment container. Dropping one of [`MIN_SEGMENT_CAPACITY`] releases its
+/// segments and keeps the empty container on this thread, and the thread's
+/// next container of that capacity is a kept one, so a queue that spills and
+/// is dropped every event stops allocating its container.
+///
+/// Dropping a container moves its deque out, so the deque left behind, which
+/// is never dropped, is always unallocated.
+#[derive(Clone, Default)]
+struct Container(ManuallyDrop<VecDeque<Bytes>>);
+
+/// Empty containers of [`MIN_SEGMENT_CAPACITY`] that this thread keeps: the
+/// first `count` slots, the most recently kept last.
+struct KeptContainers {
+    count: Cell<usize>,
+    slots: [Cell<Option<VecDeque<Bytes>>>; KEPT_CONTAINERS],
+}
+
+std::thread_local! {
+    static KEPT: KeptContainers = const {
+        KeptContainers {
+            count: Cell::new(0),
+            slots: [const { Cell::new(None) }; KEPT_CONTAINERS],
+        }
+    };
+}
+
+impl KeptContainers {
+    fn take(&self) -> Option<VecDeque<Bytes>> {
+        let count = self.count.get().checked_sub(1)?;
+        self.count.set(count);
+        self.slots[count].take()
+    }
+
+    /// Moves `container` here and returns `true`, unless this thread already
+    /// keeps the most.
+    fn keep(&self, container: &mut VecDeque<Bytes>) -> bool {
+        let count = self.count.get();
+        let Some(slot) = self.slots.get(count) else {
+            return false;
+        };
+        slot.set(Some(std::mem::take(container)));
+        self.count.set(count + 1);
+        true
+    }
+}
+
+impl Container {
+    fn with_capacity(capacity: usize) -> Self {
+        if capacity == MIN_SEGMENT_CAPACITY
+            && let Ok(Some(kept)) = KEPT.try_with(KeptContainers::take)
+        {
+            return Self(ManuallyDrop::new(kept));
+        }
+        Self(ManuallyDrop::new(VecDeque::with_capacity(capacity)))
+    }
+
+    fn into_inner(mut self) -> VecDeque<Bytes> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for Container {
+    fn drop(&mut self) {
+        release(&mut self.0);
+    }
+}
+
+/// Drops a container's segments and frees it, except that this thread keeps
+/// one of [`MIN_SEGMENT_CAPACITY`] when it has room. Either way an unallocated
+/// container is left behind.
+///
+/// Out of line, so that the drop glue of `Segments` stays small enough to be
+/// inlined.
+#[inline(never)]
+fn release(container: &mut VecDeque<Bytes>) {
+    if container.capacity() == MIN_SEGMENT_CAPACITY {
+        // Before the kept containers are touched, so a segment owner that
+        // drops another queue cannot interleave with this keep. Through a
+        // local, so a panicking segment drop still frees the container.
+        if !container.is_empty() {
+            let mut segments = std::mem::take(container);
+            segments.clear();
+            *container = segments;
+        }
+        // While this thread exits, its kept containers may already be gone.
+        if KEPT.try_with(|kept| kept.keep(container)) == Ok(true) {
+            return;
+        }
+    }
+    drop(std::mem::take(container));
+}
+
+impl Deref for Container {
+    type Target = VecDeque<Bytes>;
+
+    fn deref(&self) -> &VecDeque<Bytes> {
+        &self.0
+    }
+}
+
+impl DerefMut for Container {
+    fn deref_mut(&mut self) -> &mut VecDeque<Bytes> {
+        &mut self.0
+    }
+}
+
+impl fmt::Debug for Container {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.0, formatter)
+    }
 }
 
 fn segment_hint(capacity: usize) -> u16 {
@@ -73,7 +197,7 @@ impl Segments {
         match self {
             Self::Inline(segment, _) if segment.is_empty() => *segment = bytes,
             Self::Inline(segment, hint) => {
-                let mut segments = VecDeque::with_capacity(MIN_SEGMENT_CAPACITY);
+                let mut segments = Container::with_capacity(MIN_SEGMENT_CAPACITY);
                 segments.push_back(std::mem::take(segment));
                 segments.push_back(bytes);
                 *self = Self::Many(segments, *hint);
@@ -174,7 +298,7 @@ impl Segments {
             *self = Self::Inline(rest, hint);
             return Self::Many(prefix, 0);
         }
-        let mut prefix = VecDeque::with_capacity(taken.max(MIN_SEGMENT_CAPACITY));
+        let mut prefix = Container::with_capacity(taken.max(MIN_SEGMENT_CAPACITY));
         prefix.extend(segments.drain(..whole));
         if partial {
             prefix.push_back(segments.front_mut().expect(boundary).split_to(remaining));
@@ -197,7 +321,7 @@ impl Segments {
             (Self::Inline(..), Self::Many(source, _)) if source.len() < source.capacity() => {}
             (Self::Inline(segment, hint), _) => {
                 let capacity = (1 + incoming).max(preferred).max(MIN_SEGMENT_CAPACITY);
-                let mut segments = VecDeque::with_capacity(capacity);
+                let mut segments = Container::with_capacity(capacity);
                 segments.push_back(std::mem::take(segment));
                 *self = Self::Many(segments, *hint);
             }
@@ -359,7 +483,7 @@ impl BufQueue {
     pub fn with_segment_capacity(limit: usize, segments: usize) -> Self {
         Self {
             segments: if segments > 1 {
-                Segments::Many(VecDeque::with_capacity(segments), 0)
+                Segments::Many(Container::with_capacity(segments), 0)
             } else {
                 Segments::Inline(Bytes::new(), 0)
             },
@@ -629,7 +753,7 @@ impl BufQueue {
                         other.segments.set_hint(departing);
                     }
                     (Segments::Inline(segment, own), Segments::Many(source, _)) => {
-                        let mut segments = VecDeque::with_capacity(source.len() + 1);
+                        let mut segments = Container::with_capacity(source.len() + 1);
                         segments.push_back(std::mem::take(segment));
                         segments.append(source);
                         self.segments = Segments::Many(segments, *own);
@@ -828,7 +952,7 @@ impl BufQueue {
                 .then_some(segment)
                 .into_iter()
                 .collect(),
-            Segments::Many(segments, _) => segments,
+            Segments::Many(segments, _) => segments.into_inner(),
         }
     }
 
@@ -839,7 +963,7 @@ impl BufQueue {
             Segments::Inline(segment, _) => {
                 IntoSegments::Inline((!segment.is_empty()).then_some(segment).into_iter())
             }
-            Segments::Many(segments, _) => IntoSegments::Many(segments.into_iter()),
+            Segments::Many(segments, _) => IntoSegments::Many(segments.into_inner().into_iter()),
         }
     }
 
@@ -876,7 +1000,16 @@ impl BufQueue {
 
 #[cfg(test)]
 mod tests {
+    use std::alloc::GlobalAlloc;
+    use std::alloc::Layout;
+    use std::alloc::System;
+    use std::cell::Cell;
+    use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::hint::black_box;
+    use std::mem::ManuallyDrop;
+    use std::panic::AssertUnwindSafe;
+    use std::panic::catch_unwind;
 
     use bytes::Bytes;
 
@@ -955,7 +1088,8 @@ mod tests {
                         let mut segments = VecDeque::with_capacity(source.len() + 1);
                         segments.push_back(std::mem::take(segment));
                         segments.append(source);
-                        queue.segments = Segments::Many(segments, 0);
+                        queue.segments =
+                            Segments::Many(super::Container(ManuallyDrop::new(segments)), 0);
                     }
                     (Segments::Many(destination, _), Segments::Many(source, _)) => {
                         destination.append(source);
@@ -1890,5 +2024,398 @@ mod tests {
         refill(&mut many, 100);
         assert!(many_capacity(&many).unwrap() > 64);
         assert_eq!(many.segment_growth_hint(), 64);
+    }
+
+    /// Counts heap allocations made on a thread while its counter is enabled,
+    /// and sees whether one watched allocation is freed. It serves every test
+    /// in this crate and only counts inside [`count_allocations`] and
+    /// [`frees_allocation`].
+    struct CountingAllocator;
+
+    std::thread_local! {
+        static COUNTING: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+        static WATCHED: Cell<usize> = const { Cell::new(0) };
+        static WATCHED_FREED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn record_allocation() {
+        if COUNTING.with(Cell::get) {
+            ALLOCATIONS.with(|count| count.set(count.get() + 1));
+        }
+    }
+
+    fn record_free(pointer: *mut u8) {
+        if COUNTING.with(Cell::get) && WATCHED.with(Cell::get) == pointer as usize {
+            WATCHED_FREED.with(|freed| freed.set(true));
+        }
+    }
+
+    // SAFETY: every method passes its arguments unchanged to the same `System`
+    // method, so `System` upholds the `GlobalAlloc` contract. Counting touches
+    // only const-initialized thread-local cells, which neither allocate nor
+    // register destructors.
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record_allocation();
+            // SAFETY: this call's caller upheld `alloc`'s layout precondition.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            record_allocation();
+            // SAFETY: this call's caller upheld `alloc_zeroed`'s layout
+            // precondition.
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            record_allocation();
+            // SAFETY: `pointer` came from this allocator, which is `System`,
+            // with `layout`, and this call's caller upheld `realloc`'s size
+            // precondition.
+            unsafe { System.realloc(pointer, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            record_free(pointer);
+            // SAFETY: `pointer` came from this allocator, which is `System`,
+            // with `layout`.
+            unsafe { System.dealloc(pointer, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    /// Runs `run` and returns its value and the allocations it made on this
+    /// thread, reallocations included.
+    fn count_allocations<T>(run: impl FnOnce() -> T) -> (T, usize) {
+        ALLOCATIONS.with(|count| count.set(0));
+        COUNTING.with(|counting| counting.set(true));
+        let value = run();
+        COUNTING.with(|counting| counting.set(false));
+        (value, ALLOCATIONS.with(Cell::get))
+    }
+
+    /// Runs `run` and returns whether it freed the allocation at `address` on
+    /// this thread.
+    fn frees_allocation(address: usize, run: impl FnOnce()) -> bool {
+        WATCHED.with(|watched| watched.set(address));
+        WATCHED_FREED.with(|freed| freed.set(false));
+        COUNTING.with(|counting| counting.set(true));
+        run();
+        COUNTING.with(|counting| counting.set(false));
+        WATCHED_FREED.with(Cell::get)
+    }
+
+    /// Whether this build's std allocates through [`ALLOCATOR`]. Dev builds
+    /// link a shared std whose own allocations, `Vec` growth among them,
+    /// bypass it.
+    fn std_allocations_observable() -> bool {
+        count_allocations(|| drop(black_box(Vec::<u8>::with_capacity(4_096)))).1 == 1
+    }
+
+    /// The address of the queue's segment container, which the queue fills.
+    fn container_address(queue: &BufQueue) -> Option<usize> {
+        match &queue.segments {
+            Segments::Inline(..) => None,
+            Segments::Many(segments, _) => {
+                assert_eq!(segments.len(), segments.capacity(), "a full container");
+                let (front, back) = segments.as_slices();
+                [front, back]
+                    .into_iter()
+                    .filter(|slots| !slots.is_empty())
+                    .map(|slots| slots.as_ptr() as usize)
+                    .min()
+            }
+        }
+    }
+
+    /// An allocation the size of a smallest segment container, which a freed
+    /// container's memory would serve.
+    fn container_sized_allocation() -> Vec<Bytes> {
+        black_box(Vec::with_capacity(super::MIN_SEGMENT_CAPACITY))
+    }
+
+    fn chunk_body() -> BufQueue {
+        BufQueue::from_bytes(Bytes::from_static(&STATIC_BYTES[..128]), 1 << 20).unwrap()
+    }
+
+    /// Frames a chunked body event as `Http1xCodec::generate` does: the
+    /// chunk-size line, the body, then CRLF, in a fresh queue.
+    fn frame_chunk(prefix: Bytes, mut body: BufQueue) -> BufQueue {
+        let mut framed = BufQueue::new(prefix.len() + body.chain_length() + 2);
+        framed.push_bytes(prefix).unwrap();
+        framed.append(&mut body).unwrap();
+        framed.push_static(b"\r\n").unwrap();
+        framed
+    }
+
+    /// Appends a framed chunked body event to `egress` and takes the egress
+    /// queue for a write, as the owned HTTP/1.1 session does.
+    fn write_chunk_event(egress: &mut BufQueue, prefix: Bytes, body: BufQueue) -> BufQueue {
+        let mut framed = frame_chunk(prefix, body);
+        egress.append(&mut framed).unwrap();
+        egress.split_at_most(usize::MAX)
+    }
+
+    #[test]
+    fn chunked_body_events_reuse_their_segment_container() {
+        let mut egress = BufQueue::new(1 << 20);
+        let mut written =
+            write_chunk_event(&mut egress, Bytes::from_static(b"80\r\n"), chunk_body());
+        assert_eq!(many_capacity(&written), Some(4));
+        written.trim_start(written.chain_length()).unwrap();
+        drop(written);
+        // The chunk-size lines and bodies are the codec's and the producer's
+        // allocations, made before counting.
+        let events: Vec<_> = (0..8)
+            .map(|_| (Bytes::from(b"80\r\n".to_vec()), chunk_body()))
+            .collect();
+        let ((), allocations) = count_allocations(|| {
+            events.into_iter().for_each(|(prefix, body)| {
+                // The transport writes the taken queue, trims it, and drops it.
+                let mut data = write_chunk_event(&mut egress, prefix, body);
+                data.trim_start(data.chain_length()).unwrap();
+            });
+        });
+        if std_allocations_observable() {
+            assert_eq!(allocations, 0, "8 chunked body events after the first");
+        } else {
+            eprintln!(
+                "allocation count needs a static std (@fbcode//mode/opt); counted {allocations}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_spill_reuses_the_container_a_drained_queue_dropped() {
+        let mut first = four_byte_segments(4);
+        assert_eq!(many_capacity(&first), Some(4));
+        let address = container_address(&first);
+        first.trim_start(first.chain_length()).unwrap();
+        drop(first);
+        let decoy = container_sized_allocation();
+        let second = four_byte_segments(4);
+        assert_eq!(container_address(&second), address);
+        assert_eq!(many_capacity(&second), Some(4));
+        assert_eq!(observe(&second), observe(&four_byte_segments(4)));
+        drop(decoy);
+    }
+
+    #[test]
+    fn a_dropped_queue_releases_its_segments_before_its_container_is_reused() {
+        let owned = Bytes::from(vec![7_u8; 16]);
+        let mut first = four_byte_segments(3);
+        first.push_bytes(owned.clone()).unwrap();
+        assert_eq!(many_capacity(&first), Some(4));
+        let address = container_address(&first);
+        assert!(!owned.is_unique(), "the queue shares the segment");
+        drop(first);
+        assert!(
+            owned.is_unique(),
+            "dropping the queue releases its segments"
+        );
+        let decoy = container_sized_allocation();
+        let second = four_byte_segments(4);
+        assert_eq!(container_address(&second), address);
+        assert_eq!(observe(&second), observe(&four_byte_segments(4)));
+        drop(decoy);
+    }
+
+    #[test]
+    fn at_most_eight_dropped_containers_are_kept_per_thread() {
+        drop((0..20).map(|_| four_byte_segments(2)).collect::<Vec<_>>());
+        let mut spilled = Vec::with_capacity(20);
+        let ((), allocations) =
+            count_allocations(|| spilled.extend((0..20).map(|_| four_byte_segments(2))));
+        assert!(spilled.iter().all(|queue| many_capacity(queue) == Some(4)));
+        if std_allocations_observable() {
+            assert_eq!(allocations, 12, "8 of 20 spills reuse a kept container");
+        } else {
+            eprintln!(
+                "allocation count needs a static std (@fbcode//mode/opt); counted {allocations}"
+            );
+        }
+    }
+
+    #[test]
+    fn spills_get_the_smallest_container_after_larger_ones_drop() {
+        let eight = five_segment_queue();
+        assert_eq!(many_capacity(&eight), Some(8));
+        drop(eight);
+        drop(BufQueue::with_segment_capacity(64, 16));
+        let queue = four_byte_segments(2);
+        assert_eq!(many_capacity(&queue), Some(4));
+        let presized = BufQueue::with_segment_capacity(64, 6);
+        assert_eq!(many_capacity(&presized), Some(6));
+    }
+
+    /// A segment owner whose drop panics.
+    struct PanicsOnDrop;
+
+    impl AsRef<[u8]> for PanicsOnDrop {
+        fn as_ref(&self) -> &[u8] {
+            b"owned"
+        }
+    }
+
+    impl Drop for PanicsOnDrop {
+        fn drop(&mut self) {
+            panic!("the segment owner's drop panics");
+        }
+    }
+
+    #[test]
+    fn a_container_whose_segment_drop_panics_is_still_freed() {
+        let mut queue = four_byte_segments(3);
+        queue.push_bytes(Bytes::from_owner(PanicsOnDrop)).unwrap();
+        assert_eq!(many_capacity(&queue), Some(4));
+        let address = container_address(&queue).unwrap();
+        let freed = frees_allocation(address, || {
+            catch_unwind(AssertUnwindSafe(|| drop(queue))).expect_err("the segment drop panics");
+        });
+        if std_allocations_observable() {
+            assert!(freed, "the container is freed while the panic unwinds");
+        } else {
+            eprintln!("the free needs a static std (@fbcode//mode/opt); observed {freed}");
+        }
+    }
+
+    std::thread_local! {
+        static HELD_UNTIL_EXIT: RefCell<Option<BufQueue>> = const { RefCell::new(None) };
+    }
+
+    #[test]
+    fn queues_dropped_while_their_thread_exits_free_their_containers() {
+        std::thread::spawn(|| {
+            // This local registers its destructor first, so it runs after the
+            // destructors of locals that the queues below touch.
+            HELD_UNTIL_EXIT.with(|held| *held.borrow_mut() = Some(four_byte_segments(2)));
+            drop(four_byte_segments(2));
+        })
+        .join()
+        .expect("the thread exits cleanly");
+    }
+
+    /// Leaves `count` used containers of the smallest capacity behind on this
+    /// thread. Each held segments that wrapped around its end, and every other
+    /// one still holds them when dropped.
+    fn drop_used_small_containers(count: usize) {
+        let used: Vec<_> = (0..count)
+            .map(|index| {
+                let mut queue = four_byte_segments(4);
+                queue.trim_start(8).unwrap();
+                queue.push_static(&STATIC_BYTES[400..404]).unwrap();
+                queue.push_static(&STATIC_BYTES[404..408]).unwrap();
+                assert_eq!(many_capacity(&queue), Some(4));
+                if index % 2 == 0 {
+                    queue.trim_start(queue.chain_length()).unwrap();
+                }
+                queue
+            })
+            .collect();
+        drop(used);
+    }
+
+    type Step = (Observed, Option<usize>, Option<u16>, Option<u16>, u16);
+
+    /// Every way a queue gets a container of the smallest capacity, followed by
+    /// growth, splits, takes and refills, observed after each step.
+    /// `before_step` runs before each step.
+    fn small_container_steps(before_step: &mut dyn FnMut()) -> Vec<Step> {
+        let mut steps = Vec::new();
+        let mut step = |run: &mut dyn FnMut() -> Vec<BufQueue>| {
+            before_step();
+            let queues = run();
+            steps.extend(queues.iter().map(|queue| {
+                (
+                    observe(queue),
+                    many_capacity(queue),
+                    inline_hint(queue),
+                    many_hint(queue),
+                    queue.segment_growth_hint(),
+                )
+            }));
+        };
+        // Pushes spill at the second segment, then grow.
+        (2..=6).for_each(|count| step(&mut || vec![four_byte_segments(count)]));
+        // Presized for four segments, then grown.
+        step(&mut || {
+            let presized = BufQueue::with_segment_capacity(1024, 4);
+            let mut refilled = BufQueue::with_segment_capacity(1024, 4);
+            refill(&mut refilled, 5);
+            vec![presized, refilled]
+        });
+        // Splits whose prefix holds two to four segments, whole or partial.
+        [8, 9, 13, 16].into_iter().for_each(|amount| {
+            step(&mut || {
+                let mut queue = four_byte_segments(10);
+                let prefix = queue.split_at_most(amount);
+                vec![prefix, queue]
+            });
+        });
+        // An inline destination appending a full three-segment container.
+        step(&mut || {
+            let mut full = BufQueue::with_segment_capacity(1024, 3);
+            refill(&mut full, 3);
+            let mut single =
+                BufQueue::from_bytes(Bytes::from_static(&STATIC_BYTES[200..204]), 1024).unwrap();
+            single.append(&mut full).unwrap();
+            vec![single, full]
+        });
+        // A hinted append of one inline segment to another.
+        step(&mut || {
+            let mut single =
+                BufQueue::from_bytes(Bytes::from_static(&STATIC_BYTES[300..304]), 1024).unwrap();
+            let mut other =
+                BufQueue::from_bytes(Bytes::from_static(&STATIC_BYTES[304..308]), 4).unwrap();
+            single.append_with_growth_hint(&mut other, 4).unwrap();
+            vec![single, other]
+        });
+        // A take, then refills that use the departed capacity as their hint.
+        step(&mut || {
+            let mut queue = four_byte_segments(3);
+            let taken = queue.take();
+            refill(&mut queue, 6);
+            vec![taken, queue]
+        });
+        // Chunked body events through an egress queue holding a response head.
+        let mut egress = BufQueue::new(1 << 20);
+        egress
+            .push_static(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .unwrap();
+        (0..3).for_each(|_| {
+            step(&mut || {
+                let mut data =
+                    write_chunk_event(&mut egress, Bytes::from_static(b"80\r\n"), chunk_body());
+                let observed = data.clone_shared();
+                data.trim_start(data.chain_length()).unwrap();
+                vec![observed, data, egress.clone_shared()]
+            });
+        });
+        steps
+    }
+
+    #[test]
+    fn kept_containers_behave_as_fresh_ones() {
+        // Holding eight spilled queues before each step empties this thread's
+        // kept containers, so the step's containers are freshly allocated.
+        let fresh = std::thread::spawn(|| {
+            let mut held = Vec::new();
+            small_container_steps(&mut || held.extend((0..8).map(|_| four_byte_segments(2))))
+        })
+        .join()
+        .unwrap();
+        // Dropping eight used containers before each step makes the step reuse
+        // them.
+        let reused = small_container_steps(&mut || drop_used_small_containers(8));
+        assert_eq!(reused.len(), fresh.len());
+        reused
+            .iter()
+            .zip(&fresh)
+            .enumerate()
+            .for_each(|(index, (reused, fresh))| assert_eq!(reused, fresh, "observation {index}"));
     }
 }
