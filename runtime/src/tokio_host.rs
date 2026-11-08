@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::future::Future;
 use std::future::poll_fn;
 use std::marker::PhantomData;
@@ -7,10 +9,15 @@ use std::panic::catch_unwind;
 use std::panic::resume_unwind;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
+use std::task::Wake;
+use std::task::Waker;
 use std::thread::JoinHandle;
 use std::thread::ThreadId;
 use std::time::Duration;
@@ -115,6 +122,103 @@ impl Future for ManagedDriver {
     }
 }
 
+/// What a [`WakeGate`]'s waker records: that it fired, and the waker of the
+/// task that polls the gate, which it wakes in turn.
+struct GateWake {
+    woken: AtomicBool,
+    parent: Mutex<Option<Waker>>,
+}
+
+impl Wake for GateWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woken.store(true, Ordering::Release);
+        let parent = self
+            .parent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(parent) = parent {
+            parent.wake();
+        }
+    }
+}
+
+/// Tells a worker supervisor whether its own waker fired since it last ran.
+/// `LocalSet::run_until` polls the future it drives on every wake of any local
+/// task, and a supervisor has work only when one of its inputs (quiescence,
+/// outstanding work, its deadline timer, its task group join) wakes it.
+pub(crate) struct WakeGate {
+    wake: Arc<GateWake>,
+    waker: Waker,
+    /// The parent waker that `wake` holds. Only `poll_woken` replaces it, so
+    /// this copy compares it without the lock.
+    parent: Option<Waker>,
+}
+
+impl WakeGate {
+    pub(crate) fn new() -> Self {
+        let wake = Arc::new(GateWake {
+            woken: AtomicBool::new(true),
+            parent: Mutex::new(None),
+        });
+        Self {
+            waker: Waker::from(Arc::clone(&wake)),
+            wake,
+            parent: None,
+        }
+    }
+
+    /// The waker that the supervisor registers with its inputs.
+    pub(crate) fn waker(&self) -> &Waker {
+        &self.waker
+    }
+
+    /// Makes `parent` the waker that the gate's waker wakes, then reports
+    /// whether the gate's waker fired since the last call, and consumes that.
+    /// The first call reports true.
+    pub(crate) fn poll_woken(&mut self, parent: &Waker) -> bool {
+        // The parent is registered before the flag is read, so a wake that the
+        // read misses wakes this poll's parent.
+        if !self
+            .parent
+            .as_ref()
+            .is_some_and(|registered| registered.will_wake(parent))
+        {
+            self.register_parent(parent);
+        }
+        self.wake.woken.load(Ordering::Relaxed) && self.wake.woken.swap(false, Ordering::Acquire)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn register_parent(&mut self, waker: &Waker) {
+        let replaced = self
+            .wake
+            .parent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(waker.clone());
+        drop(replaced);
+        self.parent = Some(waker.clone());
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SUPERVISOR_POLLS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// How many times a worker supervisor has run on this thread; read on a
+/// worker's owner thread, for example from one of its commands.
+#[cfg(test)]
+pub(crate) fn supervisor_polls_on_this_thread() -> usize {
+    SUPERVISOR_POLLS.get()
+}
+
 async fn run_managed_driver(
     handle: WorkerHandle,
     driver: WorkerDriver,
@@ -129,7 +233,17 @@ async fn run_managed_driver(
     }
     let mut joined = Box::pin(tasks.join());
     let mut timer: Option<(QuiesceDeadline, Pin<Box<Sleep>>)> = None;
-    poll_fn(|context| {
+    let mut gate = WakeGate::new();
+    poll_fn(|parent| {
+        // While a quiesce deadline is armed, the supervisor runs at every
+        // poll, so a wake after the deadline forces shutdown before the woken
+        // work runs, even if the deadline's timer has not fired yet.
+        if !gate.poll_woken(parent.waker()) && timer.is_none() {
+            return Poll::Pending;
+        }
+        #[cfg(test)]
+        SUPERVISOR_POLLS.set(SUPERVISOR_POLLS.get() + 1);
+        let context = &mut Context::from_waker(gate.waker());
         if handle.state() == WorkerState::Open {
             let (deadline, outstanding) = handle.quiesce_snapshot(context.waker());
             if let Some(deadline) = deadline {

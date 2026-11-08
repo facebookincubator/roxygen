@@ -16,6 +16,7 @@ mod hosted_worker {
     use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use std::sync::mpsc;
@@ -25,6 +26,7 @@ mod hosted_worker {
     use std::task::Waker;
     use std::thread::ThreadId;
     use std::time::Duration;
+    use std::time::Instant;
 
     use tokio::runtime::Builder;
     use tokio::sync::oneshot;
@@ -34,7 +36,10 @@ mod hosted_worker {
     use crate::task_group::TaskGroupError;
     use crate::tokio_host::HostedWorker;
     use crate::tokio_host::HostedWorkerOptions;
+    use crate::tokio_host::ManagedWorker;
     use crate::tokio_host::ManagedWorkerError;
+    use crate::tokio_host::WakeGate;
+    use crate::tokio_host::supervisor_polls_on_this_thread;
     use crate::worker::QuiesceDeadline;
     use crate::worker::SubmitError;
     use crate::worker::WorkerCallError;
@@ -296,6 +301,243 @@ mod hosted_worker {
         for (index, (polls, _)) in parked.iter().enumerate() {
             let expected = if index == WOKEN { 2 } else { 1 };
             assert_eq!(polls.load(Ordering::SeqCst), expected, "command {index}");
+        }
+    }
+
+    /// A hosted worker with owner thread `name`, and a managed worker.
+    fn both_worker_kinds(name: &str) -> (HostedWorker, ManagedWorker) {
+        (
+            HostedWorker::spawn(options(name, 2)).expect("hosted worker starts"),
+            ManagedWorker::new(2).expect("managed worker starts"),
+        )
+    }
+
+    /// Counts its wakes.
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_wake_gate_reports_its_own_wakes_and_wakes_its_latest_parent() {
+        let mut gate = WakeGate::new();
+        let (first, second) = (
+            Arc::new(WakeCount(AtomicUsize::new(0))),
+            Arc::new(WakeCount(AtomicUsize::new(0))),
+        );
+        let (first_waker, second_waker) = (
+            Waker::from(Arc::clone(&first)),
+            Waker::from(Arc::clone(&second)),
+        );
+        let parent_wakes = || {
+            (
+                first.0.load(Ordering::SeqCst),
+                second.0.load(Ordering::SeqCst),
+            )
+        };
+
+        assert!(
+            gate.poll_woken(&first_waker),
+            "the first poll runs the supervisor"
+        );
+        assert!(!gate.poll_woken(&first_waker), "an unrelated wake does not");
+        assert!(!gate.poll_woken(&second_waker), "nor does a new parent");
+
+        gate.waker().wake_by_ref();
+        assert_eq!(
+            parent_wakes(),
+            (0, 1),
+            "the gate's wake wakes the latest parent only"
+        );
+        assert!(
+            gate.poll_woken(&second_waker),
+            "the next poll runs the supervisor"
+        );
+        assert!(!gate.poll_woken(&second_waker), "once per wake");
+
+        gate.waker().wake_by_ref();
+        assert!(
+            gate.poll_woken(&first_waker),
+            "a wake before a parent change is kept"
+        );
+        assert_eq!(parent_wakes(), (0, 2));
+
+        let input = gate.waker().clone();
+        input.wake();
+        assert_eq!(parent_wakes(), (1, 2), "an input's clone wakes the parent");
+        assert!(gate.poll_woken(&first_waker));
+        gate.waker().wake_by_ref();
+        assert_eq!(
+            parent_wakes(),
+            (2, 2),
+            "a wake while the supervisor runs wakes the parent"
+        );
+        assert!(
+            gate.poll_woken(&first_waker),
+            "and runs the supervisor again"
+        );
+        assert!(!gate.poll_woken(&first_waker));
+    }
+
+    #[test]
+    fn a_command_wake_does_not_poll_the_worker_supervisor() {
+        const WAKES: usize = 32;
+        let (hosted, managed) = both_worker_kinds("rox-hosted-supervisor-polls");
+        let polls: Vec<_> = [("hosted", hosted.handle()), ("managed", managed.handle())]
+            .into_iter()
+            .map(|(kind, handle)| {
+                let polls = wait(
+                    handle
+                        .call_local(|_| async {
+                            let before = supervisor_polls_on_this_thread();
+                            for _ in 0..WAKES {
+                                tokio::task::yield_now().await;
+                            }
+                            supervisor_polls_on_this_thread() - before
+                        })
+                        .expect("command admitted"),
+                )
+                .expect("command completes");
+                (kind, polls)
+            })
+            .collect();
+        assert_eq!(
+            polls,
+            [("hosted", 0), ("managed", 0)],
+            "{WAKES} wakes of a command run the worker supervisor no times"
+        );
+    }
+
+    #[test]
+    fn quiescing_an_idle_worker_wakes_its_supervisor() {
+        let (hosted, managed) = both_worker_kinds("rox-hosted-idle-quiesce");
+        for (kind, handle, completion) in [
+            ("hosted", hosted.handle(), hosted.completion()),
+            ("managed", managed.handle(), managed.completion()),
+        ] {
+            wait(handle.call(|_| ()).expect("barrier admitted")).expect("barrier completes");
+            // Lets the worker finish the barrier's release and park.
+            std::thread::sleep(Duration::from_millis(50));
+
+            // Longer than the test timeout: only the supervisor's wake ends the worker in time.
+            handle.begin_quiesce(QuiesceDeadline::new(TEST_TIMEOUT * 6));
+            assert_eq!(completed(completion), Ok(()), "{kind}");
+            assert!(
+                !handle.was_forced(),
+                "{kind}: an idle worker has nothing to force"
+            );
+            assert_eq!(handle.state(), WorkerState::Closed, "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_quiesce_deadline_passes_while_a_command_keeps_waking_the_worker() {
+        const GRACE: Duration = Duration::from_millis(20);
+        let (hosted, managed) = both_worker_kinds("rox-hosted-busy-deadline");
+        for (kind, handle, completion) in [
+            ("hosted", hosted.handle(), hosted.completion()),
+            ("managed", managed.handle(), managed.completion()),
+        ] {
+            let (started_tx, started_rx) = oneshot::channel();
+            let (dropped_tx, dropped_rx) = mpsc::channel();
+            let call = handle
+                .call_local(move |context| async move {
+                    let _probe = CancellationProbe {
+                        handle: context.handle().clone(),
+                        report: dropped_tx,
+                    };
+                    started_tx.send(()).expect("test observes startup");
+                    poll_fn(|task| {
+                        task.waker().wake_by_ref();
+                        Poll::<()>::Pending
+                    })
+                    .await;
+                })
+                .expect("command admitted");
+            wait(started_rx).expect("command started");
+
+            let quiesced = Instant::now();
+            handle.begin_quiesce(QuiesceDeadline::new(GRACE));
+            assert_eq!(wait(call), Err(WorkerCallError::Cancelled), "{kind}");
+            assert_eq!(completed(completion), Ok(()), "{kind}");
+            assert!(
+                quiesced.elapsed() >= GRACE,
+                "{kind}: the busy command runs until the deadline"
+            );
+            assert!(
+                handle.was_forced(),
+                "{kind}: the deadline cancelled the busy command"
+            );
+            assert_eq!(
+                dropped_rx.try_recv(),
+                Ok((handle.owner_thread(), true)),
+                "{kind}: the busy command is dropped, cancelled, on the owner thread"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_woken_after_the_quiesce_deadline_is_cancelled_before_it_runs() {
+        // A round tests the deadline only if the wake reaches the worker before
+        // tokio fires the deadline's timer, which it rounds up to the next
+        // millisecond; most rounds do.
+        const GRACE: Duration = Duration::from_millis(5);
+        const ROUNDS: usize = 20;
+        for round in 0..ROUNDS {
+            let (hosted, managed) = both_worker_kinds("rox-hosted-wake-after-deadline");
+            for (kind, handle, completion) in [
+                ("hosted", hosted.handle(), hosted.completion()),
+                ("managed", managed.handle(), managed.completion()),
+            ] {
+                let released = Arc::new(AtomicBool::new(false));
+                let parked = Arc::new(Mutex::new(None::<Waker>));
+                let (started_tx, started_rx) = oneshot::channel();
+                let call = handle
+                    .call_local({
+                        let (released, parked) = (Arc::clone(&released), Arc::clone(&parked));
+                        move |context| async move {
+                            let mut started = Some(started_tx);
+                            poll_fn(|task| {
+                                if released.load(Ordering::SeqCst) && !context.is_cancelled() {
+                                    return Poll::Ready(());
+                                }
+                                *parked.lock().expect("waker slot") = Some(task.waker().clone());
+                                if let Some(started) = started.take() {
+                                    started.send(()).expect("test observes startup");
+                                }
+                                Poll::Pending
+                            })
+                            .await;
+                        }
+                    })
+                    .expect("command admitted");
+                wait(started_rx).expect("command started");
+
+                let deadline = QuiesceDeadline::new(GRACE);
+                let passed = Instant::now() + GRACE;
+                handle.begin_quiesce(deadline);
+                while Instant::now() < passed {
+                    std::hint::spin_loop();
+                }
+                released.store(true, Ordering::SeqCst);
+                parked
+                    .lock()
+                    .expect("waker slot")
+                    .take()
+                    .expect("the command parked its waker")
+                    .wake();
+
+                assert_eq!(
+                    wait(call),
+                    Err(WorkerCallError::Cancelled),
+                    "{kind}, round {round}: the deadline passed before the command's wake"
+                );
+                assert!(handle.was_forced(), "{kind}, round {round}");
+                assert_eq!(completed(completion), Ok(()), "{kind}, round {round}");
+            }
         }
     }
 
