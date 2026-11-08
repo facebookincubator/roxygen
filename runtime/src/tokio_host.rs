@@ -405,6 +405,17 @@ pub struct HostedWorkerOptions {
     pub thread_name: String,
 }
 
+/// Roxygen-only (`DIV-037`): configuration of the blocking-pool threads of a
+/// [`HostedWorker`]'s runtime, which run work such as `spawn_blocking` and
+/// `tokio::net::lookup_host` that the worker's commands start.
+pub struct HostedWorkerBlockingPool {
+    /// Name of every blocking-pool thread. It must not contain a NUL byte.
+    pub thread_name: String,
+    /// Runs on each blocking-pool thread when it starts, before it runs any
+    /// work, and never on the owner thread.
+    pub on_thread_start: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+}
+
 /// A `Send + Sync` worker that owns a dedicated thread, current-thread runtime, and `LocalSet`.
 /// Unlike `ManagedWorker`, it drives `WorkerDriver::with_host`, so commands and activated
 /// cleanups run as independent Tokio local tasks.
@@ -434,12 +445,23 @@ impl HostedWorker {
     /// callers use `spawn_blocking`. A thread name with a NUL byte returns
     /// `ManagedWorkerError::ThreadSpawn` without starting a thread.
     pub fn spawn(options: HostedWorkerOptions) -> Result<Self, ManagedWorkerError> {
+        Self::spawn_inner(options, None)
+    }
+
+    fn spawn_inner(
+        options: HostedWorkerOptions,
+        blocking_pool: Option<HostedWorkerBlockingPool>,
+    ) -> Result<Self, ManagedWorkerError> {
         let HostedWorkerOptions {
             command_capacity,
             thread_name,
         } = options;
         // std::thread::Builder panics on such a name.
-        if thread_name.contains('\0') {
+        if thread_name.contains('\0')
+            || blocking_pool
+                .as_ref()
+                .is_some_and(|pool| pool.thread_name.contains('\0'))
+        {
             return Err(ManagedWorkerError::ThreadSpawn(
                 "thread name contains a NUL byte".to_owned(),
             ));
@@ -451,7 +473,15 @@ impl HostedWorker {
             .name(thread_name)
             .spawn(move || {
                 let result = catch_unwind(AssertUnwindSafe(|| {
-                    let runtime = match Builder::new_current_thread().enable_all().build() {
+                    let mut builder = Builder::new_current_thread();
+                    builder.enable_all();
+                    if let Some(pool) = blocking_pool {
+                        builder.thread_name(pool.thread_name);
+                        if let Some(start) = pool.on_thread_start {
+                            builder.on_thread_start(move || start());
+                        }
+                    }
+                    let runtime = match builder.build() {
                         Ok(runtime) => runtime,
                         Err(error) => {
                             let message = error.to_string();
@@ -499,6 +529,16 @@ impl HostedWorker {
                 Err(_) => Err(ManagedWorkerError::OwnerThreadPanicked),
             },
         }
+    }
+
+    /// [`Self::spawn`], with the runtime's blocking-pool threads named and started as
+    /// `blocking_pool` says (`DIV-037`). A blocking thread name with a NUL byte returns
+    /// `ManagedWorkerError::ThreadSpawn` without starting a thread.
+    pub fn spawn_with_blocking_pool(
+        options: HostedWorkerOptions,
+        blocking_pool: HostedWorkerBlockingPool,
+    ) -> Result<Self, ManagedWorkerError> {
+        Self::spawn_inner(options, Some(blocking_pool))
     }
 
     pub fn handle(&self) -> WorkerHandle {

@@ -35,6 +35,7 @@ mod hosted_worker {
     use crate::task_group::TaskGroup;
     use crate::task_group::TaskGroupError;
     use crate::tokio_host::HostedWorker;
+    use crate::tokio_host::HostedWorkerBlockingPool;
     use crate::tokio_host::HostedWorkerOptions;
     use crate::tokio_host::ManagedWorker;
     use crate::tokio_host::ManagedWorkerError;
@@ -1108,6 +1109,96 @@ mod hosted_worker {
             "an owner-thread Drop survives a panicking completion waker: {}\nstdout:\n{stdout}\nstderr:\n{}",
             child.status,
             String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
+    thread_local! {
+        static STARTED_BY_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The start hook's log of thread names, and the blocking-pool options that
+    /// name threads `name` and run that hook.
+    fn blocking_pool(name: &str) -> (Arc<Mutex<Vec<Option<String>>>>, HostedWorkerBlockingPool) {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&started);
+        let pool = HostedWorkerBlockingPool {
+            thread_name: name.to_owned(),
+            on_thread_start: Some(Arc::new(move || {
+                STARTED_BY_HOOK.with(|started| started.set(true));
+                log.lock()
+                    .unwrap()
+                    .push(std::thread::current().name().map(str::to_owned));
+            })),
+        };
+        (started, pool)
+    }
+
+    #[test]
+    fn blocking_pool_threads_take_the_configured_name_and_start_hook() {
+        let (started, pool) = blocking_pool("rox-w0-blk");
+        let worker = HostedWorker::spawn_with_blocking_pool(options("rox-w0", 1), pool)
+            .expect("worker starts");
+        let (owner_name, blocking) = wait(
+            worker
+                .handle()
+                .call_local(|_context| async {
+                    let owner_name = std::thread::current().name().map(str::to_owned);
+                    let blocking = tokio::task::spawn_blocking(|| {
+                        (
+                            std::thread::current().name().map(str::to_owned),
+                            STARTED_BY_HOOK.with(std::cell::Cell::get),
+                        )
+                    })
+                    .await
+                    .expect("blocking work completes");
+                    (owner_name, blocking)
+                })
+                .expect("probe admitted"),
+        )
+        .expect("probe completes");
+        assert_eq!(
+            owner_name.as_deref(),
+            Some("rox-w0"),
+            "the owner thread keeps its name"
+        );
+        assert_eq!(
+            blocking,
+            (Some("rox-w0-blk".to_owned()), true),
+            "the blocking thread is named and ran the hook before the work"
+        );
+        assert_eq!(*started.lock().unwrap(), [Some("rox-w0-blk".to_owned())]);
+        drop(worker);
+    }
+
+    #[test]
+    fn the_blocking_pool_start_hook_never_runs_on_the_owner_thread() {
+        let (started, pool) = blocking_pool("rox-w1-blk");
+        let worker = HostedWorker::spawn_with_blocking_pool(options("rox-w1", 1), pool)
+            .expect("worker starts");
+        let hooked = wait(
+            worker
+                .handle()
+                .call(|_context| STARTED_BY_HOOK.with(std::cell::Cell::get))
+                .expect("probe admitted"),
+        )
+        .expect("probe completes");
+        assert!(!hooked);
+        drop(worker);
+        assert!(
+            started.lock().unwrap().is_empty(),
+            "no blocking thread started"
+        );
+    }
+
+    #[test]
+    fn an_unrepresentable_blocking_thread_name_is_a_spawn_error() {
+        let (_, pool) = blocking_pool("rox\0blk");
+        assert!(
+            matches!(
+                HostedWorker::spawn_with_blocking_pool(options("rox-w2", 1), pool),
+                Err(ManagedWorkerError::ThreadSpawn(_))
+            ),
+            "a NUL byte is a spawn error, not a panic on the first blocking thread"
         );
     }
 }
