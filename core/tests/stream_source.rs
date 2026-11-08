@@ -18,6 +18,9 @@ use bytes::Bytes;
 use roxygen_runtime::cancellation::CancellationSource;
 use roxygen_runtime::cancellation::CancellationToken;
 use roxygen_runtime::host::Host;
+use roxygen_runtime::host::LocalFuture;
+use roxygen_runtime::host::LocalHost;
+use roxygen_runtime::host::TokioHost;
 use tokio::runtime::Builder;
 use tokio::time;
 
@@ -2816,6 +2819,297 @@ mod stream_source {
             );
             let event = ready(source.read_body_event(16)).unwrap();
             assert!(event.eom());
+        });
+    }
+
+    /// A Tokio host whose references a test counts.
+    struct CountedHost;
+
+    impl LocalHost for CountedHost {
+        fn spawn_local(&self, future: LocalFuture) {
+            TokioHost.spawn_local(future);
+        }
+
+        fn now(&self) -> Instant {
+            TokioHost.now()
+        }
+
+        fn sleep_until(&self, deadline: Instant) -> LocalFuture {
+            TokioHost.sleep_until(deadline)
+        }
+
+        fn yield_to_io(&self) -> LocalFuture {
+            TokioHost.yield_to_io()
+        }
+    }
+
+    #[test]
+    fn pending_untimed_exclusive_reads_hold_no_host_reference() {
+        run_paused(async {
+            let host = Rc::new(CountedHost);
+            let source =
+                HttpResponseSource::new(StreamId::new(1), None, 65_535, Host::new(host.clone()))
+                    .unwrap();
+            let producer = source.producer();
+            let (owner, mut reader) = source.split();
+            reader.set_suspend_free(true);
+            let mut context = Context::from_waker(Waker::noop());
+
+            reader.arm_header(&owner).unwrap();
+            assert!(reader.poll_header(&mut context).is_pending());
+            let pending_header = Rc::strong_count(&host);
+            assert!(producer.headers(response(200, None), false));
+            assert!(matches!(
+                reader.poll_header(&mut context),
+                Poll::Ready(Ok(_))
+            ));
+            let idle = Rc::strong_count(&host);
+            reader.arm_body(&owner, u32::MAX).unwrap();
+            assert!(reader.poll_body(&mut context).is_pending());
+            let pending_body = Rc::strong_count(&host);
+
+            // The test and the source hold the host. A wait with no read
+            // timeout and no cancellation needs neither a wait object nor the
+            // event baton, which would each hold it too.
+            assert_eq!((pending_header, idle, pending_body), (2, 2, 2));
+        });
+    }
+
+    #[test]
+    fn read_timeout_set_during_a_pending_exclusive_read_counts_from_the_update() {
+        run_paused(async {
+            let (owner, mut reader, producer) = reading_response();
+            reader.set_suspend_free(true);
+            reader.arm_body(&owner, u32::MAX).unwrap();
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(reader.poll_body(&mut context).is_pending());
+
+            time::advance(Duration::from_secs(1)).await;
+            let updated = time::Instant::now();
+            assert!(producer.set_read_timeout(Duration::from_secs(2)));
+            // The read is next polled after its deadline has passed.
+            time::advance(Duration::from_secs(3)).await;
+            let error = match std::future::poll_fn(|context| reader.poll_body(context)).await {
+                Err(error) => error,
+                Ok(event) => panic!("expected a read timeout, got {:?}", event.event_type()),
+            };
+            assert_eq!(error.code(), HttpErrorCode::READ_TIMEOUT);
+            assert_eq!(error.message(), b"Read timeout after 2000");
+            assert_eq!(time::Instant::now() - updated, Duration::from_secs(3));
+        });
+    }
+
+    #[test]
+    fn pending_exclusive_read_wakes_on_event_changes_and_timeout_updates() {
+        run_paused(async {
+            let (owner, mut reader, producer) = reading_response();
+            reader.set_suspend_free(true);
+            let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut context = Context::from_waker(&waker);
+            reader.arm_body(&owner, u32::MAX).unwrap();
+            assert!(reader.poll_body(&mut context).is_pending());
+
+            // Every timeout update wakes the pending read.
+            assert!(producer.set_read_timeout(Duration::ZERO));
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+            assert!(reader.poll_body(&mut context).is_pending());
+
+            // Only the first event before the next poll wakes it.
+            assert_eq!(
+                producer.body(body(b"one"), 0, false),
+                FlowControlState::Open
+            );
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                producer.body(body(b"two"), 0, false),
+                FlowControlState::Open
+            );
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 2);
+
+            // The woken read stays registered until it is polled.
+            assert!(producer.set_read_timeout(Duration::ZERO));
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 3);
+            let Poll::Ready(Ok(event)) = reader.poll_body(&mut context) else {
+                panic!("the woken read must return the queued body");
+            };
+            assert_eq!(event.event_type(), HttpBodyEventType::Body);
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 3);
+        });
+    }
+
+    #[test]
+    fn retired_pending_exclusive_read_leaves_the_next_read_free_to_wait() {
+        run_paused(async {
+            for retimed in [false, true] {
+                let (owner, mut reader, producer) = reading_response();
+                reader.set_suspend_free(true);
+                let mut context = Context::from_waker(Waker::noop());
+                reader.arm_body(&owner, u32::MAX).unwrap();
+                assert!(reader.poll_body(&mut context).is_pending());
+                if retimed {
+                    assert!(producer.set_read_timeout(Duration::from_secs(2)));
+                }
+                reader.retire_active_read();
+
+                let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wakes));
+                let mut context = Context::from_waker(&waker);
+                reader.arm_body(&owner, u32::MAX).unwrap();
+                assert!(reader.poll_body(&mut context).is_pending());
+                assert_eq!(
+                    producer.body(body(b"token"), 0, true),
+                    FlowControlState::Open
+                );
+                assert_eq!(wakes.0.load(Ordering::SeqCst), 1, "retimed={retimed}");
+                let Poll::Ready(Ok(event)) = reader.poll_body(&mut context) else {
+                    panic!("the next read must return the body, retimed={retimed}");
+                };
+                assert!(event.eom());
+            }
+        });
+    }
+
+    /// Splits a 200 response, opts its reader in, and reads one paced body.
+    fn reader_after_one_body() -> (
+        HttpResponseSourceOwner,
+        HttpResponseReader,
+        HttpStreamSourceProducer,
+    ) {
+        let (owner, mut reader, producer) = reading_response();
+        reader.set_suspend_free(true);
+        reader.arm_body(&owner, u32::MAX).unwrap();
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(reader.poll_body(&mut context).is_pending());
+        assert_eq!(
+            producer.body(body(b"one"), 0, false),
+            FlowControlState::Open
+        );
+        let Poll::Ready(Ok(event)) = reader.poll_body(&mut context) else {
+            panic!("the paced body must complete the read");
+        };
+        assert!(!event.eom());
+        (owner, reader, producer)
+    }
+
+    #[test]
+    fn suspend_free_reader_stays_armed_between_body_events() {
+        run_paused(async {
+            let (_owner, mut reader, producer) = reader_after_one_body();
+            assert!(reader.is_active());
+
+            // The next body read needs no `arm_body`.
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(reader.poll_body(&mut context).is_pending());
+            assert_eq!(producer.body(body(b"two"), 0, true), FlowControlState::Open);
+            let Poll::Ready(Ok(event)) = reader.poll_body(&mut context) else {
+                panic!("the armed reader must read the next body");
+            };
+            assert_eq!(
+                event.as_body().unwrap().coalesce(8).unwrap().as_ref(),
+                b"two"
+            );
+
+            // The terminal event retires the read.
+            assert!(event.eom());
+            assert!(!reader.is_active());
+        });
+    }
+
+    #[test]
+    fn default_reader_retires_after_each_body_event() {
+        run_paused(async {
+            let (owner, mut reader, producer) = reading_response();
+            let mut context = Context::from_waker(Waker::noop());
+            reader.arm_body(&owner, u32::MAX).unwrap();
+            assert!(matches!(
+                reader.poll_body(&mut context),
+                Poll::Ready(Ok(event)) if event.event_type() == HttpBodyEventType::Suspend
+            ));
+            assert!(!reader.is_active());
+            assert_eq!(
+                producer.body(body(b"one"), 0, false),
+                FlowControlState::Open
+            );
+            reader.arm_body(&owner, u32::MAX).unwrap();
+            assert!(matches!(
+                reader.poll_body(&mut context),
+                Poll::Ready(Ok(event)) if event.event_type() == HttpBodyEventType::Body
+            ));
+            assert!(!reader.is_active());
+        });
+    }
+
+    #[test]
+    fn releasing_the_owner_between_body_events_destroys_the_source() {
+        run_paused(async {
+            let (mut owner, reader, producer) = reader_after_one_body();
+            // The armed reader keeps no strong reference between operations.
+            owner.clear(None);
+            assert!(!producer.is_live());
+            drop(reader);
+        });
+    }
+
+    #[test]
+    fn armed_suspend_free_reader_reports_a_released_owner() {
+        run_paused(async {
+            let (mut owner, mut reader, _producer) = reader_after_one_body();
+            owner.clear(None);
+            let mut context = Context::from_waker(Waker::noop());
+            let Poll::Ready(Err(error)) = reader.poll_body(&mut context) else {
+                panic!("a read of a released source must fail");
+            };
+            // The error `arm_body` returns for a released owner.
+            assert_eq!(error.code(), HttpErrorCode::DROPPED);
+            assert_eq!(error.message(), b"HTTP source is no longer readable");
+            assert!(!reader.is_active());
+        });
+    }
+
+    #[test]
+    fn armed_suspend_free_reader_rearms_with_a_new_maximum() {
+        run_paused(async {
+            let (owner, mut reader, producer) = reader_after_one_body();
+            reader.arm_body(&owner, 2).unwrap();
+            assert_eq!(producer.body(body(b"two"), 0, true), FlowControlState::Open);
+            let mut context = Context::from_waker(Waker::noop());
+            let Poll::Ready(Ok(event)) = reader.poll_body(&mut context) else {
+                panic!("the re-armed reader must read the next body");
+            };
+            assert_eq!(
+                event.as_body().unwrap().coalesce(8).unwrap().as_ref(),
+                b"tw"
+            );
+            assert!(!event.eom());
+        });
+    }
+
+    #[test]
+    fn armed_suspend_free_reader_refuses_a_header_read() {
+        run_paused(async {
+            let (_owner, mut reader, _producer) = reader_after_one_body();
+            let mut context = Context::from_waker(Waker::noop());
+            let Poll::Ready(Err(error)) = reader.poll_header(&mut context) else {
+                panic!("a header poll of a body reader must fail");
+            };
+            assert_eq!(error.code(), HttpErrorCode::DROPPED);
+            assert_eq!(error.message(), b"response read is not armed");
+            assert!(!reader.is_active());
+        });
+    }
+
+    #[test]
+    fn suspend_free_read_error_retires_the_read() {
+        run_paused(async {
+            let (_owner, mut reader, producer) = reader_after_one_body();
+            assert!(producer.abort(HttpErrorCode::TRANSPORT_READ_ERROR, b""));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(matches!(
+                reader.poll_body(&mut context),
+                Poll::Ready(Err(error)) if error.code() == HttpErrorCode::TRANSPORT_READ_ERROR
+            ));
+            assert!(!reader.is_active());
         });
     }
 }

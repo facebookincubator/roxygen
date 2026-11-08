@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::rc::Weak;
 use std::task::Context;
 use std::task::Poll;
+use std::task::Waker;
 use std::thread::ThreadId;
 use std::time::Duration;
 
@@ -296,9 +297,25 @@ struct StreamShared {
     // Keep the host alive through state and callback destruction without a baton.
     host: Host,
     event: OnceCell<TimedBaton>,
+    /// A pending exclusive read waiting for the event without a `TimedWait`.
+    direct_wait: RefCell<Option<DirectWait>>,
+    /// The `TimedWait` that took over that read's wait when a read timeout was
+    /// set during it, until the read next polls.
+    retimed_wait: RefCell<Option<TimedWait>>,
     uninitialized_read_timeout: Cell<Duration>,
     deferred_read_timeout: Cell<Option<DeferredReadTimeout>>,
     ingress_completion: IngressCompletionPublisher,
+}
+
+/// An exclusive read's wait for the source event while the source has no read
+/// timeout. It stands in for a `TimedWait` on `event` with no cancellation, so
+/// it is woken as `event` wakes its registered waiter, and `event` is neither
+/// created nor signalled for it.
+struct DirectWait {
+    waker: Waker,
+    /// Whether the event was signalled since the wait started, the one status
+    /// change after which `TimedBaton` stops waking its waiter.
+    signalled: bool,
 }
 
 enum CallbackOwner {
@@ -359,21 +376,81 @@ impl StreamShared {
         }
     }
 
+    fn event(&self) -> &TimedBaton {
+        self.event.get_or_init(|| {
+            TimedBaton::with_host(
+                Some(self.uninitialized_read_timeout.get()),
+                self.host.clone(),
+            )
+        })
+    }
+
     fn wait_event(&self, cancellation: CancellationToken) -> TimedWait {
-        self.event
-            .get_or_init(|| {
-                TimedBaton::with_host(
-                    Some(self.uninitialized_read_timeout.get()),
-                    self.host.clone(),
-                )
-            })
-            .wait(cancellation)
+        self.event().wait(cancellation)
     }
 
     fn signal_event(&self) {
+        if self.direct_wait.borrow().is_some() {
+            return self.signal_direct_wait();
+        }
         if let Some(event) = self.event.get() {
             event.signal();
         }
+    }
+
+    fn signal_direct_wait(&self) {
+        let waker = match self.direct_wait.borrow_mut().as_mut() {
+            Some(wait) if !wait.signalled => {
+                wait.signalled = true;
+                wait.waker.clone()
+            }
+            _ => return,
+        };
+        waker.wake();
+    }
+
+    /// Whether a wait that starts now would arm a read timeout.
+    fn has_read_timeout(&self) -> bool {
+        self.event.get().map_or_else(
+            || !self.uninitialized_read_timeout.get().is_zero(),
+            |event| event.timeout().is_some(),
+        )
+    }
+
+    /// Applies a timeout update to a direct wait as `TimedBaton::set_timeout`
+    /// applies it to a registered `TimedWait`: it wakes the waiter, and an
+    /// enabled timeout counts from now. For that, an unsignalled wait moves to
+    /// the `TimedWait` it stands in for, registered with the same waker.
+    #[cold]
+    #[inline(never)]
+    fn retime_direct_wait(&self, timeout: Duration) {
+        let signalled = self
+            .direct_wait
+            .borrow()
+            .as_ref()
+            .is_some_and(|wait| wait.signalled);
+        if timeout.is_zero() || signalled {
+            self.store_read_timeout(timeout);
+            let waker = self
+                .direct_wait
+                .borrow()
+                .as_ref()
+                .map(|wait| wait.waker.clone());
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+            return;
+        }
+        let Some(DirectWait { waker, .. }) = self.direct_wait.take() else {
+            return self.store_read_timeout(timeout);
+        };
+        // The event was reset when the wait started and is not signalled.
+        let event = self.event();
+        let mut wait = event.wait(CancellationToken::never());
+        let registered = Pin::new(&mut wait).poll(&mut Context::from_waker(&waker));
+        debug_assert!(registered.is_pending(), "an unsignalled wait registers");
+        *self.retimed_wait.borrow_mut() = Some(wait);
+        event.set_timeout(Some(timeout));
     }
 
     fn event_status(&self) -> WaitStatus {
@@ -390,6 +467,14 @@ impl StreamShared {
     }
 
     fn set_read_timeout(&self, timeout: Duration) {
+        if self.direct_wait.borrow().is_some() {
+            self.retime_direct_wait(timeout);
+        } else {
+            self.store_read_timeout(timeout);
+        }
+    }
+
+    fn store_read_timeout(&self, timeout: Duration) {
         if let Some(event) = self.event.get() {
             event.set_timeout(Some(timeout));
         } else {
@@ -553,11 +638,12 @@ impl HttpResponseSource {
                 active: None,
                 kind: ReadKind::Header,
                 maximum: u32::MAX,
-                wait: None,
+                wait: ExclusiveWait::Idle,
                 admitted: false,
                 completed: true,
                 body_started: false,
                 suspend_free: false,
+                armed_idle: false,
             },
         )
     }
@@ -627,12 +713,15 @@ pub struct HttpResponseReader {
     active: Option<Rc<StreamShared>>,
     kind: ReadKind,
     maximum: u32,
-    wait: Option<TimedWait>,
+    wait: ExclusiveWait,
     admitted: bool,
     completed: bool,
     body_started: bool,
     /// Empty body reads wait instead of suspending (`DIV-045`).
     suspend_free: bool,
+    /// A suspend-free body read stays armed after a non-terminal event,
+    /// holding only `shared` until its next poll (`DIV-045`).
+    armed_idle: bool,
 }
 
 impl HttpResponseReader {
@@ -640,9 +729,11 @@ impl HttpResponseReader {
         self.shared.as_ptr() == Rc::as_ptr(&source.shared)
     }
 
-    /// Whether an armed or pending operation retains the original source state.
+    /// Whether a read is armed or pending. A pending operation retains the
+    /// original source state; a suspend-free reader that stays armed between
+    /// body events holds only its weak reference (`DIV-045`).
     pub fn is_active(&self) -> bool {
-        self.active.is_some()
+        self.active.is_some() || self.armed_idle
     }
 
     /// Makes an empty body read wait in place for the next event instead of
@@ -653,6 +744,13 @@ impl HttpResponseReader {
     /// read that is already waiting: that read still completes with its next
     /// event, error or read timeout, and the setting applies when a body read
     /// next finds no event queued.
+    ///
+    /// With it set, a body read that returns a non-terminal event leaves the
+    /// reader armed for the next body read with the same maximum: it stays
+    /// active, and `poll_body` reads on without `arm_body`, which still re-arms
+    /// it with a new maximum. Between events it holds only its weak reference,
+    /// so if the owner releases the source, that next poll fails as `arm_body`
+    /// would. Terminal events and errors retire the read.
     pub fn set_suspend_free(&mut self, suspend_free: bool) {
         self.suspend_free = suspend_free;
     }
@@ -678,10 +776,12 @@ impl HttpResponseReader {
         kind: ReadKind,
         maximum: u32,
     ) -> Result<(), HttpError> {
+        // A reader armed between body events re-arms or, on failure, retires.
+        self.armed_idle = false;
         let Some(source) = owner.owner.source() else {
             return Err(source_not_readable());
         };
-        if self.is_active() || !self.matches(source) {
+        if self.active.is_some() || !self.matches(source) {
             return Err(HttpError::with_message(
                 HttpErrorCode::INVALID_STATE_TRANSITION,
                 b"response read requires its matching idle source owner",
@@ -732,11 +832,29 @@ impl HttpResponseReader {
             armed: true,
         };
         let result = guard.reader.poll_inner(context, kind);
-        if result.is_ready() {
-            guard.reader.retire_active_read();
+        if let Poll::Ready(output) = &result {
+            if guard.reader.stays_armed(output) {
+                guard.reader.admitted = false;
+                guard.reader.armed_idle = true;
+                drop(guard.reader.active.take());
+            } else {
+                guard.reader.retire_active_read();
+            }
         }
         guard.armed = false;
         result
+    }
+
+    /// Whether a completed read leaves this reader armed for the next body read
+    /// (`DIV-045`). The owner's reference makes dropping the read's reference
+    /// trivial.
+    fn stays_armed(&self, output: &Result<StreamReadOutput, HttpError>) -> bool {
+        self.suspend_free
+            && matches!(output, Ok(StreamReadOutput::Body(event)) if !event.eom())
+            && self
+                .active
+                .as_ref()
+                .is_some_and(|shared| Rc::strong_count(shared) > 1)
     }
 
     fn poll_inner(
@@ -744,6 +862,17 @@ impl HttpResponseReader {
         context: &mut Context<'_>,
         kind: ReadKind,
     ) -> Poll<Result<StreamReadOutput, HttpError>> {
+        if self.armed_idle {
+            self.armed_idle = false;
+            if kind != self.kind {
+                return Poll::Ready(Err(response_read_not_armed()));
+            }
+            let Some(shared) = self.shared.upgrade() else {
+                return Poll::Ready(Err(source_not_readable()));
+            };
+            self.active = Some(shared);
+            self.completed = false;
+        }
         let Some(shared) = &self.active else {
             return Poll::Ready(Err(response_read_not_armed()));
         };
@@ -777,6 +906,7 @@ impl HttpResponseReader {
 
     /// Retires only the active read and wait, leaving the real source owner intact.
     pub fn retire_active_read(&mut self) {
+        self.armed_idle = false;
         let Some(shared) = self.active.take() else {
             return;
         };
@@ -795,7 +925,7 @@ impl HttpResponseReader {
             }
             .retire_inner()
         } else {
-            catch_unwind(AssertUnwindSafe(|| drop(self.wait.take()))).err()
+            catch_unwind(AssertUnwindSafe(|| self.wait.release(&shared))).err()
         };
         self.completed = true;
         retain_retirement_panic(
@@ -1080,6 +1210,8 @@ impl HttpStreamSource {
                 }),
                 host,
                 event: OnceCell::new(),
+                direct_wait: RefCell::new(None),
+                retimed_wait: RefCell::new(None),
                 uninitialized_read_timeout: Cell::new(read_timeout),
                 deferred_read_timeout: Cell::new(None),
                 ingress_completion: IngressCompletionPublisher::default(),
@@ -1824,6 +1956,8 @@ impl Future for StreamReadFuture {
 }
 
 trait ReadRole {
+    type Wait: OperationWait;
+
     fn finish(&self, shared: &Rc<StreamShared>, eom: bool);
 
     fn wait_token(&self) -> CancellationToken;
@@ -1838,6 +1972,8 @@ struct GeneralRead<'a> {
 }
 
 impl ReadRole for GeneralRead<'_> {
+    type Wait = Option<TimedWait>;
+
     fn finish(&self, shared: &Rc<StreamShared>, eom: bool) {
         finish_read(shared, self.id, eom);
     }
@@ -1856,6 +1992,8 @@ struct ExclusiveRead {
 }
 
 impl ReadRole for ExclusiveRead {
+    type Wait = ExclusiveWait;
+
     fn finish(&self, shared: &Rc<StreamShared>, eom: bool) {
         finish_exclusive_read(shared, eom);
     }
@@ -1869,12 +2007,144 @@ impl ReadRole for ExclusiveRead {
     }
 }
 
-struct ReadOperation<'a, R> {
+/// The wait of one read operation on its source event.
+trait OperationWait {
+    fn is_waiting(&self) -> bool;
+
+    /// Starts waiting on the reset event.
+    fn start(&mut self, shared: &StreamShared, cancellation: CancellationToken);
+
+    /// Polls the wait; it is no longer waiting once ready.
+    fn poll(&mut self, shared: &StreamShared, context: &mut Context<'_>) -> Poll<WaitStatus>;
+
+    /// Ends an unfinished wait without reading the event status.
+    fn release(&mut self, shared: &StreamShared);
+}
+
+impl OperationWait for Option<TimedWait> {
+    #[inline]
+    fn is_waiting(&self) -> bool {
+        self.is_some()
+    }
+
+    #[inline]
+    fn start(&mut self, shared: &StreamShared, cancellation: CancellationToken) {
+        self.get_or_insert_with(|| shared.wait_event(cancellation));
+    }
+
+    #[inline]
+    fn poll(&mut self, _shared: &StreamShared, context: &mut Context<'_>) -> Poll<WaitStatus> {
+        let wait = self
+            .as_mut()
+            .expect("a waiting read retains its timed wait");
+        let Poll::Ready(status) = Pin::new(wait).poll(context) else {
+            return Poll::Pending;
+        };
+        self.take();
+        Poll::Ready(status)
+    }
+
+    #[inline]
+    fn release(&mut self, _shared: &StreamShared) {
+        if self.is_some() {
+            *self = None;
+        }
+    }
+}
+
+/// An exclusive read's wait. It takes no cancellation, so while the source has
+/// no read timeout it is a `DirectWait` instead of a `TimedWait`.
+enum ExclusiveWait {
+    Idle,
+    Direct,
+    Timed(TimedWait),
+}
+
+impl OperationWait for ExclusiveWait {
+    #[inline]
+    fn is_waiting(&self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+
+    fn start(&mut self, shared: &StreamShared, cancellation: CancellationToken) {
+        debug_assert!(!cancellation.can_be_cancelled());
+        *self = if shared.has_read_timeout() {
+            Self::Timed(shared.wait_event(cancellation))
+        } else {
+            Self::Direct
+        };
+    }
+
+    #[inline]
+    fn poll(&mut self, shared: &StreamShared, context: &mut Context<'_>) -> Poll<WaitStatus> {
+        if matches!(self, Self::Direct) && shared.retimed_wait.borrow().is_some() {
+            self.adopt_retimed_wait(shared);
+        }
+        let status = match self {
+            Self::Idle => unreachable!("only a waiting read polls its wait"),
+            Self::Direct => {
+                let mut direct = shared.direct_wait.borrow_mut();
+                match direct.as_mut() {
+                    Some(wait) if wait.signalled => *direct = None,
+                    Some(wait) => {
+                        if !wait.waker.will_wake(context.waker()) {
+                            wait.waker = context.waker().clone();
+                        }
+                        return Poll::Pending;
+                    }
+                    None => {
+                        *direct = Some(DirectWait {
+                            waker: context.waker().clone(),
+                            signalled: false,
+                        });
+                        return Poll::Pending;
+                    }
+                }
+                WaitStatus::Signalled
+            }
+            Self::Timed(wait) => {
+                let Poll::Ready(status) = Pin::new(wait).poll(context) else {
+                    return Poll::Pending;
+                };
+                status
+            }
+        };
+        *self = Self::Idle;
+        Poll::Ready(status)
+    }
+
+    #[inline]
+    fn release(&mut self, shared: &StreamShared) {
+        if !matches!(self, Self::Idle) {
+            self.release_waiting(shared);
+        }
+    }
+}
+
+impl ExclusiveWait {
+    fn release_waiting(&mut self, shared: &StreamShared) {
+        if matches!(std::mem::replace(self, Self::Idle), Self::Direct) {
+            let direct = shared.direct_wait.take();
+            drop(shared.retimed_wait.take());
+            drop(direct);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn adopt_retimed_wait(&mut self, shared: &StreamShared) {
+        if let Some(wait) = shared.retimed_wait.take() {
+            *self = Self::Timed(wait);
+        }
+    }
+}
+
+struct ReadOperation<'a, R: ReadRole> {
     shared: &'a Rc<StreamShared>,
     role: R,
     kind: ReadKind,
     maximum: u32,
-    wait: &'a mut Option<TimedWait>,
+    wait: &'a mut R::Wait,
     completed: &'a mut bool,
 }
 
@@ -1886,7 +2156,7 @@ impl<R: ReadRole> ReadOperation<'_, R> {
     fn try_ready(&mut self) -> Option<Result<StreamReadOutput, HttpError>> {
         // An existing wait's cancellation or timeout must be consumed first.
         if let Some(result) = take_ready_event(self.shared, self.kind, self.maximum) {
-            self.wait.take();
+            self.wait.release(self.shared);
             *self.completed = true;
             let eom = result.as_ref().ok().is_some_and(|event| match event {
                 StreamReadOutput::Header(event) => event.eom(),
@@ -1929,11 +2199,10 @@ impl<R: ReadRole> ReadOperation<'_, R> {
     fn poll(&mut self, context: &mut Context<'_>) -> Poll<Result<StreamReadOutput, HttpError>> {
         self.shared.assert_owner();
         loop {
-            if let Some(wait) = self.wait.as_mut() {
-                let Poll::Ready(status) = Pin::new(wait).poll(context) else {
+            if self.wait.is_waiting() {
+                let Poll::Ready(status) = self.wait.poll(self.shared, context) else {
                     return Poll::Pending;
                 };
-                self.wait.take();
                 apply_wait_status(self.shared, status);
                 if matches!(self.kind, ReadKind::Body) {
                     self.shared.state.borrow_mut().can_suspend = true;
@@ -1945,9 +2214,9 @@ impl<R: ReadRole> ReadOperation<'_, R> {
                 return Poll::Ready(result);
             }
 
-            if self.wait.is_none() {
+            if !self.wait.is_waiting() {
                 self.shared.reset_event();
-                *self.wait = Some(self.shared.wait_event(self.role.wait_token()));
+                self.wait.start(self.shared, self.role.wait_token());
             }
         }
     }
@@ -1957,7 +2226,7 @@ impl<R: ReadRole> ReadOperation<'_, R> {
             return None;
         }
         *self.completed = true;
-        let mut first = catch_unwind(AssertUnwindSafe(|| drop(self.wait.take()))).err();
+        let mut first = catch_unwind(AssertUnwindSafe(|| self.wait.release(self.shared))).err();
         retain_retirement_panic(
             &mut first,
             catch_unwind(AssertUnwindSafe(|| {
