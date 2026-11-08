@@ -32,6 +32,7 @@ use super::FROZEN_HTTP_METHODS;
 use super::Http1xCodec;
 use super::MAX_HEADER_BYTES;
 use super::ParseState;
+use super::chunk_delimiter_turns;
 use super::server_accepted_upgrade;
 
 static_assertions::assert_not_impl_any!(Http1xCodec: Clone, Send, Sync);
@@ -964,6 +965,238 @@ fn test_malformed_chunk_delimiter() {
     );
     assert_eq!(callback.errors.len(), 1);
     assert_eq!(callback.events.len(), event_count);
+}
+
+/// A codec that has parsed a chunked message's head and waits for its first
+/// chunk-size line, with the callbacks recorded so far.
+fn chunk_size_codec(upstream: bool, strict: bool) -> (Http1xCodec, Recorder) {
+    let direction = if upstream {
+        TransportDirection::Upstream
+    } else {
+        TransportDirection::Downstream
+    };
+    let mut codec = Http1xCodec::with_options(direction, false, strict);
+    let head = if upstream {
+        send_trace_request(&mut codec);
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice()
+    } else {
+        b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice()
+    };
+    let mut callback = Recorder::default();
+    assert_eq!(parse(&mut codec, &mut callback, head), head.len());
+    assert_eq!(callback.events, ["begin", "headers"]);
+    (codec, callback)
+}
+
+#[test]
+fn chunk_delimiter_boundaries_are_independent_of_delivery() {
+    // The terminator bytes after a 1-byte chunk, the bytes the codec consumes,
+    // the error, and whether the codec holds the terminator's CR afterwards.
+    for (delimiter, expected_consumed, expected_error, expected_after_cr) in [
+        (b"\n".as_slice(), 1, None, false),
+        (b"\r\n".as_slice(), 2, None, false),
+        (b"".as_slice(), 0, Some(ProxygenError::EOF), false),
+        (b"\r".as_slice(), 1, Some(ProxygenError::EOF), true),
+        (
+            b"X0\r\n\r\n".as_slice(),
+            1,
+            Some(ProxygenError::PARSE_BODY),
+            false,
+        ),
+        (
+            b"\0\n".as_slice(),
+            1,
+            Some(ProxygenError::PARSE_BODY),
+            false,
+        ),
+        (
+            b"\rX0\r\n\r\n".as_slice(),
+            2,
+            Some(ProxygenError::PARSE_BODY),
+            true,
+        ),
+        (
+            b"\r\r\n".as_slice(),
+            2,
+            Some(ProxygenError::PARSE_BODY),
+            true,
+        ),
+    ] {
+        for upstream in [false, true] {
+            for strict in [false, true] {
+                for split in 0..=delimiter.len() {
+                    for queued in [false, true] {
+                        let context = format!(
+                            "delimiter={} upstream={upstream} strict={strict} split={split} queued={queued}",
+                            delimiter.escape_ascii()
+                        );
+                        let (mut codec, mut callback) = chunk_size_codec(upstream, strict);
+                        assert_eq!(parse(&mut codec, &mut callback, b"1\r\na"), 4);
+                        let mut egress = BufQueue::new(QUEUE_LIMIT);
+                        let consumed = if queued {
+                            let mut input = BufQueue::new(delimiter.len());
+                            for bytes in [&delimiter[..split], &delimiter[split..]] {
+                                input.push_bytes(Bytes::copy_from_slice(bytes)).unwrap();
+                            }
+                            codec
+                                .on_ingress(&input, &mut callback, &mut egress)
+                                .consumed
+                        } else {
+                            parse(&mut codec, &mut callback, &delimiter[..split])
+                                + parse(&mut codec, &mut callback, &delimiter[split..])
+                        };
+                        assert_eq!(consumed, expected_consumed, "{context}");
+                        if let Some(error) = expected_error {
+                            assert!(
+                                matches!(codec.state, ParseState::ChunkDelimiter(after_cr) if after_cr == expected_after_cr),
+                                "{context}"
+                            );
+                            if error == ProxygenError::EOF {
+                                assert!(callback.errors.is_empty(), "{context}");
+                                assert_eq!(callback.events.last(), Some(&"body"), "{context}");
+                                let _ = codec.on_ingress_eof(&mut callback, &mut egress);
+                            }
+                            assert_eq!(
+                                callback.events,
+                                ["begin", "headers", "chunk_header", "body", "error"],
+                                "{context}"
+                            );
+                            assert_eq!(callback.errors.len(), 1, "{context}");
+                            assert_eq!(callback.errors[0].0, error, "{context}");
+                            assert_eq!(
+                                callback.errors[0].1,
+                                (!upstream).then_some(400),
+                                "{context}"
+                            );
+                            let message = if error == ProxygenError::EOF {
+                                b"unexpected EOF".as_slice()
+                            } else {
+                                b"invalid HTTP chunk terminator".as_slice()
+                            };
+                            assert_eq!(callback.error_messages[0], message, "{context}");
+                            let callbacks = callback.callback_count;
+                            assert_eq!(parse(&mut codec, &mut callback, b"0\r\n\r\n"), 0);
+                            let _ = codec.on_ingress_eof(&mut callback, &mut egress);
+                            assert_eq!(callback.callback_count, callbacks, "{context}");
+                        } else {
+                            assert!(
+                                matches!(codec.state, ParseState::ChunkSize(line) if line.length == 0),
+                                "{context}"
+                            );
+                            assert_eq!(
+                                callback.events,
+                                ["begin", "headers", "chunk_header", "body", "chunk_complete"],
+                                "{context}"
+                            );
+                            assert_eq!(parse(&mut codec, &mut callback, b"0\r\n\r\n"), 5);
+                            assert_eq!(callback.completions, [false], "{context}");
+                            assert!(callback.errors.is_empty(), "{context}");
+                        }
+                        assert_eq!(callback.bodies, b"a", "{context}");
+                        assert_eq!(callback.chunk_lengths, [1], "{context}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn chunk_callbacks_pause_before_the_next_phase() {
+    struct PauseOnChunk(Recorder, SharedBodyCapture);
+
+    impl HttpCodecCallback for PauseOnChunk {
+        fn on_event(&mut self, event: CodecEvent<'_>) {
+            if let CodecEvent::Body { body, .. } = &event {
+                self.1.segments.extend(body.segments().cloned());
+            }
+            self.0.on_event(event);
+        }
+
+        fn on_ingress_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
+            let pause = matches!(
+                event,
+                CodecEvent::ChunkHeader { .. } | CodecEvent::ChunkComplete { .. }
+            );
+            self.on_event(event);
+            if pause {
+                vec![CodecCallbackAction::SetParserPaused(true)].into()
+            } else {
+                CodecCallbackActions::new()
+            }
+        }
+    }
+
+    // The chunked body, CRLF and bare-LF terminated, and the consumed offset
+    // of each paused callback.
+    for (bytes, offsets) in [
+        (b"2\r\nab\r\n1\r\nc\r\n0\r\n\r\n".as_slice(), [3, 7, 10, 13]),
+        (b"2\r\nab\n1\r\nc\n0\r\n\r\n".as_slice(), [3, 6, 9, 11]),
+    ] {
+        for split in 0..=bytes.len() {
+            let wire = Bytes::copy_from_slice(bytes);
+            let expected_body_pointers = [
+                wire.as_ptr().wrapping_add(3),
+                wire.as_ptr().wrapping_add(4),
+                wire.as_ptr().wrapping_add(offsets[2]),
+            ];
+            let (mut codec, recorder) = chunk_size_codec(false, false);
+            let mut callback = PauseOnChunk(recorder, SharedBodyCapture::default());
+            let mut input = BufQueue::new(wire.len());
+            input.push_bytes(wire.slice(..split)).unwrap();
+            input.push_bytes(wire.slice(split..)).unwrap();
+            drop(wire);
+            let mut egress = BufQueue::new(QUEUE_LIMIT);
+            let mut consumed = 0;
+            for (offset, event) in offsets.into_iter().zip([
+                "chunk_header",
+                "chunk_complete",
+                "chunk_header",
+                "chunk_complete",
+            ]) {
+                codec.set_parser_paused(false);
+                let result = codec.on_ingress(&input, &mut callback, &mut egress);
+                consumed += result.consumed;
+                input.trim_start(result.consumed).unwrap();
+                assert_eq!(consumed, offset, "split={split}");
+                assert!(codec.is_parser_paused());
+                assert_eq!(callback.0.events.last(), Some(&event));
+                if event == "chunk_complete" {
+                    assert!(matches!(codec.state, ParseState::ChunkSize(line) if line.length == 0));
+                } else {
+                    assert!(matches!(codec.state, ParseState::ChunkBody(_)));
+                }
+                let callbacks = callback.0.callback_count;
+                assert_eq!(
+                    codec
+                        .on_ingress(&input, &mut callback, &mut egress)
+                        .consumed,
+                    0
+                );
+                assert_eq!(callback.0.callback_count, callbacks);
+            }
+            codec.set_parser_paused(false);
+            consumed += codec
+                .on_ingress(&input, &mut callback, &mut egress)
+                .consumed;
+            assert_eq!(consumed, bytes.len());
+            input.trim_start(input.chain_length()).unwrap();
+            drop(input);
+            drop(codec);
+            assert_eq!(callback.0.chunk_lengths, [2, 1]);
+            assert_eq!(callback.0.bodies, b"abc");
+            assert_eq!(callback.0.completions, [false]);
+            assert!(callback.0.errors.is_empty());
+            let mut captured = Vec::new();
+            let mut pointers = Vec::new();
+            for body in &callback.1.segments {
+                captured.extend_from_slice(body);
+                pointers.extend((0..body.len()).map(|offset| body.as_ptr().wrapping_add(offset)));
+            }
+            assert_eq!(captured, b"abc");
+            assert_eq!(pointers, expected_body_pointers);
+        }
+    }
 }
 
 #[test]
@@ -8620,4 +8853,44 @@ fn chunk_size_and_terminator_progress_holds_no_heap_buffer() {
         !may_own_heap(progress),
         "chunk-terminator progress holds no heap buffer"
     );
+}
+
+#[test]
+fn a_chunk_terminator_inside_one_segment_takes_one_parse_turn() {
+    // A chunked body as the segments of one read, the bytes the codec
+    // consumes, and the parse-loop turns its chunk terminators take: one per
+    // terminator, plus one for a CR that is not followed by an LF in its
+    // segment. The last case fails at its second CR.
+    let cases: [(&[&[u8]], usize, usize); 5] = [
+        (&[b"1\r\na\r\n1\r\nb\r\n0\r\n\r\n"], 17, 2),
+        (&[b"1\r\na\n1\r\nb\n0\r\n\r\n"], 15, 2),
+        (&[b"1\r\na\r", b"\n1\r\nb\r\n0\r\n\r\n"], 17, 3),
+        (&[b"1\r\na", b"\r\n1\r\nb\r\n0\r\n\r\n"], 17, 2),
+        (&[b"1\r\na\r\r\n"], 6, 2),
+    ];
+    for (segments, expected_consumed, expected_turns) in cases {
+        let context = segments
+            .iter()
+            .map(|segment| segment.escape_ascii().to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let (mut codec, mut recorder) = chunk_size_codec(false, false);
+        let length = segments.iter().map(|segment| segment.len()).sum();
+        let mut input = BufQueue::new(length);
+        for segment in segments {
+            input.push_bytes(Bytes::from_static(segment)).unwrap();
+        }
+        let mut egress = BufQueue::new(QUEUE_LIMIT);
+        let before = chunk_delimiter_turns();
+        let consumed = codec
+            .on_ingress(&input, &mut recorder, &mut egress)
+            .consumed;
+        let turns = chunk_delimiter_turns() - before;
+
+        assert_eq!(consumed, expected_consumed, "{context}");
+        assert_eq!(
+            turns, expected_turns,
+            "{context}: chunk-terminator turns of the parse loop"
+        );
+    }
 }

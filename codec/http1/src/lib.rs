@@ -187,6 +187,18 @@ impl ChunkSizeLine {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CHUNK_DELIMITER_TURNS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Turns of the ingress parse loop in `ParseState::ChunkDelimiter` on this
+/// thread, read by the count oracles.
+#[cfg(test)]
+fn chunk_delimiter_turns() -> usize {
+    CHUNK_DELIMITER_TURNS.with(Cell::get)
+}
+
 /// The chunk size read so far, from the line's bytes before its first `;`
 /// with HTTP whitespace trimmed from both ends: nonempty hex digits whose value
 /// fits a `u64`, or invalid. A CR counts as whitespace, as the trim treats it;
@@ -2496,8 +2508,15 @@ impl HttpCodec for Http1xCodec {
                         );
                     }
                     ParseState::ChunkDelimiter(after_cr) => {
-                        let byte = input[result.consumed];
+                        #[cfg(test)]
+                        CHUNK_DELIMITER_TURNS.with(|turns| count_work(turns, 1));
+                        let mut byte = input[result.consumed];
                         result.consumed += 1;
+                        if byte == b'\r' && !after_cr && input.get(result.consumed) == Some(&b'\n')
+                        {
+                            byte = b'\n';
+                            result.consumed += 1;
+                        }
                         if byte == b'\n' {
                             self.state = ParseState::ChunkSize(ChunkSizeLine::default());
                             self.dispatch(
