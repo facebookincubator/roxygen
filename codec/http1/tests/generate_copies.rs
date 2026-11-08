@@ -11,7 +11,10 @@
 //! The framing frames (body, chunk header and terminator, trailers, and EOM)
 //! keep the chunk-size prefixes of a frozen `format!` reference and the traces
 //! recorded before `repair.http1_head_egress` (expectation-432), and allocate
-//! no byte buffer beyond an exact-size chunk prefix (expectation-433).
+//! no byte buffer beyond an exact-size chunk prefix (expectation-433): none
+//! for a chunk shorter than 0x1000. A body frame moves its body into the
+//! output with one append, and fails whole when the output lacks room or the
+//! frame's length overflows.
 
 use std::fmt::Write as _;
 
@@ -2248,11 +2251,16 @@ fn framing_frames_match_the_recorded_traces() {
 }
 
 /// One framing frame's buffer work on a fresh, empty output queue: the
-/// queue's backing bound afterwards, the byte buffers the frame created, and
-/// the strings it formatted through `core::fmt` (expectation-433).
-fn framing_work(codec: &mut Http1xCodec, frame: EgressFrame<'_>) -> (Option<usize>, usize, usize) {
+/// queue's backing bound afterwards, the byte buffers the frame created, the
+/// strings it formatted through `core::fmt` (expectation-433), and the whole
+/// queues it appended.
+fn framing_work(
+    codec: &mut Http1xCodec,
+    frame: EgressFrame<'_>,
+) -> (Option<usize>, usize, usize, usize) {
     let buffers = codec.egress_work.byte_buffers.get();
     let formatted = formatted_strings();
+    let appended = codec.egress_work.appended_queues.get();
     let mut output = BufQueue::new(QUEUE_LIMIT);
     codec
         .generate(&mut output, frame, &mut Events::default())
@@ -2261,48 +2269,158 @@ fn framing_work(codec: &mut Http1xCodec, frame: EgressFrame<'_>) -> (Option<usiz
         output.backing_capacity_upper_bound(),
         codec.egress_work.byte_buffers.get() - buffers,
         formatted_strings() - formatted,
+        codec.egress_work.appended_queues.get() - appended,
     )
 }
 
+/// A chunk shorter than 0x1000 opens with a static line, so it allocates no
+/// byte buffer; a longer one allocates its exact-size line. A body frame
+/// moves its body into the output with one append and no staging queue.
 #[test]
 fn framing_frames_allocate_at_most_their_chunk_prefix() {
     let stream = StreamId::new(1);
     let mut actual = Vec::new();
     let mut expected = Vec::new();
-    for end_stream in [false, true] {
+    for (length, end_stream, work) in [
+        (128, false, (Some(0), 0, 0, 1)),
+        (128, true, (Some(0), 0, 0, 1)),
+        (0xfff, false, (Some(0), 0, 0, 1)),
+        (0x1000, false, (Some(b"1000\r\n".len()), 1, 0, 1)),
+    ] {
         let mut codec = chunked_response_codec();
-        let work = framing_work(
-            &mut codec,
-            EgressFrame::Body {
-                stream,
-                body: static_body(&[&BODY_BYTES[..128]]),
-                padding: None,
-                end_stream,
-            },
-        );
-        actual.push((format!("Body end_stream={end_stream}"), work));
-        expected.push((
-            format!("Body end_stream={end_stream}"),
-            (Some(b"80\r\n".len()), 1, 0),
+        let label = format!("Body {length:#x} end_stream={end_stream}");
+        actual.push((
+            label.clone(),
+            framing_work(
+                &mut codec,
+                EgressFrame::Body {
+                    stream,
+                    body: static_body(&[&BODY_BYTES[..length]]),
+                    padding: None,
+                    end_stream,
+                },
+            ),
         ));
+        expected.push((label, work));
     }
     let mut codec = chunked_response_codec();
-    for length in [4, 0xf_ffff] {
-        let prefix = reference_chunk_prefix(length).len();
-        assert!(prefix < 8, "ChunkHeader {length}");
-        let work = framing_work(&mut codec, EgressFrame::ChunkHeader { stream, length });
-        actual.push((format!("ChunkHeader {length}"), work));
-        expected.push((format!("ChunkHeader {length}"), (Some(prefix), 1, 0)));
+    for (length, work) in [
+        (4, (Some(0), 0, 0, 0)),
+        (0xfff, (Some(0), 0, 0, 0)),
+        (0x1000, (Some(b"1000\r\n".len()), 1, 0, 0)),
+        (0xf_ffff, (Some(b"fffff\r\n".len()), 1, 0, 0)),
+    ] {
+        let label = format!("ChunkHeader {length:#x}");
+        let header = framing_work(&mut codec, EgressFrame::ChunkHeader { stream, length });
+        actual.push((label.clone(), header));
+        expected.push((label, work));
         let work = framing_work(&mut codec, EgressFrame::ChunkTerminator { stream });
         actual.push(("ChunkTerminator".to_owned(), work));
-        expected.push(("ChunkTerminator".to_owned(), (Some(0), 0, 0)));
+        expected.push(("ChunkTerminator".to_owned(), (Some(0), 0, 0, 0)));
     }
     let work = framing_work(&mut codec, EgressFrame::EndOfMessage { stream });
     actual.push(("EndOfMessage".to_owned(), work));
-    expected.push(("EndOfMessage".to_owned(), (Some(0), 0, 0)));
+    expected.push(("EndOfMessage".to_owned(), (Some(0), 0, 0, 0)));
     assert_eq!(
         actual, expected,
-        "per frame: the output queue's backing bound, the byte buffers, and the \
-         strings formatted through core::fmt"
+        "per frame: the output queue's backing bound, the byte buffers, the \
+         strings formatted through core::fmt, and the appended queues"
     );
+}
+
+/// A chunked body that overflows the output fails as one frame, even when its
+/// chunk line alone would fit: the output keeps its bytes and bound, the error
+/// counts the whole frame, and the codec can generate the frame again.
+#[test]
+fn body_frames_that_overflow_the_output_leave_it_unchanged() {
+    let mut codec = chunked_response_codec();
+    let stream = StreamId::new(1);
+    let body = || EgressFrame::Body {
+        stream,
+        body: static_body(&[b"abcd", b"efgh"]),
+        padding: None,
+        end_stream: false,
+    };
+    let mut output = BufQueue::new(10);
+    output
+        .push_static(b"xx")
+        .expect("the queue holds two bytes");
+    let result = codec.generate(&mut output, body(), &mut Events::default());
+    assert_eq!(
+        render_result(&result),
+        "error 2 \"buffer limit 10 exceeded: 2 existing bytes plus 13 incoming bytes\""
+    );
+    let segments: Vec<usize> = output.segments().map(|segment| segment.len()).collect();
+    assert_eq!(segments, [2]);
+    assert_eq!(queue_bytes(&output), b"xx");
+    assert_eq!(output.backing_capacity_upper_bound(), Some(0));
+    assert!(!codec.in_chunk && !codec.last_chunk_written);
+    let mut output = BufQueue::new(QUEUE_LIMIT);
+    let result = codec.generate(&mut output, body(), &mut Events::default());
+    assert_eq!(
+        render_result(&result),
+        "ok written=13 size=None offset=Some(3)"
+    );
+    assert_eq!(queue_bytes(&output), b"8\r\nabcdefgh\r\n");
+}
+
+#[test]
+fn a_body_frame_whose_length_overflows_fails_its_room_check_as_its_staging_queue_did() {
+    let empty = BufQueue::new(usize::MAX);
+    let mut holding_two = BufQueue::new(usize::MAX);
+    holding_two
+        .push_static(b"xx")
+        .expect("the queue holds two bytes");
+    let render = |result: Result<usize, HttpError>| match result {
+        Ok(written) => format!("ok {written}"),
+        Err(error) => format!(
+            "error {} \"{}\"",
+            error.code().as_u16(),
+            error.message().escape_ascii()
+        ),
+    };
+    // Output, prefix, body and suffix lengths, and the result of staging the
+    // frame in one queue and then appending that queue to the output.
+    let cases = [
+        (&empty, 3, 8, 2, "ok 13"),
+        (&empty, 3, usize::MAX - 5, 2, "ok 18446744073709551615"),
+        (
+            &empty,
+            3,
+            usize::MAX - 4,
+            2,
+            "error 2 \"buffer length overflow: 18446744073709551614 existing bytes plus 2 incoming bytes\"",
+        ),
+        (
+            &empty,
+            3,
+            usize::MAX - 1,
+            2,
+            "error 2 \"buffer length overflow: 3 existing bytes plus 18446744073709551614 incoming bytes\"",
+        ),
+        (
+            &holding_two,
+            3,
+            usize::MAX - 5,
+            2,
+            "error 2 \"buffer length overflow: 2 existing bytes plus 18446744073709551615 incoming bytes\"",
+        ),
+        (
+            &holding_two,
+            3,
+            usize::MAX - 1,
+            2,
+            "error 2 \"buffer length overflow: 3 existing bytes plus 18446744073709551614 incoming bytes\"",
+        ),
+    ];
+    cases
+        .into_iter()
+        .for_each(|(output, prefix, body, suffix, expected)| {
+            assert_eq!(
+                render(Http1xCodec::check_frame_room(output, prefix, body, suffix)),
+                expected,
+                "{} queued bytes, frame {prefix} + {body} + {suffix}",
+                output.chain_length()
+            );
+        });
 }

@@ -22,6 +22,7 @@ use roxygen_codec::HttpException;
 use roxygen_codec::HttpExceptionDirection;
 use roxygen_codec::ProxygenError;
 use roxygen_core::buf_queue::BufQueue;
+use roxygen_core::buf_queue::BufQueueError;
 use roxygen_core::error::HttpError;
 use roxygen_core::error::HttpErrorCode;
 use roxygen_core::headers::HttpHeaderCode;
@@ -448,6 +449,8 @@ struct EgressWork {
     /// Vectors with a heap capacity that `push_output` queues. Strings built
     /// by `format!`, queued or not, are counted in `FORMATTED_STRINGS`.
     byte_buffers: Cell<usize>,
+    /// Whole queues that `append_output` moves onto another queue.
+    appended_queues: Cell<usize>,
 }
 
 #[cfg(test)]
@@ -2261,6 +2264,69 @@ impl Http1xCodec {
             HttpError::with_message(HttpErrorCode::INTERNAL_ERROR, error.to_string())
         })
     }
+
+    fn append_output(&self, output: &mut BufQueue, other: &mut BufQueue) -> Result<(), HttpError> {
+        #[cfg(test)]
+        count_work(&self.egress_work.appended_queues, 1);
+        output.append(other).map_err(|error| {
+            HttpError::with_message(HttpErrorCode::INTERNAL_ERROR, error.to_string())
+        })
+    }
+
+    fn push_chunk_line(
+        &self,
+        output: &mut BufQueue,
+        line: Cow<'static, [u8]>,
+    ) -> Result<(), HttpError> {
+        match line {
+            Cow::Borrowed(line) => Self::push_static_output(output, line),
+            Cow::Owned(line) => self.push_output(output, line),
+        }
+    }
+
+    /// Fails as appending `incoming` bytes to `output` would, so that a frame
+    /// queued in parts is queued whole or not at all.
+    fn check_output_room(output: &BufQueue, incoming: usize) -> Result<(), HttpError> {
+        let current = output.chain_length();
+        let error = match current.checked_add(incoming) {
+            Some(length) if length <= output.limit() => return Ok(()),
+            Some(_) => BufQueueError::LimitExceeded {
+                limit: output.limit(),
+                current,
+                incoming,
+            },
+            None => BufQueueError::LengthOverflow { current, incoming },
+        };
+        Err(HttpError::with_message(
+            HttpErrorCode::INTERNAL_ERROR,
+            error.to_string(),
+        ))
+    }
+
+    /// Returns the length of a frame of `prefix`, `body` and `suffix` bytes,
+    /// or fails as staging the frame in one queue and appending that queue to
+    /// `output` would, including when the frame's length overflows.
+    fn check_frame_room(
+        output: &BufQueue,
+        prefix: usize,
+        body: usize,
+        suffix: usize,
+    ) -> Result<usize, HttpError> {
+        let overflow = |current, incoming| {
+            HttpError::with_message(
+                HttpErrorCode::INTERNAL_ERROR,
+                BufQueueError::LengthOverflow { current, incoming }.to_string(),
+            )
+        };
+        let framed = prefix
+            .checked_add(body)
+            .ok_or_else(|| overflow(prefix, body))?;
+        let written = framed
+            .checked_add(suffix)
+            .ok_or_else(|| overflow(framed, suffix))?;
+        Self::check_output_room(output, written)?;
+        Ok(written)
+    }
 }
 
 /// Counts every string built by `format!` from here to the end of this file
@@ -2770,7 +2836,7 @@ impl HttpCodec for Http1xCodec {
                         let offset = prefix.len() as u64;
                         (prefix, Some(offset))
                     } else {
-                        (Vec::new(), (body_len != 0).then_some(0))
+                        (Cow::Borrowed(&[][..]), (body_len != 0).then_some(0))
                     };
                     let end = if end_stream {
                         let end = self.message_end();
@@ -2784,19 +2850,11 @@ impl HttpCodec for Http1xCodec {
                     } else {
                         end.bytes()
                     };
-                    let written = prefix
-                        .len()
-                        .saturating_add(body_len)
-                        .saturating_add(suffix.len());
-                    let mut framed = BufQueue::new(written);
-                    self.push_output(&mut framed, prefix)?;
-                    framed.append(&mut body).map_err(|error| {
-                        HttpError::with_message(HttpErrorCode::INTERNAL_ERROR, error.to_string())
-                    })?;
-                    Self::push_static_output(&mut framed, suffix)?;
-                    output.append(&mut framed).map_err(|error| {
-                        HttpError::with_message(HttpErrorCode::INTERNAL_ERROR, error.to_string())
-                    })?;
+                    let written =
+                        Self::check_frame_room(output, prefix.len(), body_len, suffix.len())?;
+                    self.push_chunk_line(output, prefix)?;
+                    self.append_output(output, &mut body)?;
+                    Self::push_static_output(output, suffix)?;
                     Ok(GeneratedFrame {
                         bytes_written: written,
                         header_size: None,
@@ -2814,10 +2872,10 @@ impl HttpCodec for Http1xCodec {
                         self.in_chunk = true;
                         chunk_prefix(length)
                     } else {
-                        Vec::new()
+                        Cow::Borrowed(&[][..])
                     };
                     let written = bytes.len();
-                    self.push_output(output, bytes)?;
+                    self.push_chunk_line(output, bytes)?;
                     Ok(GeneratedFrame {
                         bytes_written: written,
                         header_size: None,
@@ -3290,23 +3348,56 @@ fn response_fields(message: &HttpMessage) -> Option<(u16, &[u8])> {
     })
 }
 
-/// The line that opens a chunk: `length` in lowercase hex digits, then CRLF,
-/// in one buffer whose capacity is its length. The digits are written through
-/// a stack array, as [`push_decimal`] writes decimal ones, not `core::fmt`.
-fn chunk_prefix(mut length: usize) -> Vec<u8> {
+/// Chunks shorter than this open with a line from [`CHUNK_LINES`].
+const STATIC_CHUNK_LINES: usize = 0x1000;
+
+/// The width of a [`CHUNK_LINES`] entry: three hex digits, then CRLF.
+const CHUNK_LINE_WIDTH: usize = 5;
+
+/// The line that opens each chunk shorter than [`STATIC_CHUNK_LINES`], right
+/// aligned in its entry, so that queueing it allocates nothing.
+static CHUNK_LINES: [u8; STATIC_CHUNK_LINES * CHUNK_LINE_WIDTH] = {
+    let mut lines = [0; STATIC_CHUNK_LINES * CHUNK_LINE_WIDTH];
+    let mut length = 0;
+    while length < STATIC_CHUNK_LINES {
+        write_chunk_line(&mut lines, (length + 1) * CHUNK_LINE_WIDTH, length);
+        length += 1;
+    }
+    lines
+};
+
+/// Writes the line that opens a chunk, `length` in lowercase hex digits and
+/// then CRLF, so that it ends at `end` in `line`, and returns its start. The
+/// digits are written as [`push_decimal`] writes decimal ones, not through
+/// `core::fmt`.
+const fn write_chunk_line(line: &mut [u8], end: usize, mut length: usize) -> usize {
     const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut line = [0_u8; usize::BITS as usize / 4 + 2];
-    let mut start = line.len() - 2;
-    line[start..].copy_from_slice(b"\r\n");
+    let mut start = end - 2;
+    line[start] = b'\r';
+    line[start + 1] = b'\n';
     loop {
         start -= 1;
         line[start] = HEX_DIGITS[length % 16];
         length /= 16;
         if length == 0 {
-            break;
+            return start;
         }
     }
-    line[start..].to_vec()
+}
+
+/// The line that opens a chunk: a static line from [`CHUNK_LINES`], or for a
+/// chunk of at least [`STATIC_CHUNK_LINES`] bytes one buffer whose capacity is
+/// the line's length.
+fn chunk_prefix(length: usize) -> Cow<'static, [u8]> {
+    if length < STATIC_CHUNK_LINES {
+        let digits = (usize::BITS - (length | 1).leading_zeros()).div_ceil(4) as usize;
+        let end = (length + 1) * CHUNK_LINE_WIDTH;
+        return Cow::Borrowed(&CHUNK_LINES[end - 2 - digits..end]);
+    }
+    let mut line = [0_u8; usize::BITS as usize / 4 + 2];
+    let end = line.len();
+    let start = write_chunk_line(&mut line, end, length);
+    Cow::Owned(line[start..].to_vec())
 }
 
 fn push_decimal(output: &mut Vec<u8>, mut value: u16) {
