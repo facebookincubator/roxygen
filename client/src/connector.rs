@@ -1124,6 +1124,13 @@ pub struct SessionParams {
     /// `Transfer-Encoding` goes out with no body framing, as reqwest sends a `POST`
     /// with an empty body, instead of an empty chunked body. HTTP/2 sessions ignore it.
     pub unframed_bodiless_http1_requests: bool,
+    /// Roxygen-only, default off (`DIV-038`): a session that resets its connection (a
+    /// dropped response, a failed or cancelled session, an HTTP/1.1 stream reset)
+    /// closes the socket without `SO_LINGER` zero, as hyper and reqwest close one by
+    /// dropping it: the kernel still sends the bytes already written, then FIN, or RST
+    /// only if received bytes are unread. Plaintext only: a connector refuses it for a
+    /// TLS connection, and `ClientSession::attach_transport` for a TLS transport.
+    pub non_abortive_close: bool,
 }
 
 /// Attaches already-connected I/O without performing DNS, TLS, or routing.
@@ -1178,6 +1185,7 @@ pub(crate) fn uniplex_config_for_session_params(session: &SessionParams) -> Unip
     }
     config.deliver_ingress_before_abort = session.deliver_ingress_before_abort;
     config.unframed_bodiless_http1_requests = session.unframed_bodiless_http1_requests;
+    config.non_abortive_close = session.non_abortive_close;
     config
 }
 
@@ -1687,6 +1695,12 @@ impl ClientSession {
         options: ClientAttachOptions,
     ) -> Result<Self, HttpError> {
         check_attachment_admission(worker, &options.cancellation)?;
+        if options.session.non_abortive_close {
+            if options.security == TransportSecurity::Tls {
+                return Err(non_abortive_close_with_tls());
+            }
+            transport.enable_non_abortive_close(worker)?;
+        }
         let limits = transport.limits(worker)?;
         let connection = connection_context(
             worker,
@@ -2005,6 +2019,11 @@ impl SessionConnector for HttpConnector {
     ) -> LocalClientFuture<Result<ClientSession, HttpError>> {
         Box::pin(async move {
             check_attachment_admission(&context, &cancellation)?;
+            if session.non_abortive_close
+                && matches!(connection.transport, ClientTransportOptions::Tls(_))
+            {
+                return Err(non_abortive_close_with_tls());
+            }
             let limits = ByteStreamLimits::new(256 * 1024, 256 * 1024, 1_024)
                 .expect("client byte-stream limits are nonzero");
             connection.configure_tls_options();
@@ -2034,6 +2053,9 @@ impl SessionConnector for HttpConnector {
                             ));
                         }
                         let transport = connected?;
+                        if session.non_abortive_close {
+                            transport.enable_non_abortive_close(&context)?;
+                        }
                         let metadata = connection_context(
                             &context,
                             &transport,
@@ -2112,6 +2134,15 @@ impl SessionConnector for HttpConnector {
             )
         })
     }
+}
+
+/// The TLS adapter's own failure paths reset, so `SessionParams::non_abortive_close`
+/// is plaintext only (`DIV-038`).
+fn non_abortive_close_with_tls() -> HttpError {
+    client_error(
+        HttpErrorCode::INVALID_STATE_TRANSITION,
+        b"non_abortive_close does not support TLS",
+    )
 }
 
 fn check_attachment_admission(

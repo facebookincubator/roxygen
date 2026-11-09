@@ -34,6 +34,10 @@ mod allocation_count;
 mod http1_egress_batching_tests;
 
 #[cfg(test)]
+#[path = "../tests/non_abortive_close.rs"]
+mod non_abortive_close_tests;
+
+#[cfg(test)]
 #[path = "../tests/native_readiness.rs"]
 mod native_readiness_tests;
 

@@ -48,6 +48,7 @@ use tokio::task::JoinSet;
 
 use crate::acceptor::AcceptedConnectionObserver;
 use crate::acceptor::AcceptorConfig;
+use crate::acceptor::NON_ABORTIVE_CLOSE_WITH_TLS;
 use crate::acceptor::NewConnectionFilter;
 use crate::acceptor::ServerSessionConfig;
 use crate::acceptor::SessionControl;
@@ -758,6 +759,9 @@ impl HttpServer {
             .session
             .check_owned()
             .map_err(HttpServerError::InvalidConfig)?;
+        if config.session.non_abortive_close && config.tls_credentials.is_some() {
+            return Err(HttpServerError::InvalidConfig(NON_ABORTIVE_CLOSE_WITH_TLS));
+        }
         let num_io_threads = if config.num_io_threads == 0 {
             std::thread::available_parallelism()
                 .map(usize::from)

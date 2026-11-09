@@ -1118,3 +1118,7 @@ mod bodiless_request_tests;
 #[cfg(test)]
 #[path = "../tests/recommended_router_params.rs"]
 mod recommended_router_params_tests;
+
+#[cfg(test)]
+#[path = "../tests/non_abortive_close.rs"]
+mod non_abortive_close_tests;

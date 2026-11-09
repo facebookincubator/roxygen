@@ -412,6 +412,13 @@ pub struct UniplexConfig {
     /// for a `POST` (`Http1xCodec::set_unframed_bodiless_requests`). Downstream and
     /// HTTP/2 sessions ignore it; the owned HTTP/1.1 upstream driver refuses it.
     pub unframed_bodiless_http1_requests: bool,
+    /// Roxygen-only, default off (`DIV-038`): set by an owner that enabled
+    /// `OwnedByteStream::enable_non_abortive_close` on the transport. An HTTP/1.1
+    /// body-source error (after the head was serialized) then abandons the output
+    /// serialized but not yet written, so the session closes at once, as hyper drops
+    /// its unflushed buffer and the I/O, instead of draining that output to a peer that
+    /// may have stopped reading. HTTP/2 sessions and the owned drivers ignore it.
+    pub non_abortive_close: bool,
 }
 
 impl Default for UniplexConfig {
@@ -430,6 +437,7 @@ impl Default for UniplexConfig {
             abort_exchanges_on_eof: false,
             deliver_ingress_before_abort: false,
             unframed_bodiless_http1_requests: false,
+            non_abortive_close: false,
         }
     }
 }
@@ -7235,6 +7243,14 @@ async fn write_loop(
                         } else if state.borrow().codec.protocol() == CodecProtocol::Http11
                             && !work_stream.is_unspecified()
                         {
+                            // `DIV-038`: a body error abandons the unwritten output, as
+                            // hyper drops its unflushed buffer with the connection.
+                            let abandon_output = config.non_abortive_close
+                                && state
+                                    .borrow()
+                                    .core()
+                                    .exchange_tracker(work_stream)
+                                    .is_some_and(|exchange| exchange.egress_started());
                             {
                                 let mut driver = state.borrow_mut();
                                 driver.record_error(error.clone());
@@ -7254,6 +7270,10 @@ async fn write_loop(
                                 capture_panic(&mut first_panic, || {
                                     fail_connection(&state, write_wake, callback_error, true);
                                 });
+                            }
+                            if abandon_output {
+                                let unwritten = state.borrow_mut().egress.take();
+                                drop(unwritten);
                             }
                             resume_first_panic(first_panic);
                         } else {

@@ -501,6 +501,10 @@ pub(crate) trait ByteStreamIo: 'static {
         Ok(())
     }
 
+    /// Makes `close_with_reset` close the socket without the linger-zero reset;
+    /// adapters without an abortive reset ignore it.
+    fn enable_non_abortive_close(&self) {}
+
     #[cfg(test)]
     fn zero_copy_owner_for_test(&self) -> Option<usize> {
         None
@@ -1151,6 +1155,21 @@ impl OwnedByteStream {
             return Err(dropped_error());
         };
         io.set_zero_copy_reenable_threshold(threshold)
+    }
+
+    /// Roxygen-only (`DIV-038`): every later reset of this stream (`close_with_reset`,
+    /// and the resets its write failures and abandoned writes cause) closes the socket
+    /// without `SO_LINGER` zero, as dropping a Tokio stream does: the kernel still sends
+    /// the bytes already written, then FIN, or RST only if received bytes are unread.
+    /// The transport-side effects of a reset are unchanged: pending reads and writes
+    /// fail, unwritten bytes are discarded, and byte events are cancelled as on a reset.
+    pub fn enable_non_abortive_close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.check_context(context)?;
+        let Some(io) = self.io.upgrade() else {
+            return Err(dropped_error());
+        };
+        io.enable_non_abortive_close();
+        Ok(())
     }
 
     #[cfg(test)]

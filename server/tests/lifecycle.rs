@@ -2024,10 +2024,9 @@ fn multiple_ports() {
     }
 }
 
-/// Held while a test spawns a child process, and by a test whose listeners must refuse
-/// connections once dropped: until it execs, a child holds a copy of every descriptor that was
-/// open when it was spawned, which keeps such a listener accepting.
-static CHILD_SPAWN: Mutex<()> = Mutex::new(());
+/// Until exec, a child inherits open sockets and can delay listener closure or a reset.
+/// Tests that depend on the last socket descriptor closing share this spawn lock.
+pub(super) static CHILD_SPAWN: Mutex<()> = Mutex::new(());
 
 #[test]
 fn shutdown() {
@@ -3782,6 +3781,19 @@ fn owned_http1_rejects_unsupported_factories() {
         start_error(session),
         "owned_http1 does not support lifecycle_observer_factory"
     );
+}
+
+#[test]
+fn non_abortive_close_rejects_tls() {
+    let mut config = tls_config(generated_tls().0);
+    config.session.non_abortive_close = true;
+    match ScopedHttpServer::start(config, echo_factory(Arc::default()), None) {
+        Err(HttpServerError::InvalidConfig(message)) => {
+            assert_eq!(message, "non_abortive_close does not support TLS");
+        }
+        Err(error) => panic!("unexpected server error: {error}"),
+        Ok(_) => panic!("the server started with non_abortive_close and TLS"),
+    }
 }
 
 #[test]

@@ -177,6 +177,17 @@ pub struct ServerSessionConfig {
     /// an ingress pause (flow control, pipelining) defers it. HTTP/2 connections are
     /// unchanged, and `owned_http1` refuses the option.
     pub abort_exchanges_on_eof: bool,
+    /// Roxygen-only, default off (`DIV-038`): a connection the session resets (an
+    /// HTTP/1.1 stream reset, such as a response body error, after writing what it
+    /// already serialized; a connection error; `ServerConnection::cancel`) closes its
+    /// socket without `SO_LINGER` zero, as hyper's server, which never
+    /// resets, closes one by dropping it: the kernel still sends the bytes already
+    /// written, then FIN, or RST only if received bytes are unread. An HTTP/1.1 response
+    /// body error also abandons the output serialized but not yet written, as hyper drops
+    /// its unflushed buffer, so the close never waits on a peer that stopped reading.
+    /// Everything else about the reset is unchanged. Plaintext only: `HttpServer` refuses
+    /// it with TLS credentials, and `serve_transport` for a transport declared TLS.
+    pub non_abortive_close: bool,
     #[cfg(test)]
     pub(crate) accepted_socket_profile: Option<Arc<AcceptedSocketProfile>>,
 }
@@ -219,11 +230,14 @@ impl Default for ServerSessionConfig {
             owned_http1: false,
             owned_http2: false,
             abort_exchanges_on_eof: false,
+            non_abortive_close: false,
             #[cfg(test)]
             accepted_socket_profile: None,
         }
     }
 }
+
+pub(crate) const NON_ABORTIVE_CLOSE_WITH_TLS: &str = "non_abortive_close does not support TLS";
 
 impl ServerSessionConfig {
     /// Refuses what the owned HTTP/1.1 mode cannot honor, instead of ignoring it.
@@ -606,6 +620,19 @@ pub(crate) fn attach_session(
             b"server admission closed",
         ));
     }
+    if config.session.non_abortive_close {
+        match &transport {
+            AcceptedTransport::ByteStream(transport) if !connection.secure => {
+                transport.enable_non_abortive_close(context)?;
+            }
+            AcceptedTransport::ByteStream(_) | AcceptedTransport::Tls(_) => {
+                return Err(HttpError::with_message(
+                    HttpErrorCode::INVALID_STATE_TRANSITION,
+                    NON_ABORTIVE_CLOSE_WITH_TLS.as_bytes(),
+                ));
+            }
+        }
+    }
     if let Some(filter) = config.connection_filter.as_ref() {
         let accepted =
             catch_unwind(AssertUnwindSafe(|| filter.accept(&connection))).unwrap_or(false);
@@ -649,6 +676,7 @@ pub(crate) fn attach_session(
         abort_exchanges_on_eof: config.session.abort_exchanges_on_eof,
         deliver_ingress_before_abort: false,
         unframed_bodiless_http1_requests: false,
+        non_abortive_close: config.session.non_abortive_close,
     };
     if let Some(limits) = transport_limits {
         uniplex.maximum_read_size = uniplex.maximum_read_size.min(limits.maximum_read_size());

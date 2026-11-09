@@ -903,6 +903,7 @@ struct TokioIoShared<S> {
     write_offset: Cell<u64>,
     close_after_shutdown: Cell<bool>,
     close_wait_waker: RefCell<Option<Waker>>,
+    non_abortive_close: Cell<bool>,
 }
 
 // Drop order follows declaration order here and in `TokioIoShared`: the I/O
@@ -929,6 +930,7 @@ impl<S> TokioByteStreamIo<S> {
                 write_offset: Cell::new(0),
                 close_after_shutdown: Cell::new(false),
                 close_wait_waker: RefCell::new(None),
+                non_abortive_close: Cell::new(false),
             }),
             close_drain,
         }
@@ -1117,6 +1119,10 @@ where
         self.retire_stream(true);
     }
 
+    fn enable_non_abortive_close(&self) {
+        self.shared.non_abortive_close.set(true);
+    }
+
     fn enable_zero_copy(
         &self,
         context: &WorkerContext,
@@ -1169,10 +1175,11 @@ where
         retain_transport_panic(
             &mut failure,
             catch_unwind(AssertUnwindSafe(|| {
-                if reset {
-                    if let Some(stream) = self.shared.stream.borrow().as_ref() {
-                        stream.prepare_reset();
-                    }
+                if reset
+                    && !self.shared.non_abortive_close.get()
+                    && let Some(stream) = self.shared.stream.borrow().as_ref()
+                {
+                    stream.prepare_reset();
                 }
             }))
             .err(),

@@ -11,6 +11,9 @@ pub use byte_stream::TransportRetirement;
 pub use byte_stream::TransportRetirementError;
 
 #[cfg(test)]
+static TEST_PROCESS_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 #[path = "../tests/byte_event_delivery.rs"]
 mod byte_event_delivery_tests;
 

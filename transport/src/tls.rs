@@ -2501,14 +2501,19 @@ mod tests {
             return;
         }
 
-        let mut child = Command::new(std::env::current_exe().expect("test binary path"))
-            .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
-            .env(PROVIDER_CHILD_MARKER, &name)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn the provider test child");
+        let mut child = {
+            let _spawn = crate::TEST_PROCESS_SPAWN_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Command::new(std::env::current_exe().expect("test binary path"))
+                .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+                .env(PROVIDER_CHILD_MARKER, &name)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn the provider test child")
+        };
         let stdout = collect_output(child.stdout.take().expect("piped child stdout"));
         let stderr = collect_output(child.stderr.take().expect("piped child stderr"));
         let started = Instant::now();

@@ -1,9 +1,14 @@
 //! One `HttpSessionPool` with the parameters recommended for a router that is
 //! compared with reqwest (most-recently-used reuse, hyper-util's interval
-//! sweep, no session timers, ingress-before-abort (`DIV-033`) and unframed
-//! bodiless requests (`DIV-036`)) against a raw HTTP/1.1 engine: a normal
-//! request, a bodiless one and a truncated response share one connection,
-//! the next request dials another, and that one idles out.
+//! sweep, no session timers, buffered ingress before abort (`DIV-033`), unframed
+//! bodyless requests (`DIV-036`), and non-abortive close (`DIV-038`)) against a
+//! raw HTTP/1.1 engine: a normal
+//! request, a bodiless one and a truncated response share one connection, the
+//! truncated response's bytes precede its error, the next request dials
+//! another, and that one idles out; a request cancelled before its response
+//! head closes its connection with FIN; and a request committed on a reused
+//! connection the engine closed fails unstarted, so the caller retries it on a
+//! fresh connection.
 
 use std::future::Future;
 use std::io::Read;
@@ -14,7 +19,12 @@ use std::net::TcpListener;
 use std::net::TcpStream;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -58,19 +68,44 @@ enum Seen {
     Reset,
 }
 
-/// An HTTP/1.1 engine that accepts `connections` connections and answers each
-/// request with `ok`, except `POST /truncated`, which it answers with 5 of 10
-/// body bytes before it closes the connection. Once every connection closed, it
-/// sends what it saw on each.
-fn engine(connections: usize) -> (SocketAddr, Receiver<Vec<Vec<Seen>>>) {
+/// A raw HTTP/1.1 engine for the router's pool.
+struct Engine {
+    address: SocketAddr,
+    /// What the engine saw on each connection, sent once every one closed.
+    served: Receiver<Vec<Vec<Seen>>>,
+    /// Set once the engine read a `POST /hold` request.
+    hold_seen: Arc<AtomicBool>,
+    /// Lets the engine close (FIN) a connection after its `POST /then-close` reply.
+    #[cfg_attr(
+        fbcode_build,
+        expect(
+            dead_code,
+            reason = "the stale-connection test needs Cargo-only session test hooks"
+        )
+    )]
+    close: Sender<()>,
+}
+
+/// An engine that accepts `connections` connections and answers each request
+/// with `ok`, except `POST /truncated`, which it answers with 5 of 10 body bytes
+/// before it closes the connection; `POST /hold`, which it never answers; and
+/// `POST /then-close`, after whose reply it closes its side (FIN) once told to
+/// and keeps reading. Once every connection closed, it sends what it saw on each.
+fn engine(connections: usize) -> Engine {
     let listener = TcpListener::bind("127.0.0.1:0").expect("engine binds");
     let address = listener.local_addr().expect("engine address");
-    let (sender, receiver) = std::sync::mpsc::channel();
+    let (sender, served) = std::sync::mpsc::channel();
+    let hold_seen = Arc::new(AtomicBool::new(false));
+    let (close, closes) = std::sync::mpsc::channel();
+    let closes = Arc::new(Mutex::new(closes));
+    let held = Arc::clone(&hold_seen);
     std::thread::spawn(move || {
         let served: Vec<_> = (0..connections)
             .map(|_| {
                 let (stream, _) = listener.accept().expect("engine accepts");
-                std::thread::spawn(move || serve(stream))
+                let held = Arc::clone(&held);
+                let closes = Arc::clone(&closes);
+                std::thread::spawn(move || serve(stream, &held, &closes))
             })
             .collect();
         let served = served
@@ -79,10 +114,15 @@ fn engine(connections: usize) -> (SocketAddr, Receiver<Vec<Vec<Seen>>>) {
             .collect();
         let _ = sender.send(served);
     });
-    (address, receiver)
+    Engine {
+        address,
+        served,
+        hold_seen,
+        close,
+    }
 }
 
-fn serve(mut stream: TcpStream) -> Vec<Seen> {
+fn serve(mut stream: TcpStream, hold_seen: &AtomicBool, closes: &Mutex<Receiver<()>>) -> Vec<Seen> {
     let mut seen = Vec::new();
     let mut input = Vec::new();
     let mut buffer = [0; 4096];
@@ -121,12 +161,25 @@ fn serve(mut stream: TcpStream) -> Vec<Seen> {
         }
         let request: Vec<u8> = input.drain(..head_end + body_length).collect();
         let truncated = request.starts_with(b"POST /truncated ");
+        let hold = request.starts_with(b"POST /hold ");
+        let then_close = request.starts_with(b"POST /then-close ");
         seen.push(Seen::Request(request));
+        if hold {
+            hold_seen.store(true, Ordering::SeqCst);
+            continue;
+        }
         stream
             .write_all(if truncated { TRUNCATED } else { OK })
             .expect("engine replies");
         last_write = Instant::now();
-        if truncated {
+        if then_close {
+            closes
+                .lock()
+                .expect("close signal")
+                .recv()
+                .expect("the client asks for the FIN");
+        }
+        if truncated || then_close {
             stream.shutdown(Shutdown::Write).expect("engine closes");
         }
     }
@@ -156,6 +209,7 @@ fn recommended_pool(context: WorkerContext, address: SocketAddr) -> HttpSessionP
             connection_read_timeout: Some(Duration::ZERO),
             deliver_ingress_before_abort: true,
             unframed_bodiless_http1_requests: true,
+            non_abortive_close: true,
             ..SessionParams::default()
         },
     )
@@ -221,6 +275,16 @@ async fn post(
         response.request_started(),
         received,
     )
+}
+
+/// Waits for the engine to report every connection.
+async fn served_by(engine: &Engine) -> Vec<Vec<Seen>> {
+    loop {
+        if let Ok(served) = engine.served.try_recv() {
+            return served;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 async fn read(response: &mut UniplexResponse) -> Vec<Received> {
@@ -302,8 +366,8 @@ where
 fn the_recommended_router_pool_reuses_retires_and_delivers_truncated_responses() {
     for client in on_workers(|context| {
         Box::pin(async move {
-            let (address, engine) = engine(2);
-            let pool = recommended_pool(context, address);
+            let engine = engine(2);
+            let pool = recommended_pool(context, engine.address);
             let exchanges = vec![
                 post(&pool, b"/generate", Some(b"hello")).await,
                 post(&pool, b"/v1/loads", None).await,
@@ -311,12 +375,7 @@ fn the_recommended_router_pool_reuses_retires_and_delivers_truncated_responses()
                 post(&pool, b"/generate", Some(b"again")).await,
             ];
             // The engine reports once its second connection idled out too.
-            let served = loop {
-                if let Ok(served) = engine.try_recv() {
-                    break served;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            };
+            let served = served_by(&engine).await;
             // The session the truncated response failed reports its error to the join.
             let _ = pool.drain_and_join().await;
             (exchanges, served)
@@ -375,6 +434,161 @@ fn the_recommended_router_pool_reuses_retires_and_delivers_truncated_responses()
         assert!(
             idle > IDLE && idle < 3 * IDLE + Duration::from_millis(500),
             "retired after {idle:?}"
+        );
+    }
+}
+
+/// A request cancelled before its response head (the router drops the
+/// response when its client goes away) closes the engine connection with FIN,
+/// as hyper's client does, not with a reset.
+#[test]
+fn the_recommended_router_pool_closes_a_connection_cancelled_before_its_head_with_fin() {
+    for served in on_workers(|context| {
+        Box::pin(async move {
+            let engine = engine(1);
+            let pool = recommended_pool(context, engine.address);
+            let GetSessionResult {
+                reservation,
+                session,
+            } = pool
+                .get_session_with_reservation(CancellationToken::never())
+                .await
+                .expect("acquisition succeeds");
+            let body = roxygen_core::buf_queue::BufQueue::copy_from_slice(b"hello", 5)
+                .expect("bounded body");
+            let request =
+                HttpFixedSource::make_fixed_request(b"/hold", HttpMethod::Post, Some(body))
+                    .expect("test request is valid");
+            let response = session
+                .send_reserved_request(
+                    HttpSourceHolder::new(Box::new(request)),
+                    reservation,
+                    CancellationToken::never(),
+                )
+                .await
+                .expect("request is committed");
+            while !engine.hold_seen.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            drop(response);
+            let _ = session.wait_closed().await;
+            let served = served_by(&engine).await;
+            let _ = pool.drain_and_join().await;
+            served
+        })
+    }) {
+        let [connection] = <[_; 1]>::try_from(served).expect("one connection");
+        assert!(
+            matches!(
+                connection[..],
+                [Seen::Request(ref request), Seen::Closed(_)]
+                    if request.starts_with(b"POST /hold HTTP/1.1\r\n")
+            ),
+            "the engine sees the request, then FIN: {connection:?}"
+        );
+    }
+}
+
+/// What the router's retry loop sees of a request committed on a reused
+/// connection whose engine closed it before the session wrote the request.
+#[cfg(not(fbcode_build))]
+#[derive(Debug, PartialEq)]
+struct StaleAttempt {
+    sequence_number: u64,
+    started: bool,
+    received: Vec<Received>,
+}
+
+/// The stale reused connection of `DIV-035`, with the recommended parameters:
+/// after one exchange the engine closes its side (FIN) while the next request's
+/// session writer is held (the session's `test-hooks` feature), as when that
+/// FIN and the commit fall in one turn. The request fails unstarted on a
+/// reused connection, which is the router's (and hyper-util's) retry signal,
+/// and the retry dials a fresh connection, where it succeeds.
+#[cfg(not(fbcode_build))]
+#[test]
+fn the_recommended_router_pool_signals_a_retry_for_a_request_on_a_stale_reused_connection() {
+    use std::rc::Rc;
+
+    for (attempts, served) in on_workers(|context| {
+        Box::pin(async move {
+            let engine = engine(2);
+            let pool = recommended_pool(context, engine.address);
+            let first = post(&pool, b"/then-close", Some(b"first")).await;
+            let GetSessionResult {
+                reservation,
+                session,
+            } = pool
+                .get_session_with_reservation(CancellationToken::never())
+                .await
+                .expect("acquisition succeeds");
+            let release = Rc::new(tokio::sync::Notify::new());
+            session.hold_writer_for_test(Rc::clone(&release));
+            let body = roxygen_core::buf_queue::BufQueue::copy_from_slice(b"hello", 5)
+                .expect("bounded body");
+            let request =
+                HttpFixedSource::make_fixed_request(b"/generate", HttpMethod::Post, Some(body))
+                    .expect("test request is valid");
+            let mut response = session
+                .send_reserved_request(
+                    HttpSourceHolder::new(Box::new(request)),
+                    reservation,
+                    CancellationToken::never(),
+                )
+                .await
+                .expect("request is committed");
+            engine
+                .close
+                .send(())
+                .expect("the engine waits for the FIN request");
+            // Loopback delivers the FIN at once; the session reads it meanwhile.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            release.notify_one();
+            let received = tokio::time::timeout(Duration::from_secs(2), read(&mut response))
+                .await
+                .expect("the request fails promptly");
+            let stale = StaleAttempt {
+                sequence_number: response.sequence_number,
+                started: response.request_started(),
+                received,
+            };
+            drop(response);
+            // The router's loop: unstarted on a reused connection -> retry.
+            assert!(stale.sequence_number != 0 && !stale.started, "{stale:?}");
+            let retry = post(&pool, b"/generate", Some(b"hello")).await;
+            let _ = pool.drain_and_join().await;
+            let served = served_by(&engine).await;
+            ((first, stale, retry), served)
+        })
+    }) {
+        let ok = || vec![Received::Head(200), Received::Body(b"ok".to_vec())];
+        let (first, stale, retry) = attempts;
+        assert_eq!(first, (0, true, ok()));
+        assert_eq!(
+            stale,
+            StaleAttempt {
+                sequence_number: 1,
+                started: false,
+                received: vec![Received::Error(HttpErrorCode::TRANSPORT_EOF)],
+            },
+            "the request failed unstarted on the reused connection"
+        );
+        assert_eq!(retry, (0, true, ok()), "the retry dials and succeeds");
+        let [stale_connection, fresh] = <[_; 2]>::try_from(served).expect("two connections");
+        assert!(
+            matches!(
+                stale_connection[..],
+                [Seen::Request(ref request), Seen::Closed(_)]
+                    if request.starts_with(b"POST /then-close HTTP/1.1\r\n")
+            ),
+            "nothing reaches the closed connection after its FIN: {stale_connection:?}"
+        );
+        assert_eq!(
+            fresh[0],
+            Seen::Request(
+                b"POST /generate HTTP/1.1\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\nhello"
+                    .to_vec()
+            )
         );
     }
 }

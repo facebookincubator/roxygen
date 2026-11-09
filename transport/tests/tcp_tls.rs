@@ -4857,6 +4857,109 @@ mod tcp_tls {
             }));
     }
 
+    /// More bytes than the peer's 4096-byte receive buffer holds, which the
+    /// accepted stream's large send buffer takes in one write.
+    #[cfg(target_os = "linux")]
+    const UNRECEIVED_BURST: usize = 48 * 1024;
+
+    /// Writes `UNRECEIVED_BURST` bytes on an accepted stream whose peer reads
+    /// nothing until `close_with_reset` has closed it; returns how many bytes the
+    /// peer then read and whether the connection ended with a reset.
+    #[cfg(target_os = "linux")]
+    fn reset_with_bytes_in_flight(non_abortive: bool) -> (usize, bool) {
+        let _spawn = crate::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(LocalSet::new().run_until(async move {
+                let listener = TcpSocket::new_v4().unwrap();
+                // Accepted sockets inherit the listener's send buffer.
+                listener.set_send_buffer_size(256 * 1024).unwrap();
+                listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                let listener = listener.listen(8).unwrap();
+                let peer = TcpSocket::new_v4().unwrap();
+                peer.set_recv_buffer_size(4096).unwrap();
+                let mut peer = peer.connect(listener.local_addr().unwrap()).await.unwrap();
+                let (accepted, _) = listener.accept().await.unwrap();
+                let accepted = accepted.into_std().unwrap();
+                let (worker, driver) = WorkerDriver::new(8).unwrap();
+                let call = worker
+                    .call_local(move |context| async move {
+                        let transport = TcpTransport::from_accepted(
+                            &context,
+                            accepted,
+                            ByteStreamLimits::new(8_000, UNRECEIVED_BURST, 8).unwrap(),
+                        )
+                        .unwrap();
+                        if non_abortive {
+                            transport.enable_non_abortive_close(&context).unwrap();
+                        }
+                        transport
+                            .write(
+                                &context,
+                                BufQueue::from_vec(vec![b'x'; UNRECEIVED_BURST], UNRECEIVED_BURST)
+                                    .unwrap(),
+                                Duration::from_secs(5),
+                                CancellationToken::never(),
+                            )
+                            .await
+                            .unwrap();
+                        transport.close_with_reset(&context).unwrap();
+                    })
+                    .unwrap();
+                let driver_task = tokio::task::spawn_local(driver);
+                time::timeout(Duration::from_secs(5), call)
+                    .await
+                    .expect("the write and the reset finish")
+                    .unwrap();
+                worker.begin_shutdown();
+                driver_task.await.unwrap();
+                let mut received = 0;
+                loop {
+                    let mut chunk = [0; 4096];
+                    let read = time::timeout(Duration::from_secs(5), peer.read(&mut chunk))
+                        .await
+                        .expect("the connection ends");
+                    match read {
+                        Ok(0) => return (received, false),
+                        Ok(read) => received += read,
+                        Err(error) => {
+                            assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+                            return (received, true);
+                        }
+                    }
+                }
+            }))
+    }
+
+    /// Pins the default: the linger-zero close discards the bytes still in the
+    /// send buffer and resets the peer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tcp_reset_discards_bytes_the_peer_has_not_received() {
+        let (received, reset) = reset_with_bytes_in_flight(false);
+        assert!(reset, "the abortive close resets the peer");
+        assert!(
+            received < UNRECEIVED_BURST,
+            "the bytes left in the send buffer are discarded: {received} arrived"
+        );
+    }
+
+    /// With `enable_non_abortive_close`, a reset closes the socket as dropping a
+    /// Tokio stream does: the kernel still sends every written byte, then FIN.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tcp_reset_with_non_abortive_close_sends_written_bytes_then_fin() {
+        assert_eq!(
+            reset_with_bytes_in_flight(true),
+            (UNRECEIVED_BURST, false),
+            "every written byte arrives, then EOF"
+        );
+    }
+
     /// Reads until EOF, checking each read's bound, and returns the bytes and
     /// the size of every read.
     async fn read_to_eof(
