@@ -2203,12 +2203,14 @@ fn buffered_responses_survive_peer_reset_and_native_write_failure_until_consumed
                             complete_credit_wait(|| wire.borrow().close == FixtureClose::Reset)
                                 .await;
                         }
+                        // A peer RST_STREAM(NO_ERROR) after the whole response stops the
+                        // upload with NO_ERROR (`DIV-050`).
                         assert_eq!(
                             probe.stops.borrow().as_slice(),
                             &[Some(if write_failure {
                                 HttpErrorCode::TRANSPORT_WRITE_ERROR
                             } else {
-                                HttpErrorCode::CANCEL
+                                HttpErrorCode::NO_ERROR
                             })]
                         );
                         assert!(response.1.readable());
@@ -2255,6 +2257,194 @@ fn buffered_responses_survive_peer_reset_and_native_write_failure_until_consumed
             })
         });
     }
+}
+
+/// What a submitter sees when the origin resets its stream with RST_STREAM(NO_ERROR)
+/// while the request upload is still open.
+struct NoErrorReset {
+    /// The upload source's `stop_reading` codes.
+    stops: Vec<Option<HttpErrorCode>>,
+    /// The response receipt once the upload is retired.
+    receipt: Option<Result<(), HttpErrorCode>>,
+    /// The response status and its body events through EOM, or the first read error.
+    read: Result<(u16, Vec<ReadEvent>), HttpErrorCode>,
+    /// RST_STREAM frames the session wrote.
+    resets: Vec<(StreamId, H2ErrorCode)>,
+}
+
+/// Submits a POST whose upload stays open. Once the upload is being read, the origin
+/// sends `response`, whose body is one byte, in one read. Once that byte has arrived
+/// (and, if `complete`, the response has ended), the origin resets the stream with
+/// RST_STREAM(NO_ERROR) in a separate read.
+fn no_error_reset_case(
+    complete: bool,
+    response: impl FnOnce(&mut Http2Codec, StreamId) -> Vec<u8> + Send + 'static,
+) -> NoErrorReset {
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let stream = StreamId::new(1);
+            let mut peer = Http2Codec::new(TransportDirection::Downstream);
+            let respond = Arc::new(tokio::sync::Notify::new());
+            let reset = Arc::new(tokio::sync::Notify::new());
+            let response = response(&mut peer, stream);
+            let reset_bytes = eligibility_frame(
+                &mut peer,
+                EgressFrame::Reset {
+                    stream,
+                    code: H2ErrorCode::NO_ERROR,
+                },
+            );
+            let (transport, wire) = FixtureTransport::new([
+                FixtureRead::Data(server_settings_bytes(1)),
+                FixtureRead::WaitData(Arc::clone(&respond), response),
+                FixtureRead::WaitData(Arc::clone(&reset), reset_bytes),
+            ]);
+            let mut config = options(context, transport);
+            config.http2.max_concurrent_outgoing_streams = 1;
+            let (session, handle) = OwnedH2UpstreamSession::new(config).unwrap();
+            let (upload, probe) = Upload::new(0, 1).held();
+            let submission = handle.reserve_request().unwrap().submit(
+                request_head(HttpMethod::Post, false, None),
+                upload,
+                CancellationToken::never(),
+            );
+            let outcome = RefCell::new(None);
+            let run = drive(
+                session,
+                &handle,
+                &[Arc::clone(&respond), Arc::clone(&reset)],
+                async {
+                    let (_, mut source, _request) = submission.await.unwrap().into_source_parts();
+                    complete_credit_wait(|| probe.reads.get() == 1).await;
+                    let receipt = source.ingress_completion().unwrap();
+                    respond.notify_one();
+                    if complete {
+                        receipt.wait().await.unwrap();
+                    } else {
+                        complete_credit_wait(|| receipt.body_bytes_received() == 1).await;
+                    }
+                    assert_eq!(probe.drops.get(), 0, "the upload is open before the reset");
+                    reset.notify_one();
+                    complete_credit_wait(|| probe.drops.get() == 1).await;
+                    let stops = probe.stops.borrow().clone();
+                    let receipt = receipt
+                        .snapshot()
+                        .map(|result| result.map(drop).map_err(|error| error.code()));
+                    let read = async {
+                        let mut head = source.read_header_event().await?;
+                        let status = head.headers_mut().status_code().unwrap();
+                        let mut events = Vec::new();
+                        let mut eom = head.eom();
+                        while !eom {
+                            let event = source.read_body_event(u32::MAX).await?;
+                            eom = event.eom();
+                            match event.into_kind() {
+                                HttpBodyEventKind::Body(bytes) => {
+                                    let length = bytes.chain_length();
+                                    let bytes = bytes.coalesce(length).unwrap().to_vec();
+                                    events.push(("body", bytes, eom));
+                                }
+                                HttpBodyEventKind::Trailers(trailers) => events.push((
+                                    "trailers",
+                                    trailers.get_single_or_empty(b"grpc-status").to_vec(),
+                                    eom,
+                                )),
+                                _ => panic!("unexpected response body event"),
+                            }
+                        }
+                        Ok::<_, HttpError>((status, events))
+                    }
+                    .await
+                    .map_err(|error| error.code());
+                    drop(source);
+                    complete_credit_wait(|| handle.is_idle()).await;
+                    let resets = decode_client_frames(&wire.borrow().writes.concat()).resets;
+                    *outcome.borrow_mut() = Some(NoErrorReset {
+                        stops,
+                        receipt,
+                        read,
+                        resets,
+                    });
+                },
+            )
+            .await;
+            cancelled(run);
+            outcome.into_inner().unwrap()
+        })
+    })
+}
+
+#[test]
+fn peer_no_error_reset_after_response_trailers_stops_the_upload_with_no_error() {
+    let outcome = no_error_reset_case(true, |peer, stream| {
+        let mut wire = response_head(peer, stream, 200, false, None);
+        wire.extend(eligibility_frame(
+            peer,
+            EgressFrame::Body {
+                stream,
+                body: queue(b"r"),
+                padding: None,
+                end_stream: false,
+            },
+        ));
+        let mut trailers = HttpHeaders::new();
+        trailers.add("grpc-status", "0");
+        wire.extend(eligibility_frame(
+            peer,
+            EgressFrame::Trailers {
+                stream,
+                trailers: &trailers,
+            },
+        ));
+        wire
+    });
+    assert_eq!(
+        outcome.stops,
+        [Some(HttpErrorCode::NO_ERROR)],
+        "a reset after the trailers ended the response stops the upload with NO_ERROR"
+    );
+    assert_eq!(outcome.receipt, Some(Ok(())));
+    assert_eq!(
+        outcome.read,
+        Ok((
+            200,
+            vec![
+                ("body", b"r".to_vec(), false),
+                ("trailers", b"0".to_vec(), true),
+            ]
+        )),
+        "the whole response, trailers included, stays readable"
+    );
+    assert!(outcome.resets.is_empty(), "a peer reset is not echoed");
+}
+
+#[test]
+fn peer_no_error_reset_mid_response_stops_the_upload_with_cancel() {
+    let outcome = no_error_reset_case(false, |peer, stream| {
+        let mut wire = response_head(peer, stream, 200, false, None);
+        wire.extend(eligibility_frame(
+            peer,
+            EgressFrame::Body {
+                stream,
+                body: queue(b"r"),
+                padding: None,
+                end_stream: false,
+            },
+        ));
+        wire
+    });
+    assert_eq!(
+        outcome.stops,
+        [Some(HttpErrorCode::CANCEL)],
+        "a reset before the response ended stops the upload with CANCEL"
+    );
+    assert_eq!(outcome.receipt, Some(Err(HttpErrorCode::CANCEL)));
+    assert_eq!(
+        outcome.read,
+        Err(HttpErrorCode::CANCEL),
+        "the response fails"
+    );
+    assert!(outcome.resets.is_empty(), "a peer reset is not echoed");
 }
 
 #[test]

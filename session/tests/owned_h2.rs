@@ -2272,6 +2272,452 @@ fn split_read_peer_reset_cancels_the_started_exchange() {
     });
 }
 
+/// A client's RST_STREAM(NO_ERROR) after its whole request reaches the exchange as
+/// `CANCEL`. Only upstream streams keep `NO_ERROR` after a complete response (`DIV-050`).
+#[test]
+fn client_no_error_reset_after_its_whole_request_cancels_the_exchange() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let release_reset = Arc::new(tokio::sync::Notify::new());
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let reset = eligibility_frame(
+                &mut peer,
+                EgressFrame::Reset {
+                    stream: StreamId::new(1),
+                    code: H2ErrorCode::NO_ERROR,
+                },
+            );
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(input),
+                FixtureRead::WaitData(Arc::clone(&release_reset), reset),
+            ]);
+            let gate = Rc::new(OwnerPollGate::default());
+            let (mut application, probes) = Application::new(vec![Reply::Body(4)]);
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            exercise(session, &handle, &[Arc::clone(&release_reset)], async {
+                complete_credit_wait(|| gate.polls.get() > 0).await;
+                let probe = Rc::clone(&probes.borrow()[0]);
+                assert_eq!(probe.requested.get(), 1, "the exchange started");
+                assert!(probe.request_eom.get(), "the whole request arrived");
+
+                release_reset.notify_one();
+                complete_credit_wait(|| probe.dropped.get() == 1).await;
+                assert_eq!(
+                    probe.cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::CANCEL, true)]
+                );
+                assert_eq!(probe.completed.get(), 0);
+                let decoded = decode_server_frames(&state.borrow().writes.concat());
+                assert!(decoded.header_streams.is_empty());
+                assert!(decoded.resets.is_empty(), "a peer reset is not echoed");
+                assert!(decoded.errors.is_empty());
+            })
+            .await;
+        })
+    });
+}
+
+/// When the origin's RST_STREAM(NO_ERROR) reaches the forwarding case's upstream session.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OriginReset {
+    /// In the read that carries the whole response.
+    WithTheResponse,
+    /// In a later read, once the client already has the whole forwarded response.
+    AfterTheForwardedResponse,
+}
+
+/// A downstream session forwards a POST whose upload stays open to an upstream session,
+/// with the downstream request's ingress body as the upstream upload. The origin sends
+/// the whole response with trailers, then RST_STREAM(NO_ERROR). The client gets the
+/// response head, body and trailers, then RST_STREAM(NO_ERROR) (`DIV-050`).
+#[test]
+fn forwarded_response_survives_an_origin_no_error_reset_after_its_trailers() {
+    forwarded_origin_no_error_reset_case(OriginReset::WithTheResponse);
+}
+
+/// As above, but the origin's reset arrives after the client got the whole forwarded
+/// response. The `NO_ERROR` stop reaches the client's stream after its END_STREAM, so,
+/// as for any request source stopped with `NO_ERROR` once its response ended, the client
+/// gets no reset, RST_STREAM(CANCEL) included, and the rest of its upload is read and
+/// discarded on a healthy connection (`DIV-050`).
+#[test]
+fn forwarded_response_then_a_late_origin_no_error_reset_sends_the_client_no_reset() {
+    forwarded_origin_no_error_reset_case(OriginReset::AfterTheForwardedResponse);
+}
+
+fn forwarded_origin_no_error_reset_case(origin_reset: OriginReset) {
+    use roxygen_core::stream_source::HttpIngressBody;
+
+    use crate::owned_h2::OwnedH2UpstreamHandle;
+    use crate::owned_h2::OwnedH2UpstreamRequest;
+    use crate::owned_h2::OwnedH2UpstreamSubmission;
+
+    #[derive(Default)]
+    struct ForwardProbe {
+        cancelled: RefCell<Vec<(HttpErrorCode, bool)>>,
+        response_complete: Cell<usize>,
+        completed: Cell<usize>,
+    }
+
+    struct ForwardApplication {
+        upstream: OwnedH2UpstreamHandle,
+        probe: Rc<ForwardProbe>,
+    }
+
+    /// The upstream response source, and the request control kept for its lifetime.
+    type Forwarded = (HttpSourceHolder, OwnedH2UpstreamRequest);
+
+    struct ForwardExchange {
+        upstream: OwnedH2UpstreamHandle,
+        submission: Option<OwnedH2UpstreamSubmission>,
+        response: Option<Forwarded>,
+        head: Option<LocalSourceFuture<Result<HttpHeaderEvent, HttpError>>>,
+        body: Option<LocalSourceFuture<Result<HttpBodyEvent, HttpError>>>,
+        probe: Rc<ForwardProbe>,
+    }
+
+    impl OwnedH2Application for ForwardApplication {
+        type Exchange = ForwardExchange;
+
+        fn new_exchange(&self, _stream: StreamId, _ingress: IngressCompletion) -> ForwardExchange {
+            ForwardExchange {
+                upstream: self.upstream.clone(),
+                submission: None,
+                response: None,
+                head: None,
+                body: None,
+                probe: Rc::clone(&self.probe),
+            }
+        }
+    }
+
+    impl OwnedH2Exchange for ForwardExchange {
+        fn request(&mut self, _head: Box<HttpMessage>, _body: HttpStreamSourceOwner, _eom: bool) {
+            panic!("the owned driver supplies the ingress body")
+        }
+
+        fn request_body(&mut self, mut head: Box<HttpMessage>, body: HttpIngressBody, eom: bool) {
+            assert_eq!(head.method().unwrap(), Some(HttpMethod::Post));
+            assert!(!eom, "the upload is still open");
+            let submission = self.upstream.reserve_request().unwrap().submit(
+                committed_test_headers(b"/forward", false),
+                body,
+                CancellationToken::never(),
+            );
+            self.submission = Some(submission);
+        }
+
+        fn poll_headers(
+            &mut self,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+            if let Some(submission) = &mut self.submission {
+                let response = std::task::ready!(Pin::new(submission).poll(context))?;
+                self.submission = None;
+                let (_, source, control) = response.into_source_parts();
+                self.response = Some((source, control));
+            }
+            let (source, _) = self.response.as_mut().expect("the upstream response");
+            let head = self.head.get_or_insert_with(|| source.read_header_event());
+            let mut head = std::task::ready!(head.as_mut().poll(context))?;
+            self.head = None;
+            let mut response = HttpMessage::new();
+            response
+                .set_status_code(head.headers_mut().status_code().unwrap())
+                .unwrap();
+            response.set_http_version(1, 1);
+            Poll::Ready(Ok(HttpHeaderEvent::new(response, head.eom()).unwrap()))
+        }
+
+        fn poll_body(
+            &mut self,
+            context: &mut Context<'_>,
+            maximum: u32,
+        ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+            let (source, _) = self.response.as_mut().expect("the upstream response");
+            let body = self
+                .body
+                .get_or_insert_with(|| source.read_body_event(maximum));
+            let event = std::task::ready!(body.as_mut().poll(context));
+            self.body = None;
+            Poll::Ready(event)
+        }
+
+        fn cancel(&mut self, error: &HttpError, peer_reset: bool) {
+            self.probe
+                .cancelled
+                .borrow_mut()
+                .push((error.code(), peer_reset));
+            self.head = None;
+            self.body = None;
+            self.response = None;
+            self.submission = None;
+        }
+
+        fn response_complete(&mut self) {
+            self.probe
+                .response_complete
+                .set(self.probe.response_complete.get() + 1);
+        }
+
+        fn complete(self) {
+            self.probe.completed.set(self.probe.completed.get() + 1);
+        }
+    }
+
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let mut client = Http2Codec::new(TransportDirection::Upstream);
+            let mut request = eligibility_frame(&mut client, EgressFrame::ConnectionPreface);
+            request.extend(transcript_settings(&mut client));
+            let stream = client.create_stream();
+            let mut head = HttpMessage::new();
+            head.set_method(HttpMethod::Post).unwrap();
+            head.set_url(b"/forward", false).unwrap();
+            head.set_http_version(1, 1);
+            head.headers_mut().set(HttpHeaderCode::Host, b"example.com");
+            request.extend(eligibility_frame(
+                &mut client,
+                EgressFrame::Headers {
+                    stream,
+                    message: &head,
+                    end_stream: false,
+                    extra_headers: None,
+                },
+            ));
+            request.extend(eligibility_frame(
+                &mut client,
+                EgressFrame::Body {
+                    stream,
+                    body: queue(b"up"),
+                    padding: None,
+                    end_stream: false,
+                },
+            ));
+            let upload_rest = Arc::new(tokio::sync::Notify::new());
+            let mut client_reads = vec![FixtureRead::Data(request)];
+            if origin_reset == OriginReset::AfterTheForwardedResponse {
+                // The rest of the client's upload, then a PING whose ACK shows that the
+                // session has read it.
+                let mut rest = eligibility_frame(
+                    &mut client,
+                    EgressFrame::Body {
+                        stream,
+                        body: queue(b"rest"),
+                        padding: None,
+                        end_stream: true,
+                    },
+                );
+                rest.extend(eligibility_frame(
+                    &mut client,
+                    EgressFrame::PingRequest { data: Some(45) },
+                ));
+                client_reads.push(FixtureRead::WaitData(Arc::clone(&upload_rest), rest));
+            }
+            let (downstream_transport, downstream_wire) = FixtureTransport::new(client_reads);
+
+            let mut origin = Http2Codec::new(TransportDirection::Downstream);
+            let origin_stream = StreamId::new(1);
+            let mut status = HttpMessage::new();
+            status.set_status_code(200).unwrap();
+            status.set_http_version(1, 1);
+            let mut response = eligibility_frame(
+                &mut origin,
+                EgressFrame::Headers {
+                    stream: origin_stream,
+                    message: &status,
+                    end_stream: false,
+                    extra_headers: None,
+                },
+            );
+            response.extend(eligibility_frame(
+                &mut origin,
+                EgressFrame::Body {
+                    stream: origin_stream,
+                    body: queue(b"reply"),
+                    padding: None,
+                    end_stream: false,
+                },
+            ));
+            let mut trailers = HttpHeaders::new();
+            trailers.add("grpc-status", "0");
+            response.extend(eligibility_frame(
+                &mut origin,
+                EgressFrame::Trailers {
+                    stream: origin_stream,
+                    trailers: &trailers,
+                },
+            ));
+            let reset = eligibility_frame(
+                &mut origin,
+                EgressFrame::Reset {
+                    stream: origin_stream,
+                    code: H2ErrorCode::NO_ERROR,
+                },
+            );
+            let respond = Arc::new(tokio::sync::Notify::new());
+            let late_reset = Arc::new(tokio::sync::Notify::new());
+            let mut reads = vec![FixtureRead::Data(server_settings_bytes(1))];
+            match origin_reset {
+                OriginReset::WithTheResponse => {
+                    response.extend(reset);
+                    reads.push(FixtureRead::WaitData(Arc::clone(&respond), response));
+                }
+                OriginReset::AfterTheForwardedResponse => {
+                    reads.push(FixtureRead::WaitData(Arc::clone(&respond), response));
+                    reads.push(FixtureRead::WaitData(Arc::clone(&late_reset), reset));
+                }
+            }
+            let (upstream_transport, upstream_wire) = FixtureTransport::new(reads);
+            let mut upstream_config = options(context.clone(), upstream_transport);
+            upstream_config.io.drain_request_body_on_drop = false;
+            upstream_config.http2.settings = vec![CodecSetting {
+                identifier: SettingsId::EnablePush.as_u16(),
+                value: 0,
+            }];
+            upstream_config.http2.double_goaway_drain = false;
+            let (upstream, upstream_handle) = OwnedH2UpstreamSession::new(upstream_config).unwrap();
+            let probe = Rc::new(ForwardProbe::default());
+            let application = ForwardApplication {
+                upstream: upstream_handle.clone(),
+                probe: Rc::clone(&probe),
+            };
+            let (downstream, downstream_handle) =
+                OwnedH2Session::new(application, options(context, downstream_transport)).unwrap();
+
+            let operation = async {
+                // The origin answers once the upstream request and its first upload bytes
+                // are on the wire, while the client's upload is still open.
+                wait_for_written(&upstream_wire, |wire| {
+                    wire.count(FrameType::HEADERS, 0) == 1 && wire.count(FrameType::DATA, 0) == 1
+                })
+                .await;
+                respond.notify_one();
+                let headers = FrameType::HEADERS.as_u8();
+                if origin_reset == OriginReset::AfterTheForwardedResponse {
+                    wait_for_written(&downstream_wire, |wire| {
+                        wire.count(FrameType::HEADERS, END_STREAM) == 1
+                    })
+                    .await;
+                    settle_turns(DRIVE_LIMIT).await;
+                    assert_eq!(
+                        stream_frame_kinds(&downstream_wire.borrow().writes.concat(), 1),
+                        [
+                            (headers, END_HEADERS),
+                            (FrameType::DATA.as_u8(), 0),
+                            (headers, END_HEADERS | END_STREAM),
+                        ],
+                        "the client has the whole response before the origin's reset"
+                    );
+                    assert_eq!(probe.completed.get(), 0, "the upload is still open");
+                    late_reset.notify_one();
+                    assert!(
+                        writer_drive_until(|| {
+                            probe.completed.get() + probe.cancelled.borrow().len() != 0
+                        })
+                        .await,
+                        "the exchange ends once the origin's reset stops its upload"
+                    );
+                    assert_eq!(probe.completed.get(), 1, "the exchange completes");
+                    upload_rest.notify_one();
+                    wait_for_written(&downstream_wire, |wire| {
+                        wire.count(FrameType::PING, ACK) == 1
+                    })
+                    .await;
+                } else {
+                    wait_for_written(&downstream_wire, |wire| {
+                        wire.count(FrameType::RST_STREAM, 0) == 1
+                    })
+                    .await;
+                }
+                settle_turns(DRIVE_LIMIT).await;
+                let wire = downstream_wire.borrow().writes.concat();
+                let decoded = decode_server_frames(&wire);
+                let mut client_stream = vec![
+                    (headers, END_HEADERS),
+                    (FrameType::DATA.as_u8(), 0),
+                    (headers, END_HEADERS | END_STREAM),
+                ];
+                if origin_reset == OriginReset::WithTheResponse {
+                    assert_eq!(
+                        decoded.resets,
+                        [(StreamId::new(1), H2ErrorCode::NO_ERROR)],
+                        "the client's stream ends with RST_STREAM(NO_ERROR), not CANCEL"
+                    );
+                    client_stream.push((FrameType::RST_STREAM.as_u8(), 0));
+                } else {
+                    assert!(
+                        decoded.resets.is_empty(),
+                        "a stop after the client's stream ended sends no reset: {:?}",
+                        decoded.resets
+                    );
+                    assert_eq!(
+                        decoded.ping_replies,
+                        [45],
+                        "the rest of the upload was read"
+                    );
+                    assert!(decoded.goaways.is_empty());
+                }
+                assert_eq!(
+                    stream_frame_kinds(&wire, 1),
+                    client_stream,
+                    "the response head, body and trailers, then any reset"
+                );
+                assert_eq!(decoded.header_statuses, [(StreamId::new(1), 200)]);
+                assert_eq!(decoded.body_data, b"reply");
+                assert_eq!(
+                    trailer_fields(&wire, 1).expect("trailers end the client's stream"),
+                    [HpackHeader::new("grpc-status", "0")]
+                );
+                assert!(decoded.errors.is_empty());
+                assert!(probe.cancelled.borrow().is_empty());
+                assert_eq!(probe.response_complete.get(), 1);
+                let upstream_resets =
+                    decode_client_frames(&upstream_wire.borrow().writes.concat()).resets;
+                assert!(
+                    upstream_resets.is_empty(),
+                    "the origin's reset is not echoed"
+                );
+            };
+            let script = async {
+                let outcome = eligibility_catch_unwind(tokio::time::timeout(
+                    Duration::from_secs(5),
+                    operation,
+                ))
+                .await;
+                // The scripted reads wait on these, so a failed check still lets both
+                // sessions join.
+                for gate in [&respond, &late_reset, &upload_rest] {
+                    gate.notify_one();
+                }
+                downstream_handle.cancel();
+                upstream_handle.cancel();
+                outcome
+            };
+            let (downstream_run, upstream_run, outcome) =
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    tokio::join!(downstream.run(), upstream.run(), script)
+                })
+                .await
+                .expect("both cancelled sessions join");
+            match outcome {
+                Ok(result) => result.expect("the forwarded exchange made progress"),
+                Err(payload) => resume_unwind(payload),
+            }
+            for run in [downstream_run.map(drop), upstream_run.map(drop)] {
+                assert_eq!(
+                    run.expect_err("the forwarding fixture ends by cancellation")
+                        .code(),
+                    HttpErrorCode::CORO_CANCELLED
+                );
+            }
+        })
+    });
+}
+
 #[test]
 fn same_read_client_goaway_below_the_stream_does_not_preempt_its_start() {
     run_on_worker(|context| {

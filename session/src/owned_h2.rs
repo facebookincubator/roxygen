@@ -3310,15 +3310,29 @@ where
                     return actions.into();
                 }
                 let code = h2_error_code_to_http_error_code(code);
-                let code = if code == HttpErrorCode::NO_ERROR {
-                    HttpErrorCode::CANCEL
-                } else {
-                    code
-                };
                 if let Some(observation) = self.state.observation.as_deref() {
-                    observation.push(LifecycleEvent::PeerReset { stream, code });
+                    // Observers are downstream-only (`DIV-051`) and see a peer's NO_ERROR
+                    // as CANCEL.
+                    let observed = if code == HttpErrorCode::NO_ERROR {
+                        HttpErrorCode::CANCEL
+                    } else {
+                        code
+                    };
+                    observation.push(LifecycleEvent::PeerReset {
+                        stream,
+                        code: observed,
+                    });
                 }
                 if let Some(owner) = self.streams.get_mut(&stream) {
+                    // `DIV-050`: once the whole response has arrived, an upstream peer's
+                    // NO_ERROR stops the upload without error (RFC 9113 §8.1).
+                    let code = if code == HttpErrorCode::NO_ERROR
+                        && !(UPSTREAM && owner.wire_ingress_complete)
+                    {
+                        HttpErrorCode::CANCEL
+                    } else {
+                        code
+                    };
                     // The owner takes `peer_reset` when it applies it; `ingress_rejected` stays.
                     let first_reset = !owner.ingress_rejected;
                     owner.ingress_rejected = true;
