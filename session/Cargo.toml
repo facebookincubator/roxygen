@@ -22,7 +22,7 @@ ferroxygen_transport = { path = "../transport" }
 foldhash = "0.2.0"
 futures = "0.3.34"
 parking_lot = "0.13.0"
-smallvec = { version = "1.16.4", features = ["const_generics", "union"] }
+smallvec = { version = "1.16.5", features = ["const_generics", "union"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["macros", "rt", "sync", "time"] }
 
