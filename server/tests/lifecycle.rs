@@ -1,3 +1,4 @@
+use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -20,6 +21,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::mpsc::TryRecvError;
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 use bytes::Bytes;
 use roxygen_codec::CodecSetting;
@@ -77,6 +79,7 @@ use tokio::time::timeout;
 
 use crate::acceptor::AcceptedConnectionObserver;
 use crate::acceptor::ConnectionInfo;
+use crate::acceptor::ServerSessionConfig;
 use crate::acceptor::TlsHandshakeObserver;
 use crate::acceptor::http2_session_config;
 use crate::scoped_server::ScopedHttpServer;
@@ -484,11 +487,8 @@ impl Drop for BoundedServer {
     }
 }
 
-fn tls_request(
-    address: SocketAddr,
-    certificate: &[u8],
-    request: &[u8],
-) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+/// An HTTP/1.1 TLS client of `localhost` that trusts only `certificate`.
+fn tls_client(certificate: &[u8]) -> ClientConnection {
     let mut roots = RootCertStore::empty();
     roots
         .add(CertificateDer::from(certificate.to_vec()))
@@ -497,15 +497,22 @@ fn tls_request(
         .with_root_certificates(roots)
         .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    let connection = ClientConnection::new(
+    ClientConnection::new(
         Arc::new(config),
         ServerName::try_from("localhost".to_owned()).unwrap(),
     )
-    .unwrap();
+    .unwrap()
+}
+
+fn tls_request(
+    address: SocketAddr,
+    certificate: &[u8],
+    request: &[u8],
+) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     let socket = TcpStream::connect_timeout(&address, REQUEST_TIMEOUT)?;
     socket.set_read_timeout(Some(REQUEST_TIMEOUT))?;
     socket.set_write_timeout(Some(REQUEST_TIMEOUT))?;
-    let mut stream = StreamOwned::new(connection, socket);
+    let mut stream = StreamOwned::new(tls_client(certificate), socket);
     stream.write_all(request)?;
     let mut response = Vec::new();
     if let Err(error) = stream.read_to_end(&mut response)
@@ -1012,6 +1019,7 @@ struct HandshakeObserver {
     accepts: AtomicUsize,
     successes: AtomicUsize,
     errors: AtomicUsize,
+    read_timeouts: AtomicUsize,
 }
 
 impl TlsHandshakeObserver for HandshakeObserver {
@@ -1023,8 +1031,11 @@ impl TlsHandshakeObserver for HandshakeObserver {
         self.successes.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn on_error(&self, _error: &HttpError) {
+    fn on_error(&self, error: &HttpError) {
         self.errors.fetch_add(1, Ordering::Relaxed);
+        if error.code() == HttpErrorCode::READ_TIMEOUT {
+            self.read_timeouts.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1044,6 +1055,300 @@ fn tls_logging_callback_invoked() {
     assert_eq!(observer.accepts.load(Ordering::Relaxed), 1);
     assert_eq!(observer.successes.load(Ordering::Relaxed), 1);
     assert_eq!(observer.errors.load(Ordering::Relaxed), 0);
+}
+
+/// A TCP client that never sends its `ClientHello`.
+struct SilentClient {
+    stream: TcpStream,
+    started: Instant,
+}
+
+impl SilentClient {
+    fn connect(address: SocketAddr) -> Self {
+        let started = Instant::now();
+        let stream = TcpStream::connect_timeout(&address, REQUEST_TIMEOUT).unwrap();
+        Self { stream, started }
+    }
+
+    /// How long after it began connecting the server closed the connection, or `None` if the
+    /// connection stays open for `wait` more.
+    fn closed_within(&mut self, wait: Duration) -> Option<Duration> {
+        self.stream.set_read_timeout(Some(wait)).unwrap();
+        match self.stream.read(&mut [0_u8; 1]) {
+            Ok(0) => Some(self.started.elapsed()),
+            Ok(_) => panic!("the server wrote to a client that never sent a ClientHello"),
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                None
+            }
+            Err(_) => Some(self.started.elapsed()),
+        }
+    }
+}
+
+/// Waits up to `REQUEST_TIMEOUT` for `counter` to reach `expected`, and returns its value.
+fn wait_for_count(counter: &AtomicUsize, expected: usize) -> usize {
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    while counter.load(Ordering::Relaxed) < expected && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    counter.load(Ordering::Relaxed)
+}
+
+/// Starts a TLS server offering `alpn` with `session`, and returns its handshake observer and
+/// certificate.
+fn start_tls_observed(
+    session: ServerSessionConfig,
+    alpn: &[u8],
+) -> (ScopedHttpServer, Arc<HandshakeObserver>, Vec<u8>) {
+    let (options, certificate) = generated_tls_with_alpn([alpn]);
+    let observer = Arc::new(HandshakeObserver::default());
+    let config = ServerConfig {
+        session,
+        tls_observer: Some(observer.clone()),
+        ..tls_config(options)
+    };
+    let server = start_tls(config, Arc::new(HandlerStats::default()), None);
+    (server, observer, certificate)
+}
+
+/// Asserts that the server closes a client that never starts its handshake no sooner than
+/// `deadline` after it connected, and reports one `READ_TIMEOUT`.
+fn assert_silent_client_times_out(
+    server: &ScopedHttpServer,
+    observer: &HandshakeObserver,
+    deadline: Duration,
+) {
+    let mut client = SilentClient::connect(server.address().unwrap());
+    let closed = client
+        .closed_within(Duration::from_secs(5))
+        .expect("the handshake deadline closes a silent client within 5 s");
+    assert!(
+        closed >= deadline,
+        "closed after {closed:?}, before the {deadline:?} deadline"
+    );
+    assert_eq!(
+        wait_for_count(&observer.read_timeouts, 1),
+        1,
+        "the observer receives one READ_TIMEOUT"
+    );
+    assert_eq!(observer.errors.load(Ordering::Relaxed), 1);
+    assert_eq!(observer.accepts.load(Ordering::Relaxed), 0);
+}
+
+/// A handshake deadline that a real handshake meets even in a sanitized build.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// An untimed session configuration with the given owned modes on.
+fn untimed_owned_session(owned_http1: bool, owned_http2: bool) -> ServerSessionConfig {
+    ServerSessionConfig {
+        owned_http2,
+        ..untimed_session(owned_http1)
+    }
+}
+
+#[test]
+fn tls_handshake_timeout_is_independent_of_connection_idle_timeout() {
+    for idle in [Duration::ZERO, Duration::from_secs(10)] {
+        let defaults = ServerSessionConfig {
+            connection_idle_timeout: idle,
+            ..ServerSessionConfig::default()
+        };
+        assert_eq!(defaults.tls_handshake_timeout, Duration::from_secs(60));
+        for handshake in [Duration::ZERO, Duration::from_millis(200)] {
+            let session = ServerSessionConfig {
+                tls_handshake_timeout: handshake,
+                ..defaults.clone()
+            };
+            assert_eq!(session.tls_handshake_timeout, handshake);
+        }
+    }
+}
+
+#[test]
+fn tls_handshake_timeout_bounds_a_silent_client_independently_of_idle() {
+    let deadline = Duration::from_millis(200);
+    let (server, observer, _) = start_tls_observed(
+        ServerSessionConfig {
+            connection_idle_timeout: Duration::from_secs(30),
+            tls_handshake_timeout: deadline,
+            ..ServerSessionConfig::default()
+        },
+        b"http/1.1",
+    );
+    assert_silent_client_times_out(&server, &observer, deadline);
+}
+
+#[test]
+fn tls_handshake_default_is_not_shortened_by_the_idle_timeout() {
+    let idle = Duration::from_millis(200);
+    let (server, observer, _) = start_tls_observed(
+        ServerSessionConfig {
+            connection_idle_timeout: idle,
+            ..ServerSessionConfig::default()
+        },
+        b"http/1.1",
+    );
+    let mut client = SilentClient::connect(server.address().unwrap());
+    assert_eq!(client.closed_within(idle * 3), None);
+    assert_eq!(observer.errors.load(Ordering::Relaxed), 0);
+    assert!(server.force_stop().unwrap());
+    assert!(client.closed_within(Duration::from_secs(5)).is_some());
+}
+
+#[test]
+fn zero_tls_handshake_timeout_leaves_the_handshake_untimed() {
+    let (server, observer, _) = start_tls_observed(
+        ServerSessionConfig {
+            connection_idle_timeout: Duration::from_millis(200),
+            tls_handshake_timeout: Duration::ZERO,
+            ..ServerSessionConfig::default()
+        },
+        b"http/1.1",
+    );
+    let mut client = SilentClient::connect(server.address().unwrap());
+    assert_eq!(
+        client.closed_within(Duration::from_millis(600)),
+        None,
+        "neither the zero handshake timeout nor the idle timeout closes the client"
+    );
+    assert!(server.force_stop().unwrap());
+    assert!(
+        client.closed_within(Duration::from_secs(5)).is_some(),
+        "a force stop cancels the pending handshake"
+    );
+    assert_eq!(observer.errors.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn tls_handshake_timeout_lets_a_prompt_handshake_serve() {
+    let (server, observer, certificate) = start_tls_observed(
+        ServerSessionConfig {
+            connection_idle_timeout: Duration::from_secs(30),
+            tls_handshake_timeout: HANDSHAKE_DEADLINE,
+            ..ServerSessionConfig::default()
+        },
+        b"http/1.1",
+    );
+    let mut socket =
+        TcpStream::connect_timeout(&server.address().unwrap(), REQUEST_TIMEOUT).unwrap();
+    socket.set_read_timeout(Some(REQUEST_TIMEOUT)).unwrap();
+    socket.set_write_timeout(Some(REQUEST_TIMEOUT)).unwrap();
+    let mut connection = tls_client(&certificate);
+    while connection.is_handshaking() {
+        connection.complete_io(&mut socket).unwrap();
+    }
+    // The deadline covers the handshake only, so an idle connection outlives it.
+    thread::sleep(HANDSHAKE_DEADLINE + Duration::from_millis(500));
+    let mut stream = StreamOwned::new(connection, socket);
+    stream
+        .write_all(b"GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut response = Vec::new();
+    if let Err(error) = stream.read_to_end(&mut response) {
+        assert_eq!(error.kind(), ErrorKind::UnexpectedEof, "{error}");
+    }
+    assert_ok_response(&response);
+    assert_eq!(observer.accepts.load(Ordering::Relaxed), 1);
+    assert_eq!(observer.successes.load(Ordering::Relaxed), 1);
+    assert_eq!(observer.errors.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn owned_modes_accept_a_tls_handshake_timeout() {
+    for (owned_http1, owned_http2) in [(true, false), (false, true), (true, true)] {
+        let session = ServerSessionConfig {
+            tls_handshake_timeout: Duration::from_millis(200),
+            ..untimed_owned_session(owned_http1, owned_http2)
+        };
+        assert_eq!(session.check_owned(), Ok(()));
+        let (options, _) = generated_tls();
+        let config = ServerConfig {
+            session,
+            ..tls_config(options)
+        };
+        assert!(
+            ScopedHttpServer::start(config, handler_factory(Arc::default(), false), None).is_ok(),
+            "owned_http1={owned_http1} owned_http2={owned_http2}"
+        );
+    }
+}
+
+#[test]
+fn owned_http2_tls_handshake_timeout_bounds_a_silent_client() {
+    let (server, observer, certificate) = start_tls_observed(
+        ServerSessionConfig {
+            tls_handshake_timeout: HANDSHAKE_DEADLINE,
+            ..untimed_owned_session(false, true)
+        },
+        b"h2",
+    );
+    assert_silent_client_times_out(&server, &observer, HANDSHAKE_DEADLINE);
+    assert_eq!(
+        h2_tls_request(server.address().unwrap(), certificate),
+        b"OK"
+    );
+}
+
+#[test]
+fn owned_http1_tls_handshake_timeout_bounds_a_silent_client() {
+    let (server, observer, certificate) = start_tls_observed(
+        ServerSessionConfig {
+            tls_handshake_timeout: HANDSHAKE_DEADLINE,
+            ..untimed_owned_session(true, false)
+        },
+        b"http/1.1",
+    );
+    assert_silent_client_times_out(&server, &observer, HANDSHAKE_DEADLINE);
+    let (response, _) = tls_request(
+        server.address().unwrap(),
+        &certificate,
+        b"GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    assert_ok_response(&response);
+}
+
+#[test]
+fn owned_drain_finishes_within_the_tls_handshake_timeout() {
+    let deadline = Duration::from_secs(1);
+    let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+    let mut session = ServerSessionConfig {
+        tls_handshake_timeout: deadline,
+        ..untimed_owned_session(false, true)
+    };
+    session.accepted_socket_profile = Some(Arc::new(move |_| {
+        let _ = accepted_tx.try_send(());
+        Ok(())
+    }));
+    let (server, observer, _) = start_tls_observed(session, b"h2");
+    let address = server.address().unwrap();
+    // The client holds its connection open for 10 s, so a handshake the deadline misses ends
+    // with an EOF instead of hanging the test.
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let client = thread::spawn(move || {
+        let _client = SilentClient::connect(address);
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+    accepted_rx
+        .recv_timeout(REQUEST_TIMEOUT)
+        .expect("the server accepts the silent client");
+    // Drain reaches only registered sessions, so the pending handshake holds the worker until
+    // its deadline.
+    let draining = Instant::now();
+    assert!(server.drain());
+    assert!(server.wait_for_stop().unwrap());
+    let stopped = draining.elapsed();
+    let _ = release_tx.send(());
+    client.join().unwrap();
+    assert!(
+        stopped < Duration::from_secs(5),
+        "drain stopped after {stopped:?}"
+    );
+    assert_eq!(
+        observer.read_timeouts.load(Ordering::Relaxed),
+        1,
+        "the handshake deadline, not the client, ended the handshake"
+    );
 }
 
 #[test]

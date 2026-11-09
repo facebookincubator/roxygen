@@ -92,6 +92,8 @@ pub trait TlsHandshakeObserver: Send + Sync + 'static {
 
     fn on_success(&self, _connection: &ConnectionInfo) {}
 
+    /// Reports a failed native TLS transport accept. `READ_TIMEOUT` means the handshake missed
+    /// its deadline (`ServerSessionConfig::tls_handshake_timeout`).
     fn on_error(&self, _error: &HttpError) {}
 }
 
@@ -115,6 +117,12 @@ pub struct ServerSessionConfig {
     pub stream_read_timeout: Duration,
     pub connection_idle_timeout: Duration,
     pub write_timeout: Duration,
+    /// Bounds a native TLS accept from the start of the handshake. The default is 60 seconds,
+    /// matching wangle's `sslHandshakeTimeout`; zero leaves the handshake untimed. A missed deadline
+    /// fails the accept with `READ_TIMEOUT`, which `TlsHandshakeObserver::on_error` receives.
+    /// Both owned modes accept it. `serve_transport`, whose transport is already established,
+    /// ignores it.
+    pub tls_handshake_timeout: Duration,
     pub read_allocation_size: usize,
     pub byte_stream_limits: ByteStreamLimits,
     pub lifecycle_observer_factory:
@@ -127,22 +135,23 @@ pub struct ServerSessionConfig {
     /// driver (`roxygen_session::owned_h1`) instead of `UniplexSession`, with no task per
     /// request. HTTP/2 connections are unchanged. The owned mode is untimed: the caller keeps
     /// timeout responsibility, and `stream_read_timeout`, `connection_idle_timeout` and
-    /// `write_timeout` must be zero, which also leaves HTTP/2 sessions and TLS handshakes
-    /// untimed. It records no statistics and observes no lifecycle, so `stats_factory` and
-    /// `lifecycle_observer_factory` must be `None`. Server construction refuses anything
-    /// else with the reason, as `HttpServerError::InvalidConfig` (or, for `serve_transport`,
+    /// `write_timeout` must be zero, which also leaves HTTP/2 sessions untimed. TLS
+    /// handshakes keep their independent timeout. It records no statistics and
+    /// observes no lifecycle, so `stats_factory` and `lifecycle_observer_factory` must be
+    /// `None`. Server construction refuses anything else with the reason, as
+    /// `HttpServerError::InvalidConfig` (or, for `serve_transport`,
     /// `INVALID_STATE_TRANSITION`).
     pub owned_http1: bool,
     /// Experimental, default off: serves HTTP/2 connections on the owned driver
     /// (`roxygen_session::owned_h2`) instead of `UniplexSession`, with no task per
     /// request. HTTP/1.1 connections are unchanged. The owned mode is untimed,
     /// unbounded-rate and stat-less: `stream_read_timeout`, `connection_idle_timeout`
-    /// and `write_timeout` must be zero (which also leaves HTTP/1.1 sessions and TLS
-    /// handshakes untimed), and `stats_factory` and `lifecycle_observer_factory`
-    /// must be `None`. Server construction refuses anything else with the reason, as
-    /// `HttpServerError::InvalidConfig` (or, for `serve_transport`,
-    /// `INVALID_STATE_TRANSITION`). The driver requires the configured stream
-    /// receive window to equal the advertised `INITIAL_WINDOW_SIZE`; the acceptor
+    /// and `write_timeout` must be zero (which also leaves HTTP/1.1 sessions untimed).
+    /// TLS handshakes keep their independent timeout. `stats_factory` and
+    /// `lifecycle_observer_factory` must be `None`. Server construction refuses
+    /// anything else with the reason, as `HttpServerError::InvalidConfig` (or, for
+    /// `serve_transport`, `INVALID_STATE_TRANSITION`). The driver requires the configured
+    /// stream receive window to equal the advertised `INITIAL_WINDOW_SIZE`; the acceptor
     /// aligns the two (see `owned_http2_session_config`).
     pub owned_http2: bool,
     /// Experimental, default off (`DIV-053`): when a downstream HTTP/1.1 peer's EOF arrives
@@ -185,6 +194,7 @@ impl Default for ServerSessionConfig {
             stream_read_timeout: Duration::from_secs(10),
             connection_idle_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(5),
+            tls_handshake_timeout: Duration::from_secs(60),
             read_allocation_size: 4_000,
             byte_stream_limits: ByteStreamLimits::new(256 * 1024, 256 * 1024, 1_024)
                 .expect("default byte-stream limits are nonzero"),
@@ -455,7 +465,7 @@ pub(crate) async fn accept_session(
             socket,
             tls,
             config.session.byte_stream_limits,
-            config.session.connection_idle_timeout,
+            config.session.tls_handshake_timeout,
             CancellationSource::new().token(),
         )
         .await;

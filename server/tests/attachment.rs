@@ -1937,6 +1937,74 @@ impl HttpHandler for FixedHandler {
 }
 
 #[test]
+fn serve_transport_ignores_tls_handshake_timeout() {
+    let mut owner = RuntimeOwner::start(RuntimeConfig {
+        workers: 1,
+        command_capacity: 4,
+    })
+    .expect("owner starts");
+    let runtime = owner.handle();
+    let worker = runtime.worker(0).expect("worker exists");
+    wait(
+        worker
+            .call_local(move |context| async move {
+                use tokio::io::AsyncReadExt;
+                use tokio::io::AsyncWriteExt;
+                for owned_http1 in [false, true] {
+                    let (io, mut peer) = tokio::io::duplex(4096);
+                    let transport = adopt_local(
+                        &context,
+                        EstablishedIo::new(
+                            io,
+                            TransportEndpoint::Unknown,
+                            TransportEndpoint::Unknown,
+                            None,
+                        ),
+                        limits(),
+                    )
+                    .expect("I/O adopted");
+                    let mut options = ServeTransportOptions::new(
+                        CodecProtocol::Http11,
+                        TransportSecurity::Plaintext,
+                    );
+                    options.session = crate::acceptor::ServerSessionConfig {
+                        tls_handshake_timeout: Duration::from_millis(1),
+                        ..untimed_owned(owned_http1, false)
+                    };
+                    let connection =
+                        serve_transport(&context, transport, Rc::new(FixedHandler), options)
+                            .expect("the established transport is served");
+                    // Far past the 1 ms handshake deadline, which an established transport
+                    // never starts.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    peer.write_all(
+                        b"GET /fixed HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .expect("request written");
+                    let mut response = Vec::new();
+                    peer.read_to_end(&mut response)
+                        .await
+                        .expect("response read");
+                    assert!(
+                        response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+                        "owned_http1={owned_http1}: {}",
+                        String::from_utf8_lossy(&response)
+                    );
+                    connection
+                        .wait_closed()
+                        .await
+                        .expect("server session joins");
+                }
+            })
+            .expect("initializer admitted"),
+    )
+    .expect("initializer finishes");
+    wait(runtime.quiesce(TIMEOUT)).expect("cleanup joins");
+    assert_eq!(owner.join().expect("physical join").workers_forced, 0);
+}
+
+#[test]
 fn owned_http2_serves_a_fixed_get_and_drains() {
     let mut owner = RuntimeOwner::start(RuntimeConfig {
         workers: 1,
