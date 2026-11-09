@@ -2416,3 +2416,663 @@ fn a_forced_worker_teardown_abandons_an_owned_pool_mid_response() {
         );
     }
 }
+
+/// `count` acquisitions of `pool`, one after another, each held: on HTTP/1.1, each on its
+/// own session.
+async fn hold(pool: &OwnedHttpSessionPool, count: usize) -> Vec<OwnedGetSessionResult> {
+    let mut held = Vec::new();
+    for _ in 0..count {
+        held.push(acquire(pool).await);
+    }
+    held
+}
+
+/// `count` sessions of `pool`, each idle after one exchange, in the order their exchanges
+/// ended: held together, so each is its own session, then exchanged one after another.
+async fn idle_sessions(pool: &OwnedHttpSessionPool, count: usize) -> Vec<OwnedClientSession> {
+    let mut sessions = Vec::new();
+    for OwnedGetSessionResult {
+        reservation,
+        session,
+    } in hold(pool, count).await
+    {
+        assert_eq!(exchange(reservation, "/").await, b"ok");
+        settle(&session).await;
+        sessions.push(session);
+    }
+    sessions
+}
+
+/// Where `session` is in `sessions`, by its connection's local endpoint; `None` for a
+/// session dialed since.
+fn position_of(sessions: &[OwnedClientSession], session: &OwnedClientSession) -> Option<usize> {
+    sessions
+        .iter()
+        .position(|known| local(known) == local(session))
+}
+
+/// A reservation taken on a pooled session's handle is recorded on that session's entry,
+/// which the pool finds from the slot its list recorded on the session, with no pass over
+/// the pool's sessions.
+#[test]
+fn a_direct_reservation_is_recorded_without_a_pool_wide_pass() {
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let (scans, served) = run_on_worker(move |context| async move {
+        let pool = idle_pool(&context, address, CodecProtocol::Http11, router_params(8));
+        let sessions = idle_sessions(&pool, 8).await;
+        let session = &sessions[3];
+        let before = pool.pool_scans_for_test();
+        let reservation = session
+            .reserve_request()
+            .expect("an idle session admits a request");
+        let scans = pool.pool_scans_for_test() - before;
+        let served = exchange(reservation, "/").await;
+        settle(session).await;
+        (scans, served)
+    });
+    assert_eq!(
+        (scans, served.as_slice()),
+        (0, b"ok".as_slice()),
+        "(passes over the pool's sessions, body)"
+    );
+}
+
+/// The K of `bench/h2/client-arms.md` §A's large HTTP/1.1 pools.
+const K64: usize = 64;
+
+/// One unary round of `streams`: as many acquisitions held at once, their exchanges run
+/// together, then every session the round used idle again.
+async fn unary_round(pool: &OwnedHttpSessionPool, streams: usize) {
+    let held = hold(pool, streams).await;
+    let sessions: Vec<_> = held
+        .iter()
+        .map(|acquired| acquired.session.clone())
+        .collect();
+    let bodies: Vec<_> = futures::stream::iter(
+        held.into_iter()
+            .map(|acquired| exchange(acquired.reservation, "/")),
+    )
+    .buffer_unordered(streams)
+    .collect()
+    .await;
+    assert!(
+        bodies.iter().all(|body| body == b"ok"),
+        "every exchange is served"
+    );
+    until(|| sessions.iter().all(OwnedClientSession::is_idle)).await;
+}
+
+/// `bench/h2/client-arms.md` §A's K=64 shape, in unary rounds: once 64 sessions are open, each
+/// round's 64 acquisitions select an idle session and its 64 releases return one with no pass
+/// over the pool's sessions, under the router's parameters, both reuse orders, both sweeps and a
+/// maximum age. No acquisition searches for a returning session or dials.
+#[test]
+fn k64_unary_rounds_select_and_release_with_no_pool_wide_pass() {
+    let configs = [
+        ("router", router_params(u32::MAX)),
+        ("least recently used", params(u32::MAX)),
+        (
+            "least recently used, retired at expiry",
+            idle_params(
+                u32::MAX,
+                SessionReuseOrder::LeastRecentlyUsed,
+                Duration::from_secs(90),
+                IdleSweep::AtExpiry,
+            ),
+        ),
+        (
+            "most recently used, retired at expiry",
+            idle_params(
+                u32::MAX,
+                SessionReuseOrder::MostRecentlyUsed,
+                Duration::from_secs(90),
+                IdleSweep::AtExpiry,
+            ),
+        ),
+        (
+            "router, with a maximum age",
+            PoolParams {
+                max_age: Duration::from_secs(600),
+                ..router_params(u32::MAX)
+            },
+        ),
+    ];
+    for (name, params) in configs {
+        let origin = Origin::start(CodecProtocol::Http11);
+        let address = origin.address;
+        let counts = run_on_worker(move |context| async move {
+            let pool = idle_pool(&context, address, CodecProtocol::Http11, params);
+            unary_round(&pool, K64).await;
+            let scans = pool.pool_scans_for_test();
+            let claims = pool.claim_scans_for_test();
+            let attempts = pool.connection_attempts_for_test();
+            for _ in 0..3 {
+                unary_round(&pool, K64).await;
+            }
+            (
+                pool.pool_scans_for_test() - scans,
+                pool.claim_scans_for_test() - claims,
+                pool.connection_attempts_for_test() - attempts,
+                pool.session_count(),
+            )
+        });
+        assert_eq!(
+            (counts, origin.accepted()),
+            ((0, 0, 0, K64), K64),
+            "{name}: ((passes over the pool's sessions, searches for a returning session, \
+             connection attempts, sessions), connections)"
+        );
+    }
+}
+
+/// Idle sessions are reused in the order `DIV-032` documents, whatever the pool's size: most
+/// recently used, the session released last first (LIFO); least recently used, the session
+/// released first first (FIFO).
+#[test]
+fn idle_sessions_are_reused_in_release_order_or_its_reverse() {
+    const COUNT: usize = 8;
+    const RELEASES: [usize; COUNT] = [3, 0, 6, 1, 7, 2, 5, 4];
+    let ninety = Duration::from_secs(90);
+    let configs = [
+        ("router", router_params(8), true),
+        (
+            "most recently used, retired at expiry",
+            idle_params(
+                8,
+                SessionReuseOrder::MostRecentlyUsed,
+                ninety,
+                IdleSweep::AtExpiry,
+            ),
+            true,
+        ),
+        ("least recently used", params(8), false),
+        (
+            "least recently used, swept on an interval",
+            idle_params(
+                8,
+                SessionReuseOrder::LeastRecentlyUsed,
+                ninety,
+                IdleSweep::Interval,
+            ),
+            false,
+        ),
+    ];
+    for (name, params, last_released_first) in configs {
+        let origin = Origin::start(CodecProtocol::Http11);
+        let address = origin.address;
+        let picks = run_on_worker(move |context| async move {
+            let pool = idle_pool(&context, address, CodecProtocol::Http11, params);
+            let held = hold(&pool, COUNT).await;
+            let sessions: Vec<_> = held
+                .iter()
+                .map(|acquired| acquired.session.clone())
+                .collect();
+            let mut responses = Vec::new();
+            for acquired in held {
+                responses.push(Some(submit(acquired.reservation, "/").await));
+            }
+            for index in RELEASES {
+                let response = responses[index].take().expect("each response is read once");
+                assert_eq!(read_body(response).await, b"ok");
+                settle(&sessions[index]).await;
+            }
+            hold(&pool, COUNT)
+                .await
+                .iter()
+                .map(|acquired| position_of(&sessions, &acquired.session))
+                .collect::<Vec<_>>()
+        });
+        let mut expected: Vec<_> = RELEASES.into_iter().map(Some).collect();
+        if last_released_first {
+            expected.reverse();
+        }
+        assert_eq!(picks, expected, "{name}: sessions by release");
+    }
+}
+
+/// An idle session whose connection closes, or which is cancelled, leaves selection; the
+/// others are still reused in order, and an acquisition beyond them dials.
+#[test]
+fn closed_and_cancelled_idle_sessions_leave_selection() {
+    for (name, params, last_released_first) in [
+        ("router", router_params(8), true),
+        ("least recently used", params(8), false),
+    ] {
+        let origin = Origin::start(CodecProtocol::Http11);
+        let address = origin.address;
+        let (open, picks, attempts) = run_on_worker(move |context| async move {
+            let pool = idle_pool(&context, address, CodecProtocol::Http11, params);
+            let sessions = idle_sessions(&pool, 6).await;
+            sessions[4]
+                .close_when_idle()
+                .expect("an idle session closes");
+            sessions[2].cancel();
+            until(|| sessions[4].is_finished() && sessions[2].is_finished()).await;
+            let open = pool.session_count();
+            let held = hold(&pool, 4).await;
+            let picks: Vec<_> = held
+                .iter()
+                .map(|acquired| position_of(&sessions, &acquired.session))
+                .collect();
+            let attempts = pool.connection_attempts_for_test();
+            let beyond = acquire(&pool).await;
+            assert_eq!(position_of(&sessions, &beyond.session), None);
+            (open, picks, pool.connection_attempts_for_test() - attempts)
+        });
+        let mut expected = vec![Some(0), Some(1), Some(3), Some(5)];
+        if last_released_first {
+            expected.reverse();
+        }
+        assert_eq!(
+            (open, picks, attempts),
+            (4, expected, 1),
+            "{name}: (sessions open, picks by release, attempts)"
+        );
+    }
+}
+
+/// An acquisition retires the idle-expired sessions it meets, as the pool's own passes do: on
+/// an interval the expired candidates in reuse order, at expiry every expired session; a
+/// retired session is never selected again. (Schedules that make an acquisition dial are left
+/// to the interval schedule tests: a retired session's drain wakes the dialing acquisition,
+/// which may dial twice, as in `one_nanosecond_idle_scenario`.)
+#[test]
+fn sessions_retired_for_idleness_leave_selection() {
+    let timeout = Duration::from_secs(90);
+    let expired = 2 * timeout;
+    let configs = [
+        // Least recently used, on an interval: the checkout retires the expired front session
+        // and takes the next.
+        (
+            "least recently used, on an interval",
+            SessionReuseOrder::LeastRecentlyUsed,
+            IdleSweep::Interval,
+            0,
+            [Some(1), Some(2)],
+        ),
+        // At expiry, the step retires the expired session before it selects.
+        (
+            "least recently used, at expiry",
+            SessionReuseOrder::LeastRecentlyUsed,
+            IdleSweep::AtExpiry,
+            1,
+            [Some(0), Some(2)],
+        ),
+        (
+            "most recently used, at expiry",
+            SessionReuseOrder::MostRecentlyUsed,
+            IdleSweep::AtExpiry,
+            2,
+            [Some(1), Some(0)],
+        ),
+    ];
+    for (name, order, sweep, aged, expected) in configs {
+        let origin = Origin::start(CodecProtocol::Http11);
+        let address = origin.address;
+        let outcome = run_on_worker(move |context| async move {
+            let pool = idle_pool(
+                &context,
+                address,
+                CodecProtocol::Http11,
+                idle_params(8, order, timeout, sweep),
+            );
+            let sessions = idle_sessions(&pool, 3).await;
+            pool.age_idle_session_for_test(&sessions[aged], expired);
+            let attempts = pool.connection_attempts_for_test();
+            let held = hold(&pool, 2).await;
+            let attempts = pool.connection_attempts_for_test() - attempts;
+            until(|| sessions[aged].is_finished()).await;
+            let picks: Vec<_> = held
+                .iter()
+                .map(|acquired| position_of(&sessions, &acquired.session))
+                .collect();
+            (picks, attempts, pool.session_count())
+        });
+        assert_eq!(
+            outcome,
+            (expected.to_vec(), 0, 2),
+            "{name}: (picks, attempts, sessions open)"
+        );
+    }
+}
+
+/// The index holds only sessions the pool holds: a closed, a cancelled and an idle-retired
+/// session leave it with their entries, a reserved one leaves its class list, and a drain
+/// empties it.
+#[test]
+fn the_index_holds_no_session_the_pool_removed() {
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let (counts, picks, open) = run_on_worker(move |context| async move {
+        let pool = idle_pool(
+            &context,
+            address,
+            CodecProtocol::Http11,
+            idle_params(
+                8,
+                SessionReuseOrder::LeastRecentlyUsed,
+                Duration::from_secs(90),
+                IdleSweep::Interval,
+            ),
+        );
+        let sessions = idle_sessions(&pool, 6).await;
+        let mut counts = vec![pool.indexed_sessions_for_test()];
+        sessions[1]
+            .close_when_idle()
+            .expect("an idle session closes");
+        sessions[3].cancel();
+        until(|| sessions[1].is_finished() && sessions[3].is_finished()).await;
+        counts.push(pool.indexed_sessions_for_test());
+        let first = acquire(&pool).await;
+        counts.push(pool.indexed_sessions_for_test());
+        pool.age_idle_session_for_test(&sessions[2], Duration::from_secs(180));
+        let second = acquire(&pool).await;
+        until(|| sessions[2].is_finished()).await;
+        counts.push(pool.indexed_sessions_for_test());
+        pool.drain();
+        counts.push(pool.indexed_sessions_for_test());
+        let picks = [&first, &second].map(|acquired| position_of(&sessions, &acquired.session));
+        drop((first, second));
+        (counts, picks, pool.session_count())
+    });
+    assert_eq!(
+        (counts, picks, open),
+        (
+            vec![(0, 6), (0, 4), (0, 3), (0, 1), (0, 0)],
+            [Some(0), Some(4)],
+            0
+        ),
+        "((busy, idle) indexed: six idle; less a closed and a cancelled one; less a reserved \
+         one; less a retired and a reserved one; drained), picks, sessions open)"
+    );
+}
+
+/// What one step of `pool_schedule` did, by session ordinal (the order in which the schedule
+/// first met each session).
+#[derive(Debug, PartialEq)]
+enum ScheduleEvent {
+    Pick(usize),
+    Release(usize),
+    Close(usize),
+    Cancel(usize),
+    Age(usize),
+}
+
+/// A seeded schedule of acquisitions (each submitting a request, then waiting for the dials
+/// it started), releases (reading a held response to its end, then waiting for its session to
+/// be idle), closes, cancellations and, when `age`, idle aging past the pool's idle timeout, on
+/// an HTTP/1.1 pool of at most eight sessions. Returns its events, the connection attempts,
+/// and the sessions left open.
+///
+/// Aging is for sweeps on an interval: at expiry, idle retirement's own task may wake on a
+/// release and retire an aged session before an acquisition meets it.
+async fn pool_schedule(
+    pool: &OwnedHttpSessionPool,
+    timeout: Option<Duration>,
+) -> (Vec<ScheduleEvent>, u64, usize) {
+    let mut random = 0x2545_f491_4f6c_dd1d_u64;
+    let mut below = move |bound: usize| {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        usize::try_from(random % u64::try_from(bound).expect("small bound")).expect("small value")
+    };
+    let mut known: Vec<OwnedClientSession> = Vec::new();
+    let mut held: Vec<(usize, OwnedClientResponse)> = Vec::new();
+    // Released, and neither picked, closed, cancelled nor aged since.
+    let mut idle: Vec<usize> = Vec::new();
+    let mut events = Vec::new();
+    let attempts = pool.connection_attempts_for_test();
+    for _ in 0..160 {
+        let choice = below(20);
+        if (choice < 8 || held.is_empty()) && held.len() < 8 {
+            let acquired = acquire(pool).await;
+            let ordinal = position_of(&known, &acquired.session).unwrap_or_else(|| {
+                known.push(acquired.session.clone());
+                known.len() - 1
+            });
+            idle.retain(|&candidate| candidate != ordinal);
+            held.push((ordinal, submit(acquired.reservation, "/").await));
+            events.push(ScheduleEvent::Pick(ordinal));
+            // A retired session's drain may wake a dialing acquisition into a second dial.
+            until(|| pool.pending_connects_for_test() == 0).await;
+        } else if choice < 15 && !held.is_empty() {
+            let (ordinal, response) = held.swap_remove(below(held.len()));
+            assert_eq!(read_body(response).await, b"ok");
+            settle(&known[ordinal]).await;
+            idle.push(ordinal);
+            events.push(ScheduleEvent::Release(ordinal));
+        } else if !idle.is_empty() {
+            let ordinal = idle.swap_remove(below(idle.len()));
+            let session = &known[ordinal];
+            match choice {
+                15 => {
+                    session.close_when_idle().expect("an idle session closes");
+                    until(|| session.is_finished()).await;
+                    events.push(ScheduleEvent::Close(ordinal));
+                }
+                16 => {
+                    session.cancel();
+                    until(|| session.is_finished()).await;
+                    events.push(ScheduleEvent::Cancel(ordinal));
+                }
+                _ if let Some(timeout) = timeout => {
+                    pool.age_idle_session_for_test(session, 2 * timeout);
+                    events.push(ScheduleEvent::Age(ordinal));
+                }
+                _ => idle.push(ordinal),
+            }
+        }
+    }
+    for (_, response) in held {
+        assert_eq!(read_body(response).await, b"ok");
+    }
+    (
+        events,
+        pool.connection_attempts_for_test() - attempts,
+        pool.session_count(),
+    )
+}
+
+/// The index selects as the pool's passes do: `pool_schedule` makes the same picks, dials as
+/// often and leaves as many sessions open on a pool selecting through its index as on one whose
+/// passes are forced, under each reuse order and sweep.
+#[test]
+fn the_index_selects_as_the_pool_s_passes_do() {
+    let ninety = Duration::from_secs(90);
+    let configs = [
+        ("router", router_params(8), Some(ninety)),
+        ("least recently used", params(8), None),
+        (
+            "most recently used, at expiry",
+            idle_params(
+                8,
+                SessionReuseOrder::MostRecentlyUsed,
+                ninety,
+                IdleSweep::AtExpiry,
+            ),
+            None,
+        ),
+        (
+            "least recently used, on an interval",
+            idle_params(
+                8,
+                SessionReuseOrder::LeastRecentlyUsed,
+                ninety,
+                IdleSweep::Interval,
+            ),
+            Some(ninety),
+        ),
+    ];
+    for (name, params, aged) in configs {
+        let origin = Origin::start(CodecProtocol::Http11);
+        let address = origin.address;
+        let [(indexed, indexed_scans), (scanned, scans)] = [false, true].map(|forced| {
+            run_on_worker(move |context| async move {
+                let pool = idle_pool(&context, address, CodecProtocol::Http11, params);
+                pool.force_pool_scans_for_test(forced);
+                let outcome = pool_schedule(&pool, aged).await;
+                (outcome, pool.pool_scans_for_test())
+            })
+        });
+        assert!(
+            indexed
+                .0
+                .iter()
+                .any(|event| matches!(event, ScheduleEvent::Pick(_))),
+            "{name}: the schedule acquires"
+        );
+        assert!(
+            indexed_scans < scans / 2,
+            "{name}: the index served most steps and releases ({indexed_scans} passes, {scans} \
+             forced)"
+        );
+        assert_eq!(
+            indexed, scanned,
+            "{name}: (events, attempts, sessions open)"
+        );
+    }
+}
+
+/// At expiry, once idle time may have passed a session's idle timeout, the step takes the
+/// pool's passes, which retire every expired session before they select: idle time that passes
+/// for the idle sessions alone, with the index settled, retires them, and the session released
+/// since is taken.
+#[test]
+fn an_acquisition_at_expiry_retires_the_sessions_whose_idle_time_passed() {
+    let timeout = Duration::from_secs(90);
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let outcome = run_on_worker(move |context| async move {
+        let pool = idle_pool(
+            &context,
+            address,
+            CodecProtocol::Http11,
+            idle_params(
+                8,
+                SessionReuseOrder::LeastRecentlyUsed,
+                timeout,
+                IdleSweep::AtExpiry,
+            ),
+        );
+        let sessions = idle_sessions(&pool, 3).await;
+        let busy = acquire(&pool).await;
+        pool.pass_idle_time_for_test(2 * timeout);
+        assert_eq!(exchange(busy.reservation, "/").await, b"ok");
+        settle(&busy.session).await;
+        let settled = pool.index_settled_for_test();
+        let attempts = pool.connection_attempts_for_test();
+        let next = acquire(&pool).await;
+        let attempts = pool.connection_attempts_for_test() - attempts;
+        let retired = [&sessions[1], &sessions[2]].map(OwnedClientSession::is_draining);
+        if retired == [true; 2] {
+            until(|| sessions[1].is_finished() && sessions[2].is_finished()).await;
+        }
+        (
+            position_of(&sessions, &busy.session),
+            settled,
+            position_of(&sessions, &next.session),
+            retired,
+            attempts,
+            pool.session_count(),
+        )
+    });
+    assert_eq!(
+        outcome,
+        (Some(0), true, Some(0), [true; 2], 0, 1),
+        "(first pick, index settled, second pick, expired sessions retired, attempts, sessions \
+         open)"
+    );
+}
+
+/// A cancelled session stops admitting before its pool hears of it: the cancellation unsettles
+/// the index, so that a reservation in the same turn and the next release take the pool's
+/// passes, and once the session's closed admission reaches the pool a release settles the index
+/// again, which then skips the cancelled session.
+#[test]
+fn a_cancellation_unsettles_the_index_until_a_release_settles_it() {
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let outcome = run_on_worker(move |context| async move {
+        let pool = idle_pool(&context, address, CodecProtocol::Http11, router_params(8));
+        let sessions = idle_sessions(&pool, 4).await;
+        let before = pool.index_settled_for_test();
+        sessions[1].cancel();
+        let cancelled = pool.index_settled_for_test();
+        let reservation = sessions[3]
+            .reserve_request()
+            .expect("an idle session admits a request");
+        assert_eq!(exchange(reservation, "/").await, b"ok");
+        settle(&sessions[3]).await;
+        until(|| sessions[1].is_finished()).await;
+        let after = pool.index_settled_for_test();
+        let picks: Vec<_> = hold(&pool, 3)
+            .await
+            .iter()
+            .map(|acquired| position_of(&sessions, &acquired.session))
+            .collect();
+        (before, cancelled, after, picks)
+    });
+    assert_eq!(
+        outcome,
+        (true, false, true, vec![Some(3), Some(2), Some(0)]),
+        "(settled before, after the cancellation, after its close and a release; picks)"
+    );
+}
+
+/// A session that reaches its maximum age while it serves an exchange is not one the passes
+/// retire, since it cannot take another: the other sessions keep being selected and released
+/// through the index, with no pass over the pool's sessions, until its exchange ends. Then the
+/// next acquisition retires it, as the passes do, and takes another session.
+#[test]
+fn a_session_aged_while_busy_leaves_selection_indexed_until_its_exchange_ends() {
+    const ROUNDS: usize = 16;
+    let configs = [
+        (
+            "router, with a maximum age",
+            PoolParams {
+                max_age: Duration::from_secs(600),
+                ..router_params(8)
+            },
+        ),
+        ("least recently used", params(8)),
+    ];
+    for (name, params) in configs {
+        let origin = Origin::start(CodecProtocol::Http11);
+        let address = origin.address;
+        let outcome = run_on_worker(move |context| async move {
+            let pool = idle_pool(&context, address, CodecProtocol::Http11, params);
+            idle_sessions(&pool, 4).await;
+            let held = acquire(&pool).await;
+            pool.expire_session_for_test(&held.session);
+            // The expiry unsettles the index; this exchange's release settles it again.
+            one_exchange(&pool).await;
+            let before = pool.pool_scans_for_test();
+            for _ in 0..ROUNDS {
+                let session = one_exchange(&pool).await;
+                assert_ne!(local(&session), local(&held.session), "{name}");
+            }
+            let scans = pool.pool_scans_for_test() - before;
+            assert_eq!(exchange(held.reservation, "/").await, b"ok");
+            settle(&held.session).await;
+            let next = one_exchange(&pool).await;
+            let closed = tokio::time::timeout(Duration::from_secs(2), held.session.wait_closed())
+                .await
+                .is_ok_and(|closed| closed.is_ok());
+            (
+                scans,
+                local(&next) != local(&held.session),
+                pool.session_count(),
+                closed,
+            )
+        });
+        assert_eq!(
+            outcome,
+            (0, true, 3, true),
+            "{name}: (passes over the pool's sessions while the aged session is busy, the \
+             acquisition after its exchange took another session, sessions, the aged session \
+             closed)"
+        );
+    }
+}

@@ -1,5 +1,7 @@
 //! Worker-local upstream session pooling and destination cache.
 
+mod session_list;
+
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -25,6 +27,7 @@ use roxygen_core::connection::ConnectionContext;
 use roxygen_core::connection::TransportSecurity;
 use roxygen_core::error::HttpError;
 use roxygen_core::error::HttpErrorCode;
+use roxygen_core::http::CodecProtocol;
 use roxygen_core::message::SocketAddress;
 use roxygen_runtime::cancellation::CancellationSource;
 use roxygen_runtime::cancellation::CancellationToken;
@@ -40,6 +43,7 @@ use roxygen_runtime::worker::WorkerState;
 use roxygen_session::session::RequestReservation;
 use roxygen_session::uniplex::UniplexRunSummary;
 use roxygen_transport::tls::TlsSessionStore;
+pub(crate) use session_list::Slot as SessionSlot;
 use thiserror::Error;
 use tokio::sync::Notify;
 use tokio::sync::watch;
@@ -56,6 +60,9 @@ use crate::connector::SessionConnector;
 use crate::connector::SessionParams;
 use crate::experimental::owned::OwnedClientSession;
 use crate::experimental::owned::worker_admits;
+use crate::pool::session_list::Class;
+use crate::pool::session_list::Linked;
+use crate::pool::session_list::SessionList;
 
 const DEFAULT_MAX_POOLS: usize = 10;
 const DEFAULT_REAP_SCAN: usize = 5;
@@ -648,6 +655,22 @@ impl PooledSession {
         }
     }
 
+    /// The slot of the session's entry in its pool's list, which an owned session records
+    /// (`None` while it has no entry); `None` for a uniplex session, which records none, so
+    /// that its pool searches for its entry.
+    fn recorded_slot(&self) -> Option<Option<SessionSlot>> {
+        match self {
+            Self::Uniplex(_) => None,
+            Self::Owned(session) => Some(session.pool_slot()),
+        }
+    }
+
+    fn set_pool_slot(&self, slot: Option<SessionSlot>) {
+        if let Self::Owned(session) = self {
+            session.set_pool_slot(slot);
+        }
+    }
+
     #[cfg(test)]
     fn is_client_session(&self, other: &ClientSession) -> bool {
         matches!(self, Self::Uniplex(session) if session.is_same_session(other))
@@ -660,10 +683,21 @@ impl PooledSession {
         }
     }
 
-    fn bind_pool(&self, pool: Weak<RefCell<PoolState>>) {
+    /// Binds the session to `pool`. An owned session also takes the flag that tells the
+    /// pool's index it stopped admitting without a release (S6.9).
+    fn bind_pool(&self, pool: Weak<RefCell<PoolState>>, unsettled: Option<Rc<Cell<bool>>>) {
         match self {
             Self::Uniplex(session) => session.bind_pool(pool),
-            Self::Owned(session) => session.bind_pool(pool),
+            Self::Owned(session) => session.bind_pool(pool, unsettled),
+        }
+    }
+
+    /// When an owned session started, from which its age counts; `None` for a uniplex
+    /// session, whose pool keeps no index.
+    fn started(&self) -> Option<Instant> {
+        match self {
+            Self::Uniplex(_) => None,
+            Self::Owned(session) => Some(session.started()),
         }
     }
 
@@ -710,6 +744,15 @@ struct SessionEntry {
     ownership: Option<Rc<SessionOwnership>>,
     /// When the session last lost its last active or reserved exchange, while it has none.
     idle_since: Option<Instant>,
+    /// An indexed pool's: whether the session counted in `idle_sessions` when the pool last
+    /// counted it (S6.9).
+    counted_idle: bool,
+}
+
+impl Linked for SessionEntry {
+    fn set_slot(&self, slot: Option<SessionSlot>) {
+        self.session.set_pool_slot(slot);
+    }
 }
 
 impl SessionEntry {
@@ -723,7 +766,27 @@ impl SessionEntry {
             max_age,
             ownership,
             idle_since: None,
+            counted_idle: false,
         }
+    }
+
+    /// Stamps the session idle once it has no active or reserved exchange, at the pass's
+    /// `now`, which the first stamp reads, and clears the stamp while it has one.
+    fn stamp_idle(&mut self, now: &mut Option<Instant>) {
+        self.idle_since = if self.session.admitted_transactions() == 0 {
+            self.idle_since
+                .or_else(|| Some(*now.get_or_insert_with(Instant::now)))
+        } else {
+            None
+        };
+    }
+
+    /// When an owned session reaches its maximum age; `None` when it never does.
+    fn max_age_deadline(&self) -> Option<Instant> {
+        if self.max_age.is_zero() {
+            return None;
+        }
+        self.session.started()?.checked_add(self.max_age)
     }
 
     /// When the session became idle, while it has no active or reserved exchange.
@@ -1005,13 +1068,57 @@ async fn retire_idle_sessions(
     }
 }
 
+/// An owned HTTP/1.1 pool's selection index (S6.9, performance only): its sessions that
+/// can take an exchange, linked in the pool's order into a busy and an idle class list
+/// (`SessionList`'s classes), with lower bounds of when a member's maximum age or any idle
+/// timeout can end. While it is settled, an acquisition step selects the first busy session
+/// that can take an exchange, else the idle session at the back (most recently used) or
+/// front (least recently used) of the idle list, and a release the pool hears for one
+/// session updates that session alone, each without a pass over the pool's sessions,
+/// with the result of those passes. Any other step or event takes the pool's passes and
+/// unsettles the index, and the next release's passes rebuild and settle it.
+///
+/// The index is exact while every change to a session that the passes test reaches the pool
+/// as an event for that session: an owned HTTP/1.1 session becomes able to take an exchange
+/// again only when its driver returns its slot (`capacity_available`), becomes idle only in
+/// that callback or in the idleness its run reports, stops being idle only by a reservation,
+/// and stops admitting by `admission_closed`, by the pool closing it, or by a cancellation,
+/// which sets `unsettled`. A session that stops taking exchanges without an event (its
+/// worker cancelled) stays in its list until a step meets it and drops it.
+struct SessionIndex {
+    /// Set while the index may not mirror the pool; `None` when the pool keeps no index.
+    /// Shared with the pool's owned sessions, whose cancellation sets it.
+    unsettled: Option<Rc<Cell<bool>>>,
+    /// No session's idle stamp is earlier.
+    idle_floor: Option<Instant>,
+    /// No session in a class list reaches its maximum age earlier; `None` while none can. The
+    /// passes retire a session for its age only while it can take an exchange, so a session
+    /// that ages while it cannot leaves the floor until it joins a list again.
+    age_floor: Option<Instant>,
+}
+
+impl SessionIndex {
+    /// An empty pool's index, which mirrors its empty pool.
+    fn new(enabled: bool) -> Self {
+        Self {
+            unsettled: enabled.then(|| Rc::new(Cell::new(false))),
+            idle_floor: None,
+            age_floor: None,
+        }
+    }
+}
+
+/// An index list whose member's class changed without an event the pool heard.
+struct IndexMismatch;
+
 pub(crate) struct PoolState {
     context: WorkerContext,
     pool_params: PoolParams,
     backend: PoolBackend,
     observer: Option<Rc<dyn PoolObserver>>,
     idle_observer: Option<Rc<dyn IdleSessionObserver>>,
-    sessions: VecDeque<SessionEntry>,
+    sessions: SessionList<SessionEntry>,
+    index: SessionIndex,
     idle_sessions: usize,
     waiters: VecDeque<Rc<Waiter>>,
     connects_in_progress: u32,
@@ -1037,6 +1144,15 @@ pub(crate) struct PoolState {
     /// Connection attempts the pool started.
     #[cfg(test)]
     connection_attempts: Cell<u64>,
+    /// Passes over the pool's sessions on an acquisition, reservation or release path.
+    #[cfg(test)]
+    pool_scans: Cell<u64>,
+    /// Searches for a session that an acquisition may wait for instead of dialing.
+    #[cfg(test)]
+    claim_scans: Cell<u64>,
+    /// Steps and releases take the pool's passes, as without an index.
+    #[cfg(test)]
+    force_scans: Cell<bool>,
     next_waiter_id: u64,
     pooling_enabled: bool,
     draining: bool,
@@ -1063,6 +1179,440 @@ impl Drop for PoolState {
 }
 
 impl PoolState {
+    /// Counts a pass over the pool's sessions on an acquisition, reservation or release path.
+    fn count_scan(&self) {
+        #[cfg(test)]
+        self.pool_scans.set(self.pool_scans.get() + 1);
+    }
+
+    /// The slot of `session`'s entry: an owned session's is the slot it recorded, found
+    /// without a search; a uniplex session's is found by a pass over the pool's sessions.
+    fn slot_of(&self, session: &PooledSession) -> Option<SessionSlot> {
+        let Some(recorded) = session.recorded_slot() else {
+            self.count_scan();
+            return self
+                .sessions
+                .find(|entry| entry.session.is_same_session(session));
+        };
+        let slot = recorded?;
+        let own =
+            self.sessions.holds(slot) && self.sessions.get(slot).session.is_same_session(session);
+        debug_assert!(own, "an owned session records its own entry's slot");
+        own.then_some(slot)
+    }
+
+    /// Whether the index mirrors the pool (S6.9).
+    fn index_settled(&self) -> bool {
+        self.index
+            .unsettled
+            .as_ref()
+            .is_some_and(|unsettled| !unsettled.get())
+            && !self.scans_forced()
+    }
+
+    #[cfg(test)]
+    fn scans_forced(&self) -> bool {
+        self.force_scans.get()
+    }
+
+    #[cfg(not(test))]
+    fn scans_forced(&self) -> bool {
+        false
+    }
+
+    /// Leaves the index to the pool's passes until a release's passes settle it again.
+    fn unsettle_index(&self) {
+        if let Some(unsettled) = &self.index.unsettled {
+            unsettled.set(true);
+        }
+    }
+
+    /// An indexed session's class: busy or idle while it can take an exchange.
+    fn class_of(entry: &SessionEntry) -> Option<Class> {
+        entry.session.supports_more_transactions().then(|| {
+            if entry.session.is_idle() {
+                Class::Idle
+            } else {
+                Class::Busy
+            }
+        })
+    }
+
+    /// Rebuilds the index after a release's passes, which left every stamp and the idle count
+    /// as they compute them (S6.9): each session that can take an exchange joins its class
+    /// list in the pool's order, each entry records whether it counted idle, and the floors are
+    /// recomputed, the age floor over the class lists' members. The index settles only if what
+    /// selection through it relies on holds: no session is finished or draining, a stamped pool
+    /// stamps exactly its idle sessions, and, most recently used, the idle list is in stamp
+    /// order.
+    fn settle_index(&mut self) {
+        let Some(unsettled) = self.index.unsettled.clone() else {
+            return;
+        };
+        self.count_scan();
+        self.sessions.clear_classes();
+        let stamps_idle = self.stamps_idle();
+        let recent_first = self.pool_params.reuse_order == SessionReuseOrder::MostRecentlyUsed;
+        let mut settled = true;
+        let mut idle_floor: Option<Instant> = None;
+        let mut age_floor: Option<Instant> = None;
+        let mut last_idle: Option<Instant> = None;
+        let mut cursor = self.sessions.front();
+        while let Some(slot) = cursor {
+            cursor = self.sessions.next(slot);
+            let entry = self.sessions.get_mut(slot);
+            entry.counted_idle = entry.session.is_idle();
+            let class = Self::class_of(entry);
+            settled &= !entry.session.is_finished() && !entry.session.is_draining();
+            settled &= !stamps_idle
+                || (entry.session.admitted_transactions() == 0) == entry.idle_since.is_some();
+            if let Some(since) = entry.idle_since {
+                idle_floor = Some(idle_floor.map_or(since, |floor| floor.min(since)));
+            }
+            if class.is_some()
+                && let Some(deadline) = entry.max_age_deadline()
+            {
+                age_floor = Some(age_floor.map_or(deadline, |floor| floor.min(deadline)));
+            }
+            if recent_first && class == Some(Class::Idle) {
+                settled &= entry
+                    .idle_since
+                    .is_some_and(|since| last_idle.is_none_or(|last| last <= since));
+                last_idle = entry.idle_since.or(last_idle);
+            }
+            self.sessions.set_class(slot, class);
+        }
+        self.index.idle_floor = idle_floor;
+        self.index.age_floor = age_floor;
+        unsettled.set(!settled);
+    }
+
+    /// Whether an acquisition step may select through the index: it is settled, and no
+    /// session that can take an exchange can have reached its maximum age, nor, retired at
+    /// expiry, any session its idle timeout, so that the step's own search for them would find
+    /// none.
+    fn index_ready(&self, now: Option<Instant>) -> bool {
+        if !self.index_settled() {
+            return false;
+        }
+        if let Some(floor) = self.index.age_floor
+            && now.unwrap_or_else(Instant::now) >= floor
+        {
+            return false;
+        }
+        if self.pool_params.idle_sweep == IdleSweep::AtExpiry
+            && let (Some(now), Some(floor)) = (now, self.index.idle_floor)
+            && now.saturating_duration_since(floor) >= self.pool_params.idle_timeout
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Selects through the index the session that `next_step`'s passes would select (S6.9):
+    /// the first busy session that can take an exchange, else the idle session at the back
+    /// (most recently used) or front (least recently used) of the idle list, retiring each
+    /// expired one it meets on an interval, as `select_idle_session` does. A member that can
+    /// no longer take an exchange leaves its list; one whose class changed without an event
+    /// falls back to the passes and unsettles the index.
+    fn select_indexed(
+        &mut self,
+        checkout_at: Option<Instant>,
+        retired: &mut RetiredSessions,
+    ) -> Option<SessionSlot> {
+        let selected = match self.indexed_busy_session() {
+            Ok(None) => self.indexed_idle_session(checkout_at, retired),
+            Err(IndexMismatch) => {
+                self.unsettle_index();
+                self.count_scan();
+                return self
+                    .sessions
+                    .find(|entry| {
+                        !entry.session.is_idle() && entry.session.supports_more_transactions()
+                    })
+                    .or_else(|| self.select_idle_session(checkout_at, retired));
+            }
+            busy => busy,
+        };
+        let Ok(selected) = selected else {
+            self.unsettle_index();
+            return self.select_idle_session(checkout_at, retired);
+        };
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            selected,
+            self.reference_selection(),
+            "the index selects as the pool's passes do"
+        );
+        selected
+    }
+
+    fn indexed_busy_session(&mut self) -> Result<Option<SessionSlot>, IndexMismatch> {
+        let mut cursor = self.sessions.class_front(Class::Busy);
+        while let Some(slot) = cursor {
+            cursor = self.sessions.class_next(slot);
+            match Self::class_of(self.sessions.get(slot)) {
+                Some(Class::Busy) => return Ok(Some(slot)),
+                Some(Class::Idle) => return Err(IndexMismatch),
+                // It takes an exchange again only once its slot returns, which indexes it.
+                None => self.sessions.set_class(slot, None),
+            }
+        }
+        Ok(None)
+    }
+
+    fn indexed_idle_session(
+        &mut self,
+        checkout_at: Option<Instant>,
+        retired: &mut RetiredSessions,
+    ) -> Result<Option<SessionSlot>, IndexMismatch> {
+        let timeout = self.pool_params.idle_timeout;
+        let sweep = self.pool_params.idle_sweep;
+        let recent_first = self.pool_params.reuse_order == SessionReuseOrder::MostRecentlyUsed;
+        loop {
+            let candidate = if recent_first {
+                self.sessions.class_back(Class::Idle)
+            } else {
+                self.sessions.class_front(Class::Idle)
+            };
+            let Some(slot) = candidate else {
+                return Ok(None);
+            };
+            let entry = self.sessions.get(slot);
+            match Self::class_of(entry) {
+                None => {
+                    self.sessions.set_class(slot, None);
+                    continue;
+                }
+                Some(Class::Busy) => return Err(IndexMismatch),
+                Some(Class::Idle) if recent_first && entry.idle_since().is_none() => {
+                    return Err(IndexMismatch);
+                }
+                Some(Class::Idle) => {}
+            }
+            if !checkout_at.is_some_and(|now| entry.idle_expired(now, timeout, sweep)) {
+                return Ok(Some(slot));
+            }
+            let entry = self.sessions.remove(slot);
+            entry.session.close_admission();
+            retired.push(entry.session);
+            // Its count and stamp leave with it: a release's passes settle the index again.
+            self.unsettle_index();
+        }
+    }
+
+    /// The selection of `next_step`'s passes, without their retirements or counts.
+    #[cfg(debug_assertions)]
+    fn reference_selection(&self) -> Option<SessionSlot> {
+        self.sessions
+            .find(|entry| !entry.session.is_idle() && entry.session.supports_more_transactions())
+            .or_else(|| match self.pool_params.reuse_order {
+                SessionReuseOrder::LeastRecentlyUsed => None,
+                SessionReuseOrder::MostRecentlyUsed => self.most_recently_idle_entry(),
+            })
+            .or_else(|| {
+                self.sessions
+                    .find(|entry| entry.session.supports_more_transactions())
+            })
+    }
+
+    /// Indexes the session at `slot` again after an event the pool heard for it alone (S6.9).
+    /// `moved`: the event moved it to the back of the pool's order, where it joins its class
+    /// list. A class it takes without that move needs a search for its place: the session
+    /// leaves the index unsettled instead. Most recently used, an idle session out of stamp
+    /// order with its neighbors does too.
+    fn index_session(&mut self, slot: SessionSlot, moved: bool) {
+        if self.index.unsettled.is_none() {
+            return;
+        }
+        let class = Self::class_of(self.sessions.get(slot));
+        let current = self.sessions.class(slot);
+        if class.is_none() || (!moved && class != current) {
+            self.sessions.set_class(slot, None);
+            if class.is_some() {
+                self.unsettle_index();
+            }
+            return;
+        }
+        if class != current {
+            self.sessions.set_class(slot, class);
+            self.lower_age_floor(slot);
+        }
+        if class == Some(Class::Idle)
+            && self.pool_params.reuse_order == SessionReuseOrder::MostRecentlyUsed
+            && !self.idle_stamp_in_order(slot)
+        {
+            self.unsettle_index();
+        }
+    }
+
+    /// Lowers the age floor to the maximum-age deadline of the session at `slot`, which joined
+    /// a class list.
+    fn lower_age_floor(&mut self, slot: SessionSlot) {
+        if let Some(deadline) = self.sessions.get(slot).max_age_deadline() {
+            let floor = self.index.age_floor.get_or_insert(deadline);
+            *floor = (*floor).min(deadline);
+        }
+    }
+
+    /// Whether the idle session at `slot` is stamped no earlier than the idle list member
+    /// before it and no later than the one after it.
+    fn idle_stamp_in_order(&self, slot: SessionSlot) -> bool {
+        let stamp = |slot| self.sessions.get(slot).idle_since;
+        let Some(own) = stamp(slot) else {
+            return false;
+        };
+        self.sessions
+            .class_prev(slot)
+            .and_then(stamp)
+            .is_none_or(|prev| prev <= own)
+            && self
+                .sessions
+                .class_next(slot)
+                .and_then(stamp)
+                .is_none_or(|next| own <= next)
+    }
+
+    /// Whether the index can hear a release of `session` alone (S6.9): it is settled, so no
+    /// other session is finished, draining or changed since the pool last looked at it; the
+    /// session itself still admits and runs; and the release drains nothing.
+    fn index_hears(&self, session: &PooledSession, release_idle: bool) -> bool {
+        self.index_settled()
+            && (self.pooling_enabled || !release_idle)
+            && !session.is_finished()
+            && !session.is_draining()
+    }
+
+    /// The waiter of the acquisition that waits for `session`'s returning slot, which takes
+    /// the session's wake whatever it reports (`DIV-046`).
+    fn take_claimer(&mut self, session: Option<&PooledSession>) -> Option<Rc<Waiter>> {
+        session
+            .and_then(PooledSession::claimant)
+            .and_then(|id| self.waiters.iter().position(|waiter| waiter.id == id))
+            .and_then(|index| self.waiters.remove(index))
+    }
+
+    /// `notify_session_event`'s pass for a release the index hears, on `session` alone
+    /// (S6.9): its move to the back, its idle count, the claimer and waiters it wakes, its
+    /// stamp, then its class. Returns the claimer, the waiters, the idle count and whether
+    /// idle retirement wakes.
+    fn release_indexed(
+        &mut self,
+        session: &PooledSession,
+        enqueue_back: bool,
+        wake_count: usize,
+    ) -> (
+        Option<Rc<Waiter>>,
+        Vec<Rc<Waiter>>,
+        usize,
+        Option<Rc<CancellableBaton>>,
+    ) {
+        let slot = self.slot_of(session);
+        if enqueue_back && let Some(slot) = slot {
+            self.sessions.move_to_back(slot);
+        }
+        if let Some(slot) = slot {
+            let entry = self.sessions.get_mut(slot);
+            let idle = entry.session.is_idle();
+            let counted = std::mem::replace(&mut entry.counted_idle, idle);
+            self.idle_sessions =
+                (self.idle_sessions + usize::from(idle)).saturating_sub(usize::from(counted));
+        }
+        let claimer = self.take_claimer(Some(session));
+        let waiters = self.take_waiters(wake_count.saturating_sub(usize::from(claimer.is_some())));
+        let idle_wake = self
+            .track_idle_session(slot, claimer.is_some() || !waiters.is_empty())
+            .then(|| Rc::clone(&self.idle_wake));
+        if let Some(slot) = slot {
+            self.index_session(slot, enqueue_back);
+        }
+        #[cfg(debug_assertions)]
+        self.verify_index();
+        (claimer, waiters, self.idle_sessions, idle_wake)
+    }
+
+    /// Checks that a settled index mirrors the pool: every session that can take an exchange
+    /// is in its class list, the lists hold only pooled sessions in the pool's order, the
+    /// counts, stamps and floors are what the passes would leave, and, most recently used, the
+    /// idle list is in stamp order.
+    #[cfg(debug_assertions)]
+    fn verify_index(&self) {
+        if !self.index_settled() {
+            return;
+        }
+        let stamps_idle = self.stamps_idle();
+        let recent_first = self.pool_params.reuse_order == SessionReuseOrder::MostRecentlyUsed;
+        let mut busy = self.sessions.class_front(Class::Busy);
+        let mut idle = self.sessions.class_front(Class::Idle);
+        let mut counted = 0;
+        let mut last_idle: Option<Instant> = None;
+        self.sessions.entries().for_each(|(slot, entry)| {
+            let session = &entry.session;
+            assert!(
+                !session.is_finished() && !session.is_draining(),
+                "a settled index's pool holds no finished or draining session"
+            );
+            assert_eq!(
+                entry.counted_idle,
+                session.is_idle(),
+                "the idle count is current"
+            );
+            counted += usize::from(entry.counted_idle);
+            if stamps_idle {
+                assert_eq!(
+                    session.admitted_transactions() == 0,
+                    entry.idle_since.is_some(),
+                    "exactly the idle sessions are stamped"
+                );
+            }
+            if let Some(since) = entry.idle_since {
+                assert!(
+                    self.index.idle_floor.is_some_and(|floor| floor <= since),
+                    "the idle floor bounds every stamp"
+                );
+            }
+            if self.sessions.class(slot).is_some()
+                && let Some(deadline) = entry.max_age_deadline()
+            {
+                assert!(
+                    self.index.age_floor.is_some_and(|floor| floor <= deadline),
+                    "the age floor bounds every class list member's deadline"
+                );
+            }
+            if let Some(class) = Self::class_of(entry) {
+                assert_eq!(
+                    self.sessions.class(slot),
+                    Some(class),
+                    "a session that can take an exchange is in its class list"
+                );
+            }
+            match self.sessions.class(slot) {
+                Some(Class::Busy) => {
+                    assert_eq!(busy, Some(slot), "the busy list is in the pool's order");
+                    busy = self.sessions.class_next(slot);
+                }
+                Some(Class::Idle) => {
+                    assert_eq!(idle, Some(slot), "the idle list is in the pool's order");
+                    idle = self.sessions.class_next(slot);
+                    if recent_first && let Some(since) = entry.idle_since {
+                        assert!(
+                            last_idle.is_none_or(|last| last <= since),
+                            "the idle list is in stamp order"
+                        );
+                        last_idle = Some(since);
+                    }
+                }
+                None => {}
+            }
+        });
+        assert_eq!(
+            (busy, idle),
+            (None, None),
+            "the class lists hold only pooled sessions"
+        );
+        assert_eq!(counted, self.idle_sessions, "the idle count is the pass's");
+    }
+
     fn full(&self) -> bool {
         let maximum = u64::from(self.pool_params.max_connections);
         match self.ownership_bound() {
@@ -1195,21 +1745,41 @@ impl PoolState {
     /// deadline; on an interval to start sweeping, the first time no waiter is
     /// `handed` a session as one becomes idle.
     fn track_idle_sessions(&mut self, handed: bool) -> bool {
-        if self.pool_params.idle_timeout.is_zero()
-            && self.pool_params.reuse_order == SessionReuseOrder::LeastRecentlyUsed
-        {
+        if !self.stamps_idle() {
             return false;
         }
         let mut now = None;
-        self.sessions.iter_mut().for_each(|entry| {
-            entry.idle_since = if entry.session.admitted_transactions() == 0 {
-                entry
-                    .idle_since
-                    .or_else(|| Some(*now.get_or_insert_with(Instant::now)))
-            } else {
-                None
-            };
-        });
+        self.count_scan();
+        self.sessions
+            .for_each_mut(|entry| entry.stamp_idle(&mut now));
+        self.wakes_idle_retirement(now, handed)
+    }
+
+    /// `track_idle_sessions` for the session at `slot` alone, which a settled index vouches
+    /// is that pass: every other session's stamp already is what it would leave (S6.9).
+    fn track_idle_session(&mut self, slot: Option<SessionSlot>, handed: bool) -> bool {
+        if !self.stamps_idle() {
+            return false;
+        }
+        let mut now = None;
+        if let Some(slot) = slot {
+            self.sessions.get_mut(slot).stamp_idle(&mut now);
+        }
+        if let Some(now) = now {
+            self.index.idle_floor.get_or_insert(now);
+        }
+        self.wakes_idle_retirement(now, handed)
+    }
+
+    /// Whether sessions are stamped idle: for idle retirement or the most-recently-used order.
+    fn stamps_idle(&self) -> bool {
+        !self.pool_params.idle_timeout.is_zero()
+            || self.pool_params.reuse_order == SessionReuseOrder::MostRecentlyUsed
+    }
+
+    /// Whether idle retirement must wake after a pass that first stamped a session idle at
+    /// `now`, if any.
+    fn wakes_idle_retirement(&mut self, now: Option<Instant>, handed: bool) -> bool {
         let Some(now) = now.filter(|_| !self.pool_params.idle_timeout.is_zero()) else {
             return false;
         };
@@ -1255,6 +1825,9 @@ impl PoolState {
             }
             retain
         });
+        if !expired.is_empty() {
+            self.unsettle_index();
+        }
         expired
     }
 
@@ -1267,42 +1840,48 @@ impl PoolState {
         &mut self,
         checkout_at: Option<Instant>,
         retired: &mut RetiredSessions,
-    ) -> Option<usize> {
+    ) -> Option<SessionSlot> {
         let timeout = self.pool_params.idle_timeout;
         let sweep = self.pool_params.idle_sweep;
         loop {
-            let index = match self.pool_params.reuse_order {
+            let slot = match self.pool_params.reuse_order {
                 SessionReuseOrder::LeastRecentlyUsed => None,
                 SessionReuseOrder::MostRecentlyUsed => self.most_recently_idle_session(),
             }
             .or_else(|| {
+                self.count_scan();
                 self.sessions
-                    .iter()
-                    .position(|entry| entry.session.supports_more_transactions())
+                    .find(|entry| entry.session.supports_more_transactions())
             })?;
             if !checkout_at
-                .is_some_and(|now| self.sessions[index].idle_expired(now, timeout, sweep))
+                .is_some_and(|now| self.sessions.get(slot).idle_expired(now, timeout, sweep))
             {
-                return Some(index);
+                return Some(slot);
             }
-            let entry = self
-                .sessions
-                .remove(index)
-                .expect("an indexed session remains in the pool");
+            let entry = self.sessions.remove(slot);
             entry.session.close_admission();
             retired.push(entry.session);
         }
     }
 
-    /// The selectable session that most recently became idle.
-    fn most_recently_idle_session(&self) -> Option<usize> {
+    /// The selectable session that most recently became idle; of two that became idle at
+    /// once, the later in the pool's order.
+    fn most_recently_idle_session(&self) -> Option<SessionSlot> {
+        self.count_scan();
+        self.most_recently_idle_entry()
+    }
+
+    /// `most_recently_idle_session` without the count.
+    fn most_recently_idle_entry(&self) -> Option<SessionSlot> {
         self.sessions
-            .iter()
+            .entries()
             .enumerate()
-            .filter(|(_, entry)| entry.session.supports_more_transactions())
-            .filter_map(|(index, entry)| entry.idle_since().map(|since| (since, index)))
-            .max()
-            .map(|(_, index)| index)
+            .filter(|(_, (_, entry))| entry.session.supports_more_transactions())
+            .filter_map(|(position, (slot, entry))| {
+                entry.idle_since().map(|since| ((since, position), slot))
+            })
+            .max_by_key(|(key, _)| *key)
+            .map(|(_, slot)| slot)
     }
 }
 
@@ -1370,18 +1949,12 @@ impl Drop for RetiredSessions {
 }
 
 fn pop_next_session_for_teardown(state: &mut PoolState) -> Option<SessionEntry> {
-    let index = state
+    let slot = state
         .sessions
-        .iter()
-        .position(|entry| !entry.session.supports_more_transactions())
-        .or_else(|| {
-            state
-                .sessions
-                .iter()
-                .position(|entry| !entry.session.is_idle())
-        })
-        .or_else(|| (!state.sessions.is_empty()).then_some(0))?;
-    state.sessions.remove(index)
+        .find(|entry| !entry.session.supports_more_transactions())
+        .or_else(|| state.sessions.find(|entry| !entry.session.is_idle()))
+        .or_else(|| state.sessions.front())?;
+    Some(state.sessions.remove(slot))
 }
 
 pub(crate) fn notify_session_event(
@@ -1402,70 +1975,75 @@ pub(crate) fn notify_session_event(
             .session_event_passes
             .set(state.session_event_passes.get() + 1);
         let prior_idle = state.idle_sessions;
-        state
-            .sessions
-            .retain(|entry| !entry.session.is_finished() && !entry.session.is_draining());
-        if enqueue_back
-            && let Some(changed_session) = changed_session
-            && let Some(index) = state
-                .sessions
-                .iter()
-                .position(|entry| entry.session.is_same_session(changed_session))
-            && let Some(entry) = state.sessions.remove(index)
+        if let Some(session) =
+            changed_session.filter(|session| state.index_hears(session, release_idle))
         {
-            state.sessions.push_back(entry);
-        }
-        let sessions_to_drain = if state.pooling_enabled || !release_idle {
-            Vec::new()
-        } else if let Some(changed_session) = changed_session {
+            let (claimer, waiters, idle, idle_wake) =
+                state.release_indexed(session, enqueue_back, wake_count);
+            (
+                Vec::new(),
+                claimer,
+                waiters,
+                prior_idle.abs_diff(idle),
+                idle_wake,
+            )
+        } else {
+            state.count_scan();
             state
                 .sessions
-                .iter()
-                .position(|entry| entry.session.is_same_session(changed_session))
-                .and_then(|index| state.sessions.remove(index))
-                .map(|entry| vec![entry.session])
-                .unwrap_or_default()
-        } else {
-            let mut retained = VecDeque::new();
-            let mut draining = Vec::new();
-            while let Some(entry) = state.sessions.pop_front() {
-                if entry.session.active_transactions() == 0 {
-                    draining.push(entry.session);
-                } else {
-                    retained.push_back(entry);
-                }
+                .retain(|entry| !entry.session.is_finished() && !entry.session.is_draining());
+            if enqueue_back
+                && let Some(changed_session) = changed_session
+                && let Some(slot) = state.slot_of(changed_session)
+            {
+                state.sessions.move_to_back(slot);
             }
-            state.sessions = retained;
-            draining
-        };
-        let idle = state
-            .sessions
-            .iter()
-            .filter(|entry| entry.session.is_idle())
-            .count();
-        state.idle_sessions = idle;
-        let wake_count = if !state.pooling_enabled && !sessions_to_drain.is_empty() {
-            1
-        } else {
-            wake_count
-        };
-        // The acquisition that waits for the session's returning slot takes the
-        // session's wake, whatever it reports (`DIV-046`).
-        let claimer = changed_session
-            .and_then(PooledSession::claimant)
-            .and_then(|id| state.waiters.iter().position(|waiter| waiter.id == id))
-            .and_then(|index| state.waiters.remove(index));
-        let waiters = state.take_waiters(wake_count.saturating_sub(usize::from(claimer.is_some())));
-        let idle_wake = state
-            .track_idle_sessions(claimer.is_some() || !waiters.is_empty())
-            .then(|| Rc::clone(&state.idle_wake));
-        (
-            sessions_to_drain,
-            claimer,
-            waiters,
-            prior_idle.abs_diff(idle),
-            idle_wake,
-        )
+            let sessions_to_drain = if state.pooling_enabled || !release_idle {
+                Vec::new()
+            } else if let Some(changed_session) = changed_session {
+                state
+                    .slot_of(changed_session)
+                    .map(|slot| vec![state.sessions.remove(slot).session])
+                    .unwrap_or_default()
+            } else {
+                state.count_scan();
+                let mut draining = Vec::new();
+                let mut cursor = state.sessions.front();
+                while let Some(slot) = cursor {
+                    cursor = state.sessions.next(slot);
+                    if state.sessions.get(slot).session.active_transactions() == 0 {
+                        draining.push(state.sessions.remove(slot).session);
+                    }
+                }
+                draining
+            };
+            state.count_scan();
+            let idle = state
+                .sessions
+                .iter()
+                .filter(|entry| entry.session.is_idle())
+                .count();
+            state.idle_sessions = idle;
+            let wake_count = if !state.pooling_enabled && !sessions_to_drain.is_empty() {
+                1
+            } else {
+                wake_count
+            };
+            let claimer = state.take_claimer(changed_session);
+            let waiters =
+                state.take_waiters(wake_count.saturating_sub(usize::from(claimer.is_some())));
+            let idle_wake = state
+                .track_idle_sessions(claimer.is_some() || !waiters.is_empty())
+                .then(|| Rc::clone(&state.idle_wake));
+            state.settle_index();
+            (
+                sessions_to_drain,
+                claimer,
+                waiters,
+                prior_idle.abs_diff(idle),
+                idle_wake,
+            )
+        }
     };
     if let Some(idle_wake) = idle_wake {
         let _ = catch_callback(|| idle_wake.signal());
@@ -1492,20 +2070,21 @@ pub(crate) fn record_reservation(
     enqueue_back: bool,
 ) {
     let mut state = pool.borrow_mut();
-    let Some(index) = state
-        .sessions
-        .iter()
-        .position(|entry| entry.session.is_same_session(session))
-    else {
+    let Some(slot) = state.slot_of(session) else {
         return;
     };
-    state.sessions[index].idle_since = None;
+    let entry = state.sessions.get_mut(slot);
+    entry.idle_since = None;
+    entry.counted_idle = entry.session.is_idle();
     if was_idle {
         state.idle_sessions = state.idle_sessions.saturating_sub(1);
     }
-    if enqueue_back && let Some(entry) = state.sessions.remove(index) {
-        state.sessions.push_back(entry);
+    if enqueue_back {
+        state.sessions.move_to_back(slot);
     }
+    state.index_session(slot, enqueue_back);
+    #[cfg(debug_assertions)]
+    state.verify_index();
 }
 
 fn notify_idle_observer(pool: &Rc<RefCell<PoolState>>) {
@@ -1893,6 +2472,11 @@ impl HttpSessionPool {
 
     fn build(context: WorkerContext, mut pool_params: PoolParams, backend: PoolBackend) -> Self {
         let pooling_enabled = pool_params.max_connections != 0;
+        let indexed = matches!(
+            &backend,
+            PoolBackend::Owned { connection, .. }
+                if connection.plaintext_protocol == CodecProtocol::Http11
+        );
         pool_params.max_connections = pool_params.max_connections.max(1);
         pool_params.max_connection_attempts = pool_params.max_connection_attempts.max(1);
         let (completion, _) = watch::channel(None);
@@ -1912,7 +2496,8 @@ impl HttpSessionPool {
                 backend,
                 observer: None,
                 idle_observer: None,
-                sessions: VecDeque::new(),
+                sessions: SessionList::new(),
+                index: SessionIndex::new(indexed),
                 idle_sessions: 0,
                 waiters: VecDeque::new(),
                 connects_in_progress: 0,
@@ -1931,6 +2516,12 @@ impl HttpSessionPool {
                 session_event_passes: Cell::default(),
                 #[cfg(test)]
                 connection_attempts: Cell::default(),
+                #[cfg(test)]
+                pool_scans: Cell::default(),
+                #[cfg(test)]
+                claim_scans: Cell::default(),
+                #[cfg(test)]
+                force_scans: Cell::default(),
                 next_waiter_id: 1,
                 pooling_enabled,
                 draining: false,
@@ -2253,6 +2844,7 @@ impl HttpSessionPool {
                 return false;
             }
             state.draining = true;
+            state.unsettle_index();
             let waiters = state.take_all_waiters();
             state.idle_sessions = 0;
             state.connects_in_progress = 0;
@@ -2327,6 +2919,7 @@ impl HttpSessionPool {
     pub fn flush(&self) {
         let waiters = {
             let mut state = self.state.borrow_mut();
+            state.unsettle_index();
             state.take_all_waiters()
         };
         cancel_waiters(waiters, PoolError::Draining);
@@ -2359,11 +2952,9 @@ impl HttpSessionPool {
         if !state.waiters.is_empty() {
             return None;
         }
-        let index = state
-            .sessions
-            .iter()
-            .position(|entry| entry.session.is_idle())?;
-        let entry = state.sessions.remove(index)?;
+        let slot = state.sessions.find(|entry| entry.session.is_idle())?;
+        state.unsettle_index();
+        let entry = state.sessions.remove(slot);
         state.idle_sessions = state.idle_sessions.saturating_sub(1);
         drop(state);
         let session = entry.session.into_client_session();
@@ -2417,7 +3008,7 @@ impl HttpSessionPool {
                 return Err(error);
             }
             client_session.mark_available();
-            session.bind_pool(Rc::downgrade(&self.state));
+            session.bind_pool(Rc::downgrade(&self.state), None);
             let wake_count = session.available_transactions();
             let worker = state.context.worker_id();
             let max_age = sampled_max_age(state.pool_params.max_age);
@@ -2458,25 +3049,24 @@ impl HttpSessionPool {
 
     #[cfg(test)]
     pub(crate) fn expire_sessions_for_test(&self) {
-        self.state
-            .borrow_mut()
-            .sessions
-            .iter_mut()
-            .for_each(|entry| {
-                let age = entry.session.age();
-                assert!(!age.is_zero(), "the fixture established an aged session");
-                entry.max_age = age;
-            });
+        let mut state = self.state.borrow_mut();
+        state.unsettle_index();
+        state.sessions.for_each_mut(|entry| {
+            let age = entry.session.age();
+            assert!(!age.is_zero(), "the fixture established an aged session");
+            entry.max_age = age;
+        });
     }
 
     #[cfg(test)]
     pub(crate) fn expire_session_for_test(&self, session: &ClientSession) {
         let mut state = self.state.borrow_mut();
-        let entry = state
+        state.unsettle_index();
+        let slot = state
             .sessions
-            .iter_mut()
             .find(|entry| entry.session.is_client_session(session))
             .expect("the session is pooled");
+        let entry = state.sessions.get_mut(slot);
         let age = entry.session.age();
         assert!(!age.is_zero(), "the fixture established an aged session");
         entry.max_age = age;
@@ -2484,24 +3074,23 @@ impl HttpSessionPool {
 
     #[cfg(test)]
     pub(crate) fn age_idle_sessions_for_test(&self, by: Duration) {
-        self.state
-            .borrow_mut()
-            .sessions
-            .iter_mut()
-            .for_each(|entry| {
-                let since = entry.idle_since.expect("the fixture left the session idle");
-                entry.idle_since = since.checked_sub(by);
-            });
+        let mut state = self.state.borrow_mut();
+        state.unsettle_index();
+        state.sessions.for_each_mut(|entry| {
+            let since = entry.idle_since.expect("the fixture left the session idle");
+            entry.idle_since = since.checked_sub(by);
+        });
     }
 
     #[cfg(test)]
     pub(crate) fn age_idle_session_for_test(&self, session: &ClientSession, by: Duration) {
         let mut state = self.state.borrow_mut();
-        let entry = state
+        state.unsettle_index();
+        let slot = state
             .sessions
-            .iter_mut()
             .find(|entry| entry.session.is_client_session(session))
             .expect("the session is pooled");
+        let entry = state.sessions.get_mut(slot);
         let since = entry.idle_since.expect("the fixture left the session idle");
         entry.idle_since = since.checked_sub(by);
     }
@@ -2513,13 +3102,79 @@ impl HttpSessionPool {
         let wake = {
             let mut state = self.state.borrow_mut();
             let since = Instant::now().checked_sub(by);
+            state.unsettle_index();
             state
                 .sessions
-                .iter_mut()
-                .for_each(|entry| entry.idle_since = since);
+                .for_each_mut(|entry| entry.idle_since = since);
             Rc::clone(&state.idle_wake)
         };
         wake.signal();
+    }
+
+    /// Sets a pooled session's maximum age to its age, as if it had reached it.
+    #[cfg(test)]
+    pub(crate) fn expire_pooled_session_for_test(&self, session: &PooledSession) {
+        let mut state = self.state.borrow_mut();
+        state.unsettle_index();
+        let slot = state.slot_of(session).expect("the session is pooled");
+        let entry = state.sessions.get_mut(slot);
+        let age = entry.session.age();
+        assert!(!age.is_zero(), "the fixture established an aged session");
+        entry.max_age = age;
+    }
+
+    /// Moves a pooled session's idle stamp `by` earlier, as if it had been idle that much
+    /// longer.
+    #[cfg(test)]
+    pub(crate) fn age_idle_pooled_session_for_test(&self, session: &PooledSession, by: Duration) {
+        let mut state = self.state.borrow_mut();
+        state.unsettle_index();
+        let slot = state.slot_of(session).expect("the session is pooled");
+        let entry = state.sessions.get_mut(slot);
+        let since = entry.idle_since.expect("the fixture left the session idle");
+        entry.idle_since = since.checked_sub(by);
+    }
+
+    /// The sessions in the index's busy and idle lists.
+    #[cfg(test)]
+    pub(crate) fn indexed_sessions_for_test(&self) -> (usize, usize) {
+        let state = self.state.borrow();
+        let members = |class| {
+            std::iter::successors(state.sessions.class_front(class), |slot| {
+                state.sessions.class_next(*slot)
+            })
+            .count()
+        };
+        (members(Class::Busy), members(Class::Idle))
+    }
+
+    /// Moves every idle stamp, and the index's idle floor, `by` earlier, as if that much time
+    /// had passed for the idle sessions alone, leaving the index settled if it was.
+    #[cfg(test)]
+    pub(crate) fn pass_idle_time_for_test(&self, by: Duration) {
+        let mut state = self.state.borrow_mut();
+        state.sessions.for_each_mut(|entry| {
+            entry.idle_since = entry.idle_since.and_then(|since| since.checked_sub(by));
+        });
+        state.index.idle_floor = state
+            .index
+            .idle_floor
+            .and_then(|floor| floor.checked_sub(by));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn index_settled_for_test(&self) -> bool {
+        self.state.borrow().index_settled()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_pool_scans_for_test(&self, forced: bool) {
+        self.state.borrow().force_scans.set(forced);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_connects_for_test(&self) -> u32 {
+        self.state.borrow().connects_in_progress
     }
 
     #[cfg(test)]
@@ -2535,6 +3190,16 @@ impl HttpSessionPool {
     #[cfg(test)]
     pub(crate) fn connection_attempts_for_test(&self) -> u64 {
         self.state.borrow().connection_attempts.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pool_scans_for_test(&self) -> u64 {
+        self.state.borrow().pool_scans.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn claim_scans_for_test(&self) -> u64 {
+        self.state.borrow().claim_scans.get()
     }
 
     #[cfg(test)]
@@ -2560,7 +3225,7 @@ impl HttpSessionPool {
     #[cfg(test)]
     pub(crate) fn insert_session_for_teardown_test(&self, session: ClientSession) {
         let session = PooledSession::Uniplex(session);
-        session.bind_pool(Rc::downgrade(&self.state));
+        session.bind_pool(Rc::downgrade(&self.state), None);
         let mut state = self.state.borrow_mut();
         if session.is_idle() {
             state.idle_sessions = state.idle_sessions.saturating_add(1);
@@ -2902,7 +3567,8 @@ async fn run_connection_attempt(
                     drain_sessions(vec![connected]);
                     return Some(completion);
                 }
-                connected.bind_pool(Rc::downgrade(&pool));
+                let unsettled = pool.borrow().index.unsettled.clone();
+                connected.bind_pool(Rc::downgrade(&pool), unsettled);
                 let wake_count = connected.available_transactions();
                 let max_age = sampled_max_age(pool.borrow().pool_params.max_age);
                 pool.borrow_mut().sessions.push_back(SessionEntry::new(
@@ -2976,10 +3642,7 @@ fn next_step(
     let step = (|| {
         let mut pool = state.borrow_mut();
         ensure_pool_open(&pool)?;
-        pool.sessions
-            .retain(|entry| !entry.session.is_finished() && !entry.session.is_draining());
         let admitting = pool.admits_reservations();
-        let bounded = pool.ownership_bound().is_some();
         let idle_timeout = pool.pool_params.idle_timeout;
         let idle_sweep = pool.pool_params.idle_sweep;
         let now = (!idle_timeout.is_zero()).then(Instant::now);
@@ -2987,52 +3650,60 @@ fn next_step(
         // below retires them as hyper-util's checkout does.
         let expired_at = now.filter(|_| idle_sweep == IdleSweep::AtExpiry);
         let checkout_at = now.filter(|_| idle_sweep == IdleSweep::Interval);
-        while let Some(index) = pool.sessions.iter().position(|entry| {
-            (entry.max_age != Duration::ZERO
-                && admitting
-                && entry.session.supports_more_transactions()
-                && entry.session.age() >= entry.max_age)
-                || expired_at.is_some_and(|now| entry.idle_expired(now, idle_timeout, idle_sweep))
-        }) {
-            let Some(entry) = pool.sessions.remove(index) else {
-                break;
-            };
-            if bounded
-                && pool.full()
-                && !pool
-                    .sessions
-                    .iter()
-                    .any(|entry| entry.session.supports_more_transactions())
-            {
-                // The last selectable session serves on while the gate refuses its replacement.
-                pool.sessions.insert(index, entry);
-                break;
-            }
-            if expired_at.is_some_and(|now| entry.idle_expired(now, idle_timeout, idle_sweep)) {
-                // As `take_idle_expired`: no drain may let a callback reserve it.
-                entry.session.close_admission();
-                idle_expired.push(entry.session);
-            } else {
-                expired.push(entry.session);
-            }
-        }
-        let selected = if admitting {
-            pool.sessions
-                .iter()
-                .position(|entry| {
-                    !entry.session.is_idle() && entry.session.supports_more_transactions()
-                })
-                .or_else(|| pool.select_idle_session(checkout_at, &mut idle_expired))
+        // A settled index selects as the passes below would, without them (S6.9).
+        let selected = if admitting && pool.index_ready(now) {
+            pool.select_indexed(checkout_at, &mut idle_expired)
         } else {
-            None
+            pool.unsettle_index();
+            pool.count_scan();
+            pool.sessions
+                .retain(|entry| !entry.session.is_finished() && !entry.session.is_draining());
+            let bounded = pool.ownership_bound().is_some();
+            while let Some(slot) = {
+                pool.count_scan();
+                pool.sessions.find(|entry| {
+                    (entry.max_age != Duration::ZERO
+                        && admitting
+                        && entry.session.supports_more_transactions()
+                        && entry.session.age() >= entry.max_age)
+                        || expired_at
+                            .is_some_and(|now| entry.idle_expired(now, idle_timeout, idle_sweep))
+                })
+            } {
+                let next = pool.sessions.next(slot);
+                let entry = pool.sessions.remove(slot);
+                if bounded
+                    && pool.full()
+                    && !pool
+                        .sessions
+                        .iter()
+                        .any(|entry| entry.session.supports_more_transactions())
+                {
+                    // The last selectable session serves on while the gate refuses its replacement.
+                    pool.sessions.insert_before(next, entry);
+                    break;
+                }
+                if expired_at.is_some_and(|now| entry.idle_expired(now, idle_timeout, idle_sweep)) {
+                    // As `take_idle_expired`: no drain may let a callback reserve it.
+                    entry.session.close_admission();
+                    idle_expired.push(entry.session);
+                } else {
+                    expired.push(entry.session);
+                }
+            }
+            if admitting {
+                pool.count_scan();
+                pool.sessions
+                    .find(|entry| {
+                        !entry.session.is_idle() && entry.session.supports_more_transactions()
+                    })
+                    .or_else(|| pool.select_idle_session(checkout_at, &mut idle_expired))
+            } else {
+                None
+            }
         };
-        Ok(if let Some(index) = selected {
-            let session = pool
-                .sessions
-                .get(index)
-                .expect("an indexed session remains in the pool")
-                .session
-                .clone();
+        Ok(if let Some(slot) = selected {
+            let session = pool.sessions.get(slot).session.clone();
             AcquireStep::Session {
                 session,
                 retired: RetiredSessions::default(),
@@ -3067,6 +3738,8 @@ fn next_step(
             {
                 None
             } else {
+                #[cfg(test)]
+                pool.claim_scans.set(pool.claim_scans.get() + 1);
                 pool.sessions
                     .iter()
                     .find(|entry| entry.session.claimable())

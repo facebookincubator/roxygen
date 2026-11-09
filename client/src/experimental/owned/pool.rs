@@ -6,6 +6,8 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::Context;
 use std::task::Poll;
+#[cfg(test)]
+use std::time::Duration;
 
 use roxygen_core::error::HttpError;
 use roxygen_core::message::SocketAddress;
@@ -32,7 +34,10 @@ use crate::pool::start_acquisition;
 /// A worker-local pool of [`OwnedClientSession`]s to one address, with
 /// `HttpSessionPool`'s scheduler and [`PoolParams`]: the same connection,
 /// waiter, connect-timeout, maximum-age, idle-timeout, reuse-order and
-/// idle-sweep semantics (`DIV-032`), shared with it.
+/// idle-sweep semantics (`DIV-032`), shared with it. An HTTP/1.1 pool keeps its
+/// sessions that can take an exchange in a selection index, so that an
+/// acquisition that finds one, and a release, make no pass over the pool's
+/// sessions however many it holds; the selection is the scheduler's.
 pub struct OwnedHttpSessionPool(HttpSessionPool);
 
 /// One reservation on the session an acquisition selected.
@@ -178,6 +183,53 @@ impl OwnedHttpSessionPool {
     #[cfg(test)]
     pub(crate) fn connection_attempts_for_test(&self) -> u64 {
         self.0.connection_attempts_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_idle_session_for_test(&self, session: &OwnedClientSession, by: Duration) {
+        self.0
+            .age_idle_pooled_session_for_test(&PooledSession::Owned(session.clone()), by);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_session_for_test(&self, session: &OwnedClientSession) {
+        self.0
+            .expire_pooled_session_for_test(&PooledSession::Owned(session.clone()));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn indexed_sessions_for_test(&self) -> (usize, usize) {
+        self.0.indexed_sessions_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pass_idle_time_for_test(&self, by: Duration) {
+        self.0.pass_idle_time_for_test(by);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn index_settled_for_test(&self) -> bool {
+        self.0.index_settled_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_pool_scans_for_test(&self, forced: bool) {
+        self.0.force_pool_scans_for_test(forced);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_connects_for_test(&self) -> u32 {
+        self.0.pending_connects_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pool_scans_for_test(&self) -> u64 {
+        self.0.pool_scans_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn claim_scans_for_test(&self) -> u64 {
+        self.0.claim_scans_for_test()
     }
 
     #[cfg(test)]

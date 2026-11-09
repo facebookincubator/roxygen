@@ -124,6 +124,7 @@ use crate::connector::uniplex_config_for_session_params;
 use crate::connector::wait_session_completion;
 use crate::pool::PoolState;
 use crate::pool::PooledSession;
+use crate::pool::SessionSlot;
 use crate::pool::notify_session_event;
 use crate::pool::record_reservation;
 
@@ -171,6 +172,12 @@ struct PoolBinding {
     /// The waiter of the acquisition that waits for the slot the driver is
     /// about to return, instead of dialing.
     claimant: Cell<Option<u64>>,
+    /// The slot of the session's entry in its pool's list, so that the pool
+    /// finds the entry without a search.
+    slot: Cell<Option<SessionSlot>>,
+    /// Set when the session stops admitting without an event its pool hears,
+    /// so that the pool's selection index looks at every session again (S6.9).
+    unsettled: RefCell<Option<Rc<Cell<bool>>>>,
 }
 
 impl Default for PoolBinding {
@@ -182,6 +189,18 @@ impl Default for PoolBinding {
             reported_idle: Cell::new(true),
             reserved: Cell::new(false),
             claimant: Cell::new(None),
+            slot: Cell::new(None),
+            unsettled: RefCell::new(None),
+        }
+    }
+}
+
+impl SessionInner {
+    /// Tells the session's pool, if any, that the session stops admitting without
+    /// an event the pool hears, as a cancellation does (S6.9).
+    fn unsettle_pool(&self) {
+        if let Some(unsettled) = self.pool.unsettled.borrow().as_ref() {
+            unsettled.set(true);
         }
     }
 }
@@ -495,6 +514,7 @@ impl OwnedClientSession {
     /// Fails the connection with `CORO_CANCELLED`: admission closes, live
     /// exchanges fail and the transport resets.
     pub fn cancel(&self) {
+        self.inner.unsettle_pool();
         self.inner.upstream.cancel();
     }
 
@@ -591,14 +611,24 @@ impl OwnedClientSession {
         self.inner.started.elapsed()
     }
 
+    /// When the session started, from which its age counts.
+    pub(crate) fn started(&self) -> Instant {
+        self.inner.started
+    }
+
     pub(crate) fn worker_id(&self) -> WorkerId {
         self.inner.worker_id
     }
 
     /// Binds the session to its pool, whose notifications the driver's
     /// capacity and admission callbacks then feed.
-    pub(crate) fn bind_pool(&self, pool: Weak<RefCell<PoolState>>) {
+    pub(crate) fn bind_pool(
+        &self,
+        pool: Weak<RefCell<PoolState>>,
+        unsettled: Option<Rc<Cell<bool>>>,
+    ) {
         self.inner.pool.pool.replace(Some(pool));
+        self.inner.pool.unsettled.replace(unsettled);
         self.inner.pool.reported_idle.set(self.is_idle());
         let observer = Rc::new(PoolObserver {
             session: Rc::downgrade(&self.inner),
@@ -612,6 +642,15 @@ impl OwnedClientSession {
 
     pub(crate) fn is_bound_to_pool(&self) -> bool {
         self.inner.pool.pool.borrow().is_some()
+    }
+
+    /// The slot of the session's entry in its pool's list, while it has one.
+    pub(crate) fn pool_slot(&self) -> Option<SessionSlot> {
+        self.inner.pool.slot.get()
+    }
+
+    pub(crate) fn set_pool_slot(&self, slot: Option<SessionSlot>) {
+        self.inner.pool.slot.set(slot);
     }
 }
 
@@ -868,11 +907,22 @@ impl RunScope {
                 HttpErrorCode::CORO_CANCELLED,
                 b"attached session cancelled",
             ));
+            self.unsettle_pool();
             upstream.cancel();
         }
         if !self.draining && Pin::new(&mut self.quiescing).poll(context).is_ready() {
             self.draining = true;
             self.failure = drain(upstream);
+            if self.failure.is_some() {
+                // The drain cancelled the session.
+                self.unsettle_pool();
+            }
+        }
+    }
+
+    fn unsettle_pool(&self) {
+        if let Some(inner) = self.session.upgrade() {
+            inner.unsettle_pool();
         }
     }
 }
