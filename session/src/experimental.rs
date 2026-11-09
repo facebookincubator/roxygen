@@ -116,7 +116,9 @@ pub trait OwnedRequestProgressExt {
     /// a failure the request or its consumer caused (a request the driver
     /// refuses, a cancel or a deadline), which resending would repeat or
     /// override, also when the refusal follows the consumer's cause. Any other
-    /// failure of a committed request reports false.
+    /// failure of a committed request reports false. An unprocessed request
+    /// fails with its refusal's error: a cancel, deadline or cancellation that
+    /// follows the refusal does not replace it.
     fn request_unprocessed(&self) -> bool;
 
     /// How many requests the connection committed before this one, fixed
@@ -135,9 +137,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Runs `hook` once, right after the next connection refusal on this thread
-/// samples its request's selected cause: where another thread's cancellation
-/// can land.
+/// Runs `hook` once, right after the next refusal on this thread, by a
+/// connection or by an HTTP/2 peer, samples its request's selected cause: where
+/// another thread's cancellation can land.
 #[cfg(test)]
 pub(crate) fn after_next_refusal_cause_sample(hook: impl FnOnce() + 'static) {
     AFTER_REFUSAL_CAUSE_SAMPLE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));

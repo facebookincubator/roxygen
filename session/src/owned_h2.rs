@@ -809,6 +809,23 @@ where
             .and_then(<E as ExchangeStorage<UPSTREAM>>::upstream_mut)
     }
 
+    /// Records a peer reset for the owner to apply, unless one is pending: the request's selected
+    /// cause, or else `reset`. A `refusal` may fail the request unprocessed and select `reset`
+    /// (`RequestStatus::peer_reset_error`, `DIV-035`), which then also fails the response's
+    /// source at once (`fail_refused_response`).
+    fn record_peer_reset(&mut self, refusal: bool, reset: impl FnOnce() -> HttpError) {
+        if self.peer_reset.is_none() {
+            let (error, unprocessed) = match self.upstream() {
+                Some(exchange) => exchange.status.peer_reset_error(refusal, reset),
+                None => (reset(), false),
+            };
+            self.peer_reset = Some(error);
+            if unprocessed {
+                self.fail_refused_response();
+            }
+        }
+    }
+
     fn release_upstream_capacity(&self) {
         if let Some(exchange) = self.upstream()
             && exchange.status.ingress_succeeded()
@@ -3306,22 +3323,10 @@ where
                     owner.ingress_rejected = true;
                     owner.signals.close_protocol();
                     self.state.scheduler.dequeue(stream, &mut owner.scheduling);
-                    let selected = owner
-                        .upstream()
-                        .and_then(|exchange| exchange.status.selected_error());
-                    let unprocessed = code == HttpErrorCode::REFUSED_STREAM
-                        && first_reset
-                        && owner
-                            .upstream()
-                            .is_some_and(|exchange| exchange.status.peer_refused());
-                    owner.peer_reset.get_or_insert_with(|| {
-                        selected.unwrap_or_else(|| {
-                            failure(code, b"peer reset cancelled local byte events")
-                        })
-                    });
-                    if unprocessed {
-                        owner.fail_refused_response();
-                    }
+                    owner.record_peer_reset(
+                        code == HttpErrorCode::REFUSED_STREAM && first_reset,
+                        || failure(code, b"peer reset cancelled local byte events"),
+                    );
                     owner.wake.enqueue();
                 }
             }
@@ -3436,24 +3441,9 @@ where
                         owner.ingress_rejected = true;
                         owner.signals.close_protocol();
                         self.state.scheduler.dequeue(id, &mut owner.scheduling);
-                        let selected = owner
-                            .upstream()
-                            .and_then(|exchange| exchange.status.selected_error());
-                        let unprocessed = first_reset
-                            && owner
-                                .upstream()
-                                .is_some_and(|exchange| exchange.status.peer_refused());
-                        owner.peer_reset.get_or_insert_with(|| {
-                            selected.unwrap_or_else(|| {
-                                failure(
-                                    HttpErrorCode::REFUSED_STREAM,
-                                    b"peer GOAWAY refused stream",
-                                )
-                            })
+                        owner.record_peer_reset(first_reset, || {
+                            failure(HttpErrorCode::REFUSED_STREAM, b"peer GOAWAY refused stream")
                         });
-                        if unprocessed {
-                            owner.fail_refused_response();
-                        }
                         owner.wake.enqueue();
                     }
                 }

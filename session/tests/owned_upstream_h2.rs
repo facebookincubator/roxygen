@@ -8344,3 +8344,200 @@ fn a_cancellation_racing_a_refusal_follows_it() {
         })
     });
 }
+
+impl Submitted {
+    fn cancel(&self, error: HttpError) {
+        match self {
+            Self::Plain(submission) => submission.cancel(error),
+            Self::Exclusive(submission) => submission.cancel(error),
+        }
+    }
+}
+
+/// How the peer refuses a committed request's stream 1.
+#[derive(Clone, Copy, Debug)]
+enum PeerRefusal {
+    /// RST_STREAM(`REFUSED_STREAM`), then a GOAWAY whose last-stream-id is 1, which refuses
+    /// nothing more and lets the connection finish.
+    RefusedStream,
+    /// A GOAWAY whose last-stream-id is 0.
+    Goaway,
+}
+
+/// Whether and when the consumer cancels a refused request whose response it has not claimed.
+#[derive(Clone, Copy, Debug)]
+enum RefusalCancel {
+    None,
+    /// After the driver applied the refusal, the submission's `cancel` with a deadline's error.
+    Explicit,
+    /// After the driver applied the refusal, the request's cancellation token.
+    Token,
+    /// The token, from a test hook right after the refusal samples the request's cause, where
+    /// another thread's cancellation can land.
+    RacingTheSample,
+}
+
+/// A POST on stream 1, submitted as `kind`, whose upload holds its body back, refused by the
+/// peer as `refusal`, cancelled as `cancel`, then claimed: the upload's stops and the request's
+/// claim error and progress.
+fn unclaimed_peer_refusal(
+    refusal: PeerRefusal,
+    kind: SubmitKind,
+    cancel: RefusalCancel,
+) -> (Vec<Option<HttpErrorCode>>, RequestProgress) {
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Downstream);
+            let goaway = |last_stream| EgressFrame::Goaway {
+                last_stream: StreamId::new(last_stream),
+                code: H2ErrorCode::NO_ERROR,
+                debug_data: None,
+            };
+            let frames = match refusal {
+                PeerRefusal::RefusedStream => {
+                    let mut frames = eligibility_frame(
+                        &mut peer,
+                        EgressFrame::Reset {
+                            stream: StreamId::new(1),
+                            code: H2ErrorCode::REFUSED_STREAM,
+                        },
+                    );
+                    frames.extend(eligibility_frame(&mut peer, goaway(1)));
+                    frames
+                }
+                PeerRefusal::Goaway => eligibility_frame(&mut peer, goaway(0)),
+            };
+            let refuse = Arc::new(tokio::sync::Notify::new());
+            let (transport, wire) = FixtureTransport::new([
+                FixtureRead::Data(server_settings_bytes(100)),
+                FixtureRead::WaitData(Arc::clone(&refuse), frames),
+            ]);
+            let (session, handle) =
+                OwnedH2UpstreamSession::new(options(context, transport)).unwrap();
+            let (run, outcome) = tokio::join!(session.run(), async {
+                complete_credit_wait(|| handle.available_capacity() == 100).await;
+                let mut cancellation = Some(CancellationSource::new());
+                let token = cancellation.as_ref().unwrap().token();
+                let (upload, probe) = Upload::new(0, 1).held();
+                let head = request_head(HttpMethod::Post, false, None);
+                let reservation = handle.reserve_request().unwrap();
+                let mut submitted = match kind {
+                    SubmitKind::Plain => Submitted::Plain(reservation.submit(head, upload, token)),
+                    SubmitKind::ResponseInterest => Submitted::Exclusive(
+                        reservation.submit_with_response_interest(head, upload, token, None),
+                    ),
+                    SubmitKind::Exclusive => {
+                        Submitted::Exclusive(reservation.submit_exclusive(head, upload, token))
+                    }
+                };
+                complete_credit_wait(|| header_streams(&wire) == [StreamId::new(1)]).await;
+                let fired = Rc::new(Cell::new(false));
+                if matches!(cancel, RefusalCancel::RacingTheSample) {
+                    let (cancellation, fired) = (cancellation.take().unwrap(), Rc::clone(&fired));
+                    crate::experimental::after_next_refusal_cause_sample(move || {
+                        cancellation.request_cancellation();
+                        fired.set(true);
+                    });
+                }
+                refuse.notify_one();
+                // Applying the refusal stops the upload.
+                complete_credit_wait(|| !probe.stops.borrow().is_empty()).await;
+                match cancel {
+                    RefusalCancel::None => {}
+                    RefusalCancel::Explicit => {
+                        submitted.cancel(HttpError::new(HttpErrorCode::READ_TIMEOUT));
+                    }
+                    RefusalCancel::Token => {
+                        cancellation.take().unwrap().request_cancellation();
+                    }
+                    RefusalCancel::RacingTheSample => {
+                        assert!(fired.get(), "the refusal sampled the request's cause");
+                    }
+                }
+                let progress = submitted.progress().await;
+                complete_credit_wait(|| handle.is_finished()).await;
+                let stops = probe.stops.borrow().clone();
+                (stops, progress)
+            });
+            run.unwrap();
+            outcome
+        })
+    })
+}
+
+/// Each case's outcome beside the refused request's: the upload stopped with the refusal, and
+/// the claim fails with it, unprocessed, sequence 0 (`DIV-035`).
+fn peer_refusal_table(
+    cases: &[(PeerRefusal, SubmitKind, RefusalCancel)],
+) -> [Vec<(String, Vec<Option<HttpErrorCode>>, RequestProgress)>; 2] {
+    let refused = || RequestProgress {
+        error: Some(HttpErrorCode::REFUSED_STREAM),
+        unprocessed: true,
+        sequence: Some(0),
+    };
+    let mut outcomes = Vec::new();
+    let mut expected = Vec::new();
+    for &(refusal, kind, cancel) in cases {
+        let case = format!("{refusal:?}, {kind:?}, {cancel:?}");
+        let (stops, progress) = unclaimed_peer_refusal(refusal, kind, cancel);
+        outcomes.push((case.clone(), stops, progress));
+        expected.push((case, vec![Some(HttpErrorCode::REFUSED_STREAM)], refused()));
+    }
+    [outcomes, expected]
+}
+
+/// Every refusal and submission kind, with `cancels`.
+fn peer_refusal_cases(
+    kinds: &[SubmitKind],
+    cancels: &[RefusalCancel],
+) -> Vec<(PeerRefusal, SubmitKind, RefusalCancel)> {
+    let mut cases = Vec::new();
+    for refusal in [PeerRefusal::RefusedStream, PeerRefusal::Goaway] {
+        for &kind in kinds {
+            for &cancel in cancels {
+                cases.push((refusal, kind, cancel));
+            }
+        }
+    }
+    cases
+}
+
+const ALL_SUBMIT_KINDS: [SubmitKind; 3] = [
+    SubmitKind::Plain,
+    SubmitKind::ResponseInterest,
+    SubmitKind::Exclusive,
+];
+
+/// A consumer's cancel after the driver applied a peer refusal, before the consumer claimed the
+/// response, does not replace the refusal: the request stays unprocessed with the refusal's error,
+/// so the resend rule never resends a request its consumer cancelled (`DIV-035`).
+#[test]
+fn a_consumer_cancel_after_an_applied_peer_refusal_keeps_the_refusal() {
+    let [outcomes, expected] = peer_refusal_table(&peer_refusal_cases(
+        &ALL_SUBMIT_KINDS,
+        &[RefusalCancel::Explicit, RefusalCancel::Token],
+    ));
+    assert_eq!(outcomes, expected);
+}
+
+/// A peer refusal is the unprocessed request's selected cause, so its unclaimed submission fails
+/// with it, as one its connection refused before commit does (`DIV-035`).
+#[test]
+fn an_unclaimed_peer_refused_submission_fails_with_the_refusal() {
+    let [outcomes, expected] = peer_refusal_table(&peer_refusal_cases(
+        &ALL_SUBMIT_KINDS,
+        &[RefusalCancel::None],
+    ));
+    assert_eq!(outcomes, expected);
+}
+
+/// A cancellation that lands right after a peer refusal samples its request's cause follows the
+/// refusal: one sample decides both the flag and the error (`DIV-035`).
+#[test]
+fn a_cancellation_racing_a_peer_refusal_follows_it() {
+    let [outcomes, expected] = peer_refusal_table(&peer_refusal_cases(
+        &[SubmitKind::Plain],
+        &[RefusalCancel::RacingTheSample],
+    ));
+    assert_eq!(outcomes, expected);
+}

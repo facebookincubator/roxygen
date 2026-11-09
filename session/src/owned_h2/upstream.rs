@@ -645,12 +645,6 @@ impl RequestStatus {
         })
     }
 
-    /// Whether a cause is selected for the request: its consumer's cancel or cancellation token,
-    /// or a supplied producer's failure.
-    fn cause_selected(&self) -> bool {
-        self.error.borrow().is_some() || self.cancellation.is_cancellation_requested()
-    }
-
     /// Whether the response's source already failed, as a stream read timeout fails it before
     /// the driver applies that failure.
     fn response_failed(&self) -> bool {
@@ -660,17 +654,33 @@ impl RequestStatus {
             .is_some_and(|receipt| matches!(receipt.snapshot(), Some(Err(_))))
     }
 
-    /// The peer refused the request's stream, with `REFUSED_STREAM` or a GOAWAY whose
-    /// last-stream-id is below it, as the stream's first reset: before any response head, any
-    /// selected cause and any failure of the response's source, the request failed unprocessed
-    /// (`DIV-035`). Returns whether it did.
-    pub(super) fn peer_refused(&self) -> bool {
-        let unprocessed =
-            !self.response_head.get() && !self.cause_selected() && !self.response_failed();
-        if unprocessed {
-            self.unprocessed.set(true);
+    /// The error a peer reset of the request's stream applies, and whether it failed the request
+    /// unprocessed: the request's selected cause, or else `reset`. A `refusal` is the peer's
+    /// `REFUSED_STREAM`, or a GOAWAY whose last-stream-id is below the stream, as the stream's
+    /// first reset. Before any response head, any selected cause and any failure of the response's
+    /// source, it failed the request unprocessed, and `reset` becomes the request's selected cause,
+    /// as `Submission::refuse` selects its connection's error, so a later cancel cannot replace it
+    /// (`DIV-035`). One sample of the cause decides both, as a cancellation can arrive from another
+    /// thread.
+    pub(super) fn peer_reset_error(
+        &self,
+        refusal: bool,
+        reset: impl FnOnce() -> HttpError,
+    ) -> (HttpError, bool) {
+        let selected = self.selected_error();
+        #[cfg(test)]
+        if refusal {
+            crate::experimental::refusal_cause_sampled();
         }
-        unprocessed
+        if let Some(selected) = selected {
+            return (selected, false);
+        }
+        let reset = reset();
+        if !refusal || self.response_head.get() || self.response_failed() {
+            return (reset, false);
+        }
+        self.unprocessed.set(true);
+        (self.error.borrow_mut().get_or_insert(reset).clone(), true)
     }
 
     /// Records the arrival of a response head, which also publishes the response.
