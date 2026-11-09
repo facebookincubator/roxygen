@@ -1214,8 +1214,8 @@ async fn take_as_hyper_util(
 }
 
 /// Runs `steps` on a `MostRecentlyUsed`, `IdleSweep::Interval` pool and on
-/// `HyperUtilPool` with the same idle timeout, and checks both against each
-/// `Step::Open`.
+/// `HyperUtilPool` with the same idle timeout, comparing their open connections
+/// at each `Step::Open`.
 fn assert_sweeps_as_hyper_util(steps: &'static [Step]) {
     let server = start_server();
     let address = server.address().expect("server has an address");
@@ -1233,7 +1233,7 @@ fn assert_sweeps_as_hyper_util(steps: &'static [Step]) {
             let mut connections = Vec::new();
             let mut held: Vec<Option<(usize, RequestReservation)>> = Vec::new();
             let mut start = None;
-            for &step in steps {
+            for (index, &step) in steps.iter().enumerate() {
                 if let Some(start) = start {
                     sleep_until(start + step.at()).await;
                 }
@@ -1253,19 +1253,30 @@ fn assert_sweeps_as_hyper_util(steps: &'static [Step]) {
                     Step::Exchange { .. } => {
                         Some(take_as_hyper_util(&pool, &mut model, &mut connections, step).await)
                     }
-                    Step::Open { open, .. } => {
-                        assert_eq!(
-                            model.open(Instant::now()),
-                            open,
-                            "{step:?}: hyper-util 0.1.20"
-                        );
+                    Step::Open { .. } => {
+                        let expected = model.open(Instant::now());
+                        if index + 1 == steps.len() && expected.is_empty() {
+                            tokio::time::timeout(Duration::from_secs(5), async {
+                                while connections
+                                    .iter()
+                                    .any(|session| !session.is_draining() && !session.is_finished())
+                                {
+                                    tokio::time::sleep(Duration::from_millis(1)).await;
+                                }
+                            })
+                            .await
+                            .expect("the final sweep retires every expired session");
+                        }
                         let pooled: Vec<usize> = connections
                             .iter()
                             .enumerate()
                             .filter(|(_, session)| !session.is_draining() && !session.is_finished())
                             .map(|(connection, _)| connection)
                             .collect();
-                        assert_eq!(pooled, open, "{step:?}: the pool");
+                        assert_eq!(
+                            pooled, expected,
+                            "{step:?}: the pool matches hyper-util 0.1.20"
+                        );
                         None
                     }
                 };
@@ -1759,6 +1770,7 @@ fn most_recently_used_reuse_keeps_fewer_sessions_under_concurrent_traffic() {
 fn sessions_left_after_a_burst(idle_sweep: IdleSweep) {
     const BURST: usize = 16;
     const REQUESTERS: usize = 4;
+    const BURST_IDLE: Duration = Duration::from_secs(1);
     let sessions_left = |reuse_order| {
         let (sender, receiver) = std::sync::mpsc::channel();
         let server = start_server();
@@ -1770,7 +1782,7 @@ fn sessions_left_after_a_burst(idle_sweep: IdleSweep) {
                     address,
                     BURST as u32,
                     reuse_order,
-                    IDLE,
+                    BURST_IDLE,
                     idle_sweep,
                 );
                 let mut burst = Vec::new();
@@ -1788,7 +1800,7 @@ fn sessions_left_after_a_burst(idle_sweep: IdleSweep) {
                     .for_each_concurrent(None, |requester| {
                         let pool = &pool;
                         async move {
-                            while started.elapsed() < IDLE * 4 {
+                            while started.elapsed() < BURST_IDLE * 4 {
                                 one_exchange(pool).await;
                                 let pause = 1 + u64::try_from(requester % 3).expect("small");
                                 tokio::time::sleep(Duration::from_millis(pause)).await;

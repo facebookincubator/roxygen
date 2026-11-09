@@ -7201,6 +7201,9 @@ pub mod h2 {
         backing_start: usize,
         backing_length: usize,
         shared_written: Cell<usize>,
+        /// Drops of the backing buffer. A segment counts as shared only while the buffer is
+        /// alive: once freed, its address range can hold a later allocation.
+        backing_drops: Arc<AtomicUsize>,
     }
 
     impl UniplexTransport for EligibilityTransport {
@@ -7228,7 +7231,10 @@ pub mod h2 {
         ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
             for segment in data.segments() {
                 let start = segment.as_ptr() as usize;
-                if start >= self.backing_start && start < self.backing_start + self.backing_length {
+                if self.backing_drops.load(Ordering::SeqCst) == 0
+                    && start >= self.backing_start
+                    && start < self.backing_start + self.backing_length
+                {
                     assert!(start + segment.len() <= self.backing_start + self.backing_length);
                     self.shared_written
                         .set(self.shared_written.get() + segment.len());
@@ -7631,6 +7637,7 @@ pub mod h2 {
             backing_start,
             backing_length: expected.len(),
             shared_written: Cell::new(0),
+            backing_drops: Arc::clone(&drops),
         });
         let (session, _) = UniplexSession::new_http2(
             context,
@@ -10260,6 +10267,7 @@ pub mod h2 {
                     backing_start: 0,
                     backing_length: 0,
                     shared_written: Cell::new(0),
+                    backing_drops: Arc::default(),
                 });
                 let (session, _) = UniplexSession::new_http2(
                     context,
@@ -10393,6 +10401,7 @@ pub mod h2 {
                     backing_start: 0,
                     backing_length: 0,
                     shared_written: Cell::new(0),
+                    backing_drops: Arc::default(),
                 });
                 let (session, handle) = UniplexSession::new_http2(
                     context,
@@ -10504,6 +10513,7 @@ pub mod h2 {
             backing_start,
             backing_length: 100,
             shared_written: Cell::new(0),
+            backing_drops: Arc::clone(&drops),
         });
         let (session, handle) = UniplexSession::new_http2(
             context,
@@ -10818,6 +10828,7 @@ pub mod h2 {
             backing_start,
             backing_length: expected.len(),
             shared_written: Cell::new(0),
+            backing_drops: Arc::clone(&backing_drops),
         });
         let write_timeout = Duration::from_secs(60);
         let mut rate_limits = Http2RateLimitConfig::default();
@@ -12335,6 +12346,7 @@ pub mod h2 {
                     backing_start: 0,
                     backing_length: 0,
                     shared_written: Cell::new(0),
+                    backing_drops: Arc::default(),
                 });
                 let held = Rc::new(RefCell::new(None));
                 let invocations = Rc::new(Cell::new(0));
@@ -14627,6 +14639,7 @@ pub mod h2 {
                         backing_start: 0,
                         backing_length: 0,
                         shared_written: Cell::new(0),
+                        backing_drops: Arc::default(),
                     });
                     let (session, handle) = UniplexSession::new_http2(
                         context,

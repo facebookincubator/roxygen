@@ -449,10 +449,17 @@ pub(crate) struct OwnedCiphertextStream<S: TokioByteStream> {
     staged_batches: Rc<Cell<usize>>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("background TLS ciphertext write timed out")]
+pub(crate) struct CiphertextWriteTimeout;
+
 #[derive(Clone)]
-struct StoredIoError {
-    kind: io::ErrorKind,
-    message: String,
+enum StoredIoError {
+    WriteTimeout,
+    Io {
+        kind: io::ErrorKind,
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -464,14 +471,24 @@ enum ForegroundRole {
 
 impl StoredIoError {
     fn new(error: io::Error) -> Self {
-        Self {
-            kind: error.kind(),
-            message: error.to_string(),
+        if error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<CiphertextWriteTimeout>())
+        {
+            Self::WriteTimeout
+        } else {
+            Self::Io {
+                kind: error.kind(),
+                message: error.to_string(),
+            }
         }
     }
 
     fn to_io_error(&self) -> io::Error {
-        io::Error::new(self.kind, self.message.clone())
+        match self {
+            Self::WriteTimeout => io::Error::new(io::ErrorKind::TimedOut, CiphertextWriteTimeout),
+            Self::Io { kind, message } => io::Error::new(*kind, message.clone()),
+        }
     }
 }
 
@@ -618,7 +635,7 @@ where
                 {
                     self.fail(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "background TLS ciphertext write timed out",
+                        CiphertextWriteTimeout,
                     ));
                     return Poll::Ready(());
                 }

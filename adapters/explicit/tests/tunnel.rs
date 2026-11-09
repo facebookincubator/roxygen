@@ -2594,6 +2594,9 @@ mod tunnel {
             assert!(pending.await.expect_err("aborted").is_cancelled());
         });
         proxy.wait_closed(0);
+        wait_until("the cancelled job finishes", || {
+            !runtime.hooks().job_errors.lock().unwrap().is_empty()
+        });
 
         // While the origin holds the tunnel TLS handshake.
         let silent = Origin::start(None, Serve::Silent);
@@ -2620,6 +2623,9 @@ mod tunnel {
             assert!(pending.await.expect_err("aborted").is_cancelled());
         });
         proxy.wait_closed(0);
+        wait_until("the cancelled job finishes", || {
+            runtime.hooks().job_errors.lock().unwrap().len() >= 2
+        });
 
         // Mid-response.
         let stalling = Origin::start(Some(&identity.server), Serve::Respond(ORIGIN_PARTIAL));
@@ -2641,6 +2647,9 @@ mod tunnel {
         });
         runtime.set_exchange_hooks(ExchangeHooks::default());
         proxy.wait_closed(0);
+        wait_until("the cancelled job finishes", || {
+            runtime.hooks().job_errors.lock().unwrap().len() >= 3
+        });
         wait_for_teardowns(&runtime);
 
         assert_eq!(runtime.stats().caller_cancellations, 3);

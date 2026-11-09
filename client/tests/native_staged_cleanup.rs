@@ -3461,6 +3461,20 @@ fn resource_bound(actual: Resources, baseline: Resources) -> io::Result<()> {
     )
 }
 
+fn resources_after_join(baseline: Resources) -> io::Result<Resources> {
+    let deadline = Instant::now() + STAGE_BOUND;
+    loop {
+        let sample = resources()?;
+        if sample.descriptors > baseline.descriptors
+            || sample.threads <= baseline.threads
+            || Instant::now() >= deadline
+        {
+            return Ok(sample);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 struct ResourcePoint {
     route: Route,
     round: usize,
@@ -4111,7 +4125,12 @@ fn run_route_observed<Observed>(
         first_panic: panic,
         ..
     } = retirement;
-    match resources() {
+    let joined_resources = if schedule == Schedule::Resources {
+        resources_after_join(baseline)
+    } else {
+        resources()
+    };
+    match joined_resources {
         Ok(sample) => {
             log_resources(
                 "R4-physical-join-handles-alive",

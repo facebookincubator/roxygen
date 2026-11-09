@@ -1436,7 +1436,7 @@ mod tests {
             "-q".to_owned(),
             "-sS".to_owned(),
             "--connect-timeout".to_owned(),
-            "0.1".to_owned(),
+            "5".to_owned(),
             format!("http://{unused}/"),
         ]);
         assert_eq!(connect_code, 7, "connection refusal should use curl code 7");

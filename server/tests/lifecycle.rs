@@ -11,6 +11,7 @@ use std::panic::resume_unwind;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -1422,8 +1423,14 @@ fn multiple_ports() {
     }
 }
 
+/// Held while a test spawns a child process, and by a test whose listeners must refuse
+/// connections once dropped: until it execs, a child holds a copy of every descriptor that was
+/// open when it was spawned, which keeps such a listener accepting.
+static CHILD_SPAWN: Mutex<()> = Mutex::new(());
+
 #[test]
 fn shutdown() {
+    let _spawn = CHILD_SPAWN.lock().unwrap_or_else(PoisonError::into_inner);
     let addresses = {
         let mut config = ServerConfig::default();
         config.socket.bind_addresses =
@@ -3643,16 +3650,23 @@ fn listener_keeps_accepting_after_descriptor_exhaustion() {
         return;
     }
     // RLIMIT_NOFILE is process-wide, so only this test runs under the lowered limit.
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "lifecycle_tests::listener_keeps_accepting_after_descriptor_exhaustion",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(DESCRIPTOR_EXHAUSTION_CHILD, "1")
-        .output()
-        .unwrap();
+    let child = {
+        let _spawn = CHILD_SPAWN.lock().unwrap_or_else(PoisonError::into_inner);
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "lifecycle_tests::listener_keeps_accepting_after_descriptor_exhaustion",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(DESCRIPTOR_EXHAUSTION_CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let output = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success() && stdout.contains("test result: ok. 1 passed"),

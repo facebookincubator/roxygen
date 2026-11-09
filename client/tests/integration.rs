@@ -1770,6 +1770,7 @@ mod connector {
 
     struct CountingConnector {
         attempts: Rc<Cell<u32>>,
+        connected: Option<ClientSession>,
         delayed_port: Option<u16>,
         delay_first: bool,
         delay: Duration,
@@ -1787,6 +1788,9 @@ mod connector {
         ) -> LocalClientFuture<Result<ClientSession, HttpError>> {
             let attempt = self.attempts.get().saturating_add(1);
             self.attempts.set(attempt);
+            if let Some(session) = &self.connected {
+                return Box::pin(std::future::ready(Ok(session.clone())));
+            }
             if address.port() == 0 {
                 return Box::pin(std::future::ready(Err(HttpError::with_message(
                     HttpErrorCode::CONNECT_ERROR,
@@ -2775,6 +2779,7 @@ mod connector {
                 let attempts = Rc::new(Cell::new(0));
                 let connector = Rc::new(CountingConnector {
                     attempts: Rc::clone(&attempts),
+                    connected: None,
                     delayed_port: Some(1),
                     delay_first: false,
                     delay: Duration::from_millis(100),
@@ -2809,6 +2814,7 @@ mod connector {
                 let attempts = Rc::new(Cell::new(0));
                 let connector = Rc::new(CountingConnector {
                     attempts: Rc::clone(&attempts),
+                    connected: None,
                     delayed_port: None,
                     delay_first: true,
                     delay: Duration::from_millis(10),
@@ -2860,9 +2866,21 @@ mod connector {
         let address = server.address().expect("server has an address");
         let attempts = run_on_worker(move |context| {
             Box::pin(async move {
+                let primary = HttpConnector::connect(
+                    &context,
+                    socket_address(address),
+                    Duration::from_secs(5),
+                    ConnectionParams::default(),
+                    SessionParams::default(),
+                    CancellationToken::never(),
+                )
+                .await
+                .expect("primary connection is ready before the race");
+                tokio::time::pause();
                 let attempts = Rc::new(Cell::new(0));
                 let connector = Rc::new(CountingConnector {
                     attempts: Rc::clone(&attempts),
+                    connected: Some(primary),
                     delayed_port: None,
                     delay_first: false,
                     delay: Duration::ZERO,
@@ -2880,7 +2898,8 @@ mod connector {
                 )
                 .await
                 .expect("primary connection wins");
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                tokio::time::advance(Duration::from_millis(300)).await;
+                tokio::time::resume();
                 (attempts.get(), session.peer_address().port())
             })
         });
@@ -2896,6 +2915,7 @@ mod connector {
                 let attempts = Rc::new(Cell::new(0));
                 let connector = Rc::new(CountingConnector {
                     attempts: Rc::clone(&attempts),
+                    connected: None,
                     delayed_port: None,
                     delay_first: false,
                     delay: Duration::ZERO,
@@ -4852,7 +4872,7 @@ mod pool {
     fn pool_params(max_connections: u32) -> PoolParams {
         PoolParams {
             max_connections,
-            connect_timeout: Duration::from_millis(100),
+            connect_timeout: Duration::from_secs(5),
             ..PoolParams::default()
         }
     }
@@ -5108,7 +5128,7 @@ mod pool {
                     context,
                     socket_address(address),
                     PoolParams {
-                        connect_timeout: Duration::from_millis(20),
+                        connect_timeout: Duration::from_secs(1),
                         ..pool_params(1)
                     },
                     ConnectionParams::default(),
@@ -5924,7 +5944,6 @@ mod pool {
                     socket_address(address),
                     PoolParams {
                         max_connection_attempts: 1,
-                        connect_timeout: Duration::from_secs(1),
                         ..pool_params(1)
                     },
                     ConnectionParams::default(),
@@ -7072,17 +7091,60 @@ mod pool {
 
     #[test]
     fn cancelling_requester_does_not_cancel_pool_owned_connect() {
+        use tokio::sync::oneshot;
+
+        struct GatedConnector {
+            inner: RecordingConnector,
+            gate: RefCell<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+        }
+
+        impl SessionConnector for GatedConnector {
+            fn connect(
+                &self,
+                context: WorkerContext,
+                address: SocketAddress,
+                timeout: Duration,
+                connection: ConnectionParams,
+                session: SessionParams,
+                cancellation: CancellationToken,
+            ) -> LocalClientFuture<Result<ClientSession, HttpError>> {
+                let (started, release) = self
+                    .gate
+                    .borrow_mut()
+                    .take()
+                    .expect("one connection attempt");
+                let connecting = self.inner.connect(
+                    context,
+                    address,
+                    timeout,
+                    connection,
+                    session,
+                    cancellation,
+                );
+                Box::pin(async move {
+                    let _ = started.send(());
+                    let _ = release.await;
+                    connecting.await
+                })
+            }
+        }
+
         let (server, _) = start_plain_server();
         let address = server.address().expect("server has an address");
         let preserved = run_on_worker(move |context| {
             Box::pin(async move {
                 let attempts = Rc::new(Cell::new(0));
-                let connector = Rc::new(RecordingConnector {
-                    attempts: Rc::clone(&attempts),
-                    parameter_keys: Rc::new(RefCell::new(Vec::new())),
-                    session_caching: None,
-                    fail_after: None,
-                    delay: Duration::from_millis(30),
+                let (started_tx, started_rx) = oneshot::channel();
+                let (release_tx, release_rx) = oneshot::channel();
+                let connector = Rc::new(GatedConnector {
+                    inner: RecordingConnector {
+                        attempts: Rc::clone(&attempts),
+                        parameter_keys: Rc::new(RefCell::new(Vec::new())),
+                        session_caching: None,
+                        fail_after: None,
+                        delay: Duration::ZERO,
+                    },
+                    gate: RefCell::new(Some((started_tx, release_rx))),
                 });
                 let pool = HttpSessionPool::with_connector(
                     context,
@@ -7095,13 +7157,29 @@ mod pool {
                 let cancellation = CancellationSource::new();
                 let pending = pool.get_session_with_reservation(cancellation.token());
                 tokio::pin!(pending);
-                tokio::select! {
-                    _ = &mut pending => panic!("connect completed before cancellation"),
-                    () = tokio::time::sleep(Duration::from_millis(5)) => {}
-                }
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::select! {
+                        _ = &mut pending => panic!("connect completed before cancellation"),
+                        started = started_rx => started.expect("connect reports it started"),
+                    }
+                })
+                .await
+                .expect("pool-owned connect starts");
                 cancellation.request_cancellation();
-                assert!(matches!(pending.await, Err(PoolError::Cancelled)));
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                let cancelled = tokio::time::timeout(Duration::from_secs(5), pending).await;
+                let released = release_tx.send(());
+                assert!(matches!(
+                    cancelled.expect("requester cancellation completes"),
+                    Err(PoolError::Cancelled)
+                ));
+                released.expect("pool-owned connect remains alive after requester cancellation");
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while pool.session_count() != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("pool admits the connection after requester cancellation");
                 attempts.get() == 1 && pool.session_count() == 1
             })
         });

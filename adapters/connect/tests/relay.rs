@@ -1146,16 +1146,24 @@ fn peer_reset_closes_the_application_socket() {
         let tap = Arc::new(Tap::default());
         let connector = Arc::new(TestConnector::plain(proxy.address).tapped(Arc::clone(&tap)));
         let pending = client
-            .connect("vm", request("early-eof-reset"), connector)
+            .connect("vm", request("early-eof-gated-reset"), connector)
             .await
             .expect("CONNECT");
-        let (mut application, relayed) = sockets().await;
-        let relay = tokio::spawn(pending.relay(relayed));
+        let (mut application, relayed) = tokio_sockets().await;
+        let (io, control) = GenericIo::socket(relayed);
+        let relay = tokio::spawn(pending.relay(io.relay_io()));
         application.write_all(PAYLOAD).await.expect("upload");
         assert!(
             finish(&mut application).await.is_empty(),
             "both directions ended"
         );
+        eventually(Duration::from_secs(5), "the queued upload", || {
+            control.read() == PAYLOAD.len() as u64
+        })
+        .await;
+        assert!(!relay.is_finished(), "flow control still holds the upload");
+        assert_eq!(written_data(&tap.written()[0]), 0);
+        proxy.close_gate();
         let outcome = relay.await.expect("relay joins");
         assert_outcome(
             &outcome,
@@ -2233,8 +2241,8 @@ fn stalled_application_io_shutdown_is_bounded() {
     });
 
     // The forced shutdown phase cuts the stalled shutdown short and keeps its ending: the reset
-    // comes after shutdown began, so the graceful phase ends before the stall's own bound would.
-    let shutdown_timeout = Duration::from_millis(400);
+    // is delayed to separate the graceful-phase and relay shutdown deadlines.
+    let shutdown_timeout = Duration::from_secs(3);
     let options = ConnectOptions {
         shutdown_timeout,
         max_tunnels: 1,
@@ -2250,6 +2258,7 @@ fn stalled_application_io_shutdown_is_bounded() {
         let started = Instant::now();
         let shutting_down = tokio::spawn(shutdown(runtime));
         admission_closed(&client, &proxy).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         // The proxy resets the stream once it has read this upload.
         application.write_all(b"last").await.expect("upload");
         let outcome = relay.await.expect("relay joins");
@@ -2282,6 +2291,10 @@ fn stalled_application_io_shutdown_is_bounded() {
 
     // A peer reset after the download's END_STREAM is recorded before the relay finishes the
     // download, so the forced phase, cutting that short, keeps its ending and counts it once.
+    let options = ConnectOptions {
+        shutdown_timeout: Duration::from_millis(400),
+        ..options
+    };
     run_owned(options.clone(), |runtime, client| async move {
         let proxy = Proxy::start().await;
         let (relay, _application, control) =

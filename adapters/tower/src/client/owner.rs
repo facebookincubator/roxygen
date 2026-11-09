@@ -644,6 +644,17 @@ fn frame_http1_request<B: Body>(head: &mut HttpMessage, body: &B) -> Result<(), 
     Err(ClientError::Projection)
 }
 
+async fn receive_native_start<T>(
+    mut start: oneshot::Receiver<Result<T, ClientError>>,
+    closed: impl Future<Output = ()>,
+) -> Result<T, ClientError> {
+    tokio::select! {
+        biased;
+        result = &mut start => result.unwrap_or(Err(ClientError::CleanupUnconfirmed)),
+        _ = closed => start.try_recv().unwrap_or(Err(ClientError::CleanupUnconfirmed)),
+    }
+}
+
 async fn run_request<B>(
     context: AppContext,
     request: Request<B>,
@@ -711,13 +722,9 @@ where
         deliver(&context.shared, response, Err(ClientError::Closed));
         return AppFinished::failed(ClientError::CleanupUnconfirmed);
     }
-    let started = match start_receiver.await {
-        Ok(Ok(started)) => started,
-        result => {
-            let error = match result {
-                Ok(Err(error)) => error,
-                _ => ClientError::CleanupUnconfirmed,
-            };
+    let started = match receive_native_start(start_receiver, context.native.closed()).await {
+        Ok(started) => started,
+        Err(error) => {
             deliver(&context.shared, response, Err(error.clone()));
             return AppFinished::failed(error);
         }
@@ -2374,17 +2381,74 @@ impl TestLatch {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::ptr;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Waker;
 
     use roxygen_client::pool::AttachedConnectFailure;
     use roxygen_client::pool::PoolError;
     use roxygen_core::error::HttpError;
     use roxygen_core::error::HttpErrorCode;
+    use tokio::sync::mpsc;
+    use tokio::sync::oneshot;
 
+    use super::receive_native_start;
     use super::record_unconfirmed_receipt_error;
     use crate::client::ClientError;
+
+    #[test]
+    fn native_start_receiver_closure_breaks_late_permit_reply_cycle() {
+        let (native, requests) = mpsc::channel(1);
+        let (started, mut start) = oneshot::channel::<Result<(), ClientError>>();
+        let permit = native.try_reserve().expect("native queue has capacity");
+        drop(requests);
+        permit.send(started);
+
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut start).poll(&mut context).is_pending());
+        let mut wait = Box::pin(receive_native_start(start, native.closed()));
+        assert!(matches!(
+            wait.as_mut().poll(&mut context),
+            Poll::Ready(Err(ClientError::CleanupUnconfirmed))
+        ));
+        assert!(native.is_closed());
+    }
+
+    #[test]
+    fn native_start_published_during_receiver_closure_keeps_payload() {
+        struct ScopeGuard(Arc<AtomicBool>);
+        impl Drop for ScopeGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let scope = ScopeGuard(Arc::clone(&dropped));
+        let (started, mut start) = oneshot::channel();
+        let (native, requests) = mpsc::channel::<()>(1);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut start).poll(&mut context).is_pending());
+        let closed = async move {
+            assert!(started.send(Ok(scope)).is_ok());
+            drop(requests);
+            native.closed().await;
+        };
+        let mut wait = Box::pin(receive_native_start(start, closed));
+        let Poll::Ready(Ok(scope)) = wait.as_mut().poll(&mut context) else {
+            panic!("startup published before closure must retain its payload");
+        };
+        drop(wait);
+        assert!(!dropped.load(Ordering::Relaxed));
+        drop(scope);
+        assert!(dropped.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn unconfirmed_receipt_preserves_prior_errors() {

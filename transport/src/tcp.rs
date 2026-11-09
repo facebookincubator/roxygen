@@ -66,6 +66,7 @@ use crate::established::AdoptedIoCompletion;
 use crate::established::AdoptedIoState;
 use crate::established::IoDropPublisher;
 use crate::tcp_zero_copy::TcpZeroCopy;
+use crate::tls::CiphertextWriteTimeout;
 
 /// Concrete TCP constructor whose public surface contains only Roxygen types.
 pub struct TcpTransport;
@@ -2162,7 +2163,14 @@ fn read_io_error(error: io::Error) -> HttpError {
 
 fn write_io_error(error: io::Error) -> HttpError {
     HttpError::with_message(
-        HttpErrorCode::TRANSPORT_WRITE_ERROR,
+        if error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<CiphertextWriteTimeout>())
+        {
+            HttpErrorCode::WRITE_TIMEOUT
+        } else {
+            HttpErrorCode::TRANSPORT_WRITE_ERROR
+        },
         error.to_string().as_bytes(),
     )
     .with_cause(Arc::new(error))

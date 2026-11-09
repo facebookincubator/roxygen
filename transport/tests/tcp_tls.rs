@@ -2956,7 +2956,6 @@ mod tcp_tls {
                             }
                         })
                         .await;
-                        time::sleep(Duration::from_millis(30)).await;
                         background_task.await.unwrap();
                         let read_error = read.await.expect_err("background timeout wakes the read");
                         assert_ne!(read_error.code(), HttpErrorCode::CORO_CANCELLED);
@@ -2964,11 +2963,12 @@ mod tcp_tls {
                             .write(
                                 &context,
                                 queue(&[b"x"]),
-                                Duration::from_secs(1),
+                                Duration::ZERO,
                                 CancellationToken::never(),
                             )
                             .await
                             .expect_err("background timeout poisons the next operation");
+                        assert_eq!(error.code(), HttpErrorCode::WRITE_TIMEOUT);
                         assert_eq!(error.bytes_written(), 0);
                         let state = control.0.borrow();
                         assert!(state.reset);

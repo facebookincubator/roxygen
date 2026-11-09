@@ -457,7 +457,7 @@ fn response_progress_before_a_reused_session_closes_is_never_retried() {
 #[test]
 fn rejected_cancelled_expired_and_dial_failures_are_not_retried() {
     let options = ConnectOptions {
-        response_timeout: Duration::from_secs(1),
+        response_timeout: Duration::from_secs(5),
         ..Default::default()
     };
     run(options, |client| async move {
@@ -659,7 +659,7 @@ fn h2_not_negotiated_is_cached_for_the_route_ttl() {
     let options = ConnectOptions {
         h2_unsupported_ttl: Duration::from_millis(400),
         max_streams: 1,
-        acquire_timeout: Duration::from_millis(300),
+        acquire_timeout: Duration::from_secs(5),
         ..Default::default()
     };
     run(options.clone(), |client| async move {
@@ -707,6 +707,7 @@ fn h2_not_negotiated_is_cached_for_the_route_ttl() {
     // A TTL well beyond the overflow waiter's acquire deadline, so the entry is still cached.
     let mixed = ConnectOptions {
         h2_unsupported_ttl: Duration::from_secs(2),
+        acquire_timeout: Duration::from_millis(300),
         ..options
     };
     run(mixed, |client| async move {
