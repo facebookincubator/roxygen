@@ -5688,3 +5688,540 @@ fn a_cancellation_racing_a_refusal_follows_it() {
     );
     assert!(written.is_empty(), "nothing is written");
 }
+
+/// How the first fenced write completes; later writes complete in full.
+#[derive(Clone, Copy, Debug)]
+enum FirstWrite {
+    Full,
+    /// Failure with `WRITE_TIMEOUT` and no bytes written.
+    Fail,
+}
+
+/// Holds every write's completion until `open`, as a slow peer's socket does.
+struct RequestFence {
+    open: Cell<bool>,
+    first: Cell<Option<FirstWrite>>,
+    wakers: RefCell<Vec<std::task::Waker>>,
+}
+
+impl RequestFence {
+    fn open(&self) {
+        self.open.set(true);
+        let wakers = std::mem::take(&mut *self.wakers.borrow_mut());
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    fn poll_open(&self, context: &mut std::task::Context<'_>) -> Poll<()> {
+        if self.open.get() {
+            return Poll::Ready(());
+        }
+        self.wakers.borrow_mut().push(context.waker().clone());
+        Poll::Pending
+    }
+
+    /// A completed write of `requested` bytes: the first write's outcome, then full writes.
+    fn result(&self, requested: usize) -> Result<WriteInfo, TransportWriteError> {
+        match self.first.take() {
+            Some(FirstWrite::Fail) => Err(TransportWriteError::new(
+                HttpError::with_message(HttpErrorCode::WRITE_TIMEOUT, b"fenced write failure"),
+                0,
+            )),
+            _ => Ok(WriteInfo {
+                bytes_written: requested,
+            }),
+        }
+    }
+}
+
+fn record_request_write(state: &RefCell<TransportState>, data: BufQueue) -> usize {
+    let length = data.chain_length();
+    let bytes = data.coalesce(length).unwrap().to_vec();
+    state.borrow_mut().writes.push(bytes);
+    length
+}
+
+/// A write queue with one write in flight, as a single write is, whose completion waits for
+/// the fence.
+struct RequestFenceQueue {
+    fence: Rc<RequestFence>,
+    state: Rc<RefCell<TransportState>>,
+    in_flight: Option<usize>,
+}
+
+impl crate::uniplex::UniplexWriteQueue for RequestFenceQueue {
+    fn can_write(&self, _bytes: usize) -> bool {
+        self.in_flight.is_none()
+    }
+
+    fn start_write(&mut self, data: BufQueue) -> Result<(), HttpError> {
+        self.in_flight = Some(record_request_write(&self.state, data));
+        Ok(())
+    }
+
+    fn poll_complete(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> Poll<crate::uniplex::UniplexWriteCompletion> {
+        let Some(requested_bytes) = self.in_flight else {
+            return Poll::Pending;
+        };
+        if self.fence.poll_open(context).is_pending() {
+            return Poll::Pending;
+        }
+        self.in_flight = None;
+        Poll::Ready(crate::uniplex::UniplexWriteCompletion {
+            requested_bytes,
+            result: self.fence.result(requested_bytes),
+        })
+    }
+
+    fn is_idle(&self) -> bool {
+        self.in_flight.is_none()
+    }
+}
+
+/// Reads and closes through a [`ScriptedTransport`]; writes wait for a [`RequestFence`],
+/// directly or, when `queued`, through a [`RequestFenceQueue`]. `UniplexSession` takes no write
+/// queue, so it writes directly either way.
+struct RequestFenceTransport {
+    inner: Rc<ScriptedTransport>,
+    state: Rc<RefCell<TransportState>>,
+    fence: Rc<RequestFence>,
+    queued: bool,
+}
+
+impl UniplexTransport for RequestFenceTransport {
+    fn try_write_queue(
+        &self,
+        _context: &WorkerContext,
+        _maximum_write_size: usize,
+        _timeout: Duration,
+        _cancellation: CancellationToken,
+    ) -> Result<Option<Box<dyn crate::uniplex::UniplexWriteQueue>>, HttpError> {
+        Ok(self.queued.then(|| {
+            Box::new(RequestFenceQueue {
+                fence: Rc::clone(&self.fence),
+                state: Rc::clone(&self.state),
+                in_flight: None,
+            }) as Box<dyn crate::uniplex::UniplexWriteQueue>
+        }))
+    }
+
+    fn read(
+        &self,
+        context: &WorkerContext,
+        maximum: usize,
+        allocation_size: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        self.inner
+            .read(context, maximum, allocation_size, timeout, cancellation)
+    }
+
+    fn write(
+        &self,
+        _context: &WorkerContext,
+        data: BufQueue,
+        _flags: ByteEventWriteFlags,
+        _timeout: Duration,
+        _cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        let length = record_request_write(&self.state, data);
+        let fence = Rc::clone(&self.fence);
+        Box::pin(std::future::poll_fn(move |context| {
+            fence.poll_open(context).map(|()| fence.result(length))
+        }))
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.shutdown_write(context)
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close_with_reset(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.inner.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.inner.register_byte_event(context, registration)
+    }
+}
+
+fn written_text(state: &TransportState) -> String {
+    String::from_utf8_lossy(&state.writes.concat()).into_owned()
+}
+
+/// What a read that failed during a request's first write left: how the transport was closed
+/// and what was written while that write was held, every byte written, the final close, the
+/// run's error, the error the request's response yielded, and the scripted reads never issued.
+#[derive(Debug, PartialEq)]
+struct ReadErrorDuringWrite {
+    held_close: CloseKind,
+    held_written: String,
+    written: String,
+    close: CloseKind,
+    run: Option<HttpErrorCode>,
+    response: Option<HttpErrorCode>,
+    unread: usize,
+}
+
+/// Sends `request` through an owned upstream session (`owned`) or a `UniplexSession` client,
+/// with `maximum_write_size`, holding every write at a fence. Once the first write starts, the
+/// connection's read fails; the fence opens after the session has had turns to act on the
+/// failure, and the first write completes as `first`. Response bytes follow the failed read in
+/// the script, for a session that would read again.
+fn read_error_during_request_write(
+    owned: bool,
+    queued: bool,
+    first: FirstWrite,
+    maximum_write_size: usize,
+    request: fn() -> (HttpHeaderEvent, Vec<HttpBodyEvent>),
+) -> ReadErrorDuringWrite {
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let failed = Arc::new(tokio::sync::Notify::new());
+            let (inner, state) = ScriptedTransport::new([
+                ReadAction::WaitError(Arc::clone(&failed), HttpErrorCode::TRANSPORT_READ_ERROR),
+                ReadAction::Data(OK_RESPONSE.to_vec()),
+            ]);
+            let fence = Rc::new(RequestFence {
+                open: Cell::new(false),
+                first: Cell::new(Some(first)),
+                wakers: RefCell::default(),
+            });
+            let transport = Rc::new(RequestFenceTransport {
+                inner,
+                state: Rc::clone(&state),
+                fence: Rc::clone(&fence),
+                queued,
+            });
+            let mut config = upstream_config();
+            config.maximum_write_size = maximum_write_size;
+            let script = async {
+                yield_until(|| !state.borrow().writes.is_empty()).await;
+                failed.notify_one();
+                // Leaves the session turns in which it observes the failed read.
+                for _ in 0..8 {
+                    context.host().yield_to_io().await;
+                }
+                let held = (state.borrow().close, written_text(&state.borrow()));
+                fence.open();
+                held
+            };
+            let (head, body) = request();
+            let (run, response, (held_close, held_written)) = if owned {
+                let mut options = upstream_options(context.clone(), transport);
+                options.io = config;
+                let (session, handle) = OwnedH1UpstreamSession::new(options).unwrap();
+                let submission = handle.reserve_request().unwrap().submit(
+                    head,
+                    RequestSource::held(None, body),
+                    CancellationToken::never(),
+                );
+                futures::join!(
+                    session.run(),
+                    async {
+                        match submission.await {
+                            Ok(response) => {
+                                let (_stream, mut source, _control) = response.into_source_parts();
+                                read_response(&mut source).await.error
+                            }
+                            Err(error) => Some(error.code()),
+                        }
+                    },
+                    script
+                )
+            } else {
+                let (session, handle) = UniplexSession::new(
+                    context.clone(),
+                    TransportDirection::Upstream,
+                    transport,
+                    None,
+                    config,
+                )
+                .unwrap();
+                futures::join!(
+                    session.run(),
+                    async {
+                        match handle
+                            .send_request(
+                                RequestSource::held(Some(head), body),
+                                CancellationToken::never(),
+                            )
+                            .await
+                        {
+                            Ok(mut response) => read_response(&mut response.source).await.error,
+                            Err(error) => Some(error.code()),
+                        }
+                    },
+                    script
+                )
+            };
+            let state = state.borrow();
+            ReadErrorDuringWrite {
+                held_close,
+                held_written,
+                written: written_text(&state),
+                close: state.close,
+                run: run.err().map(|error| error.code()),
+                response,
+                unread: state.reads.len(),
+            }
+        })
+    })
+}
+
+/// A read that fails while a request's write is outstanding fails the connection as
+/// `UniplexSession` does (`reset_after_draining_writes`): the response fails, nothing more is
+/// read, the transport resets only once the request bytes already serialized are written (here
+/// a head longer than one write, so part of it waits behind the outstanding write), and the
+/// read error stays the run's error when the outstanding write then fails too.
+#[test]
+fn a_read_error_during_a_request_write_writes_the_serialized_request_as_uniplex() {
+    let head = "GET / HTTP/1.1\r\nHost: origin\r\nConnection: keep-alive\r\n\r\n";
+    for queued in [false, true] {
+        for first in [FirstWrite::Full, FirstWrite::Fail] {
+            let case = format!("queued {queued}, first write {first:?}");
+            let request = || (get_head(), Vec::<HttpBodyEvent>::new());
+            let owned = read_error_during_request_write(true, queued, first, 24, request);
+            let uniplex = read_error_during_request_write(false, queued, first, 24, request);
+            assert_eq!(owned, uniplex, "{case}");
+            assert_eq!(
+                owned,
+                ReadErrorDuringWrite {
+                    held_close: CloseKind::Open,
+                    held_written: head[..24].to_owned(),
+                    written: match first {
+                        FirstWrite::Full => head.to_owned(),
+                        FirstWrite::Fail => head[..24].to_owned(),
+                    },
+                    close: CloseKind::Reset,
+                    run: Some(HttpErrorCode::TRANSPORT_READ_ERROR),
+                    response: Some(HttpErrorCode::TRANSPORT_READ_ERROR),
+                    unread: 1,
+                },
+                "{case}"
+            );
+        }
+    }
+}
+
+/// As `a_read_error_during_a_request_write_writes_the_serialized_request_as_uniplex`, with a
+/// request body. Both sessions serialize the ready body with its head before the
+/// read fails, then finish writing those bytes before resetting the transport.
+#[test]
+fn a_read_error_during_a_request_write_writes_the_serialized_body() {
+    let maximum_write_size = UniplexConfig::default().maximum_write_size;
+    for queued in [false, true] {
+        let case = format!("queued {queued}");
+        let request = || scripted_request(false);
+        let owned = read_error_during_request_write(
+            true,
+            queued,
+            FirstWrite::Full,
+            maximum_write_size,
+            request,
+        );
+        let uniplex = read_error_during_request_write(
+            false,
+            queued,
+            FirstWrite::Full,
+            maximum_write_size,
+            request,
+        );
+        let head_and_body = "POST /upload HTTP/1.1\r\nHost: origin\r\nConnection: keep-alive\r\nContent-Length: 11\r\n\r\nhello world";
+        assert_eq!(owned, uniplex, "{case}");
+        assert_eq!(
+            owned,
+            ReadErrorDuringWrite {
+                held_close: CloseKind::Open,
+                held_written: head_and_body.to_owned(),
+                written: head_and_body.to_owned(),
+                close: CloseKind::Reset,
+                run: Some(HttpErrorCode::TRANSPORT_READ_ERROR),
+                response: Some(HttpErrorCode::TRANSPORT_READ_ERROR),
+                unread: 1,
+            },
+            "{case}: the serialized head and body drain before the reset"
+        );
+    }
+}
+
+/// When a failed read reaches the owned driver, relative to the connection's queued request.
+#[derive(Clone, Copy, Debug)]
+enum ReadFailure {
+    /// The driver applies the failure between the reservation and the submission, which then
+    /// meets closed admission.
+    BeforeSubmission,
+    /// The read fails, then the request is submitted, before the driver runs.
+    FailedThenSubmitted,
+    /// The request is submitted, then the read fails, before the driver runs.
+    SubmittedThenFailed,
+}
+
+/// A failed read the driver has received before it commits a queued request closes admission
+/// first, as a peer EOF does: the request is refused unprocessed, nothing is written and the
+/// connection resets, as `UniplexSession` fails a request whose head it has not serialized when
+/// it processes a read error (`DIV-035`).
+#[test]
+fn a_read_error_received_before_commit_refuses_the_request_unprocessed() {
+    for failure in [
+        ReadFailure::BeforeSubmission,
+        ReadFailure::FailedThenSubmitted,
+        ReadFailure::SubmittedThenFailed,
+    ] {
+        for kind in [
+            SubmitKind::Plain,
+            SubmitKind::ResponseInterest,
+            SubmitKind::Exclusive,
+        ] {
+            let outcome = run_on_host(move |context| {
+                Box::pin(async move {
+                    let failed = Arc::new(tokio::sync::Notify::new());
+                    let (transport, state) = ScriptedTransport::new([ReadAction::WaitError(
+                        Arc::clone(&failed),
+                        HttpErrorCode::TRANSPORT_READ_ERROR,
+                    )]);
+                    let (session, handle) =
+                        OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+                    let (run, progress) = futures::join!(session.run(), async {
+                        let reservation = handle.reserve_request().unwrap();
+                        match failure {
+                            ReadFailure::BeforeSubmission => {
+                                failed.notify_one();
+                                yield_until(|| handle.is_finished()).await;
+                            }
+                            ReadFailure::FailedThenSubmitted => failed.notify_one(),
+                            ReadFailure::SubmittedThenFailed => {}
+                        }
+                        let mut submitted = Submitted::new(kind, reservation);
+                        if matches!(failure, ReadFailure::SubmittedThenFailed) {
+                            failed.notify_one();
+                        }
+                        submitted.progress().await
+                    });
+                    let state = state.borrow();
+                    (
+                        progress,
+                        written_text(&state),
+                        run.err().map(|error| error.code()),
+                        state.close,
+                    )
+                })
+            });
+            assert_eq!(
+                outcome,
+                (
+                    RequestProgress {
+                        error: Some(HttpErrorCode::TRANSPORT_READ_ERROR),
+                        unprocessed: true,
+                        sequence: Some(0),
+                    },
+                    String::new(),
+                    Some(HttpErrorCode::TRANSPORT_READ_ERROR),
+                    CloseKind::Reset,
+                ),
+                "{failure:?}, {kind:?}"
+            );
+        }
+    }
+}
+
+/// A panic in the teardown of a failed read (here the observer's capacity release as the live
+/// exchange is cancelled) resets the transport at once, without waiting for the outstanding
+/// request write, and `run` resumes it, as a teardown panic in any other abort does.
+#[test]
+fn a_teardown_panic_on_a_read_error_during_a_request_write_resets_at_once() {
+    for queued in [false, true] {
+        let outcome = run_on_host(move |context| {
+            Box::pin(async move {
+                use futures::FutureExt;
+                let failed = Arc::new(tokio::sync::Notify::new());
+                let (inner, state) = ScriptedTransport::new([ReadAction::WaitError(
+                    Arc::clone(&failed),
+                    HttpErrorCode::TRANSPORT_READ_ERROR,
+                )]);
+                let fence = Rc::new(RequestFence {
+                    open: Cell::new(false),
+                    first: Cell::new(None),
+                    wakers: RefCell::default(),
+                });
+                let transport = Rc::new(RequestFenceTransport {
+                    inner,
+                    state: Rc::clone(&state),
+                    fence: Rc::clone(&fence),
+                    queued,
+                });
+                let (session, handle) =
+                    OwnedH1UpstreamSession::new(upstream_options(context.clone(), transport))
+                        .unwrap();
+                handle.set_observer(Rc::new(PanickingObserver)).unwrap();
+                let submission = handle.reserve_request().unwrap().submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                let script = async {
+                    yield_until(|| !state.borrow().writes.is_empty()).await;
+                    failed.notify_one();
+                    // Leaves the session turns in which it observes the failed read.
+                    for _ in 0..8 {
+                        context.host().yield_to_io().await;
+                    }
+                    let held_close = state.borrow().close;
+                    fence.open();
+                    held_close
+                };
+                let (run, response, held_close) = futures::join!(
+                    std::panic::AssertUnwindSafe(session.run()).catch_unwind(),
+                    async {
+                        match submission.await {
+                            Ok(response) => {
+                                let (_stream, mut source, _control) = response.into_source_parts();
+                                read_response(&mut source).await.error
+                            }
+                            Err(error) => Some(error.code()),
+                        }
+                    },
+                    script
+                );
+                let panic = run.expect_err("run resumes the observer's panic");
+                (
+                    held_close,
+                    panic.downcast_ref::<&str>().copied(),
+                    response,
+                    state.borrow().close,
+                    handle.is_finished(),
+                )
+            })
+        });
+        assert_eq!(
+            outcome,
+            (
+                CloseKind::Reset,
+                Some("observer panicked"),
+                Some(HttpErrorCode::TRANSPORT_READ_ERROR),
+                CloseKind::Reset,
+                true,
+            ),
+            "queued {queued}"
+        );
+    }
+}

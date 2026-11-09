@@ -24,7 +24,8 @@
 //! response event's publication runs, is observed at the end of that phase, before it reads
 //! more of the request, parses the next response event, writes or closes normally. As in
 //! `UniplexSession`, a failed read fails the connection only after every byte read before it is
-//! parsed, flow control included.
+//! parsed, flow control included, and resets the transport
+//! only once the request bytes already serialized are written.
 //! [`OwnedH1UpstreamSession::new`] validates [`UniplexConfig`] as [`OwnedH1Session::new`]
 //! does, except that `drain_request_body_on_drop` must be false,
 //! `unframed_bodiless_http1_requests` (`DIV-036`) is honored: a request whose head ends it and
@@ -34,8 +35,8 @@
 //! consumer cancelled it (a cancel, a dropped submission or the cancellation token), which
 //! discards them, as `UniplexStreamAbort` does. DIV-029 lists where this driver differs from
 //! `UniplexSession`'s client. Each turn reads before it commits a queued request, so a peer EOF
-//! already readable closes admission first; a request that admission refuses reports
-//! `OwnedRequestProgressExt::request_unprocessed` (`DIV-035`).
+//! already readable, or a failed read, closes admission first; a request that admission refuses
+//! reports `OwnedRequestProgressExt::request_unprocessed` (`DIV-035`).
 
 use std::cell::RefCell;
 
@@ -1139,6 +1140,9 @@ struct UpstreamDriver {
     eof_processed: bool,
     /// A failed read, applied once the bytes read before it are parsed.
     read_error: Option<HttpError>,
+    /// An applied failed read whose connection resets once the request bytes already
+    /// serialized are written; the run's error.
+    failed_read: Option<HttpError>,
     /// Parsing waits while the unread response body is at `ingress_buffer_limit`.
     flow_pause: bool,
     /// The response ended; nothing more is parsed on this connection.
@@ -1345,6 +1349,7 @@ impl UpstreamDriver {
                 eof: false,
                 eof_processed: false,
                 read_error: None,
+                failed_read: None,
                 flow_pause: false,
                 response_pause: false,
                 body_awaits_egress: false,
@@ -1414,7 +1419,7 @@ impl UpstreamDriver {
             if !(self.flow_pause && self.codec.is_busy())
                 && let Some(error) = self.read_error.take()
             {
-                self.abort(error);
+                self.fail_read(error);
                 progress = true;
             }
             if self.fatal.is_none() && self.stream_wake.take_ready() {
@@ -1444,6 +1449,10 @@ impl UpstreamDriver {
                     self.abort(error);
                 }
                 progress = true;
+            }
+            if self.failed_read.is_some() && self.egress.is_empty() && !self.writes_pending() {
+                let error = self.failed_read.take().expect("checked above");
+                self.abort(error);
             }
             if self.fatal.is_some() && !self.transport_reset {
                 self.reset_transport();
@@ -1542,8 +1551,8 @@ impl UpstreamDriver {
             return true;
         }
         // Bytes behind a retired response are no response to the next request: they fail the
-        // connection before anything is committed.
-        if self.exchange.is_some() || !self.ingress.is_empty() {
+        // connection before anything is committed, and a failed read closes admission first.
+        if self.exchange.is_some() || !self.ingress.is_empty() || self.read_error.is_some() {
             return false;
         }
         let Some(mut submission) = self.shared.queued.borrow_mut().take() else {
@@ -2004,6 +2013,7 @@ impl UpstreamDriver {
         if self.read.is_none()
             && !self.eof
             && self.read_error.is_none()
+            && self.failed_read.is_none()
             && self.fatal.is_none()
             && !self.cancellation.is_cancellation_requested()
         {
@@ -2196,20 +2206,45 @@ impl UpstreamDriver {
         }
     }
 
+    /// Fails the connection for a failed read. As `UniplexSession`, admission closes and the
+    /// live exchange is cancelled at once, nothing more is read, and the transport resets once
+    /// the request bytes already serialized are written. A panic in that teardown resets it at
+    /// once, and `run` resumes the panic.
+    #[cold]
+    fn fail_read(&mut self, error: HttpError) {
+        if self.fatal.is_some() || (self.egress.is_empty() && !self.writes_pending()) {
+            self.abort(error);
+            return;
+        }
+        self.failed_read = Some(error.clone());
+        self.close_and_cancel(&error);
+        if self.panic.is_some() {
+            self.abort(error);
+        }
+    }
+
     /// Fails the connection: the live exchange is cancelled and dropped, admission closes,
     /// pending egress is discarded, and the transport is reset once outstanding operations are
-    /// cancelled.
+    /// cancelled. A failed read that was waiting for its writes stays the first cause.
     #[cold]
     fn abort(&mut self, error: HttpError) {
-        self.fatal.get_or_insert_with(|| error.clone());
+        let first = self.failed_read.take();
+        self.fatal
+            .get_or_insert_with(|| first.unwrap_or_else(|| error.clone()));
+        self.close_and_cancel(&error);
+        self.egress = BufQueue::new(self.config.buffer_limit);
+        self.reset_transport();
+    }
+
+    /// Closes admission with `error`, then cancels and drops the live exchange with it.
+    #[cold]
+    fn close_and_cancel(&mut self, error: &HttpError) {
         // Admission closes first, so the exchange's capacity release announces no capacity.
         capture(&mut self.panic, || self.shared.close(error.clone()));
         if let Some(mut exchange) = self.exchange.take() {
-            capture(&mut self.panic, || exchange.cancel(&error));
+            capture(&mut self.panic, || exchange.cancel(error));
             capture(&mut self.panic, || drop(exchange));
         }
-        self.egress = BufQueue::new(self.config.buffer_limit);
-        self.reset_transport();
     }
 }
 
