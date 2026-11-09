@@ -18,6 +18,11 @@
 //!   `HTTPUniplexTransportSession::enablePingProbes`, and retire once
 //!   Proxygen ships equivalent coro probes and the reference revision is
 //!   re-frozen past them.
+//! - `DIV-035`: [`UniplexResponseProgressExt`], whether a committed request's
+//!   head was serialized. It prototypes a request-progress query on the coro
+//!   client's response that would let a caller resend a request that failed
+//!   before any of it was written, as Hyper's legacy client does for reused
+//!   connections, which frozen Proxygen does not have.
 
 use std::error::Error;
 use std::sync::Arc;
@@ -68,6 +73,23 @@ pub trait UniplexResponseAbortExt {
 impl UniplexResponseAbortExt for UniplexResponse {
     fn take_stream_abort(&mut self) -> Option<UniplexStreamAbort> {
         self.abort.take().map(UniplexStreamAbort)
+    }
+}
+
+/// Request progress of a [`UniplexResponse`] (`DIV-035`).
+pub trait UniplexResponseProgressExt {
+    /// Whether the session began serializing the request's head for writing.
+    /// It stays false if the stream or session failed before that (for
+    /// example, the session saw its peer's EOF first), so none of the request
+    /// reached the transport and resending it elsewhere cannot repeat it: what
+    /// hyper-util's `retry_canceled_requests` calls an unstarted request. An
+    /// HTTP/2 head is serialized when the request is committed.
+    fn request_started(&self) -> bool;
+}
+
+impl UniplexResponseProgressExt for UniplexResponse {
+    fn request_started(&self) -> bool {
+        self.exchange.egress_started()
     }
 }
 

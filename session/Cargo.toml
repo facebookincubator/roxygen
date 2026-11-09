@@ -35,5 +35,9 @@ rustls = { version = "0.23.46", features = ["ring", "std", "tls12"], default-fea
 tokio = { version = "1.54.1", features = ["full", "test-util"] }
 tokio-rustls = { version = "0.26.6", features = ["ring", "tls12"], default-features = false }
 
+[features]
+default = []
+test-hooks = []
+
 [lints]
 workspace = true

@@ -9922,3 +9922,401 @@ fn batched_h1_egress_writes_a_chunked_body_that_fills_the_buffer_after_the_head(
 fn batched_h1_egress_writes_a_chunk_that_no_longer_fits_next() {
     assert_boundary_post(None, &[(40_000, false), (40_000, true)], 2);
 }
+
+/// Whether an upstream request was started, read before and after its stream
+/// fails: aborted at once, or failed by the peer's EOF once its head was
+/// written (`DIV-035`).
+fn request_started_around_a_failure(write_first: bool) -> (bool, bool, usize) {
+    use crate::experimental::UniplexResponseAbortExt;
+    use crate::experimental::UniplexResponseProgressExt;
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let eof = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) =
+                ScriptedTransport::new([ReadAction::WaitEof(Arc::clone(&eof))]);
+            let (session, handle) = UniplexSession::new(
+                context,
+                TransportDirection::Upstream,
+                transport,
+                None,
+                UniplexConfig::default(),
+            )
+            .unwrap();
+            let exchange = async {
+                let request = HttpFixedSource::make_get_request(b"/", None).unwrap();
+                let mut response = handle
+                    .send_request(
+                        HttpSourceHolder::new(Box::new(request)),
+                        CancellationToken::never(),
+                    )
+                    .await
+                    .unwrap();
+                let before = response.request_started();
+                if write_first {
+                    while state.borrow().writes.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                    eof.notify_one();
+                } else {
+                    response.take_stream_abort().unwrap().abort();
+                }
+                assert!(response.source.read_header_event().await.is_err());
+                let after = response.request_started();
+                drop(response);
+                eof.notify_one();
+                (before, after)
+            };
+            let (_, (before, after)) = tokio::join!(session.run(), exchange);
+            (before, after, state.borrow().writes.len())
+        })
+    })
+}
+
+#[test]
+fn a_request_failed_before_its_head_is_serialized_was_not_started() {
+    assert_eq!(request_started_around_a_failure(false), (false, false, 0));
+}
+
+#[test]
+fn a_request_whose_head_was_written_was_started() {
+    assert_eq!(request_started_around_a_failure(true), (false, true, 1));
+}
+
+/// How the peer fails an upstream session in `request_started_when_the_peer_fails_first`.
+#[derive(Clone, Copy)]
+enum PeerFailure {
+    Eof,
+    ReadError,
+}
+
+/// An upstream request whose session the peer fails (EOF or read error) after
+/// the request is committed and before the writer serializes its head, held by
+/// a test hook as when the failure and the commit fall in one turn: the
+/// request's sequence number (1 when an earlier exchange reused the session),
+/// whether it was started before and after the failure, the bytes written for
+/// it, and the error its head read returned within a bound (`DIV-035`). The
+/// session's timers are off, as the router sets them.
+fn request_started_when_the_peer_fails_first(
+    failure: PeerFailure,
+    reused: bool,
+) -> (u64, bool, bool, Vec<u8>, Option<HttpErrorCode>) {
+    use crate::experimental::UniplexResponseProgressExt;
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let respond = Arc::new(tokio::sync::Notify::new());
+            let fail = Arc::new(tokio::sync::Notify::new());
+            let mut reads = Vec::new();
+            if reused {
+                reads.push(ReadAction::WaitData(
+                    Arc::clone(&respond),
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+                ));
+            }
+            reads.push(match failure {
+                PeerFailure::Eof => ReadAction::WaitEof(Arc::clone(&fail)),
+                PeerFailure::ReadError => {
+                    ReadAction::WaitError(Arc::clone(&fail), HttpErrorCode::TRANSPORT_READ_ERROR)
+                }
+            });
+            let (transport, state) = ScriptedTransport::new(reads);
+            let (session, handle) = UniplexSession::new(
+                context,
+                TransportDirection::Upstream,
+                transport,
+                None,
+                UniplexConfig {
+                    read_timeout: Duration::ZERO,
+                    stream_read_timeout: Duration::ZERO,
+                    write_timeout: Duration::ZERO,
+                    ..UniplexConfig::default()
+                },
+            )
+            .unwrap();
+            let get = || {
+                HttpSourceHolder::new(Box::new(
+                    HttpFixedSource::make_get_request(b"/", None).unwrap(),
+                ))
+            };
+            let exchange = async {
+                if reused {
+                    let mut response = handle
+                        .send_request(get(), CancellationToken::never())
+                        .await
+                        .unwrap();
+                    while state.borrow().writes.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                    respond.notify_one();
+                    let head = response.source.read_header_event().await.unwrap();
+                    let mut eom = head.eom();
+                    while !eom {
+                        eom = response
+                            .source
+                            .read_body_event(u32::MAX)
+                            .await
+                            .unwrap()
+                            .eom();
+                    }
+                }
+                let written_before = state.borrow().writes.concat().len();
+                let release = Rc::new(tokio::sync::Notify::new());
+                handle.hold_writer_for_test(Rc::clone(&release));
+                let mut response = handle
+                    .send_request(get(), CancellationToken::never())
+                    .await
+                    .unwrap();
+                let before = response.request_started();
+                fail.notify_one();
+                // Bounded: a session that left the request to its held writer
+                // would never fail the head read.
+                let error = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    response.source.read_header_event(),
+                )
+                .await
+                .ok()
+                .map(|head| head.err().expect("no response head arrives").code());
+                let after = response.request_started();
+                let written = state.borrow().writes.concat()[written_before..].to_vec();
+                release.notify_one();
+                (response.sequence_number, before, after, written, error)
+            };
+            let (_, outcome) = tokio::join!(session.run(), exchange);
+            outcome
+        })
+    })
+}
+
+#[test]
+fn a_request_on_a_fresh_session_failed_by_an_eof_before_its_head_was_not_started() {
+    assert_eq!(
+        request_started_when_the_peer_fails_first(PeerFailure::Eof, false),
+        (
+            0,
+            false,
+            false,
+            Vec::new(),
+            Some(HttpErrorCode::TRANSPORT_EOF)
+        )
+    );
+}
+
+/// The retry case of `DIV-035`: a reused session (`sequence_number != 0`) that
+/// failed before it serialized the request (`!request_started()`).
+#[test]
+fn a_request_on_a_reused_session_failed_by_an_eof_before_its_head_was_not_started() {
+    assert_eq!(
+        request_started_when_the_peer_fails_first(PeerFailure::Eof, true),
+        (
+            1,
+            false,
+            false,
+            Vec::new(),
+            Some(HttpErrorCode::TRANSPORT_EOF)
+        )
+    );
+}
+
+/// `run_on_worker` on a runtime with I/O enabled, for loopback sockets.
+fn run_on_io_worker<T: Send + 'static>(
+    test: impl FnOnce(WorkerContext) -> Pin<Box<dyn Future<Output = T>>> + Send + 'static,
+) -> T {
+    Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("I/O runtime")
+        .block_on(LocalSet::new().run_until(async move {
+            let (worker, driver) = WorkerDriver::new(16).unwrap();
+            let call = worker
+                .call_local(move |context| {
+                    let worker = context.handle().clone();
+                    async move {
+                        let result = test(context).await;
+                        worker.begin_shutdown();
+                        result
+                    }
+                })
+                .unwrap();
+            let (_, result) = tokio::join!(driver, call);
+            result.expect("worker call completed")
+        }))
+}
+
+/// What `stale_reused_loopback_connection` observed of the second request.
+#[derive(Debug, PartialEq)]
+struct LoopbackStaleReuse {
+    sequence_number: u64,
+    started_before_the_fin: bool,
+    started_after: bool,
+    /// The head read's error within a bound; `None` while it is still pending.
+    head_error: Option<HttpErrorCode>,
+    /// What the peer received after its FIN.
+    peer_received: Vec<u8>,
+}
+
+/// The pool-level stale-connection case of `DIV-035` on a real loopback TCP
+/// connection: an upstream HTTP/1.1 session carries one exchange, then the
+/// next request is committed while the session's writer is held (the in-crate
+/// test hook) and the peer closes its side (FIN), as when that FIN and the
+/// commit fall in one turn. Session timers are off, as the router sets them.
+fn stale_reused_loopback_connection() -> LoopbackStaleReuse {
+    use crate::experimental::UniplexResponseProgressExt;
+    run_on_io_worker(move |context| {
+        Box::pin(async move {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("loopback listener");
+            let (accepted, client) = tokio::join!(
+                listener.accept(),
+                tokio::net::TcpStream::connect(listener.local_addr().unwrap()),
+            );
+            let mut peer = accepted.expect("accepted loopback peer").0;
+            let transport = roxygen_transport::established::adopt_local(
+                &context,
+                roxygen_transport::established::EstablishedIo::new(
+                    client.expect("connected loopback client"),
+                    roxygen_transport::byte_stream::TransportEndpoint::Unknown,
+                    roxygen_transport::byte_stream::TransportEndpoint::Unknown,
+                    None,
+                ),
+                roxygen_transport::byte_stream::ByteStreamLimits::new(256 << 10, 256 << 10, 1024)
+                    .unwrap(),
+            )
+            .expect("adopted loopback I/O");
+            let transport: Rc<dyn UniplexTransport> = Rc::new(transport);
+            let (session, handle) = UniplexSession::new(
+                context,
+                TransportDirection::Upstream,
+                transport,
+                None,
+                UniplexConfig {
+                    read_timeout: Duration::ZERO,
+                    stream_read_timeout: Duration::ZERO,
+                    write_timeout: Duration::ZERO,
+                    ..UniplexConfig::default()
+                },
+            )
+            .expect("upstream H1 session");
+            let close = tokio::sync::Notify::new();
+            let peer_side = async {
+                let mut input = Vec::new();
+                let mut buffer = [0; 1024];
+                while !input.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = tokio::io::AsyncReadExt::read(&mut peer, &mut buffer)
+                        .await
+                        .expect("peer reads");
+                    assert_ne!(read, 0, "the first request arrives");
+                    input.extend_from_slice(&buffer[..read]);
+                }
+                tokio::io::AsyncWriteExt::write_all(
+                    &mut peer,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                )
+                .await
+                .expect("peer replies");
+                close.notified().await;
+                tokio::io::AsyncWriteExt::shutdown(&mut peer)
+                    .await
+                    .expect("peer sends FIN");
+                let mut received = Vec::new();
+                while let Ok(read) = tokio::io::AsyncReadExt::read(&mut peer, &mut buffer).await
+                    && read != 0
+                {
+                    received.extend_from_slice(&buffer[..read]);
+                }
+                received
+            };
+            let get = || {
+                HttpSourceHolder::new(Box::new(
+                    HttpFixedSource::make_get_request(b"/", None).unwrap(),
+                ))
+            };
+            let exchange = async {
+                let mut first = handle
+                    .send_request(get(), CancellationToken::never())
+                    .await
+                    .expect("first request is committed");
+                let head = first.source.read_header_event().await.expect("first head");
+                let mut eom = head.eom();
+                while !eom {
+                    eom = first
+                        .source
+                        .read_body_event(u32::MAX)
+                        .await
+                        .expect("first body")
+                        .eom();
+                }
+                drop(first);
+                let release = Rc::new(tokio::sync::Notify::new());
+                handle.hold_writer_for_test(Rc::clone(&release));
+                let mut response = handle
+                    .send_request(get(), CancellationToken::never())
+                    .await
+                    .expect("second request is committed");
+                let started_before_the_fin = response.request_started();
+                close.notify_one();
+                // Bounded: a session that left the request to its held writer
+                // would never fail the head read.
+                let head_error = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    response.source.read_header_event(),
+                )
+                .await
+                .ok()
+                .map(|head| head.err().expect("no response head arrives").code());
+                let outcome = (
+                    response.sequence_number,
+                    started_before_the_fin,
+                    response.request_started(),
+                    head_error,
+                );
+                release.notify_one();
+                drop(response);
+                outcome
+            };
+            let (
+                _,
+                (sequence_number, started_before_the_fin, started_after, head_error),
+                peer_received,
+            ) = tokio::join!(session.run(), exchange, peer_side);
+            LoopbackStaleReuse {
+                sequence_number,
+                started_before_the_fin,
+                started_after,
+                head_error,
+                peer_received,
+            }
+        })
+    })
+}
+
+/// The request on the reused loopback connection fails unstarted with
+/// `TRANSPORT_EOF` and is never written: hyper-util's retry
+/// condition (`sequence_number != 0 && !request_started()`).
+#[test]
+fn a_request_on_a_stale_reused_loopback_connection_fails_unstarted() {
+    assert_eq!(
+        stale_reused_loopback_connection(),
+        LoopbackStaleReuse {
+            sequence_number: 1,
+            started_before_the_fin: false,
+            started_after: false,
+            head_error: Some(HttpErrorCode::TRANSPORT_EOF),
+            peer_received: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn a_request_on_a_reused_session_failed_by_a_read_error_before_its_head_was_not_started() {
+    assert_eq!(
+        request_started_when_the_peer_fails_first(PeerFailure::ReadError, true),
+        (
+            1,
+            false,
+            false,
+            Vec::new(),
+            Some(HttpErrorCode::TRANSPORT_READ_ERROR)
+        ),
+    );
+}

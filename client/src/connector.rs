@@ -1743,6 +1743,14 @@ impl ClientSession {
         completion_waiters_for_test(&self.inner.completion)
     }
 
+    /// Holds the session's writer, the next time it would stage egress, until
+    /// `release` is notified (the session's `test-hooks` feature, which Buck's
+    /// test build lacks).
+    #[cfg(all(test, not(fbcode_build)))]
+    pub(crate) fn hold_writer_for_test(&self, release: Rc<tokio::sync::Notify>) {
+        self.inner.handle.hold_writer_for_test(release);
+    }
+
     fn check_admission(&self) -> Result<(), HttpError> {
         if !self.inner.worker.is_accepting()
             || self.inner.draining.get()

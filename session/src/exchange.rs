@@ -46,6 +46,8 @@ struct ExchangeState {
     driver_applied: Cell<bool>,
     driver_complete: Cell<bool>,
     unconfirmed: Cell<bool>,
+    /// The session began serializing the exchange's outgoing head (`DIV-035`).
+    egress_started: Cell<bool>,
     wake: Rc<dyn Fn()>,
 }
 
@@ -101,6 +103,7 @@ impl ExchangeOwner {
                 driver_applied: Cell::new(false),
                 driver_complete: Cell::new(!driver_required),
                 unconfirmed: Cell::new(false),
+                egress_started: Cell::new(false),
                 wake,
             })),
         }
@@ -213,6 +216,14 @@ impl ExchangeTracker {
 
     pub(crate) fn fail(&self) {
         self.0.unconfirmed.set(true);
+    }
+
+    pub(crate) fn mark_egress_started(&self) {
+        self.0.egress_started.set(true);
+    }
+
+    pub(crate) fn egress_started(&self) -> bool {
+        self.0.egress_started.get()
     }
 }
 

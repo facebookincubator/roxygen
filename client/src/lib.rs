@@ -1106,3 +1106,7 @@ mod pool_idle_timeout_tests;
 #[cfg(test)]
 #[path = "../tests/ingress_before_abort.rs"]
 mod ingress_before_abort_tests;
+
+#[cfg(test)]
+#[path = "../tests/request_retry_signals.rs"]
+mod request_retry_signals_tests;

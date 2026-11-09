@@ -1,6 +1,8 @@
 //! Worker-local HTTP/1 byte-stream session driver.
 //!
 //! HTTP/1.1 writes batch ready events within the configured buffer and write limits.
+//! Upstream HTTP/1.1 rejects requests that peer EOF finds unserialized,
+//! leaving retry decisions to the caller (`DIV-035`).
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -109,6 +111,7 @@ use roxygen_transport::byte_stream::TransportWriteError;
 use roxygen_transport::byte_stream::WriteInfo;
 use tokio::sync::futures::Notified;
 
+use crate::exchange::ExchangeTracker;
 use crate::experimental::PingProbeConfig;
 use crate::experimental::ping_probe_timeout_error;
 use crate::http2::DEFAULT_STREAM_WINDOW;
@@ -483,6 +486,8 @@ pub struct UniplexResponse {
     pub completion: ExchangeCompletion,
     /// Taken through `experimental::UniplexResponseAbortExt` (`DIV-023`).
     pub(crate) abort: Option<StreamAbort>,
+    /// Read through `experimental::UniplexResponseProgressExt` (`DIV-035`).
+    pub(crate) exchange: ExchangeTracker,
 }
 
 static READY_DISPATCH: LazyLock<bool> =
@@ -1355,6 +1360,8 @@ struct DriverState {
     h2_source_timer_probe: Option<H2SourceTimerProbe>,
     #[cfg(test)]
     writer_wait_hooks: WriterWaitHooks,
+    #[cfg(any(test, feature = "test-hooks"))]
+    writer_hold: Option<Rc<tokio::sync::Notify>>,
 }
 
 struct Http1StatsState {
@@ -2415,6 +2422,17 @@ impl UniplexHandle {
         }
     }
 
+    /// Holds the writer, the next time it would stage egress, until `release`
+    /// is notified, so that the reader can process what the peer sent first.
+    /// Test-only: the `test-hooks` feature exposes it to other crates' tests.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn hold_writer_for_test(&self, release: Rc<tokio::sync::Notify>) {
+        if let Some(state) = self.state.upgrade() {
+            state.borrow_mut().writer_hold = Some(release);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn callback_queue_for_test(&self) -> Rc<crate::stream_state::StreamCallbacks> {
         self.state
@@ -2816,6 +2834,11 @@ impl UniplexHandle {
             .or_default()
             .response_timeout_pending = true;
         let source = outgoing.response_source;
+        let exchange = driver
+            .core()
+            .stream(stream)
+            .expect("committed stream")
+            .exchange_tracker();
         let committed_headers = if let Some(observer) = header_observer {
             Some((outgoing.headers, observer))
         } else {
@@ -2886,6 +2909,7 @@ impl UniplexHandle {
                 shared: Rc::clone(&self.shared),
                 stream,
             }),
+            exchange,
         })
     }
 
@@ -3932,6 +3956,8 @@ impl UniplexSession {
             h2_source_timer_probe: None,
             #[cfg(test)]
             writer_wait_hooks: WriterWaitHooks::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            writer_hold: None,
         }));
         let cleanup = Rc::new(RunCleanupControl {
             trigger: Cell::new(CleanupTrigger::Pending),
@@ -7095,6 +7121,14 @@ async fn write_loop(
             }
         }
 
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let hold = state.borrow_mut().writer_hold.take();
+            if let Some(release) = hold {
+                release.notified().await;
+            }
+        }
+
         let can_stage_egress = {
             let state = state.borrow();
             !state.zero_byte_write_pending
@@ -8394,6 +8428,11 @@ fn serialize_event(
             .egress_work
             .push_back(EgressWork::Event { stream, event });
         return Ok(());
+    }
+    if matches!(event, EgressEvent::Headers(_))
+        && let Ok(stream) = state.borrow().core().stream(stream)
+    {
+        stream.exchange_tracker().mark_egress_started();
     }
     enum PreparedEvent {
         Headers {
@@ -9851,6 +9890,19 @@ fn handle_eof(
                     .is_some_and(|stream| !stream.is_upgraded())
             })
     };
+    // An unserialized HTTP/1.1 request can get no response after peer EOF.
+    let upstream_request_unstarted = upstream && !upstream_response_pending && {
+        let state = state.borrow();
+        let streams = state.core().stream_ids();
+        state.codec.protocol() == CodecProtocol::Http11
+            && !streams.is_empty()
+            && streams.iter().all(|stream| {
+                state
+                    .core()
+                    .exchange_tracker(*stream)
+                    .is_some_and(|exchange| !exchange.egress_started())
+            })
+    };
     if abort_exchanges {
         capture_panic(&mut first_panic, || {
             fail_connection(
@@ -9871,7 +9923,7 @@ fn handle_eof(
                 }
             });
         }
-    } else if upstream_response_pending || !incomplete.is_empty() {
+    } else if upstream_response_pending || upstream_request_unstarted || !incomplete.is_empty() {
         capture_panic(&mut first_panic, || {
             fail_connection(
                 state,
