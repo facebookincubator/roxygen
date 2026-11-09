@@ -780,7 +780,9 @@ enum Backend {
 
 impl Timeout {
     /// A timeout for `host`. It takes nothing until its first schedule, which
-    /// binds it to at most one host sleep at a time.
+    /// takes a slot on the host's wheel timer
+    /// ([`Host::wheel_timer`](crate::host::Host::wheel_timer)) or, on a host
+    /// without one, binds it to at most one host sleep at a time.
     pub fn new(host: &Host) -> Self {
         Self {
             backend: Backend::Unbound(host.clone()),
@@ -797,6 +799,11 @@ impl Timeout {
     /// Arms the timeout for `deadline`, replacing any earlier schedule, and
     /// discards an expiry not yet observed. An expiry wakes `waker`.
     pub fn schedule_at(&mut self, deadline: Instant, waker: &Waker) {
+        if let Backend::Unbound(host) = &self.backend
+            && let Some(wheel) = host.wheel_timer()
+        {
+            self.backend = Backend::Wheel { wheel, slot: NIL };
+        }
         match &mut self.backend {
             Backend::Unbound(host) => {
                 let mut sleep = LazySleep::new(host.clone());

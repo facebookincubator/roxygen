@@ -1,5 +1,6 @@
-#[cfg(test)]
 use std::cell::Cell;
+use std::cell::OnceCell;
+use std::cell::RefCell;
 use std::future::Future;
 use std::future::poll_fn;
 use std::marker::PhantomData;
@@ -31,6 +32,8 @@ use tokio::time::Sleep;
 
 use crate::driver::WorkerDriver;
 use crate::host::Host;
+use crate::host::timer::WheelTimer;
+use crate::host::timer::WheelWakeup;
 use crate::task_group::TaskGroup;
 use crate::task_group::TaskGroupError;
 use crate::worker::PanicPayload;
@@ -38,6 +41,7 @@ use crate::worker::QuiesceDeadline;
 use crate::worker::WorkerCreateError;
 use crate::worker::WorkerHandle;
 use crate::worker::WorkerState;
+use crate::worker::retain_first_panic;
 
 struct ExitCallback<F>
 where
@@ -219,10 +223,290 @@ pub(crate) fn supervisor_polls_on_this_thread() -> usize {
     SUPERVISOR_POLLS.get()
 }
 
+/// A worker wheel's tick: Tokio's timer resolution.
+const WHEEL_TICK: Duration = Duration::from_millis(1);
+
+/// Polls of the wheel's sleep in one supervisor poll.
+const MAX_SLEEP_POLLS: usize = 2;
+
+thread_local! {
+    /// The wheel of the hosted or managed worker this thread drives.
+    static WORKER_WHEEL: RefCell<Option<Rc<WorkerWheel>>> = const { RefCell::new(None) };
+}
+
+/// The wheel of the hosted or managed worker this thread drives, which
+/// `TokioHost::wheel_timer` reports.
+pub(crate) fn worker_wheel_timer() -> Option<Rc<WheelTimer>> {
+    let wheel = WORKER_WHEEL
+        .try_with(|wheel| wheel.borrow().clone())
+        .ok()
+        .flatten()?;
+    Some(wheel.timer())
+}
+
+/// What the wheels of workers driven on this thread did, for tests.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct WakeupCounts {
+    /// Wheels created.
+    wheels: usize,
+    /// Supervisor polls.
+    supervisor_polls: usize,
+    /// Supervisor polls that refreshed the supervisor's waker and checked
+    /// the sleep.
+    wheel_steps: usize,
+    /// Tokio sleeps created.
+    sleeps: usize,
+    /// Polls of a sleep.
+    sleep_polls: usize,
+    /// Supervisor wakes requested by `arm`.
+    supervisor_wakes: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static WAKEUP_COUNTS: Cell<WakeupCounts> = Cell::new(WakeupCounts::default());
+}
+
+#[cfg(test)]
+fn wakeup_counts() -> WakeupCounts {
+    WAKEUP_COUNTS.get()
+}
+
+#[cfg(test)]
+fn count(update: impl FnOnce(&mut WakeupCounts)) {
+    let mut counts = WAKEUP_COUNTS.get();
+    update(&mut counts);
+    WAKEUP_COUNTS.set(counts);
+}
+
+/// The host wakeup of a worker's wheel: one Tokio `Sleep`, created at the
+/// first arm and reset afterwards, polled by the worker's supervisor future,
+/// which expires the wheel when it resolves.
+#[derive(Default)]
+struct TokioWakeup {
+    sleep: RefCell<Option<Pin<Box<Sleep>>>>,
+    /// The sleep's last poll was pending, so Tokio holds the supervisor's
+    /// waker for it until it fires. After a ready poll this is false: Tokio
+    /// keeps the waker then too, but not as a documented contract, so the
+    /// next arm has the sleep polled again.
+    registered: Cell<bool>,
+    /// The sleep must be polled for Tokio to hold the supervisor's waker: it
+    /// is new, or it was reset while not registered.
+    needs_poll: Cell<bool>,
+    /// The supervisor is driving the wheel, and polls a sleep that `expire`
+    /// re-arms without being woken.
+    driving: Cell<bool>,
+    supervisor: RefCell<Option<Waker>>,
+}
+
+impl TokioWakeup {
+    fn arm(&self, deadline: Instant) {
+        let deadline = tokio::time::Instant::from_std(deadline);
+        {
+            let mut sleep = self.sleep.borrow_mut();
+            match sleep.as_mut() {
+                Some(sleep) => {
+                    // A sleep that fired after its pending poll gave the
+                    // supervisor's waker up, and a reset does not restore it.
+                    if sleep.is_elapsed() {
+                        self.registered.set(false);
+                    }
+                    sleep.as_mut().reset(deadline);
+                }
+                None => {
+                    #[cfg(test)]
+                    count(|counts| counts.sleeps += 1);
+                    *sleep = Some(Box::pin(tokio::time::sleep_until(deadline)));
+                }
+            }
+        }
+        if self.registered.get() || self.needs_poll.replace(true) || self.driving.get() {
+            return;
+        }
+        if let Some(supervisor) = &*self.supervisor.borrow() {
+            #[cfg(test)]
+            count(|counts| counts.supervisor_wakes += 1);
+            supervisor.wake_by_ref();
+        }
+    }
+
+    /// Keeps the supervisor's waker, cloning it only when it changes.
+    fn refresh_supervisor(&self, waker: &Waker) {
+        let mut supervisor = self.supervisor.borrow_mut();
+        if !supervisor
+            .as_ref()
+            .is_some_and(|current| current.will_wake(waker))
+        {
+            *supervisor = Some(waker.clone());
+        }
+    }
+
+    /// Whether the supervisor must poll the sleep: Tokio may have fired it,
+    /// or must take the supervisor's waker for it. Otherwise the supervisor
+    /// leaves it alone, a resolved sleep included.
+    fn due(&self) -> bool {
+        self.needs_poll.get()
+            || (self.registered.get()
+                && self
+                    .sleep
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|sleep| sleep.is_elapsed()))
+    }
+
+    /// Polls the sleep with the supervisor's context. The supervisor's poll
+    /// starts with the wheel step, and Tokio polls the `LocalSet` root with
+    /// a fresh coop budget, so coop never refuses this poll.
+    fn poll_sleep(&self, context: &mut Context<'_>) -> Poll<()> {
+        self.needs_poll.set(false);
+        let mut sleep = self.sleep.borrow_mut();
+        let Some(sleep) = sleep.as_mut() else {
+            return Poll::Pending;
+        };
+        #[cfg(test)]
+        count(|counts| counts.sleep_polls += 1);
+        let poll = sleep.as_mut().poll(context);
+        self.registered.set(poll.is_pending());
+        poll
+    }
+}
+
+/// A worker wheel's `WheelWakeup`.
+struct SharedWakeup(Rc<TokioWakeup>);
+
+impl WheelWakeup for SharedWakeup {
+    fn arm(&self, deadline: Instant) {
+        self.0.arm(deadline);
+    }
+
+    /// A Tokio sleep is withdrawn only by dropping it. The wheel disarms only
+    /// in `stop`, after which `expire` does nothing, and the teardown drops
+    /// the sleep right after.
+    fn disarm(&self) {}
+}
+
+/// The wheel timer of one hosted or managed worker and its wakeup. The wheel
+/// is created when a timer first asks for it.
+struct WorkerWheel {
+    host: Host,
+    wakeup: Rc<TokioWakeup>,
+    timer: OnceCell<Rc<WheelTimer>>,
+}
+
+impl WorkerWheel {
+    fn new() -> Rc<Self> {
+        Rc::new(Self {
+            host: Host::tokio(),
+            wakeup: Rc::default(),
+            timer: OnceCell::new(),
+        })
+    }
+
+    fn timer(&self) -> Rc<WheelTimer> {
+        let timer = self.timer.get_or_init(|| {
+            #[cfg(test)]
+            count(|counts| counts.wheels += 1);
+            WheelTimer::new(
+                WHEEL_TICK,
+                self.host.now(),
+                Box::new(SharedWakeup(Rc::clone(&self.wakeup))),
+            )
+        });
+        Rc::clone(timer)
+    }
+
+    /// The supervisor's wheel step, run at each of its polls: polls the
+    /// wheel's sleep only when it is due, and expires the wheel when it
+    /// resolves. A sleep that `expire` re-arms is polled again, so that Tokio
+    /// holds the supervisor's waker for it; if it keeps resolving at once, the
+    /// supervisor is woken to continue. Until a timer creates the wheel, a
+    /// poll costs one load: the supervisor's waker, which the first arm needs,
+    /// was taken when the supervisor started. Returns the panic of an owner's
+    /// waker that `expire` re-raised; the wheel stays consistent and driven.
+    fn drive(&self, context: &mut Context<'_>) -> Option<PanicPayload> {
+        #[cfg(test)]
+        count(|counts| counts.supervisor_polls += 1);
+        let timer = self.timer.get()?;
+        #[cfg(test)]
+        count(|counts| counts.wheel_steps += 1);
+        self.wakeup.refresh_supervisor(context.waker());
+        if !self.wakeup.due() {
+            return None;
+        }
+        self.wakeup.driving.set(true);
+        let expired = catch_unwind(AssertUnwindSafe(|| {
+            for _ in 0..MAX_SLEEP_POLLS {
+                if self.wakeup.poll_sleep(context).is_pending() {
+                    return;
+                }
+                timer.expire(self.host.now());
+                if !self.wakeup.due() {
+                    return;
+                }
+            }
+        }));
+        self.wakeup.driving.set(false);
+        if self.wakeup.due() {
+            context.waker().wake_by_ref();
+        }
+        expired.err()
+    }
+}
+
+/// Installs a worker's wheel on its owner thread until uninstalled or
+/// dropped, whichever comes first.
+struct InstalledWheel {
+    wheel: Option<Rc<WorkerWheel>>,
+    previous: Option<Rc<WorkerWheel>>,
+}
+
+impl InstalledWheel {
+    fn install(wheel: Rc<WorkerWheel>) -> Self {
+        let previous = WORKER_WHEEL.with(|slot| slot.replace(Some(Rc::clone(&wheel))));
+        Self {
+            wheel: Some(wheel),
+            previous,
+        }
+    }
+
+    /// The wheel's teardown, done once: stops the wheel (`~HHWheelTimer`'s
+    /// `cancelAll`), drops the sleep and the supervisor's waker while the
+    /// runtime is alive, and uninstalls the wheel. Returns the panic of an
+    /// owner's waker that `stop` re-raised.
+    fn uninstall(&mut self) -> Option<PanicPayload> {
+        let wheel = self.wheel.take()?;
+        let stopped = catch_unwind(AssertUnwindSafe(|| {
+            if let Some(timer) = wheel.timer.get() {
+                timer.stop();
+            }
+        }));
+        drop(wheel.wakeup.sleep.take());
+        drop(wheel.wakeup.supervisor.take());
+        let previous = self.previous.take();
+        let _ = WORKER_WHEEL.try_with(|slot| slot.replace(previous));
+        stopped.err()
+    }
+}
+
+/// Tears the wheel down on unwind. `run_managed_driver` uninstalls it on
+/// every other path that can have created it.
+impl Drop for InstalledWheel {
+    fn drop(&mut self) {
+        if let Some(payload) = self.uninstall() {
+            crate::panic::discard_panic(payload);
+        }
+    }
+}
+
 async fn run_managed_driver(
     handle: WorkerHandle,
     driver: WorkerDriver,
 ) -> Result<(), ManagedWorkerError> {
+    let wheel = WorkerWheel::new();
+    let mut installed = InstalledWheel::install(Rc::clone(&wheel));
+    let mut gate = WakeGate::new();
+    wheel.wakeup.refresh_supervisor(gate.waker());
     let mut tasks = TaskGroup::new();
     if let Err(error) = tasks.spawn_local(move |_| ManagedDriver {
         driver,
@@ -233,8 +517,13 @@ async fn run_managed_driver(
     }
     let mut joined = Box::pin(tasks.join());
     let mut timer: Option<(QuiesceDeadline, Pin<Box<Sleep>>)> = None;
-    let mut gate = WakeGate::new();
-    poll_fn(|parent| {
+    // Unwinding out of this future would drop unjoined tasks, so a panic of
+    // an owner's waker during expiry shuts the worker down. After the final
+    // join and the wheel's teardown (which an owner's waker can panic in
+    // too), the first such panic is reported as the owner thread's; payloads
+    // are disposed of with `discard_panic`, since their destructors can panic.
+    let mut wheel_panic = None;
+    let result = poll_fn(|parent| {
         // While a quiesce deadline is armed, the supervisor runs at every
         // poll, so a wake after the deadline forces shutdown before the woken
         // work runs, even if the deadline's timer has not fired yet.
@@ -244,6 +533,11 @@ async fn run_managed_driver(
         #[cfg(test)]
         SUPERVISOR_POLLS.set(SUPERVISOR_POLLS.get() + 1);
         let context = &mut Context::from_waker(gate.waker());
+        if let Some(payload) = wheel.drive(context) {
+            retain_first_panic(&mut wheel_panic, Some(payload));
+            let shutdown = catch_unwind(AssertUnwindSafe(|| handle.begin_shutdown()));
+            retain_first_panic(&mut wheel_panic, shutdown.err());
+        }
         if handle.state() == WorkerState::Open {
             let (deadline, outstanding) = handle.quiesce_snapshot(context.waker());
             if let Some(deadline) = deadline {
@@ -277,11 +571,18 @@ async fn run_managed_driver(
         }
         joined.as_mut().poll(context)
     })
-    .await
-    .map_err(ManagedWorkerError::from)
+    .await;
+    retain_first_panic(&mut wheel_panic, installed.uninstall());
+    if let Some(payload) = wheel_panic {
+        crate::panic::discard_panic(payload);
+        return Err(ManagedWorkerError::OwnerThreadPanicked);
+    }
+    result.map_err(ManagedWorkerError::from)
 }
 
 /// A worker hosted by a dedicated thread, current-thread runtime, and LocalSet.
+/// Like `HostedWorker`, it drives a wheel timer for its owner thread, which
+/// `Host::tokio().wheel_timer()` reports there (`DIV-003`).
 pub struct ManagedWorker {
     handle: WorkerHandle,
     owner: Option<JoinHandle<Result<(), ManagedWorkerError>>>,
@@ -427,6 +728,10 @@ pub struct HostedWorkerBlockingPool {
 /// `ManagedWorker` command never does. `completion()` is published after every task is joined and
 /// the LocalSet and runtime are dropped. Dropping the runtime waits for blocking-pool work that
 /// commands started, such as `spawn_blocking` or `tokio::net::lookup_host`.
+///
+/// The owner thread has a wheel timer, which `Host::tokio().wheel_timer()` and the context
+/// host report there and a `Timeout` uses; the worker's supervisor drives it through one Tokio
+/// `Sleep` and stops it after the final join (`DIV-003`).
 ///
 /// Drop calls `begin_shutdown` and then, off the owner thread, joins the owner thread, which
 /// blocks until all of that finishes and the thread exits. Async code therefore drops the worker
@@ -687,3 +992,7 @@ pub fn caller_driven_worker(
     let handle = guard.handle();
     Ok((handle, guard))
 }
+
+#[cfg(test)]
+#[path = "../tests/wheel_driving.rs"]
+mod wheel_driving_tests;

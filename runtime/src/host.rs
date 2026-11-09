@@ -10,6 +10,7 @@ use std::thread::ThreadId;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::host::timer::WheelTimer;
 use crate::thread::current_id;
 
 /// A future whose polling and destruction stay on its owner thread.
@@ -43,6 +44,15 @@ pub trait LocalHost {
     /// next poll instead of waking it. The default, `false`, keeps every wake.
     fn runs_wakes_this_iteration(&self) -> bool {
         false
+    }
+
+    /// The owner-local wheel timer this host drives, if any (a Roxygen-only
+    /// capability, `DIV-003`). A [`Timeout`](timer::Timeout) takes a slot on
+    /// it; without one, a `Timeout` keeps at most one `sleep_until` future.
+    /// The host calls [`WheelTimer::expire`] when the wheel's wakeup fires.
+    /// The default, `None`, keeps every timer on `sleep_until`.
+    fn wheel_timer(&self) -> Option<Rc<WheelTimer>> {
+        None
     }
 }
 
@@ -168,6 +178,12 @@ impl Host {
         self.implementation.runs_wakes_this_iteration()
     }
 
+    /// See [`LocalHost::wheel_timer`].
+    pub fn wheel_timer(&self) -> Option<Rc<WheelTimer>> {
+        self.assert_owner();
+        self.implementation.wheel_timer()
+    }
+
     fn assert_owner(&self) {
         assert_eq!(current_id(), self.owner_thread);
     }
@@ -208,5 +224,10 @@ impl LocalHost for TokioHost {
 
     fn yield_to_io(&self) -> LocalFuture {
         Box::pin(tokio::task::yield_now())
+    }
+
+    /// The wheel of the hosted or managed worker driving this thread, if any.
+    fn wheel_timer(&self) -> Option<Rc<WheelTimer>> {
+        crate::tokio_host::worker_wheel_timer()
     }
 }
