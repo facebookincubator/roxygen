@@ -1534,7 +1534,7 @@ where
             || io.maximum_write_size > io.buffer_limit
             || (!UPSTREAM && !io.drain_request_body_on_drop)
             || (UPSTREAM && io.drain_request_body_on_drop)
-            || io.deliver_ingress_before_abort
+            || (!UPSTREAM && io.deliver_ingress_before_abort)
             || http2.stats.is_some()
             || http2
                 .ping_probes
@@ -4197,10 +4197,20 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
             .state
             .scheduler
             .dequeue(id, &mut stream.scheduling);
+        // `DIV-033`: a cause the request's consumer selected discards the response's queued
+        // events, as `UniplexStreamAbort` does.
+        let discard = stream
+            .upstream()
+            .is_some_and(|exchange| exchange.status.cause_selected());
         capture(&mut self.failure.panic, || {
-            stream
-                .producer
-                .abort_with_error(error.clone(), b"owned H2 stream cancelled")
+            let details = b"owned H2 stream cancelled";
+            if discard {
+                stream
+                    .producer
+                    .abort_discarding_queued(error.clone(), details)
+            } else {
+                stream.producer.abort_with_error(error.clone(), details)
+            }
         });
         if let Some(application) = &mut stream.application {
             if capture(&mut self.failure.panic, || {

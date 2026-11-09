@@ -1270,14 +1270,6 @@ fn refused() -> Vec<Refused> {
     table.push(Refused {
         protocol: CodecProtocol::Http2,
         session: SessionParams {
-            deliver_ingress_before_abort: true,
-            ..untimed()
-        },
-        field: "deliver_ingress_before_abort",
-    });
-    table.push(Refused {
-        protocol: CodecProtocol::Http2,
-        session: SessionParams {
             settings: vec![CodecSetting {
                 identifier: ENABLE_PUSH,
                 value: 1,
@@ -1358,7 +1350,7 @@ fn connect_refuses_what_the_owned_drivers_cannot_honor_before_dialing() {
         observed.push(refusal(CodecProtocol::Http11, "TLS", result));
         observed
     });
-    assert_eq!(observed.len(), 17, "every case ran");
+    assert_eq!(observed.len(), 16, "every case ran");
     assert_eq!(
         observed,
         refused_as(HttpErrorCode::INVALID_STATE_TRANSITION, &observed)
@@ -1411,7 +1403,7 @@ fn attach_refuses_what_the_owned_drivers_cannot_honor() {
             .map(|error| error.code());
         (observed, unsupported)
     });
-    assert_eq!(observed.len(), 17, "every case ran");
+    assert_eq!(observed.len(), 16, "every case ran");
     assert_eq!(
         observed,
         refused_as(HttpErrorCode::INVALID_STATE_TRANSITION, &observed)
@@ -1436,9 +1428,10 @@ impl HeaderIndexingStrategy for CountingStrategy {
 }
 
 /// The router's session parameters (prod_inference `RoxygenClientParams`):
-/// timers off; on HTTP/1.1 every hyper-parity option; on HTTP/2 hyper's
-/// SETTINGS, no local stream limit and hyper's connection window, with the
-/// HTTP/1.1-only options also on, which HTTP/2 sessions ignore.
+/// timers off; `deliver_ingress_before_abort` (`DIV-033`) on both protocols;
+/// on HTTP/1.1 every other hyper-parity option; on HTTP/2 hyper's SETTINGS, no
+/// local stream limit and hyper's connection window, with the HTTP/1.1-only
+/// options also on, which HTTP/2 sessions ignore.
 fn router_session(protocol: CodecProtocol, strategy: &CountingStrategy) -> SessionParams {
     let http2 = protocol == CodecProtocol::Http2;
     let setting = |identifier, value| CodecSetting { identifier, value };
@@ -1456,7 +1449,7 @@ fn router_session(protocol: CodecProtocol, strategy: &CountingStrategy) -> Sessi
         max_concurrent_outgoing_streams: http2.then_some(u32::MAX),
         connection_flow_control: http2.then_some(5 << 20),
         header_indexing_strategy: Some(Rc::new(strategy.clone())),
-        deliver_ingress_before_abort: !http2,
+        deliver_ingress_before_abort: true,
         unframed_bodiless_http1_requests: true,
         non_abortive_close: true,
         ..untimed()
@@ -1540,6 +1533,132 @@ fn the_router_s_session_parameters_are_accepted_and_honored() {
     assert_eq!(owned, Ok(uniplex.clone()), "HTTP/2");
     assert_eq!(uniplex.0, [Some(200), Some(201)]);
     assert_ne!(uniplex.1, 0, "the indexing strategy is consulted");
+}
+
+/// One HTTP/2 frame on `stream`.
+fn stream_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let mut frame = frame(kind, flags, payload);
+    frame[5..9].copy_from_slice(&stream.to_be_bytes());
+    frame
+}
+
+/// An h2c peer that answers stream 1 with a 200 head and `first`, then resets
+/// it with `CANCEL`, in one write, and reads until the client's GOAWAY or EOF.
+fn reset_after_data_peer() -> (SocketAddr, std::thread::JoinHandle<()>) {
+    const HEADERS: u8 = 1;
+    const DATA: u8 = 0;
+    const RST_STREAM: u8 = 3;
+    const END_HEADERS: u8 = 4;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("peer binds");
+    let address = listener.local_addr().expect("peer address");
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("peer accepts");
+        let mut preface = [0; 24];
+        stream.read_exact(&mut preface).expect("client preface");
+        stream
+            .write_all(&frame(SETTINGS, 0, &[]))
+            .expect("peer settings");
+        while read_frame(&mut stream).expect("client request").0 != HEADERS {}
+        let mut reply = frame(SETTINGS, ACK, &[]);
+        // `:status: 200` as HPACK static index 8.
+        reply.extend(stream_frame(HEADERS, END_HEADERS, 1, &[0x88]));
+        reply.extend(stream_frame(DATA, 0, 1, b"first"));
+        reply.extend(stream_frame(RST_STREAM, 0, 1, &8_u32.to_be_bytes()));
+        stream.write_all(&reply).expect("peer replies");
+        while let Some((kind, _, _)) = read_frame(&mut stream) {
+            if kind == GOAWAY {
+                break;
+            }
+        }
+    });
+    (address, peer)
+}
+
+/// Reads `source` once its response's ingress has ended, as a proxy reads an
+/// upstream body only after it has sent its own client the head.
+async fn read_after_ingress_ends(mut source: HttpSourceHolder) -> Received {
+    let receipt = source
+        .ingress_completion()
+        .expect("a fresh response has an ingress receipt");
+    let _ = receipt.wait().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    read(&mut source).await
+}
+
+/// A GET to `reset_after_data_peer` with `deliver_ingress_before_abort` set to
+/// `enabled`, through a uniplex `ClientSession` and through an owned session.
+fn reset_after_data_reads(enabled: bool) -> (Received, Received) {
+    let (uniplex, owned, peers) = run_on_worker(move |context| async move {
+        let session = SessionParams {
+            deliver_ingress_before_abort: enabled,
+            ..untimed()
+        };
+        let (address, peer) = reset_after_data_peer();
+        let client = HttpConnector::connect(
+            &context,
+            socket_address(address),
+            TIMEOUT,
+            plaintext(CodecProtocol::Http2),
+            session.clone(),
+            CancellationToken::never(),
+        )
+        .await
+        .expect("client session connects");
+        let (head, body) = Exchange::Fixed.request().await;
+        let reservation = reserve_uniplex(&client).await;
+        let response = client
+            .send_reserved_request_with_headers(head, body, reservation, CancellationToken::never())
+            .expect("request is committed");
+        let uniplex = read_after_ingress_ends(response.source).await;
+        client.close_when_idle().expect("client session drains");
+        client.wait_closed().await.expect("client session closes");
+
+        let (address, owned_peer) = reset_after_data_peer();
+        let owned = connect_owned(&context, address, CodecProtocol::Http2, session).await;
+        let (head, body) = Exchange::Fixed.request().await;
+        let response = reserve_owned(&owned)
+            .await
+            .submit(head, body, CancellationToken::never())
+            .await
+            .expect("request is committed");
+        let owned_read =
+            read_after_ingress_ends(response.source.into_source_owner().into_source_holder()).await;
+        close(&owned).await;
+        (uniplex, owned_read, [peer, owned_peer])
+    });
+    for peer in peers {
+        peer.join().expect("peer finishes");
+    }
+    (uniplex, owned)
+}
+
+/// `DIV-033` on an owned HTTP/2 session: with the option on, a response reset
+/// after part of it arrived yields the head and bytes received, then the
+/// reset's error, as through a `ClientSession`; with it off, both lose them.
+#[test]
+fn an_owned_http2_reset_after_data_yields_the_data_first_when_enabled() {
+    let (uniplex, owned) = reset_after_data_reads(true);
+    assert_eq!(
+        owned,
+        Received {
+            status: Some(200),
+            body: b"first".to_vec(),
+            error: Some(HttpErrorCode::CANCEL),
+            ..Received::default()
+        },
+        "enabled: the head and `first`, then CANCEL"
+    );
+    assert_eq!(owned, uniplex, "enabled: as through a ClientSession");
+    let (uniplex, owned) = reset_after_data_reads(false);
+    assert_eq!(
+        owned,
+        Received {
+            error: Some(HttpErrorCode::CANCEL),
+            ..Received::default()
+        },
+        "disabled: only CANCEL"
+    );
+    assert_eq!(owned, uniplex, "disabled: as through a ClientSession");
 }
 
 /// Cancelling an attachment's token cancels the attached session: its pending

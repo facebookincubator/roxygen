@@ -8590,3 +8590,587 @@ fn a_cancellation_racing_a_peer_refusal_follows_it() {
     ));
     assert_eq!(outcomes, expected);
 }
+
+/// The turns a session gets to apply an origin's bytes, and the end behind them, before a
+/// `DIV-033` comparison's reader starts.
+const LATE_READ_TURNS: usize = 1_000;
+
+async fn settle_late_read() {
+    for _ in 0..LATE_READ_TURNS {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// How the origin's response to a GET ends in the `DIV-033` comparisons.
+#[derive(Clone, Copy, Debug)]
+enum StreamEnd {
+    /// A head and `first`, then RST_STREAM(CANCEL).
+    ResetMidBody,
+    /// A head and `first`, then RST_STREAM(NO_ERROR), which a response that has not ended
+    /// reads as `CANCEL`.
+    NoErrorResetMidBody,
+    /// A head, then RST_STREAM(INTERNAL_ERROR).
+    ResetAfterHead,
+    /// A head and `first`, then EOF.
+    EofMidBody,
+    /// A head and `first`, then a failed read.
+    ReadErrorMidBody,
+    /// A head and `first`, then a DATA frame on stream 0, a connection error.
+    ConnectionErrorMidBody,
+    /// A head and `first` with END_STREAM, then RST_STREAM(NO_ERROR).
+    CompleteThenNoErrorReset,
+}
+
+impl StreamEnd {
+    const ALL: [Self; 7] = [
+        Self::ResetMidBody,
+        Self::NoErrorResetMidBody,
+        Self::ResetAfterHead,
+        Self::EofMidBody,
+        Self::ReadErrorMidBody,
+        Self::ConnectionErrorMidBody,
+        Self::CompleteThenNoErrorReset,
+    ];
+
+    /// The origin's reads: SETTINGS, the response released by `respond`, how it ends, and, on
+    /// a connection that stays open, an EOF released by `finish` once the reader is done.
+    fn reads(
+        self,
+        respond: &Arc<tokio::sync::Notify>,
+        finish: &Arc<tokio::sync::Notify>,
+    ) -> Vec<FixtureRead> {
+        let stream = StreamId::new(1);
+        let mut peer = Http2Codec::new(TransportDirection::Downstream);
+        let mut response = response_head(&mut peer, stream, 200, false, None);
+        if !matches!(self, Self::ResetAfterHead) {
+            response.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::Body {
+                    stream,
+                    body: queue(b"first"),
+                    padding: None,
+                    end_stream: matches!(self, Self::CompleteThenNoErrorReset),
+                },
+            ));
+        }
+        let reset = |peer: &mut Http2Codec, code| {
+            eligibility_frame(peer, EgressFrame::Reset { stream, code })
+        };
+        let open_end = FixtureRead::WaitDataEof(Arc::clone(finish), Vec::new());
+        let mut reads = vec![FixtureRead::Data(server_settings_bytes(1))];
+        match self {
+            Self::ResetMidBody => response.extend(reset(&mut peer, H2ErrorCode::CANCEL)),
+            Self::NoErrorResetMidBody | Self::CompleteThenNoErrorReset => {
+                response.extend(reset(&mut peer, H2ErrorCode::NO_ERROR));
+            }
+            Self::ResetAfterHead => response.extend(reset(&mut peer, H2ErrorCode::INTERNAL_ERROR)),
+            // DATA (type 0) with a one-byte payload on stream 0.
+            Self::ConnectionErrorMidBody => response.extend([0, 0, 1, 0, 0, 0, 0, 0, 0, b'x']),
+            Self::EofMidBody | Self::ReadErrorMidBody => {}
+        }
+        match self {
+            Self::EofMidBody => reads.push(FixtureRead::WaitDataEof(Arc::clone(respond), response)),
+            Self::ReadErrorMidBody => {
+                reads.push(FixtureRead::WaitData(Arc::clone(respond), response));
+                reads.push(FixtureRead::Error(HttpErrorCode::TRANSPORT_READ_ERROR));
+            }
+            _ => {
+                reads.push(FixtureRead::WaitData(Arc::clone(respond), response));
+                reads.push(open_end);
+            }
+        }
+        reads
+    }
+
+    /// What a late reader gets with `DIV-033` on: every event received before the end, then
+    /// the end's error.
+    fn delivered(self) -> LateRead {
+        let truncated = |error| LateRead {
+            status: Some(200),
+            body: b"first".to_vec(),
+            error: Some(error),
+            eom: false,
+        };
+        match self {
+            Self::ResetMidBody | Self::NoErrorResetMidBody => truncated(HttpErrorCode::CANCEL),
+            Self::ResetAfterHead => LateRead {
+                status: Some(200),
+                error: Some(HttpErrorCode::INTERNAL_ERROR),
+                ..LateRead::default()
+            },
+            Self::EofMidBody => truncated(HttpErrorCode::TRANSPORT_EOF),
+            Self::ReadErrorMidBody => truncated(HttpErrorCode::TRANSPORT_READ_ERROR),
+            Self::ConnectionErrorMidBody => truncated(HttpErrorCode::PROTOCOL_ERROR),
+            Self::CompleteThenNoErrorReset => LateRead {
+                status: Some(200),
+                body: b"first".to_vec(),
+                error: None,
+                eom: true,
+            },
+        }
+    }
+}
+
+/// What a reader that starts after a response ended got: the head's status, the body bytes,
+/// and the error that ended the read, or EOM.
+#[derive(Debug, Default, PartialEq)]
+struct LateRead {
+    status: Option<u16>,
+    body: Vec<u8>,
+    error: Option<HttpErrorCode>,
+    eom: bool,
+}
+
+async fn read_late(source: &mut HttpSourceHolder) -> LateRead {
+    let mut read = LateRead::default();
+    let head = match source.read_header_event().await {
+        Ok(head) => head,
+        Err(error) => {
+            read.error = Some(error.code());
+            return read;
+        }
+    };
+    read.status = head.headers().response_status();
+    let mut eom = head.eom();
+    while !eom {
+        match source.read_body_event(u32::MAX).await {
+            Ok(event) => {
+                if let Some(bytes) = event.as_body()
+                    && !bytes.is_empty()
+                {
+                    let length = bytes.chain_length();
+                    read.body
+                        .extend_from_slice(&bytes.coalesce(length).unwrap());
+                }
+                eom = event.eom();
+            }
+            Err(error) => {
+                read.error = Some(error.code());
+                break;
+            }
+        }
+    }
+    read.eom = eom;
+    read
+}
+
+/// Releases the origin's response once the request is committed, waits for the response's
+/// ingress to end and for the session to apply what followed, then reads it.
+async fn read_after_the_end(
+    mut source: HttpSourceHolder,
+    respond: &tokio::sync::Notify,
+    finish: &tokio::sync::Notify,
+) -> LateRead {
+    let receipt = source
+        .ingress_completion()
+        .expect("a fresh response has an ingress receipt");
+    respond.notify_one();
+    let _ = receipt.wait().await;
+    settle_late_read().await;
+    let read = read_late(&mut source).await;
+    drop(source);
+    finish.notify_one();
+    read
+}
+
+/// Runs a GET whose response ends as `end` through an owned upstream HTTP/2 session, or a
+/// `UniplexSession` HTTP/2 client, with `deliver_ingress_before_abort` set to `deliver`, and
+/// reads the response only once its ingress has ended.
+fn late_read(end: StreamEnd, owned: bool, deliver: bool) -> LateRead {
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let respond = Arc::new(tokio::sync::Notify::new());
+            let finish = Arc::new(tokio::sync::Notify::new());
+            let (transport, _wire) = FixtureTransport::new(end.reads(&respond, &finish));
+            let mut config = options(context.clone(), transport.clone());
+            config.io.deliver_ingress_before_abort = deliver;
+            let scenario = async {
+                if owned {
+                    let (session, handle) = OwnedH2UpstreamSession::new(config).unwrap();
+                    let submission = handle.reserve_request().unwrap().submit(
+                        request_head(HttpMethod::Get, true, None),
+                        HttpSourceHolder::empty(),
+                        CancellationToken::never(),
+                    );
+                    let (_run, read) = tokio::join!(session.run(), async {
+                        let (_, source, _request) = submission.await.unwrap().into_source_parts();
+                        read_after_the_end(source, &respond, &finish).await
+                    });
+                    read
+                } else {
+                    let (session, handle) = UniplexSession::new_http2(
+                        context,
+                        TransportDirection::Upstream,
+                        transport,
+                        None,
+                        config.io,
+                        config.http2,
+                    )
+                    .unwrap();
+                    let request = HttpFixedSource::make_get_request(b"/", None).unwrap();
+                    let (_run, read) = tokio::join!(session.run(), async {
+                        let response = handle
+                            .send_request(
+                                HttpSourceHolder::new(Box::new(request)),
+                                CancellationToken::never(),
+                            )
+                            .await
+                            .unwrap();
+                        read_after_the_end(response.source, &respond, &finish).await
+                    });
+                    read
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(10), scenario)
+                .await
+                .expect("the session's run and the late read end")
+        })
+    })
+}
+
+/// `DIV-033`: with the option on, a response whose stream or connection fails after part of
+/// it arrived yields the head and bytes received, then the error, as through a
+/// `UniplexSession` HTTP/2 client; with it off, both discard them.
+#[test]
+fn received_response_events_precede_a_stream_abort_as_uniplex() {
+    for end in StreamEnd::ALL {
+        let owned = late_read(end, true, true);
+        assert_eq!(
+            owned,
+            end.delivered(),
+            "{end:?}: with DIV-033 on, the received head and bytes precede the error"
+        );
+        assert_eq!(
+            owned,
+            late_read(end, false, true),
+            "{end:?}: the owned session matches Uniplex with DIV-033 on"
+        );
+        assert_eq!(
+            late_read(end, true, false),
+            late_read(end, false, false),
+            "{end:?}: the owned session matches Uniplex with DIV-033 off"
+        );
+    }
+}
+
+/// How the consumer ends an owned upstream HTTP/2 exchange in the `DIV-033` cancel tests, once
+/// its response's head and `first` are queued.
+#[derive(Clone, Copy, Debug)]
+enum H2Cancel {
+    /// `OwnedH2UpstreamRequest::cancel`, with the error `UniplexStreamAbort` selects.
+    Request,
+    /// The request's cancellation token.
+    Token,
+    /// `OwnedH2UpstreamHandle::cancel`: the connection, not the request.
+    Connection,
+}
+
+/// The origin's reads in the `DIV-033` cancel tests: SETTINGS, then a head and `first`, released
+/// by `respond`, of a response that does not end; the connection then stays open.
+fn unfinished_h2_response(respond: &Arc<tokio::sync::Notify>) -> Vec<FixtureRead> {
+    let stream = StreamId::new(1);
+    let mut peer = Http2Codec::new(TransportDirection::Downstream);
+    let mut response = response_head(&mut peer, stream, 200, false, None);
+    response.extend(eligibility_frame(
+        &mut peer,
+        EgressFrame::Body {
+            stream,
+            body: queue(b"first"),
+            padding: None,
+            end_stream: false,
+        },
+    ));
+    vec![
+        FixtureRead::Data(server_settings_bytes(1)),
+        FixtureRead::WaitData(Arc::clone(respond), response),
+    ]
+}
+
+/// Runs a GET through an owned upstream HTTP/2 session with `deliver_ingress_before_abort` set
+/// to `deliver`, ends it as `cancel` once the session has queued its response's head and
+/// `first`, and reads the response once the session has taken the cancel.
+fn owned_h2_cancel_read(cancel: H2Cancel, deliver: bool) -> LateRead {
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let respond = Arc::new(tokio::sync::Notify::new());
+            let (transport, _wire) = FixtureTransport::new(unfinished_h2_response(&respond));
+            let mut config = options(context, transport);
+            config.io.deliver_ingress_before_abort = deliver;
+            let (session, handle) = OwnedH2UpstreamSession::new(config).unwrap();
+            let token = CancellationSource::new();
+            let submission = handle.reserve_request().unwrap().submit(
+                request_head(HttpMethod::Get, true, None),
+                HttpSourceHolder::empty(),
+                token.token(),
+            );
+            let scenario = async {
+                let (_run, read) = tokio::join!(session.run(), async {
+                    let (_, mut source, request) = submission.await.unwrap().into_source_parts();
+                    let receipt = source
+                        .ingress_completion()
+                        .expect("a fresh response has an ingress receipt");
+                    respond.notify_one();
+                    complete_credit_wait(|| receipt.body_bytes_received() == 5).await;
+                    settle_late_read().await;
+                    match cancel {
+                        H2Cancel::Request => request.cancel(HttpError::with_message(
+                            HttpErrorCode::CANCEL,
+                            b"stream aborted",
+                        )),
+                        H2Cancel::Token => {
+                            token.request_cancellation();
+                        }
+                        H2Cancel::Connection => handle.cancel(),
+                    }
+                    settle_late_read().await;
+                    let read = read_late(&mut source).await;
+                    drop(source);
+                    handle.cancel();
+                    read
+                });
+                read
+            };
+            tokio::time::timeout(Duration::from_secs(10), scenario)
+                .await
+                .expect("the session's run and the read end")
+        })
+    })
+}
+
+/// As `owned_h2_cancel_read` for a `UniplexSession` HTTP/2 client whose consumer aborts the
+/// stream with `UniplexStreamAbort` (`DIV-023`).
+fn uniplex_h2_stream_abort_read(deliver: bool) -> LateRead {
+    use crate::experimental::UniplexResponseAbortExt;
+
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let respond = Arc::new(tokio::sync::Notify::new());
+            let (transport, _wire) = FixtureTransport::new(unfinished_h2_response(&respond));
+            let mut config = options(context.clone(), transport.clone());
+            config.io.deliver_ingress_before_abort = deliver;
+            let (session, handle) = UniplexSession::new_http2(
+                context,
+                TransportDirection::Upstream,
+                transport,
+                None,
+                config.io,
+                config.http2,
+            )
+            .unwrap();
+            let request = HttpFixedSource::make_get_request(b"/", None).unwrap();
+            let scenario = async {
+                let (_run, read) = tokio::join!(session.run(), async {
+                    let mut response = handle
+                        .send_request(
+                            HttpSourceHolder::new(Box::new(request)),
+                            CancellationToken::never(),
+                        )
+                        .await
+                        .unwrap();
+                    let receipt = response
+                        .source
+                        .ingress_completion()
+                        .expect("a fresh response has an ingress receipt");
+                    respond.notify_one();
+                    complete_credit_wait(|| receipt.body_bytes_received() == 5).await;
+                    settle_late_read().await;
+                    response
+                        .take_stream_abort()
+                        .expect("a live stream's abort")
+                        .abort();
+                    settle_late_read().await;
+                    let read = read_late(&mut response.source).await;
+                    drop(response);
+                    handle.close_when_idle().unwrap();
+                    read
+                });
+                read
+            };
+            tokio::time::timeout(Duration::from_secs(10), scenario)
+                .await
+                .expect("the session's run and the read end")
+        })
+    })
+}
+
+/// `DIV-033`: a cancel the request's consumer selects discards the response's received events,
+/// as a `UniplexStreamAbort` does, with the option on or off.
+#[test]
+fn an_owned_h2_request_cancel_discards_the_received_response_as_a_uniplex_stream_abort() {
+    for deliver in [true, false] {
+        let owned = owned_h2_cancel_read(H2Cancel::Request, deliver);
+        assert_eq!(
+            owned,
+            LateRead {
+                error: Some(HttpErrorCode::CANCEL),
+                ..LateRead::default()
+            },
+            "deliver {deliver}: the consumer's cancel discards the queued head and bytes"
+        );
+        assert_eq!(
+            owned,
+            uniplex_h2_stream_abort_read(deliver),
+            "deliver {deliver}: the owned reader gets what a Uniplex stream abort leaves"
+        );
+    }
+}
+
+/// `DIV-033`: the request's cancellation token is the consumer's cancel too, so it discards.
+#[test]
+fn an_owned_h2_request_token_cancel_discards_the_received_response() {
+    assert_eq!(
+        owned_h2_cancel_read(H2Cancel::Token, true),
+        LateRead {
+            error: Some(HttpErrorCode::CORO_CANCELLED),
+            ..LateRead::default()
+        }
+    );
+}
+
+/// `DIV-033`: the connection's cancel is no cancel of the request: as an ingress abort, it
+/// keeps the received head and bytes ahead of its error.
+#[test]
+fn an_owned_h2_connection_cancel_keeps_the_received_response() {
+    assert_eq!(
+        owned_h2_cancel_read(H2Cancel::Connection, true),
+        LateRead {
+            status: Some(200),
+            body: b"first".to_vec(),
+            error: Some(HttpErrorCode::CORO_CANCELLED),
+            eom: false,
+        }
+    );
+}
+
+/// What happens to the DATA a peer's reset left unread in the owned connection-credit test.
+#[derive(Clone, Copy, Debug)]
+enum KeptH2Data {
+    /// The reader takes it, then the reset's error.
+    Read,
+    /// The reader drops the response unread.
+    Dropped,
+}
+
+/// Connection credit returned on the wire, in WINDOW_UPDATEs on stream 0.
+fn connection_credit(wire: &RefCell<FixtureTransportState>) -> u64 {
+    decode_client_frames(&wire.borrow().writes.concat())
+        .window_updates
+        .iter()
+        .filter(|(stream, _)| stream.is_unspecified())
+        .map(|&(_, amount)| u64::from(amount))
+        .sum()
+}
+
+/// What the owned connection-credit test observed: the connection credit on the wire and the
+/// session's available capacity once the reset is applied, then the same once the reader has
+/// read or dropped the response; the stream credit; the body bytes read; and the read's error.
+type KeptCredit = ((u64, u32), (u64, u32), u64, usize, Option<HttpErrorCode>);
+
+/// The origin, which allows one stream, answers a GET with a head and 40,000 bytes of DATA, more
+/// than half the 65,535-byte connection window (the threshold at which connection credit is
+/// returned), then RST_STREAM(CANCEL).
+fn peer_reset_connection_credit(deliver: bool, kept: KeptH2Data) -> KeptCredit {
+    const UNREAD: usize = 40_000;
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let stream = StreamId::new(1);
+            let mut peer = Http2Codec::new(TransportDirection::Downstream);
+            let mut response = response_head(&mut peer, stream, 200, false, None);
+            for chunk in vec![b'k'; UNREAD].chunks(16_384) {
+                response.extend(eligibility_frame(
+                    &mut peer,
+                    EgressFrame::Body {
+                        stream,
+                        body: queue(chunk),
+                        padding: None,
+                        end_stream: false,
+                    },
+                ));
+            }
+            response.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::Reset {
+                    stream,
+                    code: H2ErrorCode::CANCEL,
+                },
+            ));
+            let respond = Arc::new(tokio::sync::Notify::new());
+            let (transport, wire) = FixtureTransport::new([
+                FixtureRead::Data(server_settings_bytes(1)),
+                FixtureRead::WaitData(Arc::clone(&respond), response),
+            ]);
+            let mut config = options(context, transport);
+            config.io.deliver_ingress_before_abort = deliver;
+            let (session, handle) = OwnedH2UpstreamSession::new(config).unwrap();
+            let submission = handle.reserve_request().unwrap().submit(
+                request_head(HttpMethod::Get, true, None),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            let scenario = async {
+                let (_run, outcome) = tokio::join!(session.run(), async {
+                    let (_, mut source, _request) = submission.await.unwrap().into_source_parts();
+                    let receipt = source
+                        .ingress_completion()
+                        .expect("a fresh response has an ingress receipt");
+                    respond.notify_one();
+                    let _ = receipt.wait().await;
+                    settle_late_read().await;
+                    let at_reset = (connection_credit(&wire), handle.available_capacity());
+                    let read = match kept {
+                        KeptH2Data::Read => read_late(&mut source).await,
+                        KeptH2Data::Dropped => LateRead::default(),
+                    };
+                    drop(source);
+                    complete_credit_wait(|| {
+                        connection_credit(&wire) >= UNREAD as u64
+                            && handle.available_capacity() == 1
+                    })
+                    .await;
+                    settle_late_read().await;
+                    let credit = (connection_credit(&wire), handle.available_capacity());
+                    let decoded = decode_client_frames(&wire.borrow().writes.concat());
+                    let stream_credit = decoded
+                        .window_updates
+                        .iter()
+                        .filter(|(id, _)| *id == stream)
+                        .map(|&(_, amount)| u64::from(amount))
+                        .sum();
+                    assert!(decoded.goaways.is_empty(), "the connection stays healthy");
+                    handle.cancel();
+                    (at_reset, credit, stream_credit, read.body.len(), read.error)
+                });
+                outcome
+            };
+            tokio::time::timeout(Duration::from_secs(10), scenario)
+                .await
+                .expect("the session's run and the read end")
+        })
+    })
+}
+
+/// By default a peer's reset discards the unread DATA and returns its connection credit at once.
+/// With `DIV-033` on, the kept DATA holds that credit until its reader takes it or drops the
+/// response, either of which returns all of it, as in `UniplexSession`
+/// (`h2_peer_reset_returns_connection_credit_for_kept_data_as_it_is_read`). Either way the stream
+/// keeps its admission slot until its source completes: once the reader has taken the error, and
+/// any kept events before it, or dropped the response. The reset stream sends no WINDOW_UPDATE of
+/// its own.
+#[test]
+fn an_owned_h2_peer_reset_holds_the_connection_credit_of_kept_data_until_it_is_read() {
+    assert_eq!(
+        peer_reset_connection_credit(false, KeptH2Data::Read),
+        ((40_000, 0), (40_000, 1), 0, 0, Some(HttpErrorCode::CANCEL)),
+        "default: the reset discards the DATA and returns its credit; the read takes the error"
+    );
+    assert_eq!(
+        peer_reset_connection_credit(true, KeptH2Data::Read),
+        ((0, 0), (40_000, 1), 0, 40_000, Some(HttpErrorCode::CANCEL)),
+        "kept DATA read: credit after the read, then the reset's error"
+    );
+    assert_eq!(
+        peer_reset_connection_credit(true, KeptH2Data::Dropped),
+        ((0, 0), (40_000, 1), 0, 0, None),
+        "kept DATA dropped unread: credit at the drop"
+    );
+}

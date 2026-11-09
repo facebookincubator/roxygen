@@ -23,19 +23,18 @@
 //!   `UniplexConfig`'s nonzero default;
 //! - `lifecycle_observer`, `session_stats`, `header_codec_stats`, and `ping_probes` with a
 //!   nonzero interval;
-//! - on HTTP/2, `deliver_ingress_before_abort` (`DIV-033`) and an `ENABLE_PUSH` setting
-//!   other than 0;
+//! - on HTTP/2, an `ENABLE_PUSH` setting other than 0;
 //! - TLS: `connect` dials plaintext TCP only, and `attach` refuses `non_abortive_close` on a
 //!   TLS transport, as `ClientSession::attach_transport` does.
 //!
 //! Honored as `ClientSession` honors them: on HTTP/2 `settings`,
 //! `max_concurrent_outgoing_streams`, `connection_flow_control`, `header_indexing_strategy`
 //! and all three session timers, except that `ENABLE_PUSH=0` joins settings that carry none,
-//! where `ClientSession` advertises 1; on HTTP/1.1 `deliver_ingress_before_abort` and
-//! `unframed_bodiless_http1_requests` (`DIV-036`); `non_abortive_close` (`DIV-038`) on the
-//! plaintext transport. HTTP/1.1 sessions read before committing a request, fail an
-//! unstarted request when the peer closes, and batch ready output, as uniplex sessions
-//! do (`DIV-035`, `DIV-034`). HTTP/1.1 sessions ignore the HTTP/2-only fields.
+//! where `ClientSession` advertises 1; on HTTP/1.1 `unframed_bodiless_http1_requests`
+//! (`DIV-036`); on both, `deliver_ingress_before_abort` (`DIV-033`), and `non_abortive_close`
+//! (`DIV-038`) on the plaintext transport. HTTP/1.1 sessions read before committing a
+//! request, fail an unstarted request when the peer closes, and batch ready output, as
+//! uniplex sessions do (`DIV-035`, `DIV-034`). HTTP/1.1 sessions ignore the HTTP/2-only fields.
 //!
 //! Dropping every handle leaves the connection open until `close_when_idle`, `cancel`, its
 //! peer or its worker's quiescence closes it, where dropping the last `ClientSession`
@@ -691,10 +690,6 @@ impl DriverConfig {
                 session
                     .ping_probes
                     .is_some_and(|probes| !probes.interval.is_zero()),
-            ),
-            (
-                "deliver_ingress_before_abort",
-                http2 && session.deliver_ingress_before_abort,
             ),
         ];
         if let Some((field, _)) = unsupported.iter().find(|(_, refused)| *refused) {

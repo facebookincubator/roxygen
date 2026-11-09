@@ -645,6 +645,12 @@ impl RequestStatus {
         })
     }
 
+    /// Whether a cause is selected for the request, as `selected_error` reports one, without
+    /// cloning it.
+    pub(super) fn cause_selected(&self) -> bool {
+        self.error.borrow().is_some() || self.cancellation.is_cancellation_requested()
+    }
+
     /// Whether the response's source already failed, as a stream read timeout fails it before
     /// the driver applies that failure.
     fn response_failed(&self) -> bool {
@@ -1125,6 +1131,12 @@ impl OwnedExchange for NoExchange {
 }
 
 /// Concrete upstream role over the same codec, pump, flow control and write fences.
+///
+/// It honors `UniplexConfig::deliver_ingress_before_abort` (`DIV-033`), which the downstream
+/// role refuses: a response whose stream or connection fails keeps its received head and body
+/// events for its reader, before the error, unless the request's consumer cancelled it (a
+/// cancel, a dropped submission or the cancellation token), which discards them, as
+/// `UniplexStreamAbort` does.
 pub struct OwnedH2UpstreamSession(Driver<UpstreamApplication, true>);
 
 impl OwnedH2UpstreamSession {
@@ -1305,6 +1317,9 @@ where
         })?;
         if head_response {
             source.skip_content_length_validation();
+        }
+        if self.connection.state.config.deliver_ingress_before_abort {
+            source.deliver_ingress_before_abort();
         }
         let producer = source.producer();
         // Untimed until the request's EOM is serialized, as in Proxygen (HTTPCoroSession.cpp:816)
