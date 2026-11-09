@@ -38,6 +38,10 @@ pub const DEFAULT_STREAM_WINDOW: u32 = 65_535;
 pub const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 100;
 
 /// Selects how the session derives its inbound per-stream flow-control window.
+///
+/// `UniplexSession` and `OwnedH2Session` both honour either mode, and both advertise a
+/// non-default `stream_receive_window` when no `INITIAL_WINDOW_SIZE` setting is configured.
+/// `OwnedH2Session` refuses a preserved window that differs from an advertised one.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum StreamReceiveWindowMode {
     /// Mirror the final advertised `INITIAL_WINDOW_SIZE` setting.

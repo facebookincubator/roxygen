@@ -99,6 +99,7 @@ pub use upstream::OwnedH2UpstreamSubmission;
 
 use crate::http2::DEFAULT_STREAM_WINDOW;
 use crate::http2::Http2SessionConfig;
+use crate::http2::StreamReceiveWindowMode;
 use crate::http2::protocol::CodecFailureContext;
 use crate::http2::protocol::CodecFailureDisposition;
 use crate::http2::protocol::PeerSetting;
@@ -1112,6 +1113,33 @@ const fn transport_direction<const UPSTREAM: bool>() -> TransportDirection {
     }
 }
 
+/// Resolves the stream receive window and whether it must be advertised, normalizing
+/// `configured` against the last advertised `INITIAL_WINDOW_SIZE` as `UniplexSession` does: a
+/// non-default window with no advertised value is advertised, and a mirrored advertised value
+/// replaces the default window. A preserved window must equal an advertised one, where
+/// `UniplexSession` keeps both, because a source window below the advertised one resets streams
+/// that stay within the peer's credit. `None` refuses the configuration.
+fn owned_receive_window(
+    mode: StreamReceiveWindowMode,
+    advertised: Option<u64>,
+    configured: u32,
+) -> Option<(u32, bool)> {
+    let representable = |window: u32| window != 0 && window <= i32::MAX as u32;
+    if !representable(configured) {
+        return None;
+    }
+    let Some(advertised) = advertised else {
+        return Some((configured, configured != DEFAULT_STREAM_WINDOW));
+    };
+    let advertised = u32::try_from(advertised)
+        .ok()
+        .filter(|window| representable(*window))?;
+    (configured == advertised
+        || (mode == StreamReceiveWindowMode::MirrorAdvertisedSettings
+            && configured == DEFAULT_STREAM_WINDOW))
+        .then_some((advertised, false))
+}
+
 impl<A: OwnedApplication> OwnedH2Session<A> {
     /// Creates the experimental opt-in session with its current untimed, unbounded-rate H2
     /// configuration.
@@ -1155,7 +1183,7 @@ where
             context,
             transport,
             io,
-            http2,
+            mut http2,
         } = options;
         let io = io.validate()?;
         let rates = http2.rate_limits;
@@ -1193,24 +1221,20 @@ where
                 b"owned H2 diagnostic configuration is not supported",
             ));
         }
-        let advertised_window = http2
-            .settings
-            .iter()
-            .rev()
-            .find_map(|setting| {
-                (setting.identifier == SettingsId::InitialWindowSize.as_u16())
-                    .then_some(setting.value)
-            })
-            .unwrap_or(u64::from(DEFAULT_STREAM_WINDOW));
-        if advertised_window != u64::from(http2.stream_receive_window)
-            || http2.stream_receive_window == 0
-            || http2.stream_receive_window > i32::MAX as u32
-        {
+        let advertised_window = http2.settings.iter().rev().find_map(|setting| {
+            (setting.identifier == SettingsId::InitialWindowSize.as_u16()).then_some(setting.value)
+        });
+        let Some((stream_receive_window, advertise_window)) = owned_receive_window(
+            http2.stream_receive_window_mode,
+            advertised_window,
+            http2.stream_receive_window,
+        ) else {
             return Err(failure(
                 HttpErrorCode::INVALID_STATE_TRANSITION,
                 b"owned H2 requires matching advertised and source receive windows",
             ));
-        }
+        };
+        http2.stream_receive_window = stream_receive_window;
         let incoming_limit = http2
             .settings
             .iter()
@@ -1261,6 +1285,12 @@ where
             if let Some(id) = SettingsId::from_u16(setting.identifier) {
                 codec.egress_settings_mut().set(id, setting.value);
             }
+        }
+        if advertise_window {
+            codec.egress_settings_mut().set(
+                SettingsId::InitialWindowSize,
+                u64::from(stream_receive_window),
+            );
         }
         if http2.double_goaway_drain {
             codec.enable_double_goaway_drain();
@@ -4111,5 +4141,58 @@ mod ready_queue_tests {
              `busy`, or a quiescent session could fold credit ahead of a pending read"
         );
         assert!(read.ready.load(Ordering::Acquire) && queue.busy.load(Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
+mod receive_window_tests {
+    use super::*;
+
+    #[test]
+    fn owned_receive_window_normalizes_like_uniplex_but_refuses_a_preserved_mismatch() {
+        use StreamReceiveWindowMode::MirrorAdvertisedSettings as Mirror;
+        use StreamReceiveWindowMode::PreserveConfigured as Preserve;
+
+        // (mode, last advertised INITIAL_WINDOW_SIZE, configured window, OwnedH2's window and
+        // whether it adds INITIAL_WINDOW_SIZE). The comment names UniplexSession's result.
+        let cases = [
+            // Uniplex: the default window, nothing added.
+            (Mirror, None, 65_535, Some((65_535, false))),
+            (Preserve, None, 65_535, Some((65_535, false))),
+            // Uniplex: the configured window, and it adds INITIAL_WINDOW_SIZE.
+            (Mirror, None, 262_144, Some((262_144, true))),
+            (Preserve, None, 262_144, Some((262_144, true))),
+            (
+                Preserve,
+                None,
+                i32::MAX as u32,
+                Some((i32::MAX as u32, true)),
+            ),
+            // Uniplex: the advertised window replaces the default one.
+            (Mirror, Some(131_072), 65_535, Some((131_072, false))),
+            // Uniplex: the matching window.
+            (Mirror, Some(131_072), 131_072, Some((131_072, false))),
+            (Preserve, Some(131_072), 131_072, Some((131_072, false))),
+            (Mirror, Some(65_535), 65_535, Some((65_535, false))),
+            // Uniplex: refused as conflicting with the advertised SETTINGS.
+            (Mirror, Some(131_072), 262_144, None),
+            // Uniplex: keeps both windows.
+            (Preserve, Some(131_072), 65_535, None),
+            (Preserve, Some(131_072), 262_144, None),
+            // Uniplex: refused as not representable.
+            (Mirror, Some(0), 65_535, None),
+            (Mirror, Some(1 << 31), 65_535, None),
+            (Mirror, Some(u64::from(u32::MAX) + 1), 65_535, None),
+            (Mirror, None, 0, None),
+            (Preserve, None, 1 << 31, None),
+            (Preserve, Some(131_072), 0, None),
+        ];
+        let mismatches: Vec<_> = cases
+            .into_iter()
+            .filter(|&(mode, advertised, configured, expected)| {
+                owned_receive_window(mode, advertised, configured) != expected
+            })
+            .collect();
+        assert!(mismatches.is_empty(), "mismatched cases: {mismatches:?}");
     }
 }

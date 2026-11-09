@@ -15,6 +15,7 @@ use roxygen_http2::hpack::HpackHeader;
 
 use super::*;
 use crate::external_host_tests::YieldMode;
+use crate::http2::StreamReceiveWindowMode;
 use crate::owned_h2::OwnedH2Application;
 use crate::owned_h2::OwnedH2Exchange;
 use crate::owned_h2::OwnedH2Handle;
@@ -1317,7 +1318,7 @@ fn unsupported_config_is_rejected_before_transport_or_application_work() {
                 match case {
                     0 => config.io.read_timeout = Duration::from_secs(1),
                     1 => config.http2.rate_limits.control_frames.maximum = 100,
-                    2 => config.http2.stream_receive_window = 4096,
+                    2 => config.http2.stream_receive_window = 0,
                     3 => state.borrow_mut().capability = ByteEventCapability::TransportEvents,
                     _ => unreachable!(),
                 }
@@ -5239,6 +5240,274 @@ fn owned_h2_padding_does_not_widen_the_connection_receive_window() {
                  goaways={:?}",
                 decoded.goaways
             );
+        })
+    });
+}
+
+/// What the server wrote, the request body bytes each POST's application read, and how the run
+/// ended, when the peer sends one POST per entry of `bodies`, each body in 16,384-byte DATA frames
+/// without END_STREAM, and then, once every POST has read its body or been reset, ends the
+/// POSTs, sends a GET and closes.
+async fn receive_window_case(
+    context: WorkerContext,
+    configure: impl FnOnce(&mut Http2SessionConfig),
+    bodies: &[usize],
+) -> (DecodedServerFrames, Vec<usize>, Result<(), HttpErrorCode>) {
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    let mut posts = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+    posts.extend(transcript_settings(&mut peer));
+    let mut streams = Vec::new();
+    for &length in bodies {
+        let (stream, headers) = padding_post_headers(&mut peer);
+        posts.extend(headers);
+        for offset in (0..length).step_by(16_384) {
+            posts.extend(padding_data(
+                &mut peer,
+                stream,
+                (length - offset).min(16_384),
+                None,
+            ));
+        }
+        streams.push(stream);
+    }
+    let mut finish: Vec<u8> = streams
+        .iter()
+        .flat_map(|&stream| {
+            eligibility_frame(
+                &mut peer,
+                EgressFrame::Body {
+                    stream,
+                    body: queue(&[]),
+                    padding: None,
+                    end_stream: true,
+                },
+            )
+        })
+        .collect();
+    let mut get = HttpMessage::new();
+    get.set_method(HttpMethod::Get).unwrap();
+    get.set_url(b"/after", false).unwrap();
+    get.set_http_version(1, 1);
+    get.headers_mut().set(HttpHeaderCode::Host, b"example.com");
+    let get_stream = peer.create_stream();
+    finish.extend(eligibility_frame(
+        &mut peer,
+        EgressFrame::Headers {
+            stream: get_stream,
+            message: &get,
+            end_stream: true,
+            extra_headers: None,
+        },
+    ));
+    let finish_gate = Arc::new(tokio::sync::Notify::new());
+    let (transport, state) = FixtureTransport::new([
+        FixtureRead::Data(posts),
+        FixtureRead::WaitDataEof(Arc::clone(&finish_gate), finish),
+    ]);
+    let requests = bodies.len() + 1;
+    let (application, probes) = Application::new(vec![Reply::Body(0); requests]);
+    let mut config = options(context, transport);
+    config.http2.connection_receive_window = 1 << 20;
+    configure(&mut config.http2);
+    let (session, _handle) = OwnedH2Session::new(application, config).unwrap();
+    let script = async {
+        let settled = || {
+            let resets =
+                decode_server_frames_with_requests(&state.borrow().writes.concat(), requests)
+                    .resets;
+            let probes = probes.borrow();
+            probes.len() == bodies.len()
+                && streams.iter().zip(bodies).zip(probes.iter()).all(
+                    |((stream, &length), probe)| {
+                        probe.request_bytes.get() == length
+                            || resets.iter().any(|(reset, _)| reset == stream)
+                    },
+                )
+        };
+        let _ = tokio::time::timeout(TRANSCRIPT_WAIT, complete_credit_wait(settled)).await;
+        settle_turns(16).await;
+        finish_gate.notify_one();
+    };
+    let (run, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(session.run(), script)
+    })
+    .await
+    .expect("the receive-window fixture finishes at EOF");
+    let written = decode_server_frames_with_requests(&state.borrow().writes.concat(), requests);
+    let consumed = probes
+        .borrow()
+        .iter()
+        .map(|probe| probe.request_bytes.get())
+        .collect();
+    (
+        written,
+        consumed,
+        run.map(drop).map_err(|error| error.code()),
+    )
+}
+
+/// The `INITIAL_WINDOW_SIZE` values of the server's SETTINGS, in order.
+fn advertised_windows(written: &DecodedServerFrames) -> Vec<u64> {
+    written
+        .settings
+        .iter()
+        .filter(|setting| setting.identifier == SettingsId::InitialWindowSize.as_u16())
+        .map(|setting| setting.value)
+        .collect()
+}
+
+fn sorted_statuses(written: &DecodedServerFrames) -> Vec<(StreamId, u16)> {
+    let mut statuses = written.header_statuses.clone();
+    statuses.sort_unstable();
+    statuses
+}
+
+#[test]
+fn preserved_stream_window_is_advertised_and_enforced() {
+    let (written, consumed, run) = run_on_worker(|context| {
+        Box::pin(receive_window_case(
+            context,
+            |http2| {
+                http2.stream_receive_window = 262_144;
+                http2.stream_receive_window_mode = StreamReceiveWindowMode::PreserveConfigured;
+            },
+            &[200_000, 262_145],
+        ))
+    });
+    assert_eq!(
+        advertised_windows(&written),
+        [262_144],
+        "the configured window is advertised once"
+    );
+    assert_eq!(
+        written.settings.last().map(|setting| setting.identifier),
+        Some(SettingsId::InitialWindowSize.as_u16()),
+        "it follows the configured settings, as UniplexSession appends it"
+    );
+    assert_eq!(
+        consumed[0], 200_000,
+        "a body above the default window stays within the advertised one"
+    );
+    assert!(
+        written
+            .window_updates
+            .iter()
+            .any(|&(stream, amount)| stream == StreamId::new(1) && amount >= 131_072),
+        "consuming more than half the window returns stream credit: {:?}",
+        written.window_updates
+    );
+    assert_eq!(
+        written.resets,
+        [(StreamId::new(3), H2ErrorCode::FLOW_CONTROL_ERROR)],
+        "one byte beyond the advertised window resets only that stream"
+    );
+    assert_eq!(
+        sorted_statuses(&written),
+        [(StreamId::new(1), 200), (StreamId::new(5), 200)],
+        "the connection keeps serving after the reset"
+    );
+    assert!(written.goaways.is_empty());
+    assert_eq!(run, Ok(()));
+}
+
+#[test]
+fn mirrored_advertised_window_replaces_the_default_source_window() {
+    let (written, consumed, run) = run_on_worker(|context| {
+        Box::pin(receive_window_case(
+            context,
+            |http2| {
+                http2.settings = vec![CodecSetting {
+                    identifier: SettingsId::InitialWindowSize.as_u16(),
+                    value: 131_072,
+                }];
+                assert_eq!(
+                    http2.stream_receive_window_mode,
+                    StreamReceiveWindowMode::MirrorAdvertisedSettings
+                );
+                assert_eq!(http2.stream_receive_window, 65_535);
+            },
+            &[131_072, 131_073],
+        ))
+    });
+    assert_eq!(advertised_windows(&written), [131_072]);
+    assert_eq!(
+        consumed[0], 131_072,
+        "the advertised window is the source window"
+    );
+    assert_eq!(
+        written.resets,
+        [(StreamId::new(3), H2ErrorCode::FLOW_CONTROL_ERROR)]
+    );
+    assert_eq!(
+        sorted_statuses(&written),
+        [(StreamId::new(1), 200), (StreamId::new(5), 200)]
+    );
+    assert_eq!(run, Ok(()));
+}
+
+#[test]
+fn default_config_advertises_no_initial_window() {
+    let (written, consumed, run) =
+        run_on_worker(|context| Box::pin(receive_window_case(context, |_| {}, &[65_535, 65_536])));
+    assert!(
+        advertised_windows(&written).is_empty(),
+        "the default 65,535-byte window needs no setting: {:?}",
+        written.settings
+    );
+    assert_eq!(consumed[0], 65_535);
+    assert_eq!(
+        written.resets,
+        [(StreamId::new(3), H2ErrorCode::FLOW_CONTROL_ERROR)]
+    );
+    assert_eq!(
+        sorted_statuses(&written),
+        [(StreamId::new(1), 200), (StreamId::new(5), 200)]
+    );
+    assert_eq!(run, Ok(()));
+}
+
+#[test]
+fn conflicting_receive_windows_are_refused() {
+    use StreamReceiveWindowMode::MirrorAdvertisedSettings as Mirror;
+    use StreamReceiveWindowMode::PreserveConfigured as Preserve;
+
+    run_on_worker(|context| {
+        Box::pin(async move {
+            // (mode, advertised INITIAL_WINDOW_SIZE, configured window)
+            let refused = [
+                (Preserve, Some(131_072), 65_535),
+                (Preserve, Some(131_072), 262_144),
+                (Mirror, Some(131_072), 262_144),
+                (Mirror, Some(0), 65_535),
+                (Mirror, Some(1 << 31), 65_535),
+                (Mirror, Some(u64::from(u32::MAX) + 1), 65_535),
+                (Mirror, None, 0),
+                (Preserve, None, 1 << 31),
+            ];
+            for (mode, advertised, configured) in refused {
+                let (transport, state) = FixtureTransport::new([]);
+                let mut config = options(context.clone(), transport);
+                config.http2.stream_receive_window_mode = mode;
+                config.http2.stream_receive_window = configured;
+                config.http2.settings = advertised
+                    .map(|value| CodecSetting {
+                        identifier: SettingsId::InitialWindowSize.as_u16(),
+                        value,
+                    })
+                    .into_iter()
+                    .collect();
+                let (application, probes) = Application::new(vec![]);
+                let Err(error) = OwnedH2Session::new(application, config) else {
+                    panic!("{mode:?} {advertised:?} {configured} was accepted");
+                };
+                assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+                assert_eq!(
+                    error.message(),
+                    b"owned H2 requires matching advertised and source receive windows"
+                );
+                assert!(probes.borrow().is_empty());
+                assert!(state.borrow().writes.is_empty());
+            }
         })
     });
 }
