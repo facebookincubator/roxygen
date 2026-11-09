@@ -157,6 +157,12 @@ impl OwnedH2UpstreamHandle {
         }
     }
 
+    /// Reservations and streams holding an admission slot: what `available_capacity` subtracts
+    /// from the stream limit.
+    pub fn admitted_streams(&self) -> u32 {
+        self.admission.used.get()
+    }
+
     pub fn reserve_request(&self) -> Result<OwnedH2UpstreamReservation, HttpError> {
         if self.available_capacity() == 0
             || self.control.complete.get()

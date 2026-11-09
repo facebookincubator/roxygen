@@ -37,8 +37,26 @@ use crate::pool::start_acquisition;
 /// idle-sweep semantics (`DIV-032`), shared with it. An HTTP/1.1 pool keeps its
 /// sessions that can take an exchange in a selection index, so that an
 /// acquisition that finds one, and a release, make no pass over the pool's
-/// sessions however many it holds; the selection is the scheduler's.
+/// sessions however many it holds; the selection is the scheduler's, or, opted into with
+/// [`OwnedHttpSessionPool::set_session_selection`], the least loaded session's (`DIV-048`).
 pub struct OwnedHttpSessionPool(HttpSessionPool);
+
+/// Which session an [`OwnedHttpSessionPool`]'s acquisition takes among its established
+/// sessions that can take an exchange (`DIV-048`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OwnedSessionSelection {
+    /// `HttpSessionPool`'s order: the first session in the pool's order that has an exchange
+    /// and can take another, else an idle session in `PoolParams::reuse_order` (`DIV-032`), so
+    /// that exchanges pack onto the first session with room.
+    #[default]
+    FirstAvailable,
+    /// The session with the fewest exchanges in flight: on HTTP/2 the fewest streams reserved
+    /// or open, so idle sessions first; on HTTP/1.1, whose sessions take one exchange, an idle
+    /// session before one whose free slot its driver has not settled yet. Equally loaded
+    /// sessions are taken in `FirstAvailable`'s order: a busy one first, in the pool's order,
+    /// then an idle one in `PoolParams::reuse_order`.
+    LeastLoaded,
+}
 
 /// One reservation on the session an acquisition selected.
 pub struct OwnedGetSessionResult {
@@ -150,6 +168,14 @@ impl OwnedHttpSessionPool {
             state: Rc::clone(self.0.state()),
             cancellation,
         })
+    }
+
+    /// Selects among the pool's established sessions as `selection` says (`DIV-048`), from
+    /// the next acquisition step on; [`OwnedSessionSelection::FirstAvailable`] until set.
+    /// Refused with [`PoolError::Draining`] once the pool drains, as `HttpSessionPool`'s
+    /// setters are.
+    pub fn set_session_selection(&self, selection: OwnedSessionSelection) -> Result<(), PoolError> {
+        self.0.set_session_selection(selection)
     }
 
     pub fn session_count(&self) -> usize {

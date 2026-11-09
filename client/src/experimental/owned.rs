@@ -47,9 +47,11 @@
 //! events do. Its acquisitions take a selected session on their first poll with no
 //! allocation and no clock read for their deadline ([`OwnedSessionAcquisition`]), and one
 //! that would dial waits instead for an HTTP/1.1 session whose driver returns its slot at
-//! its next turn. A reservation taken on a pooled session's handle reaches its pool as one
-//! the pool's acquisition made, and the admission the pool closes on a session it retires or
-//! drains refuses the handle's reservations, as a `ClientSession`'s draining flag does.
+//! its next turn. [`OwnedHttpSessionPool::set_session_selection`] opts into taking the
+//! least loaded of the sessions that can take an exchange (`DIV-048`). A reservation taken
+//! on a pooled session's handle reaches its pool as one the pool's acquisition made, and the
+//! admission the pool closes on a session it retires or drains refuses the handle's
+//! reservations, as a `ClientSession`'s draining flag does.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -133,6 +135,7 @@ mod pool;
 pub use pool::OwnedGetSessionResult;
 pub use pool::OwnedHttpSessionPool;
 pub use pool::OwnedSessionAcquisition;
+pub use pool::OwnedSessionSelection;
 
 /// HTTP/2 `SETTINGS_ENABLE_PUSH`.
 const ENABLE_PUSH: u16 = 2;
@@ -590,6 +593,17 @@ impl OwnedClientSession {
     /// upload or a write is outstanding.
     pub(crate) fn admitted_transactions(&self) -> u32 {
         u32::from(!self.is_idle())
+    }
+
+    /// The exchanges in flight that a least-loaded pool compares (`DIV-048`): on HTTP/2 the
+    /// streams its driver admitted, reserved or open; on HTTP/1.1, whose one slot is free
+    /// whenever the session can take an exchange, `admitted_transactions`, so that an idle
+    /// session comes first.
+    pub(crate) fn in_flight(&self) -> u32 {
+        match &self.inner.upstream {
+            Upstream::Http1(_) => self.admitted_transactions(),
+            Upstream::Http2(handle) => handle.admitted_streams(),
+        }
     }
 
     /// Refuses further pool reservations ahead of `initiate_drain`.

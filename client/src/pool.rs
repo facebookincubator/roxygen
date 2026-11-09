@@ -59,6 +59,7 @@ use crate::connector::ResolvedHost;
 use crate::connector::SessionConnector;
 use crate::connector::SessionParams;
 use crate::experimental::owned::OwnedClientSession;
+use crate::experimental::owned::OwnedSessionSelection;
 use crate::experimental::owned::worker_admits;
 use crate::pool::session_list::Class;
 use crate::pool::session_list::Linked;
@@ -633,6 +634,15 @@ impl PooledSession {
         }
     }
 
+    /// The exchanges in flight that least-loaded selection compares (`DIV-048`): an owned
+    /// session's `in_flight`; a uniplex session's reserved and active transactions.
+    fn load(&self) -> u32 {
+        match self {
+            Self::Uniplex(session) => session.admitted_transactions(),
+            Self::Owned(session) => session.in_flight(),
+        }
+    }
+
     fn close_admission(&self) {
         match self {
             Self::Uniplex(session) => session.close_admission(),
@@ -1118,6 +1128,8 @@ pub(crate) struct PoolState {
     observer: Option<Rc<dyn PoolObserver>>,
     idle_observer: Option<Rc<dyn IdleSessionObserver>>,
     sessions: SessionList<SessionEntry>,
+    /// An owned pool's selection among its established sessions (`DIV-048`).
+    selection: OwnedSessionSelection,
     index: SessionIndex,
     idle_sessions: usize,
     waiters: VecDeque<Rc<Waiter>>,
@@ -1312,31 +1324,41 @@ impl PoolState {
     /// Selects through the index the session that `next_step`'s passes would select (S6.9):
     /// the first busy session that can take an exchange, else the idle session at the back
     /// (most recently used) or front (least recently used) of the idle list, retiring each
-    /// expired one it meets on an interval, as `select_idle_session` does. A member that can
-    /// no longer take an exchange leaves its list; one whose class changed without an event
-    /// falls back to the passes and unsettles the index.
+    /// expired one it meets on an interval, as `select_idle_session` does; least loaded
+    /// (`DIV-048`), as `indexed_least_loaded_session` does. A member that can no longer take an
+    /// exchange leaves its list; one whose class changed without an event falls back to the
+    /// passes and unsettles the index.
     fn select_indexed(
         &mut self,
         checkout_at: Option<Instant>,
         retired: &mut RetiredSessions,
     ) -> Option<SessionSlot> {
-        let selected = match self.indexed_busy_session() {
-            Ok(None) => self.indexed_idle_session(checkout_at, retired),
-            Err(IndexMismatch) => {
-                self.unsettle_index();
-                self.count_scan();
-                return self
-                    .sessions
-                    .find(|entry| {
-                        !entry.session.is_idle() && entry.session.supports_more_transactions()
-                    })
-                    .or_else(|| self.select_idle_session(checkout_at, retired));
+        let least_loaded = self.selection == OwnedSessionSelection::LeastLoaded;
+        let selected = if least_loaded {
+            self.indexed_least_loaded_session(checkout_at, retired)
+        } else {
+            match self.indexed_busy_session() {
+                Ok(None) => self.indexed_idle_session(checkout_at, retired),
+                Err(IndexMismatch) => {
+                    self.unsettle_index();
+                    self.count_scan();
+                    return self
+                        .sessions
+                        .find(|entry| {
+                            !entry.session.is_idle() && entry.session.supports_more_transactions()
+                        })
+                        .or_else(|| self.select_idle_session(checkout_at, retired));
+                }
+                busy => busy,
             }
-            busy => busy,
         };
         let Ok(selected) = selected else {
             self.unsettle_index();
-            return self.select_idle_session(checkout_at, retired);
+            return if least_loaded {
+                self.select_least_loaded(checkout_at, retired)
+            } else {
+                self.select_idle_session(checkout_at, retired)
+            };
         };
         #[cfg(debug_assertions)]
         assert_eq!(
@@ -1359,6 +1381,41 @@ impl PoolState {
             }
         }
         Ok(None)
+    }
+
+    /// `select_least_loaded` through the index (`DIV-048`): the first busy list member with no
+    /// exchange in flight; else the idle list's session in reuse order, as
+    /// `indexed_idle_session` takes it; else, all idle candidates retired or none, the first
+    /// busy member of the fewest exchanges in flight. Busy members of an indexed (HTTP/1.1)
+    /// pool are sessions not yet reserved or whose driver has not settled their free slot, so
+    /// the busy list is short.
+    fn indexed_least_loaded_session(
+        &mut self,
+        checkout_at: Option<Instant>,
+        retired: &mut RetiredSessions,
+    ) -> Result<Option<SessionSlot>, IndexMismatch> {
+        let mut least: Option<(u32, SessionSlot)> = None;
+        let mut cursor = self.sessions.class_front(Class::Busy);
+        while let Some(slot) = cursor {
+            cursor = self.sessions.class_next(slot);
+            match Self::class_of(self.sessions.get(slot)) {
+                Some(Class::Busy) => {
+                    let load = self.sessions.get(slot).session.load();
+                    if load == 0 {
+                        return Ok(Some(slot));
+                    }
+                    if least.is_none_or(|(minimum, _)| load < minimum) {
+                        least = Some((load, slot));
+                    }
+                }
+                Some(Class::Idle) => return Err(IndexMismatch),
+                // It takes an exchange again only once its slot returns, which indexes it.
+                None => self.sessions.set_class(slot, None),
+            }
+        }
+        Ok(self
+            .indexed_idle_session(checkout_at, retired)?
+            .or(least.map(|(_, slot)| slot)))
     }
 
     fn indexed_idle_session(
@@ -1404,6 +1461,9 @@ impl PoolState {
     /// The selection of `next_step`'s passes, without their retirements or counts.
     #[cfg(debug_assertions)]
     fn reference_selection(&self) -> Option<SessionSlot> {
+        if self.selection == OwnedSessionSelection::LeastLoaded {
+            return self.least_loaded_entry();
+        }
         self.sessions
             .find(|entry| !entry.session.is_idle() && entry.session.supports_more_transactions())
             .or_else(|| match self.pool_params.reuse_order {
@@ -1882,6 +1942,60 @@ impl PoolState {
             })
             .max_by_key(|(key, _)| *key)
             .map(|(_, slot)| slot)
+    }
+
+    /// The session a least-loaded acquisition takes (`DIV-048`), as `least_loaded_entry`
+    /// finds it. On an interval (`checkout_at`), an idle candidate that has expired is retired
+    /// into `retired`, its admission closed, as `select_idle_session` retires one, and the
+    /// search runs again over the sessions left.
+    fn select_least_loaded(
+        &mut self,
+        checkout_at: Option<Instant>,
+        retired: &mut RetiredSessions,
+    ) -> Option<SessionSlot> {
+        let timeout = self.pool_params.idle_timeout;
+        let sweep = self.pool_params.idle_sweep;
+        loop {
+            self.count_scan();
+            let slot = self.least_loaded_entry()?;
+            let entry = self.sessions.get(slot);
+            if !entry.session.is_idle()
+                || !checkout_at.is_some_and(|now| entry.idle_expired(now, timeout, sweep))
+            {
+                return Some(slot);
+            }
+            let entry = self.sessions.remove(slot);
+            entry.session.close_admission();
+            retired.push(entry.session);
+        }
+    }
+
+    /// Of the sessions that can take an exchange, one with the fewest exchanges in flight
+    /// (`PooledSession::load`), taken in the passes' order (`DIV-048`): the first busy one in
+    /// the pool's order, else an idle one in reuse order. An idle session has none in flight,
+    /// so when no busy session is that lightly loaded, every candidate is idle.
+    fn least_loaded_entry(&self) -> Option<SessionSlot> {
+        let (_, busy) = self
+            .sessions
+            .entries()
+            .filter(|(_, entry)| entry.session.supports_more_transactions())
+            .fold(None, |least, (slot, entry)| {
+                let load = entry.session.load();
+                let busy = (!entry.session.is_idle()).then_some(slot);
+                match least {
+                    Some((minimum, first)) if minimum < load => Some((minimum, first)),
+                    Some((minimum, Some(first))) if minimum == load => Some((minimum, Some(first))),
+                    _ => Some((load, busy)),
+                }
+            })?;
+        busy.or_else(|| match self.pool_params.reuse_order {
+            SessionReuseOrder::LeastRecentlyUsed => None,
+            SessionReuseOrder::MostRecentlyUsed => self.most_recently_idle_entry(),
+        })
+        .or_else(|| {
+            self.sessions
+                .find(|entry| entry.session.is_idle() && entry.session.supports_more_transactions())
+        })
     }
 }
 
@@ -2497,6 +2611,7 @@ impl HttpSessionPool {
                 observer: None,
                 idle_observer: None,
                 sessions: SessionList::new(),
+                selection: OwnedSessionSelection::FirstAvailable,
                 index: SessionIndex::new(indexed),
                 idle_sessions: 0,
                 waiters: VecDeque::new(),
@@ -2604,6 +2719,17 @@ impl HttpSessionPool {
         let mut state = self.state.borrow_mut();
         ensure_pool_open(&state)?;
         state.pool_params.max_age = maximum;
+        Ok(())
+    }
+
+    /// An owned pool's selection among its established sessions (`DIV-048`).
+    pub(crate) fn set_session_selection(
+        &self,
+        selection: OwnedSessionSelection,
+    ) -> Result<(), PoolError> {
+        let mut state = self.state.borrow_mut();
+        ensure_pool_open(&state)?;
+        state.selection = selection;
         Ok(())
     }
 
@@ -3691,15 +3817,17 @@ fn next_step(
                     expired.push(entry.session);
                 }
             }
-            if admitting {
+            if !admitting {
+                None
+            } else if pool.selection == OwnedSessionSelection::LeastLoaded {
+                pool.select_least_loaded(checkout_at, &mut idle_expired)
+            } else {
                 pool.count_scan();
                 pool.sessions
                     .find(|entry| {
                         !entry.session.is_idle() && entry.session.supports_more_transactions()
                     })
                     .or_else(|| pool.select_idle_session(checkout_at, &mut idle_expired))
-            } else {
-                None
             }
         };
         Ok(if let Some(slot) = selected {

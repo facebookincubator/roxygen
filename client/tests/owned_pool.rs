@@ -66,6 +66,7 @@ use crate::experimental::owned::OwnedClientResponse;
 use crate::experimental::owned::OwnedClientSession;
 use crate::experimental::owned::OwnedGetSessionResult;
 use crate::experimental::owned::OwnedHttpSessionPool;
+use crate::experimental::owned::OwnedSessionSelection;
 use crate::experimental::owned::worker_admission_checks_for_test;
 use crate::pool::GetSessionResult;
 use crate::pool::HttpSessionPool;
@@ -1122,7 +1123,11 @@ fn all_distinct<T: PartialEq>(items: &[T]) -> bool {
 /// drain closes its admission, and the waiter then starts a second dial beside
 /// the first, as in `aged_session_scenario`; whether the next exchange takes
 /// that unused session or dials again depends on task timing.
-fn one_nanosecond_idle_scenario(owned: bool, protocol: CodecProtocol) -> (String, bool) {
+fn one_nanosecond_idle_scenario(
+    owned: bool,
+    protocol: CodecProtocol,
+    selection: OwnedSessionSelection,
+) -> (String, bool) {
     let origin = Origin::start(protocol);
     let address = origin.address;
     run_on_worker(move |context| async move {
@@ -1135,6 +1140,8 @@ fn one_nanosecond_idle_scenario(owned: bool, protocol: CodecProtocol) -> (String
         let mut ends = Vec::new();
         let distinct = if owned {
             let pool = idle_pool(&context, address, protocol, params);
+            pool.set_session_selection(selection)
+                .expect("an open pool takes a selection");
             let mut served = Vec::new();
             for _ in 0..3 {
                 match pool
@@ -1190,10 +1197,29 @@ fn a_freshly_dialed_session_serves_its_dialing_acquisition_under_a_1_ns_idle_tim
     for protocol in PROTOCOLS {
         let served = || ("[Ok(()), Ok(()), Ok(())]".to_owned(), true);
         assert_eq!(
-            [true, false].map(|owned| one_nanosecond_idle_scenario(owned, protocol)),
+            [true, false].map(|owned| one_nanosecond_idle_scenario(
+                owned,
+                protocol,
+                OwnedSessionSelection::FirstAvailable
+            )),
             [served(), served()],
             "{protocol:?}: every exchange is served, each on a connection no earlier exchange \
              used, through an owned pool and an `HttpSessionPool`"
+        );
+    }
+}
+
+/// Least-loaded selection (`DIV-048`) keeps that: a session the pool dialed has no exchange in
+/// flight, as an idle one has, and of equally loaded sessions a busy one, which the dialed
+/// session counts as, is taken first.
+#[test]
+fn a_freshly_dialed_session_serves_its_dialing_acquisition_under_least_loaded_selection() {
+    for protocol in PROTOCOLS {
+        assert_eq!(
+            one_nanosecond_idle_scenario(true, protocol, OwnedSessionSelection::LeastLoaded),
+            ("[Ok(()), Ok(()), Ok(())]".to_owned(), true),
+            "{protocol:?}: every exchange is served, each on a connection no earlier exchange \
+             used"
         );
     }
 }
@@ -2505,13 +2531,16 @@ async fn unary_round(pool: &OwnedHttpSessionPool, streams: usize) {
 
 /// `bench/h2/client-arms.md` §A's K=64 shape, in unary rounds: once 64 sessions are open, each
 /// round's 64 acquisitions select an idle session and its 64 releases return one with no pass
-/// over the pool's sessions, under the router's parameters, both reuse orders, both sweeps and a
-/// maximum age. No acquisition searches for a returning session or dials.
+/// over the pool's sessions, under the router's parameters, both reuse orders, both sweeps, a
+/// maximum age and least-loaded selection (`DIV-048`). No acquisition searches for a returning
+/// session or dials.
 #[test]
 fn k64_unary_rounds_select_and_release_with_no_pool_wide_pass() {
+    let first = OwnedSessionSelection::FirstAvailable;
+    let least_loaded = OwnedSessionSelection::LeastLoaded;
     let configs = [
-        ("router", router_params(u32::MAX)),
-        ("least recently used", params(u32::MAX)),
+        ("router", router_params(u32::MAX), first),
+        ("least recently used", params(u32::MAX), first),
         (
             "least recently used, retired at expiry",
             idle_params(
@@ -2520,6 +2549,7 @@ fn k64_unary_rounds_select_and_release_with_no_pool_wide_pass() {
                 Duration::from_secs(90),
                 IdleSweep::AtExpiry,
             ),
+            first,
         ),
         (
             "most recently used, retired at expiry",
@@ -2529,6 +2559,7 @@ fn k64_unary_rounds_select_and_release_with_no_pool_wide_pass() {
                 Duration::from_secs(90),
                 IdleSweep::AtExpiry,
             ),
+            first,
         ),
         (
             "router, with a maximum age",
@@ -2536,13 +2567,26 @@ fn k64_unary_rounds_select_and_release_with_no_pool_wide_pass() {
                 max_age: Duration::from_secs(600),
                 ..router_params(u32::MAX)
             },
+            first,
+        ),
+        (
+            "router, least loaded",
+            router_params(u32::MAX),
+            least_loaded,
+        ),
+        (
+            "least recently used, least loaded",
+            params(u32::MAX),
+            least_loaded,
         ),
     ];
-    for (name, params) in configs {
+    for (name, params, selection) in configs {
         let origin = Origin::start(CodecProtocol::Http11);
         let address = origin.address;
         let counts = run_on_worker(move |context| async move {
             let pool = idle_pool(&context, address, CodecProtocol::Http11, params);
+            pool.set_session_selection(selection)
+                .expect("an open pool takes a selection");
             unary_round(&pool, K64).await;
             let scans = pool.pool_scans_for_test();
             let claims = pool.claim_scans_for_test();
@@ -2877,13 +2921,16 @@ async fn pool_schedule(
 
 /// The index selects as the pool's passes do: `pool_schedule` makes the same picks, dials as
 /// often and leaves as many sessions open on a pool selecting through its index as on one whose
-/// passes are forced, under each reuse order and sweep.
+/// passes are forced, under each reuse order and sweep, and under least-loaded selection
+/// (`DIV-048`).
 #[test]
 fn the_index_selects_as_the_pool_s_passes_do() {
     let ninety = Duration::from_secs(90);
+    let first = OwnedSessionSelection::FirstAvailable;
+    let least_loaded = OwnedSessionSelection::LeastLoaded;
     let configs = [
-        ("router", router_params(8), Some(ninety)),
-        ("least recently used", params(8), None),
+        ("router", router_params(8), Some(ninety), first),
+        ("least recently used", params(8), None, first),
         (
             "most recently used, at expiry",
             idle_params(
@@ -2893,6 +2940,7 @@ fn the_index_selects_as_the_pool_s_passes_do() {
                 IdleSweep::AtExpiry,
             ),
             None,
+            first,
         ),
         (
             "least recently used, on an interval",
@@ -2903,14 +2951,29 @@ fn the_index_selects_as_the_pool_s_passes_do() {
                 IdleSweep::Interval,
             ),
             Some(ninety),
+            first,
+        ),
+        (
+            "router, least loaded",
+            router_params(8),
+            Some(ninety),
+            least_loaded,
+        ),
+        (
+            "least recently used, least loaded",
+            params(8),
+            None,
+            least_loaded,
         ),
     ];
-    for (name, params, aged) in configs {
+    for (name, params, aged, selection) in configs {
         let origin = Origin::start(CodecProtocol::Http11);
         let address = origin.address;
         let [(indexed, indexed_scans), (scanned, scans)] = [false, true].map(|forced| {
             run_on_worker(move |context| async move {
                 let pool = idle_pool(&context, address, CodecProtocol::Http11, params);
+                pool.set_session_selection(selection)
+                    .expect("an open pool takes a selection");
                 pool.force_pool_scans_for_test(forced);
                 let outcome = pool_schedule(&pool, aged).await;
                 (outcome, pool.pool_scans_for_test())
@@ -3074,5 +3137,352 @@ fn a_session_aged_while_busy_leaves_selection_indexed_until_its_exchange_ends() 
              acquisition after its exchange took another session, sessions, the aged session \
              closed)"
         );
+    }
+}
+
+/// HTTP/2 sessions limited to four streams each.
+fn four_streams() -> SessionParams {
+    SessionParams {
+        max_concurrent_outgoing_streams: Some(4),
+        ..untimed()
+    }
+}
+
+/// The order in which `four_idle_http2_sessions` lets its sessions' exchanges end, by the
+/// order in which the sessions first appear among its acquisitions.
+const HTTP2_RELEASES: [usize; 4] = [2, 0, 3, 1];
+
+/// Four HTTP/2 sessions of `four_streams`, idle: sixteen acquisitions held together open them,
+/// four streams each, then each session's four exchanges run and end, one session after
+/// another in `HTTP2_RELEASES` order, so that the pool's order and the sessions' idle stamps
+/// follow it. Returns the sessions in that order.
+async fn four_idle_http2_sessions(pool: &OwnedHttpSessionPool) -> Vec<OwnedClientSession> {
+    let held: Vec<OwnedGetSessionResult> = futures::stream::iter((0..16).map(|_| acquire(pool)))
+        .buffered(16)
+        .collect()
+        .await;
+    let mut sessions: Vec<OwnedClientSession> = Vec::new();
+    let mut reservations: Vec<Vec<OwnedClientReservation>> = Vec::new();
+    for OwnedGetSessionResult {
+        reservation,
+        session,
+    } in held
+    {
+        let index = position_of(&sessions, &session).unwrap_or_else(|| {
+            sessions.push(session);
+            reservations.push(Vec::new());
+            sessions.len() - 1
+        });
+        reservations[index].push(reservation);
+    }
+    assert_eq!(
+        reservations.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![4; 4],
+        "sixteen held acquisitions open four sessions of four streams"
+    );
+    for index in HTTP2_RELEASES {
+        for reservation in std::mem::take(&mut reservations[index]) {
+            assert_eq!(exchange(reservation, "/").await, b"ok");
+        }
+        settle(&sessions[index]).await;
+    }
+    HTTP2_RELEASES
+        .iter()
+        .map(|&index| sessions[index].clone())
+        .collect()
+}
+
+/// A least-loaded acquisition (`DIV-048`) takes the session with the fewest streams in flight;
+/// of equally loaded sessions, an idle one in `DIV-032`'s reuse order, a busy one in the pool's
+/// order. Eight acquisitions held one after another on four idle HTTP/2 sessions of four
+/// streams therefore take each session twice: least recently used, in release order, twice;
+/// most recently used, in its reverse, twice. `FirstAvailable`, the default, packs them onto
+/// the first session with room: four on the first idle session the reuse order takes, then
+/// four on the next.
+#[test]
+fn least_loaded_selection_spreads_held_http2_reservations_in_reuse_order() {
+    let least = SessionReuseOrder::LeastRecentlyUsed;
+    let most = SessionReuseOrder::MostRecentlyUsed;
+    let configs = [
+        (
+            "first available, least recently used",
+            OwnedSessionSelection::FirstAvailable,
+            least,
+            [0, 0, 0, 0, 1, 1, 1, 1],
+        ),
+        (
+            "first available, most recently used",
+            OwnedSessionSelection::FirstAvailable,
+            most,
+            [3, 3, 3, 3, 2, 2, 2, 2],
+        ),
+        (
+            "least loaded, least recently used",
+            OwnedSessionSelection::LeastLoaded,
+            least,
+            [0, 1, 2, 3, 0, 1, 2, 3],
+        ),
+        (
+            "least loaded, most recently used",
+            OwnedSessionSelection::LeastLoaded,
+            most,
+            [3, 2, 1, 0, 3, 2, 1, 0],
+        ),
+    ];
+    for (name, selection, reuse_order, expected) in configs {
+        let origin = Origin::start(CodecProtocol::Http2);
+        let address = origin.address;
+        let (picks, sessions) = run_on_worker(move |context| async move {
+            let pool = pool_with(
+                &context,
+                address,
+                CodecProtocol::Http2,
+                PoolParams {
+                    reuse_order,
+                    ..params(4)
+                },
+                four_streams(),
+            );
+            let released = four_idle_http2_sessions(&pool).await;
+            pool.set_session_selection(selection)
+                .expect("an open pool takes a selection");
+            let held = hold(&pool, 8).await;
+            let picks: Vec<Option<usize>> = held
+                .iter()
+                .map(|acquired| position_of(&released, &acquired.session))
+                .collect();
+            drop(held);
+            (picks, pool.session_count())
+        });
+        assert_eq!(
+            (picks, sessions, origin.accepted()),
+            (expected.map(Some).to_vec(), 4, 4),
+            "{name}: (sessions taken, by release order; sessions; connections)"
+        );
+    }
+}
+
+/// Under least-loaded selection (`DIV-048`), loops of exchanges run concurrently over four
+/// HTTP/2 sessions of four streams. Each acquisition takes a session at most one stream above
+/// every other, read from the sessions' own capacity right after its reservation (nothing else
+/// runs between the reservation and the read); every session serves; every exchange completes,
+/// also with twenty loops for sixteen streams, so that acquisitions wait for a stream; and no
+/// connection is added.
+#[test]
+fn least_loaded_selection_keeps_concurrent_http2_load_within_one_stream_and_starves_nothing() {
+    const ROUNDS: usize = 16;
+    let configs = [
+        (8, SessionReuseOrder::LeastRecentlyUsed),
+        (8, SessionReuseOrder::MostRecentlyUsed),
+        (20, SessionReuseOrder::LeastRecentlyUsed),
+        (20, SessionReuseOrder::MostRecentlyUsed),
+    ];
+    for (loops, reuse_order) in configs {
+        let origin = Origin::start(CodecProtocol::Http2);
+        let address = origin.address;
+        let (uneven, served, completed, sessions) = run_on_worker(move |context| async move {
+            let pool = pool_with(
+                &context,
+                address,
+                CodecProtocol::Http2,
+                PoolParams {
+                    reuse_order,
+                    ..params(4)
+                },
+                four_streams(),
+            );
+            let known = four_idle_http2_sessions(&pool).await;
+            pool.set_session_selection(OwnedSessionSelection::LeastLoaded)
+                .expect("an open pool takes a selection");
+            let uneven = Cell::new(0_usize);
+            let served = RefCell::new([0_usize; 4]);
+            let completed = Cell::new(0_usize);
+            let (pool, known, uneven, served, completed) =
+                (&pool, &known, &uneven, &served, &completed);
+            futures::stream::iter(0..loops)
+                .for_each_concurrent(None, |_| async move {
+                    for _ in 0..ROUNDS {
+                        let OwnedGetSessionResult {
+                            reservation,
+                            session,
+                        } = acquire(pool).await;
+                        let chosen = position_of(known, &session).expect("an established session");
+                        let in_flight: Vec<u32> = known
+                            .iter()
+                            .map(|known| 4 - known.available_capacity())
+                            .collect();
+                        if in_flight.iter().any(|&other| in_flight[chosen] > other + 1) {
+                            uneven.set(uneven.get() + 1);
+                        }
+                        served.borrow_mut()[chosen] += 1;
+                        if exchange(reservation, "/").await == b"ok" {
+                            completed.set(completed.get() + 1);
+                        }
+                    }
+                })
+                .await;
+            (
+                uneven.get(),
+                *served.borrow(),
+                completed.get(),
+                pool.session_count(),
+            )
+        });
+        assert_eq!(
+            (
+                uneven,
+                served.iter().all(|&count| count > 0),
+                completed,
+                sessions,
+                origin.accepted()
+            ),
+            (0, true, loops * ROUNDS, 4, 4),
+            "{loops} loops, {reuse_order:?}: (acquisitions that took a session more than one \
+             stream above another, every session served ({served:?}), exchanges completed, \
+             sessions, connections)"
+        );
+    }
+}
+
+/// On HTTP/1.1, whose sessions take one exchange, a least-loaded acquisition (`DIV-048`) takes
+/// an idle session before one whose slot is free but whose driver is not idle yet: a
+/// reservation dropped unsubmitted, before the driver's next turn. `FirstAvailable`, the
+/// default, takes the latter first, as the busy session that can take an exchange.
+#[test]
+fn least_loaded_selection_takes_an_idle_http1_session_before_one_not_yet_idle() {
+    let configs = [
+        ("router", router_params(4)),
+        ("least recently used", params(4)),
+    ];
+    for (selection, takes_dropped) in [
+        (OwnedSessionSelection::FirstAvailable, true),
+        (OwnedSessionSelection::LeastLoaded, false),
+    ] {
+        for (name, params) in configs {
+            let origin = Origin::start(CodecProtocol::Http11);
+            let address = origin.address;
+            let (dropped, same) = run_on_worker(move |context| async move {
+                let pool = idle_pool(&context, address, CodecProtocol::Http11, params);
+                pool.set_session_selection(selection)
+                    .expect("an open pool takes a selection");
+                idle_sessions(&pool, 2).await;
+                let OwnedGetSessionResult {
+                    reservation,
+                    session,
+                } = acquire(&pool).await;
+                drop(reservation);
+                let dropped = (session.available_capacity(), session.is_idle());
+                let mut next = pin!(pool.get_session_with_reservation(CancellationToken::never()));
+                let Poll::Ready(next) = poll_once(next.as_mut()).await else {
+                    panic!("an established session is taken in the first poll");
+                };
+                let next = next.expect("the acquisition succeeds");
+                (dropped, local(&next.session) == local(&session))
+            });
+            assert_eq!(
+                (dropped, same),
+                ((1, false), takes_dropped),
+                "{selection:?}, {name}: ((the dropped session's capacity, idle), the next \
+                 acquisition took it)"
+            );
+        }
+    }
+}
+
+/// Of equally loaded sessions a least-loaded acquisition (`DIV-048`) takes a busy one first,
+/// as `FirstAvailable` does: an HTTP/1.1 session the pool dialed for an acquisition dropped
+/// before it took it has no exchange in flight, as an idle session has, and counts as busy
+/// until its first reservation (`DIV-046`), so the next acquisition takes it before the idle
+/// session, under either selection.
+#[test]
+fn least_loaded_selection_takes_a_dialed_session_no_acquisition_took_before_an_idle_one() {
+    let configs = [
+        ("router", router_params(4)),
+        ("least recently used", params(4)),
+    ];
+    for selection in [
+        OwnedSessionSelection::FirstAvailable,
+        OwnedSessionSelection::LeastLoaded,
+    ] {
+        for (name, params) in configs {
+            let origin = Origin::start(CodecProtocol::Http11);
+            let address = origin.address;
+            let (dialed, sessions) = run_on_worker(move |context| async move {
+                let pool = idle_pool(&context, address, CodecProtocol::Http11, params);
+                pool.set_session_selection(selection)
+                    .expect("an open pool takes a selection");
+                let held = acquire(&pool).await;
+                {
+                    let mut abandoned =
+                        pin!(pool.get_session_with_reservation(CancellationToken::never()));
+                    assert!(
+                        poll_once(abandoned.as_mut()).await.is_pending(),
+                        "a reserved HTTP/1.1 session makes the acquisition dial"
+                    );
+                    until(|| pool.session_count() == 2).await;
+                }
+                assert_eq!(exchange(held.reservation, "/").await, b"ok");
+                settle(&held.session).await;
+                let next = acquire(&pool).await;
+                (
+                    local(&next.session) != local(&held.session),
+                    pool.session_count(),
+                )
+            });
+            assert_eq!(
+                (dialed, sessions, origin.accepted()),
+                (true, 2, 2),
+                "{selection:?}, {name}: (the dialed session was taken, sessions, connections)"
+            );
+        }
+    }
+}
+
+/// A least-loaded acquisition (`DIV-048`) takes the least loaded session that can take an
+/// exchange, however loaded: an HTTP/1.1 session whose free slot its driver has not settled yet,
+/// when no session is idle, is taken in the acquisition's first poll, with no connection
+/// attempt, under either selection.
+#[test]
+fn least_loaded_selection_takes_a_session_not_yet_idle_rather_than_dial() {
+    let configs = [
+        ("router", router_params(4)),
+        ("least recently used", params(4)),
+    ];
+    for selection in [
+        OwnedSessionSelection::FirstAvailable,
+        OwnedSessionSelection::LeastLoaded,
+    ] {
+        for (name, params) in configs {
+            let origin = Origin::start(CodecProtocol::Http11);
+            let address = origin.address;
+            let (same, attempts, sessions) = run_on_worker(move |context| async move {
+                let pool = idle_pool(&context, address, CodecProtocol::Http11, params);
+                pool.set_session_selection(selection)
+                    .expect("an open pool takes a selection");
+                idle_sessions(&pool, 1).await;
+                let OwnedGetSessionResult {
+                    reservation,
+                    session,
+                } = acquire(&pool).await;
+                drop(reservation);
+                let attempts = pool.connection_attempts_for_test();
+                let mut next = pin!(pool.get_session_with_reservation(CancellationToken::never()));
+                let Poll::Ready(next) = poll_once(next.as_mut()).await else {
+                    panic!("an established session is taken in the first poll");
+                };
+                let next = next.expect("the acquisition succeeds");
+                (
+                    local(&next.session) == local(&session),
+                    pool.connection_attempts_for_test() - attempts,
+                    pool.session_count(),
+                )
+            });
+            assert_eq!(
+                (same, attempts, sessions, origin.accepted()),
+                (true, 0, 1, 1),
+                "{selection:?}, {name}: (the session not yet idle was taken, connection attempts, \
+                 sessions, connections)"
+            );
+        }
     }
 }
