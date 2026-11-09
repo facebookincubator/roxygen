@@ -10,6 +10,10 @@ pub mod server;
 pub mod shutdown;
 
 #[cfg(test)]
+#[path = "../tests/cleanup_polling.rs"]
+mod cleanup_polling_tests;
+
+#[cfg(test)]
 #[path = "../tests/expect_continue.rs"]
 mod expect_continue_tests;
 

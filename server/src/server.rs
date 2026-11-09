@@ -31,6 +31,8 @@ use roxygen_runtime::tokio_host::ManagedWorker;
 use roxygen_runtime::tokio_host::ManagedWorkerError;
 use roxygen_runtime::worker::SubmitError;
 use roxygen_runtime::worker::WorkerContext;
+use roxygen_runtime::worker::WorkerHandle;
+pub use roxygen_runtime::worker::WorkerPollStats;
 use roxygen_session::uniplex::UniplexRunSummary;
 #[cfg(test)]
 use roxygen_transport::byte_stream::TransportRetirement;
@@ -657,11 +659,21 @@ pub struct HttpServerControl {
     state: Arc<AtomicU8>,
     draining: Arc<AtomicBool>,
     commands: Vec<mpsc::UnboundedSender<WorkerCommand>>,
+    worker_handles: Arc<[WorkerHandle]>,
 }
 
 impl HttpServerControl {
     pub fn state(&self) -> HttpServerState {
         HttpServerState::from_raw(self.state.load(Ordering::Acquire))
+    }
+
+    /// Each worker's driver poll counters, in worker index order, including
+    /// after the workers have stopped.
+    pub fn worker_poll_stats(&self) -> Vec<WorkerPollStats> {
+        self.worker_handles
+            .iter()
+            .map(WorkerHandle::poll_stats)
+            .collect()
     }
 
     pub fn drain(&self) -> bool {
@@ -709,6 +721,7 @@ pub struct HttpServer {
     tcp_max_segments: Vec<Option<u32>>,
     num_io_threads: usize,
     workers: RefCell<Vec<ManagedWorker>>,
+    worker_handles: Arc<[WorkerHandle]>,
     commands: Vec<mpsc::UnboundedSender<WorkerCommand>>,
     tls_credentials: Option<Arc<dyn TlsCredentialProvider>>,
     tls: Option<Arc<ArcSwap<TlsServerOptions>>>,
@@ -842,10 +855,13 @@ impl HttpServer {
         }
 
         let accept_round_robin = Arc::new(AtomicUsize::new(0));
+        let worker_handles: Arc<[WorkerHandle]> =
+            workers.iter().map(ManagedWorker::handle).collect();
         let control = HttpServerControl {
             state: Arc::clone(&state),
             draining: Arc::clone(&draining),
             commands: commands.clone(),
+            worker_handles: Arc::clone(&worker_handles),
         };
         let mut startup_receivers = Vec::with_capacity(num_io_threads);
         let mut owned_listeners = Some(listeners);
@@ -913,6 +929,7 @@ impl HttpServer {
             tcp_max_segments,
             num_io_threads,
             workers: RefCell::new(workers),
+            worker_handles,
             commands,
             tls_credentials: config.tls_credentials,
             tls,
@@ -930,7 +947,17 @@ impl HttpServer {
             state: Arc::clone(&self.state),
             draining: Arc::clone(&self.draining),
             commands: self.commands.clone(),
+            worker_handles: Arc::clone(&self.worker_handles),
         }
+    }
+
+    /// Each worker's driver poll counters, in worker index order, including
+    /// after the workers have stopped.
+    pub fn worker_poll_stats(&self) -> Vec<WorkerPollStats> {
+        self.worker_handles
+            .iter()
+            .map(WorkerHandle::poll_stats)
+            .collect()
     }
 
     pub fn address(&self) -> Option<SocketAddr> {

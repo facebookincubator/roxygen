@@ -40,6 +40,12 @@ use crate::task_group::NO_SLOT;
 use crate::task_group::TaskGroup;
 use crate::thread::current_id;
 
+mod poll_stats;
+
+pub(crate) use poll_stats::PassStats;
+use poll_stats::PollCounters;
+pub use poll_stats::WorkerPollStats;
+
 static NEXT_WORKER_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -350,8 +356,7 @@ pub(crate) struct WorkerShared {
     queue: Mutex<QueueState>,
     cancelled: AtomicBool,
     quiescing: CancellationSource,
-    #[cfg(test)]
-    driver_polls: AtomicUsize,
+    poll_counters: PollCounters,
     shutdown_span: Mutex<Option<OperationSpan>>,
 }
 
@@ -451,9 +456,11 @@ impl WorkerShared {
         self.queue().lifecycle
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_driver_poll(&self) {
-        self.driver_polls.fetch_add(1, Ordering::Relaxed);
+    /// The poll counters, for their single writer, the owner thread.
+    #[inline]
+    pub(crate) fn poll_counters(&self) -> &PollCounters {
+        debug_assert_eq!(current_id(), self.owner_thread);
+        &self.poll_counters
     }
 
     pub(crate) fn start_cancellation_span(&self) -> OperationSpan {
@@ -510,8 +517,7 @@ impl WorkerHandle {
                 }),
                 cancelled: AtomicBool::new(false),
                 quiescing: CancellationSource::new(),
-                #[cfg(test)]
-                driver_polls: AtomicUsize::new(0),
+                poll_counters: PollCounters::default(),
                 shutdown_span: Mutex::new(None),
             }),
         })
@@ -726,9 +732,14 @@ impl WorkerHandle {
         Ok(())
     }
 
+    /// This worker's driver poll counters, read from any thread.
+    pub fn poll_stats(&self) -> WorkerPollStats {
+        self.shared.poll_counters.snapshot()
+    }
+
     #[cfg(test)]
     pub(crate) fn driver_poll_count(&self) -> usize {
-        self.shared.driver_polls.load(Ordering::Relaxed)
+        self.poll_stats().driver_polls as usize
     }
 
     /// How many listeners the worker's quiescing source has registered.
@@ -875,8 +886,8 @@ impl WorkerContext {
 
     fn create(handle: WorkerHandle, host: Host, independently_scheduled: bool) -> Self {
         Self {
-            handle,
             local: Rc::new(OwnerState {
+                shared: Arc::clone(&handle.shared),
                 active_guards: Cell::new(0),
                 next_cleanup_id: Cell::new(0),
                 cleanups: RefCell::new(IdSlab::new()),
@@ -889,6 +900,7 @@ impl WorkerContext {
                 hosted_panic: RefCell::new(None),
                 host,
             }),
+            handle,
         }
     }
 
@@ -1034,6 +1046,8 @@ impl WorkerContext {
             completion_waker: RefCell::new(None),
             destruction_failed,
             publisher: CleanupPublisher::new(),
+            registered: Cell::new(true),
+            activated: Cell::new(false),
         });
         let slot = if self.local.hosted_tasks.is_some() {
             self.local
@@ -1048,6 +1062,7 @@ impl WorkerContext {
             NO_SLOT
         };
         drop(queue);
+        self.handle.shared.poll_counters().cleanup_registered();
 
         Ok(WorkerCleanupTaskRegistration {
             local: Rc::downgrade(&self.local),
@@ -1139,13 +1154,13 @@ impl WorkerContext {
         &self,
         context: &mut Context<'_>,
         finish_reserved: bool,
-    ) -> (bool, Option<PanicPayload>) {
+    ) -> CleanupPass {
         if self.local.hosted_tasks.is_some() {
             return self.poll_hosted_cleanup_tasks(context, finish_reserved);
         }
         let tasks = std::mem::take(&mut *self.local.cleanup_tasks.borrow_mut());
         let mut retained = VecDeque::new();
-        let mut first_panic = None;
+        let mut pass = CleanupPass::default();
         for state in tasks {
             let phase =
                 std::mem::replace(&mut *state.phase.borrow_mut(), TrackedCleanupPhase::Polling);
@@ -1154,7 +1169,8 @@ impl WorkerContext {
                     if finish_reserved {
                         let (pending, result) =
                             poll_tracked_cleanup(&state, NO_SLOT, future, context);
-                        retain_first_panic(&mut first_panic, result);
+                        pass.polls += 1;
+                        retain_first_panic(&mut pass.panic, result);
                         if pending {
                             retained.push_back(state);
                         }
@@ -1165,7 +1181,8 @@ impl WorkerContext {
                 }
                 TrackedCleanupPhase::Active(future) => {
                     let (pending, result) = poll_tracked_cleanup(&state, NO_SLOT, future, context);
-                    retain_first_panic(&mut first_panic, result);
+                    pass.polls += 1;
+                    retain_first_panic(&mut pass.panic, result);
                     if pending {
                         retained.push_back(state);
                     }
@@ -1180,19 +1197,19 @@ impl WorkerContext {
         }
         let mut newly_registered = self.local.cleanup_tasks.borrow_mut();
         retained.append(&mut newly_registered);
-        let complete = retained
+        pass.complete = retained
             .iter()
             .all(|state| matches!(&*state.phase.borrow(), TrackedCleanupPhase::Finished));
         retained.retain(|state| !matches!(&*state.phase.borrow(), TrackedCleanupPhase::Finished));
         *newly_registered = retained;
-        (complete, first_panic)
+        pass
     }
 
     fn poll_hosted_cleanup_tasks(
         &self,
         context: &mut Context<'_>,
         finish_reserved: bool,
-    ) -> (bool, Option<PanicPayload>) {
+    ) -> CleanupPass {
         let tasks = self
             .local
             .hosted_tasks
@@ -1228,8 +1245,11 @@ impl WorkerContext {
             }
             completion.discard();
         }
-        let complete = self.local.hosted_cleanups.borrow().is_empty() && tasks.is_empty();
-        (complete, self.local.hosted_panic.borrow_mut().take())
+        CleanupPass {
+            complete: self.local.hosted_cleanups.borrow().is_empty() && tasks.is_empty(),
+            panic: self.local.hosted_panic.borrow_mut().take(),
+            polls: 0,
+        }
     }
 
     pub(crate) fn abort_cleanup_tasks(&self) -> Option<PanicPayload> {
@@ -1273,7 +1293,17 @@ impl WorkerContext {
     }
 }
 
+/// What one `WorkerContext::poll_cleanup_tasks` call did.
+#[derive(Default)]
+pub(crate) struct CleanupPass {
+    /// Whether every cleanup task has finished.
+    pub(crate) complete: bool,
+    pub(crate) panic: Option<PanicPayload>,
+    pub(crate) polls: u64,
+}
+
 struct OwnerState {
+    shared: Arc<WorkerShared>,
     active_guards: Cell<usize>,
     next_cleanup_id: Cell<u64>,
     cleanups: RefCell<IdSlab<CleanupEntry>>,
@@ -1301,6 +1331,10 @@ struct TrackedCleanupState {
     completion_waker: RefCell<Option<Waker>>,
     destruction_failed: Option<Rc<Cell<bool>>>,
     publisher: CleanupPublisher,
+    /// Whether `cleanups_registered` counts this cleanup.
+    registered: Cell<bool>,
+    /// Whether `cleanups_active` counts this cleanup.
+    activated: Cell<bool>,
 }
 
 fn schedule_hosted_cleanup(
@@ -1362,6 +1396,10 @@ impl Future for HostedCleanup {
         );
         match phase {
             TrackedCleanupPhase::Active(future) => {
+                self.handle
+                    .shared
+                    .poll_counters()
+                    .record_hosted_cleanup_poll();
                 let (pending, panic) =
                     poll_tracked_cleanup(&self.state, self.slot, future, context);
                 if let Some(panic) = panic {
@@ -1678,6 +1716,9 @@ impl WorkerCleanupTaskRegistration {
             }
         }
         drop(phase);
+        if !state.activated.replace(true) {
+            self.handle.shared.poll_counters().cleanup_activated();
+        }
         if let Some(local) = self.local.upgrade() {
             schedule_hosted_cleanup(&local, &state, self.slot, &self.handle);
         }
@@ -1772,6 +1813,9 @@ impl Drop for WorkerCleanupTaskRegistration {
             TrackedCleanupPhase::Reserved(future) => {
                 *phase = TrackedCleanupPhase::Active(future);
                 drop(phase);
+                if !state.activated.replace(true) {
+                    self.handle.shared.poll_counters().cleanup_activated();
+                }
                 if let Some(local) = self.local.upgrade() {
                     schedule_hosted_cleanup(&local, &state, self.slot, &self.handle);
                 }
@@ -1836,6 +1880,10 @@ fn finish_tracked_cleanup(
 ) -> Option<PanicPayload> {
     *state.phase.borrow_mut() = TrackedCleanupPhase::Finished;
     if let Some(local) = state.local.upgrade() {
+        local.shared.poll_counters().cleanup_finished(
+            state.registered.replace(false),
+            state.activated.replace(false),
+        );
         debug_assert!(
             slot != NO_SLOT || local.hosted_tasks.is_none() || local.hosted_aborting.get(),
             "a hosted cleanup finishes through its registry slot until the registry is taken"
@@ -1990,6 +2038,8 @@ mod observer_tests {
             completion_waker: RefCell::new(None),
             destruction_failed: Some(Rc::clone(&destruction_failed)),
             publisher: CleanupPublisher::new(),
+            registered: Cell::new(false),
+            activated: Cell::new(false),
         });
         let observer = state.publisher.observe();
         let mut task = TrackedTask {

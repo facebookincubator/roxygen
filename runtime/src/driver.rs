@@ -16,6 +16,7 @@ use crate::task_group::TaskGroup;
 use crate::thread::current_id;
 use crate::worker::LocalTask;
 use crate::worker::PanicPayload;
+use crate::worker::PassStats;
 use crate::worker::WorkerCommand;
 use crate::worker::WorkerContext;
 use crate::worker::WorkerCreateError;
@@ -157,15 +158,25 @@ impl WorkerDriver {
         }
     }
 
-    fn poll_shutdown(&mut self, context: &mut Context<'_>) -> Poll<()> {
+    /// Publishes `pass` itself before completing, since completion may unwind.
+    fn poll_shutdown(&mut self, context: &mut Context<'_>, pass: &mut PassStats) -> Poll<()> {
         self.start_shutdown();
-        let (complete, cleanup_panic) = self.context.poll_cleanup_tasks(context, true);
-        self.record_shutdown_panic(cleanup_panic);
-        if !complete {
+        let cleanup = self.context.poll_cleanup_tasks(context, true);
+        pass.cleanup_polls += cleanup.polls;
+        self.record_shutdown_panic(cleanup.panic);
+        if !cleanup.complete {
             return Poll::Pending;
         }
+        self.publish_pass(pass);
         self.finish_shutdown();
         Poll::Ready(())
+    }
+
+    fn publish_pass(&self, pass: &PassStats) {
+        self.handle
+            .shared
+            .poll_counters()
+            .record_pass(pass, self.hosted_tasks.is_none());
     }
 
     fn abort_and_close(&mut self) {
@@ -183,36 +194,26 @@ impl WorkerDriver {
     }
 }
 
-impl Future for WorkerDriver {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        debug_assert_eq!(current_id(), self.owner_thread);
-        if self.complete {
-            return Poll::Ready(());
-        }
-
-        #[cfg(test)]
-        self.handle.shared.record_driver_poll();
+impl WorkerDriver {
+    fn poll_pass(&mut self, context: &mut Context<'_>, pass: &mut PassStats) -> Poll<()> {
         if self.handle.state() != WorkerState::Open {
             self.handle.shared.register_driver_waker(context.waker());
-            return self.poll_shutdown(context);
+            return self.poll_shutdown(context, pass);
         }
 
         #[cfg(test)]
         crate::worker::run_driver_intake_hook(&self.handle);
-        let this = &mut *self;
-        this.handle
+        self.handle
             .shared
-            .take_open_commands(context.waker(), &mut this.intake);
-        for command in this.intake.drain(..) {
-            let task = command.into_command(this.context.clone());
-            if let Some(tasks) = &mut this.hosted_tasks {
+            .take_open_commands(context.waker(), &mut self.intake);
+        for command in self.intake.drain(..) {
+            let task = command.into_command(self.context.clone());
+            if let Some(tasks) = &mut self.hosted_tasks {
                 tasks
                     .spawn_command(task)
                     .expect("open worker retains command admission");
             } else {
-                this.tasks.push_back(Box::pin(task));
+                self.tasks.push_back(Box::pin(task));
             }
         }
         let mut failure = None;
@@ -230,7 +231,7 @@ impl Future for WorkerDriver {
         }
 
         if self.handle.state() != WorkerState::Open {
-            return self.poll_shutdown(context);
+            return self.poll_shutdown(context, pass);
         }
 
         let tasks_to_poll = self.tasks.len();
@@ -238,23 +239,44 @@ impl Future for WorkerDriver {
             let Some(mut task) = self.tasks.pop_front() else {
                 break;
             };
+            pass.command_polls += 1;
             if task.as_mut().poll(context).is_pending() {
                 self.tasks.push_back(task);
             }
         }
 
-        let (_, cleanup_panic) = self.context.poll_cleanup_tasks(context, false);
-        if cleanup_panic.is_some() {
-            self.record_shutdown_panic(cleanup_panic);
+        let cleanup = self.context.poll_cleanup_tasks(context, false);
+        pass.cleanup_polls += cleanup.polls;
+        pass.budget_exhausted = !tokio::task::coop::has_budget_remaining();
+        if cleanup.panic.is_some() {
+            self.record_shutdown_panic(cleanup.panic);
             let shutdown = catch_unwind(AssertUnwindSafe(|| self.handle.begin_shutdown()));
             self.record_shutdown_panic(shutdown.err());
         }
 
         if self.handle.state() != WorkerState::Open {
-            self.poll_shutdown(context)
+            self.poll_shutdown(context, pass)
         } else {
             Poll::Pending
         }
+    }
+}
+
+impl Future for WorkerDriver {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        debug_assert_eq!(current_id(), self.owner_thread);
+        if self.complete {
+            return Poll::Ready(());
+        }
+        self.handle.shared.poll_counters().record_driver_poll();
+        let mut pass = PassStats::default();
+        let polled = self.poll_pass(context, &mut pass);
+        if polled.is_pending() {
+            self.publish_pass(&pass);
+        }
+        polled
     }
 }
 

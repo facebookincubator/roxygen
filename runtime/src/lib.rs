@@ -38,6 +38,10 @@ mod managed_tests;
 mod observability_context_tests;
 
 #[cfg(test)]
+#[path = "../tests/poll_stats.rs"]
+mod poll_stats_tests;
+
+#[cfg(test)]
 #[path = "../tests/source_bridge.rs"]
 mod source_bridge_tests;
 
