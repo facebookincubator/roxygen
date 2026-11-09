@@ -1793,6 +1793,7 @@ pub struct TlsConnectionInfo {
     requested_server_name: Option<Box<str>>,
     application_protocol: Option<Box<[u8]>>,
     cipher_suite: Option<Box<str>>,
+    key_exchange_group: Option<Box<str>>,
     protocol_version: Option<Box<str>>,
     session_resumed: bool,
 }
@@ -1809,6 +1810,12 @@ impl TlsConnectionInfo {
 
     pub fn cipher_suite(&self) -> Option<&str> {
         self.cipher_suite.as_deref()
+    }
+
+    /// Returns the negotiated key-exchange group, or `None` when the
+    /// handshake exchanged no key (a resumed TLS 1.2 session).
+    pub fn key_exchange_group(&self) -> Option<&str> {
+        self.key_exchange_group.as_deref()
     }
 
     pub fn protocol_version(&self) -> Option<&str> {
@@ -1987,6 +1994,9 @@ impl TlsTransport {
                 cipher_suite: connection
                     .negotiated_cipher_suite()
                     .map(|suite| format!("{:?}", suite.suite()).into_boxed_str()),
+                key_exchange_group: connection
+                    .negotiated_key_exchange_group()
+                    .map(|group| format!("{:?}", group.name()).into_boxed_str()),
                 protocol_version: connection
                     .protocol_version()
                     .map(|version| format!("{version:?}").into_boxed_str()),
@@ -2341,6 +2351,9 @@ fn connection_info(
         cipher_suite: connection
             .negotiated_cipher_suite()
             .map(|suite| format!("{:?}", suite.suite()).into_boxed_str()),
+        key_exchange_group: connection
+            .negotiated_key_exchange_group()
+            .map(|group| format!("{:?}", group.name()).into_boxed_str()),
         protocol_version: connection
             .protocol_version()
             .map(|version| format!("{version:?}").into_boxed_str()),

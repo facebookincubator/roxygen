@@ -89,6 +89,8 @@ pub struct ConnectionContext {
     http_protocol: Option<CodecProtocol>,
     requested_server_name: Option<Box<str>>,
     negotiated_application_protocol: Option<Box<[u8]>>,
+    tls_cipher_suite: Option<Box<str>>,
+    tls_key_exchange_group: Option<Box<str>>,
 }
 
 impl ConnectionContext {
@@ -108,6 +110,8 @@ impl ConnectionContext {
             http_protocol: None,
             requested_server_name: None,
             negotiated_application_protocol: None,
+            tls_cipher_suite: None,
+            tls_key_exchange_group: None,
         }
     }
 
@@ -134,6 +138,18 @@ impl ConnectionContext {
         self
     }
 
+    /// Records the cipher suite and key-exchange group of a completed TLS
+    /// handshake.
+    pub fn with_tls_parameters(
+        mut self,
+        cipher_suite: Option<Box<str>>,
+        key_exchange_group: Option<Box<str>>,
+    ) -> Self {
+        self.tls_cipher_suite = cipher_suite;
+        self.tls_key_exchange_group = key_exchange_group;
+        self
+    }
+
     /// Returns the selected wire protocol, independently of any request head.
     pub fn http_protocol(&self) -> Option<CodecProtocol> {
         self.http_protocol
@@ -147,6 +163,18 @@ impl ConnectionContext {
     /// Returns the negotiated TLS ALPN bytes, when available.
     pub fn negotiated_application_protocol(&self) -> Option<&[u8]> {
         self.negotiated_application_protocol.as_deref()
+    }
+
+    /// Returns the negotiated TLS cipher suite, such as
+    /// `TLS13_AES_128_GCM_SHA256`, when available.
+    pub fn tls_cipher_suite(&self) -> Option<&str> {
+        self.tls_cipher_suite.as_deref()
+    }
+
+    /// Returns the negotiated TLS key-exchange group, such as `X25519`, when
+    /// available.
+    pub fn tls_key_exchange_group(&self) -> Option<&str> {
+        self.tls_key_exchange_group.as_deref()
     }
 
     /// Returns the immediate local endpoint.

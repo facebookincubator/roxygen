@@ -296,10 +296,15 @@ impl AcceptedTransport {
             Self::ByteStream(_) => metadata,
             Self::Tls(transport) => {
                 let handshake = transport.connection_info();
-                metadata.with_tls_handshake(
-                    handshake.requested_server_name().map(Box::from),
-                    handshake.application_protocol().map(Box::from),
-                )
+                metadata
+                    .with_tls_handshake(
+                        handshake.requested_server_name().map(Box::from),
+                        handshake.application_protocol().map(Box::from),
+                    )
+                    .with_tls_parameters(
+                        handshake.cipher_suite().map(Box::from),
+                        handshake.key_exchange_group().map(Box::from),
+                    )
             }
         })
     }

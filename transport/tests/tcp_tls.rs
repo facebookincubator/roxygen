@@ -5726,6 +5726,10 @@ mod tcp_tls {
                                 Some(b"http/1.1".as_slice()),
                             );
                             assert!(transport.connection_info().cipher_suite().is_some());
+                            assert_eq!(
+                                transport.connection_info().key_exchange_group(),
+                                Some("X25519"),
+                            );
                             assert!(transport.connection_info().protocol_version().is_some());
                             transport.close(&context).unwrap();
 
@@ -5961,6 +5965,10 @@ mod tcp_tls {
                         assert_eq!(
                             transport.zero_copy_owner_for_test(&context).unwrap(),
                             Some(owner),
+                        );
+                        assert_eq!(
+                            transport.connection_info().key_exchange_group(),
+                            Some("X25519"),
                         );
                         let stream = transport.into_byte_stream();
                         let request = stream

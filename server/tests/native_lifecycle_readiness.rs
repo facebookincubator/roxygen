@@ -2498,6 +2498,11 @@ impl Shared {
             "actual immediate-hop security",
         )?;
         require(
+            connection.tls_cipher_suite().is_some() == self.route.tls
+                && connection.tls_key_exchange_group().is_some() == self.route.tls,
+            "TLS parameters exactly on TLS connections",
+        )?;
+        require(
             connection.peer_identity().is_none() && connection.upstream_origin().is_none(),
             "direct native connection has no identity or logical origin",
         )?;
