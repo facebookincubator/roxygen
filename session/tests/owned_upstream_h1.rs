@@ -1163,7 +1163,7 @@ fn submit_exclusive_and_source_parts_match_h2_contracts() {
 #[test]
 fn owned_h1_upstream_rejects_unsupported_config() {
     type Change = fn(&mut OwnedH1Options);
-    let cases: [(&str, Change, ByteEventCapability); 12] = [
+    let cases: [(&str, Change, ByteEventCapability); 11] = [
         (
             "read_timeout",
             |options| options.io.read_timeout = Duration::from_secs(1),
@@ -1192,11 +1192,6 @@ fn owned_h1_upstream_rejects_unsupported_config() {
         (
             "abort_exchanges_on_eof",
             |options| options.io.abort_exchanges_on_eof = true,
-            ByteEventCapability::Unsupported,
-        ),
-        (
-            "unframed_bodiless_http1_requests",
-            |options| options.io.unframed_bodiless_http1_requests = true,
             ByteEventCapability::Unsupported,
         ),
         (
@@ -3139,14 +3134,26 @@ fn owned_reuse_outcome(
     eof: bool,
     tail: Option<Arc<tokio::sync::Notify>>,
 ) -> ReuseOutcome {
+    owned_reuse_outcome_with(upstream_config(), request, response, eof, tail)
+}
+
+/// As `owned_reuse_outcome`, with `config` for the session.
+fn owned_reuse_outcome_with(
+    config: UniplexConfig,
+    request: impl FnOnce() -> (HttpHeaderEvent, Vec<HttpBodyEvent>) + Send + 'static,
+    response: &'static [u8],
+    eof: bool,
+    tail: Option<Arc<tokio::sync::Notify>>,
+) -> ReuseOutcome {
     run_on_host(move |context| {
         Box::pin(async move {
             let first_ready = Arc::new(tokio::sync::Notify::new());
             let second_ready = Arc::new(tokio::sync::Notify::new());
             let (transport, state) =
                 ScriptedTransport::new(reuse_reads(&first_ready, &second_ready, response, eof));
-            let (session, handle) =
-                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let mut options = upstream_options(context, transport);
+            options.io = config;
+            let (session, handle) = OwnedH1UpstreamSession::new(options).unwrap();
             let log = Rc::new(AdmissionLog::default());
             handle.set_observer(log.clone()).unwrap();
             let (head, body) = request();
@@ -3215,6 +3222,17 @@ fn uniplex_reuse_outcome(
     eof: bool,
     tail: Option<Arc<tokio::sync::Notify>>,
 ) -> ReuseOutcome {
+    uniplex_reuse_outcome_with(upstream_config(), request, response, eof, tail)
+}
+
+/// As `uniplex_reuse_outcome`, with `config` for the session.
+fn uniplex_reuse_outcome_with(
+    config: UniplexConfig,
+    request: impl FnOnce() -> (HttpHeaderEvent, Vec<HttpBodyEvent>) + Send + 'static,
+    response: &'static [u8],
+    eof: bool,
+    tail: Option<Arc<tokio::sync::Notify>>,
+) -> ReuseOutcome {
     run_on_host(move |context| {
         Box::pin(async move {
             let first_ready = Arc::new(tokio::sync::Notify::new());
@@ -3226,7 +3244,7 @@ fn uniplex_reuse_outcome(
                 TransportDirection::Upstream,
                 transport,
                 None,
-                upstream_config(),
+                config,
             )
             .unwrap();
             let (head, body) = request();
@@ -5087,4 +5105,150 @@ fn a_connection_cancel_keeps_the_received_response() {
             },
         }
     );
+}
+
+/// `upstream_config` with `DIV-036`'s `unframed_bodiless_http1_requests` set to `unframed`.
+fn unframed_config(unframed: bool) -> UniplexConfig {
+    UniplexConfig {
+        unframed_bodiless_http1_requests: unframed,
+        ..upstream_config()
+    }
+}
+
+type RequestFn = fn() -> (HttpHeaderEvent, Vec<HttpBodyEvent>);
+
+/// A `POST /upload` whose head ends the request, with no framing header.
+fn bodiless_post() -> (HttpHeaderEvent, Vec<HttpBodyEvent>) {
+    (post_head(None, true), Vec::new())
+}
+
+/// As `bodiless_post`, declaring `Content-Length: 0`.
+fn zero_length_post() -> (HttpHeaderEvent, Vec<HttpBodyEvent>) {
+    (post_head(Some(0), true), Vec::new())
+}
+
+/// As `bodiless_post`, an HTTP/1.0 request asking for keep-alive, on which the codec cannot chunk.
+fn bodiless_http10_post() -> (HttpHeaderEvent, Vec<HttpBodyEvent>) {
+    let mut head = post_head(None, true);
+    head.headers_mut().set_http_version(1, 0);
+    head.headers_mut()
+        .headers_mut()
+        .set(HttpHeaderCode::Connection, b"keep-alive");
+    (head, Vec::new())
+}
+
+/// As `bodiless_post`, carrying the caller's own chunked `Transfer-Encoding`.
+fn caller_chunked_bodiless_post() -> (HttpHeaderEvent, Vec<HttpBodyEvent>) {
+    let mut head = post_head(None, true);
+    head.headers_mut()
+        .headers_mut()
+        .set(HttpHeaderCode::TransferEncoding, b"chunked");
+    (head, Vec::new())
+}
+
+/// Sends `request`, then a `GET /` when the connection admits one, through an owned upstream
+/// session and a `UniplexSession` client that share `unframed_config(unframed)`; asserts that
+/// they read, write, reuse and close alike, and returns the owned session's first request's
+/// bytes and whether it reused the connection.
+fn unframed_outcome(name: &str, request: RequestFn, unframed: bool) -> (Vec<u8>, bool) {
+    let config = unframed_config(unframed);
+    let uniplex = uniplex_reuse_outcome_with(config, request, OK_RESPONSE, false, None);
+    let owned = owned_reuse_outcome_with(config, request, OK_RESPONSE, false, None);
+    assert_eq!(owned.first, uniplex.first, "{name}");
+    assert_eq!(owned.first.body, b"ok", "{name}");
+    assert_eq!(
+        String::from_utf8_lossy(&owned.wire),
+        String::from_utf8_lossy(&uniplex.wire),
+        "{name}: every byte both connections wrote"
+    );
+    assert_eq!(owned.reused, uniplex.reused, "{name}: the reuse decision");
+    assert_eq!(
+        (owned.run, owned.close),
+        (uniplex.run, uniplex.close),
+        "{name}"
+    );
+    let first = owned.wire[..owned.wire.len() - owned.second_wire.len()].to_vec();
+    (first, owned.reused)
+}
+
+#[test]
+fn bodiless_requests_go_out_unframed_as_uniplex_when_enabled() {
+    // (name, request, its bytes with `DIV-036` on, whether the connection is then reused)
+    let cases: [(&str, RequestFn, &[u8], bool); 6] = [
+        (
+            "bodiless POST",
+            bodiless_post,
+            b"POST /upload HTTP/1.1\r\nHost: origin\r\nConnection: keep-alive\r\n\r\n",
+            true,
+        ),
+        (
+            "Content-Length: 0 POST",
+            zero_length_post,
+            b"POST /upload HTTP/1.1\r\nHost: origin\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n",
+            true,
+        ),
+        (
+            // Unframed, the codec no longer disables keep-alive on a connection that cannot chunk.
+            "bodiless HTTP/1.0 POST",
+            bodiless_http10_post,
+            b"POST /upload HTTP/1.0\r\nHost: origin\r\nConnection: keep-alive\r\n\r\n",
+            true,
+        ),
+        (
+            // The caller's framing is kept: no last chunk, so the connection closes.
+            "bodiless POST with the caller's chunked framing",
+            caller_chunked_bodiless_post,
+            b"POST /upload HTTP/1.1\r\nHost: origin\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            false,
+        ),
+        (
+            "POST with a body",
+            || scripted_request(true),
+            b"POST /upload HTTP/1.1\r\nHost: origin\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n",
+            true,
+        ),
+        (
+            "GET",
+            || (get_head(), Vec::new()),
+            b"GET / HTTP/1.1\r\nHost: origin\r\nConnection: keep-alive\r\n\r\n",
+            true,
+        ),
+    ];
+    for (name, request, expected, reused) in cases {
+        let (first, owned_reused) = unframed_outcome(name, request, true);
+        assert_eq!(
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(expected),
+            "{name}"
+        );
+        assert_eq!(owned_reused, reused, "{name}: the reuse decision");
+    }
+}
+
+#[test]
+fn bodiless_posts_are_framed_as_uniplex_by_default() {
+    // (name, request, its bytes with `DIV-036` off, whether the connection is then reused)
+    let cases: [(&str, RequestFn, &[u8], bool); 2] = [
+        (
+            "bodiless POST",
+            bodiless_post,
+            b"POST /upload HTTP/1.1\r\nHost: origin\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n0\r\n\r\n",
+            true,
+        ),
+        (
+            "bodiless HTTP/1.0 POST",
+            bodiless_http10_post,
+            b"POST /upload HTTP/1.0\r\nHost: origin\r\nConnection: close\r\n\r\n",
+            false,
+        ),
+    ];
+    for (name, request, expected, reused) in cases {
+        let (first, owned_reused) = unframed_outcome(name, request, false);
+        assert_eq!(
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(expected),
+            "{name}"
+        );
+        assert_eq!(owned_reused, reused, "{name}: the reuse decision");
+    }
 }

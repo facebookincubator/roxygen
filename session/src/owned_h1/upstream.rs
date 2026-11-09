@@ -26,8 +26,9 @@
 //! `UniplexSession`, a failed read fails the connection only after every byte read before it is
 //! parsed, flow control included.
 //! [`OwnedH1UpstreamSession::new`] validates [`UniplexConfig`] as [`OwnedH1Session::new`]
-//! does, except that `drain_request_body_on_drop` and `unframed_bodiless_http1_requests`
-//! must be false, and
+//! does, except that `drain_request_body_on_drop` must be false,
+//! `unframed_bodiless_http1_requests` (`DIV-036`) is honored: a request whose head ends it and
+//! carries no framing header goes out with no body framing, as through `UniplexSession`, and
 //! `deliver_ingress_before_abort` (`DIV-033`) is honored: a response that fails keeps its
 //! received head and body events for its reader, before the error, unless the request's
 //! consumer cancelled it (a cancel, a dropped submission or the cancellation token), which
@@ -1219,7 +1220,6 @@ impl UpstreamDriver {
             || io.drain_request_body_on_drop
             || io.wait_for_http1_response_on_drain
             || io.abort_exchanges_on_eof
-            || io.unframed_bodiless_http1_requests
             || transport.byte_event_capability(&context)? != ByteEventCapability::Unsupported
         {
             return Err(failure(
@@ -1256,6 +1256,7 @@ impl UpstreamDriver {
             Http1xCodec::with_options(TransportDirection::Upstream, false, http1.strict_validation);
         let ordinary_upgrades = http1.upgrade_policy == Http1UpgradePolicy::AsOrdinaryRequest;
         codec.set_upstream_upgrade_as_ordinary(ordinary_upgrades);
+        codec.set_unframed_bodiless_requests(io.unframed_bodiless_http1_requests);
         Ok((
             Self {
                 context,

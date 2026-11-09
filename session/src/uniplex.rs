@@ -410,7 +410,7 @@ pub struct UniplexConfig {
     /// `Transfer-Encoding` goes out with no body framing, as Hyper sends a request with
     /// an empty body, instead of `Transfer-Encoding: chunked` and an empty last chunk
     /// for a `POST` (`Http1xCodec::set_unframed_bodiless_requests`). Downstream and
-    /// HTTP/2 sessions ignore it; the owned HTTP/1.1 upstream driver refuses it.
+    /// HTTP/2 sessions ignore it; the owned HTTP/1.1 upstream driver honors it.
     pub unframed_bodiless_http1_requests: bool,
     /// Roxygen-only, default off (`DIV-038`): set by an owner that enabled
     /// `OwnedByteStream::enable_non_abortive_close` on the transport. An HTTP/1.1
