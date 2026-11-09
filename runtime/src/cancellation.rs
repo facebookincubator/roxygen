@@ -480,6 +480,7 @@ impl fmt::Debug for CancellationRegistration {
 }
 
 impl CancellationRegistration {
+    #[inline]
     pub(crate) fn unregister(mut self) -> bool {
         let mut registry = self.state.registry();
         if let Some(id) = self.id.take() {
