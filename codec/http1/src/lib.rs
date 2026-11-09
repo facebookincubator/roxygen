@@ -558,6 +558,8 @@ pub struct Http1xCodec {
     force_1_1: bool,
     strict_validation: bool,
     downstream_upgrade_as_ordinary: bool,
+    /// Roxygen-only (`DIV-036`): a request head that ends its message gets no body framing.
+    unframed_bodiless_requests: bool,
     /// The last request stream parsed under `downstream_upgrade_as_ordinary`, or unspecified.
     last_ordinary_request: StreamId,
     upstream_upgrade_as_ordinary: bool,
@@ -642,6 +644,7 @@ impl Http1xCodec {
             force_1_1,
             strict_validation,
             downstream_upgrade_as_ordinary: false,
+            unframed_bodiless_requests: false,
             last_ordinary_request: StreamId::UNSPECIFIED,
             upstream_upgrade_as_ordinary: false,
             ordinary_request_sent: false,
@@ -708,6 +711,18 @@ impl Http1xCodec {
     /// codec's upgrade handling. It has no effect on a downstream codec.
     pub fn set_upstream_upgrade_as_ordinary(&mut self, enabled: bool) {
         self.upstream_upgrade_as_ordinary = enabled;
+    }
+
+    /// Roxygen-only (`DIV-036`): an upstream request whose head ends the message (it has no
+    /// body) and that carries neither `Content-Length` nor a chunked `Transfer-Encoding` is sent
+    /// with no body framing at all, as Hyper sends a request with an empty body, instead of the
+    /// reference codec's `Transfer-Encoding: chunked` and empty last chunk for a `POST` (or,
+    /// where chunking is not allowed, `Connection: close`). A head with framing of the caller's
+    /// is generated exactly as without the option (a caller's chunked `Transfer-Encoding` with no
+    /// body still closes the connection), and a request that has a body is framed as before.
+    /// Off by default. It has no effect on a downstream codec.
+    pub fn set_unframed_bodiless_requests(&mut self, enabled: bool) {
+        self.unframed_bodiless_requests = enabled;
     }
 
     /// Releases upstream egress ownership as soon as the request completes.
@@ -2011,8 +2026,14 @@ impl Http1xCodec {
             output.extend_from_slice(b"\r\n");
         }
 
+        // `DIV-036`: only a head that ends its message with no framing of the
+        // caller's goes out unframed.
+        let unframed = end_stream
+            && self.unframed_bodiless_requests
+            && !transfer_encoding_written
+            && deferred_content_length.is_none();
         let body_check = (!upstream && !self.expect_no_response_body && !self.egress_upgrade)
-            || (upstream && (method == Some(HttpMethod::Post) || self.egress_chunked));
+            || (upstream && !unframed && (method == Some(HttpMethod::Post) || self.egress_chunked));
         self.egress_chunked &= transfer_encoding_written;
         if body_check && !self.egress_chunked && deferred_content_length.is_none() {
             if !transfer_encoding_written && self.may_chunk_egress {

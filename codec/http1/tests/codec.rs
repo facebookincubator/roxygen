@@ -9005,3 +9005,118 @@ fn a_chunk_terminator_inside_one_segment_takes_one_parse_turn() {
         );
     }
 }
+
+fn generate_post_head(unframed: bool, end_stream: bool, content_length: Option<&[u8]>) -> Vec<u8> {
+    let mut codec = Http1xCodec::new(TransportDirection::Upstream);
+    codec.set_unframed_bodiless_requests(unframed);
+    let stream = codec.create_stream();
+    let mut message = request(HttpMethod::Post, b"/generate", (1, 1));
+    if let Some(content_length) = content_length {
+        message
+            .headers_mut()
+            .set(HttpHeaderCode::ContentLength, content_length);
+    }
+    generate(
+        &mut codec,
+        EgressFrame::Headers {
+            stream,
+            message: &message,
+            end_stream,
+            extra_headers: None,
+        },
+    )
+}
+
+#[test]
+fn a_bodiless_post_is_framed_as_an_empty_chunked_body_by_default() {
+    assert_eq!(
+        generate_post_head(false, true, None),
+        b"POST /generate HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n0\r\n\r\n"
+    );
+}
+
+#[test]
+fn a_bodiless_post_has_no_body_framing_when_enabled() {
+    assert_eq!(
+        generate_post_head(true, true, None),
+        b"POST /generate HTTP/1.1\r\nConnection: keep-alive\r\n\r\n"
+    );
+}
+
+#[test]
+fn a_post_with_a_body_still_auto_chunks_when_enabled() {
+    assert_eq!(
+        generate_post_head(true, false, None),
+        b"POST /generate HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"
+    );
+}
+
+#[test]
+fn an_explicit_zero_content_length_is_kept_when_enabled() {
+    assert_eq!(
+        generate_post_head(true, true, Some(b"0")),
+        b"POST /generate HTTP/1.1\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n"
+    );
+}
+
+#[test]
+fn a_bodiless_http10_post_keeps_the_connection_when_enabled() {
+    let mut codec = Http1xCodec::new(TransportDirection::Upstream);
+    codec.set_unframed_bodiless_requests(true);
+    let stream = codec.create_stream();
+    let mut message = request(HttpMethod::Post, b"/", (1, 0));
+    message
+        .headers_mut()
+        .set(HttpHeaderCode::Connection, b"keep-alive");
+    let head = generate(
+        &mut codec,
+        EgressFrame::Headers {
+            stream,
+            message: &message,
+            end_stream: true,
+            extra_headers: None,
+        },
+    );
+    assert_eq!(head, b"POST / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n");
+    assert!(codec.is_reusable());
+}
+
+/// The head of a bodiless POST that carries the caller's own chunked
+/// `Transfer-Encoding`, and whether the connection stays reusable after it.
+fn bodiless_post_with_chunked_transfer_encoding(unframed: bool) -> (Vec<u8>, bool) {
+    let mut codec = Http1xCodec::new(TransportDirection::Upstream);
+    codec.set_unframed_bodiless_requests(unframed);
+    let stream = codec.create_stream();
+    let mut message = request(HttpMethod::Post, b"/generate", (1, 1));
+    message
+        .headers_mut()
+        .set(HttpHeaderCode::TransferEncoding, b"chunked");
+    let head = generate(
+        &mut codec,
+        EgressFrame::Headers {
+            stream,
+            message: &message,
+            end_stream: true,
+            extra_headers: None,
+        },
+    );
+    (head, codec.is_reusable())
+}
+
+/// Caller framing is the caller's: a chunked `Transfer-Encoding` on a head that
+/// ends the message gets no last chunk, so the connection must close after it,
+/// with the option as without it. Reusing it would let a server that answers
+/// without reading the body parse the next request as chunk data.
+#[test]
+fn a_bodiless_post_with_caller_chunked_framing_closes_the_connection_when_enabled() {
+    let expected = (
+        b"POST /generate HTTP/1.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            .to_vec(),
+        false,
+    );
+    assert_eq!(
+        bodiless_post_with_chunked_transfer_encoding(false),
+        expected
+    );
+    assert_eq!(bodiless_post_with_chunked_transfer_encoding(true), expected);
+}

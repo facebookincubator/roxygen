@@ -1163,7 +1163,7 @@ fn submit_exclusive_and_source_parts_match_h2_contracts() {
 #[test]
 fn owned_h1_upstream_rejects_unsupported_config() {
     type Change = fn(&mut OwnedH1Options);
-    let cases: [(&str, Change, ByteEventCapability); 12] = [
+    let cases: [(&str, Change, ByteEventCapability); 13] = [
         (
             "read_timeout",
             |options| options.io.read_timeout = Duration::from_secs(1),
@@ -1197,6 +1197,11 @@ fn owned_h1_upstream_rejects_unsupported_config() {
         (
             "deliver_ingress_before_abort",
             |options| options.io.deliver_ingress_before_abort = true,
+            ByteEventCapability::Unsupported,
+        ),
+        (
+            "unframed_bodiless_http1_requests",
+            |options| options.io.unframed_bodiless_http1_requests = true,
             ByteEventCapability::Unsupported,
         ),
         (

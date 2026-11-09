@@ -405,6 +405,13 @@ pub struct UniplexConfig {
     /// a later error, instead of being discarded. Both directions; the owned drivers
     /// refuse it.
     pub deliver_ingress_before_abort: bool,
+    /// Roxygen-only, default off (`DIV-036`): an upstream HTTP/1.1 request whose head
+    /// ends the message and carries neither `Content-Length` nor a chunked
+    /// `Transfer-Encoding` goes out with no body framing, as Hyper sends a request with
+    /// an empty body, instead of `Transfer-Encoding: chunked` and an empty last chunk
+    /// for a `POST` (`Http1xCodec::set_unframed_bodiless_requests`). Downstream and
+    /// HTTP/2 sessions ignore it; the owned HTTP/1.1 upstream driver refuses it.
+    pub unframed_bodiless_http1_requests: bool,
 }
 
 impl Default for UniplexConfig {
@@ -422,6 +429,7 @@ impl Default for UniplexConfig {
             wait_for_http1_response_on_drain: false,
             abort_exchanges_on_eof: false,
             deliver_ingress_before_abort: false,
+            unframed_bodiless_http1_requests: false,
         }
     }
 }
@@ -3886,7 +3894,9 @@ impl UniplexSession {
             )?);
             (codec, Some(connection_window_transition))
         } else {
-            (DriverCodec::Http1(Http1xCodec::new(direction)), None)
+            let mut codec = Http1xCodec::new(direction);
+            codec.set_unframed_bodiless_requests(config.unframed_bodiless_http1_requests);
+            (DriverCodec::Http1(codec), None)
         };
         let http2_state = http2_config.clone().map(|config| {
             let mut http2 = Box::new(Http2DriverState::new(config, context.host().clone()));

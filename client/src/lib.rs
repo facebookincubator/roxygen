@@ -1110,3 +1110,11 @@ mod ingress_before_abort_tests;
 #[cfg(test)]
 #[path = "../tests/request_retry_signals.rs"]
 mod request_retry_signals_tests;
+
+#[cfg(test)]
+#[path = "../tests/bodiless_request.rs"]
+mod bodiless_request_tests;
+
+#[cfg(test)]
+#[path = "../tests/recommended_router_params.rs"]
+mod recommended_router_params_tests;

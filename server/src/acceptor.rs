@@ -648,6 +648,7 @@ pub(crate) fn attach_session(
         wait_for_http1_response_on_drain: false,
         abort_exchanges_on_eof: config.session.abort_exchanges_on_eof,
         deliver_ingress_before_abort: false,
+        unframed_bodiless_http1_requests: false,
     };
     if let Some(limits) = transport_limits {
         uniplex.maximum_read_size = uniplex.maximum_read_size.min(limits.maximum_read_size());

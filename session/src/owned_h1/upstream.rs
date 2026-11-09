@@ -26,8 +26,8 @@
 //! `UniplexSession`, a failed read fails the connection only after every byte read before it is
 //! parsed, flow control included.
 //! [`OwnedH1UpstreamSession::new`] validates [`UniplexConfig`] as [`OwnedH1Session::new`]
-//! does, except that `drain_request_body_on_drop` must be false. DIV-029 lists where this
-//! driver differs from `UniplexSession`'s client.
+//! does, except that `drain_request_body_on_drop` and `unframed_bodiless_http1_requests`
+//! must be false. DIV-029 lists where this driver differs from `UniplexSession`'s client.
 
 use std::cell::RefCell;
 
@@ -1199,6 +1199,7 @@ impl UpstreamDriver {
             || io.wait_for_http1_response_on_drain
             || io.abort_exchanges_on_eof
             || io.deliver_ingress_before_abort
+            || io.unframed_bodiless_http1_requests
             || transport.byte_event_capability(&context)? != ByteEventCapability::Unsupported
         {
             return Err(failure(

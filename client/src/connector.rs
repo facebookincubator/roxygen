@@ -1119,6 +1119,11 @@ pub struct SessionParams {
     /// received, in order, before the error, as Hyper's body channel and h2 do.
     /// Off, the frozen behavior, the error discards them.
     pub deliver_ingress_before_abort: bool,
+    /// Roxygen-only, default off (`DIV-036`): an HTTP/1.1 request whose head ends the
+    /// message (no body) and carries neither `Content-Length` nor a chunked
+    /// `Transfer-Encoding` goes out with no body framing, as reqwest sends a `POST`
+    /// with an empty body, instead of an empty chunked body. HTTP/2 sessions ignore it.
+    pub unframed_bodiless_http1_requests: bool,
 }
 
 /// Attaches already-connected I/O without performing DNS, TLS, or routing.
@@ -1172,6 +1177,7 @@ pub(crate) fn uniplex_config_for_session_params(session: &SessionParams) -> Unip
         config.write_timeout = timeout;
     }
     config.deliver_ingress_before_abort = session.deliver_ingress_before_abort;
+    config.unframed_bodiless_http1_requests = session.unframed_bodiless_http1_requests;
     config
 }
 
