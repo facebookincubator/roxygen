@@ -208,7 +208,7 @@ pub fn get_default_cert_verifier() -> Option<Arc<dyn TlsCertificateVerifier>> {
         .clone()
 }
 
-fn client_error(code: HttpErrorCode, message: impl AsRef<[u8]>) -> HttpError {
+pub(crate) fn client_error(code: HttpErrorCode, message: impl AsRef<[u8]>) -> HttpError {
     HttpError::with_message(code, message)
 }
 
@@ -1221,6 +1221,10 @@ fn session_completion_outcome(completion: &SessionCompletion) -> Option<SessionO
 pub(crate) struct SessionCompletionPublisher(Option<SessionCompletion>);
 
 impl SessionCompletionPublisher {
+    pub(crate) fn new(completion: &SessionCompletion) -> Self {
+        Self(Some(Rc::clone(completion)))
+    }
+
     pub(crate) fn publish(mut self, outcome: SessionOutcome) {
         if let Some(completion) = self.0.take() {
             let waiters = {
@@ -2024,8 +2028,7 @@ impl SessionConnector for HttpConnector {
             {
                 return Err(non_abortive_close_with_tls());
             }
-            let limits = ByteStreamLimits::new(256 * 1024, 256 * 1024, 1_024)
-                .expect("client byte-stream limits are nonzero");
+            let limits = client_byte_stream_limits();
             connection.configure_tls_options();
             let tcp_options = connection.tcp_options.clone();
             let tls_stats = connection.tls_stats.clone();
@@ -2033,35 +2036,16 @@ impl SessionConnector for HttpConnector {
             let (transport, protocol, metadata, tls_session_reused, transport_retirement) =
                 match connection.transport {
                     ClientTransportOptions::Plaintext => {
-                        let connected = TcpTransport::connect_with_options(
+                        let (transport, metadata) = dial_plaintext(
                             &context,
                             address,
                             limits,
                             timeout,
                             cancellation,
                             tcp_options,
+                            session.non_abortive_close,
                         )
-                        .await;
-                        tokio::task::yield_now().await;
-                        if post_connect_cancellation.is_cancellation_requested() {
-                            if let Ok(transport) = &connected {
-                                let _ = ByteStreamTransport::close(transport, &context);
-                            }
-                            return Err(client_error(
-                                HttpErrorCode::CORO_CANCELLED,
-                                b"client connect cancelled after transport completion",
-                            ));
-                        }
-                        let transport = connected?;
-                        if session.non_abortive_close {
-                            transport.enable_non_abortive_close(&context)?;
-                        }
-                        let metadata = connection_context(
-                            &context,
-                            &transport,
-                            TransportSecurity::Plaintext,
-                            None,
-                        )?;
+                        .await?;
                         let transport_retirement = transport.retirement();
                         (
                             Rc::new(transport) as Rc<dyn UniplexTransport>,
@@ -2136,16 +2120,62 @@ impl SessionConnector for HttpConnector {
     }
 }
 
+/// The byte-stream limits of the connections a connector dials.
+pub(crate) fn client_byte_stream_limits() -> ByteStreamLimits {
+    ByteStreamLimits::new(256 * 1024, 256 * 1024, 1_024)
+        .expect("client byte-stream limits are nonzero")
+}
+
+/// Dials a plaintext TCP connection and reads its connection context, enabling
+/// `non_abortive_close` (`DIV-038`) first. A cancellation that lands while the
+/// connect completes closes the connected transport.
+pub(crate) async fn dial_plaintext(
+    context: &WorkerContext,
+    address: SocketAddress,
+    limits: ByteStreamLimits,
+    timeout: Duration,
+    cancellation: CancellationToken,
+    tcp_options: TcpConnectOptions,
+    non_abortive_close: bool,
+) -> Result<(OwnedByteStream, Arc<ConnectionContext>), HttpError> {
+    let post_connect_cancellation = cancellation.clone();
+    let connected = TcpTransport::connect_with_options(
+        context,
+        address,
+        limits,
+        timeout,
+        cancellation,
+        tcp_options,
+    )
+    .await;
+    tokio::task::yield_now().await;
+    if post_connect_cancellation.is_cancellation_requested() {
+        if let Ok(transport) = &connected {
+            let _ = ByteStreamTransport::close(transport, context);
+        }
+        return Err(client_error(
+            HttpErrorCode::CORO_CANCELLED,
+            b"client connect cancelled after transport completion",
+        ));
+    }
+    let transport = connected?;
+    if non_abortive_close {
+        transport.enable_non_abortive_close(context)?;
+    }
+    let metadata = connection_context(context, &transport, TransportSecurity::Plaintext, None)?;
+    Ok((transport, metadata))
+}
+
 /// The TLS adapter's own failure paths reset, so `SessionParams::non_abortive_close`
 /// is plaintext only (`DIV-038`).
-fn non_abortive_close_with_tls() -> HttpError {
+pub(crate) fn non_abortive_close_with_tls() -> HttpError {
     client_error(
         HttpErrorCode::INVALID_STATE_TRANSITION,
         b"non_abortive_close does not support TLS",
     )
 }
 
-fn check_attachment_admission(
+pub(crate) fn check_attachment_admission(
     context: &WorkerContext,
     cancellation: &CancellationToken,
 ) -> Result<(), HttpError> {
@@ -2170,7 +2200,7 @@ fn check_attachment_admission(
     Ok(())
 }
 
-fn connection_context(
+pub(crate) fn connection_context(
     context: &WorkerContext,
     transport: &impl ByteStreamTransport,
     security: TransportSecurity,
@@ -2221,31 +2251,7 @@ fn start_client_session(
         ));
     }
     let protocol_config = if protocol == CodecProtocol::Http2 {
-        let settings = normalized_http2_settings(&session.settings);
-        let stream_receive_window = settings
-            .iter()
-            .rev()
-            .find(|setting| setting.identifier == 4)
-            .and_then(|setting| u32::try_from(setting.value).ok())
-            .unwrap_or(DEFAULT_STREAM_FLOW_CONTROL);
-        UniplexProtocolConfig::Http2(Http2SessionConfig {
-            settings,
-            connection_receive_window: session
-                .connection_flow_control
-                .unwrap_or(DEFAULT_CONNECTION_FLOW_CONTROL),
-            stream_receive_window,
-            max_concurrent_outgoing_streams: session
-                .max_concurrent_outgoing_streams
-                .filter(|maximum| *maximum != 0)
-                .unwrap_or(100),
-            stats: session.session_stats.as_ref().map(|stats| {
-                Rc::new(Http2ClientSessionStats(Rc::clone(stats))) as Rc<dyn Http2SessionStats>
-            }),
-            header_codec_stats: session.header_codec_stats.clone(),
-            header_indexing_strategy: session.header_indexing_strategy.clone(),
-            ping_probes: session.ping_probes,
-            ..Http2SessionConfig::default()
-        })
+        UniplexProtocolConfig::Http2(http2_session_config(&session))
     } else {
         UniplexProtocolConfig::Http1 {
             stats: session.session_stats.as_ref().map(|stats| {
@@ -2515,6 +2521,35 @@ impl HttpConnector {
                 },
             }
         })
+    }
+}
+
+/// The HTTP/2 session configuration `session` selects for a client session.
+pub(crate) fn http2_session_config(session: &SessionParams) -> Http2SessionConfig {
+    let settings = normalized_http2_settings(&session.settings);
+    let stream_receive_window = settings
+        .iter()
+        .rev()
+        .find(|setting| setting.identifier == 4)
+        .and_then(|setting| u32::try_from(setting.value).ok())
+        .unwrap_or(DEFAULT_STREAM_FLOW_CONTROL);
+    Http2SessionConfig {
+        settings,
+        connection_receive_window: session
+            .connection_flow_control
+            .unwrap_or(DEFAULT_CONNECTION_FLOW_CONTROL),
+        stream_receive_window,
+        max_concurrent_outgoing_streams: session
+            .max_concurrent_outgoing_streams
+            .filter(|maximum| *maximum != 0)
+            .unwrap_or(100),
+        stats: session.session_stats.as_ref().map(|stats| {
+            Rc::new(Http2ClientSessionStats(Rc::clone(stats))) as Rc<dyn Http2SessionStats>
+        }),
+        header_codec_stats: session.header_codec_stats.clone(),
+        header_indexing_strategy: session.header_indexing_strategy.clone(),
+        ping_probes: session.ping_probes,
+        ..Http2SessionConfig::default()
     }
 }
 

@@ -4,6 +4,7 @@
 
 mod connect_session;
 pub mod connector;
+pub mod experimental;
 pub mod pool;
 
 use std::cell::RefCell;
