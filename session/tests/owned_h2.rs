@@ -12,10 +12,13 @@ use roxygen_http2::hpack::HpackDecoder;
 use roxygen_http2::hpack::HpackEncodeBuffer;
 use roxygen_http2::hpack::HpackEncoder;
 use roxygen_http2::hpack::HpackHeader;
+use roxygen_runtime::tokio_host::ManagedWorkerError;
 
 use super::*;
 use crate::external_host_tests::ManualHost;
 use crate::external_host_tests::YieldMode;
+use crate::external_host_tests::after_forced_teardown;
+use crate::external_host_tests::forced_teardown_of_scope;
 use crate::http2::StreamReceiveWindowMode;
 use crate::owned_h2::OwnedH2Application;
 use crate::owned_h2::OwnedH2Exchange;
@@ -2794,6 +2797,41 @@ fn abandoning_a_started_run_signals_io_and_reports_the_missing_join() {
             assert!(catch_unwind(AssertUnwindSafe(|| drop(unstarted.run()))).is_ok());
         })
     });
+}
+
+/// `DIV-043`: a worker whose teardown deadline has passed destroys a started owned HTTP/2
+/// downstream, here waiting for its client's preface, before its application and native I/O
+/// cleanup joined. That destruction is an abandonment: the driver still resets the transport,
+/// and the worker reports a clean overrun instead of a panic.
+#[test]
+fn a_forced_worker_teardown_abandons_an_owned_h2_downstream() {
+    let (inspected_tx, inspected_rx) = std::sync::mpsc::channel();
+    let completion = forced_teardown_of_scope(move |context| {
+        // The read is never notified and ignores cancellation, so the driver's native I/O cleanup
+        // cannot join before the forced teardown destroys it.
+        let (transport, state) = FixtureTransport::new([FixtureRead::WaitData(
+            Arc::new(tokio::sync::Notify::new()),
+            Vec::new(),
+        )]);
+        let (application, _probes) = Application::new(vec![]);
+        let (session, handle) =
+            OwnedH2Session::new(application, options(context, transport)).unwrap();
+        after_forced_teardown(move || inspected_tx.send(state.borrow().close).unwrap());
+        Box::pin(async move {
+            let _ = session.run().await;
+            drop(handle);
+        })
+    });
+    assert_eq!(
+        completion,
+        Err(ManagedWorkerError::TeardownDeadlineExceeded),
+        "the forced destruction of the unjoined driver is a clean overrun"
+    );
+    assert_eq!(
+        inspected_rx.recv().unwrap(),
+        FixtureClose::Reset,
+        "the abandoned driver reset its transport"
+    );
 }
 
 #[test]

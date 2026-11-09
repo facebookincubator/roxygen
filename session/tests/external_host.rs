@@ -1,8 +1,10 @@
+use std::any::Any;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::future::Future;
 use std::future::poll_fn;
 use std::mem;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::rc::Weak;
@@ -40,6 +42,10 @@ use roxygen_runtime::host::LocalHost;
 use roxygen_runtime::host::timer::WheelStats;
 use roxygen_runtime::host::timer::WheelTimer;
 use roxygen_runtime::host::timer::WheelWakeup;
+use roxygen_runtime::tokio_host::HostedWorker;
+use roxygen_runtime::tokio_host::HostedWorkerJoin;
+use roxygen_runtime::tokio_host::HostedWorkerOptions;
+use roxygen_runtime::tokio_host::ManagedWorkerError;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_transport::byte_event::AsyncSocketByteEventObserver;
 use roxygen_transport::byte_event::ByteEventOffsets;
@@ -303,6 +309,74 @@ impl LocalHost for ManualHost {
 
 thread_local! {
     static RUNNING_HOST: RefCell<Option<Rc<ManualHost>>> = const { RefCell::new(None) };
+    /// What `after_forced_teardown` registered on a forced teardown's owner thread.
+    static AFTER_FORCED_TEARDOWN: RefCell<Option<Box<dyn FnOnce()>>> =
+        const { RefCell::new(None) };
+}
+
+/// Runs `inspect` on the owner thread of `forced_teardown_of_scope`'s worker, from its stop
+/// hook, once every task of the worker was dropped.
+pub(crate) fn after_forced_teardown(inspect: impl FnOnce() + 'static) {
+    AFTER_FORCED_TEARDOWN.set(Some(Box::new(inspect)));
+}
+
+/// Starts the future that `start` builds on the owner thread of a fresh `HostedWorker` as a
+/// worker scope, as `OwnedClientSession` runs an owned driver. Once the scope's first poll has
+/// returned `Pending`, shuts the worker down with a teardown deadline that has already passed
+/// (`DIV-043`), so its supervisor destroys the scope unfinished, and returns the worker's
+/// completion. The shutdown can land while the owner thread is still in that poll's turn, so a
+/// scope that could finish once cancelled may finish first and the worker then joins cleanly:
+/// the scope must hold something its cancellation cannot finish, such as a transport read that
+/// ignores cancellation, for the teardown to always destroy it unfinished.
+pub(crate) fn forced_teardown_of_scope(
+    start: impl FnOnce(WorkerContext) -> LocalFuture + Send + 'static,
+) -> Result<(), ManagedWorkerError> {
+    let worker = HostedWorker::spawn(HostedWorkerOptions {
+        command_capacity: NonZeroUsize::new(4).expect("nonzero capacity"),
+        thread_name: "rox-forced-teardown".to_owned(),
+        on_owner_thread_stop: Some(Box::new(|| {
+            if let Some(inspect) = AFTER_FORCED_TEARDOWN.take() {
+                inspect();
+            }
+        })),
+    })
+    .expect("worker starts");
+    let (polled_tx, polled_rx) = std::sync::mpsc::channel();
+    worker
+        .handle()
+        .spawn_local(move |context| {
+            let mut scope = start(context.clone());
+            let mut polled = Some(polled_tx);
+            context
+                .register_scope(poll_fn(move |task| {
+                    let poll = scope.as_mut().poll(task);
+                    if let Some(polled) = polled.take() {
+                        polled
+                            .send(poll.is_pending())
+                            .expect("test observes the poll");
+                    }
+                    poll
+                }))
+                .expect("scope registered while open")
+                .activate()
+                .expect("scope activated while open")
+                .detach();
+            std::future::ready(())
+        })
+        .expect("command admitted");
+    assert!(
+        polled_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the scope is polled"),
+        "the scope is still running after its first poll"
+    );
+    // The passed deadline can wake the supervisor, which then begins the shutdown itself,
+    // before this call does.
+    worker.shutdown_by(Instant::now());
+    match worker.join_by(Instant::now() + Duration::from_secs(10)) {
+        HostedWorkerJoin::Joined(completion) => completion,
+        HostedWorkerJoin::Detached => panic!("the forced teardown ends within 10 s"),
+    }
 }
 
 pub(crate) fn run_on_host<T: Send + 'static>(
@@ -379,6 +453,15 @@ fn run_on_manual_host<T: Send + 'static>(
         implementation.advance(deadline.saturating_duration_since(implementation.current_time()));
     }
     panic!("hosted worker did not complete within 100 timer turns");
+}
+
+/// The text of a panic payload.
+pub(crate) fn panic_text(payload: Box<dyn Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .expect("a text panic")
 }
 
 pub(crate) fn poll_once<F: Future + ?Sized>(future: Pin<&mut F>) -> Poll<F::Output> {

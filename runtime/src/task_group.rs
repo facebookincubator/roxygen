@@ -975,12 +975,25 @@ impl TaskGroup {
 
     /// Closes admission and aborts all remaining futures on their owner thread.
     pub fn abort_all(&mut self) {
+        self.abort_remaining(false);
+    }
+
+    /// `abort_all`, which with `take_panic` also takes the first panic that a task raises as
+    /// this abort destroys it.
+    fn abort_remaining(&mut self, take_panic: bool) -> Option<Payload> {
         self.close();
+        let mut raised = None;
         for (seq, slot) in self.tasks.keys_by_id() {
-            if let Some(state) = self.tasks.get(slot, seq) {
-                state.finish(Err(TaskGroupError::TaskCancelled));
+            let Some(state) = self.tasks.get(slot, seq) else {
+                continue;
+            };
+            let destroyed = !state.completed.get();
+            state.finish(Err(TaskGroupError::TaskCancelled));
+            if take_panic && destroyed && raised.is_none() {
+                raised = state.panic.borrow_mut().take();
             }
         }
+        raised
     }
 
     pub async fn join(&mut self) -> Result<(), TaskGroupError> {
@@ -1028,6 +1041,28 @@ impl Default for TaskGroup {
     }
 }
 
+thread_local! {
+    /// Set on a `HostedWorker`'s owner thread when its supervisor destroys the worker's driver
+    /// past the teardown deadline (`DIV-043`), and never cleared: the thread only tears down
+    /// from then on.
+    static FORCED_TEARDOWN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Roxygen-only (`DIV-043`): whether this thread is the owner thread of a `HostedWorker` whose
+/// teardown passed its deadline, so that its supervisor destroyed the worker's driver and every
+/// unfinished cleanup. Every later drop on the thread belongs to that forced teardown, which
+/// abandons the work it finds unjoined: a drop that asserts an ordinary teardown joined its
+/// work, as a task group's or an owned session driver's does, does not assert it then, but
+/// still raises a panic that work raises as it is destroyed.
+pub fn in_forced_teardown() -> bool {
+    FORCED_TEARDOWN.get()
+}
+
+/// Marks this owner thread's teardown as forced (`DIV-043`).
+pub(crate) fn begin_forced_teardown() {
+    FORCED_TEARDOWN.set(true);
+}
+
 impl Drop for TaskGroup {
     fn drop(&mut self) {
         self.assert_owner_thread();
@@ -1039,17 +1074,34 @@ impl Drop for TaskGroup {
                     source.request_cancellation();
                 }
             }));
-            self.abort_all();
-            if let Err(payload) = cancellation {
-                resume_unwind(payload);
+            let raised = self.abort_remaining(in_forced_teardown());
+            let payload = match cancellation {
+                Err(payload) => {
+                    // The cancellation's panic wins. The task's is disposed of here: dropped as
+                    // the cancellation's panic unwinds, a payload whose destructor panics would
+                    // abort the process.
+                    if let Some(raised) = raised {
+                        crate::panic::discard_panic(raised);
+                    }
+                    Some(payload)
+                }
+                Ok(()) => raised,
+            };
+            if let Some(payload) = payload {
+                // Resumed while the thread already unwinds, it would abort the process.
+                if std::thread::panicking() {
+                    crate::panic::discard_panic(payload);
+                } else {
+                    resume_unwind(payload);
+                }
             }
         }
         assert!(
-            !self.accepting,
+            !self.accepting || in_forced_teardown(),
             "task group must be explicitly closed before drop"
         );
         assert!(
-            !had_tasks,
+            !had_tasks || in_forced_teardown(),
             "task group must join every admitted task before drop"
         );
     }

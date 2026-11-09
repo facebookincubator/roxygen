@@ -13,6 +13,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::net::TcpListener;
+use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -48,6 +49,10 @@ use roxygen_runtime::cancellation::CancellationSource;
 use roxygen_runtime::cancellation::CancellationToken;
 use roxygen_runtime::managed::RuntimeConfig;
 use roxygen_runtime::managed::RuntimeOwner;
+use roxygen_runtime::tokio_host::HostedWorker;
+use roxygen_runtime::tokio_host::HostedWorkerJoin;
+use roxygen_runtime::tokio_host::HostedWorkerOptions;
+use roxygen_runtime::tokio_host::ManagedWorkerError;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_transport::tls::TlsClientOptions;
 
@@ -2024,6 +2029,71 @@ fn max_connections_zero_disables_reuse() {
             (closed, replaced, body, origin.accepted()),
             (true, true, b"ok".to_vec(), 2),
             "{protocol:?}: the released session closes, and the next exchange dials anew"
+        );
+    }
+}
+
+/// `DIV-043`, as a router's late teardown meets it: a `HostedWorker` whose
+/// teardown deadline has passed destroys an owned pool, its session midway
+/// through a streamed response, before the session's native I/O cleanup and
+/// the pool's task join finished. That destruction is an abandonment: the
+/// worker reports a clean overrun instead of a panic.
+#[test]
+fn a_forced_worker_teardown_abandons_an_owned_pool_mid_response() {
+    for protocol in PROTOCOLS {
+        let origin = Origin::start(protocol);
+        let address = origin.address;
+        let worker = HostedWorker::spawn(HostedWorkerOptions {
+            command_capacity: NonZeroUsize::new(4).expect("nonzero capacity"),
+            thread_name: "rox-owned-pool-forced".to_owned(),
+            on_owner_thread_stop: None,
+        })
+        .expect("worker starts");
+        let (streaming_tx, streaming_rx) = std::sync::mpsc::channel();
+        worker
+            .handle()
+            .spawn_local(move |context| async move {
+                let pool = pool(&context, address, protocol, 2);
+                let acquired = acquire(&pool).await;
+                let (head, body) = request("/slow").await;
+                let response = acquired
+                    .reservation
+                    .submit(head, body, CancellationToken::never())
+                    .await
+                    .expect("request is committed");
+                let mut source = response.source.into_source_owner().into_source_holder();
+                let head = source.read_header_event().await.expect("response head");
+                let first = source.read_body_event(u32::MAX).await.expect("first chunk");
+                let _cleanup = context
+                    .register_cleanup_task(async move {
+                        std::future::pending::<()>().await;
+                        drop((pool, acquired.session, source));
+                    })
+                    .expect("streaming pool cleanup registered");
+                streaming_tx
+                    .send((head.headers().response_status(), first.eom()))
+                    .expect("test observes the response");
+                std::future::pending::<()>().await;
+            })
+            .expect("command admitted");
+        assert_eq!(
+            streaming_rx.recv_timeout(TIMEOUT),
+            Ok((Some(200), false)),
+            "{protocol:?}: the response is streaming"
+        );
+
+        // The passed deadline can wake the supervisor, which then begins the
+        // shutdown itself.
+        worker.shutdown_by(Instant::now());
+        let completion = match worker.join_by(Instant::now() + TIMEOUT) {
+            HostedWorkerJoin::Joined(completion) => completion,
+            HostedWorkerJoin::Detached => panic!("{protocol:?}: the teardown ends in time"),
+        };
+        assert_eq!(
+            completion,
+            Err(ManagedWorkerError::TeardownDeadlineExceeded),
+            "{protocol:?}: the forced destruction of the unjoined pool and session is a clean \
+             overrun"
         );
     }
 }

@@ -4,9 +4,14 @@
 use roxygen_core::ids::StreamId;
 use roxygen_core::source::LocalSourceFuture;
 use roxygen_core::stream_source::FlowControlState;
+use roxygen_runtime::tokio_host::ManagedWorkerError;
 
 use super::*;
 use crate::experimental::OwnedRequestProgressExt;
+use crate::external_host_tests::after_forced_teardown;
+use crate::external_host_tests::forced_teardown_of_scope;
+use crate::external_host_tests::panic_text;
+use crate::external_host_tests::poll_once;
 use crate::external_host_tests::run_on_host;
 use crate::external_host_tests::run_on_host_with;
 use crate::owned_h1::Http1DriverConfig;
@@ -1073,6 +1078,74 @@ fn upstream_teardown_is_clean() {
             drop(producer);
         })
     });
+}
+
+/// `DIV-043`: a worker whose teardown deadline has passed destroys an owned upstream with a
+/// request in flight before its native I/O cleanup joined. That destruction is an
+/// abandonment: the driver still resets the transport, and the worker reports a clean overrun
+/// instead of a panic.
+#[test]
+fn a_forced_worker_teardown_abandons_an_owned_upstream_mid_request() {
+    let (inspected_tx, inspected_rx) = std::sync::mpsc::channel();
+    let completion = forced_teardown_of_scope(move |context| {
+        let (transport, state) = ScriptedTransport::new([]);
+        let (session, handle) =
+            OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+        let submission = handle.reserve_request().unwrap().submit(
+            get_head(),
+            HttpSourceHolder::empty(),
+            CancellationToken::never(),
+        );
+        after_forced_teardown(move || {
+            let state = state.borrow();
+            inspected_tx
+                .send((state.close, state.writes.concat()))
+                .unwrap();
+        });
+        Box::pin(async move {
+            let _ = futures::join!(session.run(), async move {
+                let response = submission.await;
+                std::future::pending::<()>().await;
+                drop((handle, response));
+            });
+        })
+    });
+    assert_eq!(
+        completion,
+        Err(ManagedWorkerError::TeardownDeadlineExceeded),
+        "the forced destruction of the unjoined driver is a clean overrun"
+    );
+    let (close, writes) = inspected_rx.recv().unwrap();
+    assert!(
+        writes.starts_with(b"GET / HTTP/1.1\r\n"),
+        "the request was in flight: {:?}",
+        String::from_utf8_lossy(&writes)
+    );
+    assert_eq!(
+        close,
+        CloseKind::Reset,
+        "the abandoned driver reset its transport"
+    );
+}
+
+/// Outside a forced teardown, dropping a started owned upstream before its native I/O cleanup
+/// joined still asserts.
+#[test]
+fn dropping_a_started_owned_upstream_before_its_cleanup_joined_asserts() {
+    let message = run_on_host(|context| {
+        Box::pin(async move {
+            let (transport, _state) = ScriptedTransport::new([]);
+            let (session, _handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let mut run = Box::pin(session.run());
+            assert!(poll_once(run.as_mut()).is_pending());
+            panic_text(catch_unwind(AssertUnwindSafe(|| drop(run))).unwrap_err())
+        })
+    });
+    assert_eq!(
+        message,
+        "started owned H1 upstream runner dropped before native I/O cleanup joined"
+    );
 }
 
 /// One chunked response read either through `submit_exclusive`'s fresh source and its

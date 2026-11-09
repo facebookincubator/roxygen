@@ -10,9 +10,14 @@ use roxygen_core::ingress_completion::IngressCompletion;
 use roxygen_core::message::HttpMessage;
 use roxygen_core::source::LocalSourceFuture;
 use roxygen_core::stream_source::HttpStreamSourceOwner;
+use roxygen_runtime::tokio_host::ManagedWorkerError;
 
 use super::*;
 use crate::external_host_tests::YieldMode;
+use crate::external_host_tests::after_forced_teardown;
+use crate::external_host_tests::forced_teardown_of_scope;
+use crate::external_host_tests::panic_text;
+use crate::external_host_tests::poll_once;
 use crate::external_host_tests::run_on_host;
 use crate::external_host_tests::run_on_host_with;
 use crate::owned::OwnedApplication;
@@ -956,6 +961,79 @@ fn serial_exchanges_do_not_overlap() {
             ("drop", 1)
         ],
         "the second request's exchange is created only after the first retires"
+    );
+}
+
+/// `DIV-043`: a worker whose teardown deadline has passed destroys an owned downstream midway
+/// through a request body, before its application and native I/O cleanup joined. That
+/// destruction is an abandonment: the driver still cancels the exchange and resets the
+/// transport, and the worker reports a clean overrun instead of a panic.
+#[test]
+fn a_forced_worker_teardown_abandons_an_owned_downstream_mid_request() {
+    let (inspected_tx, inspected_rx) = std::sync::mpsc::channel();
+    let completion = forced_teardown_of_scope(move |context| {
+        // The second read is never notified and ignores cancellation, so the driver's native I/O
+        // cleanup cannot join before the forced teardown destroys it.
+        let (transport, state) = ScriptedTransport::new([
+            ReadAction::Data(
+                b"POST /upload HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nhal".to_vec(),
+            ),
+            ReadAction::WaitData(Arc::new(tokio::sync::Notify::new()), Vec::new()),
+        ]);
+        let (application, probes) = H1App::new(vec![Response::fixed(200, b"ok")]);
+        let (session, handle) =
+            OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+        after_forced_teardown(move || {
+            let cancelled: Vec<_> = probes
+                .borrow()
+                .iter()
+                .map(|probe| probe.cancelled.borrow().clone())
+                .collect();
+            inspected_tx
+                .send((state.borrow().close, cancelled))
+                .unwrap();
+        });
+        Box::pin(async move {
+            let _ = session.run().await;
+            drop(handle);
+        })
+    });
+    assert_eq!(
+        completion,
+        Err(ManagedWorkerError::TeardownDeadlineExceeded),
+        "the forced destruction of the unjoined driver is a clean overrun"
+    );
+    let (close, cancelled) = inspected_rx.recv().unwrap();
+    assert_eq!(
+        cancelled,
+        [vec![(HttpErrorCode::CORO_CANCELLED, false)]],
+        "the request's exchange was live and is cancelled"
+    );
+    assert_eq!(
+        close,
+        CloseKind::Reset,
+        "the abandoned driver reset its transport"
+    );
+}
+
+/// Outside a forced teardown, dropping a started owned downstream before its cleanup joined
+/// still asserts.
+#[test]
+fn dropping_a_started_owned_downstream_before_its_cleanup_joined_asserts() {
+    let message = run_on_host(|context| {
+        Box::pin(async move {
+            let (transport, _state) = ScriptedTransport::new([]);
+            let (application, _probes) = H1App::new(vec![]);
+            let (session, _handle) =
+                OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+            let mut run = Box::pin(session.run());
+            assert!(poll_once(run.as_mut()).is_pending());
+            panic_text(catch_unwind(AssertUnwindSafe(|| drop(run))).unwrap_err())
+        })
+    });
+    assert_eq!(
+        message,
+        "started owned H1 runner dropped before application and native I/O cleanup joined"
     );
 }
 

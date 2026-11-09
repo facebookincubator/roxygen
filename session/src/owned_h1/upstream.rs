@@ -2263,7 +2263,7 @@ impl Drop for UpstreamDriver {
                 }
             }
             assert!(
-                !self.started || std::thread::panicking(),
+                !self.started || std::thread::panicking() || in_forced_teardown(),
                 "started owned H1 upstream runner dropped before native I/O cleanup joined"
             );
         }

@@ -10,9 +10,12 @@ use roxygen_core::stream_source::HttpResponseSourceOwner;
 use roxygen_core::stream_source::HttpStreamSourceCallback;
 use roxygen_core::stream_source::HttpStreamSourceProducer;
 use roxygen_runtime::host::Host;
+use roxygen_runtime::tokio_host::ManagedWorkerError;
 
 use super::*;
 use crate::experimental::OwnedRequestProgressExt;
+use crate::external_host_tests::after_forced_teardown;
+use crate::external_host_tests::forced_teardown_of_scope;
 use crate::owned_h2::OwnedH2ExclusiveSubmission;
 use crate::owned_h2::OwnedH2Options;
 use crate::owned_h2::OwnedH2UpstreamHandle;
@@ -263,6 +266,52 @@ fn cancelled(run: Result<UniplexRunSummary, HttpError>) {
         run.expect_err("fixture ends by explicit cancellation")
             .code(),
         HttpErrorCode::CORO_CANCELLED
+    );
+}
+
+/// `DIV-043`: a worker whose teardown deadline has passed destroys an owned HTTP/2 upstream
+/// with a request in flight before its native I/O cleanup joined. That destruction is an
+/// abandonment: the driver still resets the transport, and the worker reports a clean overrun
+/// instead of a panic.
+#[test]
+fn a_forced_worker_teardown_abandons_an_owned_h2_upstream_mid_request() {
+    let (inspected_tx, inspected_rx) = std::sync::mpsc::channel();
+    let completion = forced_teardown_of_scope(move |context| {
+        let (transport, state) = FixtureTransport::new([]);
+        let (session, handle) = OwnedH2UpstreamSession::new(options(context, transport)).unwrap();
+        let submission = handle.reserve_request().unwrap().submit(
+            request_head(HttpMethod::Get, true, None),
+            HttpSourceHolder::empty(),
+            CancellationToken::never(),
+        );
+        after_forced_teardown(move || {
+            inspected_tx
+                .send((state.borrow().close, header_streams(&state)))
+                .unwrap();
+        });
+        Box::pin(async move {
+            let _ = futures::join!(session.run(), async move {
+                let response = submission.await;
+                std::future::pending::<()>().await;
+                drop((handle, response));
+            });
+        })
+    });
+    let (close, header_streams) = inspected_rx.recv().unwrap();
+    assert_eq!(
+        header_streams,
+        [StreamId::new(1)],
+        "the request was in flight"
+    );
+    assert_eq!(
+        completion,
+        Err(ManagedWorkerError::TeardownDeadlineExceeded),
+        "the forced destruction of the unjoined driver is a clean overrun"
+    );
+    assert_eq!(
+        close,
+        FixtureClose::Reset,
+        "the abandoned driver reset its transport"
     );
 }
 

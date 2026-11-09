@@ -80,6 +80,7 @@ use roxygen_runtime::host::Host;
 use roxygen_runtime::host::timer::Expiry;
 use roxygen_runtime::host::timer::Timeout;
 use roxygen_runtime::panic::discard_panic;
+use roxygen_runtime::task_group::in_forced_teardown;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_transport::byte_event::AsyncSocketByteEventObserver;
 use roxygen_transport::byte_event::ByteEventOffsets;
@@ -5001,7 +5002,7 @@ where
                 }
             }
             assert!(
-                !self.started || std::thread::panicking(),
+                !self.started || std::thread::panicking() || in_forced_teardown(),
                 "started owned H2 runner dropped before application and native I/O cleanup joined"
             );
         }

@@ -41,6 +41,7 @@ use crate::host::timer::WheelTimer;
 use crate::host::timer::WheelWakeup;
 use crate::task_group::TaskGroup;
 use crate::task_group::TaskGroupError;
+use crate::task_group::begin_forced_teardown;
 use crate::worker::PanicPayload;
 use crate::worker::QuiesceDeadline;
 use crate::worker::WorkerCreateError;
@@ -857,7 +858,9 @@ async fn run_managed_driver(
         Supervised::Joined(result) => result.map_err(ManagedWorkerError::from),
         Supervised::TeardownDeadlinePassed => {
             // Destroying the driver aborts its unfinished cleanup tasks and re-raises a
-            // command, cleanup or driver panic it recorded, which the join reports.
+            // command, cleanup or driver panic it recorded, which the join reports. The work
+            // they abandon unjoined, from here to the thread's exit, is expected.
+            begin_forced_teardown();
             tasks.abort_all();
             match tasks.join().await {
                 Err(TaskGroupError::TaskPanicked) => Err(TaskGroupError::TaskPanicked.into()),
@@ -1342,7 +1345,12 @@ impl HostedWorker {
     /// unfinished cleanup included, and `completion()` reports
     /// `ManagedWorkerError::TeardownDeadlineExceeded`, or
     /// `ManagedWorkerError::TaskGroup(TaskPanicked)` if a command, cleanup or the
-    /// driver panicked, as without a deadline. The owner thread then drops its
+    /// driver panicked, as without a deadline. That destruction abandons the work it
+    /// finds unjoined: from then until the owner thread exits,
+    /// [`crate::task_group::in_forced_teardown`] holds there, and a task group or an
+    /// owned session driver dropped with work unjoined still cancels that work, and
+    /// raises a panic that work raises as it is destroyed, but does not assert that
+    /// it was joined. The owner thread then drops its
     /// LocalSet, as without a deadline, and its runtime as Tokio's
     /// `Runtime::shutdown_background` does: the blocking pool is shut down (blocking
     /// work spawned from then on is refused) and every `tokio::spawn` task is dropped

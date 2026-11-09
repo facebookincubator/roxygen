@@ -32,6 +32,9 @@ mod hosted_worker {
     use tokio::sync::oneshot;
     use tokio::sync::watch;
 
+    use crate::host::Host;
+    use crate::host::timer::Expiry;
+    use crate::host::timer::Timeout;
     use crate::task_group::TaskGroup;
     use crate::task_group::TaskGroupError;
     use crate::tokio_host::HostedWorker;
@@ -45,6 +48,7 @@ mod hosted_worker {
     use crate::worker::QuiesceDeadline;
     use crate::worker::SubmitError;
     use crate::worker::WorkerCallError;
+    use crate::worker::WorkerContext;
     use crate::worker::WorkerHandle;
     use crate::worker::WorkerQuiescing;
     use crate::worker::WorkerState;
@@ -2156,6 +2160,428 @@ mod hosted_worker {
             completed(worker.completion()),
             Err(ManagedWorkerError::TaskGroup(TaskGroupError::TaskPanicked)),
             "the driver's panic is reported, not a clean overrun"
+        );
+    }
+
+    /// Registers `scope` as a worker scope, as an owned session's run is registered.
+    fn start_scope(context: &WorkerContext, scope: impl Future<Output = ()> + 'static) {
+        context
+            .register_scope(scope)
+            .expect("scope registered while open")
+            .activate()
+            .expect("scope activated while open")
+            .detach();
+    }
+
+    thread_local! {
+        /// The wheel timeout that an abandoned cleanup holds, kept on its owner thread past the
+        /// final join for the worker's stop hook.
+        static ABANDONED_TIMEOUT: RefCell<Option<Rc<RefCell<Timeout>>>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Reports, as it is dropped, whether the thread's Tokio host still has the worker's wheel
+    /// and what `timeout` had completed with by then.
+    struct WheelAtDrop {
+        timeout: Rc<RefCell<Timeout>>,
+        report: mpsc::Sender<(bool, Option<Expiry>)>,
+    }
+
+    impl Drop for WheelAtDrop {
+        fn drop(&mut self) {
+            let expired = self.timeout.borrow_mut().take_expired();
+            let _ = self
+                .report
+                .send((Host::tokio().wheel_timer().is_some(), expired));
+        }
+    }
+
+    /// Past its teardown deadline the supervisor destroys unfinished cleanup, which abandons the
+    /// task groups that cleanup owns: here one still joining a task that never finishes, and one
+    /// never closed. Their drops still cancel and drop their tasks on the owner thread, but do not
+    /// assert that they were closed and joined: the worker reports a clean overrun. The cleanup
+    /// that never finishes also holds a timeout armed on the owner thread's wheel, which the
+    /// worker stops only after that final join: the cleanup is dropped with the wheel installed
+    /// and the timeout still armed, then the timeout completes as stopped and its waker is woken
+    /// once.
+    #[test]
+    fn a_forced_teardown_abandons_the_task_groups_of_unfinished_cleanup() {
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let worker = HostedWorker::spawn(HostedWorkerOptions {
+            on_owner_thread_stop: Some(Box::new(move || {
+                let expired = ABANDONED_TIMEOUT
+                    .take()
+                    .and_then(|timeout| timeout.borrow_mut().take_expired());
+                let _ = stopped_tx.send((Host::tokio().wheel_timer().is_some(), expired));
+            })),
+            ..options("rox-hosted-forced-groups", 2)
+        })
+        .expect("worker starts");
+        let handle = worker.handle();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let (joining_tx, joining_rx) = mpsc::channel();
+        let (at_drop_tx, at_drop_rx) = mpsc::channel();
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        handle
+            .spawn_local(move |context| async move {
+                let mut joining = TaskGroup::new();
+                joining
+                    .spawn_local(move |_| async move {
+                        let _probe = DropProbe(dropped_tx);
+                        pending::<()>().await;
+                    })
+                    .expect("task admitted");
+                start_scope(&context, async move {
+                    joining.cancel();
+                    joining_tx.send(()).expect("test observes the join");
+                    let _ = joining.join().await;
+                });
+                let open = TaskGroup::new();
+                let host = context.host().clone();
+                let timeout = Rc::new(RefCell::new(Timeout::new(&host)));
+                timeout
+                    .borrow_mut()
+                    .schedule_at(host.now() + Duration::from_secs(600), &waker);
+                ABANDONED_TIMEOUT.set(Some(Rc::clone(&timeout)));
+                let at_drop = WheelAtDrop {
+                    timeout,
+                    report: at_drop_tx,
+                };
+                start_scope(&context, async move {
+                    let _open = open;
+                    let _at_drop = at_drop;
+                    pending::<()>().await;
+                });
+            })
+            .expect("command admitted");
+        joining_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the cleanup is joining its group");
+
+        // The passed deadline can wake the supervisor, which then begins the shutdown itself.
+        worker.shutdown_by(Instant::now());
+        assert_eq!(
+            completed(worker.completion()),
+            Err(ManagedWorkerError::TeardownDeadlineExceeded),
+            "abandoning the cleanup's task groups is a clean overrun"
+        );
+        assert_eq!(
+            dropped_rx.recv_timeout(TEST_TIMEOUT),
+            Ok(handle.owner_thread()),
+            "the abandoned group's task was dropped on the owner thread"
+        );
+        assert_eq!(
+            at_drop_rx.recv_timeout(TEST_TIMEOUT),
+            Ok((true, None)),
+            "(wheel installed, timeout's expiry) as the final join dropped the cleanup"
+        );
+        assert_eq!(
+            stopped_rx.recv_timeout(TEST_TIMEOUT),
+            Ok((false, Some(Expiry::Stopped))),
+            "(wheel installed, timeout's expiry) in the owner thread's stop hook"
+        );
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            1,
+            "stopping the wheel woke the abandoned timeout's waker once"
+        );
+    }
+
+    /// Panics with its message as it drops.
+    struct PanicOnDrop(&'static str);
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("{}", self.0);
+        }
+    }
+
+    /// A forced teardown abandons the joins of the task groups it destroys, not the panics their
+    /// tasks raise as they are destroyed: the worker reports one, as it does a cleanup's.
+    #[test]
+    fn a_forced_teardown_still_reports_a_task_that_panics_as_its_abandoned_group_drops_it() {
+        let worker = HostedWorker::spawn(options("rox-hosted-forced-group-panic", 2))
+            .expect("worker starts");
+        let handle = worker.handle();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let (joining_tx, joining_rx) = mpsc::channel();
+        handle
+            .spawn_local(move |context| async move {
+                let mut joining = TaskGroup::new();
+                joining
+                    .spawn_local(move |_| async move {
+                        let _probe = DropProbe(dropped_tx);
+                        let _panics = PanicOnDrop("injected task destructor panic");
+                        pending::<()>().await;
+                    })
+                    .expect("task admitted");
+                start_scope(&context, async move {
+                    joining.cancel();
+                    joining_tx.send(()).expect("test observes the join");
+                    let _ = joining.join().await;
+                });
+            })
+            .expect("command admitted");
+        joining_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the cleanup is joining its group");
+
+        worker.shutdown_by(Instant::now());
+        assert_eq!(
+            completed(worker.completion()),
+            Err(ManagedWorkerError::TaskGroup(TaskGroupError::TaskPanicked)),
+            "the task's destructor panic is still reported"
+        );
+        assert_eq!(
+            dropped_rx.recv_timeout(TEST_TIMEOUT),
+            Ok(handle.owner_thread()),
+            "the abandoned group's task was dropped on the owner thread"
+        );
+    }
+
+    /// Fields drop in order: the panic first, then the group, during that unwind.
+    struct GroupDroppedWhileUnwinding {
+        _panics: PanicOnDrop,
+        _group: TaskGroup,
+    }
+
+    /// A forced teardown that destroys an abandoned group while the thread already unwinds
+    /// discards the panic a task of that group raises as it is destroyed, rather than aborting
+    /// the process: the worker reports the panic that was unwinding.
+    #[test]
+    fn a_forced_teardown_discards_a_task_panic_its_abandoned_group_raises_while_unwinding() {
+        let worker = HostedWorker::spawn(options("rox-hosted-forced-group-unwind", 2))
+            .expect("worker starts");
+        let handle = worker.handle();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let (held_tx, held_rx) = mpsc::channel();
+        handle
+            .spawn_local(move |context| async move {
+                let mut group = TaskGroup::new();
+                group
+                    .spawn_local(move |_| async move {
+                        let _probe = DropProbe(dropped_tx);
+                        let _panics = PanicOnDrop("injected task destructor panic");
+                        pending::<()>().await;
+                    })
+                    .expect("task admitted");
+                start_scope(&context, async move {
+                    let _held = GroupDroppedWhileUnwinding {
+                        _panics: PanicOnDrop("injected cleanup destructor panic"),
+                        _group: group,
+                    };
+                    held_tx.send(()).expect("test observes the cleanup");
+                    pending::<()>().await;
+                });
+            })
+            .expect("command admitted");
+        held_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the cleanup holds its group");
+
+        worker.shutdown_by(Instant::now());
+        assert_eq!(
+            completed(worker.completion()),
+            Err(ManagedWorkerError::TaskGroup(TaskGroupError::TaskPanicked)),
+            "the cleanup's destructor panic is reported"
+        );
+        assert_eq!(
+            dropped_rx.recv_timeout(TEST_TIMEOUT),
+            Ok(handle.owner_thread()),
+            "the abandoned group's task was dropped on the owner thread"
+        );
+    }
+
+    /// Raises a panic whose payload's destructor panics too, as it drops.
+    struct PayloadPanicOnDrop;
+
+    impl Drop for PayloadPanicOnDrop {
+        fn drop(&mut self) {
+            panic_any(PanickingPayload);
+        }
+    }
+
+    /// A forced teardown that destroys an abandoned group whose cancellation runs a waker that
+    /// panics disposes of the panic a task of that group raises as it is destroyed, here one whose
+    /// payload's destructor panics too, before that cancellation's panic unwinds, rather than
+    /// aborting the process: the worker reports the cancellation's panic.
+    #[test]
+    fn a_forced_teardown_disposes_of_a_task_panic_when_its_abandoned_group_s_cancellation_panics() {
+        let worker = HostedWorker::spawn(options("rox-hosted-forced-group-cancel", 2))
+            .expect("worker starts");
+        let handle = worker.handle();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let (registered_tx, registered_rx) = mpsc::channel();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let cancellation_wakes = Arc::clone(&wakes);
+        handle
+            .spawn_local(move |context| async move {
+                let mut group = TaskGroup::new();
+                group
+                    .spawn_local(move |cancellation| async move {
+                        let _probe = DropProbe(dropped_tx);
+                        let _panics = PayloadPanicOnDrop;
+                        let mut registration = cancellation.wake_registration();
+                        let waker = Waker::from(Arc::new(PanickingWake(cancellation_wakes)));
+                        assert!(!registration.update_waker(&waker));
+                        registered_tx
+                            .send(())
+                            .expect("test observes the registration");
+                        pending::<()>().await;
+                    })
+                    .expect("task admitted");
+                start_scope(&context, async move {
+                    let _group = group;
+                    pending::<()>().await;
+                });
+            })
+            .expect("command admitted");
+        registered_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the task registered its cancellation waker");
+
+        worker.shutdown_by(Instant::now());
+        assert_eq!(
+            completed(worker.completion()),
+            Err(ManagedWorkerError::TaskGroup(TaskGroupError::TaskPanicked)),
+            "the cancellation's panic is reported"
+        );
+        assert_eq!(
+            dropped_rx.recv_timeout(TEST_TIMEOUT),
+            Ok(handle.owner_thread()),
+            "the abandoned group's task was dropped on the owner thread"
+        );
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "the abandoned group's cancellation ran the panicking waker once"
+        );
+    }
+
+    /// A forced teardown that destroys an abandoned group while the thread already unwinds
+    /// discards the panic of that group's cancellation, here a waker that panics, and the panic a
+    /// task of that group raises as it is destroyed, here one whose payload's destructor panics
+    /// too, rather than aborting the process: the worker reports the panic that was unwinding.
+    #[test]
+    fn a_forced_teardown_discards_its_abandoned_group_s_cancellation_panic_while_unwinding() {
+        let worker = HostedWorker::spawn(options("rox-hosted-forced-group-cancel-unwind", 2))
+            .expect("worker starts");
+        let handle = worker.handle();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let (registered_tx, registered_rx) = mpsc::channel();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let cancellation_wakes = Arc::clone(&wakes);
+        handle
+            .spawn_local(move |context| async move {
+                let mut group = TaskGroup::new();
+                group
+                    .spawn_local(move |cancellation| async move {
+                        let _probe = DropProbe(dropped_tx);
+                        let _panics = PayloadPanicOnDrop;
+                        let mut registration = cancellation.wake_registration();
+                        let waker = Waker::from(Arc::new(PanickingWake(cancellation_wakes)));
+                        assert!(!registration.update_waker(&waker));
+                        registered_tx
+                            .send(())
+                            .expect("test observes the registration");
+                        pending::<()>().await;
+                    })
+                    .expect("task admitted");
+                start_scope(&context, async move {
+                    let _held = GroupDroppedWhileUnwinding {
+                        _panics: PanicOnDrop("injected cleanup destructor panic"),
+                        _group: group,
+                    };
+                    pending::<()>().await;
+                });
+            })
+            .expect("command admitted");
+        registered_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the task registered its cancellation waker");
+
+        worker.shutdown_by(Instant::now());
+        assert_eq!(
+            completed(worker.completion()),
+            Err(ManagedWorkerError::TaskGroup(TaskGroupError::TaskPanicked)),
+            "the cleanup's destructor panic is reported"
+        );
+        assert_eq!(
+            dropped_rx.recv_timeout(TEST_TIMEOUT),
+            Ok(handle.owner_thread()),
+            "the abandoned group's task was dropped on the owner thread"
+        );
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "the abandoned group's cancellation ran the panicking waker once"
+        );
+    }
+
+    /// The text of the panic that `drop` raised.
+    fn drop_panic(drop: impl FnOnce()) -> String {
+        let payload = catch_unwind(AssertUnwindSafe(drop)).expect_err("the drop asserts");
+        payload
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .expect("a text panic")
+    }
+
+    /// Unclosed and unjoined task groups that the worker's owner thread drops.
+    fn ordinary_task_group_drops() -> [String; 2] {
+        let mut unjoined = TaskGroup::new();
+        unjoined
+            .spawn_local(|_| pending::<()>())
+            .expect("task admitted");
+        [
+            drop_panic(|| drop(TaskGroup::new())),
+            drop_panic(move || drop(unjoined)),
+        ]
+    }
+
+    /// Only a forced teardown abandons task groups: on a worker's owner thread, an unclosed or
+    /// unjoined group still asserts as it drops, while the worker runs and during a bounded
+    /// teardown whose deadline has not passed.
+    #[test]
+    fn task_group_drops_outside_a_forced_teardown_still_assert() {
+        const ORDINARY: [&str; 2] = [
+            "task group must be explicitly closed before drop",
+            "task group must join every admitted task before drop",
+        ];
+        let worker =
+            HostedWorker::spawn(options("rox-hosted-ordinary-groups", 2)).expect("worker starts");
+        let handle = worker.handle();
+        let running = wait(
+            handle
+                .call(|_| ordinary_task_group_drops())
+                .expect("call admitted"),
+        )
+        .expect("call completes");
+        assert_eq!(running, ORDINARY, "while the worker runs");
+
+        let (tearing_down_tx, tearing_down_rx) = mpsc::channel();
+        wait(
+            handle
+                .call(move |context| {
+                    let quiescing = context.quiescing();
+                    start_scope(context, async move {
+                        quiescing.await;
+                        tearing_down_tx
+                            .send(ordinary_task_group_drops())
+                            .expect("test observes the drops");
+                    });
+                })
+                .expect("call admitted"),
+        )
+        .expect("call completes");
+        assert!(worker.shutdown_by(Instant::now() + TEST_TIMEOUT));
+        assert_eq!(completed(worker.completion()), Ok(()));
+        assert_eq!(
+            tearing_down_rx.recv_timeout(TEST_TIMEOUT),
+            Ok(ORDINARY.map(str::to_owned)),
+            "during a bounded teardown before its deadline"
         );
     }
 

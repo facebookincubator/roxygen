@@ -77,6 +77,7 @@ use roxygen_http1::Http1xCodec;
 use roxygen_runtime::cancellation::CancellationSource;
 use roxygen_runtime::host::LocalFuture;
 use roxygen_runtime::panic::discard_panic;
+use roxygen_runtime::task_group::in_forced_teardown;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_transport::byte_event::ByteEventWriteFlags;
 use roxygen_transport::byte_stream::ByteEventCapability;
@@ -1596,7 +1597,7 @@ impl<A: OwnedApplication> Drop for Driver<A> {
                 }
             }
             assert!(
-                !self.started || std::thread::panicking(),
+                !self.started || std::thread::panicking() || in_forced_teardown(),
                 "started owned H1 runner dropped before application and native I/O cleanup joined"
             );
         }
