@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
 use std::panic::resume_unwind;
@@ -1325,20 +1326,20 @@ impl PoolState {
     /// the first busy session that can take an exchange, else the idle session at the back
     /// (most recently used) or front (least recently used) of the idle list, retiring each
     /// expired one it meets on an interval, as `select_idle_session` does; least loaded
-    /// (`DIV-048`), as `indexed_least_loaded_session` does. A member that can no longer take an
-    /// exchange leaves its list; one whose class changed without an event falls back to the
-    /// passes and unsettles the index.
+    /// (`DIV-048`), as `indexed_least_loaded_busy_session` says. A member that can no longer
+    /// take an exchange leaves its list; one whose class changed without an event falls back to
+    /// the passes and unsettles the index.
     fn select_indexed(
         &mut self,
         checkout_at: Option<Instant>,
         retired: &mut RetiredSessions,
     ) -> Option<SessionSlot> {
         let least_loaded = self.selection == OwnedSessionSelection::LeastLoaded;
-        let selected = if least_loaded {
-            self.indexed_least_loaded_session(checkout_at, retired)
+        let busy = if least_loaded {
+            self.indexed_least_loaded_busy_session()
         } else {
             match self.indexed_busy_session() {
-                Ok(None) => self.indexed_idle_session(checkout_at, retired),
+                Ok(busy) => Ok(busy.map_or(ControlFlow::Continue(None), ControlFlow::Break)),
                 Err(IndexMismatch) => {
                     self.unsettle_index();
                     self.count_scan();
@@ -1349,8 +1350,14 @@ impl PoolState {
                         })
                         .or_else(|| self.select_idle_session(checkout_at, retired));
                 }
-                busy => busy,
             }
+        };
+        let selected = match busy {
+            Ok(ControlFlow::Break(slot)) => Ok(Some(slot)),
+            Ok(ControlFlow::Continue(fallback)) => self
+                .indexed_idle_session(checkout_at, retired)
+                .map(|idle| idle.or(fallback)),
+            Err(mismatch) => Err(mismatch),
         };
         let Ok(selected) = selected else {
             self.unsettle_index();
@@ -1383,17 +1390,15 @@ impl PoolState {
         Ok(None)
     }
 
-    /// `select_least_loaded` through the index (`DIV-048`): the first busy list member with no
-    /// exchange in flight; else the idle list's session in reuse order, as
-    /// `indexed_idle_session` takes it; else, all idle candidates retired or none, the first
-    /// busy member of the fewest exchanges in flight. Busy members of an indexed (HTTP/1.1)
-    /// pool are sessions not yet reserved or whose driver has not settled their free slot, so
-    /// the busy list is short.
-    fn indexed_least_loaded_session(
+    /// The busy list's part of `select_least_loaded` through the index (`DIV-048`): `Break`
+    /// with the first member with no exchange in flight; else `Continue` with the first member
+    /// of the fewest exchanges in flight, if any, which `select_indexed` takes only when the
+    /// idle list, walked as `indexed_idle_session` walks it, yields no session. Busy members of
+    /// an indexed (HTTP/1.1) pool are sessions not yet reserved or whose driver has not settled
+    /// their free slot, so the busy list is short.
+    fn indexed_least_loaded_busy_session(
         &mut self,
-        checkout_at: Option<Instant>,
-        retired: &mut RetiredSessions,
-    ) -> Result<Option<SessionSlot>, IndexMismatch> {
+    ) -> Result<ControlFlow<SessionSlot, Option<SessionSlot>>, IndexMismatch> {
         let mut least: Option<(u32, SessionSlot)> = None;
         let mut cursor = self.sessions.class_front(Class::Busy);
         while let Some(slot) = cursor {
@@ -1402,7 +1407,7 @@ impl PoolState {
                 Some(Class::Busy) => {
                     let load = self.sessions.get(slot).session.load();
                     if load == 0 {
-                        return Ok(Some(slot));
+                        return Ok(ControlFlow::Break(slot));
                     }
                     if least.is_none_or(|(minimum, _)| load < minimum) {
                         least = Some((load, slot));
@@ -1413,11 +1418,10 @@ impl PoolState {
                 None => self.sessions.set_class(slot, None),
             }
         }
-        Ok(self
-            .indexed_idle_session(checkout_at, retired)?
-            .or(least.map(|(_, slot)| slot)))
+        Ok(ControlFlow::Continue(least.map(|(_, slot)| slot)))
     }
 
+    /// `select_indexed` is its one caller, so that it inlines into `next_step`.
     fn indexed_idle_session(
         &mut self,
         checkout_at: Option<Instant>,
@@ -1896,6 +1900,7 @@ impl PoolState {
     /// checkout pops its idle list from the end: it retires expired candidates
     /// into `retired`, closing their admission, until it finds one that is not,
     /// and leaves older expired sessions to the sweep.
+    #[inline(never)]
     fn select_idle_session(
         &mut self,
         checkout_at: Option<Instant>,
@@ -1948,6 +1953,7 @@ impl PoolState {
     /// finds it. On an interval (`checkout_at`), an idle candidate that has expired is retired
     /// into `retired`, its admission closed, as `select_idle_session` retires one, and the
     /// search runs again over the sessions left.
+    #[inline(never)]
     fn select_least_loaded(
         &mut self,
         checkout_at: Option<Instant>,

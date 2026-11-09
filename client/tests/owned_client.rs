@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::rc::Rc;
+use std::rc::Weak;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -1968,6 +1969,40 @@ fn a_panic_in_the_quiescence_drain_cancels_the_session_and_completes_its_cleanup
                 true
             ),
             "{protocol:?}"
+        );
+    }
+}
+
+/// A failed quiescence drain cancels the session without an event its pool hears, so the
+/// session sets the selection-index flag its pool handed it at `bind_pool` (S6.9), as its
+/// cancellation does; a drain that closes admission leaves the flag alone. The pool is already
+/// gone, so only the session can set the flag: (the exchange's status, the flag after a clean
+/// drain), then the same after a drain whose refused upload panics.
+#[test]
+fn a_failed_quiescence_drain_unsettles_its_pool_s_index() {
+    for protocol in [CodecProtocol::Http11, CodecProtocol::Http2] {
+        let observed = [false, true].map(|fail| {
+            let origin = Origin::start(protocol);
+            let address = origin.address;
+            run_on_quiescing_worker(move |context, runtime| async move {
+                let session = connect_owned(&context, address, protocol, untimed()).await;
+                let unsettled = Rc::new(Cell::new(false));
+                session.bind_pool(Weak::new(), Some(Rc::clone(&unsettled)));
+                let status = exchange(&session, Exchange::Fixed).await.status;
+                if fail {
+                    queue_a_panicking_upload_then_quiesce(&session, &runtime, None).await;
+                } else {
+                    until(|| session.is_idle()).await;
+                    drop(runtime.quiesce(TIMEOUT));
+                }
+                let _ = session.wait_closed().await;
+                (status, unsettled.get())
+            })
+        });
+        assert_eq!(
+            observed,
+            [(Some(200), false), (Some(200), true)],
+            "{protocol:?}: (status, unsettled) after a clean drain, then a failed one"
         );
     }
 }

@@ -591,6 +591,7 @@ impl OwnedClientSession {
 
     /// 0 while the session is idle, otherwise 1: an exchange, a reservation, an
     /// upload or a write is outstanding.
+    #[inline]
     pub(crate) fn admitted_transactions(&self) -> u32 {
         u32::from(!self.is_idle())
     }
@@ -926,12 +927,18 @@ impl RunScope {
         }
         if !self.draining && Pin::new(&mut self.quiescing).poll(context).is_ready() {
             self.draining = true;
-            self.failure = drain(upstream);
-            if self.failure.is_some() {
-                // The drain cancelled the session.
-                self.unsettle_pool();
+            if let Some(failure) = drain(upstream) {
+                self.fail_drain(failure);
             }
         }
+    }
+
+    /// Records the failure of a quiescence drain, which cancelled the session.
+    #[cold]
+    #[inline(never)]
+    fn fail_drain(&mut self, failure: HttpError) {
+        self.failure = Some(failure);
+        self.unsettle_pool();
     }
 
     fn unsettle_pool(&self) {
