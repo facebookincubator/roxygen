@@ -164,6 +164,10 @@ struct PoolBinding {
     full: Cell<bool>,
     /// The pool last saw the session idle, or the session is not pooled.
     reported_idle: Cell<bool>,
+    /// The session has taken a reservation since it was pooled. Until then the
+    /// pool does not count it idle, as a `ClientSession` is not idle before its
+    /// first `DeactivateConnection`.
+    reserved: Cell<bool>,
 }
 
 impl Default for PoolBinding {
@@ -173,6 +177,7 @@ impl Default for PoolBinding {
             draining: Cell::new(false),
             full: Cell::new(false),
             reported_idle: Cell::new(true),
+            reserved: Cell::new(false),
         }
     }
 }
@@ -450,6 +455,7 @@ impl OwnedClientSession {
         let full = self.selectable_capacity() == 0;
         self.inner.pool.full.set(full);
         self.inner.pool.reported_idle.set(false);
+        self.inner.pool.reserved.set(true);
         record_reservation(
             pool,
             &PooledSession::Owned(self.clone()),
@@ -501,9 +507,12 @@ impl OwnedClientSession {
         self.inner.pool.draining.get()
     }
 
-    /// Idle and admitting, as a pool counts a `ClientSession` idle.
+    /// Idle and admitting after its first reservation, as a pool counts a
+    /// `ClientSession` idle: an acquisition selects a session the pool dialed
+    /// as one that can take an exchange, so the dialing acquisition takes it
+    /// before the idle checkout can retire it.
     pub(crate) fn is_pooled_idle(&self) -> bool {
-        !self.is_draining() && self.is_idle()
+        !self.is_draining() && self.inner.pool.reserved.get() && self.is_idle()
     }
 
     /// `available_capacity` without the worker admission check, which the

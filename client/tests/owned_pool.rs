@@ -614,13 +614,19 @@ fn a_connection_close_response_retires_its_session() {
 /// Runs one exchange on `pool`'s next uniplex session, and returns that session
 /// once it has no active exchange.
 async fn uniplex_one_exchange(pool: &HttpSessionPool) -> ClientSession {
+    uniplex_try_one_exchange(pool)
+        .await
+        .expect("acquisition succeeds")
+}
+
+/// As `uniplex_one_exchange`, or the acquisition's error.
+async fn uniplex_try_one_exchange(pool: &HttpSessionPool) -> Result<ClientSession, PoolError> {
     let GetSessionResult {
         reservation,
         session,
     } = pool
         .get_session_with_reservation(CancellationToken::never())
-        .await
-        .expect("acquisition succeeds");
+        .await?;
     let (head, body) = request("/").await;
     let mut response = session
         .send_reserved_request_with_headers(head, body, reservation, CancellationToken::never())
@@ -641,7 +647,7 @@ async fn uniplex_one_exchange(pool: &HttpSessionPool) -> ClientSession {
     }
     drop(response);
     until(|| session.active_transactions() == 0).await;
-    session
+    Ok(session)
 }
 
 /// Whether the session the second exchange took, 120 ms after the first, was
@@ -1079,6 +1085,101 @@ fn most_recently_used_reuse_picks_the_session_released_last() {
         [picks[0], picks[1], last]
     });
     assert_eq!(picks, [true, true, true]);
+}
+
+/// Whether `items` holds no value twice.
+fn all_distinct<T: PartialEq>(items: &[T]) -> bool {
+    items
+        .iter()
+        .enumerate()
+        .all(|(index, item)| !items[..index].contains(item))
+}
+
+/// How each of three sequential exchanges, 20 ms apart, ended (served, or its
+/// acquisition's error), and whether each was served on a connection no
+/// earlier exchange used, through an owned pool or an `HttpSessionPool` with a
+/// 1 ns idle timeout and hyper-util's reuse order and sweep: a router's zero
+/// `pool_idle_timeout`, "expire as soon as idle" to reqwest.
+///
+/// The connections the origin accepts are not compared: in both pools the
+/// session the checkout retires wakes the acquisition's own waiter when its
+/// drain closes its admission, and the waiter then starts a second dial beside
+/// the first, as in `aged_session_scenario`; whether the next exchange takes
+/// that unused session or dials again depends on task timing.
+fn one_nanosecond_idle_scenario(owned: bool, protocol: CodecProtocol) -> (String, bool) {
+    let origin = Origin::start(protocol);
+    let address = origin.address;
+    run_on_worker(move |context| async move {
+        let params = idle_params(
+            4,
+            SessionReuseOrder::MostRecentlyUsed,
+            Duration::from_nanos(1),
+            IdleSweep::Interval,
+        );
+        let mut ends = Vec::new();
+        let distinct = if owned {
+            let pool = idle_pool(&context, address, protocol, params);
+            let mut served = Vec::new();
+            for _ in 0..3 {
+                match pool
+                    .get_session_with_reservation(CancellationToken::never())
+                    .await
+                {
+                    Ok(OwnedGetSessionResult {
+                        reservation,
+                        session,
+                    }) => {
+                        assert_eq!(exchange(reservation, "/").await, b"ok");
+                        // The sweep may retire the session as soon as it is idle.
+                        until(|| session.is_idle() || session.is_finished()).await;
+                        served.push(local(&session));
+                        ends.push(Ok(()));
+                    }
+                    Err(error) => ends.push(Err(error)),
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            all_distinct(&served)
+        } else {
+            let pool = HttpSessionPool::new(
+                context,
+                socket_address(address),
+                params,
+                plaintext(protocol),
+                untimed(),
+            );
+            let mut served = Vec::new();
+            for _ in 0..3 {
+                match uniplex_try_one_exchange(&pool).await {
+                    Ok(session) => {
+                        served.push(session.local_address().clone());
+                        ends.push(Ok(()));
+                    }
+                    Err(error) => ends.push(Err(error)),
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            all_distinct(&served)
+        };
+        (format!("{ends:?}"), distinct)
+    })
+}
+
+/// As in an `HttpSessionPool`, a session the pool dialed counts as idle only
+/// once it has served, so the dialing acquisition takes it before hyper-util's
+/// checkout can retire it, however short the idle timeout: "expire as soon as
+/// idle" means no reuse of an idle session, not no use.
+#[test]
+fn a_freshly_dialed_session_serves_its_dialing_acquisition_under_a_1_ns_idle_timeout() {
+    for protocol in PROTOCOLS {
+        let served = || ("[Ok(()), Ok(()), Ok(())]".to_owned(), true);
+        assert_eq!(
+            [true, false].map(|owned| one_nanosecond_idle_scenario(owned, protocol)),
+            [served(), served()],
+            "{protocol:?}: every exchange is served, each on a connection no earlier exchange \
+             used, through an owned pool and an `HttpSessionPool`"
+        );
+    }
 }
 
 /// A reservation taken on a pooled session's handle, as a `ClientSession`'s
