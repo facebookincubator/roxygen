@@ -1870,7 +1870,7 @@ fn owned_http2_attachment_rejects_unsupported_configuration() {
                     (stats, &b"owned_http2 does not support stats_factory"[..]),
                     (
                         timed,
-                        &b"owned_http2 is untimed: stream_read_timeout must be zero"[..],
+                        &b"owned_http2 does not honor stream_read_timeout: it must be zero"[..],
                     ),
                 ] {
                     let (io, _peer) = tokio::io::duplex(64);
@@ -1901,6 +1901,69 @@ fn owned_http2_attachment_rejects_unsupported_configuration() {
                     assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
                     assert_eq!(error.message(), message);
                 }
+            })
+            .expect("initializer admitted"),
+    )
+    .expect("initializer finishes");
+    wait(runtime.quiesce(TIMEOUT)).expect("cleanup joins");
+    assert_eq!(owner.join().expect("physical join").workers_forced, 0);
+}
+
+/// `owned_http2` honors `connection_idle_timeout`: an idle HTTP/2 connection gets the drain's
+/// GOAWAYs and is closed, and the session ends cleanly.
+#[test]
+fn owned_http2_reaps_an_idle_connection() {
+    let mut owner = RuntimeOwner::start(RuntimeConfig {
+        workers: 1,
+        command_capacity: 4,
+    })
+    .expect("owner starts");
+    let runtime = owner.handle();
+    let worker = runtime.worker(0).expect("worker exists");
+    wait(
+        worker
+            .call_local(move |context| async move {
+                assert!(
+                    context.host().wheel_timer().is_some(),
+                    "a managed worker drives a wheel timer"
+                );
+                let mut session = untimed_owned(false, true);
+                session.connection_idle_timeout = Duration::from_millis(100);
+                let (io, peer) = tokio::io::duplex(64 * 1024);
+                let accepted = attach_for_test(
+                    &context,
+                    CodecProtocol::Http2,
+                    session,
+                    io,
+                    Rc::new(FixedHandler),
+                );
+                let control = accepted.control;
+                let run = tokio::task::spawn_local(accepted.session.run());
+                let (client, connection) = h2::client::handshake(peer).await.expect("H2 handshake");
+                let mut client = client.ready().await.expect("H2 client ready");
+                let request = http::Request::builder()
+                    .method("GET")
+                    .uri("http://localhost/fixed")
+                    .body(())
+                    .expect("request builds");
+                let (response, _stream) = client.send_request(request, true).expect("request sent");
+                let (response, connection) = tokio::join!(response, async {
+                    tokio::time::timeout(Duration::from_secs(5), connection).await
+                });
+                assert_eq!(
+                    response.expect("response head").status(),
+                    http::StatusCode::OK
+                );
+                connection
+                    .expect("the idle connection is reaped within the timeout")
+                    .expect("the server closes the connection gracefully");
+                let summary = run
+                    .await
+                    .expect("owned run task joins")
+                    .expect("the idle drain completes the session");
+                assert!(summary.bytes_written > 0);
+                assert!(control.is_finished());
+                drop(client);
             })
             .expect("initializer admitted"),
     )

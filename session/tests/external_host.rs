@@ -37,6 +37,9 @@ use roxygen_runtime::driver::WorkerDriver;
 use roxygen_runtime::host::Host;
 use roxygen_runtime::host::LocalFuture;
 use roxygen_runtime::host::LocalHost;
+use roxygen_runtime::host::timer::WheelStats;
+use roxygen_runtime::host::timer::WheelTimer;
+use roxygen_runtime::host::timer::WheelWakeup;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_transport::byte_event::AsyncSocketByteEventObserver;
 use roxygen_transport::byte_event::ByteEventOffsets;
@@ -65,6 +68,19 @@ struct HostYield {
     waker: RefCell<Option<Waker>>,
 }
 
+/// A `ManualHost` wheel's wakeup: the instant at which `advance` expires the wheel.
+struct ManualWakeup(Rc<Cell<Option<Instant>>>);
+
+impl WheelWakeup for ManualWakeup {
+    fn arm(&self, deadline: Instant) {
+        self.0.set(Some(deadline));
+    }
+
+    fn disarm(&self) {
+        self.0.set(None);
+    }
+}
+
 pub(crate) struct ManualHost {
     spawner: LocalSpawner,
     now: Rc<Cell<Instant>>,
@@ -74,8 +90,10 @@ pub(crate) struct ManualHost {
     deferred_yields: RefCell<Vec<Weak<HostYield>>>,
     completed_yields: Rc<Cell<usize>>,
     spawns: Cell<usize>,
-    sleeps: Cell<usize>,
     now_reads: Cell<usize>,
+    sleeps: Cell<usize>,
+    wheel: RefCell<Option<Rc<WheelTimer>>>,
+    wheel_wakeup: Rc<Cell<Option<Instant>>>,
 }
 
 impl ManualHost {
@@ -91,10 +109,25 @@ impl ManualHost {
             deferred_yields: RefCell::new(Vec::new()),
             completed_yields: Rc::new(Cell::new(0)),
             spawns: Cell::new(0),
-            sleeps: Cell::new(0),
             now_reads: Cell::new(0),
+            sleeps: Cell::new(0),
+            wheel: RefCell::new(None),
+            wheel_wakeup: Rc::new(Cell::new(None)),
         });
         let host = Host::new(implementation.clone());
+        (pool, implementation, host)
+    }
+
+    /// A host that drives an owner-local wheel timer with a 1 ms tick, as a hosted worker's
+    /// host does. `advance` expires it once the clock reaches its wakeup.
+    pub(crate) fn create_with_wheel() -> (LocalPool, Rc<Self>, Host) {
+        let (pool, implementation, host) = Self::create();
+        let wheel = WheelTimer::new(
+            Duration::from_millis(1),
+            implementation.now.get(),
+            Box::new(ManualWakeup(Rc::clone(&implementation.wheel_wakeup))),
+        );
+        *implementation.wheel.borrow_mut() = Some(wheel);
         (pool, implementation, host)
     }
 
@@ -109,6 +142,52 @@ impl ManualHost {
             .filter_map(|timer| timer.waker.borrow_mut().take())
             .collect();
         ready.into_iter().for_each(Waker::wake);
+        let wheel = self.wheel.borrow().clone();
+        if let Some(wheel) = wheel {
+            while self
+                .wheel_wakeup
+                .get()
+                .is_some_and(|deadline| deadline <= self.now.get())
+            {
+                self.wheel_wakeup.set(None);
+                wheel.expire(self.now.get());
+            }
+        }
+    }
+
+    /// The clock without counting a read.
+    pub(crate) fn current_time(&self) -> Instant {
+        self.now.get()
+    }
+
+    /// How many times host code has read the clock.
+    pub(crate) fn now_reads(&self) -> usize {
+        self.now_reads.get()
+    }
+
+    /// How many host sleeps have been created.
+    pub(crate) fn sleeps(&self) -> usize {
+        self.sleeps.get()
+    }
+
+    /// The wheel's counters, for a host made by `create_with_wheel`.
+    pub(crate) fn wheel_stats(&self) -> WheelStats {
+        self.wheel
+            .borrow()
+            .as_ref()
+            .expect("the host drives a wheel")
+            .stats()
+    }
+
+    /// The earliest instant at which a host sleep or the wheel needs the clock.
+    fn next_deadline(&self) -> Option<Instant> {
+        self.timers
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|timer| timer.deadline)
+            .chain(self.wheel_wakeup.get())
+            .min()
     }
 
     pub(crate) fn yields(&self) -> usize {
@@ -127,11 +206,6 @@ impl ManualHost {
     /// How many timers this host has created.
     pub(crate) fn timers_created(&self) -> usize {
         self.sleeps.get()
-    }
-
-    /// How many times this host's clock has been read.
-    pub(crate) fn now_reads(&self) -> usize {
-        self.now_reads.get()
     }
 
     /// Applies to `yield_to_io` futures created after this call.
@@ -221,6 +295,10 @@ impl LocalHost for ManualHost {
             }
         }))
     }
+
+    fn wheel_timer(&self) -> Option<Rc<WheelTimer>> {
+        self.wheel.borrow().clone()
+    }
 }
 
 thread_local! {
@@ -238,7 +316,24 @@ pub(crate) fn run_on_host_with<T: Send + 'static>(
     + Send
     + 'static,
 ) -> T {
-    let (mut pool, implementation, host) = ManualHost::create();
+    run_on_manual_host(ManualHost::create(), test)
+}
+
+/// `run_on_host_with` on a host that drives a wheel timer.
+pub(crate) fn run_on_wheel_host_with<T: Send + 'static>(
+    test: impl FnOnce(Rc<ManualHost>, WorkerContext) -> Pin<Box<dyn Future<Output = T>>>
+    + Send
+    + 'static,
+) -> T {
+    run_on_manual_host(ManualHost::create_with_wheel(), test)
+}
+
+fn run_on_manual_host<T: Send + 'static>(
+    (mut pool, implementation, host): (LocalPool, Rc<ManualHost>, Host),
+    test: impl FnOnce(Rc<ManualHost>, WorkerContext) -> Pin<Box<dyn Future<Output = T>>>
+    + Send
+    + 'static,
+) -> T {
     // The command factory must be `Send`, so the `!Send` host reaches it through this thread.
     RUNNING_HOST.set(Some(Rc::clone(&implementation)));
     let (worker, driver) = WorkerDriver::with_host(16, host).unwrap();
@@ -279,14 +374,9 @@ pub(crate) fn run_on_host_with<T: Send + 'static>(
             continue;
         }
         let deadline = implementation
-            .timers
-            .borrow()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .map(|timer| timer.deadline)
-            .min()
+            .next_deadline()
             .expect("stalled host must have an armed timer");
-        implementation.advance(deadline.saturating_duration_since(implementation.now()));
+        implementation.advance(deadline.saturating_duration_since(implementation.current_time()));
     }
     panic!("hosted worker did not complete within 100 timer turns");
 }

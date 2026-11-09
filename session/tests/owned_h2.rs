@@ -14,6 +14,7 @@ use roxygen_http2::hpack::HpackEncoder;
 use roxygen_http2::hpack::HpackHeader;
 
 use super::*;
+use crate::external_host_tests::ManualHost;
 use crate::external_host_tests::YieldMode;
 use crate::http2::StreamReceiveWindowMode;
 use crate::owned_h2::OwnedH2Application;
@@ -1317,7 +1318,12 @@ fn unsupported_config_is_rejected_before_transport_or_application_work() {
                 let (transport, state) = FixtureTransport::new([]);
                 let mut config = options(context.clone(), transport);
                 match case {
-                    0 => config.io.read_timeout = Duration::from_secs(1),
+                    0 => {
+                        config.http2.ping_probes = Some(crate::experimental::PingProbeConfig {
+                            interval: Duration::from_secs(1),
+                            ..crate::experimental::PingProbeConfig::default()
+                        })
+                    }
                     1 => config.http2.stats = Some(Rc::new(StatsProbe::default())),
                     2 => config.http2.stream_receive_window = 0,
                     3 => state.borrow_mut().capability = ByteEventCapability::TransportEvents,
@@ -12863,6 +12869,988 @@ fn owned_header_rate_limit_reports_drain_and_suppresses_ingress_message() {
                     .any(|event| matches!(event, LifecycleEvent::Http2IngressError { .. })),
                 "a header breach reports no ingress error: {events:?}"
             );
+        })
+    });
+}
+
+/// The read idle timeout of the connection-timer tests.
+const IDLE: Duration = Duration::from_secs(10);
+
+/// The GOAWAY timeout of the connection-timer tests: the grace between a drain's two GOAWAYs.
+const GRACE: Duration = Duration::from_secs(1);
+
+/// The last-stream id of a graceful drain's first GOAWAY, `2^31 - 1` on the wire.
+const GOAWAY_MAX: StreamId = StreamId::new(0x7fff_ffff);
+
+/// Serves the fixture's scripted reads and requires each to carry no timeout: the owned driver
+/// times its connection itself. A parked `WaitData` read, and a read past the script, end on
+/// transport cancellation.
+struct UntimedReads(Rc<FixtureTransport>);
+
+impl UniplexTransport for UntimedReads {
+    fn read(
+        &self,
+        context: &WorkerContext,
+        maximum: usize,
+        allocation: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        assert!(
+            timeout.is_zero(),
+            "owned H2 reads carry no transport timeout"
+        );
+        let parked = {
+            let mut state = self.0.state.borrow_mut();
+            match state.reads.front() {
+                None | Some(FixtureRead::WaitData(..)) => Some(state.reads.pop_front()),
+                Some(_) => None,
+            }
+        };
+        let Some(parked) = parked else {
+            return self
+                .0
+                .read(context, maximum, allocation, timeout, cancellation);
+        };
+        let baton = CancellableBaton::with_host(context.host().clone());
+        Box::pin(async move {
+            let ready = match parked {
+                Some(FixtureRead::WaitData(ready, bytes)) => Some((ready, bytes)),
+                _ => None,
+            };
+            if let Some((ready, bytes)) = ready {
+                if let Either::Left(_) = select(
+                    std::pin::pin!(ready.notified()),
+                    std::pin::pin!(baton.wait(cancellation)),
+                )
+                .await
+                {
+                    return Ok(UniplexRead::new(queue(&bytes), false));
+                }
+            } else {
+                baton.wait(cancellation).await;
+            }
+            Err(HttpError::with_message(
+                HttpErrorCode::CORO_CANCELLED,
+                b"scripted H2 read cancelled",
+            ))
+        })
+    }
+
+    fn write(
+        &self,
+        context: &WorkerContext,
+        data: BufQueue,
+        flags: ByteEventWriteFlags,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        self.0.write(context, data, flags, timeout, cancellation)
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.0.shutdown_write(context)
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.0.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.0.close_with_reset(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.0.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.0.register_byte_event(context, registration)
+    }
+}
+
+/// A downstream session over `reads` with the given read idle and GOAWAY timeouts.
+fn timed_session(
+    context: WorkerContext,
+    reads: impl IntoIterator<Item = FixtureRead>,
+    replies: Vec<Reply>,
+    read_timeout: Duration,
+    goaway_timeout: Duration,
+) -> (
+    OwnedH2Session<Application>,
+    OwnedH2Handle,
+    Rc<RefCell<FixtureTransportState>>,
+    Rc<RefCell<Vec<Rc<Probe>>>>,
+) {
+    let (fixture, state) = FixtureTransport::new(reads);
+    let (application, probes) = Application::new(replies);
+    let mut config = options(context, Rc::new(UntimedReads(fixture)));
+    config.io.read_timeout = read_timeout;
+    config.http2.goaway_timeout = goaway_timeout;
+    let (session, handle) = OwnedH2Session::new(application, config).expect("timed owned H2");
+    (session, handle, state, probes)
+}
+
+/// The frames written so far, decoded by a client that sent `requests` requests.
+fn written_frames(state: &RefCell<FixtureTransportState>, requests: usize) -> DecodedServerFrames {
+    decode_server_frames_with_requests(&state.borrow().writes.concat(), requests)
+}
+
+fn written_goaways(state: &RefCell<FixtureTransportState>) -> Vec<(StreamId, H2ErrorCode)> {
+    written_frames(state, 1).goaways
+}
+
+type HostCase = fn(Rc<ManualHost>, WorkerContext) -> Pin<Box<dyn Future<Output = ()>>>;
+
+/// Runs `case` on a host that drives a wheel timer, as hosted workers do, and on one without a
+/// wheel, where the driver's timeouts fall back to host sleeps.
+fn on_both_hosts(case: HostCase) {
+    crate::external_host_tests::run_on_wheel_host_with(case);
+    crate::external_host_tests::run_on_host_with(case);
+}
+
+/// An idle connection drains at its read timeout, not a millisecond earlier, as Proxygen's read
+/// timeout calls `initiateDrain`. With a zero GOAWAY timeout both GOAWAYs go out at once, then
+/// the connection closes.
+#[test]
+fn idle_connection_drains_at_its_read_timeout() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(0);
+            let (session, _handle, state, probes) = timed_session(
+                context,
+                [FixtureRead::Data(preface)],
+                Vec::new(),
+                IDLE,
+                Duration::ZERO,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                assert!(written_goaways(&state).is_empty());
+                host.advance(IDLE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert!(written_goaways(&state).is_empty(), "the drain came early");
+                assert_eq!(state.borrow().close, FixtureClose::Open);
+                host.advance(Duration::from_millis(1));
+            });
+            run.expect("an idle drain closes cleanly");
+            assert_eq!(
+                written_goaways(&state),
+                [
+                    (GOAWAY_MAX, H2ErrorCode::NO_ERROR),
+                    (StreamId::UNSPECIFIED, H2ErrorCode::NO_ERROR)
+                ]
+            );
+            assert_eq!(state.borrow().close, FixtureClose::Closed);
+            assert!(probes.borrow().is_empty());
+        })
+    });
+}
+
+/// Request bytes that arrive in the turn the read idle timeout fires win: the connection serves
+/// them and stays open, and the next read gets a fresh deadline.
+#[test]
+fn data_at_the_read_deadline_beats_the_idle_timeout() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (mut peer, preface) = ready_owner_requests(0);
+            let request = eligibility_request(&mut peer, 0);
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (session, _handle, state, probes) = timed_session(
+                context,
+                [
+                    FixtureRead::Data(preface),
+                    FixtureRead::WaitData(Arc::clone(&gate), request),
+                ],
+                vec![Reply::Body(0)],
+                IDLE,
+                Duration::ZERO,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                host.advance(IDLE);
+                gate.notify_one();
+                settle_turns(64).await;
+                let frames = written_frames(&state, 1);
+                assert!(frames.goaways.is_empty(), "the expiry beat same-turn data");
+                assert_eq!(frames.header_statuses, [(StreamId::new(1), 200)]);
+                host.advance(IDLE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert!(
+                    written_goaways(&state).is_empty(),
+                    "the next read kept the old deadline"
+                );
+                host.advance(Duration::from_millis(1));
+            });
+            run.expect("the later idle drain closes cleanly");
+            assert_eq!(
+                written_goaways(&state),
+                [
+                    (GOAWAY_MAX, H2ErrorCode::NO_ERROR),
+                    (StreamId::new(1), H2ErrorCode::NO_ERROR)
+                ]
+            );
+            assert_eq!(probes.borrow()[0].completed.get(), 1);
+        })
+    });
+}
+
+/// An idle drain keeps Proxygen's grace: it sends GOAWAY(2^31-1), serves a request that arrives
+/// before the GOAWAY timeout, sends the final GOAWAY exactly at that timeout, then closes.
+/// `UniplexSession` refuses streams during an idle drain instead (`DIV-028`).
+#[test]
+fn idle_drain_keeps_grace_until_the_goaway_timeout() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (mut peer, preface) = ready_owner_requests(0);
+            let request = eligibility_request(&mut peer, 0);
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (session, _handle, state, probes) = timed_session(
+                context,
+                [
+                    FixtureRead::Data(preface),
+                    FixtureRead::WaitData(Arc::clone(&gate), request),
+                ],
+                vec![Reply::Body(0)],
+                IDLE,
+                GRACE,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                host.advance(IDLE);
+                settle_turns(32).await;
+                assert_eq!(
+                    written_goaways(&state),
+                    [(GOAWAY_MAX, H2ErrorCode::NO_ERROR)]
+                );
+                host.advance(GRACE / 2);
+                gate.notify_one();
+                settle_turns(64).await;
+                assert_eq!(
+                    written_frames(&state, 1).header_statuses,
+                    [(StreamId::new(1), 200)],
+                    "a request inside the grace is served"
+                );
+                host.advance(GRACE / 2 - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    written_goaways(&state).len(),
+                    1,
+                    "the final GOAWAY came early"
+                );
+                assert_eq!(state.borrow().close, FixtureClose::Open);
+                host.advance(Duration::from_millis(1));
+            });
+            run.expect("the idle drain closes cleanly");
+            assert_eq!(
+                written_goaways(&state),
+                [
+                    (GOAWAY_MAX, H2ErrorCode::NO_ERROR),
+                    (StreamId::new(1), H2ErrorCode::NO_ERROR)
+                ]
+            );
+            assert_eq!(state.borrow().close, FixtureClose::Closed);
+            assert_eq!(probes.borrow()[0].completed.get(), 1);
+        })
+    });
+}
+
+/// A local drain honors a nonzero downstream GOAWAY timeout. While the final GOAWAY waits, turns
+/// read no clock, and on a wheel host the wait creates no host sleep.
+#[test]
+fn local_drain_waits_the_goaway_timeout_without_reading_the_clock() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let wheel = context.host().wheel_timer().is_some();
+            let (mut peer, preface) = ready_owner_requests(0);
+            let gates: Vec<_> = (0..3)
+                .map(|_| Arc::new(tokio::sync::Notify::new()))
+                .collect();
+            let pings = gates.iter().enumerate().map(|(index, gate)| {
+                FixtureRead::WaitData(
+                    Arc::clone(gate),
+                    eligibility_frame(
+                        &mut peer,
+                        EgressFrame::PingRequest {
+                            data: Some(index as u64 + 1),
+                        },
+                    ),
+                )
+            });
+            let reads: Vec<_> = [FixtureRead::Data(preface)]
+                .into_iter()
+                .chain(pings)
+                .collect();
+            let (session, handle, state, probes) =
+                timed_session(context, reads, Vec::new(), Duration::ZERO, GRACE);
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                assert!(handle.initiate_drain().unwrap());
+                settle_turns(32).await;
+                assert_eq!(
+                    written_goaways(&state),
+                    [(GOAWAY_MAX, H2ErrorCode::NO_ERROR)]
+                );
+                let (now_reads, sleeps) = (host.now_reads(), host.sleeps());
+                for gate in &gates {
+                    gate.notify_one();
+                    settle_turns(32).await;
+                }
+                assert_eq!(written_frames(&state, 1).ping_replies, [1, 2, 3]);
+                assert_eq!(
+                    host.now_reads() - now_reads,
+                    0,
+                    "a pending GOAWAY read the clock"
+                );
+                assert_eq!(host.sleeps() - sleeps, 0);
+                if wheel {
+                    assert_eq!(host.sleeps(), 0, "the GOAWAY wait used a host sleep");
+                }
+                host.advance(GRACE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    written_goaways(&state).len(),
+                    1,
+                    "the final GOAWAY came early"
+                );
+                host.advance(Duration::from_millis(1));
+            });
+            run.expect("the drain closes cleanly");
+            assert_eq!(
+                written_goaways(&state),
+                [
+                    (GOAWAY_MAX, H2ErrorCode::NO_ERROR),
+                    (StreamId::UNSPECIFIED, H2ErrorCode::NO_ERROR)
+                ]
+            );
+            assert_eq!(state.borrow().close, FixtureClose::Closed);
+            assert!(probes.borrow().is_empty());
+        })
+    });
+}
+
+/// An active connection keeps one wheel slot for its read idle timeout: a hundred requests, each
+/// arriving well inside the timeout, restamp it without relinking, the wheel re-slots it about
+/// once per timeout period, and it never fires.
+#[test]
+fn active_connection_restamps_one_read_idle_slot() {
+    const REQUESTS: usize = 100;
+    const SPACING: Duration = Duration::from_secs(6);
+    crate::external_host_tests::run_on_wheel_host_with(|host, context| {
+        Box::pin(async move {
+            let (mut peer, preface) = ready_owner_requests(0);
+            let gates: Vec<_> = (0..REQUESTS)
+                .map(|_| Arc::new(tokio::sync::Notify::new()))
+                .collect();
+            let requests = gates.iter().map(|gate| {
+                FixtureRead::WaitData(Arc::clone(gate), eligibility_request(&mut peer, 0))
+            });
+            let reads: Vec<_> = [FixtureRead::Data(preface)]
+                .into_iter()
+                .chain(requests)
+                .collect();
+            let (session, handle, state, probes) = timed_session(
+                context,
+                reads,
+                vec![Reply::Body(0); REQUESTS],
+                IDLE,
+                Duration::ZERO,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                for (served, gate) in gates.iter().enumerate() {
+                    host.advance(SPACING);
+                    gate.notify_one();
+                    complete_credit_wait(|| {
+                        written_frames(&state, REQUESTS).header_statuses.len() == served + 1
+                    })
+                    .await;
+                }
+                assert!(
+                    written_frames(&state, REQUESTS).goaways.is_empty(),
+                    "an active connection drained"
+                );
+                let stats = host.wheel_stats();
+                assert_eq!(
+                    stats.live_slots, 1,
+                    "one slot for the connection's read idle"
+                );
+                assert_eq!(stats.fired, 0);
+                assert_eq!(stats.relinked, 1, "restamps are stores, not relinks");
+                let periods = (SPACING.as_secs() * REQUESTS as u64).div_ceil(IDLE.as_secs());
+                assert!(
+                    stats.reslotted <= 2 * periods,
+                    "{} re-slots over {periods} timeout periods",
+                    stats.reslotted
+                );
+                assert!(handle.initiate_drain().unwrap());
+            });
+            run.expect("the drained connection closes cleanly");
+            assert!(
+                probes
+                    .borrow()
+                    .iter()
+                    .all(|probe| probe.completed.get() == 1)
+            );
+        })
+    });
+}
+
+/// The clock reads of the zero-config guard: a GET round trip, as on the parent commit, and that
+/// round trip plus a local drain with a zero GOAWAY timeout, one fewer than the parent's 3: the
+/// final GOAWAY no longer rereads the clock to find the zero timeout passed.
+const ZERO_CONFIG_ROUND_TRIP_NOW_READS: usize = 1;
+const ZERO_CONFIG_DRAIN_NOW_READS: usize = 2;
+
+/// With every timeout zero the driver installs no timer: a request round trip and a drain take no
+/// wheel slot, create no host sleep, and read the clock no more often than before the driver
+/// honored timeouts.
+#[test]
+fn zero_timeouts_take_no_slot_sleep_or_clock_read() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let wheel = context.host().wheel_timer().is_some();
+            let (mut peer, preface) = ready_owner_requests(0);
+            let request = eligibility_request(&mut peer, 0);
+            let (session, handle, state, probes) = timed_session(
+                context,
+                [FixtureRead::Data([preface, request].concat())],
+                vec![Reply::Body(0)],
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+            let reads_before = host.now_reads();
+            let (run, round_trip) = futures::join!(session.run(), async {
+                complete_credit_wait(|| written_frames(&state, 1).header_statuses.len() == 1).await;
+                settle_turns(32).await;
+                let round_trip = host.now_reads() - reads_before;
+                assert!(handle.initiate_drain().unwrap());
+                round_trip
+            });
+            run.expect("the drained connection closes cleanly");
+            let drain = host.now_reads() - reads_before;
+            assert_eq!(round_trip, ZERO_CONFIG_ROUND_TRIP_NOW_READS);
+            assert_eq!(drain, ZERO_CONFIG_DRAIN_NOW_READS);
+            assert_eq!(host.sleeps(), 0, "a zero-config session made a host sleep");
+            if wheel {
+                let stats = host.wheel_stats();
+                assert_eq!(stats.scheduled, 0);
+                assert_eq!(stats.live_slots, 0);
+            }
+            assert_eq!(
+                written_goaways(&state),
+                [
+                    (GOAWAY_MAX, H2ErrorCode::NO_ERROR),
+                    (StreamId::new(1), H2ErrorCode::NO_ERROR)
+                ]
+            );
+            assert_eq!(probes.borrow()[0].completed.get(), 1);
+        })
+    });
+}
+
+/// Runs `test` on a caller-driven worker over a current-thread runtime whose clock is paused, so
+/// Tokio sleeps, the fixture's read timeouts and a host without a wheel all advance together.
+fn run_on_paused_worker<T: Send + 'static>(
+    test: impl FnOnce(WorkerContext) -> Pin<Box<dyn Future<Output = T>>> + Send + 'static,
+) -> T {
+    Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .expect("paused current-thread runtime")
+        .block_on(LocalSet::new().run_until(async move {
+            let (worker, driver) = WorkerDriver::new(16).expect("worker driver");
+            let call = worker
+                .call_local(move |context| {
+                    let worker = context.handle().clone();
+                    async move {
+                        let result = test(context).await;
+                        worker.begin_shutdown();
+                        result
+                    }
+                })
+                .expect("worker call");
+            let (_, result) = tokio::join!(driver, call);
+            result.expect("worker call completed")
+        }))
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DrainStart {
+    /// The connection idles until its read timeout drains it.
+    Idle,
+    /// The application drains the connection at once.
+    Local,
+}
+
+/// Scripted reads that both drivers time the same way. A read waits for its gate, if any, and a
+/// nonzero read timeout ends a read still waiting with `READ_TIMEOUT`, keeping its bytes for the
+/// next read, as a socket read does. Past the script, a read waits for cancellation or its
+/// timeout.
+struct GatedReads {
+    inner: Rc<FixtureTransport>,
+    script: Rc<RefCell<VecDeque<(Option<Arc<tokio::sync::Notify>>, Vec<u8>)>>>,
+}
+
+impl UniplexTransport for GatedReads {
+    fn read(
+        &self,
+        context: &WorkerContext,
+        _maximum: usize,
+        _allocation: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        let front = self.script.borrow().front().cloned();
+        let script = Rc::clone(&self.script);
+        let baton = CancellableBaton::with_host(context.host().clone());
+        Box::pin(async move {
+            let ready = async {
+                match &front {
+                    Some((Some(gate), _)) => gate.notified().await,
+                    Some((None, _)) => {}
+                    None => std::future::pending().await,
+                }
+            };
+            let expired = async {
+                if timeout.is_zero() {
+                    std::future::pending::<()>().await;
+                }
+                tokio::time::sleep(timeout).await;
+            };
+            tokio::select! {
+                biased;
+                () = ready => {
+                    let (_, bytes) = script.borrow_mut().pop_front().expect("the scripted read");
+                    Ok(UniplexRead::new(queue(&bytes), false))
+                }
+                () = expired => Err(HttpError::with_message(
+                    HttpErrorCode::READ_TIMEOUT,
+                    b"scripted H2 read timeout",
+                )),
+                _ = baton.wait(cancellation) => Err(HttpError::with_message(
+                    HttpErrorCode::CORO_CANCELLED,
+                    b"scripted H2 read cancelled",
+                )),
+            }
+        })
+    }
+
+    fn write(
+        &self,
+        context: &WorkerContext,
+        data: BufQueue,
+        flags: ByteEventWriteFlags,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        self.inner
+            .write(context, data, flags, timeout, cancellation)
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.shutdown_write(context)
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close_with_reset(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.inner.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.inner.register_byte_event(context, registration)
+    }
+}
+
+/// What a downstream driver wrote while it drained an idle connection.
+struct DrainWire {
+    /// `(milliseconds since start, last stream)` of each GOAWAY, sampled every millisecond of
+    /// paused time until the session ended.
+    goaways: Vec<(u64, StreamId)>,
+    header_statuses: Vec<(StreamId, u16)>,
+    resets: Vec<(StreamId, H2ErrorCode)>,
+}
+
+/// Drains an idle connection on the owned driver or on `UniplexSession`. A GET arrives at
+/// `request_at`, if given.
+async fn drain_wire(
+    context: WorkerContext,
+    owned: bool,
+    start: DrainStart,
+    read_timeout: Duration,
+    goaway_timeout: Duration,
+    request_at: Option<Duration>,
+) -> DrainWire {
+    let (mut peer, preface) = ready_owner_requests(0);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let mut script = VecDeque::from([(None, preface)]);
+    if request_at.is_some() {
+        script.push_back((Some(Arc::clone(&gate)), eligibility_request(&mut peer, 0)));
+    }
+    let (inner, state) = FixtureTransport::new([]);
+    let transport = Rc::new(GatedReads {
+        inner,
+        script: Rc::new(RefCell::new(script)),
+    });
+    let begun = tokio::time::Instant::now();
+    let done = Rc::new(Cell::new(false));
+    let session: Pin<Box<dyn Future<Output = Result<UniplexRunSummary, HttpError>>>> = if owned {
+        let (application, _probes) = Application::new(vec![Reply::Body(0)]);
+        let mut config = options(context, transport);
+        config.io.read_timeout = read_timeout;
+        config.http2.goaway_timeout = goaway_timeout;
+        let (session, handle) = OwnedH2Session::new(application, config).expect("owned H2");
+        if let DrainStart::Local = start {
+            assert!(handle.initiate_drain().unwrap());
+        }
+        Box::pin(session.run())
+    } else {
+        let handler: Rc<dyn HttpHandler> = Rc::new(FixtureHandler {
+            status: 200,
+            response_body: 0,
+            response_error: None,
+            invocations: Rc::new(Cell::new(0)),
+            request_body: Rc::new(Cell::new(0)),
+        });
+        let config = UniplexConfig {
+            read_timeout,
+            ..UniplexConfig::default()
+        };
+        let http2 = Http2SessionConfig {
+            goaway_timeout,
+            ..Http2SessionConfig::default()
+        };
+        let (session, handle) = UniplexSession::new_http2(
+            context,
+            TransportDirection::Downstream,
+            transport,
+            Some(handler),
+            config,
+            http2,
+        )
+        .expect("Uniplex H2");
+        if let DrainStart::Local = start {
+            assert!(handle.initiate_drain().unwrap());
+        }
+        Box::pin(session.run())
+    };
+    let monitor = async {
+        let mut timeline = Vec::new();
+        loop {
+            let at = begun.elapsed();
+            if request_at.is_some_and(|request_at| at >= request_at) {
+                gate.notify_one();
+            }
+            let goaways = written_goaways(&state);
+            timeline.extend(goaways[timeline.len()..].iter().map(|(stream, code)| {
+                assert_eq!(*code, H2ErrorCode::NO_ERROR);
+                (at.as_millis() as u64, *stream)
+            }));
+            if done.get() {
+                return timeline;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    let run = async {
+        let result = session.await;
+        done.set(true);
+        result
+    };
+    let (result, goaways) = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(run, monitor)
+    })
+    .await
+    .expect("the drain ends");
+    result.expect("the drain closes cleanly");
+    let frames = written_frames(&state, 1);
+    DrainWire {
+        goaways,
+        header_statuses: frames.header_statuses,
+        resets: frames.resets,
+    }
+}
+
+/// Asserts the same GOAWAYs, each within the millisecond the timelines sample at.
+fn assert_same_goaways(owned: &[(u64, StreamId)], uniplex: &[(u64, StreamId)]) {
+    assert_eq!(
+        owned.iter().map(|(_, stream)| *stream).collect::<Vec<_>>(),
+        uniplex
+            .iter()
+            .map(|(_, stream)| *stream)
+            .collect::<Vec<_>>(),
+    );
+    for ((owned_at, _), (uniplex_at, _)) in owned.iter().zip(uniplex) {
+        assert!(
+            owned_at.abs_diff(*uniplex_at) <= 1,
+            "owned {owned:?}, uniplex {uniplex:?}"
+        );
+    }
+}
+
+/// Downstream drains of an idle connection, owned against `UniplexSession` on the same paused
+/// clock: a local drain, and an idle drain with a zero and with a nonzero GOAWAY timeout, write
+/// the same GOAWAYs at the same instants, and a request inside a local drain's grace is served
+/// by both. A request inside an idle drain's grace is served by the owned driver, as Proxygen's
+/// read timeout (`initiateDrain`) keeps the grace, while `UniplexSession` keeps grace only for a
+/// local drain and refuses it (`DIV-028`).
+#[test]
+fn owned_drain_goaways_match_uniplex_apart_from_idle_grace() {
+    let half = GRACE / 2;
+    let cases = [
+        (DrainStart::Local, Duration::ZERO, GRACE, None),
+        (DrainStart::Idle, IDLE, Duration::ZERO, None),
+        (DrainStart::Idle, IDLE, GRACE, None),
+        (DrainStart::Local, Duration::ZERO, GRACE, Some(half)),
+        (DrainStart::Idle, IDLE, GRACE, Some(IDLE + half)),
+    ];
+    for (start, read_timeout, goaway_timeout, request_at) in cases {
+        let (owned, uniplex) = run_on_paused_worker(move |context| {
+            Box::pin(async move {
+                let owned = drain_wire(
+                    context.clone(),
+                    true,
+                    start,
+                    read_timeout,
+                    goaway_timeout,
+                    request_at,
+                )
+                .await;
+                let uniplex = drain_wire(
+                    context,
+                    false,
+                    start,
+                    read_timeout,
+                    goaway_timeout,
+                    request_at,
+                )
+                .await;
+                (owned, uniplex)
+            })
+        });
+        assert_same_goaways(&owned.goaways, &uniplex.goaways);
+        let idle_grace = matches!(start, DrainStart::Idle) && request_at.is_some();
+        if !idle_grace {
+            assert_eq!(owned.header_statuses, uniplex.header_statuses);
+            assert_eq!(owned.resets, uniplex.resets);
+            continue;
+        }
+        assert_eq!(owned.header_statuses, [(StreamId::new(1), 200)]);
+        assert!(owned.resets.is_empty());
+        // Until `UniplexSession` keeps grace for an idle drain, it refuses the request, and with
+        // PROTOCOL_ERROR rather than REFUSED_STREAM.
+        assert!(uniplex.header_statuses.is_empty());
+        assert_eq!(
+            uniplex.resets,
+            [(StreamId::new(1), H2ErrorCode::PROTOCOL_ERROR)]
+        );
+    }
+}
+
+/// Records `session`'s lifecycle events.
+fn observe_lifecycle(
+    session: &mut OwnedH2Session<Application>,
+) -> Rc<RefCell<Vec<LifecycleEvent>>> {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    session
+        .add_lifecycle_observer(Rc::new(LifecycleProbe {
+            events: Rc::clone(&events),
+        }))
+        .unwrap();
+    events
+}
+
+fn drains_started(events: &[LifecycleEvent]) -> Vec<LifecycleEvent> {
+    events
+        .iter()
+        .filter(|event| matches!(event, LifecycleEvent::DrainStarted(_)))
+        .copied()
+        .collect()
+}
+
+/// An observer sees an idle drain as `DrainStarted(IdleTimeout)`, once: the read idle expiries
+/// that follow while the drain waits out its GOAWAY timeout report nothing more.
+#[test]
+fn an_idle_drain_reports_one_idle_timeout_drain() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(0);
+            let (mut session, _handle, state, _probes) = timed_session(
+                context,
+                [FixtureRead::Data(preface)],
+                Vec::new(),
+                IDLE,
+                IDLE * 2 + IDLE / 2,
+            );
+            let events = observe_lifecycle(&mut session);
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                for _ in 0..3 {
+                    host.advance(IDLE);
+                    settle_turns(32).await;
+                }
+                assert_eq!(
+                    written_goaways(&state),
+                    [(GOAWAY_MAX, H2ErrorCode::NO_ERROR)],
+                    "two read idle expiries during the drain sent nothing"
+                );
+                host.advance(IDLE / 2);
+            });
+            run.expect("an idle drain closes cleanly");
+            assert_eq!(
+                written_goaways(&state),
+                [
+                    (GOAWAY_MAX, H2ErrorCode::NO_ERROR),
+                    (StreamId::UNSPECIFIED, H2ErrorCode::NO_ERROR)
+                ]
+            );
+            let events = events.take();
+            assert_eq!(
+                drains_started(&events),
+                [LifecycleEvent::DrainStarted(DrainTrigger::IdleTimeout)],
+                "{events:?}"
+            );
+            assert_eq!(events.last(), Some(&LifecycleEvent::Destroy));
+        })
+    });
+}
+
+/// On a connection with a read idle timeout and a GOAWAY timeout, an observer sees a header-rate
+/// breach as `DrainStarted(HeaderRateLimit)`, and C7's one final GOAWAY is all the wire gets: it
+/// disarms nothing that could send a second one, and a later read idle expiry starts no drain.
+/// The accepted stream's response holds its end after one body byte while the clock passes the
+/// GOAWAY timeout and then the read idle timeout, so the connection is still in its final drain
+/// when both would fire.
+#[test]
+fn a_header_rate_limit_trip_on_a_timed_connection_reports_one_drain() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (fixture, state) =
+                FixtureTransport::new([FixtureRead::Data(peer_two_requests_bytes())]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(1); 2]);
+            let release = Arc::new(tokio::sync::Notify::new());
+            application.empty_terminal = Some(Arc::clone(&release));
+            let mut config = options(context, Rc::new(UntimedReads(fixture)));
+            config.io.read_timeout = IDLE;
+            config.http2.goaway_timeout = GRACE;
+            config.http2.rate_limits = Http2RateLimitConfig {
+                header_frames: RateLimitConfig::new(1, Duration::from_secs(60), 0),
+                ..unbounded_rates()
+            };
+            let (mut session, _) = OwnedH2Session::new(application, config).unwrap();
+            let events = observe_lifecycle(&mut session);
+            let done = Cell::new(false);
+            let run = async {
+                let result = session.run().await;
+                done.set(true);
+                result
+            };
+            let (run, ()) = futures::join!(run, async {
+                settle_turns(64).await;
+                let final_goaway = [(StreamId::new(3), H2ErrorCode::NO_ERROR)];
+                assert_eq!(written_frames(&state, 2).goaways, final_goaway);
+                host.advance(GRACE);
+                settle_turns(32).await;
+                host.advance(IDLE);
+                settle_turns(32).await;
+                assert!(
+                    !done.get(),
+                    "the open response keeps the final drain running"
+                );
+                assert_eq!(probes.borrow()[0].completed.get(), 0);
+                assert_eq!(
+                    written_frames(&state, 2).goaways,
+                    final_goaway,
+                    "the GOAWAY and read idle expiries during the final drain sent nothing"
+                );
+                release.notify_one();
+            });
+            run.expect("a header breach drains gracefully");
+            let written = written_frames(&state, 2);
+            assert_eq!(written.goaways, [(StreamId::new(3), H2ErrorCode::NO_ERROR)]);
+            assert!(written.resets.is_empty());
+            assert_eq!(written.header_statuses, [(StreamId::new(1), 200)]);
+            assert_eq!(probes.borrow()[0].completed.get(), 1);
+            let events = events.take();
+            assert_eq!(
+                drains_started(&events),
+                [LifecycleEvent::DrainStarted(DrainTrigger::HeaderRateLimit)],
+                "{events:?}"
+            );
+        })
+    });
+}
+
+/// A connection without an observer creates no `Observation` (C4's zero-config path), on both
+/// hosts: not for requests served to EOF or a local drain with every timeout zero, nor for an
+/// idle drain on a timed connection, whose `DrainStarted(IdleTimeout)` has nobody to go to.
+/// Adding an observer creates exactly one.
+#[test]
+fn unobserved_connections_create_no_observation() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let created = crate::owned_h2::observations_created();
+            for drain in [false, true] {
+                let (transport, _) =
+                    FixtureTransport::new([FixtureRead::DataEof(peer_two_requests_bytes())]);
+                let (application, probes) = Application::new(vec![Reply::Body(0); 2]);
+                let (session, handle) =
+                    OwnedH2Session::new(application, options(context.clone(), transport)).unwrap();
+                if drain {
+                    assert!(handle.initiate_drain().unwrap());
+                }
+                session.run().await.expect("the connection closes cleanly");
+                if !drain {
+                    assert_eq!(probes.borrow().len(), 2);
+                }
+            }
+
+            let (_, preface) = ready_owner_requests(0);
+            let (session, _handle, state, _probes) = timed_session(
+                context.clone(),
+                [FixtureRead::Data(preface)],
+                Vec::new(),
+                IDLE,
+                Duration::ZERO,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                host.advance(IDLE);
+            });
+            run.expect("an idle drain closes cleanly");
+            assert_eq!(written_goaways(&state).len(), 2);
+            assert_eq!(
+                crate::owned_h2::observations_created(),
+                created,
+                "an unobserved connection created an Observation"
+            );
+
+            let (mut session, ..) = timed_session(context, [], Vec::new(), IDLE, Duration::ZERO);
+            observe_lifecycle(&mut session);
+            observe_lifecycle(&mut session);
+            assert_eq!(crate::owned_h2::observations_created(), created + 1);
         })
     });
 }

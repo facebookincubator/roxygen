@@ -146,11 +146,12 @@ pub struct ServerSessionConfig {
     pub owned_http1: bool,
     /// Experimental, default off: serves HTTP/2 connections on the owned driver
     /// (`roxygen_session::owned_h2`) instead of `UniplexSession`, with no task per
-    /// request. HTTP/1.1 connections are unchanged. The owned mode is untimed and
-    /// stat-less: `stream_read_timeout`, `connection_idle_timeout`
-    /// and `write_timeout` must be zero (which also leaves HTTP/1.1 sessions untimed).
-    /// TLS handshakes keep their independent timeout. `stats_factory`
-    /// must be `None`. Server construction refuses anything else with the reason, as
+    /// request. HTTP/1.1 connections are unchanged. The owned mode honors
+    /// `connection_idle_timeout`, which drains an idle connection with GOAWAY
+    /// (`DIV-028`). It is stat-less: `stream_read_timeout` and
+    /// `write_timeout` must be zero (which also leaves HTTP/1.1 sessions untimed for
+    /// them), and `stats_factory` must be `None`. Server construction refuses
+    /// anything else with the reason, as
     /// `HttpServerError::InvalidConfig` (or, for `serve_transport`,
     /// `INVALID_STATE_TRANSITION`). It applies `http2_rate_limits`, as the managed driver does.
     /// A `lifecycle_observer_factory` observer
@@ -252,13 +253,10 @@ impl ServerSessionConfig {
             return Err("owned_http2 does not support stats_factory");
         }
         if !self.stream_read_timeout.is_zero() {
-            return Err("owned_http2 is untimed: stream_read_timeout must be zero");
-        }
-        if !self.connection_idle_timeout.is_zero() {
-            return Err("owned_http2 is untimed: connection_idle_timeout must be zero");
+            return Err("owned_http2 does not honor stream_read_timeout: it must be zero");
         }
         if !self.write_timeout.is_zero() {
-            return Err("owned_http2 is untimed: write_timeout must be zero");
+            return Err("owned_http2 does not honor write_timeout: it must be zero");
         }
         Ok(())
     }
@@ -841,10 +839,11 @@ pub(crate) fn http2_session_config(config: &ServerSessionConfig) -> Http2Session
 }
 
 /// The owned driver's HTTP/2 configuration: the managed session's, with the parts
-/// the driver cannot honor turned off instead of silently kept. It is untimed and
-/// records no statistics, so the GOAWAY timeout is zero and stats and ping probes
-/// are `None`. Its flood limits are `http2_rate_limits`, with the same defaults
-/// as the managed driver (`DIV-052`). The driver
+/// the driver cannot honor turned off instead of silently kept. It records no
+/// statistics, so stats and ping probes are `None`. Both drivers use the same flood limits.
+/// The GOAWAY timeout stays zero, so a drain sends both GOAWAYs at once, as before
+/// the driver honored it: `ServerSessionConfig` has no field for it, and the managed
+/// session's one-second default is left to the drain policy that adopts it. The driver
 /// also requires its stream receive window to equal the advertised
 /// `INITIAL_WINDOW_SIZE`, so the window follows the advertised setting (the
 /// protocol default when `settings` carries none); where the setting is present,

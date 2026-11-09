@@ -6405,3 +6405,29 @@ fn cancel_before_release_still_resets() {
     assert!(idle, "the reset stream retires and the session is idle");
     assert!(released_after, "the retired stream releases its capacity");
 }
+
+/// The upstream driver still refuses the timers it does not honor: a connection read timeout
+/// and a stream read timeout or write timeout, before any transport or application work.
+#[test]
+fn upstream_refuses_unhonored_timeouts() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            for case in 0..3 {
+                let (transport, state) = FixtureTransport::new([]);
+                let mut config = options(context.clone(), transport);
+                match case {
+                    0 => config.io.read_timeout = Duration::from_secs(1),
+                    1 => config.io.stream_read_timeout = Duration::from_secs(1),
+                    2 => config.io.write_timeout = Duration::from_secs(1),
+                    _ => unreachable!(),
+                }
+                let error = match OwnedH2UpstreamSession::new(config) {
+                    Err(error) => error,
+                    Ok(_) => panic!("unhonored upstream timeout {case} was accepted"),
+                };
+                assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+                assert!(state.borrow().writes.is_empty());
+            }
+        })
+    });
+}

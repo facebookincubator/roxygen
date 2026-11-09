@@ -77,6 +77,7 @@ use roxygen_http2::flow_control::FlowControlledCodec;
 use roxygen_http2::settings::SettingsId;
 use roxygen_runtime::cancellation::CancellationSource;
 use roxygen_runtime::host::Host;
+use roxygen_runtime::host::timer::Timeout;
 use roxygen_runtime::panic::discard_panic;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_transport::byte_event::AsyncSocketByteEventObserver;
@@ -232,6 +233,33 @@ impl Wake for IoWake {
     fn wake_by_ref(self: &Arc<Self>) {
         self.queue
             .wake_after(|| self.ready.store(true, Ordering::Release));
+    }
+}
+
+/// The connection's timeouts (`DIV-028`), installed when the first one is armed, so a session
+/// whose timeouts are all zero has none.
+struct ConnectionTimers {
+    /// Set when a slot fires; each turn takes it once.
+    wake: Arc<IoWake>,
+    waker: Waker,
+    /// Proxygen's connection read timeout, which bounds each transport read: stamped when a read
+    /// is issued and observed only while that read is outstanding.
+    read_idle: Timeout,
+    /// Proxygen's `GoawayTimeout`: `goaway_deadline` under a nonzero `goaway_timeout`.
+    goaway: Timeout,
+}
+
+impl ConnectionTimers {
+    #[cold]
+    #[inline(never)]
+    fn new(host: &Host, queue: &Arc<ReadyQueue>) -> Box<Self> {
+        let wake = IoWake::new(queue);
+        Box::new(Self {
+            waker: Waker::from(Arc::clone(&wake)),
+            wake,
+            read_idle: Timeout::new(host),
+            goaway: Timeout::new(host),
+        })
     }
 }
 
@@ -474,6 +502,18 @@ struct Observation {
 }
 
 impl Observation {
+    #[cold]
+    #[inline(never)]
+    fn new(max_outgoing: u32) -> Box<Self> {
+        #[cfg(test)]
+        OBSERVATIONS_CREATED.set(OBSERVATIONS_CREATED.get() + 1);
+        Box::new(Self {
+            lifecycle: Rc::new(UniplexLifecycleDispatcher::new(None)),
+            drain_started: false,
+            max_outgoing,
+        })
+    }
+
     #[cold]
     #[inline(never)]
     fn push(&self, event: LifecycleEvent) {
@@ -1093,8 +1133,8 @@ where
     sent_initial_goaway: bool,
     sent_final_goaway: bool,
     goaway_deadline: Option<Instant>,
-    goaway_wait: Option<roxygen_runtime::host::LocalFuture>,
     budget_yield: Option<roxygen_runtime::host::LocalFuture>,
+    timers: Option<Box<ConnectionTimers>>,
     ready_waker: Option<Arc<Waker>>,
     /// A queued write started without arming the writer, and no `poll_complete` has since
     /// registered its waker or found the queue idle.
@@ -1244,6 +1284,17 @@ fn record_rate(limiter: &mut Http2RateLimiter, kind: RateLimitKind, host: &Host)
     !limiter.is_unbounded(kind) && limiter.record(kind, host.now()).0
 }
 
+#[cfg(test)]
+thread_local! {
+    static OBSERVATIONS_CREATED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// How many sessions on this thread have created their `Observation`.
+#[cfg(test)]
+pub(crate) fn observations_created() -> usize {
+    OBSERVATIONS_CREATED.get()
+}
+
 /// A refused or rejected stream's head is reported as `UniplexSession` reports it: as an
 /// ingress message, unless it has a forbidden body.
 #[cold]
@@ -1290,7 +1341,9 @@ fn owned_receive_window(
 }
 
 impl<A: OwnedApplication> OwnedH2Session<A> {
-    /// Creates the experimental opt-in session. It is untimed, and it limits only the flood
+    /// Creates the experimental opt-in session. It honors `read_timeout`, whose expiry drains
+    /// the connection with grace, and `goaway_timeout`, and refuses a nonzero
+    /// `stream_read_timeout` or `write_timeout` (`DIV-028`). It limits only the flood
     /// categories that `Http2SessionConfig::rate_limits` bounds (`DIV-052`).
     pub fn new(
         application: A,
@@ -1323,13 +1376,10 @@ impl<A: OwnedApplication> OwnedH2Session<A> {
         let lifecycle = match &driver.connection.state.observation {
             Some(observation) => Rc::clone(&observation.lifecycle),
             None => {
-                let lifecycle = Rc::new(UniplexLifecycleDispatcher::new(None));
                 driver.connection.state.control.window_transition.set(None);
-                driver.connection.state.observation = Some(Box::new(Observation {
-                    lifecycle: Rc::clone(&lifecycle),
-                    drain_started: false,
-                    max_outgoing: driver.h2.max_concurrent_outgoing_streams,
-                }));
+                let observation = Observation::new(driver.h2.max_concurrent_outgoing_streams);
+                let lifecycle = Rc::clone(&observation.lifecycle);
+                driver.connection.state.observation = Some(observation);
                 lifecycle
             }
         };
@@ -1386,10 +1436,9 @@ where
             || io.maximum_write_size > io.buffer_limit
             || (!UPSTREAM && !io.drain_request_body_on_drop)
             || (UPSTREAM && io.drain_request_body_on_drop)
-            || !io.read_timeout.is_zero()
+            || (UPSTREAM && !io.read_timeout.is_zero())
             || !io.stream_read_timeout.is_zero()
             || !io.write_timeout.is_zero()
-            || (!UPSTREAM && !http2.goaway_timeout.is_zero())
             || http2.stats.is_some()
             || http2
                 .ping_probes
@@ -1570,8 +1619,8 @@ where
                 sent_initial_goaway: false,
                 sent_final_goaway: false,
                 goaway_deadline: None,
-                goaway_wait: None,
                 budget_yield: None,
+                timers: None,
                 ready_waker: None,
                 unarmed_write: false,
             },
@@ -1718,16 +1767,20 @@ where
                 self.write_wake.ready.store(true, Ordering::Release);
             }
             self.check_cancel();
-            let mut ran = self.goaway_wait.is_some() || self.goaway_deadline.is_some();
+            let timer_fired = self
+                .timers
+                .as_ref()
+                .is_some_and(|timers| timers.wake.take_ready());
+            let mut ran = self.goaway_deadline.is_some();
             if self.connection.state.control.drain.get()
                 && !self.connection.state.draining
                 && self.failure.fatal.is_none()
             {
                 ran = true;
-                self.start_drain();
+                self.start_drain(DrainTrigger::Local);
             }
-            if self.goaway_wait.is_some() || self.goaway_deadline.is_some() {
-                self.poll_goaway(context);
+            if self.goaway_deadline.is_some() {
+                self.poll_goaway(timer_fired);
             }
             let mut progress = false;
             if let Some(wrote) = self.poll_write() {
@@ -1737,6 +1790,11 @@ where
             self.check_cancel_after(&mut ran);
             if let Some(read) = self.poll_read() {
                 progress |= read;
+                ran = true;
+            }
+            // Data or EOF the read phase just observed beats an expiry in the same turn.
+            if timer_fired && self.read.is_some() && self.read_idle_expired() {
+                self.read_idle_timeout();
                 ran = true;
             }
             self.check_cancel_after(&mut ran);
@@ -1918,7 +1976,6 @@ where
             && self.egress.is_empty()
             && !state.zero_write_pending
             && self.budget_yield.is_none()
-            && self.goaway_wait.is_none()
             && self.goaway_deadline.is_none()
             && !state.control.drain.get()
             && !state.draining
@@ -1953,29 +2010,37 @@ where
 
     #[cold]
     #[inline(never)]
-    fn start_drain(&mut self) {
+    fn start_drain(&mut self, trigger: DrainTrigger) {
         self.connection.state.draining = true;
-        self.connection.state.ingress_grace = !UPSTREAM && self.h2.double_goaway_drain;
+        // Proxygen's `initiateDrain` serves both a local drain and a read timeout
+        // (HTTPCoroSession.cpp:1426-1440, 2626-2628), so either keeps the grace.
+        self.connection.state.ingress_grace = !UPSTREAM
+            && self.h2.double_goaway_drain
+            && matches!(trigger, DrainTrigger::Local | DrainTrigger::IdleTimeout);
         if UPSTREAM {
             self.sent_initial_goaway = true;
         }
         if let Some(observation) = self.connection.state.observation.as_deref_mut() {
-            observation.drain(DrainTrigger::Local);
+            observation.drain(trigger);
         }
         if let Err(error) = self.generate_goaway(H2ErrorCode::NO_ERROR) {
             self.abort(error);
         }
     }
 
+    /// Sends the final GOAWAY once the pending one's deadline passed: at once for a zero
+    /// `goaway_timeout`, whose deadline is the instant of the first GOAWAY, else when the `goaway`
+    /// slot fired.
     #[cold]
     #[inline(never)]
-    fn poll_goaway(&mut self, context: &mut Context<'_>) {
-        if let Some(wait) = &mut self.goaway_wait {
-            let _ = wait.as_mut().poll(context);
-        }
-        if self
-            .goaway_deadline
-            .is_some_and(|deadline| deadline <= self.context.host().now())
+    fn poll_goaway(&mut self, timer_fired: bool) {
+        let due = self.h2.goaway_timeout.is_zero()
+            || (timer_fired
+                && self
+                    .timers
+                    .as_mut()
+                    .is_some_and(|timers| timers.goaway.take_expired().is_some()));
+        if due
             && self.failure.fatal.is_none()
             && let Err(error) = self.generate_goaway(H2ErrorCode::NO_ERROR)
         {
@@ -1993,6 +2058,20 @@ where
             });
         }
         self.fail_connection(error);
+    }
+
+    /// Arms the `goaway` slot for `goaway_deadline`, or disarms it once a final GOAWAY cleared
+    /// the deadline. A zero `goaway_timeout` needs no slot.
+    fn sync_goaway_timer(&mut self) {
+        let armed = self
+            .goaway_deadline
+            .filter(|_| !self.h2.goaway_timeout.is_zero());
+        if let Some(deadline) = armed {
+            let ConnectionTimers { goaway, waker, .. } = self.timers();
+            goaway.schedule_at(deadline, waker);
+        } else if let Some(timers) = &mut self.timers {
+            timers.goaway.cancel();
+        }
     }
 
     #[cold]
@@ -2065,9 +2144,7 @@ where
         ) {
             self.connection.state.ingress_grace = false;
         }
-        self.goaway_wait = self
-            .goaway_deadline
-            .map(|deadline| self.context.host().sleep_until(deadline));
+        self.sync_goaway_timer();
         Ok(())
     }
 
@@ -2095,11 +2172,14 @@ where
                             .config
                             .read_allocation_size
                             .min(maximum),
-                        self.connection.state.config.read_timeout,
+                        Duration::ZERO,
                         self.cancellation.token(),
                     ),
                 );
                 self.read_wake.ready.store(true, Ordering::Release);
+                if !self.connection.state.config.read_timeout.is_zero() {
+                    self.stamp_read_idle();
+                }
             }
         }
         let Some(read) = &mut self.read else {
@@ -2136,6 +2216,41 @@ where
             Err(error) => self.read_failed(error),
         }
         Some(true)
+    }
+
+    fn timers(&mut self) -> &mut ConnectionTimers {
+        self.timers.get_or_insert_with(|| {
+            ConnectionTimers::new(self.context.host(), &self.connection.state.control.ready)
+        })
+    }
+
+    /// Arms the read idle timeout for the read just issued.
+    fn stamp_read_idle(&mut self) {
+        let deadline = self
+            .context
+            .host()
+            .deadline_after(self.connection.state.config.read_timeout);
+        let ConnectionTimers {
+            read_idle, waker, ..
+        } = self.timers();
+        read_idle.schedule_at(deadline, waker);
+    }
+
+    fn read_idle_expired(&mut self) -> bool {
+        self.timers
+            .as_mut()
+            .is_some_and(|timers| timers.read_idle.take_expired().is_some())
+    }
+
+    /// The outstanding read timed out: Proxygen drains the connection and reads on with a fresh
+    /// deadline (HTTPCoroSession.cpp:2626-2628). The read stays outstanding here.
+    #[cold]
+    #[inline(never)]
+    fn read_idle_timeout(&mut self) {
+        if !self.connection.state.draining && self.failure.fatal.is_none() {
+            self.start_drain(DrainTrigger::IdleTimeout);
+        }
+        self.stamp_read_idle();
     }
 
     #[cold]
@@ -3199,8 +3314,9 @@ where
                 .on_ingress(input, &mut callback, &mut self.egress);
             (result.consumed, result.egress_results)
         };
+        let input_length = input.chain_length();
         let finishing_eof =
-            self.eof && !self.eof_processed && (consumed == input.chain_length() || consumed == 0);
+            self.eof && !self.eof_processed && (consumed == input_length || consumed == 0);
         if finishing_eof {
             self.eof_processed = true;
             if let Some(observation) = callback.state.observation.as_deref() {
@@ -3234,11 +3350,9 @@ where
             }
         }
         if peer_goaway_generated {
-            self.goaway_wait = self
-                .goaway_deadline
-                .map(|deadline| self.context.host().sleep_until(deadline));
+            self.sync_goaway_timer();
         }
-        if consumed > input.chain_length() {
+        if consumed > input_length {
             return Err(failure(
                 HttpErrorCode::INVALID_STATE_TRANSITION,
                 b"codec consumed beyond the supplied prefix",
