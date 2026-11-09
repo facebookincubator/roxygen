@@ -619,6 +619,16 @@ impl HttpResponseSource {
             .skip_content_length_validation();
     }
 
+    /// Roxygen-only (`DIV-033`): makes a later ingress abort leave the queued
+    /// header and body events to be read before its error, as
+    /// [`HttpStreamSource::deliver_ingress_before_abort`] does.
+    pub fn deliver_ingress_before_abort(&self) {
+        self.owner
+            .source()
+            .expect("a fresh response is owned")
+            .deliver_ingress_before_abort();
+    }
+
     /// Initializes a source whose header has been delivered separately.
     pub fn initialize_body_only(&self, message: &mut HttpMessage, eom: bool) -> bool {
         self.owner

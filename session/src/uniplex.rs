@@ -402,8 +402,8 @@ pub struct UniplexConfig {
     /// peer reset, a transport EOF or read error, a connection error), the head and
     /// body events its source already queued are delivered to the reader, in order,
     /// before the error, as Hyper's body channel and h2 deliver received data before
-    /// a later error, instead of being discarded. Both directions; the owned drivers
-    /// refuse it.
+    /// a later error, instead of being discarded. Both directions; the owned HTTP/1.1
+    /// upstream driver honors it, and the other owned drivers refuse it.
     pub deliver_ingress_before_abort: bool,
     /// Roxygen-only, default off (`DIV-036`): an upstream HTTP/1.1 request whose head
     /// ends the message and carries neither `Content-Length` nor a chunked

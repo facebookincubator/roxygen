@@ -1163,7 +1163,7 @@ fn submit_exclusive_and_source_parts_match_h2_contracts() {
 #[test]
 fn owned_h1_upstream_rejects_unsupported_config() {
     type Change = fn(&mut OwnedH1Options);
-    let cases: [(&str, Change, ByteEventCapability); 13] = [
+    let cases: [(&str, Change, ByteEventCapability); 12] = [
         (
             "read_timeout",
             |options| options.io.read_timeout = Duration::from_secs(1),
@@ -1192,11 +1192,6 @@ fn owned_h1_upstream_rejects_unsupported_config() {
         (
             "abort_exchanges_on_eof",
             |options| options.io.abort_exchanges_on_eof = true,
-            ByteEventCapability::Unsupported,
-        ),
-        (
-            "deliver_ingress_before_abort",
-            |options| options.io.deliver_ingress_before_abort = true,
             ByteEventCapability::Unsupported,
         ),
         (
@@ -4648,4 +4643,448 @@ fn upgrade_as_ordinary_refuses_an_unframed_upgrade_body() {
     for (name, request, code) in cases {
         assert_ordinary_refusal(name, request, code);
     }
+}
+
+/// The turns a session gets to take an origin's bytes, and the end behind them, before a
+/// `DIV-033` comparison's reader starts.
+const SETTLE_TURNS: usize = 1_000;
+
+async fn settle() {
+    for _ in 0..SETTLE_TURNS {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// How the origin's response to a GET ends in the `DIV-033` comparisons.
+#[derive(Clone, Copy, Debug)]
+enum ResponseEnd {
+    /// A `Content-Length: 9` body cut short by EOF after `first`.
+    LengthBodyEof,
+    /// A chunked body cut short by EOF after its `first` chunk.
+    ChunkedBodyEof,
+    /// A head declaring a body, then EOF.
+    HeadEof,
+    /// A `Content-Length: 9` body cut short after `first` by a reset connection's failed read.
+    LengthBodyReset,
+    /// A chunked body whose second chunk size does not parse.
+    ChunkedBodyParseError,
+    /// A complete response, then EOF.
+    Complete,
+}
+
+impl ResponseEnd {
+    const ALL: [Self; 6] = [
+        Self::LengthBodyEof,
+        Self::ChunkedBodyEof,
+        Self::HeadEof,
+        Self::LengthBodyReset,
+        Self::ChunkedBodyParseError,
+        Self::Complete,
+    ];
+
+    /// The origin's reads: the response's bytes, released by `gate`, then how they end.
+    fn reads(self, gate: &Arc<tokio::sync::Notify>) -> Vec<ReadAction> {
+        let (bytes, end): (&[u8], ReadAction) = match self {
+            Self::LengthBodyEof => (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nfirst",
+                ReadAction::Eof,
+            ),
+            Self::ChunkedBodyEof => (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n",
+                ReadAction::Eof,
+            ),
+            Self::HeadEof => (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n",
+                ReadAction::Eof,
+            ),
+            Self::LengthBodyReset => (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nfirst",
+                ReadAction::Error(HttpErrorCode::TRANSPORT_READ_ERROR),
+            ),
+            Self::ChunkedBodyParseError => (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\nzz\r\n",
+                ReadAction::Eof,
+            ),
+            Self::Complete => (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst",
+                ReadAction::Eof,
+            ),
+        };
+        vec![ReadAction::WaitData(Arc::clone(gate), bytes.to_vec()), end]
+    }
+
+    /// What a reader gets with `DIV-033` on: every event received before the end, then the
+    /// end's error.
+    fn delivered(self) -> ReadResponse {
+        let truncated = |error| ReadResponse {
+            statuses: vec![200],
+            body: b"first".to_vec(),
+            error: Some(error),
+            ..ReadResponse::default()
+        };
+        match self {
+            Self::LengthBodyEof | Self::ChunkedBodyEof => truncated(HttpErrorCode::TRANSPORT_EOF),
+            Self::HeadEof => ReadResponse {
+                statuses: vec![200],
+                error: Some(HttpErrorCode::TRANSPORT_EOF),
+                ..ReadResponse::default()
+            },
+            Self::LengthBodyReset => truncated(HttpErrorCode::TRANSPORT_READ_ERROR),
+            Self::ChunkedBodyParseError => truncated(HttpErrorCode::BODY_PARSE_ERROR),
+            Self::Complete => ReadResponse {
+                statuses: vec![200],
+                body: b"first".to_vec(),
+                eom: true,
+                ..ReadResponse::default()
+            },
+        }
+    }
+}
+
+/// A session's run error, if it failed, and what its response source yielded.
+#[derive(Debug, PartialEq)]
+struct ResponseEndOutcome {
+    run: Option<HttpErrorCode>,
+    read: ReadResponse,
+}
+
+/// Runs a GET whose response ends as `end` through an owned upstream session, or a
+/// `UniplexSession` client, with `deliver_ingress_before_abort` set to `deliver`. The reader
+/// starts `SETTLE_TURNS` turns after the origin's bytes are released, so the session has taken
+/// the bytes and their end by then.
+fn response_end_outcome(end: ResponseEnd, owned: bool, deliver: bool) -> ResponseEndOutcome {
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (transport, _state) = ScriptedTransport::new(end.reads(&gate));
+            let mut config = upstream_config();
+            config.deliver_ingress_before_abort = deliver;
+            let read_late = |mut source: HttpSourceHolder| {
+                let gate = Arc::clone(&gate);
+                async move {
+                    gate.notify_one();
+                    settle().await;
+                    read_response(&mut source).await
+                }
+            };
+            let (run, read) = if owned {
+                let mut options = upstream_options(context, transport);
+                options.io = config;
+                let (session, handle) = OwnedH1UpstreamSession::new(options).unwrap();
+                let submission = handle.reserve_request().unwrap().submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                futures::join!(session.run(), async {
+                    let (_stream, source, _control) = submission.await.unwrap().into_source_parts();
+                    read_late(source).await
+                })
+            } else {
+                let (session, handle) = UniplexSession::new(
+                    context,
+                    TransportDirection::Upstream,
+                    transport,
+                    None,
+                    config,
+                )
+                .unwrap();
+                futures::join!(session.run(), async {
+                    let response = handle
+                        .send_request(
+                            RequestSource::held(Some(get_head()), Vec::new()),
+                            CancellationToken::never(),
+                        )
+                        .await
+                        .unwrap();
+                    read_late(response.source).await
+                })
+            };
+            ResponseEndOutcome {
+                run: run.err().map(|error| error.code()),
+                read,
+            }
+        })
+    })
+}
+
+#[test]
+fn received_response_events_precede_an_ingress_abort_as_uniplex() {
+    for end in ResponseEnd::ALL {
+        let uniplex = response_end_outcome(end, false, true);
+        let owned = response_end_outcome(end, true, true);
+        assert_eq!(
+            owned.read,
+            end.delivered(),
+            "{end:?}: with DIV-033 on, the received head and bytes precede the error"
+        );
+        assert_eq!(
+            owned, uniplex,
+            "{end:?}: the owned session matches Uniplex with DIV-033 on"
+        );
+        let uniplex = response_end_outcome(end, false, false);
+        let owned = response_end_outcome(end, true, false);
+        assert_eq!(
+            owned, uniplex,
+            "{end:?}: the owned session matches Uniplex with DIV-033 off"
+        );
+    }
+}
+
+#[test]
+fn an_ingress_abort_discards_the_received_response_by_default() {
+    // The frozen order: the error reaches the late reader first, carrying the queued head.
+    let owned = response_end_outcome(ResponseEnd::LengthBodyEof, true, false);
+    assert_eq!(
+        owned.read,
+        ReadResponse {
+            error: Some(HttpErrorCode::TRANSPORT_EOF),
+            ..ReadResponse::default()
+        }
+    );
+}
+
+/// A real loopback origin answers a GET with a head and the first bytes of a longer body, then
+/// resets the connection (`SO_LINGER` 0). The owned session runs with `DIV-033` on, and its
+/// response is read only once its run has ended. Returns the run's error and what was read.
+fn owned_loopback_reset_mid_body() -> ResponseEndOutcome {
+    run_on_io_worker(|context| {
+        Box::pin(async move {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("loopback listener");
+            let (accepted, client) = tokio::join!(
+                listener.accept(),
+                tokio::net::TcpStream::connect(listener.local_addr().unwrap()),
+            );
+            let mut peer = accepted.expect("accepted loopback peer").0;
+            let transport = roxygen_transport::established::adopt_local(
+                &context,
+                roxygen_transport::established::EstablishedIo::new(
+                    client.expect("connected loopback client"),
+                    roxygen_transport::byte_stream::TransportEndpoint::Unknown,
+                    roxygen_transport::byte_stream::TransportEndpoint::Unknown,
+                    None,
+                ),
+                roxygen_transport::byte_stream::ByteStreamLimits::new(64 << 10, 64 << 10, 64)
+                    .unwrap(),
+            )
+            .expect("adopted loopback I/O");
+            let mut options = upstream_options(context, Rc::new(transport));
+            options.io.deliver_ingress_before_abort = true;
+            let (session, handle) = OwnedH1UpstreamSession::new(options).unwrap();
+            let submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            let origin = async move {
+                let mut input = Vec::new();
+                let mut buffer = [0; 1024];
+                while !input.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = tokio::io::AsyncReadExt::read(&mut peer, &mut buffer)
+                        .await
+                        .expect("origin reads the request");
+                    assert_ne!(read, 0, "the request arrives");
+                    input.extend_from_slice(&buffer[..read]);
+                }
+                tokio::io::AsyncWriteExt::write_all(
+                    &mut peer,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nfirst",
+                )
+                .await
+                .expect("origin answers");
+                peer.set_zero_linger().expect("zero linger");
+                drop(peer);
+            };
+            let reader = async {
+                let (_stream, mut source, _control) = submission.await.unwrap().into_source_parts();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !handle.is_finished() {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the session's run ends after the reset");
+                read_response(&mut source).await
+            };
+            let (run, read, ()) = futures::join!(session.run(), reader, origin);
+            ResponseEndOutcome {
+                run: run.err().map(|error| error.code()),
+                read,
+            }
+        })
+    })
+}
+
+#[test]
+fn a_connection_reset_mid_body_yields_the_received_bytes_first() {
+    assert_eq!(
+        owned_loopback_reset_mid_body(),
+        ResponseEndOutcome {
+            run: Some(HttpErrorCode::TRANSPORT_READ_ERROR),
+            read: ResponseEnd::LengthBodyReset.delivered(),
+        }
+    );
+}
+
+/// How the consumer cancels an owned upstream exchange in the `DIV-033` cancel tests, once its
+/// response's head and `first` are queued.
+#[derive(Clone, Copy, Debug)]
+enum OwnedCancel {
+    /// `OwnedH1UpstreamRequest::cancel`, with the error `UniplexStreamAbort` selects.
+    Request,
+    /// The request's cancellation token.
+    Token,
+    /// `OwnedH1UpstreamHandle::cancel`: the connection, not the request.
+    Connection,
+}
+
+/// The origin's reads in the `DIV-033` cancel tests: a head and `first` of a 9-byte body,
+/// released by `gate`; the connection then stays open.
+fn unfinished_response(gate: &Arc<tokio::sync::Notify>) -> Vec<ReadAction> {
+    vec![ReadAction::WaitData(
+        Arc::clone(gate),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nfirst".to_vec(),
+    )]
+}
+
+/// Runs a GET through an owned upstream session with `deliver_ingress_before_abort` set to
+/// `deliver`, cancels it as `cancel` once the session has queued the response's head and
+/// `first`, and reads the response once the session has taken the cancel.
+fn owned_cancel_outcome(cancel: OwnedCancel, deliver: bool) -> ResponseEndOutcome {
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (transport, _state) = ScriptedTransport::new(unfinished_response(&gate));
+            let mut options = upstream_options(context, transport);
+            options.io.deliver_ingress_before_abort = deliver;
+            let (session, handle) = OwnedH1UpstreamSession::new(options).unwrap();
+            let token = CancellationSource::new();
+            let submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                token.token(),
+            );
+            let (run, read) = futures::join!(session.run(), async {
+                let (_stream, mut source, control) = submission.await.unwrap().into_source_parts();
+                gate.notify_one();
+                settle().await;
+                match cancel {
+                    OwnedCancel::Request => control.cancel(HttpError::with_message(
+                        HttpErrorCode::CANCEL,
+                        b"stream aborted",
+                    )),
+                    OwnedCancel::Token => {
+                        token.request_cancellation();
+                    }
+                    OwnedCancel::Connection => handle.cancel(),
+                }
+                settle().await;
+                read_response(&mut source).await
+            });
+            ResponseEndOutcome {
+                run: run.err().map(|error| error.code()),
+                read,
+            }
+        })
+    })
+}
+
+/// As `owned_cancel_outcome` for a `UniplexSession` client whose consumer aborts the stream
+/// with `UniplexStreamAbort` (`DIV-023`).
+fn uniplex_stream_abort_outcome(deliver: bool) -> ResponseEndOutcome {
+    use crate::experimental::UniplexResponseAbortExt;
+
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (transport, _state) = ScriptedTransport::new(unfinished_response(&gate));
+            let mut config = upstream_config();
+            config.deliver_ingress_before_abort = deliver;
+            let (session, handle) = UniplexSession::new(
+                context,
+                TransportDirection::Upstream,
+                transport,
+                None,
+                config,
+            )
+            .unwrap();
+            let (run, read) = futures::join!(session.run(), async {
+                let mut response = handle
+                    .send_request(
+                        RequestSource::held(Some(get_head()), Vec::new()),
+                        CancellationToken::never(),
+                    )
+                    .await
+                    .unwrap();
+                gate.notify_one();
+                settle().await;
+                response
+                    .take_stream_abort()
+                    .expect("a live stream's abort")
+                    .abort();
+                settle().await;
+                read_response(&mut response.source).await
+            });
+            ResponseEndOutcome {
+                run: run.err().map(|error| error.code()),
+                read,
+            }
+        })
+    })
+}
+
+#[test]
+fn a_request_cancel_discards_the_received_response_as_a_uniplex_stream_abort() {
+    for deliver in [true, false] {
+        let owned = owned_cancel_outcome(OwnedCancel::Request, deliver);
+        let uniplex = uniplex_stream_abort_outcome(deliver);
+        assert_eq!(
+            owned.read,
+            ReadResponse {
+                error: Some(HttpErrorCode::CANCEL),
+                ..ReadResponse::default()
+            },
+            "deliver {deliver}: the consumer's cancel discards the queued head and bytes"
+        );
+        assert_eq!(
+            owned.read, uniplex.read,
+            "deliver {deliver}: the owned reader gets what a Uniplex stream abort leaves"
+        );
+        // The runs differ as `DIV-029` records: a Uniplex stream abort leaves the session to
+        // finish, while a cancel of an unfinished owned exchange closes its connection.
+        assert_eq!(owned.run, Some(HttpErrorCode::CANCEL));
+    }
+}
+
+#[test]
+fn a_cancelled_request_token_discards_the_received_response() {
+    assert_eq!(
+        owned_cancel_outcome(OwnedCancel::Token, true),
+        ResponseEndOutcome {
+            run: Some(HttpErrorCode::CORO_CANCELLED),
+            read: ReadResponse {
+                error: Some(HttpErrorCode::CORO_CANCELLED),
+                ..ReadResponse::default()
+            },
+        }
+    );
+}
+
+#[test]
+fn a_connection_cancel_keeps_the_received_response() {
+    // The connection's cancel is no cancel of the request: as an ingress abort, it keeps.
+    assert_eq!(
+        owned_cancel_outcome(OwnedCancel::Connection, true),
+        ResponseEndOutcome {
+            run: Some(HttpErrorCode::CORO_CANCELLED),
+            read: ReadResponse {
+                statuses: vec![200],
+                body: b"first".to_vec(),
+                error: Some(HttpErrorCode::CORO_CANCELLED),
+                ..ReadResponse::default()
+            },
+        }
+    );
 }

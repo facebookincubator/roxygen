@@ -3595,3 +3595,32 @@ fn a_consumer_requested_abort_discards_queued_events_when_enabled() {
     );
     assert_eq!(log.borrow().completions, [None]);
 }
+
+/// A fresh response source, which an owned upstream session builds, takes the
+/// `DIV-033` policy before it is split or converted.
+#[test]
+fn a_response_source_delivers_ingress_before_abort_when_enabled() {
+    run_paused(async {
+        let source =
+            HttpResponseSource::new(StreamId::new(1), None, 65_535, Host::tokio()).unwrap();
+        source.deliver_ingress_before_abort();
+        let producer = source.producer();
+        assert!(producer.headers(response(200, None), false));
+        assert_eq!(
+            producer.body(body(b"first"), 0, false),
+            FlowControlState::Open
+        );
+        assert!(producer.abort(HttpErrorCode::TRANSPORT_EOF, b"transport EOF"));
+
+        let owner = source.into_source_owner();
+        let source = owner.source().expect("the response is owned");
+        let head = read_header(source).expect("the queued head comes first");
+        assert_eq!(head.headers().response_status(), Some(200));
+        let first = read_body(source, u32::MAX).expect("the queued body comes next");
+        assert_eq!(body_bytes(first), b"first");
+        assert_eq!(
+            error_code(read_body(source, u32::MAX)),
+            HttpErrorCode::TRANSPORT_EOF
+        );
+    });
+}

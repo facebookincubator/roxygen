@@ -27,7 +27,12 @@
 //! parsed, flow control included.
 //! [`OwnedH1UpstreamSession::new`] validates [`UniplexConfig`] as [`OwnedH1Session::new`]
 //! does, except that `drain_request_body_on_drop` and `unframed_bodiless_http1_requests`
-//! must be false. DIV-029 lists where this driver differs from `UniplexSession`'s client.
+//! must be false, and
+//! `deliver_ingress_before_abort` (`DIV-033`) is honored: a response that fails keeps its
+//! received head and body events for its reader, before the error, unless the request's
+//! consumer cancelled it (a cancel, a dropped submission or the cancellation token), which
+//! discards them, as `UniplexStreamAbort` does. DIV-029 lists where this driver differs from
+//! `UniplexSession`'s client.
 
 use std::cell::RefCell;
 
@@ -612,6 +617,13 @@ impl RequestStatus {
         self.shared.wake.wake_by_ref();
     }
 
+    /// Whether a cause is selected for the request: its consumer's cancel (the request's or its
+    /// submission's cancel, the submission's drop, or its cancellation token), or a supplied
+    /// producer's failure, which is selected only before the response is delivered.
+    fn cause_selected(&self) -> bool {
+        self.error.borrow().is_some() || self.cancellation.is_cancellation_requested()
+    }
+
     fn notify(&self) {
         let waiter = self.waiter.borrow_mut().take();
         if let Some(waiter) = waiter {
@@ -894,16 +906,25 @@ impl Exchange {
         error
     }
 
-    /// Fails the response with `error` and stops the upload.
+    /// Fails the response with `error` and stops the upload. A cancel the request's consumer
+    /// selected discards the response's queued events, as `UniplexStreamAbort` does (`DIV-033`).
     fn cancel(&mut self, error: &HttpError) {
         let retirement = self
             .transfer
             .as_mut()
             .map(|transfer| transfer.prepare_stop_and_clear(error.clone()));
+        // A selected cause is the consumer's cancel, or a producer failure whose response is
+        // then dropped undelivered: neither keeps the response's queued events.
+        let discard = self.status.cause_selected();
         let mut panic = None;
         capture(&mut panic, || {
-            self.producer
-                .abort_with_error(error.clone(), b"owned H1 upstream exchange cancelled")
+            let details = b"owned H1 upstream exchange cancelled";
+            if discard {
+                self.producer
+                    .abort_discarding_queued(error.clone(), details)
+            } else {
+                self.producer.abort_with_error(error.clone(), details)
+            }
         });
         if !self.status.response_ready.get() || self.status.selected_error().is_some() {
             capture(&mut panic, || self.status.fail(error.clone()));
@@ -1198,7 +1219,6 @@ impl UpstreamDriver {
             || io.drain_request_body_on_drop
             || io.wait_for_http1_response_on_drain
             || io.abort_exchanges_on_eof
-            || io.deliver_ingress_before_abort
             || io.unframed_bodiless_http1_requests
             || transport.byte_event_capability(&context)? != ByteEventCapability::Unsupported
         {
@@ -1553,6 +1573,9 @@ impl UpstreamDriver {
         })?;
         if head_request {
             source.skip_content_length_validation();
+        }
+        if self.config.deliver_ingress_before_abort {
+            source.deliver_ingress_before_abort();
         }
         let producer = source.producer();
         let eom = headers.eom();
