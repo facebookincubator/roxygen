@@ -1102,3 +1102,7 @@ mod idle_sweep_cost_tests;
 #[cfg(test)]
 #[path = "../tests/pool_idle_timeout.rs"]
 mod pool_idle_timeout_tests;
+
+#[cfg(test)]
+#[path = "../tests/ingress_before_abort.rs"]
+mod ingress_before_abort_tests;

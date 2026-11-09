@@ -3401,3 +3401,197 @@ mod coalesced_body_growth {
         assert_eq!(coalescing_cycle(&source, &producer, 3), 32);
     }
 }
+
+fn body_bytes(event: HttpBodyEvent) -> Vec<u8> {
+    let body = event.as_body().expect("a body event");
+    body.coalesce(body.chain_length()).unwrap().to_vec()
+}
+
+#[test]
+fn ingress_abort_discards_queued_body_by_default() {
+    let (source, producer, log) = session_source(65_535);
+    assert!(producer.headers(response(200, None), false));
+    read_header(&source).unwrap();
+    assert_eq!(
+        producer.body(body(b"first"), 0, false),
+        FlowControlState::Open
+    );
+    assert!(producer.abort(HttpErrorCode::TRANSPORT_EOF, b"transport EOF"));
+    assert_eq!(log.borrow().processed, [(StreamId::new(7), 5, 0)]);
+    assert_eq!(
+        error_code(read_body(&source, u32::MAX)),
+        HttpErrorCode::TRANSPORT_EOF
+    );
+    assert_eq!(log.borrow().completions, [None]);
+}
+
+#[test]
+fn ingress_abort_delivers_queued_head_and_body_first_when_enabled() {
+    let (source, producer, log) = session_source(65_535);
+    source.deliver_ingress_before_abort();
+    assert!(producer.headers(response(200, None), false));
+    assert_eq!(
+        producer.body(body(b"first"), 0, false),
+        FlowControlState::Open
+    );
+    assert!(producer.abort(HttpErrorCode::TRANSPORT_EOF, b"transport EOF"));
+    assert!(log.borrow().processed.is_empty());
+
+    let head = read_header(&source).expect("the queued head comes first");
+    assert_eq!(head.headers().response_status(), Some(200));
+    assert!(!head.eom());
+    let first = read_body(&source, u32::MAX).expect("the queued body comes next");
+    assert!(!first.eom());
+    assert_eq!(body_bytes(first), b"first");
+    assert_eq!(log.borrow().processed, [(StreamId::new(7), 5, 0)]);
+    assert_eq!(
+        error_code(read_body(&source, u32::MAX)),
+        HttpErrorCode::TRANSPORT_EOF
+    );
+    assert_eq!(log.borrow().completions, [None]);
+    assert_eq!(
+        error_code(read_body(&source, u32::MAX)),
+        HttpErrorCode::TRANSPORT_EOF
+    );
+    assert_eq!(log.borrow().completions, [None]);
+}
+
+#[test]
+fn source_completes_only_after_kept_events_are_read_when_enabled() {
+    let (source, producer, log) = session_source(65_535);
+    source.deliver_ingress_before_abort();
+    assert!(producer.headers(response(200, None), false));
+    read_header(&source).unwrap();
+    producer.body(body(b"ab"), 0, false);
+    let push = HttpFixedSource::make_fixed_response(200, None).unwrap();
+    assert!(producer.push_promise(request(None), Box::new(push), false));
+    producer.body(body(b"cd"), 0, false);
+    assert!(producer.abort(HttpErrorCode::CANCEL, b"received reset from peer"));
+    assert_eq!(body_bytes(read_body(&source, 1).unwrap()), b"a");
+    assert_eq!(body_bytes(read_body(&source, u32::MAX).unwrap()), b"b");
+    assert_eq!(
+        read_body(&source, u32::MAX).unwrap().event_type(),
+        HttpBodyEventType::PushPromise
+    );
+    assert!(log.borrow().completions.is_empty());
+    assert_eq!(body_bytes(read_body(&source, u32::MAX).unwrap()), b"cd");
+    assert_eq!(
+        error_code(read_body(&source, u32::MAX)),
+        HttpErrorCode::CANCEL
+    );
+    assert_eq!(log.borrow().completions, [None]);
+    let credited: usize = log
+        .borrow()
+        .processed
+        .iter()
+        .map(|(_, amount, _)| amount)
+        .sum();
+    assert_eq!(credited, 4);
+}
+
+#[test]
+fn dropping_the_source_releases_events_kept_after_an_ingress_abort() {
+    let (source, producer, log) = session_source(65_535);
+    source.deliver_ingress_before_abort();
+    assert!(producer.headers(response(200, None), false));
+    read_header(&source).unwrap();
+    producer.body(body(b"abcd"), 0, false);
+    assert!(producer.abort(HttpErrorCode::TRANSPORT_EOF, b"transport EOF"));
+    assert!(log.borrow().processed.is_empty());
+    drop(source);
+    assert_eq!(log.borrow().processed, [(StreamId::new(7), 4, 0)]);
+    assert_eq!(log.borrow().completions, [None]);
+    assert!(!producer.is_live());
+}
+
+/// A body read before the kept final head is a state error the source detects
+/// itself: it returns the ingress error that stays first, discards the kept head
+/// and body, credits the body once and completes the source, so no later read in
+/// the right order can still return them.
+#[test]
+fn an_early_body_read_discards_events_kept_after_an_ingress_abort() {
+    let (source, producer, log) = session_source(65_535);
+    source.deliver_ingress_before_abort();
+    assert!(producer.headers(response(200, None), false));
+    producer.body(body(b"first"), 0, false);
+    assert!(producer.abort(HttpErrorCode::TRANSPORT_EOF, b"transport EOF"));
+    assert_eq!(
+        error_code(read_body(&source, u32::MAX)),
+        HttpErrorCode::TRANSPORT_EOF
+    );
+    assert_eq!(log.borrow().processed, [(StreamId::new(7), 5, 0)]);
+    assert_eq!(log.borrow().completions, [None]);
+    assert_eq!(
+        error_code(read_header(&source)),
+        HttpErrorCode::TRANSPORT_EOF
+    );
+    assert_eq!(
+        error_code(read_body(&source, u32::MAX)),
+        HttpErrorCode::TRANSPORT_EOF
+    );
+    assert_eq!(log.borrow().processed, [(StreamId::new(7), 5, 0)]);
+    assert_eq!(log.borrow().completions, [None]);
+}
+
+/// As `an_early_body_read_discards_events_kept_after_an_ingress_abort`, for a
+/// body read with a zero maximum after the kept head was read.
+#[test]
+fn a_zero_maximum_body_read_discards_events_kept_after_an_ingress_abort() {
+    let (source, producer, log) = session_source(65_535);
+    source.deliver_ingress_before_abort();
+    assert!(producer.headers(response(200, None), false));
+    producer.body(body(b"first"), 0, false);
+    assert!(producer.abort(HttpErrorCode::TRANSPORT_EOF, b"transport EOF"));
+    read_header(&source).expect("the kept head comes first");
+    assert_eq!(
+        error_code(read_body(&source, 0)),
+        HttpErrorCode::TRANSPORT_EOF
+    );
+    assert_eq!(log.borrow().processed, [(StreamId::new(7), 5, 0)]);
+    assert_eq!(log.borrow().completions, [None]);
+    assert_eq!(
+        error_code(read_body(&source, u32::MAX)),
+        HttpErrorCode::TRANSPORT_EOF
+    );
+    assert_eq!(log.borrow().processed, [(StreamId::new(7), 5, 0)]);
+    assert_eq!(log.borrow().completions, [None]);
+}
+
+#[test]
+fn locally_detected_errors_still_discard_queued_events_when_enabled() {
+    let (source, producer, log) = session_source(65_535);
+    source.deliver_ingress_before_abort();
+    assert!(producer.headers(response(200, Some(b"5")), false));
+    read_header(&source).unwrap();
+    producer.body(body(b"ab"), 0, false);
+    producer.body(body(b"cdefg"), 0, false);
+    assert_eq!(
+        error_code(read_body(&source, u32::MAX)),
+        HttpErrorCode::CONTENT_LENGTH_MISMATCH
+    );
+    let credited: usize = log
+        .borrow()
+        .processed
+        .iter()
+        .map(|(_, amount, _)| amount)
+        .sum();
+    assert_eq!(credited, 7);
+}
+
+#[test]
+fn a_consumer_requested_abort_discards_queued_events_when_enabled() {
+    let (source, producer, log) = session_source(65_535);
+    source.deliver_ingress_before_abort();
+    assert!(producer.headers(response(200, None), false));
+    read_header(&source).unwrap();
+    producer.body(body(b"abcd"), 0, false);
+    assert!(
+        producer.abort_discarding_queued(HttpError::new(HttpErrorCode::CANCEL), b"stream aborted")
+    );
+    assert_eq!(log.borrow().processed, [(StreamId::new(7), 4, 0)]);
+    assert_eq!(
+        error_code(read_body(&source, u32::MAX)),
+        HttpErrorCode::CANCEL
+    );
+    assert_eq!(log.borrow().completions, [None]);
+}

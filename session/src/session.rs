@@ -959,6 +959,7 @@ pub struct SessionCore {
     max_concurrent_outgoing_streams: u32,
     ingress_receive_window: u32,
     drain_request_body_on_drop: bool,
+    deliver_ingress_before_abort: bool,
     egress_write_timeout: std::time::Duration,
     buffered_egress_stats_enabled: bool,
     peer_identity: Option<Rc<[u8]>>,
@@ -1024,6 +1025,7 @@ impl SessionCore {
             max_concurrent_outgoing_streams: maximum,
             ingress_receive_window: DEFAULT_INGRESS_RECEIVE_WINDOW,
             drain_request_body_on_drop: false,
+            deliver_ingress_before_abort: false,
             egress_write_timeout: DEFAULT_EGRESS_WRITE_TIMEOUT,
             buffered_egress_stats_enabled: true,
             peer_identity: None,
@@ -1146,6 +1148,18 @@ impl SessionCore {
 
     pub(crate) fn drains_request_body_on_drop(&self) -> bool {
         self.drain_request_body_on_drop
+    }
+
+    /// Roxygen-only (`DIV-033`): an ingress abort of a stream created after this
+    /// call leaves the events already queued on its source to be read before the
+    /// error. Existing streams retain their creation-time policy.
+    pub fn set_deliver_ingress_before_abort(&mut self, enabled: bool) -> bool {
+        self.assert_owner();
+        if !self.streams.is_empty() {
+            return false;
+        }
+        self.deliver_ingress_before_abort = enabled;
+        true
     }
 
     pub(crate) fn set_peer_identity(&mut self, peer_identity: Option<Rc<[u8]>>) -> bool {
@@ -2529,6 +2543,7 @@ impl SessionCore {
             exchange,
             head_response,
             self.direction.is_downstream() && self.drain_request_body_on_drop,
+            self.deliver_ingress_before_abort,
             self.host.clone(),
         )?;
         if !self.buffered_egress_stats_enabled {

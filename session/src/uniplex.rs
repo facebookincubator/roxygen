@@ -392,6 +392,13 @@ pub struct UniplexConfig {
     /// arrives while a transaction other than an established tunnel is open, reading past
     /// a request that closes the connection to see it (`DIV-053`).
     pub abort_exchanges_on_eof: bool,
+    /// Roxygen-only, default off (`DIV-033`): when a stream's ingress is aborted (a
+    /// peer reset, a transport EOF or read error, a connection error), the head and
+    /// body events its source already queued are delivered to the reader, in order,
+    /// before the error, as Hyper's body channel and h2 deliver received data before
+    /// a later error, instead of being discarded. Both directions; the owned drivers
+    /// refuse it.
+    pub deliver_ingress_before_abort: bool,
 }
 
 impl Default for UniplexConfig {
@@ -408,6 +415,7 @@ impl Default for UniplexConfig {
             drain_request_body_on_drop: false,
             wait_for_http1_response_on_drain: false,
             abort_exchanges_on_eof: false,
+            deliver_ingress_before_abort: false,
         }
     }
 }
@@ -2208,7 +2216,7 @@ impl StreamAbort {
         if let Some((retirement, drain)) = reset {
             let core = DetachedSessionCore::take(&state);
             capture_panic(&mut first_panic, || {
-                ingress.abort_with_error(error.clone(), error.message());
+                ingress.abort_discarding_queued(error.clone(), error.message());
             });
             capture_panic(&mut first_panic, || {
                 if let Err(payload) = retirement.retire() {
@@ -4238,6 +4246,7 @@ impl UniplexSession {
         }
         let _ = core.set_egress_write_timeout(config.write_timeout);
         let _ = core.set_drain_request_body_on_drop(config.drain_request_body_on_drop);
+        let _ = core.set_deliver_ingress_before_abort(config.deliver_ingress_before_abort);
         let _ = core.set_peer_identity(peer_identity);
         let outgoing_activity = core.outgoing_transaction_activity();
         state.borrow_mut().core = Some(Box::new(core));

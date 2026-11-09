@@ -1174,7 +1174,21 @@ fn h2_abort_fails_reader_and_pending_egress() {
 
 #[test]
 fn h2_abort_returns_connection_credit_for_unread_data() {
-    run_on_worker(|context| {
+    abort_returns_connection_credit_for_unread_data(UniplexConfig::default());
+}
+
+/// A local abort discards what its reader has not read, even where an ingress
+/// abort would leave it to be read first (`DIV-033`).
+#[test]
+fn h2_abort_returns_connection_credit_for_unread_data_with_ingress_before_abort() {
+    abort_returns_connection_credit_for_unread_data(UniplexConfig {
+        deliver_ingress_before_abort: true,
+        ..UniplexConfig::default()
+    });
+}
+
+fn abort_returns_connection_credit_for_unread_data(uniplex: UniplexConfig) {
+    run_on_worker(move |context| {
         Box::pin(async move {
             // The windows admit more unread DATA than half the stream window, the
             // threshold at which stream credit would be acknowledged.
@@ -1184,7 +1198,8 @@ fn h2_abort_returns_connection_credit_for_unread_data() {
                 ..Http2SessionConfig::default()
             };
             let unread = 3 * WINDOW;
-            let (session, handle, wire, mut peer, lifecycle) = h2_session(context, config, &[]);
+            let (session, handle, wire, mut peer, lifecycle) =
+                h2_session_with(context, uniplex, config, &[]);
             let observed = wire.clone();
             let exchange = async move {
                 let mut tunnel = open_tunnel(&handle, &observed, &mut peer, STREAM_1, None).await;
@@ -1272,6 +1287,104 @@ fn h2_abort_returns_connection_credit_for_unread_data() {
             );
             assert_eq!(frames(&wire).credit_for(STREAM_1), 0);
             assert_eq!(frames(&wire).credit_for(STREAM_3), 0);
+        })
+    });
+}
+
+/// What the reader of a stream the peer reset does with the DATA that the reset
+/// left to be read first (`DIV-033`).
+#[derive(Clone, Copy, Debug)]
+enum KeptData {
+    Read,
+    Dropped,
+}
+
+#[test]
+fn h2_peer_reset_returns_connection_credit_for_kept_data_as_it_is_read() {
+    peer_reset_returns_connection_credit_for_kept_data(KeptData::Read);
+}
+
+#[test]
+fn h2_peer_reset_returns_connection_credit_for_kept_data_dropped_unread() {
+    peer_reset_returns_connection_credit_for_kept_data(KeptData::Dropped);
+}
+
+/// With `deliver_ingress_before_abort`, a peer's RST_STREAM leaves the DATA the
+/// reader has not read to be read before the reset, and the stream holds that
+/// DATA's connection credit until its reader takes it or drops the response.
+/// Either returns all of it, so a sibling then receives the whole connection
+/// window without reading.
+fn peer_reset_returns_connection_credit_for_kept_data(kept: KeptData) {
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            // More unread DATA than half the connection window, the threshold at
+            // which connection credit is acknowledged.
+            let config = Http2SessionConfig {
+                connection_receive_window: 4 * WINDOW as u32,
+                stream_receive_window: 4 * WINDOW as u32,
+                ..Http2SessionConfig::default()
+            };
+            let unread = 3 * WINDOW;
+            let uniplex = UniplexConfig {
+                deliver_ingress_before_abort: true,
+                ..UniplexConfig::default()
+            };
+            let (session, handle, wire, mut peer, lifecycle) =
+                h2_session_with(context, uniplex, config, &[]);
+            let observed = wire.clone();
+            let exchange = async move {
+                let mut tunnel = open_tunnel(&handle, &observed, &mut peer, STREAM_1, None).await;
+                let connection_credit = || frames(&observed).credit_for(StreamId::UNSPECIFIED);
+                let before = connection_credit();
+                let mut sent = 0;
+                send_within_window(&observed, &mut peer, STREAM_1, unread, WINDOW, &mut sent).await;
+                observed.deliver(peer.reset(STREAM_1, H2ErrorCode::CANCEL));
+                ingress_consumed(&observed, &handle).await;
+                settle().await;
+                assert_eq!(
+                    connection_credit(),
+                    before,
+                    "{kept:?}: the kept DATA holds its credit until it is read"
+                );
+                match kept {
+                    KeptData::Read => {
+                        assert_eq!(tunnel.read_body(unread).await.len(), unread);
+                        assert_cancel(&tunnel.read_error().await);
+                    }
+                    KeptData::Dropped => drop(tunnel),
+                }
+                eventually("connection credit for the kept DATA", || {
+                    connection_credit() >= before + unread
+                })
+                .await;
+                assert_eq!(connection_credit(), before + unread, "{kept:?}");
+                assert_eq!(
+                    frames(&observed).credit_for(STREAM_1),
+                    0,
+                    "{kept:?}: the reset stream acknowledged nothing"
+                );
+                eventually("the reset stream to detach", || {
+                    lifecycle.detached(STREAM_1)
+                })
+                .await;
+
+                let mut sibling = open_tunnel(&handle, &observed, &mut peer, STREAM_3, None).await;
+                send_within_window(
+                    &observed,
+                    &mut peer,
+                    STREAM_3,
+                    4 * WINDOW,
+                    WINDOW,
+                    &mut sent,
+                )
+                .await;
+                ingress_consumed(&observed, &handle).await;
+                assert_eq!(sibling.read_body(4 * WINDOW).await.len(), 4 * WINDOW);
+                finish_tunnel(&mut sibling, &observed, &mut peer, &lifecycle).await;
+                observed.end();
+            };
+            let (_, ()) = tokio::join!(session.run(), exchange);
+            assert_eq!(resets(&wire), []);
         })
     });
 }

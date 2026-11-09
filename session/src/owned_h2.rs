@@ -1504,6 +1504,7 @@ where
             || io.maximum_write_size > io.buffer_limit
             || (!UPSTREAM && !io.drain_request_body_on_drop)
             || (UPSTREAM && io.drain_request_body_on_drop)
+            || io.deliver_ingress_before_abort
             || http2.stats.is_some()
             || http2
                 .ping_probes

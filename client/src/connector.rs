@@ -1113,6 +1113,12 @@ pub struct SessionParams {
     /// parameters (`DIV-024`); HTTP/1.1 sessions ignore them. `None`, the
     /// default, sends none.
     pub ping_probes: Option<PingProbeConfig>,
+    /// Roxygen-only, default off (`DIV-033`): a response whose stream is aborted
+    /// (a peer reset, a transport EOF or read error, a connection error) after
+    /// part of it arrived still delivers the head and body events already
+    /// received, in order, before the error, as Hyper's body channel and h2 do.
+    /// Off, the frozen behavior, the error discards them.
+    pub deliver_ingress_before_abort: bool,
 }
 
 /// Attaches already-connected I/O without performing DNS, TLS, or routing.
@@ -1165,6 +1171,7 @@ pub(crate) fn uniplex_config_for_session_params(session: &SessionParams) -> Unip
     if let Some(timeout) = session.write_timeout {
         config.write_timeout = timeout;
     }
+    config.deliver_ingress_before_abort = session.deliver_ingress_before_abort;
     config
 }
 

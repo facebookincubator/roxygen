@@ -278,6 +278,11 @@ struct StreamState {
     active_read: Option<ReadActivity>,
     next_read_id: u64,
     sink_mode: bool,
+    /// Roxygen-only (`DIV-033`): an ingress abort leaves queued events to be
+    /// read before its error.
+    deliver_ingress_before_abort: bool,
+    /// An ingress abort left the queued events to be read before its error.
+    keeps_queued_events: bool,
     drain_on_drop: bool,
     draining: bool,
     source_complete: bool,
@@ -1194,6 +1199,8 @@ impl HttpStreamSource {
                     active_read: None,
                     next_read_id: 1,
                     sink_mode: false,
+                    deliver_ingress_before_abort: false,
+                    keeps_queued_events: false,
                     drain_on_drop: false,
                     draining: false,
                     source_complete: false,
@@ -1252,6 +1259,20 @@ impl HttpStreamSource {
             self.shared.state.borrow().ingress_state,
             IngressState::Start | IngressState::NonFinalHeadersReceived
         )
+    }
+
+    /// Roxygen-only (`DIV-033`): makes a later ingress abort (`abort` or
+    /// `abort_with_error` on the producer: a peer reset, transport EOF or
+    /// connection error) leave the header and body events already queued to be
+    /// read, in order, before its error, as Hyper's body channel and h2 deliver
+    /// received data before a later error. The source completes once the
+    /// consumer has taken them; stopping or dropping it releases them. Errors the
+    /// source detects itself (flow control, content length, state transitions,
+    /// read timeouts) and consumer stops still discard queued events, also those
+    /// an ingress abort kept, whose error stays the one reads return.
+    pub fn deliver_ingress_before_abort(&self) {
+        self.shared.assert_owner();
+        self.shared.state.borrow_mut().deliver_ingress_before_abort = true;
     }
 
     pub fn mark_egress_only(&self) {
@@ -1715,7 +1736,18 @@ impl HttpStreamSourceProducer {
     ///
     /// The first error wins. Diagnostics use the existing code/details format,
     /// and a queued final header is attached exactly as for `abort`.
-    pub fn abort_with_error(&self, mut error: HttpError, details: impl AsRef<[u8]>) -> bool {
+    pub fn abort_with_error(&self, error: HttpError, details: impl AsRef<[u8]>) -> bool {
+        self.abort_owned(error, details.as_ref(), true)
+    }
+
+    /// Aborts as `abort_with_error` does, but discards queued events even when
+    /// the source delivers ingress before an abort (`DIV-033`): for an abort the
+    /// consumer itself requested.
+    pub fn abort_discarding_queued(&self, error: HttpError, details: impl AsRef<[u8]>) -> bool {
+        self.abort_owned(error, details.as_ref(), false)
+    }
+
+    fn abort_owned(&self, mut error: HttpError, details: &[u8], keep_queued: bool) -> bool {
         let Some(shared) = self.shared.upgrade() else {
             return false;
         };
@@ -1724,7 +1756,6 @@ impl HttpStreamSourceProducer {
             return false;
         }
         shared.state.borrow_mut().ingress_state = IngressState::ReceivingDone;
-        let details = details.as_ref();
         let mut message =
             format!("HTTP source aborted err={}", get_error_string(error.code())).into_bytes();
         if !details.is_empty() {
@@ -1732,7 +1763,7 @@ impl HttpStreamSourceProducer {
             message.extend_from_slice(details);
         }
         error.set_message(message);
-        set_owned_error(&shared, error, true)
+        set_owned_error(&shared, error, true, keep_queued)
     }
 
     pub fn body_bytes_buffered(&self) -> Option<u32> {
@@ -2636,7 +2667,7 @@ fn take_ready_event(
     let mut flow_length = 0;
     let result = {
         let mut state = shared.state.borrow_mut();
-        if state.error.is_some() || state.draining {
+        if state.draining || (state.error.is_some() && !kept_event_ready(&state, kind, maximum)) {
             return Some(Err(unreadable(&state)));
         }
         match kind {
@@ -2680,6 +2711,24 @@ fn take_ready_event(
         update_flow_control(shared, flow_length);
     }
     Some(result)
+}
+
+/// Whether an event an ingress abort left queued is the next one for a valid
+/// read of `kind`: a header while headers are read, a body event once they are.
+fn kept_event_ready(state: &StreamState, kind: ReadKind, maximum: u32) -> bool {
+    if !state.keeps_queued_events {
+        return false;
+    }
+    match kind {
+        ReadKind::Header => {
+            state.read_state == ReadState::HeaderEvents && !state.header_queue.is_empty()
+        }
+        ReadKind::Body => {
+            state.read_state == ReadState::BodyEvents
+                && maximum != 0
+                && !state.body_queue.is_empty()
+        }
+    }
 }
 
 #[cold]
@@ -2861,30 +2910,57 @@ fn set_error(
     message: &[u8],
     ingress: bool,
 ) -> bool {
-    set_owned_error(shared, HttpError::with_message(code, message), ingress)
+    set_owned_error(
+        shared,
+        HttpError::with_message(code, message),
+        ingress,
+        false,
+    )
 }
 
-fn set_owned_error(shared: &Rc<StreamShared>, mut error: HttpError, ingress: bool) -> bool {
+/// Installs the first error. `keep_queued` lets an ingress abort leave queued
+/// events to be read first on a source that delivers ingress before an abort.
+/// A later error does not replace the first, but one that would have discarded
+/// queued events still discards those an ingress abort left (`DIV-033`).
+fn set_owned_error(
+    shared: &Rc<StreamShared>,
+    mut error: HttpError,
+    ingress: bool,
+    keep_queued: bool,
+) -> bool {
     let _completion = CompleteDrainedSource(shared);
-    let installed = {
+    let (installed, keep_queued) = {
         let mut state = shared.state.borrow_mut();
+        let keep_queued = keep_queued && ingress && state.deliver_ingress_before_abort;
         if state.error.is_some() {
+            let discard = !keep_queued && has_queued_events(&state);
+            drop(state);
+            if discard {
+                enable_sink_mode(shared);
+            }
             return false;
         }
-        let attach_final = state
-            .header_queue
-            .back_mut()
-            .is_some_and(|header| header.message.is_final().unwrap_or(false));
+        let attach_final = !keep_queued
+            && state
+                .header_queue
+                .back_mut()
+                .is_some_and(|header| header.message.is_final().unwrap_or(false));
         if attach_final {
             if let Some(header) = state.header_queue.pop_back() {
                 error.set_http_message(Some(*header.message));
             }
         }
         state.error = Some(StoredError { error, ingress });
-        true
+        (true, keep_queued)
     };
     if installed {
-        enable_sink_mode(shared);
+        if keep_queued {
+            let mut state = shared.state.borrow_mut();
+            state.keeps_queued_events = true;
+            state.sink_mode = true;
+        } else {
+            enable_sink_mode(shared);
+        }
         let error = shared
             .state
             .borrow()
@@ -2947,6 +3023,7 @@ fn complete_drained_source(shared: &Rc<StreamShared>) {
 fn enable_sink_mode(shared: &Rc<StreamShared>) {
     {
         let mut state = shared.state.borrow_mut();
+        state.keeps_queued_events = false;
         state.header_queue.clear();
     }
     loop {
@@ -2998,6 +3075,7 @@ fn maybe_complete(shared: &Rc<StreamShared>, eom_return: bool) {
         if state.source_complete
             || (!eom_return && !drained && state.error.is_none())
             || state.active_read.is_some()
+            || has_queued_events(&state)
         {
             None
         } else {
@@ -3042,6 +3120,12 @@ fn stop_reading(shared: &Rc<StreamShared>, error: Option<HttpErrorCode>) -> bool
     set_error(shared, code, b"Abandoned reading", false);
     maybe_complete(shared, false);
     true
+}
+
+/// Whether events an ingress abort left queued (`deliver_ingress_before_abort`)
+/// remain to be read.
+fn has_queued_events(state: &StreamState) -> bool {
+    state.keeps_queued_events && (!state.header_queue.is_empty() || !state.body_queue.is_empty())
 }
 
 fn emit_callback(shared: &Rc<StreamShared>, event: CallbackEvent) {
