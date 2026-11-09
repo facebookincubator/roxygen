@@ -573,6 +573,56 @@ fn a_worker_with_no_timers_allocates_no_sleep() {
     }
 }
 
+/// Until a timer creates the wheel, a supervisor poll only checks that it
+/// does not exist, and never calls the wheel step, on hosted and managed
+/// workers.
+#[test]
+fn a_supervisor_poll_with_no_wheel_calls_no_wheel_step() {
+    let hosted = hosted_worker("rox-wheel-absent");
+    let managed = ManagedWorker::new(4).expect("managed worker starts");
+    for handle in [hosted.handle(), managed.handle()] {
+        run_commands(&handle, 50);
+        let counts = counts(&handle);
+        assert!(counts.supervisor_polls >= 50, "{counts:?}");
+        assert_eq!(counts.wheel_drives, 0, "wheel step calls: {counts:?}");
+    }
+}
+
+/// Once a timer has created the wheel, every supervisor poll runs the wheel
+/// step (refreshing the supervisor's waker and checking the sleep), on hosted
+/// and managed workers, even with no timeout armed.
+#[test]
+fn once_the_wheel_exists_every_supervisor_poll_steps_it() {
+    let hosted = hosted_worker("rox-wheel-present");
+    let managed = ManagedWorker::new(4).expect("managed worker starts");
+    for handle in [hosted.handle(), managed.handle()] {
+        wait(
+            handle
+                .call(|context| {
+                    context
+                        .host()
+                        .wheel_timer()
+                        .expect("the worker's host has a wheel");
+                })
+                .expect("command admitted"),
+        )
+        .expect("command returns");
+        let before = counts(&handle);
+        run_commands(&handle, 50);
+        let after = counts(&handle);
+        let polls = after.supervisor_polls - before.supervisor_polls;
+        assert!(polls >= 50, "{before:?} {after:?}");
+        assert_eq!(
+            (
+                after.wheel_drives - before.wheel_drives,
+                after.wheel_steps - before.wheel_steps
+            ),
+            (polls, polls),
+            "(wheel step calls, wheel steps) per supervisor poll: {before:?} {after:?}"
+        );
+    }
+}
+
 #[derive(Default)]
 struct CountingWake(AtomicUsize);
 

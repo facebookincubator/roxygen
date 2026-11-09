@@ -255,6 +255,8 @@ struct WakeupCounts {
     /// Supervisor polls that refreshed the supervisor's waker and checked
     /// the sleep.
     wheel_steps: usize,
+    /// Calls of the supervisor's wheel step, `WorkerWheel::drive`.
+    wheel_drives: usize,
     /// Tokio sleeps created.
     sleeps: usize,
     /// Polls of a sleep.
@@ -416,23 +418,40 @@ impl WorkerWheel {
         Rc::clone(timer)
     }
 
-    /// The supervisor's wheel step, run at each of its polls: polls the
-    /// wheel's sleep only when it is due, and expires the wheel when it
-    /// resolves. A sleep that `expire` re-arms is polled again, so that Tokio
-    /// holds the supervisor's waker for it; if it keeps resolving at once, the
-    /// supervisor is woken to continue. Until a timer creates the wheel, a
-    /// poll costs one load: the supervisor's waker, which the first arm needs,
-    /// was taken when the supervisor started. Returns the panic of an owner's
-    /// waker that `expire` re-raised; the wheel stays consistent and driven.
-    fn drive(&self, context: &mut Context<'_>) -> Option<PanicPayload> {
+    /// Whether a timer has created the wheel: one load, inlined into the
+    /// supervisor, which calls `drive` only then.
+    #[inline(always)]
+    fn created(&self) -> bool {
+        self.timer.get().is_some()
+    }
+
+    /// The supervisor's wheel step, run at each of its polls once a timer has
+    /// created the wheel: polls the wheel's sleep only when it is due, and
+    /// expires the wheel when it resolves. A sleep that `expire` re-arms is
+    /// polled again, so that Tokio holds the supervisor's waker for it; if it
+    /// keeps resolving at once, the supervisor is woken to continue. Before
+    /// the wheel exists the supervisor does not call it: the supervisor's
+    /// waker, which the first arm needs, was taken when the supervisor
+    /// started. The panic of an owner's waker that `expire` re-raised (the
+    /// wheel stays consistent and driven) goes to `wheel_panicked`. Out of
+    /// line, so that a supervisor poll without a wheel carries none of it.
+    #[inline(never)]
+    fn drive(
+        &self,
+        context: &mut Context<'_>,
+        handle: &WorkerHandle,
+        wheel_panic: &mut Option<PanicPayload>,
+    ) {
         #[cfg(test)]
-        count(|counts| counts.supervisor_polls += 1);
-        let timer = self.timer.get()?;
+        count(|counts| counts.wheel_drives += 1);
+        let Some(timer) = self.timer.get() else {
+            return;
+        };
         #[cfg(test)]
         count(|counts| counts.wheel_steps += 1);
         self.wakeup.refresh_supervisor(context.waker());
         if !self.wakeup.due() {
-            return None;
+            return;
         }
         self.wakeup.driving.set(true);
         let expired = catch_unwind(AssertUnwindSafe(|| {
@@ -450,8 +469,24 @@ impl WorkerWheel {
         if self.wakeup.due() {
             context.waker().wake_by_ref();
         }
-        expired.err()
+        if let Err(payload) = expired {
+            wheel_panicked(handle, wheel_panic, payload);
+        }
     }
+}
+
+/// Keeps the first panic of an owner's waker that a worker's wheel re-raised,
+/// and begins the worker's shutdown, keeping a panic of that too.
+#[cold]
+#[inline(never)]
+fn wheel_panicked(
+    handle: &WorkerHandle,
+    wheel_panic: &mut Option<PanicPayload>,
+    payload: PanicPayload,
+) {
+    retain_first_panic(wheel_panic, Some(payload));
+    let shutdown = catch_unwind(AssertUnwindSafe(|| handle.begin_shutdown()));
+    retain_first_panic(wheel_panic, shutdown.err());
 }
 
 /// Installs a worker's wheel on its owner thread until uninstalled or
@@ -533,10 +568,10 @@ async fn run_managed_driver(
         #[cfg(test)]
         SUPERVISOR_POLLS.set(SUPERVISOR_POLLS.get() + 1);
         let context = &mut Context::from_waker(gate.waker());
-        if let Some(payload) = wheel.drive(context) {
-            retain_first_panic(&mut wheel_panic, Some(payload));
-            let shutdown = catch_unwind(AssertUnwindSafe(|| handle.begin_shutdown()));
-            retain_first_panic(&mut wheel_panic, shutdown.err());
+        #[cfg(test)]
+        count(|counts| counts.supervisor_polls += 1);
+        if wheel.created() {
+            wheel.drive(context, &handle, &mut wheel_panic);
         }
         if handle.state() == WorkerState::Open {
             let (deadline, outstanding) = handle.quiesce_snapshot(context.waker());
