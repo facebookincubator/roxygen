@@ -820,6 +820,18 @@ where
         }
     }
 
+    /// Fails the response's source with the peer reset just recorded, for a request that the
+    /// peer's refusal failed unprocessed. The owner applies the reset only when its wake is
+    /// polled, one stream per turn, so a stream read timeout that expires before then would
+    /// otherwise fail the response first (`DIV-035`). `cancel_owner`'s details keep the error
+    /// the same whichever fails the source.
+    fn fail_refused_response(&self) {
+        if let Some(error) = &self.peer_reset {
+            self.producer
+                .abort_with_error(error.clone(), b"owned H2 stream cancelled");
+        }
+    }
+
     fn protocol_active(&self) -> bool {
         self.signals.active.get()
     }
@@ -3055,7 +3067,7 @@ where
                                 ),
                             ));
                         } else if let Some(exchange) = owner.upstream() {
-                            exchange.status.publish_response();
+                            exchange.status.response_head_arrived();
                         }
                     }
                     return actions.into();
@@ -3289,17 +3301,27 @@ where
                     observation.push(LifecycleEvent::PeerReset { stream, code });
                 }
                 if let Some(owner) = self.streams.get_mut(&stream) {
+                    // The owner takes `peer_reset` when it applies it; `ingress_rejected` stays.
+                    let first_reset = !owner.ingress_rejected;
                     owner.ingress_rejected = true;
                     owner.signals.close_protocol();
                     self.state.scheduler.dequeue(stream, &mut owner.scheduling);
                     let selected = owner
                         .upstream()
                         .and_then(|exchange| exchange.status.selected_error());
+                    let unprocessed = code == HttpErrorCode::REFUSED_STREAM
+                        && first_reset
+                        && owner
+                            .upstream()
+                            .is_some_and(|exchange| exchange.status.peer_refused());
                     owner.peer_reset.get_or_insert_with(|| {
                         selected.unwrap_or_else(|| {
                             failure(code, b"peer reset cancelled local byte events")
                         })
                     });
+                    if unprocessed {
+                        owner.fail_refused_response();
+                    }
                     owner.wake.enqueue();
                 }
             }
@@ -3410,12 +3432,17 @@ where
                             .streams
                             .get_mut(&id)
                             .expect("GOAWAY visits live streams");
+                        let first_reset = !owner.ingress_rejected;
                         owner.ingress_rejected = true;
                         owner.signals.close_protocol();
                         self.state.scheduler.dequeue(id, &mut owner.scheduling);
                         let selected = owner
                             .upstream()
                             .and_then(|exchange| exchange.status.selected_error());
+                        let unprocessed = first_reset
+                            && owner
+                                .upstream()
+                                .is_some_and(|exchange| exchange.status.peer_refused());
                         owner.peer_reset.get_or_insert_with(|| {
                             selected.unwrap_or_else(|| {
                                 failure(
@@ -3424,6 +3451,9 @@ where
                                 )
                             })
                         });
+                        if unprocessed {
+                            owner.fail_refused_response();
+                        }
                         owner.wake.enqueue();
                     }
                 }

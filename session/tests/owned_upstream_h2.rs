@@ -12,10 +12,14 @@ use roxygen_core::stream_source::HttpStreamSourceProducer;
 use roxygen_runtime::host::Host;
 
 use super::*;
+use crate::experimental::OwnedRequestProgressExt;
+use crate::owned_h2::OwnedH2ExclusiveSubmission;
 use crate::owned_h2::OwnedH2Options;
 use crate::owned_h2::OwnedH2UpstreamHandle;
 use crate::owned_h2::OwnedH2UpstreamObserver;
+use crate::owned_h2::OwnedH2UpstreamReservation;
 use crate::owned_h2::OwnedH2UpstreamSession;
+use crate::owned_h2::OwnedH2UpstreamSubmission;
 use crate::uniplex::UniplexRunSummary;
 
 #[derive(Default)]
@@ -7620,6 +7624,723 @@ fn zero_stream_read_timeout_upstream_takes_no_slot_sleep_or_clock_read() {
                 assert_eq!(stats.live_slots, 0);
             }
             assert!(written_resets(&wire).is_empty());
+        })
+    });
+}
+
+/// A finished request's error and progress (`DIV-035`): `request_unprocessed()` and
+/// `sequence_number()`.
+#[derive(Debug, Eq, PartialEq)]
+struct RequestProgress {
+    error: Option<HttpErrorCode>,
+    unprocessed: bool,
+    sequence: Option<u64>,
+}
+
+impl RequestProgress {
+    fn of(error: Option<HttpErrorCode>, progress: &impl OwnedRequestProgressExt) -> Self {
+        Self {
+            error,
+            unprocessed: progress.request_unprocessed(),
+            sequence: progress.sequence_number(),
+        }
+    }
+}
+
+/// The owned submission kinds, which all report progress.
+#[derive(Clone, Copy, Debug)]
+enum SubmitKind {
+    Plain,
+    ResponseInterest,
+    Exclusive,
+}
+
+enum Submitted {
+    Plain(OwnedH2UpstreamSubmission),
+    Exclusive(OwnedH2ExclusiveSubmission),
+}
+
+impl Submitted {
+    fn new(kind: SubmitKind, reservation: OwnedH2UpstreamReservation) -> Self {
+        let (head, body, token) = (
+            request_head(HttpMethod::Get, true, None),
+            HttpSourceHolder::empty(),
+            CancellationToken::never(),
+        );
+        match kind {
+            SubmitKind::Plain => Self::Plain(reservation.submit(head, body, token)),
+            SubmitKind::ResponseInterest => {
+                Self::Exclusive(reservation.submit_with_response_interest(head, body, token, None))
+            }
+            SubmitKind::Exclusive => {
+                Self::Exclusive(reservation.submit_exclusive(head, body, token))
+            }
+        }
+    }
+
+    /// Awaits the submission, then reads its progress.
+    async fn progress(&mut self) -> RequestProgress {
+        match self {
+            Self::Plain(submission) => {
+                let error = (&mut *submission).await.err().map(|error| error.code());
+                RequestProgress::of(error, submission)
+            }
+            Self::Exclusive(submission) => {
+                let error = (&mut *submission).await.err().map(|error| error.code());
+                RequestProgress::of(error, submission)
+            }
+        }
+    }
+}
+
+/// When the FIN of a stale reused connection's origin reaches the owned driver, relative to the
+/// connection's next request.
+#[derive(Clone, Copy, Debug)]
+enum StaleFin {
+    /// The driver processes the FIN between the reservation and the submission, which then
+    /// meets closed admission.
+    BeforeSubmission,
+    /// The FIN becomes readable, then the request is submitted, before the driver runs.
+    ReadableThenSubmitted,
+    /// The request is submitted, then the FIN becomes readable, before the driver runs.
+    SubmittedThenReadable,
+}
+
+/// A stale reused connection's two requests: the first, answered, and the second, submitted
+/// around the origin's FIN; the streams whose HEADERS were written; the run.
+#[derive(Debug, Eq, PartialEq)]
+struct StaleOutcome {
+    first: RequestProgress,
+    second: RequestProgress,
+    header_streams: Vec<StreamId>,
+    run: Option<HttpErrorCode>,
+}
+
+/// A GET answered with a 200 that ends stream 1, then a second GET submitted as `kind` around
+/// the origin's FIN, as `fin` orders them.
+fn owned_stale_outcome(fin: StaleFin, kind: SubmitKind) -> StaleOutcome {
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Downstream);
+            let first_ready = Arc::new(tokio::sync::Notify::new());
+            let fin_ready = Arc::new(tokio::sync::Notify::new());
+            let (transport, wire) = FixtureTransport::new([
+                FixtureRead::Data(server_settings_bytes(100)),
+                FixtureRead::WaitData(
+                    Arc::clone(&first_ready),
+                    response_head(&mut peer, StreamId::new(1), 200, true, Some(0)),
+                ),
+                FixtureRead::WaitDataEof(Arc::clone(&fin_ready), Vec::new()),
+            ]);
+            let (session, handle) =
+                OwnedH2UpstreamSession::new(options(context, transport)).unwrap();
+            let probe = Rc::new(AdmissionProbe::default());
+            handle.set_observer(probe.clone()).unwrap();
+            let (run, (first, second)) = tokio::join!(session.run(), async {
+                complete_credit_wait(|| handle.available_capacity() == 100).await;
+                let (_stream, mut source, control) = handle
+                    .reserve_request()
+                    .unwrap()
+                    .submit(
+                        request_head(HttpMethod::Get, true, None),
+                        HttpSourceHolder::empty(),
+                        CancellationToken::never(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_source_parts();
+                first_ready.notify_one();
+                let mut head = source.read_header_event().await.unwrap();
+                assert_eq!(head.headers_mut().status_code().unwrap(), 200);
+                assert!(head.eom());
+                drop(source);
+                complete_credit_wait(|| handle.is_idle()).await;
+                assert_eq!(handle.available_capacity(), 100, "the connection is reused");
+                let first = RequestProgress::of(None, &control);
+                let reservation = handle.reserve_request().unwrap();
+                match fin {
+                    StaleFin::BeforeSubmission => {
+                        fin_ready.notify_one();
+                        complete_credit_wait(|| probe.closed.get() == 1).await;
+                    }
+                    StaleFin::ReadableThenSubmitted => fin_ready.notify_one(),
+                    StaleFin::SubmittedThenReadable => {}
+                }
+                let mut submitted = Submitted::new(kind, reservation);
+                if matches!(fin, StaleFin::SubmittedThenReadable) {
+                    fin_ready.notify_one();
+                }
+                let second = submitted.progress().await;
+                complete_credit_wait(|| handle.is_finished()).await;
+                (first, second)
+            });
+            let header_streams =
+                decode_client_frames(&wire.borrow().writes.concat()).header_streams;
+            StaleOutcome {
+                first,
+                second,
+                header_streams,
+                run: run.err().map(|error| error.code()),
+            }
+        })
+    })
+}
+
+#[test]
+fn a_stale_reused_connection_rejects_its_next_request_unprocessed_in_every_schedule() {
+    for fin in [
+        StaleFin::BeforeSubmission,
+        StaleFin::ReadableThenSubmitted,
+        StaleFin::SubmittedThenReadable,
+    ] {
+        for kind in [
+            SubmitKind::Plain,
+            SubmitKind::ResponseInterest,
+            SubmitKind::Exclusive,
+        ] {
+            assert_eq!(
+                owned_stale_outcome(fin, kind),
+                StaleOutcome {
+                    first: RequestProgress {
+                        error: None,
+                        unprocessed: false,
+                        sequence: Some(0),
+                    },
+                    // Refused before commit, with one earlier request on the connection.
+                    second: RequestProgress {
+                        error: Some(HttpErrorCode::TRANSPORT_EOF),
+                        unprocessed: true,
+                        sequence: Some(1),
+                    },
+                    header_streams: vec![StreamId::new(1)],
+                    run: None,
+                },
+                "{fin:?}, {kind:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn peer_refusals_before_a_response_head_report_the_request_unprocessed() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Downstream);
+            // Stream 1 gets a response head, then REFUSED_STREAM; stream 3 REFUSED_STREAM;
+            // stream 5 CANCEL; a GOAWAY whose last-stream-id is 5 refuses stream 7.
+            let mut refusals = response_head(&mut peer, StreamId::new(1), 200, false, None);
+            for (stream, code) in [
+                (1, H2ErrorCode::REFUSED_STREAM),
+                (3, H2ErrorCode::REFUSED_STREAM),
+                (5, H2ErrorCode::CANCEL),
+            ] {
+                refusals.extend(eligibility_frame(
+                    &mut peer,
+                    EgressFrame::Reset {
+                        stream: StreamId::new(stream),
+                        code,
+                    },
+                ));
+            }
+            refusals.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::Goaway {
+                    last_stream: StreamId::new(5),
+                    code: H2ErrorCode::NO_ERROR,
+                    debug_data: None,
+                },
+            ));
+            let refuse = Arc::new(tokio::sync::Notify::new());
+            let (transport, wire) = FixtureTransport::new([
+                FixtureRead::Data(server_settings_bytes(100)),
+                FixtureRead::WaitData(Arc::clone(&refuse), refusals),
+            ]);
+            let (session, handle) =
+                OwnedH2UpstreamSession::new(options(context, transport)).unwrap();
+            let probe = Rc::new(AdmissionProbe::default());
+            handle.set_observer(probe.clone()).unwrap();
+            let (run, (committed, refused)) = tokio::join!(session.run(), async {
+                complete_credit_wait(|| handle.available_capacity() == 100).await;
+                let mut responses = Vec::new();
+                for _ in 0..4 {
+                    responses.push(
+                        handle
+                            .reserve_request()
+                            .unwrap()
+                            .submit(
+                                request_head(HttpMethod::Get, true, None),
+                                HttpSourceHolder::empty(),
+                                CancellationToken::never(),
+                            )
+                            .await
+                            .unwrap()
+                            .into_source_parts(),
+                    );
+                }
+                let reserved = handle.reserve_request().unwrap();
+                complete_credit_wait(|| {
+                    decode_client_frames(&wire.borrow().writes.concat()).header_streams
+                        == [1, 3, 5, 7].map(StreamId::new)
+                })
+                .await;
+                refuse.notify_one();
+                complete_credit_wait(|| probe.closed.get() == 1).await;
+                let committed: Vec<_> = responses
+                    .iter()
+                    .map(|(_stream, _source, control)| RequestProgress::of(None, control))
+                    .collect();
+                // Reserved before the GOAWAY and submitted after it: refused before commit.
+                let refused = Submitted::new(SubmitKind::Plain, reserved).progress().await;
+                drop(responses);
+                complete_credit_wait(|| handle.is_finished()).await;
+                (committed, refused)
+            });
+            let progress = |unprocessed, sequence| RequestProgress {
+                error: None,
+                unprocessed,
+                sequence: Some(sequence),
+            };
+            assert_eq!(
+                committed,
+                [
+                    // A response head arrived before the refusal.
+                    progress(false, 0),
+                    progress(true, 1),
+                    // CANCEL is no refusal.
+                    progress(false, 2),
+                    // Above the GOAWAY's last-stream-id.
+                    progress(true, 3),
+                ]
+            );
+            assert_eq!(
+                refused,
+                RequestProgress {
+                    error: Some(HttpErrorCode::REFUSED_STREAM),
+                    unprocessed: true,
+                    sequence: Some(4),
+                }
+            );
+            run.unwrap();
+        })
+    });
+}
+
+/// A peer refusal that reaches a stream whose earlier peer reset the driver already applied, in an
+/// earlier turn, is not the stream's first reset: the request keeps that reset's error and is not
+/// unprocessed (`DIV-035`). The held response sources retain the reset streams.
+#[test]
+fn a_peer_refusal_after_an_applied_peer_reset_leaves_the_request_processed() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Downstream);
+            let mut cancels = Vec::new();
+            for stream in [1, 3] {
+                cancels.extend(eligibility_frame(
+                    &mut peer,
+                    EgressFrame::Reset {
+                        stream: StreamId::new(stream),
+                        code: H2ErrorCode::CANCEL,
+                    },
+                ));
+            }
+            // Stream 1 REFUSED_STREAM; a GOAWAY whose last-stream-id is 1 refuses stream 3.
+            let mut refusals = eligibility_frame(
+                &mut peer,
+                EgressFrame::Reset {
+                    stream: StreamId::new(1),
+                    code: H2ErrorCode::REFUSED_STREAM,
+                },
+            );
+            refusals.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::Goaway {
+                    last_stream: StreamId::new(1),
+                    code: H2ErrorCode::NO_ERROR,
+                    debug_data: None,
+                },
+            ));
+            let cancel = Arc::new(tokio::sync::Notify::new());
+            let refuse = Arc::new(tokio::sync::Notify::new());
+            let (transport, wire) = FixtureTransport::new([
+                FixtureRead::Data(server_settings_bytes(100)),
+                FixtureRead::WaitData(Arc::clone(&cancel), cancels),
+                FixtureRead::WaitData(Arc::clone(&refuse), refusals),
+            ]);
+            let (session, handle) =
+                OwnedH2UpstreamSession::new(options(context, transport)).unwrap();
+            let probe = Rc::new(AdmissionProbe::default());
+            handle.set_observer(probe.clone()).unwrap();
+            let (run, outcomes) = tokio::join!(session.run(), async {
+                complete_credit_wait(|| handle.available_capacity() == 100).await;
+                let mut responses = Vec::new();
+                for _ in 0..2 {
+                    responses.push(
+                        handle
+                            .reserve_request()
+                            .unwrap()
+                            .submit(
+                                request_head(HttpMethod::Get, true, None),
+                                HttpSourceHolder::empty(),
+                                CancellationToken::never(),
+                            )
+                            .await
+                            .unwrap()
+                            .into_source_parts(),
+                    );
+                }
+                complete_credit_wait(|| header_streams(&wire) == [1, 3].map(StreamId::new)).await;
+                cancel.notify_one();
+                // The driver applies both CANCELs, which complete the responses' ingress.
+                for (_stream, source, _control) in &responses {
+                    let receipt = source.ingress_completion().unwrap();
+                    assert_eq!(
+                        receipt.wait().await.err().map(|error| error.code()),
+                        Some(HttpErrorCode::CANCEL)
+                    );
+                }
+                refuse.notify_one();
+                complete_credit_wait(|| probe.closed.get() == 1).await;
+                let mut outcomes = Vec::new();
+                for (_stream, mut source, control) in responses {
+                    let error = source
+                        .read_header_event()
+                        .await
+                        .err()
+                        .map(|error| error.code());
+                    outcomes.push(RequestProgress::of(error, &control));
+                }
+                complete_credit_wait(|| handle.is_finished()).await;
+                outcomes
+            });
+            let cancelled = |sequence| RequestProgress {
+                error: Some(HttpErrorCode::CANCEL),
+                unprocessed: false,
+                sequence: Some(sequence),
+            };
+            assert_eq!(outcomes, [cancelled(0), cancelled(1)]);
+            run.unwrap();
+        })
+    });
+}
+
+/// The progress of a GET whose stream the peer refuses, with `REFUSED_STREAM` or, with `goaway`,
+/// a GOAWAY whose last-stream-id is below it, in the driver turn that would apply the stream read
+/// timeout that has just failed its response head read.
+async fn refused_after_a_stream_read_timeout(
+    host: Rc<crate::external_host_tests::ManualHost>,
+    context: WorkerContext,
+    goaway: bool,
+) -> RequestProgress {
+    let mut peer = Http2Codec::new(TransportDirection::Downstream);
+    let refusal = if goaway {
+        EgressFrame::Goaway {
+            last_stream: StreamId::UNSPECIFIED,
+            code: H2ErrorCode::NO_ERROR,
+            debug_data: None,
+        }
+    } else {
+        EgressFrame::Reset {
+            stream: StreamId::new(1),
+            code: H2ErrorCode::REFUSED_STREAM,
+        }
+    };
+    let refuse = Arc::new(tokio::sync::Notify::new());
+    let (session, handle, wire) = stream_read_timed_upstream(
+        context,
+        [FixtureRead::WaitData(
+            Arc::clone(&refuse),
+            eligibility_frame(&mut peer, refusal),
+        )],
+    );
+    let (run, progress) = futures::join!(session.run(), async {
+        let (_stream, mut source, control) = handle
+            .reserve_request()
+            .unwrap()
+            .submit(
+                request_head(HttpMethod::Get, true, None),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            )
+            .await
+            .expect("the request is committed")
+            .into_source_parts();
+        let mut read = source.read_header_event();
+        assert!(futures::poll!(read.as_mut()).is_pending());
+        super::owned::settle_turns(32).await;
+        assert_eq!(header_streams(&wire), [StreamId::new(1)]);
+        host.advance(STREAM_READ);
+        // A timed wait commits its timeout in one poll and returns it from the next.
+        let _ = futures::poll!(read.as_mut());
+        let Poll::Ready(Err(error)) = futures::poll!(read.as_mut()) else {
+            panic!("the response head read times out");
+        };
+        drop(read);
+        // Readable before the driver runs again, so its next turn reads the refusal before it
+        // applies the timeout.
+        refuse.notify_one();
+        super::owned::settle_turns(32).await;
+        assert!(
+            written_resets(&wire).is_empty(),
+            "the refusal reset the stream before the driver applied the timeout"
+        );
+        let progress = RequestProgress::of(Some(error.code()), &control);
+        drop((source, control));
+        let _ = handle.close_when_idle();
+        progress
+    });
+    run.expect("the upstream connection closes cleanly");
+    progress
+}
+
+/// A peer refusal that the driver reads in the turn it would apply a stream read timeout that
+/// already failed the response, before any response head, leaves the request processed: the
+/// timeout is the request's failure (`DIV-035`).
+#[test]
+fn a_peer_refusal_after_a_stream_read_timeout_failed_the_response_leaves_the_request_processed() {
+    const TIMED_OUT: RequestProgress = RequestProgress {
+        error: Some(HttpErrorCode::READ_TIMEOUT),
+        unprocessed: false,
+        sequence: Some(0),
+    };
+    super::owned::on_both_hosts(|host, context| {
+        Box::pin(async move {
+            assert_eq!(
+                refused_after_a_stream_read_timeout(host, context, false).await,
+                TIMED_OUT,
+                "REFUSED_STREAM"
+            );
+        })
+    });
+    super::owned::on_both_hosts(|host, context| {
+        Box::pin(async move {
+            assert_eq!(
+                refused_after_a_stream_read_timeout(host, context, true).await,
+                TIMED_OUT,
+                "GOAWAY"
+            );
+        })
+    });
+}
+
+/// More streams than the driver polls stream owners in one turn budget.
+const BEYOND_A_TURN_BUDGET: usize = 100;
+
+/// Counts the response completions the driver delivers, which it does as it polls a stream's
+/// owner.
+struct Completions(Rc<Cell<usize>>);
+
+impl crate::owned_h2::OwnedH2ResponseObserver for Completions {
+    fn poll_deadline(&mut self, _: &mut std::task::Context<'_>) -> Poll<HttpError> {
+        Poll::Pending
+    }
+
+    fn response_complete(self: Box<Self>, _: Result<std::time::Instant, HttpError>) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
+/// The progress of `BEYOND_A_TURN_BUDGET` GETs whose streams the peer refuses in one read, each
+/// with `REFUSED_STREAM` or, with `goaway`, all with one GOAWAY, and whose response head reads
+/// time out once the driver has yielded at its turn budget with refusals still to apply; and how
+/// many of the refusals the driver applied before the timeout.
+async fn timed_out_before_the_driver_applies_its_refusals(
+    host: Rc<crate::external_host_tests::ManualHost>,
+    context: WorkerContext,
+    goaway: bool,
+) -> (usize, Vec<RequestProgress>) {
+    let mut peer = Http2Codec::new(TransportDirection::Downstream);
+    let refusals = if goaway {
+        eligibility_frame(
+            &mut peer,
+            EgressFrame::Goaway {
+                last_stream: StreamId::UNSPECIFIED,
+                code: H2ErrorCode::NO_ERROR,
+                debug_data: None,
+            },
+        )
+    } else {
+        (0..BEYOND_A_TURN_BUDGET as u64)
+            .flat_map(|index| {
+                eligibility_frame(
+                    &mut peer,
+                    EgressFrame::Reset {
+                        stream: StreamId::new(2 * index + 1),
+                        code: H2ErrorCode::REFUSED_STREAM,
+                    },
+                )
+            })
+            .collect()
+    };
+    let refuse = Arc::new(tokio::sync::Notify::new());
+    let (session, handle, wire) = stream_read_timed_upstream(
+        context,
+        [FixtureRead::WaitData(Arc::clone(&refuse), refusals)],
+    );
+    let (run, (applied, outcomes)) = futures::join!(session.run(), async {
+        let completed = Rc::new(Cell::new(0));
+        let mut requests = Vec::new();
+        for _ in 0..BEYOND_A_TURN_BUDGET {
+            let (_stream, source, control) = handle
+                .reserve_request()
+                .unwrap()
+                .submit(
+                    request_head(HttpMethod::Get, true, None),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                )
+                .await
+                .expect("the request is committed")
+                .into_source_parts();
+            control
+                .observe_response(Box::new(Completions(Rc::clone(&completed))))
+                .unwrap();
+            requests.push((source, control));
+        }
+        complete_credit_wait(|| header_streams(&wire).len() == BEYOND_A_TURN_BUDGET).await;
+        let mut reads: Vec<_> = requests
+            .iter_mut()
+            .map(|(source, _control)| source.read_header_event())
+            .collect();
+        for read in &mut reads {
+            assert!(futures::poll!(read.as_mut()).is_pending());
+        }
+        super::owned::settle_turns(32).await;
+        assert_eq!(completed.get(), 0);
+        let yields = host.yields();
+        refuse.notify_one();
+        // The driver reads the refusals, polls one stream owner per turn and yields at its turn
+        // budget before it has polled every refused stream's owner.
+        assert!(
+            super::owned::drive_until(64, || host.yields() > yields).await,
+            "the driver yields at its turn budget"
+        );
+        let applied = completed.get();
+        assert!(
+            applied < BEYOND_A_TURN_BUDGET,
+            "the driver applied every refusal before it yielded"
+        );
+        host.advance(STREAM_READ);
+        let mut errors = Vec::new();
+        for read in &mut reads {
+            // A timed wait commits its timeout in one poll and returns it from the next.
+            let result = match futures::poll!(read.as_mut()) {
+                Poll::Ready(result) => result,
+                Poll::Pending => {
+                    let Poll::Ready(result) = futures::poll!(read.as_mut()) else {
+                        panic!("the response head read neither failed nor timed out");
+                    };
+                    result
+                }
+            };
+            errors.push(result.err().map(|error| error.code()));
+        }
+        drop(reads);
+        super::owned::settle_turns(32).await;
+        assert!(written_resets(&wire).is_empty(), "no stream was reset");
+        let outcomes = errors
+            .into_iter()
+            .zip(&requests)
+            .map(|(error, (_source, control))| RequestProgress::of(error, control))
+            .collect();
+        drop(requests);
+        let _ = handle.close_when_idle();
+        (applied, outcomes)
+    });
+    run.expect("the upstream connection closes cleanly");
+    (applied, outcomes)
+}
+
+/// Refusals of more streams than the driver polls stream owners in one turn budget, read at once
+/// (`REFUSED_STREAM` for every stream, or one GOAWAY), leave refusals recorded but not yet applied
+/// when the driver yields. A stream read timeout that expires then does not fail a request that its
+/// refusal failed unprocessed: every response head read fails with `REFUSED_STREAM`, and every
+/// request reports unprocessed (`DIV-035`).
+#[test]
+fn a_stream_read_timeout_before_the_driver_applies_a_peer_refusal_keeps_the_refusal() {
+    fn assert_refused((applied, outcomes): (usize, Vec<RequestProgress>), refusal: &str) {
+        let mismatched: Vec<_> = outcomes
+            .iter()
+            .enumerate()
+            .filter(|(sequence, progress)| {
+                **progress
+                    != RequestProgress {
+                        error: Some(HttpErrorCode::REFUSED_STREAM),
+                        unprocessed: true,
+                        sequence: Some(*sequence as u64),
+                    }
+            })
+            .collect();
+        assert!(
+            mismatched.is_empty(),
+            "{refusal}: {} of {BEYOND_A_TURN_BUDGET} requests, {applied} refusals applied before \
+             the timeout: {mismatched:?}",
+            mismatched.len()
+        );
+    }
+    super::owned::on_both_hosts(|host, context| {
+        Box::pin(async move {
+            assert_refused(
+                timed_out_before_the_driver_applies_its_refusals(host, context, false).await,
+                "REFUSED_STREAM",
+            );
+        })
+    });
+    super::owned::on_both_hosts(|host, context| {
+        Box::pin(async move {
+            assert_refused(
+                timed_out_before_the_driver_applies_its_refusals(host, context, true).await,
+                "GOAWAY",
+            );
+        })
+    });
+}
+
+/// A cancellation that lands right after a connection refusal samples its request's cause, as
+/// another thread's can, follows the refusal: the request reports the refusal's error and
+/// unprocessed, not the cancellation's error with the refusal's flag (`DIV-035`).
+#[test]
+fn a_cancellation_racing_a_refusal_follows_it() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let fin = Arc::new(tokio::sync::Notify::new());
+            let (transport, wire) = FixtureTransport::new([
+                FixtureRead::Data(server_settings_bytes(100)),
+                FixtureRead::WaitDataEof(Arc::clone(&fin), Vec::new()),
+            ]);
+            let (session, handle) =
+                OwnedH2UpstreamSession::new(options(context, transport)).unwrap();
+            let probe = Rc::new(AdmissionProbe::default());
+            handle.set_observer(probe.clone()).unwrap();
+            let (run, progress) = tokio::join!(session.run(), async {
+                complete_credit_wait(|| handle.available_capacity() == 100).await;
+                let reservation = handle.reserve_request().unwrap();
+                fin.notify_one();
+                complete_credit_wait(|| probe.closed.get() == 1).await;
+                let cancellation = CancellationSource::new();
+                let token = cancellation.token();
+                crate::experimental::after_next_refusal_cause_sample(move || {
+                    cancellation.request_cancellation();
+                });
+                let mut submission = reservation.submit(
+                    request_head(HttpMethod::Get, true, None),
+                    HttpSourceHolder::empty(),
+                    token,
+                );
+                let error = (&mut submission).await.err().map(|error| error.code());
+                let progress = RequestProgress::of(error, &submission);
+                complete_credit_wait(|| handle.is_finished()).await;
+                progress
+            });
+            assert_eq!(
+                progress,
+                RequestProgress {
+                    error: Some(HttpErrorCode::TRANSPORT_EOF),
+                    unprocessed: true,
+                    sequence: Some(0),
+                }
+            );
+            assert!(header_streams(&wire).is_empty(), "no request is written");
+            run.unwrap();
         })
     });
 }

@@ -33,7 +33,9 @@
 //! received head and body events for its reader, before the error, unless the request's
 //! consumer cancelled it (a cancel, a dropped submission or the cancellation token), which
 //! discards them, as `UniplexStreamAbort` does. DIV-029 lists where this driver differs from
-//! `UniplexSession`'s client.
+//! `UniplexSession`'s client. Each turn reads before it commits a queued request, so a peer EOF
+//! already readable closes admission first; a request that admission refuses reports
+//! `OwnedRequestProgressExt::request_unprocessed` (`DIV-035`).
 
 use std::cell::RefCell;
 
@@ -52,6 +54,7 @@ use roxygen_runtime::cancellation::CancellationToken;
 use roxygen_runtime::cancellation::CancellationWakeRegistration;
 
 use super::*;
+use crate::experimental::OwnedRequestProgressExt;
 use crate::owned::OwnedResponseObserver;
 use crate::owned::OwnedUpstreamObserver;
 
@@ -67,6 +70,8 @@ struct Shared {
     used: Cell<u32>,
     /// A committed exchange holds the slot until it retires.
     spent: Cell<bool>,
+    /// Requests committed on the connection (`DIV-035`).
+    committed: Cell<u64>,
     closed: RefCell<Option<HttpError>>,
     observer: RefCell<Option<Rc<dyn OwnedUpstreamObserver>>>,
     queued: RefCell<Option<Submission>>,
@@ -144,7 +149,7 @@ impl Shared {
         }
         let mut panic = None;
         if let Some(mut submission) = queued {
-            capture(&mut panic, || submission.reject(error.clone()));
+            capture(&mut panic, || submission.refuse(error.clone()));
         }
         if let Some(observer) = observer {
             capture(&mut panic, || observer.admission_closed());
@@ -343,6 +348,8 @@ impl OwnedH1UpstreamReservation {
             response_observer: RefCell::new(None),
             live: Cell::new(false),
             waiter: RefCell::new(None),
+            unprocessed: Cell::new(false),
+            sequence: Cell::new(None),
         });
         let cancellation_wake = status.cancellation.can_be_cancelled().then(|| {
             let mut registration = status.cancellation.wake_registration();
@@ -363,7 +370,7 @@ impl OwnedH1UpstreamReservation {
         };
         let closed = shared.closed.borrow().clone();
         if let Some(error) = closed {
-            submission.reject(error);
+            submission.refuse(error);
         } else {
             *shared.queued.borrow_mut() = Some(submission);
             shared.wake.wake_by_ref();
@@ -571,6 +578,36 @@ impl OwnedH1UpstreamRequest {
     }
 }
 
+impl OwnedRequestProgressExt for OwnedH1UpstreamSubmission {
+    fn request_unprocessed(&self) -> bool {
+        self.status.unprocessed.get()
+    }
+
+    fn sequence_number(&self) -> Option<u64> {
+        self.status.sequence.get()
+    }
+}
+
+impl OwnedRequestProgressExt for OwnedH1ExclusiveSubmission {
+    fn request_unprocessed(&self) -> bool {
+        self.0.request_unprocessed()
+    }
+
+    fn sequence_number(&self) -> Option<u64> {
+        self.0.sequence_number()
+    }
+}
+
+impl OwnedRequestProgressExt for OwnedH1UpstreamRequest {
+    fn request_unprocessed(&self) -> bool {
+        self.0.unprocessed.get()
+    }
+
+    fn sequence_number(&self) -> Option<u64> {
+        self.0.sequence.get()
+    }
+}
+
 struct RequestStatus {
     shared: Rc<Shared>,
     stream: Cell<Option<StreamId>>,
@@ -591,6 +628,10 @@ struct RequestStatus {
     /// The exchange is live in the driver, which polls an attached observer.
     live: Cell<bool>,
     waiter: RefCell<Option<Waker>>,
+    /// Its connection refused it before commit (`DIV-035`).
+    unprocessed: Cell<bool>,
+    /// The connection's earlier commits, fixed at commit or at that refusal (`DIV-035`).
+    sequence: Cell<Option<u64>>,
 }
 
 impl RequestStatus {
@@ -699,8 +740,29 @@ struct Submission {
 }
 
 impl Submission {
+    /// Rejects the submission because its connection's admission closed before commit: unless
+    /// its consumer selected a cause, it failed unprocessed (`DIV-035`). One sample of the cause
+    /// decides both, as a cancellation can arrive from another thread.
+    fn refuse(&mut self, error: HttpError) {
+        let selected = self.status.selected_error();
+        #[cfg(test)]
+        crate::experimental::refusal_cause_sampled();
+        let error = selected.unwrap_or_else(|| {
+            self.status.unprocessed.set(true);
+            self.status
+                .sequence
+                .set(Some(self.status.shared.committed.get()));
+            error
+        });
+        self.reject_selected(error);
+    }
+
     fn reject(&mut self, error: HttpError) {
         let error = self.status.selected_error().unwrap_or(error);
+        self.reject_selected(error);
+    }
+
+    fn reject_selected(&mut self, error: HttpError) {
         let mut panic = None;
         capture(&mut panic, || self.status.fail(error.clone()));
         if let Some(headers) = self.headers.as_mut() {
@@ -1240,6 +1302,7 @@ impl UpstreamDriver {
             idle: Cell::new(true),
             used: Cell::new(0),
             spent: Cell::new(false),
+            committed: Cell::new(0),
             closed: RefCell::new(None),
             observer: RefCell::new(None),
             queued: RefCell::new(None),
@@ -1617,6 +1680,9 @@ impl UpstreamDriver {
         };
         let status = Rc::clone(&submission.status);
         status.stream.set(Some(id));
+        let committed = self.shared.committed.get();
+        status.sequence.set(Some(committed));
+        self.shared.committed.set(committed + 1);
         *status.ingress.borrow_mut() = source.ingress_completion();
         submission
             .reservation

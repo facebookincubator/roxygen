@@ -6,10 +6,12 @@ use roxygen_core::source::LocalSourceFuture;
 use roxygen_core::stream_source::FlowControlState;
 
 use super::*;
+use crate::experimental::OwnedRequestProgressExt;
 use crate::external_host_tests::run_on_host;
 use crate::external_host_tests::run_on_host_with;
 use crate::owned_h1::Http1DriverConfig;
 use crate::owned_h1::OwnedH1Options;
+use crate::owned_h1::OwnedH1UpstreamReservation;
 use crate::owned_h1::OwnedH1UpstreamSession;
 
 const OK_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
@@ -5251,4 +5253,438 @@ fn bodiless_posts_are_framed_as_uniplex_by_default() {
         );
         assert_eq!(owned_reused, reused, "{name}: the reuse decision");
     }
+}
+
+/// A finished request's error and progress (`DIV-035`): `request_unprocessed()` and
+/// `sequence_number()`.
+#[derive(Debug, Eq, PartialEq)]
+struct RequestProgress {
+    error: Option<HttpErrorCode>,
+    unprocessed: bool,
+    sequence: Option<u64>,
+}
+
+impl RequestProgress {
+    fn of(error: Option<HttpErrorCode>, progress: &impl OwnedRequestProgressExt) -> Self {
+        Self {
+            error,
+            unprocessed: progress.request_unprocessed(),
+            sequence: progress.sequence_number(),
+        }
+    }
+}
+
+/// The owned submission kinds, which all report progress.
+#[derive(Clone, Copy, Debug)]
+enum SubmitKind {
+    Plain,
+    ResponseInterest,
+    Exclusive,
+}
+
+enum Submitted {
+    Plain(crate::owned_h1::OwnedH1UpstreamSubmission),
+    Exclusive(crate::owned_h1::OwnedH1ExclusiveSubmission),
+}
+
+impl Submitted {
+    fn new(kind: SubmitKind, reservation: OwnedH1UpstreamReservation) -> Self {
+        let (head, body, token) = (
+            get_head(),
+            HttpSourceHolder::empty(),
+            CancellationToken::never(),
+        );
+        match kind {
+            SubmitKind::Plain => Self::Plain(reservation.submit(head, body, token)),
+            SubmitKind::ResponseInterest => {
+                Self::Exclusive(reservation.submit_with_response_interest(head, body, token, None))
+            }
+            SubmitKind::Exclusive => {
+                Self::Exclusive(reservation.submit_exclusive(head, body, token))
+            }
+        }
+    }
+
+    /// Awaits the submission, then reads its progress.
+    async fn progress(&mut self) -> RequestProgress {
+        match self {
+            Self::Plain(submission) => {
+                let error = (&mut *submission).await.err().map(|error| error.code());
+                RequestProgress::of(error, submission)
+            }
+            Self::Exclusive(submission) => {
+                let error = (&mut *submission).await.err().map(|error| error.code());
+                RequestProgress::of(error, submission)
+            }
+        }
+    }
+}
+
+/// When the FIN of a stale reused connection's origin reaches the owned driver, relative to the
+/// connection's next request.
+#[derive(Clone, Copy, Debug)]
+enum StaleFin {
+    /// The driver processes the FIN between the reservation and the submission, which then
+    /// meets closed admission.
+    BeforeSubmission,
+    /// The FIN becomes readable, then the request is submitted, before the driver runs.
+    ReadableThenSubmitted,
+    /// The request is submitted, then the FIN becomes readable, before the driver runs.
+    SubmittedThenReadable,
+}
+
+/// A stale reused connection's two requests: the first, answered, and the second, submitted
+/// around the origin's FIN; every byte written after the first request; the run and the close.
+#[derive(Debug, Eq, PartialEq)]
+struct StaleOutcome {
+    first: RequestProgress,
+    second: RequestProgress,
+    written_after_first: Vec<u8>,
+    run: Option<HttpErrorCode>,
+    close: CloseKind,
+}
+
+/// A `GET /` answered with `OK_RESPONSE` on a keep-alive connection, then a second `GET /`
+/// submitted as `kind` around the origin's FIN, as `fin` orders them.
+fn owned_stale_outcome(fin: StaleFin, kind: SubmitKind) -> StaleOutcome {
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let first_ready = Arc::new(tokio::sync::Notify::new());
+            let fin_ready = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = ScriptedTransport::new([
+                ReadAction::WaitData(Arc::clone(&first_ready), OK_RESPONSE.to_vec()),
+                ReadAction::WaitEof(Arc::clone(&fin_ready)),
+            ]);
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let log = Rc::new(AdmissionLog::default());
+            handle.set_observer(log.clone()).unwrap();
+            let (run, (first, second, written_after_first)) =
+                futures::join!(session.run(), async {
+                    let (_stream, mut source, control) = handle
+                        .reserve_request()
+                        .unwrap()
+                        .submit(
+                            get_head(),
+                            HttpSourceHolder::empty(),
+                            CancellationToken::never(),
+                        )
+                        .await
+                        .unwrap()
+                        .into_source_parts();
+                    first_ready.notify_one();
+                    assert_eq!(read_response(&mut source).await.body, b"ok");
+                    drop(source);
+                    yield_until(|| handle.is_idle()).await;
+                    assert_eq!(handle.available_capacity(), 1, "the connection is reused");
+                    let first = RequestProgress::of(None, &control);
+                    let written = state.borrow().writes.concat().len();
+                    let reservation = handle.reserve_request().unwrap();
+                    match fin {
+                        StaleFin::BeforeSubmission => {
+                            fin_ready.notify_one();
+                            yield_until(|| {
+                                log.0.borrow().iter().any(|note| note == "admission_closed")
+                            })
+                            .await;
+                        }
+                        StaleFin::ReadableThenSubmitted => fin_ready.notify_one(),
+                        StaleFin::SubmittedThenReadable => {}
+                    }
+                    let mut submitted = Submitted::new(kind, reservation);
+                    if matches!(fin, StaleFin::SubmittedThenReadable) {
+                        fin_ready.notify_one();
+                    }
+                    let second = submitted.progress().await;
+                    let written_after_first = state.borrow().writes.concat()[written..].to_vec();
+                    (first, second, written_after_first)
+                });
+            let close = state.borrow().close;
+            StaleOutcome {
+                first,
+                second,
+                written_after_first,
+                run: run.err().map(|error| error.code()),
+                close,
+            }
+        })
+    })
+}
+
+#[test]
+fn a_stale_reused_connection_rejects_its_next_request_unprocessed_in_every_schedule() {
+    for fin in [
+        StaleFin::BeforeSubmission,
+        StaleFin::ReadableThenSubmitted,
+        StaleFin::SubmittedThenReadable,
+    ] {
+        for kind in [
+            SubmitKind::Plain,
+            SubmitKind::ResponseInterest,
+            SubmitKind::Exclusive,
+        ] {
+            assert_eq!(
+                owned_stale_outcome(fin, kind),
+                StaleOutcome {
+                    first: RequestProgress {
+                        error: None,
+                        unprocessed: false,
+                        sequence: Some(0),
+                    },
+                    // Refused before commit, with one earlier request on the connection.
+                    second: RequestProgress {
+                        error: Some(HttpErrorCode::TRANSPORT_EOF),
+                        unprocessed: true,
+                        sequence: Some(1),
+                    },
+                    written_after_first: Vec::new(),
+                    run: None,
+                    close: CloseKind::ShutdownWrite,
+                },
+                "{fin:?}, {kind:?}"
+            );
+        }
+    }
+}
+
+/// Control (passes before and after `DIV-035`'s owned progress): a FIN the driver processes
+/// before the next reservation closes admission, so no request is taken and nothing is written.
+#[test]
+fn a_stale_reused_connection_refuses_a_reservation_after_its_fin() {
+    run_on_host(|context| {
+        Box::pin(async move {
+            let first_ready = Arc::new(tokio::sync::Notify::new());
+            let fin_ready = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = ScriptedTransport::new([
+                ReadAction::WaitData(Arc::clone(&first_ready), OK_RESPONSE.to_vec()),
+                ReadAction::WaitEof(Arc::clone(&fin_ready)),
+            ]);
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let (run, refused) = futures::join!(session.run(), async {
+                let (_stream, mut source, _control) = handle
+                    .reserve_request()
+                    .unwrap()
+                    .submit(
+                        get_head(),
+                        HttpSourceHolder::empty(),
+                        CancellationToken::never(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_source_parts();
+                first_ready.notify_one();
+                assert_eq!(read_response(&mut source).await.body, b"ok");
+                drop(source);
+                yield_until(|| handle.is_idle()).await;
+                fin_ready.notify_one();
+                yield_until(|| handle.is_finished()).await;
+                handle.reserve_request().err().map(|error| error.code())
+            });
+            assert_eq!(refused, Some(HttpErrorCode::REFUSED_STREAM));
+            run.unwrap();
+            assert_eq!(
+                state.borrow().writes.concat(),
+                b"GET / HTTP/1.1\r\nHost: origin\r\nConnection: keep-alive\r\n\r\n",
+                "only the first request is written"
+            );
+        })
+    });
+}
+
+#[test]
+fn committed_requests_report_how_many_requests_their_connection_committed_before() {
+    run_on_host(|context| {
+        Box::pin(async move {
+            let ready = [
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(tokio::sync::Notify::new()),
+            ];
+            let (transport, _state) = ScriptedTransport::new(
+                ready
+                    .iter()
+                    .map(|ready| ReadAction::WaitData(Arc::clone(ready), OK_RESPONSE.to_vec())),
+            );
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let (run, progress) = futures::join!(session.run(), async {
+                let mut progress = Vec::new();
+                for ready in &ready {
+                    let mut submission = handle.reserve_request().unwrap().submit(
+                        get_head(),
+                        HttpSourceHolder::empty(),
+                        CancellationToken::never(),
+                    );
+                    let response = (&mut submission).await.unwrap();
+                    progress.push(RequestProgress::of(None, &submission));
+                    let (_stream, mut source, control) = response.into_source_parts();
+                    ready.notify_one();
+                    assert_eq!(read_response(&mut source).await.body, b"ok");
+                    drop(source);
+                    progress.push(RequestProgress::of(None, &control));
+                    yield_until(|| handle.is_idle()).await;
+                }
+                assert!(handle.close_when_idle().unwrap());
+                progress
+            });
+            run.unwrap();
+            // The submission and its response's request control read the same progress.
+            let committed = |sequence| RequestProgress {
+                error: None,
+                unprocessed: false,
+                sequence: Some(sequence),
+            };
+            assert_eq!(
+                progress,
+                [committed(0), committed(0), committed(1), committed(1)]
+            );
+        })
+    });
+}
+
+/// How a request fails on a fresh connection for a cause other than its connection's refusal.
+#[derive(Clone, Copy, Debug)]
+enum NotUnprocessed {
+    /// The driver refuses the request itself at commit (a CONNECT).
+    RefusedRequest,
+    /// The submission's consumer cancels it before the driver commits it.
+    CancelledBeforeCommit,
+    /// The consumer cancels the queued submission, then the peer's EOF closes admission.
+    CancelledThenEof,
+    /// The request is committed and written, then the peer's EOF fails its response.
+    EofAfterCommit,
+}
+
+fn not_unprocessed_outcome(case: NotUnprocessed) -> RequestProgress {
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let fin_ready = Arc::new(tokio::sync::Notify::new());
+            let reads = match case {
+                NotUnprocessed::RefusedRequest | NotUnprocessed::CancelledBeforeCommit => vec![],
+                NotUnprocessed::CancelledThenEof | NotUnprocessed::EofAfterCommit => {
+                    vec![ReadAction::WaitEof(Arc::clone(&fin_ready))]
+                }
+            };
+            let (transport, state) = ScriptedTransport::new(reads);
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let head = if matches!(case, NotUnprocessed::RefusedRequest) {
+                let mut message = roxygen_core::message::HttpMessage::new();
+                message.set_method(HttpMethod::Connect).unwrap();
+                message.set_url(b"origin:443", false).unwrap();
+                message.set_http_version(1, 1);
+                HttpHeaderEvent::new(message, false).unwrap()
+            } else {
+                get_head()
+            };
+            let mut submission = handle.reserve_request().unwrap().submit(
+                head,
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            if matches!(
+                case,
+                NotUnprocessed::CancelledBeforeCommit | NotUnprocessed::CancelledThenEof
+            ) {
+                submission.cancel(HttpError::with_message(
+                    HttpErrorCode::READ_TIMEOUT,
+                    b"route timeout",
+                ));
+            }
+            if matches!(case, NotUnprocessed::CancelledThenEof) {
+                fin_ready.notify_one();
+            }
+            let (_run, progress) = futures::join!(session.run(), async {
+                let progress = match (&mut submission).await {
+                    Err(error) => RequestProgress::of(Some(error.code()), &submission),
+                    Ok(response) => {
+                        let (_stream, mut source, control) = response.into_source_parts();
+                        yield_until(|| !state.borrow().writes.is_empty()).await;
+                        fin_ready.notify_one();
+                        let read = read_response(&mut source).await;
+                        RequestProgress::of(read.error, &control)
+                    }
+                };
+                handle.cancel();
+                progress
+            });
+            progress
+        })
+    })
+}
+
+#[test]
+fn failures_a_request_or_its_consumer_causes_are_not_unprocessed() {
+    // (case, its error, its sequence number: fixed only for a committed request)
+    let cases = [
+        (
+            NotUnprocessed::RefusedRequest,
+            HttpErrorCode::HEADER_PARSE_ERROR,
+            None,
+        ),
+        (
+            NotUnprocessed::CancelledBeforeCommit,
+            HttpErrorCode::READ_TIMEOUT,
+            None,
+        ),
+        (
+            NotUnprocessed::CancelledThenEof,
+            HttpErrorCode::READ_TIMEOUT,
+            None,
+        ),
+        (
+            NotUnprocessed::EofAfterCommit,
+            HttpErrorCode::TRANSPORT_EOF,
+            Some(0),
+        ),
+    ];
+    for (case, error, sequence) in cases {
+        assert_eq!(
+            not_unprocessed_outcome(case),
+            RequestProgress {
+                error: Some(error),
+                unprocessed: false,
+                sequence,
+            },
+            "{case:?}"
+        );
+    }
+}
+
+/// A cancellation that lands right after a connection refusal samples its request's cause, as
+/// another thread's can, follows the refusal: the request reports the refusal's error and
+/// unprocessed, not the cancellation's error with the refusal's flag (`DIV-035`).
+#[test]
+fn a_cancellation_racing_a_refusal_follows_it() {
+    let (progress, written) = run_on_host(|context| {
+        Box::pin(async move {
+            let (transport, state) = ScriptedTransport::new([ReadAction::Eof]);
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let token = CancellationSource::new();
+            let mut submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                token.token(),
+            );
+            crate::experimental::after_next_refusal_cause_sample(move || {
+                token.request_cancellation();
+            });
+            let (_run, progress) = futures::join!(session.run(), async {
+                let error = (&mut submission).await.err().map(|error| error.code());
+                RequestProgress::of(error, &submission)
+            });
+            let written = state.borrow().writes.concat();
+            (progress, written)
+        })
+    });
+    assert_eq!(
+        progress,
+        RequestProgress {
+            error: Some(HttpErrorCode::TRANSPORT_EOF),
+            unprocessed: true,
+            sequence: Some(0),
+        }
+    );
+    assert!(written.is_empty(), "nothing is written");
 }

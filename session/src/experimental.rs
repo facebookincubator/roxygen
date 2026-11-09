@@ -23,6 +23,9 @@
 //!   client's response that would let a caller resend a request that failed
 //!   before any of it was written, as Hyper's legacy client does for reused
 //!   connections, which frozen Proxygen does not have.
+//!   [`OwnedRequestProgressExt`] is its counterpart for the owned upstream
+//!   drivers' requests: whether a request failed unprocessed, and how many
+//!   requests its connection carried before it.
 
 use std::error::Error;
 use std::sync::Arc;
@@ -90,6 +93,61 @@ pub trait UniplexResponseProgressExt {
 impl UniplexResponseProgressExt for UniplexResponse {
     fn request_started(&self) -> bool {
         self.exchange.egress_started()
+    }
+}
+
+/// Request progress of an owned upstream request (`DIV-035`): an
+/// `OwnedH1UpstreamSubmission`, `OwnedH1ExclusiveSubmission` or
+/// `OwnedH1UpstreamRequest`, or its HTTP/2 counterpart. A submission and its
+/// response's request control read the same state, which a failure leaves
+/// readable.
+pub trait OwnedRequestProgressExt {
+    /// Whether the request failed unprocessed: its connection refused it
+    /// before the driver committed it, because the connection's admission
+    /// closed (the peer's EOF or GOAWAY, a drain, a response that left the
+    /// connection unusable, or the connection's failure or cancel), so none of
+    /// it was serialized; or, on HTTP/2, the peer refused its stream before
+    /// any response head arrived, with RST_STREAM(`REFUSED_STREAM`) or a
+    /// GOAWAY whose last-stream-id is below it, as the stream's first reset,
+    /// which RFC 9113 (sections 8.7 and 6.8) defines as unprocessed. Resending
+    /// it on another connection cannot repeat it, as hyper-util's
+    /// `retry_canceled_requests` resends a request its dispatcher never took.
+    /// It stays false while the request is pending, once it succeeds, and for
+    /// a failure the request or its consumer caused (a request the driver
+    /// refuses, a cancel or a deadline), which resending would repeat or
+    /// override, also when the refusal follows the consumer's cause. Any other
+    /// failure of a committed request reports false.
+    fn request_unprocessed(&self) -> bool;
+
+    /// How many requests the connection committed before this one, fixed
+    /// when the driver commits the request or its connection refuses it
+    /// (`request_unprocessed`), and `None` before either and after any other
+    /// failure before commit; a committed request keeps it whatever follows.
+    /// A connection that carried a request before reports a nonzero value:
+    /// hyper-util resends an unprocessed request on a newly acquired
+    /// connection only when its connection was reused.
+    fn sequence_number(&self) -> Option<u64>;
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_REFUSAL_CAUSE_SAMPLE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `hook` once, right after the next connection refusal on this thread
+/// samples its request's selected cause: where another thread's cancellation
+/// can land.
+#[cfg(test)]
+pub(crate) fn after_next_refusal_cause_sample(hook: impl FnOnce() + 'static) {
+    AFTER_REFUSAL_CAUSE_SAMPLE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+pub(crate) fn refusal_cause_sampled() {
+    let hook = AFTER_REFUSAL_CAUSE_SAMPLE.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
     }
 }
 

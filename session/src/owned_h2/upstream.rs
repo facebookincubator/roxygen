@@ -7,6 +7,7 @@ use roxygen_runtime::cancellation::CancellationToken;
 use roxygen_runtime::cancellation::CancellationWakeRegistration;
 
 use super::*;
+use crate::experimental::OwnedRequestProgressExt;
 pub use crate::owned::OwnedResponseObserver as OwnedH2ResponseObserver;
 use crate::owned::OwnedResponseObserver;
 pub use crate::owned::OwnedUpstreamObserver as OwnedH2UpstreamObserver;
@@ -21,6 +22,8 @@ pub(super) struct Admission {
     maximum: u32,
     peer_maximum: Cell<u32>,
     pub(super) used: Cell<u32>,
+    /// Requests committed on the connection (`DIV-035`).
+    committed: Cell<u64>,
     closed: RefCell<Option<HttpError>>,
     observer: RefCell<Option<Rc<dyn OwnedUpstreamObserver>>>,
     queued: RefCell<VecDeque<Submission>>,
@@ -40,6 +43,7 @@ impl Admission {
             maximum,
             peer_maximum: Cell::new(u32::MAX),
             used: Cell::new(0),
+            committed: Cell::new(0),
             closed: RefCell::new(None),
             observer: RefCell::new(None),
             queued: RefCell::new(VecDeque::new()),
@@ -117,7 +121,7 @@ impl Admission {
         }
         let mut panic = None;
         for mut submission in queued {
-            capture(&mut panic, || submission.reject(error.clone()));
+            capture(&mut panic, || submission.refuse(error.clone()));
         }
         if let Some(observer) = observer {
             capture(&mut panic, || observer.admission_closed());
@@ -323,6 +327,9 @@ impl OwnedH2UpstreamReservation {
             released_undelivered: Cell::new(false),
             waiter: RefCell::new(None),
             wake: RefCell::new(None),
+            response_head: Cell::new(false),
+            unprocessed: Cell::new(false),
+            sequence: Cell::new(None),
         });
         let cancellation_wake = if status.cancellation.can_be_cancelled() {
             let mut registration = status.cancellation.wake_registration();
@@ -345,7 +352,7 @@ impl OwnedH2UpstreamReservation {
         };
         let closed = admission.closed.borrow().clone();
         if let Some(error) = closed {
-            submission.reject(error);
+            submission.refuse(error);
         } else {
             admission.queued.borrow_mut().push_back(submission);
             admission.ready.wake();
@@ -560,6 +567,36 @@ impl OwnedH2UpstreamRequest {
     }
 }
 
+impl OwnedRequestProgressExt for OwnedH2UpstreamSubmission {
+    fn request_unprocessed(&self) -> bool {
+        self.status.unprocessed.get()
+    }
+
+    fn sequence_number(&self) -> Option<u64> {
+        self.status.sequence.get()
+    }
+}
+
+impl OwnedRequestProgressExt for OwnedH2ExclusiveSubmission {
+    fn request_unprocessed(&self) -> bool {
+        self.0.request_unprocessed()
+    }
+
+    fn sequence_number(&self) -> Option<u64> {
+        self.0.sequence_number()
+    }
+}
+
+impl OwnedRequestProgressExt for OwnedH2UpstreamRequest {
+    fn request_unprocessed(&self) -> bool {
+        self.0.unprocessed.get()
+    }
+
+    fn sequence_number(&self) -> Option<u64> {
+        self.0.sequence.get()
+    }
+}
+
 pub(super) struct RequestStatus {
     admission: Rc<Admission>,
     stream: Cell<Option<StreamId>>,
@@ -579,6 +616,13 @@ pub(super) struct RequestStatus {
     released_undelivered: Cell<bool>,
     waiter: RefCell<Option<Waker>>,
     wake: RefCell<Option<Arc<StreamWake>>>,
+    /// A response head arrived.
+    response_head: Cell<bool>,
+    /// Its connection refused it before commit, or the peer refused its stream before any
+    /// response head (`DIV-035`).
+    unprocessed: Cell<bool>,
+    /// The connection's earlier commits, fixed at commit or at a refusal before it (`DIV-035`).
+    sequence: Cell<Option<u64>>,
 }
 
 impl RequestStatus {
@@ -599,6 +643,40 @@ impl RequestStatus {
                 b"request body production cancelled",
             )
         })
+    }
+
+    /// Whether a cause is selected for the request: its consumer's cancel or cancellation token,
+    /// or a supplied producer's failure.
+    fn cause_selected(&self) -> bool {
+        self.error.borrow().is_some() || self.cancellation.is_cancellation_requested()
+    }
+
+    /// Whether the response's source already failed, as a stream read timeout fails it before
+    /// the driver applies that failure.
+    fn response_failed(&self) -> bool {
+        self.ingress
+            .borrow()
+            .as_ref()
+            .is_some_and(|receipt| matches!(receipt.snapshot(), Some(Err(_))))
+    }
+
+    /// The peer refused the request's stream, with `REFUSED_STREAM` or a GOAWAY whose
+    /// last-stream-id is below it, as the stream's first reset: before any response head, any
+    /// selected cause and any failure of the response's source, the request failed unprocessed
+    /// (`DIV-035`). Returns whether it did.
+    pub(super) fn peer_refused(&self) -> bool {
+        let unprocessed =
+            !self.response_head.get() && !self.cause_selected() && !self.response_failed();
+        if unprocessed {
+            self.unprocessed.set(true);
+        }
+        unprocessed
+    }
+
+    /// Records the arrival of a response head, which also publishes the response.
+    pub(super) fn response_head_arrived(&self) {
+        self.response_head.set(true);
+        self.publish_response();
     }
 
     fn cancel(&self, error: HttpError) {
@@ -696,8 +774,29 @@ struct Submission {
 }
 
 impl Submission {
+    /// Rejects the submission because its connection's admission closed before commit: unless
+    /// its consumer selected a cause, it failed unprocessed (`DIV-035`). One sample of the cause
+    /// decides both, as a cancellation can arrive from another thread.
+    fn refuse(&mut self, error: HttpError) {
+        let selected = self.status.selected_error();
+        #[cfg(test)]
+        crate::experimental::refusal_cause_sampled();
+        let error = selected.unwrap_or_else(|| {
+            self.status.unprocessed.set(true);
+            self.status
+                .sequence
+                .set(Some(self.status.admission.committed.get()));
+            error
+        });
+        self.reject_selected(error);
+    }
+
     fn reject(&mut self, error: HttpError) {
         let error = self.status.selected_error().unwrap_or(error);
+        self.reject_selected(error);
+    }
+
+    fn reject_selected(&mut self, error: HttpError) {
         let mut panic = None;
         capture(&mut panic, || self.status.fail(error.clone()));
         if let Some(headers) = self.headers.as_mut() {
@@ -1205,6 +1304,9 @@ where
         ));
         let status = Rc::clone(&submission.status);
         status.stream.set(Some(id));
+        let committed = status.admission.committed.get();
+        status.sequence.set(Some(committed));
+        status.admission.committed.set(committed + 1);
         *status.ingress.borrow_mut() = source.ingress_completion();
         *status.wake.borrow_mut() = Some(Arc::clone(&wake));
         let headers = submission
