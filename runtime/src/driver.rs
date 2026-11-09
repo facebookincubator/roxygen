@@ -45,6 +45,9 @@ pub struct WorkerDriver {
 }
 
 impl WorkerDriver {
+    /// Polls commands and the activated cleanups whose wakers fired. Each
+    /// cleanup is polled at most once per pass, in wake order. Shutdown polls
+    /// every unfinished cleanup in registration order.
     pub fn new(command_capacity: usize) -> Result<(WorkerHandle, Self), WorkerCreateError> {
         Self::create(command_capacity, None)
     }
@@ -162,7 +165,7 @@ impl WorkerDriver {
     fn poll_shutdown(&mut self, context: &mut Context<'_>, pass: &mut PassStats) -> Poll<()> {
         self.start_shutdown();
         let cleanup = self.context.poll_cleanup_tasks(context, true);
-        pass.cleanup_polls += cleanup.polls;
+        cleanup.add_to(pass);
         self.record_shutdown_panic(cleanup.panic);
         if !cleanup.complete {
             return Poll::Pending;
@@ -246,7 +249,7 @@ impl WorkerDriver {
         }
 
         let cleanup = self.context.poll_cleanup_tasks(context, false);
-        pass.cleanup_polls += cleanup.polls;
+        cleanup.add_to(pass);
         pass.budget_exhausted = !tokio::task::coop::has_budget_remaining();
         if cleanup.panic.is_some() {
             self.record_shutdown_panic(cleanup.panic);

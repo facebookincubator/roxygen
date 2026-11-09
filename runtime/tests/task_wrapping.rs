@@ -1991,8 +1991,9 @@ mod task_wrapping {
     fn cleanup_path(cast: &Cast, driving: Driving, path: CleanupPath) {
         let mut rig = DriverRig::new(cast, driving);
         let context = rig.context();
+        let gate = Signal::default();
         let register = |name: &'static str, plan: Plan, scope: bool| {
-            let future = plan.probe(name);
+            let future = plan.gated(&gate).probe(name);
             let registered = under(&cast.submitter, Some(&cast.submitter_observer), || {
                 if scope {
                     context.register_scope(future)
@@ -2015,15 +2016,15 @@ mod task_wrapping {
         let mut reserved = Vec::new();
         match path {
             CleanupPath::Complete => {
-                tasks.extend(activate(register("cleanup", Plan::ready(1), false)));
+                tasks.extend(activate(register("cleanup", Plan::ready(0), false)));
             }
             CleanupPath::PollPanic => {
-                tasks.extend(activate(register("cleanup", Plan::panic(1), false)));
+                tasks.extend(activate(register("cleanup", Plan::panic(0), false)));
             }
             CleanupPath::DestructionPanic => {
                 tasks.extend(activate(register(
                     "scope",
-                    Plan::ready(1).drop_panicking(),
+                    Plan::ready(0).drop_panicking(),
                     true,
                 )));
             }
@@ -2036,6 +2037,7 @@ mod task_wrapping {
             }
         }
         rig.turn();
+        gate.open();
         rig.turn();
         if !matches!(path, CleanupPath::Abort | CleanupPath::AbortReserved) {
             rig.turn();

@@ -2938,15 +2938,16 @@ fn adopted_io_unused_root_drop_preserves_existing_unwind() {
                 .expect("root-drop initializer");
             let mut driver = Box::pin(driver);
             let conditional = Arc::new(ConditionalPanicWake::default());
-            assert!(
-                poll_with_waker(driver.as_mut(), &Waker::from(Arc::clone(&conditional)))
-                    .is_pending()
-            );
+            assert!(poll_once(driver.as_mut()).is_pending());
             let (control, evidence, cleaned) =
                 initialized.await.expect("unused adoption published");
             let receipt = control.completion();
             assert_eq!(evidence.drops.load(Ordering::SeqCst), 0);
-            assert!(poll_once(Box::pin(receipt.wait_retired()).as_mut()).is_pending());
+            let mut observing = Box::pin(receipt.wait_retired());
+            assert!(
+                poll_with_waker(observing.as_mut(), &Waker::from(Arc::clone(&conditional)))
+                    .is_pending()
+            );
             let RetirementFixture {
                 transport,
                 _cleanup: cleanup,
@@ -2965,7 +2966,7 @@ fn adopted_io_unused_root_drop_preserves_existing_unwind() {
             );
             assert!(
                 conditional.panics.load(Ordering::SeqCst) > 0,
-                "unused drain was polled and its notification really panicked"
+                "I/O destruction notified its waiter and the notification really panicked"
             );
             assert!(
                 poll_once(Box::pin(receipt.wait_retired()).as_mut()).is_pending(),

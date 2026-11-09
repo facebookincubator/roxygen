@@ -64,6 +64,7 @@ use crate::client_tests::ProbedIo;
 use crate::client_tests::ReleaseGate;
 use crate::client_tests::TestBody;
 use crate::client_tests::TestConnector;
+use crate::client_tests::WorkerControl;
 use crate::client_tests::body_bytes;
 use crate::client_tests::case;
 use crate::client_tests::forced_run;
@@ -392,6 +393,8 @@ fn live_stopped(frame: Option<Result<Frame<Bytes>, crate::client::BoxError>>) {
 async fn live_cancel_read(
     body: &mut crate::client::ClientBody,
     exchange: &crate::client::ClientExchange,
+    control: &WorkerControl,
+    application: &TestApplicationJoin,
     repeat: bool,
 ) {
     let wakes = Arc::new(AtomicUsize::new(0));
@@ -408,11 +411,20 @@ async fn live_cancel_read(
             .poll(&mut Context::from_waker(&waker))
             .is_pending()
     );
+    control.pause().await;
     let before = wakes.load(Ordering::SeqCst);
     exchange.cancel();
     if repeat {
         exchange.cancel();
     }
+    let forwarded = tokio::time::timeout(Duration::from_secs(5), async {
+        while application.forwards.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    control.resume().await;
+    forwarded.expect("response stop is accepted before native cancellation runs");
     live_phase("retained read wake after cancellation", async {
         while wakes.load(Ordering::SeqCst) == before {
             tokio::task::yield_now().await;
@@ -532,7 +544,14 @@ fn live_exchange_cancel_wakes_retained_body_and_reaps_upload() {
                         assert!(body.frame().await.is_none());
                     } else {
                         live_prefix(&mut body).await;
-                        live_cancel_read(&mut body, &exchange, phase == 2).await;
+                        live_cancel_read(
+                            &mut body,
+                            &exchange,
+                            &fixture.control,
+                            &application,
+                            phase == 2,
+                        )
+                        .await;
                     }
                     live_cancelled(&exchange).await;
                     live_upload_joined(&application, &upload_state).await;
@@ -635,20 +654,7 @@ fn live_join_credit_case(protocol: CodecProtocol, native_first: bool) {
                 .into_body();
             live_prefix(&mut body).await;
             live_phase("credit case upload pending", upload_state.pending.wait()).await;
-            fixture.control.pause().await;
-            let resume_after_stop = async {
-                live_phase("credit case response stop forwarded", async {
-                    while application.forwards.load(Ordering::Acquire) == 0 {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await;
-                fixture.control.resume().await;
-            };
-            tokio::join!(
-                live_cancel_read(&mut body, &exchange, false),
-                resume_after_stop,
-            );
+            live_cancel_read(&mut body, &exchange, &fixture.control, &application, false).await;
             live_phase("actual app-return gate", app_gate.wait_entered()).await;
             live_phase("actual native-return gate", native_gate.wait_entered()).await;
             live_upload_joined(&application, &upload_state).await;
@@ -1109,7 +1115,7 @@ fn live_h2_sibling_case() {
                 .unwrap();
             assert_eq!(first, b"healthy-"[..]);
             assert!(!release.peer.is_open());
-            live_cancel_read(&mut body, &exchange, true).await;
+            live_cancel_read(&mut body, &exchange, &fixture.control, &application, true).await;
             live_cancelled(&exchange).await;
             let mut next = Box::pin(sibling_body.frame());
             assert!(

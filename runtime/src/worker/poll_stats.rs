@@ -22,6 +22,10 @@ pub struct WorkerPollStats {
     /// Polls of cleanup tasks, by the driver or, under a hosted driver, by
     /// each cleanup's own task.
     pub cleanup_polls: u64,
+    /// Ready-list entries that open passes drained.
+    pub ready_entries: u64,
+    /// Drained entries whose cleanup had finished or was not active.
+    pub stale_ready_entries: u64,
     /// Open driver passes that ended with the Tokio cooperative budget of the
     /// driver's task spent.
     pub budget_exhausted_passes: u64,
@@ -30,6 +34,8 @@ pub struct WorkerPollStats {
     pub cleanup_polls_per_driver_poll: [u64; CLEANUP_POLL_BUCKETS],
     /// The most cleanup polls that one non-hosted driver poll has made.
     pub max_cleanup_polls_per_driver_poll: u64,
+    /// The most entries that one open pass has drained.
+    pub max_ready_batch: u64,
     /// Registered cleanup tasks that have not finished.
     pub cleanups_registered: u64,
     /// Activated cleanup tasks that have not finished.
@@ -51,6 +57,10 @@ impl WorkerPollStats {
             driver_polls: self.driver_polls.wrapping_sub(earlier.driver_polls),
             command_polls: self.command_polls.wrapping_sub(earlier.command_polls),
             cleanup_polls: self.cleanup_polls.wrapping_sub(earlier.cleanup_polls),
+            ready_entries: self.ready_entries.wrapping_sub(earlier.ready_entries),
+            stale_ready_entries: self
+                .stale_ready_entries
+                .wrapping_sub(earlier.stale_ready_entries),
             budget_exhausted_passes: self
                 .budget_exhausted_passes
                 .wrapping_sub(earlier.budget_exhausted_passes),
@@ -65,6 +75,10 @@ impl WorkerPollStats {
         self.driver_polls = self.driver_polls.wrapping_add(other.driver_polls);
         self.command_polls = self.command_polls.wrapping_add(other.command_polls);
         self.cleanup_polls = self.cleanup_polls.wrapping_add(other.cleanup_polls);
+        self.ready_entries = self.ready_entries.wrapping_add(other.ready_entries);
+        self.stale_ready_entries = self
+            .stale_ready_entries
+            .wrapping_add(other.stale_ready_entries);
         self.budget_exhausted_passes = self
             .budget_exhausted_passes
             .wrapping_add(other.budget_exhausted_passes);
@@ -78,6 +92,7 @@ impl WorkerPollStats {
         self.max_cleanup_polls_per_driver_poll = self
             .max_cleanup_polls_per_driver_poll
             .max(other.max_cleanup_polls_per_driver_poll);
+        self.max_ready_batch = self.max_ready_batch.max(other.max_ready_batch);
         self.cleanups_registered = self
             .cleanups_registered
             .wrapping_add(other.cleanups_registered);
@@ -100,6 +115,9 @@ pub(crate) fn cleanup_poll_bucket(polls: u64) -> usize {
 pub(crate) struct PassStats {
     pub(crate) command_polls: u64,
     pub(crate) cleanup_polls: u64,
+    pub(crate) ready_entries: u64,
+    pub(crate) stale_ready_entries: u64,
+    pub(crate) max_ready_batch: u64,
     pub(crate) budget_exhausted: bool,
 }
 
@@ -109,6 +127,12 @@ fn add(counter: &AtomicU64, n: u64) {
         counter.load(Ordering::Relaxed).wrapping_add(n),
         Ordering::Relaxed,
     );
+}
+
+fn raise(maximum: &AtomicU64, value: u64) {
+    if value > maximum.load(Ordering::Relaxed) {
+        maximum.store(value, Ordering::Relaxed);
+    }
 }
 
 fn sub(counter: &AtomicU64, n: u64) {
@@ -126,9 +150,12 @@ pub(crate) struct PollCounters {
     driver_polls: AtomicU64,
     command_polls: AtomicU64,
     cleanup_polls: AtomicU64,
+    ready_entries: AtomicU64,
+    stale_ready_entries: AtomicU64,
     budget_exhausted_passes: AtomicU64,
     cleanup_polls_per_driver_poll: [AtomicU64; CLEANUP_POLL_BUCKETS],
     max_cleanup_polls_per_driver_poll: AtomicU64,
+    max_ready_batch: AtomicU64,
     cleanups_registered: AtomicU64,
     cleanups_active: AtomicU64,
 }
@@ -151,14 +178,12 @@ impl PollCounters {
                 &self.cleanup_polls_per_driver_poll[cleanup_poll_bucket(pass.cleanup_polls)],
                 1,
             );
-            if pass.cleanup_polls
-                > self
-                    .max_cleanup_polls_per_driver_poll
-                    .load(Ordering::Relaxed)
-            {
-                self.max_cleanup_polls_per_driver_poll
-                    .store(pass.cleanup_polls, Ordering::Relaxed);
-            }
+            raise(&self.max_cleanup_polls_per_driver_poll, pass.cleanup_polls);
+        }
+        if pass.ready_entries != 0 {
+            add(&self.ready_entries, pass.ready_entries);
+            add(&self.stale_ready_entries, pass.stale_ready_entries);
+            raise(&self.max_ready_batch, pass.max_ready_batch);
         }
     }
 
@@ -190,6 +215,8 @@ impl PollCounters {
             driver_polls: self.driver_polls.load(Ordering::Relaxed),
             command_polls: self.command_polls.load(Ordering::Relaxed),
             cleanup_polls: self.cleanup_polls.load(Ordering::Relaxed),
+            ready_entries: self.ready_entries.load(Ordering::Relaxed),
+            stale_ready_entries: self.stale_ready_entries.load(Ordering::Relaxed),
             budget_exhausted_passes: self.budget_exhausted_passes.load(Ordering::Relaxed),
             cleanup_polls_per_driver_poll: std::array::from_fn(|bucket| {
                 self.cleanup_polls_per_driver_poll[bucket].load(Ordering::Relaxed)
@@ -197,6 +224,7 @@ impl PollCounters {
             max_cleanup_polls_per_driver_poll: self
                 .max_cleanup_polls_per_driver_poll
                 .load(Ordering::Relaxed),
+            max_ready_batch: self.max_ready_batch.load(Ordering::Relaxed),
             cleanups_registered: self.cleanups_registered.load(Ordering::Relaxed),
             cleanups_active: self.cleanups_active.load(Ordering::Relaxed),
         }

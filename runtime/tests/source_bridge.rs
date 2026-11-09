@@ -468,15 +468,10 @@ fn prepared_source_stop_waker_clone_panic_preserves_first_failure() {
     let (attachment, remote, observer) =
         RemoteHttpSource::prepare_local::<OwnedFaultSource>(&context, 1).unwrap();
     *probe.observation.borrow_mut() = Some(observer.clone());
+    context.set_newest_cleanup_poll_waker(source_stop_clone_waker());
     attachment.attach(source).unwrap();
     assert_eq!(probe.drops.get(), 0);
-    let waker = source_stop_clone_waker();
-    assert!(
-        driver
-            .as_mut()
-            .poll(&mut Context::from_waker(&waker))
-            .is_pending()
-    );
+    assert!(poll_once(driver.as_mut()).is_pending());
     assert_eq!(SOURCE_STOP_CLONE_HITS.get(), 1);
     assert!(!SOURCE_STOP_CLONE_ARMED.get());
     assert!(

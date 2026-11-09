@@ -75,6 +75,7 @@ mod worker {
         drops: Arc<AtomicUsize>,
         captures: Arc<AtomicUsize>,
         observer: Arc<Mutex<Option<WorkerCleanupObserver>>>,
+        waker: Arc<Mutex<Option<Waker>>>,
     }
 
     impl RetirementProbe {
@@ -88,6 +89,15 @@ mod worker {
                 drops: Arc::new(AtomicUsize::new(0)),
                 captures: Arc::new(AtomicUsize::new(0)),
                 observer: Arc::new(Mutex::new(None)),
+                waker: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn finish(&self) {
+            self.ready.store(true, Ordering::SeqCst);
+            let waker = self.waker.lock().expect("probe waker").take();
+            if let Some(waker) = waker {
+                waker.wake();
             }
         }
 
@@ -123,7 +133,8 @@ mod worker {
     impl Future for RetirementFuture {
         type Output = ();
 
-        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+        fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+            *self.probe.waker.lock().expect("probe waker") = Some(context.waker().clone());
             self.probe.polls.fetch_add(1, Ordering::SeqCst);
             assert!(
                 !self.probe.panic_on_poll.load(Ordering::SeqCst),
@@ -305,7 +316,7 @@ mod worker {
         drop(observer.wait());
         assert_eq!(probe.polls.load(Ordering::SeqCst), 0);
         activate_retirement();
-        probe.ready.store(true, Ordering::SeqCst);
+        probe.finish();
         assert!(poll_retirement_driver(&mut driver).is_pending());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(dropped_calls.load(Ordering::SeqCst), 0);
@@ -333,7 +344,7 @@ mod worker {
             let probe = RetirementProbe::new();
             let observer = add_retirement(&handle, &mut driver, &probe, scope, true);
             assert!(retirement_result(&observer).is_pending());
-            probe.ready.store(true, Ordering::SeqCst);
+            probe.finish();
             assert!(poll_retirement_driver(&mut driver).is_pending());
             probe.assert_destroyed();
             assert_eq!(retirement_result(&observer), Poll::Ready(Ok(())));
@@ -391,7 +402,7 @@ mod worker {
             .expect("owner-local disarm");
         assert!(!disarmed);
         assert!(retirement_result(&observer).is_pending());
-        probe.ready.store(true, Ordering::SeqCst);
+        probe.finish();
         assert!(poll_retirement_driver(&mut driver).is_ready());
         assert_eq!(retirement_result(&observer), Poll::Ready(Ok(())));
         probe.assert_destroyed();
@@ -406,7 +417,7 @@ mod worker {
         assert!(retirement_result(&observer).is_pending());
         assert!(poll_retirement_driver(&mut driver).is_pending());
         assert_eq!(probe.drops.load(Ordering::SeqCst), 0);
-        probe.ready.store(true, Ordering::SeqCst);
+        probe.finish();
         assert!(poll_retirement_driver(&mut driver).is_pending());
         probe.assert_destroyed();
         assert_eq!(retirement_result(&observer), Poll::Ready(Ok(())));
@@ -487,7 +498,7 @@ mod worker {
                     .poll(&mut Context::from_waker(&closed_waker))
                     .is_pending()
             );
-            first_probe.ready.store(true, Ordering::SeqCst);
+            first_probe.finish();
             first_probe
                 .panic_on_poll
                 .store(panic_on_poll, Ordering::SeqCst);
@@ -508,7 +519,7 @@ mod worker {
             assert!(counts.iter().all(|count| count.load(Ordering::SeqCst) == 1));
             assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
             assert_eq!(handle.state(), WorkerState::Closing);
-            gated_probe.ready.store(true, Ordering::SeqCst);
+            gated_probe.finish();
             let panic = catch_unwind(AssertUnwindSafe(|| poll_retirement_driver(&mut driver)))
                 .expect_err("first panic follows all cleanup");
             let message = if panic_on_poll {
@@ -533,7 +544,7 @@ mod worker {
         let (handle, mut driver) = WorkerDriver::new(1).expect("worker starts");
         let probe = RetirementProbe::new();
         let observer = add_retirement(&handle, &mut driver, &probe, true, true);
-        probe.ready.store(true, Ordering::SeqCst);
+        probe.finish();
         probe.panic_on_drop.store(true, Ordering::SeqCst);
         let panic = catch_unwind(AssertUnwindSafe(|| poll_retirement_driver(&mut driver)))
             .expect_err("inner future destructor panic propagates");
@@ -598,7 +609,7 @@ mod worker {
                     .poll(&mut Context::from_waker(&closed_waker))
                     .is_pending()
             );
-            probe.ready.store(true, Ordering::SeqCst);
+            probe.finish();
             probe
                 .panic_on_poll
                 .store(!accounting_panics, Ordering::SeqCst);
@@ -1798,8 +1809,8 @@ mod worker {
         }
     }
 
-    /// `Owner` is `WorkerDriver::new`, which polls its tasks itself; `Hosted`
-    /// is `WorkerDriver::with_host`, the driver of `HostedWorker` and
+    /// `Owner` is `WorkerDriver::new`, which polls commands and woken cleanups.
+    /// `Hosted` is `WorkerDriver::with_host`, the driver of `HostedWorker` and
     /// `roxygen_explicit`, which runs each command as a task-group host task.
     #[derive(Clone, Copy, Debug)]
     enum CallDriver {
@@ -1818,21 +1829,7 @@ mod worker {
 
     impl CallWorker {
         fn start(kind: CallDriver) -> Self {
-            let host = match kind {
-                CallDriver::Owner => None,
-                CallDriver::Hosted => Some(ManualHost::default()),
-            };
-            let (handle, driver) = match &host {
-                None => WorkerDriver::new(4),
-                Some(host) => WorkerDriver::with_host(4, Host::new(Rc::new(host.clone()))),
-            }
-            .expect("worker driver starts");
-            Self {
-                kind,
-                handle,
-                driver,
-                host,
-            }
+            Self::with_capacity(kind, 4)
         }
 
         /// Polls the driver; a hosted driver's tasks then run once, and the
@@ -2806,8 +2803,8 @@ mod worker {
                 CallDriver::Hosted => Some(ManualHost::default()),
             };
             let (handle, driver) = match &host {
-                None => WorkerDriver::new(capacity),
                 Some(host) => WorkerDriver::with_host(capacity, Host::new(Rc::new(host.clone()))),
+                None => WorkerDriver::new(capacity),
             }
             .expect("worker driver starts");
             Self {
@@ -3145,66 +3142,68 @@ mod worker {
         use OrderStep::Dropped;
         use OrderStep::Polled;
 
-        let mut worker = CallWorker::start(CallDriver::Hosted);
-        assert!(worker.turn().is_pending());
-        let log = OrderLog::default();
-        let context = worker.context();
-        let reserve = || {
-            context
-                .register_cleanup_task(std::future::ready(()))
-                .expect("cleanup reserved")
-        };
-        let long_lived = log.reserve(&context, 0);
-        assert_eq!(context.armed_hosted_cleanups(), 1);
-        assert_eq!(context.stored_hosted_cleanups(), 1);
+        for kind in CALL_DRIVERS {
+            let mut worker = CallWorker::start(kind);
+            assert!(worker.turn().is_pending());
+            let log = OrderLog::default();
+            let context = worker.context();
+            let reserve = || {
+                context
+                    .register_cleanup_task(std::future::ready(()))
+                    .expect("cleanup reserved")
+            };
+            let long_lived = log.reserve(&context, 0);
+            assert_eq!(context.armed_hosted_cleanups(), 1);
+            assert_eq!(context.stored_hosted_cleanups(), 1);
 
-        for cycle in 0..10_000 {
-            let registration = reserve();
-            assert_eq!(context.armed_hosted_cleanups(), 2, "{cycle}");
-            assert_eq!(context.stored_hosted_cleanups(), 2, "{cycle}");
-            assert_eq!(registration.disarm(), Ok(true), "{cycle}");
-            assert_eq!(context.armed_hosted_cleanups(), 1, "{cycle}");
-            assert_eq!(context.stored_hosted_cleanups(), 2, "{cycle}");
-        }
-
-        let mut live: Vec<_> = (0..1_000)
-            .map(|index| {
+            for cycle in 0..10_000 {
                 let registration = reserve();
-                assert_eq!(context.armed_hosted_cleanups(), index + 2);
-                assert_eq!(context.stored_hosted_cleanups(), index + 2);
-                Some(registration)
-            })
-            .collect();
-        for (retired, index) in (0..1_000).map(|step| step * 919 % 1_000).enumerate() {
-            let registration = live[index].take().expect("retired once");
-            assert_eq!(registration.disarm(), Ok(true), "{index}");
-            assert_eq!(context.armed_hosted_cleanups(), 1_000 - retired, "{index}");
-            assert_eq!(context.stored_hosted_cleanups(), 1_001, "{index}");
-        }
+                assert_eq!(context.armed_hosted_cleanups(), 2, "{cycle}");
+                assert_eq!(context.stored_hosted_cleanups(), 2, "{cycle}");
+                assert_eq!(registration.disarm(), Ok(true), "{cycle}");
+                assert_eq!(context.armed_hosted_cleanups(), 1, "{cycle}");
+                assert_eq!(context.stored_hosted_cleanups(), 2, "{cycle}");
+            }
 
-        let wave: Vec<_> = (0..1_000)
-            .map(|index| {
-                let registration = reserve();
-                assert_eq!(context.armed_hosted_cleanups(), index + 2);
-                assert_eq!(context.stored_hosted_cleanups(), 1_001);
-                registration
-            })
-            .collect();
-        for (retired, registration) in wave.into_iter().enumerate() {
-            assert_eq!(registration.disarm(), Ok(true), "{retired}");
-            assert_eq!(
-                context.armed_hosted_cleanups(),
-                1_000 - retired,
-                "{retired}"
-            );
-            assert_eq!(context.stored_hosted_cleanups(), 1_001, "{retired}");
-        }
-        drop(context);
+            let mut live: Vec<_> = (0..1_000)
+                .map(|index| {
+                    let registration = reserve();
+                    assert_eq!(context.armed_hosted_cleanups(), index + 2);
+                    assert_eq!(context.stored_hosted_cleanups(), index + 2);
+                    Some(registration)
+                })
+                .collect();
+            for (retired, index) in (0..1_000).map(|step| step * 919 % 1_000).enumerate() {
+                let registration = live[index].take().expect("retired once");
+                assert_eq!(registration.disarm(), Ok(true), "{index}");
+                assert_eq!(context.armed_hosted_cleanups(), 1_000 - retired, "{index}");
+                assert_eq!(context.stored_hosted_cleanups(), 1_001, "{index}");
+            }
 
-        assert!(worker.handle.begin_shutdown());
-        assert!(worker.turn().is_ready());
-        assert_eq!(log.steps(), [Polled(0), Dropped(0)]);
-        drop(long_lived);
+            let wave: Vec<_> = (0..1_000)
+                .map(|index| {
+                    let registration = reserve();
+                    assert_eq!(context.armed_hosted_cleanups(), index + 2);
+                    assert_eq!(context.stored_hosted_cleanups(), 1_001);
+                    registration
+                })
+                .collect();
+            for (retired, registration) in wave.into_iter().enumerate() {
+                assert_eq!(registration.disarm(), Ok(true), "{retired}");
+                assert_eq!(
+                    context.armed_hosted_cleanups(),
+                    1_000 - retired,
+                    "{retired}"
+                );
+                assert_eq!(context.stored_hosted_cleanups(), 1_001, "{retired}");
+            }
+            drop(context);
+
+            assert!(worker.handle.begin_shutdown());
+            assert!(worker.turn().is_ready());
+            assert_eq!(log.steps(), [Polled(0), Dropped(0)]);
+            drop(long_lived);
+        }
     }
 
     #[test]
@@ -3412,7 +3411,7 @@ mod worker {
             let mut worker = CallWorker::start(kind);
             assert!(worker.turn().is_pending());
             let probe = RetirementProbe::new();
-            probe.ready.store(true, Ordering::SeqCst);
+            probe.finish();
             probe.panic_on_drop.store(true, Ordering::SeqCst);
             let task = retirement_task(&worker.context(), &probe);
             let failed = catch_unwind(AssertUnwindSafe(|| worker.turn()));
@@ -3472,7 +3471,7 @@ mod worker {
                 assert!(worker.turn().is_pending(), "{kind:?}");
                 assert!(retirement_result(&reserved).is_pending(), "{kind:?}");
 
-                probe.ready.store(true, Ordering::SeqCst);
+                probe.finish();
                 let turned = catch_unwind(AssertUnwindSafe(|| worker.turn()));
                 assert_eq!(turned.is_err(), destruction_panics, "{kind:?}");
                 let expected = if destruction_panics {

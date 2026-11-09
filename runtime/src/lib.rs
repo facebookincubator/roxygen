@@ -56,3 +56,7 @@ mod wait_primitives_tests;
 #[cfg(test)]
 #[path = "../tests/worker_affinity.rs"]
 mod worker_affinity_tests;
+
+#[cfg(test)]
+#[path = "../tests/woken_cleanup.rs"]
+mod woken_cleanup_tests;

@@ -41,10 +41,14 @@ use crate::task_group::TaskGroup;
 use crate::thread::current_id;
 
 mod poll_stats;
+mod woken;
 
 pub(crate) use poll_stats::PassStats;
 use poll_stats::PollCounters;
 pub use poll_stats::WorkerPollStats;
+use woken::ReadyEntry;
+use woken::WokenCleanups;
+use woken::WokenHandle;
 
 static NEXT_WORKER_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -348,6 +352,9 @@ struct QueueState {
     supervisor_waker: Option<Waker>,
     driver_waker: Option<Waker>,
     closed_wakers: Vec<Waker>,
+    /// Cleanups woken since the last woken pass drained the list, each at
+    /// most once.
+    ready: Vec<ReadyEntry>,
 }
 
 pub(crate) struct WorkerShared {
@@ -401,6 +408,31 @@ impl WorkerShared {
         }
     }
 
+    /// Queues a woken cleanup for the next woken pass and wakes the driver.
+    /// Every pass registers the driver waker before it drains the list, and
+    /// whatever takes the waker wakes it. So when no waker is stored, the
+    /// driver is already due to poll again, as is a driver not yet polled,
+    /// and that poll drains this entry. A closed worker queues nothing.
+    fn push_ready_cleanup(&self, entry: ReadyEntry) {
+        let driver = {
+            let mut queue = self.queue();
+            if queue.lifecycle == WorkerState::Closed {
+                return;
+            }
+            queue.ready.push(entry);
+            queue.driver_waker.take()
+        };
+        if let Some(driver) = driver {
+            driver.wake();
+        }
+    }
+
+    /// Swaps the woken cleanups into the empty `batch`.
+    fn take_ready_cleanups(&self, batch: &mut Vec<ReadyEntry>) {
+        debug_assert!(batch.is_empty());
+        std::mem::swap(&mut self.queue().ready, batch);
+    }
+
     pub(crate) fn take_commands_for_shutdown(&self) -> Vec<WorkerCommand> {
         self.queue().commands.drain(..).collect()
     }
@@ -410,6 +442,7 @@ impl WorkerShared {
             let mut queue = self.queue();
             queue.lifecycle = WorkerState::Closed;
             queue.accepting = false;
+            queue.ready = Vec::new();
             (
                 std::mem::take(&mut queue.closed_wakers),
                 queue.driver_waker.take(),
@@ -514,6 +547,7 @@ impl WorkerHandle {
                     supervisor_waker: None,
                     driver_waker: None,
                     closed_wakers: Vec::new(),
+                    ready: Vec::new(),
                 }),
                 cancelled: AtomicBool::new(false),
                 quiescing: CancellationSource::new(),
@@ -885,19 +919,20 @@ impl WorkerContext {
     }
 
     fn create(handle: WorkerHandle, host: Host, independently_scheduled: bool) -> Self {
+        let woken = (!independently_scheduled).then(WokenCleanups::new);
         Self {
             local: Rc::new(OwnerState {
                 shared: Arc::clone(&handle.shared),
                 active_guards: Cell::new(0),
                 next_cleanup_id: Cell::new(0),
                 cleanups: RefCell::new(IdSlab::new()),
-                cleanup_tasks: RefCell::new(VecDeque::new()),
                 hosted_cleanups: RefCell::new(IdSlab::new()),
                 hosted_tasks: independently_scheduled
                     .then(|| RefCell::new(TaskGroup::with_host(host.clone()))),
                 hosted_shutdown_started: Cell::new(false),
                 hosted_aborting: Cell::new(false),
                 hosted_panic: RefCell::new(None),
+                woken,
                 host,
             }),
             handle,
@@ -1048,19 +1083,15 @@ impl WorkerContext {
             publisher: CleanupPublisher::new(),
             registered: Cell::new(true),
             activated: Cell::new(false),
+            woken: OnceCell::new(),
+            #[cfg(test)]
+            poll_waker_override: OnceCell::new(),
         });
-        let slot = if self.local.hosted_tasks.is_some() {
-            self.local
-                .hosted_cleanups
-                .borrow_mut()
-                .insert(id, Rc::clone(&state))
-        } else {
-            self.local
-                .cleanup_tasks
-                .borrow_mut()
-                .push_back(Rc::clone(&state));
-            NO_SLOT
-        };
+        let slot = self
+            .local
+            .hosted_cleanups
+            .borrow_mut()
+            .insert(id, Rc::clone(&state));
         drop(queue);
         self.handle.shared.poll_counters().cleanup_registered();
 
@@ -1150,6 +1181,30 @@ impl WorkerContext {
         self.local.hosted_cleanups.borrow().len()
     }
 
+    /// Overrides the newest cleanup's poll waker for fault injection.
+    #[cfg(test)]
+    pub(crate) fn set_newest_cleanup_poll_waker(&self, waker: Waker) {
+        assert_eq!(current_id(), self.owner_thread());
+        assert!(self.local.hosted_tasks.is_none());
+        let cleanups = self.local.hosted_cleanups.borrow();
+        let (id, slot) = cleanups.keys_by_id().pop().expect("a registered cleanup");
+        cleanups
+            .get(slot, id)
+            .expect("the newest cleanup is still registered")
+            .poll_waker_override
+            .set(waker)
+            .expect("the fixture installs its waker only once");
+    }
+
+    /// The woken cleanups awaiting the next drain and the ready list's
+    /// capacity, for a non-hosted driver.
+    #[cfg(test)]
+    pub(crate) fn queued_cleanup_wakes(&self) -> Option<(usize, usize)> {
+        self.local.woken.as_ref()?;
+        let queue = self.handle.shared.queue();
+        Some((queue.ready.len(), queue.ready.capacity()))
+    }
+
     pub(crate) fn poll_cleanup_tasks(
         &self,
         context: &mut Context<'_>,
@@ -1158,50 +1213,109 @@ impl WorkerContext {
         if self.local.hosted_tasks.is_some() {
             return self.poll_hosted_cleanup_tasks(context, finish_reserved);
         }
-        let tasks = std::mem::take(&mut *self.local.cleanup_tasks.borrow_mut());
-        let mut retained = VecDeque::new();
+        self.poll_woken_cleanup_tasks(
+            self.local
+                .woken
+                .as_ref()
+                .expect("a non-hosted driver keeps a ready list"),
+            finish_reserved,
+        )
+    }
+
+    /// Polls the cleanups woken since the last pass, each once, in wake
+    /// order, or, once shutdown starts, every unfinished cleanup in
+    /// registration order. No registry borrow is held across a poll. The
+    /// driver registered its waker before its commands ran.
+    fn poll_woken_cleanup_tasks(
+        &self,
+        woken: &WokenCleanups,
+        finish_reserved: bool,
+    ) -> CleanupPass {
+        let mut batch = woken.spare.take();
+        self.local.shared.take_ready_cleanups(&mut batch);
         let mut pass = CleanupPass::default();
-        for state in tasks {
-            let phase =
-                std::mem::replace(&mut *state.phase.borrow_mut(), TrackedCleanupPhase::Polling);
-            match phase {
-                TrackedCleanupPhase::Reserved(future) => {
-                    if finish_reserved {
-                        let (pending, result) =
-                            poll_tracked_cleanup(&state, NO_SLOT, future, context);
+        if finish_reserved {
+            batch.clear();
+            let keys = self.local.hosted_cleanups.borrow().keys_by_id();
+            for (id, slot) in keys {
+                let Some(state) = self.local.hosted_cleanups.borrow().get(slot, id).cloned() else {
+                    continue;
+                };
+                let phase =
+                    std::mem::replace(&mut *state.phase.borrow_mut(), TrackedCleanupPhase::Polling);
+                match phase {
+                    TrackedCleanupPhase::Reserved(future) | TrackedCleanupPhase::Active(future) => {
+                        let handle = state
+                            .woken
+                            .get_or_init(|| woken.handle_for(&self.local.shared, slot, id));
+                        // A wake whose entry this pass discarded left the flag set.
+                        handle.node.queued.swap(false, Ordering::SeqCst);
+                        let poll_waker = &handle.waker;
+                        #[cfg(test)]
+                        let poll_waker = state.poll_waker_override.get().unwrap_or(poll_waker);
+                        let (_, panic) = poll_tracked_cleanup(
+                            &state,
+                            slot,
+                            future,
+                            &mut Context::from_waker(poll_waker),
+                        );
                         pass.polls += 1;
-                        retain_first_panic(&mut pass.panic, result);
-                        if pending {
-                            retained.push_back(state);
-                        }
-                    } else {
-                        *state.phase.borrow_mut() = TrackedCleanupPhase::Reserved(future);
-                        retained.push_back(state);
+                        retain_first_panic(&mut pass.panic, panic);
+                    }
+                    TrackedCleanupPhase::Finished => {
+                        *state.phase.borrow_mut() = TrackedCleanupPhase::Finished;
+                    }
+                    TrackedCleanupPhase::Polling => {
+                        unreachable!("a cleanup task cannot be polled reentrantly")
                     }
                 }
-                TrackedCleanupPhase::Active(future) => {
-                    let (pending, result) = poll_tracked_cleanup(&state, NO_SLOT, future, context);
-                    pass.polls += 1;
-                    retain_first_panic(&mut pass.panic, result);
-                    if pending {
-                        retained.push_back(state);
+            }
+            pass.complete = self.local.hosted_cleanups.borrow().is_empty();
+        } else {
+            pass.ready = batch.len() as u64;
+            for entry in batch.drain(..) {
+                let state = self
+                    .local
+                    .hosted_cleanups
+                    .borrow()
+                    .get(entry.slot, entry.id)
+                    .cloned();
+                let Some(state) = state else {
+                    pass.stale += 1;
+                    continue;
+                };
+                let phase =
+                    std::mem::replace(&mut *state.phase.borrow_mut(), TrackedCleanupPhase::Polling);
+                match phase {
+                    TrackedCleanupPhase::Active(future) => {
+                        let handle = state
+                            .woken
+                            .get()
+                            .expect("an activated woken cleanup has its waker");
+                        handle.node.queued.swap(false, Ordering::SeqCst);
+                        let poll_waker = &handle.waker;
+                        #[cfg(test)]
+                        let poll_waker = state.poll_waker_override.get().unwrap_or(poll_waker);
+                        let (_, panic) = poll_tracked_cleanup(
+                            &state,
+                            entry.slot,
+                            future,
+                            &mut Context::from_waker(poll_waker),
+                        );
+                        pass.polls += 1;
+                        retain_first_panic(&mut pass.panic, panic);
                     }
-                }
-                TrackedCleanupPhase::Finished => {
-                    *state.phase.borrow_mut() = TrackedCleanupPhase::Finished;
-                }
-                TrackedCleanupPhase::Polling => {
-                    unreachable!("a cleanup task cannot be polled reentrantly")
+                    other @ (TrackedCleanupPhase::Reserved(_) | TrackedCleanupPhase::Finished) => {
+                        *state.phase.borrow_mut() = other;
+                        pass.stale += 1;
+                    }
+                    TrackedCleanupPhase::Polling => {
+                        unreachable!("a cleanup task cannot be polled reentrantly")
+                    }
                 }
             }
         }
-        let mut newly_registered = self.local.cleanup_tasks.borrow_mut();
-        retained.append(&mut newly_registered);
-        pass.complete = retained
-            .iter()
-            .all(|state| matches!(&*state.phase.borrow(), TrackedCleanupPhase::Finished));
-        retained.retain(|state| !matches!(&*state.phase.borrow(), TrackedCleanupPhase::Finished));
-        *newly_registered = retained;
+        woken.spare.replace(batch);
         pass
     }
 
@@ -1248,7 +1362,7 @@ impl WorkerContext {
         CleanupPass {
             complete: self.local.hosted_cleanups.borrow().is_empty() && tasks.is_empty(),
             panic: self.local.hosted_panic.borrow_mut().take(),
-            polls: 0,
+            ..CleanupPass::default()
         }
     }
 
@@ -1275,18 +1389,18 @@ impl WorkerContext {
             }
             return first_panic;
         }
-        let tasks = std::mem::take(&mut *self.local.cleanup_tasks.borrow_mut());
+        self.local.hosted_aborting.set(true);
+        let taken = std::mem::take(&mut *self.local.hosted_cleanups.borrow_mut());
         let mut first_panic = None;
-        for state in tasks {
+        for (_, state) in taken.into_sorted() {
             let phase = std::mem::replace(
                 &mut *state.phase.borrow_mut(),
                 TrackedCleanupPhase::Finished,
             );
-            match phase {
-                TrackedCleanupPhase::Reserved(future) | TrackedCleanupPhase::Active(future) => {
-                    retain_first_panic(&mut first_panic, drop_tracked_cleanup(&state, future));
-                }
-                TrackedCleanupPhase::Polling | TrackedCleanupPhase::Finished => {}
+            if let TrackedCleanupPhase::Reserved(future) | TrackedCleanupPhase::Active(future) =
+                phase
+            {
+                retain_first_panic(&mut first_panic, drop_tracked_cleanup(&state, future));
             }
         }
         first_panic
@@ -1300,6 +1414,19 @@ pub(crate) struct CleanupPass {
     pub(crate) complete: bool,
     pub(crate) panic: Option<PanicPayload>,
     pub(crate) polls: u64,
+    /// Ready-list entries that an open woken pass drained.
+    pub(crate) ready: u64,
+    /// Drained entries whose cleanup had finished or was not active.
+    pub(crate) stale: u64,
+}
+
+impl CleanupPass {
+    pub(crate) fn add_to(&self, pass: &mut PassStats) {
+        pass.cleanup_polls += self.polls;
+        pass.ready_entries += self.ready;
+        pass.stale_ready_entries += self.stale;
+        pass.max_ready_batch = pass.max_ready_batch.max(self.ready);
+    }
 }
 
 struct OwnerState {
@@ -1307,12 +1434,13 @@ struct OwnerState {
     active_guards: Cell<usize>,
     next_cleanup_id: Cell<u64>,
     cleanups: RefCell<IdSlab<CleanupEntry>>,
-    cleanup_tasks: RefCell<VecDeque<Rc<TrackedCleanupState>>>,
     hosted_cleanups: RefCell<IdSlab<Rc<TrackedCleanupState>>>,
     hosted_tasks: Option<RefCell<TaskGroup>>,
     hosted_shutdown_started: Cell<bool>,
     hosted_aborting: Cell<bool>,
     hosted_panic: RefCell<Option<PanicPayload>>,
+    /// Woken-only cleanup polling, which keeps cleanups in `hosted_cleanups`.
+    woken: Option<WokenCleanups>,
     host: Host,
 }
 
@@ -1335,6 +1463,26 @@ struct TrackedCleanupState {
     registered: Cell<bool>,
     /// Whether `cleanups_active` counts this cleanup.
     activated: Cell<bool>,
+    /// The cleanup's own waker under woken polling, created at activation or
+    /// at its first shutdown poll.
+    woken: OnceCell<WokenHandle>,
+    #[cfg(test)]
+    poll_waker_override: OnceCell<Waker>,
+}
+
+/// Queues an activated cleanup for the next woken pass and wakes the driver.
+fn schedule_woken_cleanup(local: &OwnerState, state: &TrackedCleanupState, slot: usize) {
+    let Some(woken) = &local.woken else {
+        return;
+    };
+    if local.hosted_aborting.get() {
+        return;
+    }
+    state
+        .woken
+        .get_or_init(|| woken.handle_for(&local.shared, slot, state.id))
+        .waker
+        .wake_by_ref();
 }
 
 fn schedule_hosted_cleanup(
@@ -1721,6 +1869,7 @@ impl WorkerCleanupTaskRegistration {
         }
         if let Some(local) = self.local.upgrade() {
             schedule_hosted_cleanup(&local, &state, self.slot, &self.handle);
+            schedule_woken_cleanup(&local, &state, self.slot);
         }
         self.handle.shared.wake_driver();
         Ok(WorkerCleanupTask {
@@ -1818,6 +1967,7 @@ impl Drop for WorkerCleanupTaskRegistration {
                 }
                 if let Some(local) = self.local.upgrade() {
                     schedule_hosted_cleanup(&local, &state, self.slot, &self.handle);
+                    schedule_woken_cleanup(&local, &state, self.slot);
                 }
                 self.handle.shared.wake_driver();
             }
@@ -1879,14 +2029,17 @@ fn finish_tracked_cleanup(
     confirmed: bool,
 ) -> Option<PanicPayload> {
     *state.phase.borrow_mut() = TrackedCleanupPhase::Finished;
+    if let Some(handle) = state.woken.get() {
+        handle.node.queued.store(true, Ordering::Release);
+    }
     if let Some(local) = state.local.upgrade() {
         local.shared.poll_counters().cleanup_finished(
             state.registered.replace(false),
             state.activated.replace(false),
         );
         debug_assert!(
-            slot != NO_SLOT || local.hosted_tasks.is_none() || local.hosted_aborting.get(),
-            "a hosted cleanup finishes through its registry slot until the registry is taken"
+            slot != NO_SLOT || local.hosted_aborting.get(),
+            "a slotted cleanup finishes through its registry slot until the registry is taken"
         );
         local.hosted_cleanups.borrow_mut().remove(slot, state.id);
     }
@@ -1904,8 +2057,7 @@ fn finish_tracked_cleanup(
     first_panic
 }
 
-/// `drop_slotted_cleanup` for a cleanup that no hosted registry slot holds:
-/// an owner-polled one, or one in a registry that shutdown has taken.
+/// `drop_slotted_cleanup` for a cleanup in a registry that shutdown has taken.
 fn drop_tracked_cleanup(
     state: &Rc<TrackedCleanupState>,
     future: TrackedTask,
@@ -2040,6 +2192,8 @@ mod observer_tests {
             publisher: CleanupPublisher::new(),
             registered: Cell::new(false),
             activated: Cell::new(false),
+            woken: std::cell::OnceCell::new(),
+            poll_waker_override: std::cell::OnceCell::new(),
         });
         let observer = state.publisher.observe();
         let mut task = TrackedTask {

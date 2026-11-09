@@ -170,8 +170,8 @@ mod poll_stats {
         assert_eq!(counts(&delta), (1, 1, 1, histogram(&[(1, 1)])));
         assert!(turn(&mut driver).is_pending());
         let delta = handle.poll_stats().since(&start);
-        assert_eq!(counts(&delta), (2, 1, 2, histogram(&[(1, 2)])));
-        assert_eq!((active.polls.get(), reserved.polls.get()), (2, 0));
+        assert_eq!(counts(&delta), (2, 1, 1, histogram(&[(0, 1), (1, 1)])));
+        assert_eq!((active.polls.get(), reserved.polls.get()), (1, 0));
 
         assert_eq!(registration.disarm(), Ok(true));
         assert_eq!(gauges(&handle), (1, 1));
@@ -182,7 +182,7 @@ mod poll_stats {
         assert!(handle.begin_shutdown());
         assert!(turn(&mut driver).is_ready());
         let total = handle.poll_stats();
-        assert_eq!(counts(&total), (5, 1, 3, histogram(&[(0, 2), (1, 3)])));
+        assert_eq!(counts(&total), (5, 1, 2, histogram(&[(0, 3), (1, 2)])));
         assert_eq!(total.max_cleanup_polls_per_driver_poll, 1);
         assert_eq!(total.budget_exhausted_passes, 0);
         assert_eq!(handle.driver_poll_count(), 5);
@@ -270,9 +270,12 @@ mod poll_stats {
             driver_polls: 10,
             command_polls: 4,
             cleanup_polls: 20,
+            ready_entries: 18,
+            stale_ready_entries: 1,
             budget_exhausted_passes: 1,
             cleanup_polls_per_driver_poll: [1, 2, 3, 4, 0, 0, 0, 0],
             max_cleanup_polls_per_driver_poll: 9,
+            max_ready_batch: 8,
             cleanups_registered: 7,
             cleanups_active: 5,
         };
@@ -280,9 +283,12 @@ mod poll_stats {
             driver_polls: 15,
             command_polls: 6,
             cleanup_polls: 29,
+            ready_entries: 27,
+            stale_ready_entries: 2,
             budget_exhausted_passes: 3,
             cleanup_polls_per_driver_poll: [2, 4, 3, 5, 1, 0, 0, 0],
             max_cleanup_polls_per_driver_poll: 12,
+            max_ready_batch: 10,
             cleanups_registered: 2,
             cleanups_active: 1,
         };
@@ -292,9 +298,12 @@ mod poll_stats {
                 driver_polls: 5,
                 command_polls: 2,
                 cleanup_polls: 9,
+                ready_entries: 9,
+                stale_ready_entries: 1,
                 budget_exhausted_passes: 2,
                 cleanup_polls_per_driver_poll: [1, 2, 0, 1, 1, 0, 0, 0],
                 max_cleanup_polls_per_driver_poll: 12,
+                max_ready_batch: 10,
                 cleanups_registered: 2,
                 cleanups_active: 1,
             }
@@ -308,13 +317,67 @@ mod poll_stats {
                 driver_polls: 25,
                 command_polls: 10,
                 cleanup_polls: 49,
+                ready_entries: 45,
+                stale_ready_entries: 3,
                 budget_exhausted_passes: 4,
                 cleanup_polls_per_driver_poll: [3, 6, 6, 9, 1, 0, 0, 0],
                 max_cleanup_polls_per_driver_poll: 12,
+                max_ready_batch: 10,
                 cleanups_registered: 9,
                 cleanups_active: 6,
             }
         );
+        let hosted = WorkerPollStats {
+            cleanup_polls: 1,
+            ..WorkerPollStats::default()
+        };
+        merged.merge(&hosted);
+        assert_eq!(merged.cleanup_polls, 50);
+    }
+
+    #[test]
+    fn woken_driver_counts_only_woken_cleanup_polls_exactly() {
+        let (handle, mut driver) = WorkerDriver::new(4).expect("worker starts");
+        let context = driver.context().clone();
+        assert!(turn(&mut driver).is_pending());
+
+        let first = Probe::default();
+        let second = Probe::default();
+        let _tasks = (first.activate(&context), second.activate(&context));
+        let reserved = Probe::default();
+        let _registration = reserved.reserve(&context);
+        assert_eq!(gauges(&handle), (3, 2));
+
+        let start = handle.poll_stats();
+        handle.submit(|_| {}).expect("command admitted");
+        assert!(turn(&mut driver).is_pending());
+        let delta = handle.poll_stats().since(&start);
+        assert_eq!(counts(&delta), (1, 1, 2, histogram(&[(2, 1)])));
+        assert_eq!((delta.ready_entries, delta.stale_ready_entries), (2, 0));
+
+        let start = handle.poll_stats();
+        assert!(turn(&mut driver).is_pending());
+        first.waker.borrow().as_ref().expect("polled").wake_by_ref();
+        assert!(turn(&mut driver).is_pending());
+        let delta = handle.poll_stats().since(&start);
+        assert_eq!(counts(&delta), (2, 0, 1, histogram(&[(0, 1), (1, 1)])));
+        assert_eq!((delta.ready_entries, delta.stale_ready_entries), (1, 0));
+        assert_eq!((first.polls.get(), second.polls.get()), (2, 1));
+
+        first.finish();
+        second.finish();
+        assert!(turn(&mut driver).is_pending());
+        assert_eq!(gauges(&handle), (1, 0));
+        assert!(handle.begin_shutdown());
+        reserved.ready.set(true);
+        assert!(turn(&mut driver).is_ready());
+        let total = handle.poll_stats();
+        assert_eq!(
+            counts(&total),
+            (6, 1, 6, histogram(&[(0, 2), (1, 2), (2, 2)]))
+        );
+        assert_eq!((total.ready_entries, total.max_ready_batch), (5, 2));
+        assert_eq!(gauges(&handle), (0, 0));
     }
 
     #[test]
