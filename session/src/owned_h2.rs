@@ -37,6 +37,7 @@ use parking_lot::Mutex;
 use roxygen_codec::CodecCallbackAction;
 use roxygen_codec::CodecCallbackActions;
 use roxygen_codec::CodecEvent;
+use roxygen_codec::CodecSetting;
 use roxygen_codec::EgressFrame;
 use roxygen_codec::H2ErrorCode;
 use roxygen_codec::HttpCodec;
@@ -111,7 +112,12 @@ pub use crate::owned::OwnedApplication as OwnedH2Application;
 use crate::owned::OwnedApplication;
 pub use crate::owned::OwnedExchange as OwnedH2Exchange;
 use crate::owned::OwnedExchange;
+use crate::session::LifecycleEvent;
+use crate::session::LifecycleObserver;
+use crate::session::LifecycleObserverId;
+use crate::shutdown::DrainTrigger;
 use crate::uniplex::UniplexConfig;
+use crate::uniplex::UniplexLifecycleDispatcher;
 use crate::uniplex::UniplexRead;
 use crate::uniplex::UniplexRunSummary;
 use crate::uniplex::UniplexTransport;
@@ -390,6 +396,9 @@ struct Control {
     /// Streams whose request source completed without error while quiescent.
     early_completed: RefCell<Vec<StreamId>>,
     folds_pending: Cell<bool>,
+    /// The connection send window's last transition, `Some(true)` when it opened, which a
+    /// lifecycle observer receives as `Http2FlowWindowOpen` or `Http2FlowWindowClosed`.
+    window_transition: Cell<Option<bool>>,
 }
 
 impl Control {
@@ -436,14 +445,106 @@ impl OwnedH2Handle {
     }
 }
 
-struct ConnectionWindowWake(Arc<ReadyQueue>);
+struct ConnectionWindowWake(Rc<Control>);
 
 impl ConnectionFlowControlCallback for ConnectionWindowWake {
     fn on_connection_send_window_open(&self) {
-        self.0.wake();
+        self.0.window_transition.set(Some(true));
+        self.0.ready.wake();
     }
 
-    fn on_connection_send_window_closed(&self) {}
+    fn on_connection_send_window_closed(&self) {
+        self.0.window_transition.set(Some(false));
+    }
+}
+
+/// Opt-in lifecycle observation of a downstream session (`DIV-051`), present only once an
+/// observer was added. Events queue in the dispatcher, which delivers them at the end of each
+/// poll and at teardown.
+struct Observation {
+    lifecycle: Rc<UniplexLifecycleDispatcher>,
+    /// Only the first drain is reported, as `SessionCore` reports only the first.
+    drain_started: bool,
+    /// `Http2SessionConfig::max_concurrent_outgoing_streams`, which caps the peer's
+    /// `MAX_CONCURRENT_STREAMS` in the outgoing capacity that `Http2StreamsFull` reports.
+    max_outgoing: u32,
+}
+
+impl Observation {
+    #[cold]
+    #[inline(never)]
+    fn push(&self, event: LifecycleEvent) {
+        self.lifecycle.on_event(event);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn drain(&mut self, trigger: DrainTrigger) {
+        if !std::mem::replace(&mut self.drain_started, true) {
+            self.push(LifecycleEvent::DrainStarted(trigger));
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn opened(&self, stream: StreamId, first: bool) {
+        self.push(LifecycleEvent::RequestBegin {
+            stream,
+            sequence_number: stream.get() / 2,
+        });
+        if first {
+            self.push(LifecycleEvent::ActivateConnection);
+        }
+        self.push(LifecycleEvent::TransactionAttached);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn retired(&self, stream: StreamId, last: bool) {
+        self.push(LifecycleEvent::TransactionDetached {
+            stream: Some(stream),
+        });
+        if last {
+            self.push(LifecycleEvent::DeactivateConnection);
+        }
+    }
+
+    /// Reports a peer SETTINGS frame as `UniplexSession` does: its size, each entry, and each
+    /// change in whether the peer's `MAX_CONCURRENT_STREAMS` leaves room for an outgoing
+    /// stream.
+    #[cold]
+    #[inline(never)]
+    fn settings(&self, settings: &[CodecSetting], mut peer_maximum: u32, draining: bool) {
+        self.push(LifecycleEvent::Http2Settings {
+            count: settings.len(),
+        });
+        let available = |maximum: u32| !draining && maximum.min(self.max_outgoing) != 0;
+        for setting in settings {
+            self.push(LifecycleEvent::Http2Setting { setting: *setting });
+            if let PeerSetting::MaxConcurrentStreams(maximum) = PeerSetting::from(*setting) {
+                let was_available = available(peer_maximum);
+                peer_maximum = maximum;
+                if was_available != available(maximum) {
+                    self.push(if available(maximum) {
+                        LifecycleEvent::Http2StreamsNotFull
+                    } else {
+                        LifecycleEvent::Http2StreamsFull
+                    });
+                }
+            }
+        }
+    }
+
+    /// Reports the connection send window's last transition since the previous report.
+    fn window_transition(&self, control: &Control) {
+        if let Some(open) = control.window_transition.take() {
+            self.push(if open {
+                LifecycleEvent::Http2FlowWindowOpen
+            } else {
+                LifecycleEvent::Http2FlowWindowClosed
+            });
+        }
+    }
 }
 
 enum PendingEgress {
@@ -753,6 +854,9 @@ struct Failure {
     wire_code: Option<H2ErrorCode>,
     direction: HttpExceptionDirection,
     new_stream: bool,
+    /// Set by `CodecInput::fail`: parsing ingress found the failure, which a lifecycle
+    /// observer receives as `Http2IngressError`.
+    ingress: bool,
 }
 
 impl Failure {
@@ -764,6 +868,7 @@ impl Failure {
             wire_code: None,
             direction: HttpExceptionDirection::IngressAndEgress,
             new_stream: false,
+            ingress: false,
         }
     }
 }
@@ -933,6 +1038,9 @@ where
                 // Every step a session test drives ends with a pending poll.
                 #[cfg(test)]
                 driver.debug_assert_stream_counts();
+                if driver.connection.state.observation.is_some() {
+                    driver.flush_observation(context);
+                }
                 Poll::Pending
             }
             Ok(Poll::Ready(result)) => {
@@ -1015,6 +1123,7 @@ struct ConnectionState {
     draining: bool,
     ingress_grace: bool,
     summary: UniplexRunSummary,
+    observation: Option<Box<Observation>>,
 }
 
 struct DriverFailure {
@@ -1119,6 +1228,16 @@ fn push_connection_failure(failures: &mut VecDeque<Failure>, error: HttpError) {
     failures.push_back(Failure::new(StreamId::UNSPECIFIED, error));
 }
 
+/// A refused or rejected stream's head is reported as `UniplexSession` reports it: as an
+/// ingress message, unless it has a forbidden body.
+#[cold]
+#[inline(never)]
+fn observe_rejected_head(observation: &Observation, stream: StreamId, message: &mut HttpMessage) {
+    if !crate::uniplex::request_has_forbidden_body(message) {
+        observation.push(LifecycleEvent::Http2IngressMessage { stream });
+    }
+}
+
 const fn transport_direction<const UPSTREAM: bool>() -> TransportDirection {
     if UPSTREAM {
         TransportDirection::Upstream
@@ -1174,6 +1293,37 @@ impl<A: OwnedApplication> OwnedH2Session<A> {
     /// Runs inside the caller's registered worker cleanup scope.
     pub fn run(self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
         self.0.run()
+    }
+
+    /// Adds an owner-local lifecycle observer, as `UniplexSession::add_lifecycle_observer`
+    /// does (`DIV-051`). Its `on_attached` runs before this returns. The run delivers events
+    /// at the end of each poll, and `Destroy` when it completes; a session dropped unrun
+    /// delivers only `Destroy`. A session without observers queues nothing.
+    pub fn add_lifecycle_observer(
+        &mut self,
+        observer: Rc<dyn LifecycleObserver>,
+    ) -> Result<LifecycleObserverId, HttpError> {
+        let driver = &mut self.0;
+        let lifecycle = match &driver.connection.state.observation {
+            Some(observation) => Rc::clone(&observation.lifecycle),
+            None => {
+                let lifecycle = Rc::new(UniplexLifecycleDispatcher::new(None));
+                driver.connection.state.control.window_transition.set(None);
+                driver.connection.state.observation = Some(Box::new(Observation {
+                    lifecycle: Rc::clone(&lifecycle),
+                    drain_started: false,
+                    max_outgoing: driver.h2.max_concurrent_outgoing_streams,
+                }));
+                lifecycle
+            }
+        };
+        Ok(lifecycle.add_observer(observer))
+    }
+
+    /// Whether the session observes its lifecycle.
+    #[cfg(test)]
+    pub(crate) fn observed(&self) -> bool {
+        self.0.connection.state.observation.is_some()
     }
 }
 
@@ -1291,6 +1441,7 @@ where
             early_credit: Cell::new(0),
             early_completed: RefCell::new(Vec::new()),
             folds_pending: Cell::new(false),
+            window_transition: Cell::new(None),
         });
         let mut egress = BufQueue::new(io.buffer_limit);
         let mut codec = Http2Codec::new(transport_direction::<UPSTREAM>());
@@ -1323,7 +1474,7 @@ where
         codec.generate_configured_settings(&mut egress, &mut NoopCallback)?;
         let codec = FlowControlledCodec::new(
             Box::new(codec),
-            Rc::new(ConnectionWindowWake(Arc::clone(&control.ready))),
+            Rc::new(ConnectionWindowWake(Rc::clone(&control))),
             &mut egress,
             &mut NoopCallback,
             http2.connection_receive_window,
@@ -1367,6 +1518,7 @@ where
                         draining: false,
                         ingress_grace: false,
                         summary: UniplexRunSummary::default(),
+                        observation: None,
                     },
                 },
                 streams: StreamTable::with_hasher(stream_hash_state()),
@@ -1425,6 +1577,43 @@ where
         context.waker().wake_by_ref();
     }
 
+    /// Delivers the queued lifecycle events. An observer panic aborts the connection as a
+    /// callback panic does.
+    #[cold]
+    #[inline(never)]
+    fn flush_observation(&mut self, context: &Context<'_>) {
+        let Some(observation) = self.connection.state.observation.as_deref() else {
+            return;
+        };
+        observation.window_transition(&self.connection.state.control);
+        let lifecycle = Rc::clone(&observation.lifecycle);
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| lifecycle.flush())) {
+            self.poll_panicked(panic, context);
+        }
+    }
+
+    /// Reports the end of the session once: detaches the streams it still holds, then
+    /// `Destroy`, delivers everything queued and drops the observers. Panics are retained.
+    #[cold]
+    #[inline(never)]
+    fn observe_destroy(&mut self) {
+        let Some(observation) = self.connection.state.observation.take() else {
+            return;
+        };
+        observation.window_transition(&self.connection.state.control);
+        let remaining = self.streams.ids_in_order();
+        for id in &remaining {
+            observation.push(LifecycleEvent::TransactionDetached { stream: Some(*id) });
+        }
+        if !remaining.is_empty() {
+            observation.push(LifecycleEvent::DeactivateConnection);
+        }
+        observation.push(LifecycleEvent::Destroy);
+        let lifecycle = &observation.lifecycle;
+        capture(&mut self.failure.panic, || lifecycle.flush());
+        capture(&mut self.failure.panic, || lifecycle.clear());
+    }
+
     #[cold]
     #[inline(never)]
     fn finish_run(
@@ -1439,6 +1628,7 @@ where
                 ))
             });
         }
+        self.observe_destroy();
         self.connection.state.control.complete.set(true);
         if let Some(panic) = self.failure.panic.take() {
             resume_unwind(panic);
@@ -1531,7 +1721,7 @@ where
             {
                 match self.parse_input() {
                     Ok(consumed) => progress |= consumed,
-                    Err(error) => self.fail_connection(error),
+                    Err(error) => self.parse_failed(error),
                 }
                 ran = true;
             }
@@ -1745,6 +1935,9 @@ where
         if UPSTREAM {
             self.sent_initial_goaway = true;
         }
+        if let Some(observation) = self.connection.state.observation.as_deref_mut() {
+            observation.drain(DrainTrigger::Local);
+        }
         if let Err(error) = self.generate_goaway(H2ErrorCode::NO_ERROR) {
             self.abort(error);
         }
@@ -1764,6 +1957,18 @@ where
         {
             self.abort(error);
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn parse_failed(&mut self, error: HttpError) {
+        if let Some(observation) = self.connection.state.observation.as_deref() {
+            observation.push(LifecycleEvent::Http2IngressError {
+                stream: StreamId::UNSPECIFIED,
+                code: error.code(),
+            });
+        }
+        self.fail_connection(error);
     }
 
     #[cold]
@@ -1794,6 +1999,9 @@ where
     #[cold]
     #[inline(never)]
     fn close_idle(&mut self) -> Option<Result<UniplexRunSummary, HttpError>> {
+        if let Some(observation) = self.connection.state.observation.as_deref_mut() {
+            observation.drain(DrainTrigger::CloseWhenIdle);
+        }
         if self.cancellation.request_cancellation() {
             self.read_wake.ready.store(true, Ordering::Release);
         }
@@ -1883,6 +2091,12 @@ where
         self.read.take();
         match result {
             Ok(read) => {
+                if let Some(observation) = self.connection.state.observation.as_deref() {
+                    observation.push(LifecycleEvent::Http2Read {
+                        bytes: read.bytes_read(),
+                        stream: None,
+                    });
+                }
                 self.connection.state.summary.bytes_read = self
                     .connection
                     .state
@@ -2058,7 +2272,11 @@ where
                         HttpErrorCode::TRANSPORT_WRITE_ERROR,
                         b"transport reported a short successful write",
                     )),
-                Ok(_) => {}
+                Ok(_) => {
+                    if let Some(observation) = self.connection.state.observation.as_deref() {
+                        observation.push(LifecycleEvent::Http2Write { bytes });
+                    }
+                }
             }
         }
         self.retire_write_fences();
@@ -2121,7 +2339,11 @@ where
                 observed => retain_observer_failure(&mut failed, observed),
             }
             match completion.result {
-                Ok(_) if bytes == completion.requested_bytes => {}
+                Ok(_) if bytes == completion.requested_bytes => {
+                    if let Some(observation) = self.connection.state.observation.as_deref() {
+                        observation.push(LifecycleEvent::Http2Write { bytes });
+                    }
+                }
                 result => retain_write_failure(&mut failed, result),
             }
             if self.cancelled() {
@@ -2205,7 +2427,8 @@ where
     const OBSERVES_FRAME_HEADERS: bool = false;
 
     #[cold]
-    fn fail(&mut self, failure: Failure) {
+    fn fail(&mut self, mut failure: Failure) {
+        failure.ingress = true;
         if failure.status.is_some()
             && let Some(owner) = self.streams.get_mut(&failure.stream)
         {
@@ -2378,6 +2601,8 @@ where
                     }));
                 } else if let Err(error) = self.new_stream(stream) {
                     self.fail(Failure::new(stream, error));
+                } else if let Some(observation) = self.state.observation.as_deref() {
+                    observation.opened(stream, self.streams.len() == 1);
                 }
             }
             CodecEvent::HeadersComplete {
@@ -2388,10 +2613,16 @@ where
                 // unknown one: its DATA returns credit, and its trailers, END_STREAM and codec
                 // errors are ignored.
                 if self.state.discarded.remove(&stream).is_some() {
+                    if let Some(observation) = self.state.observation.as_deref() {
+                        observe_rejected_head(observation, stream, &mut message);
+                    }
                     return actions.into();
                 }
                 let owner = self.streams.get_mut(&stream);
                 if owner.as_ref().is_some_and(|owner| owner.ingress_rejected) {
+                    if let Some(observation) = self.state.observation.as_deref() {
+                        observe_rejected_head(observation, stream, &mut message);
+                    }
                     return actions.into();
                 }
                 if UPSTREAM {
@@ -2423,8 +2654,12 @@ where
                         wire_code: None,
                         direction: HttpExceptionDirection::Ingress,
                         new_stream: true,
+                        ingress: false,
                     });
                     return actions.into();
+                }
+                if let Some(observation) = self.state.observation.as_deref() {
+                    observation.push(LifecycleEvent::Http2IngressMessage { stream });
                 }
                 let Some(owner) = owner else {
                     return actions.into();
@@ -2458,6 +2693,7 @@ where
                         wire_code: None,
                         direction: HttpExceptionDirection::Ingress,
                         new_stream: true,
+                        ingress: false,
                     });
                     return actions.into();
                 }
@@ -2574,6 +2810,7 @@ where
                             wire_code: Some(H2ErrorCode::INTERNAL_ERROR),
                             direction: HttpExceptionDirection::Ingress,
                             new_stream: false,
+                            ingress: false,
                         });
                     }
                 }
@@ -2604,6 +2841,7 @@ where
                     wire_code: error.codec_status_code(),
                     direction: error.direction(),
                     new_stream,
+                    ingress: false,
                 });
             }
             CodecEvent::Abort { stream, code } => {
@@ -2613,6 +2851,9 @@ where
                 } else {
                     code
                 };
+                if let Some(observation) = self.state.observation.as_deref() {
+                    observation.push(LifecycleEvent::PeerReset { stream, code });
+                }
                 if let Some(owner) = self.streams.get_mut(&stream) {
                     owner.ingress_rejected = true;
                     owner.signals.close_protocol();
@@ -2660,6 +2901,13 @@ where
                 }
             }
             CodecEvent::Settings { settings } => {
+                if let Some(observation) = self.state.observation.as_deref() {
+                    observation.settings(
+                        &settings,
+                        self.state.peer_maximum_streams,
+                        self.state.draining,
+                    );
+                }
                 for setting in settings.iter() {
                     match PeerSetting::from(*setting) {
                         PeerSetting::MaxConcurrentStreams(maximum) => {
@@ -2702,12 +2950,24 @@ where
                 code,
                 ..
             } => {
+                if let Some(observation) = self.state.observation.as_deref() {
+                    observation.push(LifecycleEvent::Http2Goaway {
+                        last_good_stream,
+                        code: h2_error_code_to_http_error_code(code),
+                    });
+                }
                 for id in self.streams.ids_in_order() {
                     if protocol::peer_goaway_refuses(
                         id,
                         last_good_stream,
                         transport_direction::<UPSTREAM>(),
                     ) {
+                        if let Some(observation) = self.state.observation.as_deref() {
+                            observation.push(LifecycleEvent::PeerReset {
+                                stream: id,
+                                code: HttpErrorCode::REFUSED_STREAM,
+                            });
+                        }
                         let owner = self
                             .streams
                             .get_mut(&id)
@@ -2746,6 +3006,9 @@ where
                 } else if !self.state.draining {
                     self.state.draining = true;
                     self.state.ingress_grace = false;
+                    if let Some(observation) = self.state.observation.as_deref_mut() {
+                        observation.drain(DrainTrigger::PeerGoaway);
+                    }
                     actions.push(CodecCallbackAction::Generate(OwnedEgressFrame::Goaway {
                         last_stream: StreamId::MAX,
                         code: H2ErrorCode::NO_ERROR,
@@ -2755,13 +3018,26 @@ where
                 }
             }
             CodecEvent::PingRequest { data } => {
+                if let Some(observation) = self.state.observation.as_deref() {
+                    observation.push(LifecycleEvent::Http2PingReplySent {
+                        latency: Duration::ZERO,
+                    });
+                }
                 actions.push(CodecCallbackAction::Generate(OwnedEgressFrame::PingReply {
                     data,
                 }))
             }
+            CodecEvent::SettingsAck => {
+                if let Some(observation) = self.state.observation.as_deref() {
+                    observation.push(LifecycleEvent::Http2SettingsAck);
+                }
+            }
+            CodecEvent::PingReply { .. } => {
+                if let Some(observation) = self.state.observation.as_deref() {
+                    observation.push(LifecycleEvent::Http2PingReplyReceived);
+                }
+            }
             CodecEvent::FrameHeader { .. }
-            | CodecEvent::SettingsAck
-            | CodecEvent::PingReply { .. }
             | CodecEvent::Priority { .. }
             | CodecEvent::PushPriority { .. }
             | CodecEvent::GeneratedFrameHeader { .. }
@@ -2827,6 +3103,9 @@ where
             self.eof && !self.eof_processed && (consumed == input.chain_length() || consumed == 0);
         if finishing_eof {
             self.eof_processed = true;
+            if let Some(observation) = callback.state.observation.as_deref() {
+                observation.push(LifecycleEvent::Http2IngressEof);
+            }
             let result = self
                 .connection
                 .codec
@@ -2879,9 +3158,21 @@ where
         for result in egress_results {
             result?;
         }
+        let mut ingress_error_reported = false;
         while self.failure.fatal.is_none()
             && let Some(problem) = self.failure.failures.pop_front()
         {
+            if problem.ingress
+                && !ingress_error_reported
+                && let Some(observation) = self.connection.state.observation.as_deref()
+            {
+                // `UniplexSession` reports one codec failure per parse.
+                ingress_error_reported = true;
+                observation.push(LifecycleEvent::Http2IngressError {
+                    stream: problem.stream,
+                    code: problem.error.code(),
+                });
+            }
             self.handle_failure(problem);
             self.check_cancel();
         }
@@ -2899,6 +3190,7 @@ where
                     wire_code: None,
                     direction: HttpExceptionDirection::Ingress,
                     new_stream: false,
+                    ingress: false,
                 });
                 self.check_cancel();
                 if self.failure.fatal.is_some() {
@@ -3000,6 +3292,9 @@ where
                 });
             }
             capture(&mut self.failure.panic, || drop(stream));
+            if let Some(observation) = self.connection.state.observation.as_deref() {
+                observation.retired(id, self.streams.is_empty());
+            }
         }
         if serialized.is_none() && self.failure.panic.is_some() && self.failure.fatal.is_none() {
             self.abort_retirement_panic();
@@ -3523,6 +3818,9 @@ where
             return;
         }
         self.failure.fatal = Some(error.clone());
+        if let Some(observation) = self.connection.state.observation.as_deref_mut() {
+            observation.drain(DrainTrigger::ConnectionError);
+        }
         if let Some(admission) = &self.connection.state.control.upstream {
             capture(&mut self.failure.panic, || admission.close(error.clone()));
         }
@@ -3551,6 +3849,9 @@ where
     fn abort(&mut self, error: HttpError) {
         if self.failure.fatal.is_none() {
             self.failure.fatal = Some(error.clone());
+            if let Some(observation) = self.connection.state.observation.as_deref_mut() {
+                observation.drain(DrainTrigger::ConnectionError);
+            }
         }
         if let Some(admission) = &self.connection.state.control.upstream {
             capture(&mut self.failure.panic, || admission.close(error.clone()));
@@ -3926,6 +4227,9 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
                     .as_mut()
                     .expect("application remains owned"),
             );
+            if let Some(observation) = self.connection.state.observation.as_deref() {
+                observation.push(LifecycleEvent::RequestEnd { stream: id });
+            }
             if self.cancelled() {
                 return Err(completion_cancelled(&mut registrations));
             }
@@ -4048,6 +4352,7 @@ where
 {
     fn drop(&mut self) {
         if !self.connection.state.control.complete.get() {
+            self.observe_destroy();
             self.abort(failure(
                 HttpErrorCode::CORO_CANCELLED,
                 b"owned H2 runner abandoned before cleanup completed",

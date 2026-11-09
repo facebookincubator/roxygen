@@ -1351,6 +1351,238 @@ fn owned_drain_finishes_within_the_tls_handshake_timeout() {
     );
 }
 
+/// A client HTTP/2 preface and an empty SETTINGS frame, which open a connection without a
+/// request.
+const H2_PREFACE_AND_SETTINGS: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0";
+
+/// Opens a plaintext HTTP/2 connection that sends no request and holds it open.
+fn idle_h2_connection(address: SocketAddr) -> TcpStream {
+    let mut stream = TcpStream::connect_timeout(&address, REQUEST_TIMEOUT).unwrap();
+    stream.set_read_timeout(Some(REQUEST_TIMEOUT)).unwrap();
+    stream.write_all(H2_PREFACE_AND_SETTINGS).unwrap();
+    stream
+}
+
+/// Waits up to `REQUEST_TIMEOUT` for `condition`.
+fn wait_until(condition: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    while !condition() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
+/// Counts of an API-Proxy-shaped open-connection gauge: up when its observer attaches, down at
+/// `Destroy`.
+#[derive(Default)]
+struct GaugeCounts {
+    open: AtomicUsize,
+    attached: AtomicUsize,
+    requests: AtomicUsize,
+    destroyed: AtomicUsize,
+    alive: AtomicUsize,
+}
+
+struct ConnectionGauge(Arc<GaugeCounts>);
+
+impl ConnectionGauge {
+    fn new(counts: &Arc<GaugeCounts>) -> Self {
+        counts.alive.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(counts))
+    }
+}
+
+impl LifecycleObserver for ConnectionGauge {
+    fn on_attached(&self) {
+        self.0.attached.fetch_add(1, Ordering::Relaxed);
+        self.0.open.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn on_event(&self, event: LifecycleEvent) {
+        match event {
+            LifecycleEvent::RequestBegin { .. } => {
+                self.0.requests.fetch_add(1, Ordering::Relaxed);
+            }
+            LifecycleEvent::Destroy => {
+                self.0.destroyed.fetch_add(1, Ordering::Relaxed);
+                self.0.open.fetch_sub(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Drop for ConnectionGauge {
+    fn drop(&mut self) {
+        self.0.alive.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn owned_http2_gauge_config(counts: &Arc<GaugeCounts>) -> ServerConfig {
+    let mut session = untimed_owned_session(false, true);
+    let counts = Arc::clone(counts);
+    session.lifecycle_observer_factory = Some(Arc::new(move || {
+        Rc::new(ConnectionGauge::new(&counts)) as Rc<dyn LifecycleObserver>
+    }));
+    ServerConfig {
+        plaintext_protocol: CodecProtocol::Http2,
+        session,
+        num_io_threads: 1,
+        shutdown_on_signals: Vec::new(),
+        ..ServerConfig::default()
+    }
+}
+
+#[test]
+fn owned_http2_lifecycle_observer_lives_as_long_as_the_connection() {
+    let counts = Arc::new(GaugeCounts::default());
+    let stats = Arc::new(HandlerStats::default());
+    let server = start_plain(owned_http2_gauge_config(&counts), Arc::clone(&stats));
+    let address = server.address().unwrap();
+    let idle = idle_h2_connection(address);
+    assert!(wait_until(|| counts.attached.load(Ordering::Relaxed) == 1));
+    assert_eq!(h2_plain_request(address), b"OK");
+    assert!(
+        wait_until(|| counts.destroyed.load(Ordering::Relaxed) == 1),
+        "the served connection reports Destroy when it closes"
+    );
+    assert_eq!(counts.attached.load(Ordering::Relaxed), 2);
+    assert_eq!(counts.requests.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        counts.open.load(Ordering::Relaxed),
+        1,
+        "the idle connection stays counted while it is open"
+    );
+    assert_eq!(counts.alive.load(Ordering::Relaxed), 1);
+    drop(idle);
+    assert!(
+        wait_until(|| counts.open.load(Ordering::Relaxed) == 0),
+        "the idle connection reports Destroy at its peer's EOF"
+    );
+    assert!(wait_until(|| counts.alive.load(Ordering::Relaxed) == 0));
+    assert_eq!(counts.destroyed.load(Ordering::Relaxed), 2);
+    assert_eq!(stats.requests.load(Ordering::Relaxed), 1);
+    server.force_stop().unwrap();
+}
+
+#[test]
+fn owned_http2_late_rejection_reports_destroy() {
+    struct CloseOnAttach {
+        worker: WorkerHandle,
+        events: Arc<Mutex<Vec<LifecycleEvent>>>,
+        alive: Arc<AtomicUsize>,
+    }
+    impl LifecycleObserver for CloseOnAttach {
+        fn on_attached(&self) {
+            self.worker.begin_shutdown();
+        }
+        fn on_event(&self, event: LifecycleEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+    impl Drop for CloseOnAttach {
+        fn drop(&mut self) {
+            self.alive.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    let observer = Arc::new(RegistrationObserver::default());
+    let stats = Arc::new(HandlerStats::default());
+    let worker = Arc::new(Mutex::new(None::<WorkerHandle>));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let alive = Arc::new(AtomicUsize::new(0));
+    let mut session = untimed_owned_session(false, true);
+    session.lifecycle_observer_factory = Some(Arc::new({
+        let worker = Arc::clone(&worker);
+        let events = Arc::clone(&events);
+        let alive = Arc::clone(&alive);
+        move || {
+            alive.fetch_add(1, Ordering::Relaxed);
+            Rc::new(CloseOnAttach {
+                worker: worker.lock().unwrap().clone().unwrap(),
+                events: Arc::clone(&events),
+                alive: Arc::clone(&alive),
+            })
+        }
+    }));
+    let config = ServerConfig {
+        plaintext_protocol: CodecProtocol::Http2,
+        session,
+        connection_observer: Some(observer.clone()),
+        num_io_threads: 1,
+        shutdown_on_signals: Vec::new(),
+        ..ServerConfig::default()
+    };
+    let handler_stats = Arc::clone(&stats);
+    let server = HttpServer::start_with_worker_factory(
+        config,
+        Arc::new(move |context, _| {
+            *worker.lock().unwrap() = Some(context.handle().clone());
+            Rc::new(TestHandler {
+                stats: Arc::clone(&handler_stats),
+                fail: false,
+                response_body: Bytes::from_static(b"OK"),
+            })
+        }),
+        None,
+    )
+    .unwrap();
+    let mut client = idle_h2_connection(server.address().unwrap());
+    let _ = client.read_to_end(&mut Vec::new());
+    server.force_stop().unwrap();
+    assert_eq!(observer.accepted.load(Ordering::Relaxed), 1);
+    assert_eq!(observer.registered.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.requests.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        [LifecycleEvent::Destroy],
+        "a session rejected after construction reports only its destruction"
+    );
+    assert_eq!(alive.load(Ordering::Relaxed), 0, "the observer is released");
+}
+
+#[test]
+fn owned_http2_factory_panic_is_contained() {
+    let counts = Arc::new(GaugeCounts::default());
+    let mut config = owned_http2_gauge_config(&counts);
+    let panicked = Arc::new(AtomicBool::new(false));
+    config.session.lifecycle_observer_factory = Some(Arc::new({
+        let counts = Arc::clone(&counts);
+        let panicked = Arc::clone(&panicked);
+        move || {
+            if !panicked.swap(true, Ordering::Relaxed) {
+                panic!("lifecycle observer factory");
+            }
+            Rc::new(ConnectionGauge::new(&counts)) as Rc<dyn LifecycleObserver>
+        }
+    }));
+    let stats = Arc::new(HandlerStats::default());
+    let server = start_plain(config, Arc::clone(&stats));
+    let address = server.address().unwrap();
+    let mut refused = idle_h2_connection(address);
+    let _ = refused.read_to_end(&mut Vec::new());
+    assert!(panicked.load(Ordering::Relaxed));
+    assert_eq!(server.state(), HttpServerState::Running);
+    assert_eq!(
+        h2_plain_request(address),
+        b"OK",
+        "the worker keeps serving after the factory panics"
+    );
+    assert!(wait_until(|| counts.destroyed.load(Ordering::Relaxed) == 1));
+    assert_eq!(counts.attached.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.requests.load(Ordering::Relaxed), 1);
+    assert!(matches!(
+        server.force_stop(),
+        Err(HttpServerError::CallbackPanic {
+            worker_index: 0,
+            stage: ServerCallbackStage::LifecycleObserverFactory,
+        })
+    ));
+}
+
 #[test]
 fn tls_accept_success_precedes_connection_rejection() {
     let (options, certificate) = generated_tls();

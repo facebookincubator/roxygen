@@ -147,10 +147,13 @@ pub struct ServerSessionConfig {
     /// request. HTTP/1.1 connections are unchanged. The owned mode is untimed,
     /// unbounded-rate and stat-less: `stream_read_timeout`, `connection_idle_timeout`
     /// and `write_timeout` must be zero (which also leaves HTTP/1.1 sessions untimed).
-    /// TLS handshakes keep their independent timeout. `stats_factory` and
-    /// `lifecycle_observer_factory` must be `None`. Server construction refuses
-    /// anything else with the reason, as `HttpServerError::InvalidConfig` (or, for
-    /// `serve_transport`, `INVALID_STATE_TRANSITION`). The driver requires the configured
+    /// TLS handshakes keep their independent timeout. `stats_factory`
+    /// must be `None`. Server construction refuses anything else with the reason, as
+    /// `HttpServerError::InvalidConfig` (or, for `serve_transport`,
+    /// `INVALID_STATE_TRANSITION`). A `lifecycle_observer_factory` observer sees the
+    /// connection's lifecycle as under `UniplexSession`, with the differences recorded in
+    /// `DIV-051`: among them, events arrive at the end of each driver poll, and a stream
+    /// detaches when it retires. The driver requires the configured
     /// stream receive window to equal the advertised `INITIAL_WINDOW_SIZE`; the acceptor
     /// aligns the two (see `owned_http2_session_config`).
     pub owned_http2: bool,
@@ -243,9 +246,6 @@ impl ServerSessionConfig {
         }
         if self.stats_factory.is_some() {
             return Err("owned_http2 does not support stats_factory");
-        }
-        if self.lifecycle_observer_factory.is_some() {
-            return Err("owned_http2 does not support lifecycle_observer_factory");
         }
         if !self.stream_read_timeout.is_zero() {
             return Err("owned_http2 is untimed: stream_read_timeout must be zero");
@@ -679,7 +679,7 @@ pub(crate) fn attach_session(
             drain_request_body_on_drop: true,
             ..uniplex
         };
-        let (session, handle, finished) = OwnedHttp2Session::new(
+        let (mut session, handle, finished) = OwnedHttp2Session::new(
             context,
             Rc::clone(&transport),
             handler,
@@ -687,6 +687,15 @@ pub(crate) fn attach_session(
             io,
             owned_http2_session_config(&config.session),
         )?;
+        if let Some(factory) = config.session.lifecycle_observer_factory.as_ref() {
+            let observer = invoke_accept_callback(
+                callback_failure,
+                worker_index,
+                ServerCallbackStage::LifecycleObserverFactory,
+                || factory(),
+            )?;
+            session.add_lifecycle_observer(observer)?;
+        }
         return admit_session(
             context,
             draining,

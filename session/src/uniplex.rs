@@ -854,7 +854,7 @@ pub(crate) struct UniplexLifecycleDispatcher {
 }
 
 impl UniplexLifecycleDispatcher {
-    fn new(ping_prober: Option<Rc<PingProber>>) -> Self {
+    pub(crate) fn new(ping_prober: Option<Rc<PingProber>>) -> Self {
         Self {
             next_id: Cell::new(1),
             observers: LifecycleObservers::default(),
@@ -893,7 +893,7 @@ impl UniplexLifecycleDispatcher {
         self.observers.remove(id)
     }
 
-    fn flush(&self) {
+    pub(crate) fn flush(&self) {
         if self.dispatching.replace(true) {
             return;
         }
@@ -922,7 +922,7 @@ impl UniplexLifecycleDispatcher {
         }
     }
 
-    fn clear(&self) {
+    pub(crate) fn clear(&self) {
         self.pending.borrow_mut().clear();
         let observers = self.observers.take();
         drop_items_individually(observers.into_iter().map(|(_, observer)| observer));

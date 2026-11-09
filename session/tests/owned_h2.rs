@@ -11397,3 +11397,769 @@ fn drain_close_polls_the_read_again_after_cancelling_it() {
         })
     });
 }
+
+/// Runs one downstream connection fed `input` then EOF, observed by a recording probe, each of
+/// `requests` requests answered with an empty 200. Returns the events and the run's outcome.
+async fn owned_lifecycle(
+    context: WorkerContext,
+    input: Vec<u8>,
+    requests: usize,
+) -> (Vec<LifecycleEvent>, Result<(), HttpErrorCode>) {
+    let (transport, _) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+    let (application, _) = Application::new(vec![Reply::Body(0); requests]);
+    let (mut session, _) = OwnedH2Session::new(application, options(context, transport)).unwrap();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    session
+        .add_lifecycle_observer(Rc::new(LifecycleProbe {
+            events: Rc::clone(&events),
+        }))
+        .unwrap();
+    let run = tokio::time::timeout(Duration::from_secs(5), session.run())
+        .await
+        .expect("the observed connection finishes at EOF");
+    (events.take(), run.map(drop).map_err(|error| error.code()))
+}
+
+/// The same connection under `UniplexSession` with its default configuration.
+async fn uniplex_lifecycle(
+    context: WorkerContext,
+    input: Vec<u8>,
+) -> (Vec<LifecycleEvent>, Result<(), HttpErrorCode>) {
+    let (transport, _) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+    let handler: Rc<dyn HttpHandler> = Rc::new(FixtureHandler {
+        status: 200,
+        response_body: 0,
+        response_error: None,
+        invocations: Rc::new(Cell::new(0)),
+        request_body: Rc::new(Cell::new(0)),
+    });
+    let (session, _) = UniplexSession::new_http2(
+        context,
+        TransportDirection::Downstream,
+        transport,
+        Some(handler),
+        UniplexConfig::default(),
+        Http2SessionConfig::default(),
+    )
+    .unwrap();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    session
+        .add_lifecycle_observer(Rc::new(LifecycleProbe {
+            events: Rc::clone(&events),
+        }))
+        .unwrap();
+    let run = tokio::time::timeout(Duration::from_secs(5), session.run())
+        .await
+        .expect("the observed connection finishes at EOF");
+    (events.take(), run.map(drop).map_err(|error| error.code()))
+}
+
+#[test]
+fn owned_h2_lifecycle_order_matches_uniplex_get() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let input_length = input.len();
+            let (transport, transport_state) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+            let (application, _probes) = Application::new(vec![Reply::Body(0)]);
+            let (mut session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let observer = Rc::new(RegisteredLifecycleProbe::new(Rc::clone(&events)));
+            session.add_lifecycle_observer(observer.clone()).unwrap();
+            assert_eq!(
+                observer.attached.get(),
+                1,
+                "attachment runs at registration"
+            );
+            tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .unwrap()
+                .expect("session completes");
+            let events = events.borrow();
+            let read = event_position(
+                &events,
+                |event| {
+                    *event
+                        == LifecycleEvent::Http2Read {
+                            bytes: input_length,
+                            stream: None,
+                        }
+                },
+                "HTTP/2 transport read",
+            );
+            let settings = event_position(
+                &events,
+                |event| matches!(event, LifecycleEvent::Http2Settings { .. }),
+                "HTTP/2 settings",
+            );
+            let request_begin = event_position(
+                &events,
+                |event| {
+                    *event
+                        == LifecycleEvent::RequestBegin {
+                            stream: StreamId::new(1),
+                            sequence_number: 0,
+                        }
+                },
+                "request begin",
+            );
+            let activated = event_position(
+                &events,
+                |event| *event == LifecycleEvent::ActivateConnection,
+                "activate connection",
+            );
+            let attached = event_position(
+                &events,
+                |event| *event == LifecycleEvent::TransactionAttached,
+                "transaction attached",
+            );
+            let ingress_message = event_position(
+                &events,
+                |event| {
+                    *event
+                        == LifecycleEvent::Http2IngressMessage {
+                            stream: StreamId::new(1),
+                        }
+                },
+                "HTTP/2 ingress message",
+            );
+            let request_end = event_position(
+                &events,
+                |event| {
+                    *event
+                        == LifecycleEvent::RequestEnd {
+                            stream: StreamId::new(1),
+                        }
+                },
+                "request end",
+            );
+            let detached = event_position(
+                &events,
+                |event| {
+                    *event
+                        == LifecycleEvent::TransactionDetached {
+                            stream: Some(StreamId::new(1)),
+                        }
+                },
+                "transaction detached",
+            );
+            let deactivated = event_position(
+                &events,
+                |event| *event == LifecycleEvent::DeactivateConnection,
+                "deactivate connection",
+            );
+            let eof = event_position(
+                &events,
+                |event| *event == LifecycleEvent::Http2IngressEof,
+                "HTTP/2 ingress EOF",
+            );
+            let destroy = event_position(
+                &events,
+                |event| *event == LifecycleEvent::Destroy,
+                "destroy",
+            );
+            let written = events
+                .iter()
+                .filter_map(|event| match event {
+                    LifecycleEvent::Http2Write { bytes } => Some(*bytes),
+                    _ => None,
+                })
+                .sum::<usize>();
+            assert_eq!(
+                written,
+                transport_state
+                    .borrow()
+                    .writes
+                    .iter()
+                    .map(Vec::len)
+                    .sum::<usize>()
+            );
+            assert!(written > 0);
+            assert!(read < settings);
+            assert!(settings < request_begin);
+            assert!(request_begin < activated && activated < attached);
+            assert!(attached < ingress_message && ingress_message < request_end);
+            assert!(request_end < detached);
+            assert!(read < eof && eof < destroy);
+            assert!(detached < deactivated && deactivated < destroy);
+            assert_eq!(destroy, events.len() - 1);
+            let drain = event_position(
+                &events,
+                |event| matches!(event, LifecycleEvent::DrainStarted(_)),
+                "close drain",
+            );
+            assert_eq!(
+                events[drain],
+                LifecycleEvent::DrainStarted(DrainTrigger::CloseWhenIdle),
+                "a connection that closes at EOF reports the close as `UniplexSession` does"
+            );
+            assert!(deactivated < drain && drain < destroy);
+        })
+    });
+}
+
+/// The events both drivers report alike: everything but writes, whose coalescing differs,
+/// flow-window transitions, and the detach and deactivation, which the owned driver reports at
+/// retirement (`DIV-051`) and which are returned separately.
+fn comparable_lifecycle(events: &[LifecycleEvent]) -> (Vec<LifecycleEvent>, Vec<LifecycleEvent>) {
+    events
+        .iter()
+        .copied()
+        .filter(|event| {
+            !matches!(
+                event,
+                LifecycleEvent::Http2Write { .. }
+                    | LifecycleEvent::Http2FlowWindowOpen
+                    | LifecycleEvent::Http2FlowWindowClosed
+            )
+        })
+        .partition(|event| {
+            !matches!(
+                event,
+                LifecycleEvent::TransactionDetached { .. } | LifecycleEvent::DeactivateConnection
+            )
+        })
+}
+
+#[test]
+fn owned_h2_lifecycle_sequence_equals_uniplex() {
+    let cases: [(&str, fn() -> Vec<u8>, usize); 4] = [
+        (
+            "GET",
+            || peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None),
+            1,
+        ),
+        ("two requests", peer_two_requests_bytes, 2),
+        (
+            "POST with body",
+            || peer_request_bytes(HttpMethod::Post, &[b'q'; 1024], None, PeerControl::None),
+            1,
+        ),
+        (
+            "peer RST",
+            || {
+                peer_request_bytes(
+                    HttpMethod::Get,
+                    &[],
+                    None,
+                    PeerControl::Reset(H2ErrorCode::CANCEL),
+                )
+            },
+            1,
+        ),
+    ];
+    for (name, input, requests) in cases {
+        let (owned, owned_run) =
+            run_on_worker(move |context| Box::pin(owned_lifecycle(context, input(), requests)));
+        let (uniplex, uniplex_run) =
+            run_on_worker(move |context| Box::pin(uniplex_lifecycle(context, input())));
+        assert_eq!(owned_run, uniplex_run, "{name}: run outcome");
+        let (owned_sequence, owned_detached) = comparable_lifecycle(&owned);
+        let (uniplex_sequence, uniplex_detached) = comparable_lifecycle(&uniplex);
+        assert_eq!(
+            owned_sequence, uniplex_sequence,
+            "{name}: owned {owned:?}\nuniplex {uniplex:?}"
+        );
+        assert_eq!(
+            owned_detached, uniplex_detached,
+            "{name}: owned {owned:?}\nuniplex {uniplex:?}"
+        );
+        assert_eq!(owned.last(), Some(&LifecycleEvent::Destroy), "{name}");
+    }
+}
+
+#[test]
+fn owned_h2_reset_and_error_lifecycle_order() {
+    let (events, run) = run_on_worker(|context| {
+        Box::pin(owned_lifecycle(
+            context,
+            peer_request_bytes(
+                HttpMethod::Get,
+                &[],
+                None,
+                PeerControl::Reset(H2ErrorCode::CANCEL),
+            ),
+            1,
+        ))
+    });
+    assert_eq!(run, Ok(()), "a peer reset stays stream-local");
+    let begin = event_position(
+        &events,
+        |event| matches!(event, LifecycleEvent::RequestBegin { .. }),
+        "request begin",
+    );
+    let message = event_position(
+        &events,
+        |event| matches!(event, LifecycleEvent::Http2IngressMessage { .. }),
+        "ingress message",
+    );
+    let reset = event_position(
+        &events,
+        |event| {
+            *event
+                == LifecycleEvent::PeerReset {
+                    stream: StreamId::new(1),
+                    code: HttpErrorCode::CANCEL,
+                }
+        },
+        "peer reset",
+    );
+    let detached = event_position(
+        &events,
+        |event| matches!(event, LifecycleEvent::TransactionDetached { .. }),
+        "transaction detached",
+    );
+    let eof = event_position(
+        &events,
+        |event| *event == LifecycleEvent::Http2IngressEof,
+        "ingress EOF",
+    );
+    assert!(begin < message && message < reset);
+    assert!(reset < eof && eof < detached);
+    assert_eq!(
+        event_count(&events, |event| matches!(
+            event,
+            LifecycleEvent::RequestEnd { .. }
+        )),
+        0,
+        "a reset stream reports no request end"
+    );
+
+    let (events, run) = run_on_worker(|context| {
+        Box::pin(owned_lifecycle(
+            context,
+            peer_request_bytes(
+                HttpMethod::Get,
+                &[],
+                None,
+                PeerControl::WindowUpdate {
+                    connection: true,
+                    amount: 0x7fff_ffff,
+                },
+            ),
+            1,
+        ))
+    });
+    assert_eq!(run, Err(HttpErrorCode::FLOW_CONTROL_ERROR));
+    let message = event_position(
+        &events,
+        |event| matches!(event, LifecycleEvent::Http2IngressMessage { .. }),
+        "ingress message",
+    );
+    let ingress_error = event_position(
+        &events,
+        |event| {
+            *event
+                == LifecycleEvent::Http2IngressError {
+                    stream: StreamId::UNSPECIFIED,
+                    code: HttpErrorCode::FLOW_CONTROL_ERROR,
+                }
+        },
+        "ingress error",
+    );
+    let drain = event_position(
+        &events,
+        |event| *event == LifecycleEvent::DrainStarted(DrainTrigger::ConnectionError),
+        "connection-error drain",
+    );
+    assert!(message < ingress_error && ingress_error < drain);
+    assert_eq!(
+        event_count(&events, |event| matches!(
+            event,
+            LifecycleEvent::Http2IngressError { .. }
+        )),
+        1
+    );
+    assert_eq!(events.last(), Some(&LifecycleEvent::Destroy));
+}
+
+/// A client preface and SETTINGS followed by `frames`.
+fn peer_control_bytes(frames: &[EgressFrame<'_>]) -> Vec<u8> {
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    let mut input = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+    input.extend(transcript_settings(&mut peer));
+    for frame in frames {
+        let frame = match frame {
+            EgressFrame::SettingsAck => EgressFrame::SettingsAck,
+            EgressFrame::PingRequest { data } => EgressFrame::PingRequest { data: *data },
+            EgressFrame::PingReply { data } => EgressFrame::PingReply { data: *data },
+            _ => unreachable!("only control frames"),
+        };
+        input.extend(eligibility_frame(&mut peer, frame));
+    }
+    input
+}
+
+#[test]
+fn owned_h2_control_frame_events() {
+    let (events, run) = run_on_worker(|context| {
+        Box::pin(owned_lifecycle(
+            context,
+            peer_control_bytes(&[
+                EgressFrame::SettingsAck,
+                EgressFrame::PingRequest { data: Some(12_345) },
+                EgressFrame::PingReply { data: 54_321 },
+            ]),
+            0,
+        ))
+    });
+    assert_eq!(run, Ok(()));
+    let settings = events
+        .iter()
+        .find_map(|event| match event {
+            LifecycleEvent::Http2Settings { count } => Some(*count),
+            _ => None,
+        })
+        .expect("the peer's SETTINGS are reported");
+    assert_eq!(
+        event_count(&events, |event| matches!(
+            event,
+            LifecycleEvent::Http2Setting { .. }
+        )),
+        settings,
+        "each setting follows its frame's report"
+    );
+    let acknowledged = event_position(
+        &events,
+        |event| *event == LifecycleEvent::Http2SettingsAck,
+        "settings acknowledgement",
+    );
+    let reply_sent = event_position(
+        &events,
+        |event| {
+            *event
+                == LifecycleEvent::Http2PingReplySent {
+                    latency: Duration::ZERO,
+                }
+        },
+        "PING reply sent",
+    );
+    let reply_received = event_position(
+        &events,
+        |event| *event == LifecycleEvent::Http2PingReplyReceived,
+        "PING reply received",
+    );
+    assert!(acknowledged < reply_sent && reply_sent < reply_received);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        LifecycleEvent::Http2StreamsFull | LifecycleEvent::Http2StreamsNotFull
+    )));
+
+    let (events, run) = run_on_worker(|context| {
+        Box::pin(owned_lifecycle(
+            context,
+            peer_stream_limit_transition_bytes(),
+            0,
+        ))
+    });
+    assert_eq!(run, Ok(()));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                LifecycleEvent::Http2StreamsFull | LifecycleEvent::Http2StreamsNotFull
+            ))
+            .copied()
+            .collect::<Vec<_>>(),
+        [
+            LifecycleEvent::Http2StreamsFull,
+            LifecycleEvent::Http2StreamsNotFull
+        ]
+    );
+
+    let (events, _) = run_on_worker(|context| {
+        Box::pin(owned_lifecycle(
+            context,
+            peer_idle_goaway_bytes(H2ErrorCode::NO_ERROR),
+            0,
+        ))
+    });
+    let goaway = event_position(
+        &events,
+        |event| {
+            *event
+                == LifecycleEvent::Http2Goaway {
+                    last_good_stream: StreamId::UNSPECIFIED,
+                    code: HttpErrorCode::NO_ERROR,
+                }
+        },
+        "peer GOAWAY",
+    );
+    let drain = event_position(
+        &events,
+        |event| *event == LifecycleEvent::DrainStarted(DrainTrigger::PeerGoaway),
+        "peer GOAWAY drain",
+    );
+    assert!(goaway < drain);
+}
+
+#[test]
+fn owned_h2_peer_reset_of_unknown_stream_is_reported() {
+    let (events, run) = run_on_worker(|context| {
+        let mut input = peer_control_bytes(&[]);
+        // RST_STREAM(9, CANCEL) for a stream the peer never opened.
+        input.extend([0, 0, 4, 3, 0, 0, 0, 0, 9, 0, 0, 0, 8]);
+        Box::pin(owned_lifecycle(context, input, 0))
+    });
+    assert_eq!(run, Ok(()));
+    assert_eq!(
+        event_count(&events, |event| *event
+            == LifecycleEvent::PeerReset {
+                stream: StreamId::new(9),
+                code: HttpErrorCode::CANCEL,
+            }),
+        1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, LifecycleEvent::RequestBegin { .. }))
+    );
+    assert_eq!(events.last(), Some(&LifecycleEvent::Destroy));
+}
+
+#[test]
+fn owned_h2_drain_started_once() {
+    // (drain locally before the run, peer GOAWAY code, the one drain reported)
+    let cases = [
+        (true, H2ErrorCode::NO_ERROR, DrainTrigger::Local),
+        (false, H2ErrorCode::NO_ERROR, DrainTrigger::PeerGoaway),
+        (true, H2ErrorCode::PROTOCOL_ERROR, DrainTrigger::Local),
+        (
+            false,
+            H2ErrorCode::PROTOCOL_ERROR,
+            DrainTrigger::ConnectionError,
+        ),
+    ];
+    for (local, code, trigger) in cases {
+        let events = run_on_worker(move |context| {
+            Box::pin(async move {
+                let (transport, _) =
+                    FixtureTransport::new([FixtureRead::DataEof(peer_idle_goaway_bytes(code))]);
+                let (application, _) = Application::new(Vec::new());
+                let (mut session, handle) =
+                    OwnedH2Session::new(application, options(context, transport)).unwrap();
+                let events = Rc::new(RefCell::new(Vec::new()));
+                session
+                    .add_lifecycle_observer(Rc::new(LifecycleProbe {
+                        events: Rc::clone(&events),
+                    }))
+                    .unwrap();
+                if local {
+                    assert!(handle.initiate_drain().unwrap());
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(5), session.run())
+                    .await
+                    .expect("the drained connection finishes");
+                events.take()
+            })
+        });
+        let drains: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event, LifecycleEvent::DrainStarted(_)))
+            .copied()
+            .collect();
+        assert_eq!(
+            drains,
+            [LifecycleEvent::DrainStarted(trigger)],
+            "local={local} {code:?}: {events:?}"
+        );
+        assert_eq!(events.last(), Some(&LifecycleEvent::Destroy));
+    }
+}
+
+#[test]
+fn owned_h2_unrun_session_reports_destroy_and_drops_observer() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (transport, state) = FixtureTransport::new([]);
+            let (application, probes) = Application::new(Vec::new());
+            let (mut session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let observer = Rc::new(LifecycleProbe {
+                events: Rc::clone(&events),
+            });
+            session.add_lifecycle_observer(observer.clone()).unwrap();
+            assert_eq!(Rc::strong_count(&observer), 2);
+            drop(session);
+            assert_eq!(events.borrow().as_slice(), [LifecycleEvent::Destroy]);
+            assert_eq!(
+                Rc::strong_count(&observer),
+                1,
+                "the dropped session releases its observer"
+            );
+            assert!(probes.borrow().is_empty());
+            assert!(state.borrow().writes.is_empty());
+        })
+    });
+}
+
+/// Panics the first time it sees `TransactionAttached`.
+struct PanicOnAttach {
+    panicked: Cell<bool>,
+}
+
+impl LifecycleObserver for PanicOnAttach {
+    fn on_event(&self, event: LifecycleEvent) {
+        if event == LifecycleEvent::TransactionAttached && !self.panicked.replace(true) {
+            panic_any("lifecycle observer");
+        }
+    }
+}
+
+#[test]
+fn owned_h2_observer_panic_aborts_after_cleanup() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let (transport, state) = FixtureTransport::new([FixtureRead::Data(input)]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+            application.hold_headers = true;
+            let (mut session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let events = Rc::new(RefCell::new(Vec::new()));
+            session
+                .add_lifecycle_observer(Rc::new(LifecycleProbe {
+                    events: Rc::clone(&events),
+                }))
+                .unwrap();
+            session
+                .add_lifecycle_observer(Rc::new(PanicOnAttach {
+                    panicked: Cell::new(false),
+                }))
+                .unwrap();
+            let panic = tokio::time::timeout(
+                Duration::from_secs(5),
+                eligibility_catch_unwind(session.run()),
+            )
+            .await
+            .expect("the panicked connection joins its I/O")
+            .expect_err("the run resumes the observer's panic after cleanup");
+            assert_eq!(
+                panic.downcast_ref::<&'static str>(),
+                Some(&"lifecycle observer")
+            );
+            assert_eq!(state.borrow().close, FixtureClose::Reset);
+            let probes = probes.borrow();
+            assert_eq!(
+                probes[0].cancelled.borrow().as_slice(),
+                [(HttpErrorCode::INTERNAL_ERROR, false)]
+            );
+            assert_eq!(probes[0].dropped.get(), 1);
+            let events = events.borrow();
+            let drain = event_position(
+                &events,
+                |event| *event == LifecycleEvent::DrainStarted(DrainTrigger::ConnectionError),
+                "connection-error drain",
+            );
+            let detached = event_position(
+                &events,
+                |event| matches!(event, LifecycleEvent::TransactionDetached { .. }),
+                "transaction detached",
+            );
+            assert!(drain < detached);
+            assert_eq!(
+                events.last(),
+                Some(&LifecycleEvent::Destroy),
+                "the other observer still sees the teardown"
+            );
+        })
+    });
+}
+
+/// Records each event it sees, tagged with its own number.
+struct TaggedProbe {
+    tag: u8,
+    seen: Rc<RefCell<Vec<(u8, LifecycleEvent)>>>,
+}
+
+impl LifecycleObserver for TaggedProbe {
+    fn on_event(&self, event: LifecycleEvent) {
+        self.seen.borrow_mut().push((self.tag, event));
+    }
+}
+
+#[test]
+fn owned_h2_registration_adds_and_removes_observers() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let (transport, _) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+            let (application, _) = Application::new(vec![Reply::Body(0)]);
+            let (mut session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let removed_events = Rc::new(RefCell::new(Vec::new()));
+            let removed = Rc::new(RegisteredLifecycleProbe::new(Rc::clone(&removed_events)));
+            let self_removed_events = Rc::new(RefCell::new(Vec::new()));
+            let self_removed = Rc::new(SelfRemovingAttachedObserver {
+                attached: Cell::new(0),
+                removed: Cell::new(false),
+                events: Rc::clone(&self_removed_events),
+            });
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let first = session
+                .add_lifecycle_observer(Rc::new(TaggedProbe {
+                    tag: 1,
+                    seen: Rc::clone(&seen),
+                }))
+                .unwrap();
+            let second = session.add_lifecycle_observer(removed.clone()).unwrap();
+            let third = session
+                .add_lifecycle_observer(self_removed.clone())
+                .unwrap();
+            let fourth = session
+                .add_lifecycle_observer(Rc::new(TaggedProbe {
+                    tag: 2,
+                    seen: Rc::clone(&seen),
+                }))
+                .unwrap();
+            assert!(first < second && second < third && third < fourth);
+            assert!(self_removed.removed.get());
+            assert!(removed.remove(), "a registration removes its observer");
+            assert!(!removed.remove(), "a removed observer is removed once");
+            tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .unwrap()
+                .expect("session completes");
+            assert!(removed_events.borrow().is_empty());
+            assert!(self_removed_events.borrow().is_empty());
+            assert_eq!(Rc::strong_count(&removed), 1);
+            let seen = seen.borrow();
+            assert_eq!(seen.len() % 2, 0);
+            for pair in seen.chunks(2) {
+                assert_eq!(
+                    [pair[0].0, pair[1].0],
+                    [2, 1],
+                    "the newest observer sees each event first"
+                );
+                assert_eq!(pair[0].1, pair[1].1);
+            }
+            assert_eq!(
+                seen.last().map(|(_, event)| *event),
+                Some(LifecycleEvent::Destroy)
+            );
+        })
+    });
+}
+
+#[test]
+fn owned_h2_default_path_has_no_observation() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (transport, _) = FixtureTransport::new([]);
+            let (application, _) = Application::new(Vec::new());
+            let (mut session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            assert!(!session.observed(), "no observer, no observation state");
+            session
+                .add_lifecycle_observer(Rc::new(LifecycleProbe {
+                    events: Rc::default(),
+                }))
+                .unwrap();
+            assert!(session.observed());
+        })
+    });
+}

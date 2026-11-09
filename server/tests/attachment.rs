@@ -2338,3 +2338,121 @@ fn a_server_run_cancellation_wakes_its_latest_waker() {
         });
     }
 }
+
+/// Records every lifecycle event of the session it observes.
+struct RecordedLifecycle(Arc<Mutex<Vec<LifecycleEvent>>>);
+
+impl LifecycleObserver for RecordedLifecycle {
+    fn on_event(&self, event: LifecycleEvent) {
+        self.0.lock().expect("events").push(event);
+    }
+}
+
+#[test]
+fn owned_http2_attachment_accepts_a_lifecycle_observer_factory() {
+    let mut owner = RuntimeOwner::start(RuntimeConfig {
+        workers: 1,
+        command_capacity: 4,
+    })
+    .expect("owner starts");
+    let runtime = owner.handle();
+    let worker = runtime.worker(0).expect("worker exists");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observers = Arc::new(AtomicUsize::new(0));
+    let recorded = Arc::clone(&events);
+    let built = Arc::clone(&observers);
+    wait(
+        worker
+            .call_local(move |context| async move {
+                let mut session = untimed_owned(false, true);
+                session.lifecycle_observer_factory = Some(Arc::new(move || {
+                    built.fetch_add(1, Ordering::Relaxed);
+                    Rc::new(RecordedLifecycle(Arc::clone(&recorded)))
+                }));
+                assert_eq!(session.check_owned(), Ok(()));
+                let (io, peer) = tokio::io::duplex(64 * 1024);
+                let accepted = attach_for_test(
+                    &context,
+                    CodecProtocol::Http2,
+                    session,
+                    io,
+                    Rc::new(FixedHandler),
+                );
+                assert_eq!(
+                    accepted.session.kind(),
+                    crate::acceptor::ServerSessionKind::OwnedHttp2
+                );
+                let run = tokio::task::spawn_local(accepted.session.run());
+                let (client, connection) = h2::client::handshake(peer).await.expect("H2 handshake");
+                let connection = tokio::task::spawn_local(connection);
+                let mut client = client.ready().await.expect("H2 client ready");
+                let request = http::Request::builder()
+                    .method("GET")
+                    .uri("http://localhost/fixed")
+                    .body(())
+                    .expect("request builds");
+                let (response, _stream) = client.send_request(request, true).expect("request sent");
+                let response = response.await.expect("response head");
+                assert_eq!(response.status(), http::StatusCode::OK);
+                let mut body = response.into_body();
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk.expect("response chunk");
+                    body.flow_control()
+                        .release_capacity(chunk.len())
+                        .expect("capacity released");
+                }
+                accepted.control.drain();
+                drop(client);
+                connection.abort();
+                run.await
+                    .expect("owned run task joins")
+                    .expect("owned run completes");
+            })
+            .expect("initializer admitted"),
+    )
+    .expect("initializer finishes");
+    wait(runtime.quiesce(TIMEOUT)).expect("cleanup joins");
+    assert_eq!(owner.join().expect("physical join").workers_forced, 0);
+    assert_eq!(
+        observers.load(Ordering::Relaxed),
+        1,
+        "one observer per connection"
+    );
+    let events = events.lock().expect("events");
+    let stream = roxygen_core::ids::StreamId::new(1);
+    let expected = [
+        LifecycleEvent::RequestBegin {
+            stream,
+            sequence_number: 0,
+        },
+        LifecycleEvent::ActivateConnection,
+        LifecycleEvent::TransactionAttached,
+        LifecycleEvent::Http2IngressMessage { stream },
+        LifecycleEvent::RequestEnd { stream },
+        LifecycleEvent::TransactionDetached {
+            stream: Some(stream),
+        },
+        LifecycleEvent::DeactivateConnection,
+        LifecycleEvent::Destroy,
+    ];
+    let observed: Vec<_> = events
+        .iter()
+        .copied()
+        .filter(|event| expected.contains(event))
+        .collect();
+    assert_eq!(observed, expected, "{events:?}");
+    // The drain races the stream's retirement, so only its count and the end are fixed.
+    let drains: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event, LifecycleEvent::DrainStarted(_)))
+        .copied()
+        .collect();
+    assert_eq!(
+        drains,
+        [LifecycleEvent::DrainStarted(
+            roxygen_session::shutdown::DrainTrigger::Local
+        )],
+        "{events:?}"
+    );
+    assert_eq!(events.last(), Some(&LifecycleEvent::Destroy));
+}

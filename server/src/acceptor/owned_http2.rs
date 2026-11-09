@@ -23,6 +23,8 @@ use roxygen_session::http2::Http2SessionConfig;
 use roxygen_session::owned_h2::OwnedH2Handle;
 use roxygen_session::owned_h2::OwnedH2Options;
 use roxygen_session::owned_h2::OwnedH2Session;
+use roxygen_session::session::LifecycleObserver;
+use roxygen_session::session::LifecycleObserverId;
 use roxygen_session::uniplex::UniplexConfig;
 use roxygen_session::uniplex::UniplexRunSummary;
 use roxygen_session::uniplex::UniplexTransport;
@@ -115,6 +117,13 @@ impl OwnedHttp2Session {
             handle,
             finished,
         ))
+    }
+
+    pub(crate) fn add_lifecycle_observer(
+        &mut self,
+        observer: Rc<dyn LifecycleObserver>,
+    ) -> Result<LifecycleObserverId, HttpError> {
+        self.session.add_lifecycle_observer(observer)
     }
 
     /// Runs the connection, then waits for its handler contexts to be released. Dropping
