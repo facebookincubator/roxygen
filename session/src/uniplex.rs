@@ -1,4 +1,6 @@
 //! Worker-local HTTP/1 byte-stream session driver.
+//!
+//! HTTP/1.1 writes batch ready events within the configured buffer and write limits.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -144,6 +146,7 @@ use crate::session::small_map::SmallMap;
 use crate::shutdown::DrainTrigger;
 use crate::stream_state::EgressEvent;
 use crate::stream_state::EgressTransfer;
+use crate::stream_state::SourceWakeCounter;
 
 const DEFAULT_BUFFER_LIMIT: usize = 1 << 20;
 const DEFAULT_INGRESS_BUFFER_LIMIT: u32 = 65_535;
@@ -1328,6 +1331,9 @@ struct DriverState {
     upgrade_stream_awaiting_detach: Option<StreamId>,
     upstream_ingress_upgraded: bool,
     zero_byte_write_pending: bool,
+    /// The writer task's wake for batched HTTP/1.1 attempts that do not wait
+    /// (`DIV-034`), made at the first and kept for the connection.
+    batched_source_wake: Option<Arc<SourceWakeCounter>>,
     bytes_read: u64,
     bytes_scheduled: u64,
     bytes_written: u64,
@@ -3904,6 +3910,7 @@ impl UniplexSession {
             upgrade_stream_awaiting_detach: None,
             upstream_ingress_upgraded: false,
             zero_byte_write_pending: false,
+            batched_source_wake: None,
             bytes_read: 0,
             bytes_scheduled: 0,
             bytes_written: 0,
@@ -7091,14 +7098,16 @@ async fn write_loop(
         let can_stage_egress = {
             let state = state.borrow();
             !state.zero_byte_write_pending
-                && (state.egress.is_empty()
-                    || (state.codec.protocol() == CodecProtocol::Http2
-                        && state.egress.chain_length() < config.maximum_write_size))
+                && state.egress.chain_length() < config.maximum_write_size
         };
         if can_stage_egress {
-            let wait_for_source = {
+            let (wait_for_source, http1_queued) = {
                 let state = state.borrow();
-                state.http2.is_none() && state.egress.is_empty()
+                let http1 = state.http2.is_none();
+                (
+                    http1 && state.egress.is_empty(),
+                    (http1 && !state.egress.is_empty()).then(|| state.egress.remaining_capacity()),
+                )
             };
             let work = state.borrow_mut().pop_ready_egress_work(&skipped_sources);
             if let Some(work) = work {
@@ -7129,6 +7138,19 @@ async fn write_loop(
                 )
                 .await
                 {
+                    Ok(NextEgressEvent::Ready(stream, event))
+                        if http1_queued
+                            .is_some_and(|remaining| !http1_event_fits(&event, remaining)) =>
+                    {
+                        // Batched HTTP/1.1 (`DIV-034`): the event follows the queued
+                        // bytes once they are written, as it would unbatched.
+                        source_flow_wait = None;
+                        state
+                            .borrow_mut()
+                            .egress_work
+                            .push_front(EgressWork::Event { stream, event });
+                        true
+                    }
                     Ok(NextEgressEvent::Ready(stream, event)) => {
                         source_flow_wait = None;
                         if let Err(error) = serialize_event(
@@ -8053,7 +8075,7 @@ impl ReadyEgressDispatch<'_> {
         &mut self,
         task_context: &mut Context<'_>,
         transfer: &mut EgressTransfer,
-        readiness: &mut EgressSourceReadiness,
+        readiness: Option<&mut EgressSourceReadiness>,
         maximum_body: Option<u32>,
     ) -> Option<Option<Result<Option<EgressEvent>, HttpError>>> {
         if poll_exchange_cleanup(
@@ -8076,8 +8098,23 @@ impl ReadyEgressDispatch<'_> {
                 return Some(None);
             }
         }
-        let result = readiness
-            .poll_with(|context| transfer.poll_next_event_with_credit(context, maximum_body));
+        let result = match readiness {
+            Some(readiness) => readiness
+                .poll_with(|context| transfer.poll_next_event_with_credit(context, maximum_body)),
+            // HTTP/1.1, batching's attempt that does not wait (`DIV-034`).
+            None => {
+                let wake = {
+                    let mut state = self.state.borrow_mut();
+                    match &state.batched_source_wake {
+                        Some(wake) if wake.wakes_task_of(task_context) => Arc::clone(wake),
+                        _ => Arc::clone(state.batched_source_wake.insert(Arc::new(
+                            SourceWakeCounter::new(task_context.waker().clone()),
+                        ))),
+                    }
+                };
+                transfer.poll_next_event_until_woken(&wake, task_context, maximum_body)
+            }
+        };
         match result {
             Poll::Ready(result) => Some(Some(result)),
             Poll::Pending => {
@@ -8090,6 +8127,33 @@ impl ReadyEgressDispatch<'_> {
             }
         }
     }
+}
+
+/// Whether an HTTP/1.1 codec surely serializes `event` within `remaining`
+/// bytes: body bytes or padding (none on HTTP/1.1) with the longest chunk
+/// framing and message end they can take (`DIV-034`). The size of a head or
+/// trailers is known only once they are serialized, so they never join queued
+/// bytes.
+fn http1_event_fits(event: &EgressEvent, remaining: usize) -> bool {
+    let EgressEvent::Body(body) = event else {
+        return false;
+    };
+    let length = match body.kind() {
+        HttpBodyEventKind::Body(data) => data.chain_length(),
+        HttpBodyEventKind::Padding(_) => 0,
+        _ => return false,
+    };
+    // `<hex length>\r\n` opens a chunk.
+    let chunk_prefix = if length == 0 {
+        0
+    } else {
+        (usize::BITS - length.leading_zeros()).div_ceil(4) as usize + 2
+    };
+    // The chunk's CRLF, then the last chunk at the end of the message.
+    let suffix = if body.eom() { 7 } else { 2 };
+    length
+        .checked_add(chunk_prefix + suffix)
+        .is_some_and(|framed| framed <= remaining)
 }
 
 async fn next_egress_event(
@@ -8130,15 +8194,21 @@ async fn next_egress_event(
             };
             // A nonwaiting attempt stays on the owner through its first poll.
             // Ready callback/cancellation notifications retain their consuming wait.
+            // On HTTP/1.1 a nonwaiting attempt is batching's (`DIV-034`), made
+            // before every flush of a streamed response, so it builds no wait.
             let use_ready_dispatch = {
                 let state = state.borrow();
-                state.ready_dispatch
-                    && state.http2.is_some()
-                    && !wait_for_source
+                !wait_for_source
                     && tokio::task::coop::has_budget_remaining()
-                    && readiness.is_some()
                     && !cancellation.is_cancellation_requested()
                     && !state.core().has_pending_events()
+                    && if state.http2.is_some() {
+                        state.ready_dispatch && readiness.is_some()
+                    } else {
+                        transfer_cancellation
+                            .as_ref()
+                            .is_none_or(|token| !token.is_cancellation_requested())
+                    }
             };
             let event = if use_ready_dispatch {
                 let mut dispatch = ReadyEgressDispatch {
@@ -8149,16 +8219,12 @@ async fn next_egress_event(
                     write_wake,
                 };
                 poll_fn(|task_context| {
-                    Poll::Ready(
-                        dispatch.poll(
-                            task_context,
-                            &mut transfer,
-                            readiness
-                                .as_mut()
-                                .expect("direct H2 dispatch has readiness"),
-                            maximum_body,
-                        ),
-                    )
+                    Poll::Ready(dispatch.poll(
+                        task_context,
+                        &mut transfer,
+                        readiness.as_mut(),
+                        maximum_body,
+                    ))
                 })
                 .await
             } else {

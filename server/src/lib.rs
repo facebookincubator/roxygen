@@ -26,6 +26,14 @@ mod lifecycle_tests;
 mod attachment_tests;
 
 #[cfg(test)]
+#[path = "../tests/allocation_count.rs"]
+mod allocation_count;
+
+#[cfg(test)]
+#[path = "../tests/http1_egress_batching.rs"]
+mod http1_egress_batching_tests;
+
+#[cfg(test)]
 #[path = "../tests/native_readiness.rs"]
 mod native_readiness_tests;
 

@@ -6363,7 +6363,17 @@ fn branch_response() -> (Outcome, usize, Vec<HttpByteEvent>) {
 }
 
 fn registered_response() -> (Vec<HttpByteEvent>, Vec<ByteEventWriteFlags>) {
-    run_on_worker(|context| {
+    registered_response_with(UniplexConfig::default(), 2).0
+}
+
+/// `RegisteredHandler`'s response once the session has made `writes` writes:
+/// the byte events fired, the flags of each write, and the writes.
+#[expect(clippy::type_complexity, reason = "a test result tuple")]
+fn registered_response_with(
+    config: UniplexConfig,
+    writes: usize,
+) -> ((Vec<HttpByteEvent>, Vec<ByteEventWriteFlags>), Vec<Vec<u8>>) {
+    run_on_worker(move |context| {
         Box::pin(async move {
             let (transport, state) = ScriptedTransport::with_capability(
                 [
@@ -6382,13 +6392,13 @@ fn registered_response() -> (Vec<HttpByteEvent>, Vec<ByteEventWriteFlags>) {
                 TransportDirection::Downstream,
                 erased,
                 Some(handler),
-                UniplexConfig::default(),
+                config,
             )
             .unwrap();
             let run = session.run();
             tokio::pin!(run);
             tokio::time::timeout(Duration::from_secs(1), async {
-                while state.borrow().writes.len() < 3 {
+                while state.borrow().writes.len() < writes {
                     tokio::select! {
                         _ = run.as_mut() => panic!("session completed before registered writes"),
                         _ = tokio::task::yield_now() => {},
@@ -6424,7 +6434,8 @@ fn registered_response() -> (Vec<HttpByteEvent>, Vec<ByteEventWriteFlags>) {
             assert_eq!(callback.cancelled.get(), 0);
             let events = std::mem::take(&mut *callback.fired.borrow_mut());
             let flags = state.borrow().write_flags.clone();
-            (events, flags)
+            let writes = state.borrow().writes.clone();
+            ((events, flags), writes)
         })
     })
 }
@@ -6677,7 +6688,7 @@ fn read_failure_interrupts_final_byte_event_wait() {
             let run = session.run();
             tokio::pin!(run);
             tokio::time::timeout(Duration::from_secs(1), async {
-                while state.borrow().writes.len() < 3 {
+                while state.borrow().writes.len() < 2 {
                     tokio::select! {
                         _ = run.as_mut() => panic!("session completed before byte-event wait"),
                         _ = tokio::task::yield_now() => {},
@@ -7270,7 +7281,10 @@ fn connection_failure_cancels_queued_registration_reentrantly() {
                 TransportDirection::Downstream,
                 erased,
                 Some(handler),
-                UniplexConfig::default(),
+                UniplexConfig {
+                    maximum_write_size: 1,
+                    ..UniplexConfig::default()
+                },
             )
             .unwrap();
             *callback.handle.borrow_mut() = Some(handle);
@@ -9348,21 +9362,34 @@ mod h1 {
     fn byte_event_boundaries_use_post_generation_offsets() {
         let (events, flags) = registered_response();
         assert_eq!(events.len(), 10);
-        assert_eq!(events[0].event_type, ByteEventType::TransportWrite);
-        assert_eq!(events[1].event_type, ByteEventType::KernelWrite);
-        assert_eq!(events[2].event_type, ByteEventType::TransportWrite);
-        assert_eq!(events[3].event_type, ByteEventType::KernelWrite);
-        assert_eq!(events[2].transport_offset, events[0].transport_offset);
-        assert_eq!(events[2].stream_offset, events[0].stream_offset);
-        assert_eq!(events[2].body_offset, events[0].body_offset);
-        assert!(events[0].stream_offset > 0);
-        assert_eq!(events[4].body_offset, 3);
-        assert!(events[4].transport_offset > events[0].transport_offset);
-        assert_eq!(flags.len(), 3);
-        assert!(flags[0].timestamp_write);
-        assert_eq!(flags[1], ByteEventWriteFlags::default());
-        assert!(flags[2].timestamp_tx);
-        assert!(flags[2].timestamp_ack);
+        for event in &events {
+            assert_eq!(event.stream_offset, event.transport_offset);
+            assert_eq!(
+                event.transport_offset,
+                if event.body_offset == 0 { 101 } else { 114 }
+            );
+        }
+        let writes = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.event_type == ByteEventType::TransportWrite);
+        for (write_index, write) in writes {
+            let completion_index = events
+                .iter()
+                .position(|event| {
+                    event.event_type == ByteEventType::KernelWrite
+                        && event.transport_offset == write.transport_offset
+                        && event.field_section_info == write.field_section_info
+                })
+                .expect("each write registration completes");
+            assert!(write_index < completion_index);
+        }
+        assert_eq!(flags.len(), 2);
+        assert!(
+            flags
+                .iter()
+                .all(|flags| flags.timestamp_write && flags.timestamp_tx && flags.timestamp_ack)
+        );
     }
 
     #[test]
@@ -9458,4 +9485,440 @@ mod h1 {
 
 pub(crate) fn ready_dispatch_transport() -> Rc<dyn UniplexTransport> {
     ScriptedTransport::new([ReadAction::Eof]).0
+}
+
+/// The writes an upstream HTTP/1.1 session makes for a POST of `hello`
+/// answered by the peer once it has the request.
+fn upstream_post_writes(config: UniplexConfig) -> Vec<Vec<u8>> {
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let respond = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = ScriptedTransport::new([ReadAction::WaitData(
+                Arc::clone(&respond),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+            )]);
+            let (session, handle) = UniplexSession::new(
+                context,
+                TransportDirection::Upstream,
+                transport,
+                None,
+                config,
+            )
+            .unwrap();
+            let exchange = async {
+                let request = HttpFixedSource::make_fixed_request(
+                    b"/",
+                    HttpMethod::Post,
+                    Some(queue(b"hello")),
+                )
+                .unwrap();
+                let mut response = handle
+                    .send_request(
+                        HttpSourceHolder::new(Box::new(request)),
+                        CancellationToken::never(),
+                    )
+                    .await
+                    .unwrap();
+                while !state.borrow().writes.concat().ends_with(b"hello") {
+                    tokio::task::yield_now().await;
+                }
+                respond.notify_one();
+                let head = response.source.read_header_event().await.unwrap();
+                assert_eq!(head.headers().response_status(), Some(200));
+                drop(response);
+                handle.initiate_drain().unwrap();
+            };
+            let (result, ()) = tokio::join!(session.run(), exchange);
+            result.unwrap();
+            state.borrow().writes.clone()
+        })
+    })
+}
+
+#[test]
+fn upstream_h1_request_head_and_ready_body_share_a_write() {
+    let writes = upstream_post_writes(UniplexConfig::default());
+    assert_eq!(writes.len(), 1, "head and body together");
+    assert!(writes[0].starts_with(b"POST / HTTP/1.1\r\n"));
+    assert!(writes[0].ends_with(b"\r\n\r\nhello"));
+}
+
+/// A request whose body becomes readable only when `release` is notified.
+struct GatedBody {
+    head: Option<HttpHeaderEvent>,
+    release: Arc<tokio::sync::Notify>,
+    sent: bool,
+}
+
+impl HttpSource for GatedBody {
+    fn read_header_event(
+        &mut self,
+    ) -> roxygen_core::source::LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
+        Box::pin(std::future::ready(self.head.take().ok_or_else(|| {
+            HttpError::with_message(HttpErrorCode::DROPPED, b"request header exhausted")
+        })))
+    }
+
+    fn read_body_event(
+        &mut self,
+        _maximum: u32,
+    ) -> roxygen_core::source::LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
+        assert!(!std::mem::replace(&mut self.sent, true), "one body event");
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            release.notified().await;
+            Ok(HttpBodyEvent::body(queue(b"hello"), true))
+        })
+    }
+
+    fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {}
+}
+
+#[test]
+fn batched_h1_egress_writes_the_head_without_waiting_for_the_body() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let respond = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = ScriptedTransport::new([ReadAction::WaitData(
+                Arc::clone(&respond),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            )]);
+            let (session, handle) = UniplexSession::new(
+                context,
+                TransportDirection::Upstream,
+                transport,
+                None,
+                UniplexConfig::default(),
+            )
+            .unwrap();
+            let release = Arc::new(tokio::sync::Notify::new());
+            let mut message = roxygen_core::message::HttpMessage::new();
+            message.set_method(HttpMethod::Post).unwrap();
+            message.set_url(b"/", false).unwrap();
+            message.set_http_version(1, 1);
+            message
+                .headers_mut()
+                .set(HttpHeaderCode::ContentLength, b"5");
+            let request = GatedBody {
+                head: Some(HttpHeaderEvent::new(message, false).unwrap()),
+                release: Arc::clone(&release),
+                sent: false,
+            };
+            let exchange = async {
+                let response = handle
+                    .send_request(
+                        HttpSourceHolder::new(Box::new(request)),
+                        CancellationToken::never(),
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while state.borrow().writes.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the head is written while the body is pending");
+                {
+                    let writes = &state.borrow().writes;
+                    assert_eq!(writes.len(), 1);
+                    assert!(writes[0].starts_with(b"POST / HTTP/1.1\r\n"));
+                    assert!(writes[0].ends_with(b"\r\n\r\n"));
+                }
+                release.notify_one();
+                while state.borrow().writes.len() < 2 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(state.borrow().writes[1], b"hello");
+                respond.notify_one();
+                drop(response);
+                handle.initiate_drain().unwrap();
+            };
+            let (result, ()) = tokio::join!(session.run(), exchange);
+            result.unwrap();
+        })
+    });
+}
+
+/// The writes a downstream HTTP/1.1 session makes answering one GET with a
+/// fixed three-byte body.
+fn downstream_response_writes(config: UniplexConfig) -> Vec<Vec<u8>> {
+    struct Fixed;
+    impl HttpHandler for Fixed {
+        fn handle_request(
+            &self,
+            _context: HandlerSessionContext,
+            mut request_source: HttpSourceHolder,
+        ) -> LocalHandlerFuture {
+            Box::pin(async move {
+                request_source.read_header_event().await?;
+                Ok(fixed_response(200, 3))
+            })
+        }
+    }
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let (transport, state) = ScriptedTransport::new([
+                ReadAction::Data(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec()),
+                ReadAction::Eof,
+            ]);
+            let erased: Rc<dyn UniplexTransport> = transport;
+            let (session, _handle) = UniplexSession::new(
+                context,
+                TransportDirection::Downstream,
+                erased,
+                Some(Rc::new(Fixed)),
+                config,
+            )
+            .unwrap();
+            session.run().await.unwrap();
+            state.borrow().writes.clone()
+        })
+    })
+}
+
+#[test]
+fn downstream_h1_response_head_and_ready_body_share_a_write() {
+    let writes = downstream_response_writes(UniplexConfig::default());
+    assert_eq!(writes.len(), 1, "head and body together: {writes:?}");
+    assert!(writes[0].starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(writes[0].ends_with(b"\r\n\r\nxxx"));
+}
+
+/// Zero-byte padding shares the head's write, but a TX/ACK boundary still ends
+/// a write. Every registration reports its serialized byte offset.
+#[test]
+fn batched_h1_egress_keeps_byte_event_offsets_and_tx_ack_boundaries() {
+    let summary = |events: &[HttpByteEvent]| {
+        let mut events = events
+            .iter()
+            .map(|event| {
+                (
+                    format!("{:?}", event.event_type),
+                    event.transport_offset,
+                    event.stream_offset,
+                    event.body_offset,
+                )
+            })
+            .collect::<Vec<_>>();
+        events.sort();
+        events
+    };
+    let ((events, flags), writes) = registered_response_with(UniplexConfig::default(), 2);
+    assert_eq!(
+        writes.iter().map(Vec::len).collect::<Vec<_>>(),
+        [101, 13],
+        "the head's TX/ACK boundary still ends a write"
+    );
+    assert_eq!(writes[1], b"3\r\nabc\r\n0\r\n\r\n");
+    assert!(
+        flags
+            .iter()
+            .all(|flags| flags.timestamp_tx && flags.timestamp_ack),
+        "each write ends at a TX/ACK boundary: {flags:?}"
+    );
+    let mut expected = Vec::new();
+    for event_type in [
+        ByteEventType::TransportWrite,
+        ByteEventType::KernelWrite,
+        ByteEventType::NicTx,
+        ByteEventType::CumulativeAck,
+    ] {
+        expected.push((format!("{event_type:?}"), 101, 101, 0));
+        expected.push((format!("{event_type:?}"), 114, 114, 3));
+    }
+    for event_type in [ByteEventType::TransportWrite, ByteEventType::KernelWrite] {
+        expected.push((format!("{event_type:?}"), 101, 101, 0));
+    }
+    expected.sort();
+    assert_eq!(summary(&events), expected);
+}
+
+/// The egress buffer and write size of the buffer-boundary tests: a queued head
+/// leaves too little room for a body that alone fills the buffer.
+const BOUNDARY_BUFFER: usize = 64 << 10;
+/// Body bytes of the buffer-boundary tests; never a hex digit, so chunk sizes
+/// cannot be mistaken for body bytes.
+const BOUNDARY_BYTE: u8 = b'z';
+
+/// A request whose body events, `(length, eom)` each, are all ready at once.
+struct ReadyRequest {
+    head: Option<HttpHeaderEvent>,
+    events: VecDeque<(usize, bool)>,
+}
+
+impl HttpSource for ReadyRequest {
+    fn read_header_event(
+        &mut self,
+    ) -> roxygen_core::source::LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
+        Box::pin(std::future::ready(self.head.take().ok_or_else(|| {
+            HttpError::with_message(HttpErrorCode::DROPPED, b"request header exhausted")
+        })))
+    }
+
+    fn read_body_event(
+        &mut self,
+        maximum: u32,
+    ) -> roxygen_core::source::LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
+        let (length, eom) = self.events.pop_front().expect("a body event is left");
+        assert!(length <= maximum as usize, "each body event fits one read");
+        Box::pin(std::future::ready(Ok(HttpBodyEvent::body(
+            queue(&vec![BOUNDARY_BYTE; length]),
+            eom,
+        ))))
+    }
+
+    fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {}
+}
+
+/// The writes of an upstream HTTP/1.1 POST whose body events are all ready, on
+/// a session whose egress buffer and write size are both `BOUNDARY_BUFFER`,
+/// with a `Content-Length` of `content_length` or, without one, chunked; and the
+/// response status, or the error that failed the exchange instead.
+fn boundary_post(
+    content_length: Option<usize>,
+    events: &'static [(usize, bool)],
+) -> (Vec<Vec<u8>>, Result<u16, HttpErrorCode>) {
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let respond = Arc::new(tokio::sync::Notify::new());
+            // A failed session cancels the read that waits for the request.
+            let (transport, state) = ScriptedTransport::new([ReadAction::WaitDataOrCancellation(
+                Arc::clone(&respond),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            )]);
+            let config = UniplexConfig {
+                buffer_limit: BOUNDARY_BUFFER,
+                maximum_write_size: BOUNDARY_BUFFER,
+                ..UniplexConfig::default()
+            };
+            let (session, handle) = UniplexSession::new(
+                context,
+                TransportDirection::Upstream,
+                transport,
+                None,
+                config,
+            )
+            .unwrap();
+            let mut message = roxygen_core::message::HttpMessage::new();
+            message.set_method(HttpMethod::Post).unwrap();
+            message.set_url(b"/", false).unwrap();
+            message.set_http_version(1, 1);
+            if let Some(length) = content_length {
+                message
+                    .headers_mut()
+                    .set(HttpHeaderCode::ContentLength, length.to_string().as_bytes());
+            }
+            let request = ReadyRequest {
+                head: Some(HttpHeaderEvent::new(message, false).unwrap()),
+                events: events.iter().copied().collect(),
+            };
+            let body_length: usize = events.iter().map(|(length, _)| length).sum();
+            let request_sent = || {
+                let wire = state.borrow().writes.concat();
+                wire.iter().filter(|byte| **byte == BOUNDARY_BYTE).count() == body_length
+                    && (content_length.is_some() || wire.ends_with(b"0\r\n\r\n"))
+            };
+            let exchange = async {
+                let mut response = handle
+                    .send_request(
+                        HttpSourceHolder::new(Box::new(request)),
+                        CancellationToken::never(),
+                    )
+                    .await
+                    .map_err(|error| error.code())?;
+                let respond_once_sent = async {
+                    while !request_sent() {
+                        tokio::task::yield_now().await;
+                    }
+                    respond.notify_one();
+                    std::future::pending::<()>().await
+                };
+                let head = tokio::select! {
+                    head = response.source.read_header_event() => head,
+                    () = respond_once_sent => unreachable!("the response ends the select"),
+                };
+                let status = head.map_err(|error| error.code())?;
+                drop(response);
+                handle.initiate_drain().unwrap();
+                Ok(status.headers().response_status().unwrap_or(0))
+            };
+            let (_, status) = tokio::join!(session.run(), exchange);
+            (state.borrow().writes.clone(), status)
+        })
+    })
+}
+
+/// Every write stays within the buffer, and concatenating them preserves the
+/// request's framing and complete body.
+fn assert_boundary_post(
+    content_length: Option<usize>,
+    events: &'static [(usize, bool)],
+    expected_writes: usize,
+) -> Vec<Vec<u8>> {
+    let (writes, status) = boundary_post(content_length, events);
+    assert_eq!(status, Ok(200));
+    assert_eq!(writes.len(), expected_writes);
+    assert!(
+        writes.iter().all(|write| write.len() <= BOUNDARY_BUFFER),
+        "every write fits the buffer"
+    );
+    let wire = writes.concat();
+    let head_end = wire
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let head = &wire[..head_end];
+    assert!(head.starts_with(b"POST / HTTP/1.1\r\n"));
+    let mut expected_body = Vec::new();
+    if let Some(length) = content_length {
+        assert!(String::from_utf8_lossy(head).contains(&format!("Content-Length: {length}\r\n")));
+        expected_body.resize(length, BOUNDARY_BYTE);
+    } else {
+        assert!(String::from_utf8_lossy(head).contains("Transfer-Encoding: chunked\r\n"));
+        for &(length, eom) in events {
+            if length != 0 {
+                expected_body.extend_from_slice(format!("{length:x}\r\n").as_bytes());
+                expected_body.extend(std::iter::repeat_n(BOUNDARY_BYTE, length));
+                expected_body.extend_from_slice(b"\r\n");
+            }
+            if eom {
+                expected_body.extend_from_slice(b"0\r\n\r\n");
+            }
+        }
+    }
+    assert_eq!(&wire[head_end..], expected_body, "complete framed body");
+    writes
+}
+
+/// A queued head leaves too little room for a body that fills the buffer.
+#[test]
+fn batched_h1_egress_writes_a_body_event_that_fills_the_buffer_after_the_head() {
+    const BODY: &[(usize, bool)] = &[(BOUNDARY_BUFFER - 1, false), (1, true)];
+    let writes = assert_boundary_post(Some(BOUNDARY_BUFFER), BODY, 3);
+    assert_eq!(writes[1], vec![BOUNDARY_BYTE; BOUNDARY_BUFFER - 1]);
+    assert_eq!(writes[2], [BOUNDARY_BYTE]);
+}
+
+#[test]
+fn batched_h1_egress_writes_a_content_length_body_event_that_no_longer_fits_next() {
+    assert_boundary_post(
+        Some(BOUNDARY_BUFFER),
+        &[(30_000, false), (BOUNDARY_BUFFER - 30_000, true)],
+        2,
+    );
+}
+
+/// The chunk framing and body together fill exactly one buffer.
+#[test]
+fn batched_h1_egress_writes_a_chunked_body_that_fills_the_buffer_after_the_head() {
+    const BODY: &[(usize, bool)] = &[(0xfff3, true)];
+    let writes = assert_boundary_post(None, BODY, 2);
+    assert_eq!(writes[1].len(), BOUNDARY_BUFFER);
+}
+
+#[test]
+fn batched_h1_egress_writes_a_chunk_that_no_longer_fits_next() {
+    assert_boundary_post(None, &[(40_000, false), (40_000, true)], 2);
 }

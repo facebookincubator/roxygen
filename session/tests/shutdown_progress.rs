@@ -875,7 +875,17 @@ fn first_poll_write_still_runs_pending_callbacks_before_the_next_write() {
                 RESPONSE,
                 false,
             )]);
-            let (session, handle) = upstream(&context, transport);
+            let (session, handle) = UniplexSession::new(
+                context.clone(),
+                TransportDirection::Upstream,
+                transport,
+                None,
+                UniplexConfig {
+                    maximum_write_size: 16,
+                    ..UniplexConfig::default()
+                },
+            )
+            .unwrap();
             let callbacks = handle.callback_queue_for_test();
             let pending_at_write = Rc::new(RefCell::new(Vec::new()));
             {

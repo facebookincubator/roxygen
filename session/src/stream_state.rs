@@ -11,8 +11,12 @@ use std::panic::resume_unwind;
 use std::pin::Pin;
 use std::pin::pin;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
+use std::task::Wake;
 use std::task::Waker;
 use std::time::Duration;
 use std::time::Instant;
@@ -330,6 +334,43 @@ pub enum EgressEvent {
     Body(HttpBodyEvent),
 }
 
+/// Wakes a writer's task and counts its wakes (`DIV-034`): a transfer that a
+/// batched HTTP/1.1 attempt polled with it and found pending is not polled again
+/// until the count moves, i.e. until something that poll registered with woke.
+pub(crate) struct SourceWakeCounter {
+    wakes: AtomicU64,
+    task: Waker,
+}
+
+impl SourceWakeCounter {
+    pub(crate) fn new(task: Waker) -> Self {
+        Self {
+            wakes: AtomicU64::new(0),
+            task,
+        }
+    }
+
+    /// Whether this counter wakes the task polling with `context`.
+    pub(crate) fn wakes_task_of(&self, context: &Context<'_>) -> bool {
+        self.task.will_wake(context.waker())
+    }
+
+    fn wakes(&self) -> u64 {
+        self.wakes.load(Ordering::Acquire)
+    }
+}
+
+impl Wake for SourceWakeCounter {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::AcqRel);
+        self.task.wake_by_ref();
+    }
+}
+
 /// One generation of response or request-body production.
 ///
 /// Dropping an unfinished transfer requests cancellation and reports producer
@@ -352,6 +393,9 @@ pub struct EgressTransfer {
     // Source EOM ends capacity waits; generation retirement still follows serialization.
     production_complete: bool,
     retirement: ExchangeGuard,
+    /// The counter and its count when `poll_next_event_until_woken` last found
+    /// this transfer pending; cleared by any other poll.
+    awaited_wake: Option<(Arc<SourceWakeCounter>, u64)>,
 }
 
 impl EgressTransfer {
@@ -458,11 +502,54 @@ impl EgressTransfer {
         poll_fn(|context| self.poll_next_event_with_limit(context, maximum_body)).await
     }
 
+    /// While the last poll was `poll_next_event_until_woken`'s pending one and
+    /// nothing it registered with has woken, polls with that counter's task
+    /// return `Pending` without polling the source (`DIV-034`).
     pub(crate) async fn next_event_with_credit(
         &mut self,
         maximum_body: Option<u32>,
     ) -> Result<Option<EgressEvent>, HttpError> {
-        poll_fn(|context| self.poll_next_event_with_credit(context, maximum_body)).await
+        poll_fn(|context| {
+            if self.awaits_wake(context) {
+                return Poll::Pending;
+            }
+            self.poll_next_event_with_credit(context, maximum_body)
+        })
+        .await
+    }
+
+    /// Polls like `poll_next_event_with_credit`, waking `context`'s task
+    /// through `wake`, whose task it is, and remembers a `Pending` result with
+    /// `wake`'s count: until something this poll registered with wakes, polls
+    /// from that task return `Pending` without polling the source again
+    /// (`DIV-034`: batching's attempt before a flush, then the waiting attempt
+    /// after it, poll a token-paced source once each, not twice).
+    pub(crate) fn poll_next_event_until_woken(
+        &mut self,
+        wake: &Arc<SourceWakeCounter>,
+        context: &Context<'_>,
+        maximum_body: Option<u32>,
+    ) -> Poll<Result<Option<EgressEvent>, HttpError>> {
+        if self.awaits_wake(context) {
+            return Poll::Pending;
+        }
+        let wakes = wake.wakes();
+        let waker = Waker::from(Arc::clone(wake));
+        let polled =
+            self.poll_next_event_with_credit(&mut Context::from_waker(&waker), maximum_body);
+        if polled.is_pending() {
+            self.awaited_wake = Some((Arc::clone(wake), wakes));
+        }
+        polled
+    }
+
+    /// Whether the last poll was `poll_next_event_until_woken`'s pending one,
+    /// nothing it registered with has woken since, and `context` belongs to
+    /// the task that wake would reach.
+    fn awaits_wake(&self, context: &Context<'_>) -> bool {
+        self.awaited_wake
+            .as_ref()
+            .is_some_and(|(wake, wakes)| wake.wakes() == *wakes && wake.wakes_task_of(context))
     }
 
     /// Polls the bounded egress queue while retaining a pending child read.
@@ -480,6 +567,7 @@ impl EgressTransfer {
         context: &mut Context<'_>,
         maximum_body: Option<u32>,
     ) -> Poll<Result<Option<EgressEvent>, HttpError>> {
+        self.awaited_wake = None;
         if self.complete {
             return Poll::Ready(Ok(None));
         }
@@ -1100,6 +1188,7 @@ impl StreamState {
             complete: false,
             production_complete: false,
             retirement: self.exchange.guard(),
+            awaited_wake: None,
         })
     }
 

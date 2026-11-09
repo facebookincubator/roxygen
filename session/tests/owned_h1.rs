@@ -2802,9 +2802,8 @@ fn a_read_error_during_a_response_write_fails_the_connection_as_uniplex() {
 }
 
 /// As `a_read_error_during_a_response_write_fails_the_connection_as_uniplex`, with a response
-/// body. Both sessions write only what is serialized when the read fails, and with no
-/// per-stream task the owned driver has serialized the ready body with its head, while
-/// `UniplexSession`'s stream has serialized only the head (`DIV-029`).
+/// body. Both sessions write the ready body serialized with the head before the
+/// read fails.
 #[test]
 fn a_read_error_during_a_response_write_writes_the_serialized_body() {
     for queued in [false, true] {
@@ -2822,16 +2821,12 @@ fn a_read_error_during_a_response_write_writes_the_serialized_body() {
             Some(HttpErrorCode::TRANSPORT_READ_ERROR),
             "{case}"
         );
-        let head = without_dates(&uniplex.output);
+        let output = without_dates(&uniplex.output);
         assert!(
-            head.ends_with("\r\nContent-Length: 5\r\n\r\n"),
-            "{case}: UniplexSession writes the head it serialized: {head:?}"
+            output.ends_with("\r\nContent-Length: 5\r\n\r\nhello"),
+            "{case}: the serialized head and ready body are written: {output:?}"
         );
-        assert_eq!(
-            without_dates(&owned.output),
-            format!("{head}hello"),
-            "{case}: the owned driver writes the head and body it serialized"
-        );
+        assert_eq!(without_dates(&owned.output), output, "{case}");
     }
 }
 
