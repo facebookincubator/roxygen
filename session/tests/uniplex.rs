@@ -10320,3 +10320,135 @@ fn a_request_on_a_reused_session_failed_by_a_read_error_before_its_head_was_not_
         ),
     );
 }
+
+/// What a request committed on a reused upstream HTTP/1.1 session met when the
+/// peer's EOF was already readable, the session not yet polled since.
+#[derive(Debug, PartialEq)]
+struct ReadableEofCommit {
+    sequence_number: u64,
+    started: bool,
+    head_error: Option<HttpErrorCode>,
+    /// Whether the transport took any write after the earlier exchanges.
+    written: bool,
+}
+
+/// Runs `prior_exchanges` exchanges with timers off, brings the session to an
+/// even or odd poll count, then makes the peer's EOF readable and commits the
+/// next request before the session runs again.
+fn readable_eof_commit(prior_exchanges: usize, even_poll_count: bool) -> ReadableEofCommit {
+    use crate::experimental::UniplexResponseProgressExt;
+    use crate::uniplex::writer_probe;
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            writer_probe::reset();
+            let responses: Vec<_> = (0..prior_exchanges)
+                .map(|_| Arc::new(tokio::sync::Notify::new()))
+                .collect();
+            let eof = Arc::new(tokio::sync::Notify::new());
+            let reads = responses
+                .iter()
+                .map(|ready| {
+                    ReadAction::WaitData(
+                        Arc::clone(ready),
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+                    )
+                })
+                .chain([ReadAction::WaitEof(Arc::clone(&eof))]);
+            let (transport, state) = ScriptedTransport::new(reads);
+            let (session, handle) = UniplexSession::new(
+                context,
+                TransportDirection::Upstream,
+                transport,
+                None,
+                UniplexConfig {
+                    read_timeout: Duration::ZERO,
+                    stream_read_timeout: Duration::ZERO,
+                    write_timeout: Duration::ZERO,
+                    ..UniplexConfig::default()
+                },
+            )
+            .expect("upstream H1 session");
+            let run = tokio::task::spawn_local(session.run());
+            let get = || {
+                HttpSourceHolder::new(Box::new(
+                    HttpFixedSource::make_get_request(b"/", None).unwrap(),
+                ))
+            };
+            for ready in &responses {
+                let mut response = handle
+                    .send_request(get(), CancellationToken::never())
+                    .await
+                    .expect("request is committed");
+                ready.notify_one();
+                let head = response.source.read_header_event().await.expect("head");
+                let mut eom = head.eom();
+                while !eom {
+                    eom = response
+                        .source
+                        .read_body_event(u32::MAX)
+                        .await
+                        .expect("body")
+                        .eom();
+                }
+            }
+            // Let the session finish the last exchange and park its reader on the EOF.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            let mut wakeups = 0;
+            while writer_probe::snapshot().join_passes.is_multiple_of(2) != even_poll_count {
+                assert!(wakeups < 64, "the session polls on a writer wakeup");
+                wakeups += 1;
+                handle.wake_writer_for_test();
+                tokio::task::yield_now().await;
+            }
+            let writes = state.borrow().writes.len();
+            let passes = writer_probe::snapshot().join_passes;
+            eof.notify_one();
+            let mut response = handle
+                .send_request(get(), CancellationToken::never())
+                .await
+                .expect("request is committed");
+            assert_eq!(
+                writer_probe::snapshot().join_passes,
+                passes,
+                "the session did not run between the EOF and the commit"
+            );
+            assert!(!response.request_started());
+            let head_error =
+                tokio::time::timeout(Duration::from_secs(5), response.source.read_header_event())
+                    .await
+                    .ok()
+                    .map(|head| head.err().expect("no response head arrives").code());
+            let outcome = ReadableEofCommit {
+                sequence_number: response.sequence_number,
+                started: response.request_started(),
+                head_error,
+                written: state.borrow().writes.len() > writes,
+            };
+            drop(response);
+            let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+            outcome
+        })
+    })
+}
+
+/// A readable EOF rejects a newly committed request without writing it,
+/// independently of the session's earlier poll count.
+#[test]
+fn a_request_committed_with_an_eof_already_readable_fails_unstarted_in_every_schedule() {
+    for prior_exchanges in [1, 2] {
+        for even_poll_count in [true, false] {
+            assert_eq!(
+                readable_eof_commit(prior_exchanges, even_poll_count),
+                ReadableEofCommit {
+                    sequence_number: prior_exchanges as u64,
+                    started: false,
+                    head_error: Some(HttpErrorCode::TRANSPORT_EOF),
+                    written: false,
+                },
+                "after {prior_exchanges} exchanges, at an even poll count {even_poll_count}"
+            );
+        }
+    }
+}

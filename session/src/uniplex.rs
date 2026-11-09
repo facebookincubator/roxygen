@@ -1,8 +1,8 @@
 //! Worker-local HTTP/1 byte-stream session driver.
 //!
 //! HTTP/1.1 writes batch ready events within the configured buffer and write limits.
-//! Upstream HTTP/1.1 rejects requests that peer EOF finds unserialized,
-//! leaving retry decisions to the caller (`DIV-035`).
+//! Upstream HTTP/1.1 polls reads before writes and rejects requests that peer EOF
+//! finds unserialized, leaving retry decisions to the caller (`DIV-035`, `DIV-042`).
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -4414,11 +4414,15 @@ async fn run_transport_loops(
         .http2
         .as_ref()
         .and_then(|http2| http2.ping_prober.clone());
+    let read_first_always = {
+        let state = state.borrow();
+        state.http2.is_none() && state.core().direction().is_upstream()
+    };
     {
         // Pinned write first so that the read loop drops first.
         let mut write = pin!(MaybeDone::Future(write));
         let mut read = pin!(MaybeDone::Future(read));
-        let loops = join_transport_loops(read.as_mut(), write.as_mut());
+        let loops = join_transport_loops(read.as_mut(), write.as_mut(), read_first_always);
         match ping_prober {
             // The probe timer ends with the transport loops. It is polled after
             // them, so a reply read in the same poll clears the probe first,
@@ -4460,13 +4464,15 @@ async fn run_transport_loops(
 }
 
 /// Polls the read and write loops, alternating which goes first on each poll
-/// and polling every pending loop with the task's own context. When the loop
+/// (with `read_first_always`, the read loop goes first on every poll) and
+/// polling every pending loop with the task's own context. When the loop
 /// polled second completes while the first is still pending, the first is
 /// polled once more in that pass so that it observes the completion without
 /// another task poll.
 async fn join_transport_loops<R, W>(
     mut read: Pin<&mut MaybeDone<R>>,
     mut write: Pin<&mut MaybeDone<W>>,
+    read_first_always: bool,
 ) where
     R: Future<Output = ()>,
     W: Future<Output = ()>,
@@ -4476,7 +4482,7 @@ async fn join_transport_loops<R, W>(
         #[cfg(test)]
         let (read_was_done, write_was_done) =
             (maybe_done_is_done(&read), maybe_done_is_done(&write));
-        let pass_read_first = read_first;
+        let pass_read_first = read_first || read_first_always;
         read_first = !read_first;
         let poll = if pass_read_first {
             poll_join_pass(read.as_mut(), write.as_mut(), task_context)

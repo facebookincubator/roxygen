@@ -1122,3 +1122,7 @@ mod recommended_router_params_tests;
 #[cfg(test)]
 #[path = "../tests/non_abortive_close.rs"]
 mod non_abortive_close_tests;
+
+#[cfg(test)]
+#[path = "../tests/read_before_write.rs"]
+mod read_before_write_tests;

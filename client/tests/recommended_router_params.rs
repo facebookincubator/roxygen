@@ -2,13 +2,12 @@
 //! compared with reqwest (most-recently-used reuse, hyper-util's interval
 //! sweep, no session timers, buffered ingress before abort (`DIV-033`), unframed
 //! bodyless requests (`DIV-036`), and non-abortive close (`DIV-038`)) against a
-//! raw HTTP/1.1 engine: a normal
-//! request, a bodiless one and a truncated response share one connection, the
-//! truncated response's bytes precede its error, the next request dials
-//! another, and that one idles out; a request cancelled before its response
-//! head closes its connection with FIN; and a request committed on a reused
-//! connection the engine closed fails unstarted, so the caller retries it on a
-//! fresh connection.
+//! raw HTTP/1.1 engine: a normal request, a bodiless one and a truncated
+//! response share one connection, the truncated response's bytes precede its
+//! error, the next request dials another, and that one idles out; a request
+//! cancelled before its response head closes its connection with FIN; and a
+//! request committed on a reused connection the engine closed fails unstarted,
+//! so the caller retries it on a fresh connection.
 
 use std::future::Future;
 use std::io::Read;
