@@ -7467,9 +7467,9 @@ fn response_published_before_the_reader_polls_beats_the_timeout() {
 
 /// Each wait for response data is timed afresh from the request's EOM on: a response whose head
 /// and body chunks each arrive within the stream read timeout is delivered whole, however long
-/// it takes in all. On the existing `TimedBaton` each armed wait costs one host sleep on either
-/// host (ST.3 moves the baton onto the wheel), and the stream read timeout takes no connection
-/// slot.
+/// it takes in all. On a wheel host each armed wait is a store on the stream baton's one slot,
+/// with no host sleep; without a wheel each armed wait takes one host sleep, as before. The stream
+/// read timeout takes no connection slot.
 #[test]
 fn trickling_response_is_timed_per_wait() {
     super::owned::on_both_hosts(|host, context| {
@@ -7537,13 +7537,25 @@ fn trickling_response_is_timed_per_wait() {
                 assert!(handle.close_when_idle().unwrap());
             });
             run.expect("the drained upstream connection closes cleanly");
-            assert_eq!(
-                host.sleeps(),
-                gates.len(),
-                "one host sleep per armed wait for response data"
-            );
             if wheel {
-                assert_eq!(host.wheel_stats().scheduled, 0);
+                let stats = host.wheel_stats();
+                assert_eq!(
+                    (
+                        host.sleeps(),
+                        stats.scheduled,
+                        stats.relinked,
+                        stats.live_slots
+                    ),
+                    (0, gates.len() as u64, 1, 0),
+                    "(host sleeps, schedules, links, slots left): each armed wait for response data is a \
+                     store on one slot"
+                );
+            } else {
+                assert_eq!(
+                    host.sleeps(),
+                    gates.len(),
+                    "one host sleep per armed wait for response data"
+                );
             }
         })
     });

@@ -123,6 +123,9 @@ pub mod h2 {
     fn run_on_worker<T: Send + 'static>(
         test: impl FnOnce(WorkerContext) -> Pin<Box<dyn Future<Output = T>>> + Send + 'static,
     ) -> T {
+        if crate::uniplex_tests::on_hosted_worker() {
+            return crate::uniplex_tests::run_on_hosted_worker(test);
+        }
         run_local(async move {
             let (worker, driver) = WorkerDriver::new(16).expect("worker driver");
             let call = worker
@@ -19379,6 +19382,50 @@ pub mod h2 {
             H2ErrorCode::ENHANCE_YOUR_CALM,
             HttpErrorCode::ENHANCE_YOUR_CALM,
         );
+    }
+
+    /// The HTTP/2 timer tests on a `HostedWorker`, whose wheel timer backs the
+    /// session's timed batons and host sleeps: idle and transport write timeouts in
+    /// both directions, upstream response and downstream request read timeouts (408),
+    /// custom timeout responses, buffer and flow-control timeouts and their
+    /// arbitration, GOAWAY drains, the reset rate limit's window, and byte events.
+    #[test]
+    fn h2_timers_on_a_hosted_worker() {
+        crate::uniplex_tests::on_hosted_workers(|| {
+            for direction in [TransportDirection::Upstream, TransportDirection::Downstream] {
+                assert_real_idle_timeout(direction);
+                assert_real_transport_write_timeout(direction);
+            }
+            for case in [
+                RequestTimeoutCase::PendingPost,
+                RequestTimeoutCase::CompletePost,
+                RequestTimeoutCase::CompletePostCustom,
+                RequestTimeoutCase::CompleteGet,
+            ] {
+                assert_real_upstream_response_timeout(case);
+            }
+            assert_real_downstream_request_read_timeout();
+            assert_real_partial_headers_use_connection_timeout();
+            assert_real_custom_timeout_response(408);
+            assert_real_custom_timeout_response(500);
+            assert_real_transaction_buffer_timeout();
+            complete_transfer_credit_preserves_zero_window_buffer_timeout();
+            upstream_full_buffer_case(FullBufferCase::Prefilled);
+            upstream_full_buffer_case(FullBufferCase::DisabledTimeout);
+            flow_timeout_retains_tokio_clock_origin();
+            timeout_arbitration_uses_tokio_expiration_clock();
+            assert_real_egress_flow_timeout(false);
+            assert_real_egress_flow_timeout(true);
+            assert_real_stream_flow_timeout_resets_every_blocked_stream();
+            assert_no_flow_timeout_without_buffered_body();
+            assert_real_downstream_request_between_goaways();
+            assert_real_upstream_single_goaway();
+            assert_upstream_double_drain_retires_without_final_goaway();
+            assert_first_wire_maximum_goaway_retires_idle_upstream();
+            assert_incoming_wire_maximum_goaway_keeps_timed_final_drain();
+            assert_real_reset_rate_limit_cancels_unrelated_active_request();
+            assert_real_byte_event_timeout();
+        });
     }
 
     #[test]

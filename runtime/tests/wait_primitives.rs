@@ -6,7 +6,9 @@ mod wait {
     use std::panic::catch_unwind;
     use std::panic::panic_any;
     use std::pin::Pin;
+    use std::pin::pin;
     use std::ptr;
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
@@ -21,27 +23,53 @@ mod wait {
     use std::time::Duration;
 
     use tokio::runtime::Builder;
+    use tokio::runtime::Runtime;
+    use tokio::task::LocalSet;
     use tokio::time;
 
     use crate::cancellation::CancellationRegistration;
     use crate::cancellation::CancellationSource;
     use crate::cancellation::CancellationToken;
     use crate::driver::WorkerDriver;
+    use crate::host::Host;
+    use crate::host::timer::WheelTimer;
+    use crate::host::timer::tests::count_allocations;
+    use crate::tokio_host::wheel_driving_tests::run_with_worker_wheel;
     use crate::wait::CancellableBaton;
     use crate::wait::DetachableCancellableBaton;
     use crate::wait::TimedBaton;
     use crate::wait::TimedCancellableBaton;
     use crate::wait::WaitStatus;
 
-    fn run_paused(test: impl Future<Output = ()>) {
+    fn paused_runtime() -> Runtime {
         Builder::new_current_thread()
             .enable_time()
             .build()
             .expect("current-thread test runtime")
-            .block_on(async {
-                time::pause();
-                test.await;
-            });
+    }
+
+    /// Runs `test` under a paused clock on both hosts: a bare runtime, where
+    /// the Tokio host has no wheel timer and a timed wait keeps a host sleep,
+    /// and a wheel host, where a worker supervisor drives a wheel timer for
+    /// this thread as a hosted worker's owner thread does.
+    fn run_paused<Test, Work>(test: Test)
+    where
+        Test: Fn() -> Work,
+        Work: Future<Output = ()>,
+    {
+        paused_runtime().block_on(async {
+            time::pause();
+            test().await;
+        });
+        run_on_wheel_host(test());
+    }
+
+    /// Runs `test` under a paused clock on a wheel host only.
+    fn run_on_wheel_host(test: impl Future<Output = ()>) {
+        LocalSet::new().block_on(&paused_runtime(), async {
+            time::pause();
+            run_with_worker_wheel(test).await;
+        });
     }
 
     struct PanickingWake;
@@ -390,7 +418,7 @@ mod wait {
 
     #[test]
     fn cancellable_signal() {
-        run_paused(async {
+        run_paused(|| async {
             let baton = CancellableBaton::new();
             let mut wait = Box::pin(baton.wait(CancellationToken::never()));
             assert!(futures::poll!(wait.as_mut()).is_pending());
@@ -402,7 +430,7 @@ mod wait {
 
     #[test]
     fn signal_before_wait() {
-        run_paused(async {
+        run_paused(|| async {
             let baton = CancellableBaton::new();
             baton.signal();
             assert!(baton.ready());
@@ -418,7 +446,7 @@ mod wait {
 
     #[test]
     fn cross_thread_cancel_resumes_on_owner() {
-        run_paused(async {
+        run_paused(|| async {
             let owner = std::thread::current().id();
             let source = CancellationSource::new();
             let token = source.token();
@@ -443,7 +471,7 @@ mod wait {
 
     #[test]
     fn cancellable_wait_updates_cancellation_waker() {
-        run_paused(async {
+        run_paused(|| async {
             let source = CancellationSource::new();
             let baton = CancellableBaton::new();
             let mut wait = Box::pin(baton.wait(source.token()));
@@ -480,7 +508,7 @@ mod wait {
 
     #[test]
     fn cancellable_wait_retries_panicking_waker_update() {
-        run_paused(async {
+        run_paused(|| async {
             for clone_fault in [1, 2] {
                 WAIT_WAKER_WAKES.set(0);
                 let source = CancellationSource::new();
@@ -553,7 +581,7 @@ mod wait {
 
     #[test]
     fn cancellable_wait_retries_panicking_unregister() {
-        run_paused(async {
+        run_paused(|| async {
             WAIT_WAKER_WAKES.set(0);
             let source = CancellationSource::new();
             let baton = CancellableBaton::new();
@@ -989,7 +1017,7 @@ mod wait {
 
     #[test]
     fn timeout_result() {
-        run_paused(async {
+        run_paused(|| async {
             let baton = TimedCancellableBaton::new(Duration::from_secs(2));
             let mut wait = Box::pin(baton.wait(CancellationToken::never()));
             assert!(futures::poll!(wait.as_mut()).is_pending());
@@ -1002,7 +1030,7 @@ mod wait {
 
     #[test]
     fn timeout_result_is_per_wait_while_post_remains_ready() {
-        run_paused(async {
+        run_paused(|| async {
             let baton = CancellableBaton::new();
             let mut first_wait =
                 Box::pin(baton.timed_wait(Duration::from_secs(2), CancellationToken::never()));
@@ -1025,7 +1053,7 @@ mod wait {
 
     #[test]
     fn cancellation_result_is_per_wait_while_post_remains_ready() {
-        run_paused(async {
+        run_paused(|| async {
             let source = CancellationSource::new();
             let baton = CancellableBaton::new();
             let mut first_wait = Box::pin(baton.wait(source.token()));
@@ -1046,7 +1074,7 @@ mod wait {
 
     #[test]
     fn cross_thread_cancel_posts_readiness_before_owner_repoll() {
-        run_paused(async {
+        run_paused(|| async {
             let source = CancellationSource::new();
             let token = source.token();
             let baton = CancellableBaton::new();
@@ -1069,7 +1097,7 @@ mod wait {
 
     #[test]
     fn cancellable_signal_then_cancel_before_repoll_prefers_cancellation() {
-        run_paused(async {
+        run_paused(|| async {
             let source = CancellationSource::new();
             let token = source.token();
             let baton = CancellableBaton::new();
@@ -1099,7 +1127,7 @@ mod wait {
 
     #[test]
     fn detach_disarms_timer_without_completing_wait() {
-        run_paused(async {
+        run_paused(|| async {
             let baton = DetachableCancellableBaton::new();
             let mut wait =
                 Box::pin(baton.timed_wait(Duration::from_secs(1), CancellationToken::never()));
@@ -1118,7 +1146,7 @@ mod wait {
 
     #[test]
     fn signal_before_timeout() {
-        run_paused(async {
+        run_paused(|| async {
             let baton = DetachableCancellableBaton::new();
             let mut wait =
                 Box::pin(baton.timed_wait(Duration::from_secs(5), CancellationToken::never()));
@@ -1259,7 +1287,7 @@ mod wait {
         }
 
         for state_updates in [true, false] {
-            run_paused(async {
+            run_paused(|| async {
                 let actions = Arc::new(Mutex::new(Vec::new()));
                 let _subscriber = tracing::subscriber::set_default(SleepSubscriber {
                     state_updates,
@@ -1321,7 +1349,7 @@ mod wait {
 
     #[test]
     fn timed_wait_updates_cancellation_waker() {
-        run_paused(async {
+        run_paused(|| async {
             let source = CancellationSource::new();
             let baton = TimedBaton::new(None);
             let mut wait = Box::pin(baton.wait(source.token()));
@@ -1358,7 +1386,7 @@ mod wait {
 
     #[test]
     fn timed_wait_retries_panicking_waker_update() {
-        run_paused(async {
+        run_paused(|| async {
             for clone_fault in [1, 2] {
                 WAIT_WAKER_WAKES.set(0);
                 let source = CancellationSource::new();
@@ -1431,7 +1459,7 @@ mod wait {
 
     #[test]
     fn timed_wait_retries_panicking_unregister() {
-        run_paused(async {
+        run_paused(|| async {
             WAIT_WAKER_WAKES.set(0);
             let source = CancellationSource::new();
             let baton = TimedBaton::new(None);
@@ -1479,7 +1507,7 @@ mod wait {
 
     #[test]
     fn timed_timeout() {
-        run_paused(async {
+        run_paused(|| async {
             let baton = TimedBaton::new(Some(Duration::from_secs(1)));
             let mut wait = Box::pin(baton.wait(CancellationToken::never()));
             assert!(futures::poll!(wait.as_mut()).is_pending());
@@ -1497,7 +1525,7 @@ mod wait {
 
     #[test]
     fn timed_deadline_can_change() {
-        run_paused(async {
+        run_paused(|| async {
             let baton = TimedBaton::new(None);
             let mut wait = Box::pin(baton.wait(CancellationToken::never()));
             assert!(futures::poll!(wait.as_mut()).is_pending());
@@ -1514,7 +1542,7 @@ mod wait {
 
     #[test]
     fn timed_without_deadline() {
-        run_paused(async {
+        run_paused(|| async {
             let source = CancellationSource::new();
             let baton = TimedBaton::new(None);
             let mut wait = Box::pin(baton.wait(source.token()));
@@ -1531,7 +1559,7 @@ mod wait {
 
     #[test]
     fn timed_disable_deadline() {
-        run_paused(async {
+        run_paused(|| async {
             let source = CancellationSource::new();
             let baton = TimedBaton::new(Some(Duration::from_secs(1)));
             let mut wait = Box::pin(baton.wait(source.token()));
@@ -1549,7 +1577,7 @@ mod wait {
 
     #[test]
     fn timed_signal() {
-        run_paused(async {
+        run_paused(|| async {
             let baton = TimedBaton::new(Some(Duration::from_secs(1)));
             let mut wait = Box::pin(baton.wait(CancellationToken::never()));
             assert!(futures::poll!(wait.as_mut()).is_pending());
@@ -1563,7 +1591,7 @@ mod wait {
 
     #[test]
     fn timed_cancel() {
-        run_paused(async {
+        run_paused(|| async {
             let source = CancellationSource::new();
             let baton = TimedBaton::new(Some(Duration::from_secs(1)));
             let mut wait = Box::pin(baton.wait(source.token()));
@@ -1587,7 +1615,7 @@ mod wait {
 
     #[test]
     fn signal_is_sticky() {
-        run_paused(async {
+        run_paused(|| async {
             let baton = TimedBaton::new(Some(Duration::from_secs(1)));
             baton.signal();
             assert_eq!(
@@ -1600,7 +1628,7 @@ mod wait {
 
     #[test]
     fn cross_thread_cancel_marshals_to_owner() {
-        run_paused(async {
+        run_paused(|| async {
             let owner = std::thread::current().id();
             let source = CancellationSource::new();
             let token = source.token();
@@ -1625,7 +1653,7 @@ mod wait {
 
     #[test]
     fn drop_wakes_waiter_as_cancelled() {
-        run_paused(async {
+        run_paused(|| async {
             let baton = TimedBaton::new(Some(Duration::from_secs(10)));
             let mut wait = Box::pin(baton.wait(CancellationToken::never()));
             assert!(futures::poll!(wait.as_mut()).is_pending());
@@ -1644,7 +1672,7 @@ mod wait {
 
     #[test]
     fn signal_vs_timeout_commit_order() {
-        run_paused(async {
+        run_paused(|| async {
             let signal_first = TimedBaton::new(Some(Duration::from_secs(1)));
             let mut signal_wait = Box::pin(signal_first.wait(CancellationToken::never()));
             assert!(futures::poll!(signal_wait.as_mut()).is_pending());
@@ -1667,7 +1695,7 @@ mod wait {
 
     #[test]
     fn cancel_vs_timeout_commit_order() {
-        run_paused(async {
+        run_paused(|| async {
             let local_source = CancellationSource::new();
             let local = TimedBaton::new(Some(Duration::from_secs(1)));
             let mut local_wait = Box::pin(local.wait(local_source.token()));
@@ -1706,7 +1734,7 @@ mod wait {
 
     #[test]
     fn future_drop_unregisters_hooks_on_owner() {
-        run_paused(async {
+        run_paused(|| async {
             let timed_source = CancellationSource::new();
             let timed_token = timed_source.token();
             let timed_baton = TimedBaton::new(Some(Duration::from_secs(1)));
@@ -1758,7 +1786,7 @@ mod wait {
 
     #[test]
     fn timed_wait_drop_commits_cancellation_that_won_teardown() {
-        run_paused(async {
+        run_paused(|| async {
             let source = CancellationSource::new();
             let token = source.token();
             let baton = TimedBaton::new(None);
@@ -1783,7 +1811,7 @@ mod wait {
 
     #[test]
     fn timed_wait_drop_unregisters_before_later_cancellation() {
-        run_paused(async {
+        run_paused(|| async {
             let baton = TimedBaton::new(None);
 
             let unpolled_source = CancellationSource::new();
@@ -1822,7 +1850,7 @@ mod wait {
 
     #[test]
     fn timed_wait_drop_preserves_committed_timeout() {
-        run_paused(async {
+        run_paused(|| async {
             let source = CancellationSource::new();
             let token = source.token();
             let baton = TimedBaton::new(Some(Duration::from_secs(1)));
@@ -1843,6 +1871,314 @@ mod wait {
             drop(wait);
             assert_eq!(token.registration_count(), 0);
             assert_eq!(baton.status(), WaitStatus::TimedOut);
+        });
+    }
+
+    /// `set_timeout` on a waiting baton moves its deadline later and earlier,
+    /// from the instant of the call (`RUN-004`): a later deadline is a store
+    /// on the wheel and an earlier one relinks the slot.
+    #[test]
+    fn set_timeout_while_waiting_moves_the_deadline_both_ways() {
+        run_paused(|| async {
+            let start = time::Instant::now();
+            let extended = TimedBaton::new(Some(Duration::from_secs(1)));
+            let mut extended_wait = Box::pin(extended.wait(CancellationToken::never()));
+            assert!(futures::poll!(extended_wait.as_mut()).is_pending());
+            time::advance(Duration::from_millis(500)).await;
+            extended.set_timeout(Some(Duration::from_secs(2)));
+            assert!(futures::poll!(extended_wait.as_mut()).is_pending());
+            time::advance(Duration::from_millis(1_000)).await;
+            assert!(futures::poll!(extended_wait.as_mut()).is_pending());
+            assert_eq!(extended_wait.await, WaitStatus::TimedOut);
+            let extended_at = start.elapsed();
+            assert!(
+                (Duration::from_millis(2_500)..=Duration::from_millis(2_501))
+                    .contains(&extended_at),
+                "extended at 500 ms to 2 s: timed out at {extended_at:?}"
+            );
+
+            let start = time::Instant::now();
+            let shortened = TimedBaton::new(Some(Duration::from_secs(10)));
+            let mut shortened_wait = Box::pin(shortened.wait(CancellationToken::never()));
+            assert!(futures::poll!(shortened_wait.as_mut()).is_pending());
+            shortened.set_timeout(Some(Duration::from_millis(300)));
+            assert_eq!(shortened_wait.await, WaitStatus::TimedOut);
+            let shortened_at = start.elapsed();
+            assert!(
+                (Duration::from_millis(300)..=Duration::from_millis(301)).contains(&shortened_at),
+                "shortened from 10 s to 300 ms: timed out at {shortened_at:?}"
+            );
+        });
+    }
+
+    /// A deadline that `set_timeout` moved, and that is due by the wait's next
+    /// poll, times the wait out in that poll, before a later signal, exactly
+    /// when a Tokio sleep made for it then is ready at its first poll, as the
+    /// host sleep made at that poll was (`RUN-004`): on a timed wait, whose
+    /// timeout is re-armed, and on an untimed one, whose timeout is armed
+    /// first. Tokio rounds a deadline up to its next millisecond tick, so one
+    /// just due may not be; 100 ms past the deadline it is.
+    #[test]
+    fn a_moved_deadline_due_by_the_next_poll_times_out_in_that_poll() {
+        run_paused(|| async {
+            for initial in [Some(Duration::from_secs(10)), None] {
+                for delay in [Duration::from_millis(300), Duration::from_millis(400)] {
+                    let baton = TimedBaton::new(initial);
+                    let mut wait = Box::pin(baton.wait(CancellationToken::never()));
+                    assert!(futures::poll!(wait.as_mut()).is_pending());
+                    baton.set_timeout(Some(Duration::from_millis(300)));
+                    let deadline = time::Instant::now() + Duration::from_millis(300);
+                    time::advance(delay).await;
+                    let mut tokio_sleep = pin!(time::sleep_until(deadline));
+                    let due = futures::poll!(tokio_sleep.as_mut()).is_ready();
+                    assert!(futures::poll!(wait.as_mut()).is_pending());
+                    baton.signal();
+                    let expected = if due {
+                        WaitStatus::TimedOut
+                    } else {
+                        WaitStatus::Signalled
+                    };
+                    assert_eq!(
+                        wait.await,
+                        expected,
+                        "a 300 ms deadline set on a wait timed {initial:?}, polled {delay:?} after \
+                         it was set (Tokio sleep ready: {due})"
+                    );
+                    assert!(
+                        due || delay < Duration::from_millis(400),
+                        "a Tokio sleep is ready 100 ms past its deadline"
+                    );
+                }
+            }
+        });
+    }
+
+    /// The wheel timer of this thread's worker, on a wheel host.
+    fn wheel() -> Rc<WheelTimer> {
+        Host::tokio().wheel_timer().expect("a wheel host")
+    }
+
+    /// On a wheel host, an armed wait takes a slot on the wheel instead of a
+    /// host sleep and times out at its deadline, never earlier; dropping a
+    /// waiting baton and its wait frees the slot (`RUN-003`).
+    #[test]
+    fn armed_waits_take_a_wheel_slot_on_a_wheel_host() {
+        run_on_wheel_host(async {
+            let wheel = wheel();
+            let start = time::Instant::now();
+            let timed = TimedBaton::new(Some(Duration::from_secs(1)));
+            let mut timed_wait = Box::pin(timed.wait(CancellationToken::never()));
+            let cancellable = CancellableBaton::new();
+            let mut cancellable_wait = Box::pin(
+                cancellable.timed_wait(Duration::from_secs(2), CancellationToken::never()),
+            );
+            assert!(futures::poll!(timed_wait.as_mut()).is_pending());
+            assert!(futures::poll!(cancellable_wait.as_mut()).is_pending());
+            let armed = wheel.stats();
+            assert_eq!(
+                (armed.live_slots, armed.armed),
+                (2, 2),
+                "one armed slot per waiting baton: {armed:?}"
+            );
+
+            assert_eq!(timed_wait.await, WaitStatus::TimedOut);
+            let timed_out = start.elapsed();
+            assert_eq!(cancellable_wait.await, WaitStatus::TimedOut);
+            let cancellable_out = start.elapsed();
+            assert!(
+                (Duration::from_secs(1)..=Duration::from_millis(1_001)).contains(&timed_out),
+                "{timed_out:?}"
+            );
+            assert!(
+                (Duration::from_secs(2)..=Duration::from_millis(2_001)).contains(&cancellable_out),
+                "{cancellable_out:?}"
+            );
+            assert_eq!(wheel.stats().fired, 2);
+
+            let dropped = TimedBaton::new(Some(Duration::from_secs(1)));
+            let mut dropped_wait = Box::pin(dropped.wait(CancellationToken::never()));
+            assert!(futures::poll!(dropped_wait.as_mut()).is_pending());
+            assert_eq!(wheel.stats().armed, 1);
+            drop(dropped);
+            drop(dropped_wait);
+            let stats = wheel.stats();
+            assert_eq!(
+                (stats.live_slots, stats.armed),
+                (2, 0),
+                "the dropped baton freed its slot: {stats:?}"
+            );
+        });
+    }
+
+    /// Successive armed waits on one baton reuse its one slot: each later
+    /// deadline is a store, so only the first wait links the slot.
+    #[test]
+    fn successive_waits_on_one_baton_keep_one_slot() {
+        run_on_wheel_host(async {
+            let wheel = wheel();
+            let timed = TimedBaton::new(Some(Duration::from_secs(1)));
+            let cancellable = CancellableBaton::new();
+            for _ in 0..10 {
+                let mut timed_wait = Box::pin(timed.wait(CancellationToken::never()));
+                let mut cancellable_wait = Box::pin(
+                    cancellable.timed_wait(Duration::from_secs(1), CancellationToken::never()),
+                );
+                assert!(futures::poll!(timed_wait.as_mut()).is_pending());
+                assert!(futures::poll!(cancellable_wait.as_mut()).is_pending());
+                time::advance(Duration::from_millis(100)).await;
+                timed.signal();
+                cancellable.signal();
+                assert_eq!(timed_wait.await, WaitStatus::Signalled);
+                assert_eq!(cancellable_wait.await, WaitStatus::Signalled);
+                timed.reset();
+                cancellable.reset();
+            }
+            let stats = wheel.stats();
+            assert_eq!(
+                (
+                    stats.live_slots,
+                    stats.armed,
+                    stats.scheduled,
+                    stats.relinked,
+                    stats.fired
+                ),
+                (2, 0, 20, 2, 0),
+                "(slots, armed, schedules, links, fires): {stats:?}"
+            );
+        });
+    }
+
+    /// A signal beats a timeout that fired on the wheel but that the waiter
+    /// has not observed yet: the waiter commits in its own poll, where the
+    /// signal is seen first (`RUN-004`).
+    #[test]
+    fn a_signal_beats_a_fired_but_unobserved_timeout() {
+        run_on_wheel_host(async {
+            let wheel = wheel();
+            let timed = TimedBaton::new(Some(Duration::from_secs(1)));
+            let mut timed_wait = Box::pin(timed.wait(CancellationToken::never()));
+            let cancellable = CancellableBaton::new();
+            let mut cancellable_wait = Box::pin(
+                cancellable.timed_wait(Duration::from_secs(1), CancellationToken::never()),
+            );
+            assert!(futures::poll!(timed_wait.as_mut()).is_pending());
+            assert!(futures::poll!(cancellable_wait.as_mut()).is_pending());
+            time::advance(Duration::from_secs(1)).await;
+            assert_eq!(wheel.stats().fired, 2, "both timeouts fired unobserved");
+
+            timed.signal();
+            cancellable.signal();
+            assert_eq!(timed_wait.await, WaitStatus::Signalled);
+            assert_eq!(cancellable_wait.await, WaitStatus::Signalled);
+            assert_eq!(timed.status(), WaitStatus::Signalled);
+        });
+    }
+
+    /// A wheel stopped while waits are armed (`~HHWheelTimer`'s `cancelAll`,
+    /// as at a worker's teardown) completes them as cancelled, the destroyed
+    /// baton's outcome (`RUN-008`), and so it does a wait armed after it.
+    #[test]
+    fn a_stopped_wheel_cancels_armed_waits() {
+        run_on_wheel_host(async {
+            let timed = TimedBaton::new(Some(Duration::from_secs(1)));
+            let mut timed_wait = Box::pin(timed.wait(CancellationToken::never()));
+            let cancellable = CancellableBaton::new();
+            let mut cancellable_wait = Box::pin(
+                cancellable.timed_wait(Duration::from_secs(1), CancellationToken::never()),
+            );
+            assert!(futures::poll!(timed_wait.as_mut()).is_pending());
+            assert!(futures::poll!(cancellable_wait.as_mut()).is_pending());
+            assert_eq!(wheel().stop(), 2, "two armed timeouts stopped");
+
+            assert_eq!(timed_wait.await, WaitStatus::Cancelled);
+            assert_eq!(timed.status(), WaitStatus::Cancelled);
+            assert_eq!(cancellable_wait.await, WaitStatus::Cancelled);
+            assert!(cancellable.ready());
+
+            let late = CancellableBaton::new();
+            assert_eq!(
+                late.timed_wait(Duration::from_secs(1), CancellationToken::never())
+                    .await,
+                WaitStatus::Cancelled
+            );
+        });
+    }
+
+    /// On a wheel host an armed wait on a reused baton allocates nothing,
+    /// where a Tokio sleep took one allocation per wait; a fresh baton and
+    /// its armed wait allocate only the baton's state; an untimed wait
+    /// allocates nothing. The counts are observable only where std's
+    /// allocations reach this crate's counting allocator (opt builds).
+    #[test]
+    fn armed_waits_allocate_nothing_on_a_wheel_host() {
+        run_on_wheel_host(async {
+            let waker = futures::task::noop_waker();
+            let mut context = Context::from_waker(&waker);
+            let timed = TimedBaton::new(Some(Duration::from_secs(1)));
+            let cancellable = CancellableBaton::new();
+            let untimed = TimedBaton::new(None);
+            let mut reused = || {
+                let mut wait = pin!(timed.wait(CancellationToken::never()));
+                assert!(wait.as_mut().poll(&mut context).is_pending());
+                timed.signal();
+                assert_eq!(
+                    wait.as_mut().poll(&mut context),
+                    Poll::Ready(WaitStatus::Signalled)
+                );
+                timed.reset();
+                let mut wait = pin!(
+                    cancellable.timed_wait(Duration::from_secs(1), CancellationToken::never())
+                );
+                assert!(wait.as_mut().poll(&mut context).is_pending());
+                cancellable.signal();
+                assert_eq!(
+                    wait.as_mut().poll(&mut context),
+                    Poll::Ready(WaitStatus::Signalled)
+                );
+                cancellable.reset();
+            };
+            reused();
+            let reused_allocations = count_allocations(|| (0..10).for_each(|_| reused()));
+            let mut fresh = || {
+                let baton = TimedBaton::new(Some(Duration::from_secs(1)));
+                let mut wait = pin!(baton.wait(CancellationToken::never()));
+                assert!(wait.as_mut().poll(&mut context).is_pending());
+                baton.signal();
+                assert_eq!(
+                    wait.as_mut().poll(&mut context),
+                    Poll::Ready(WaitStatus::Signalled)
+                );
+            };
+            fresh();
+            let fresh_allocations = count_allocations(|| (0..10).for_each(|_| fresh()));
+            let untimed_allocations = count_allocations(|| {
+                for _ in 0..10 {
+                    let mut wait = pin!(untimed.wait(CancellationToken::never()));
+                    assert!(wait.as_mut().poll(&mut context).is_pending());
+                    untimed.signal();
+                    assert_eq!(
+                        wait.as_mut().poll(&mut context),
+                        Poll::Ready(WaitStatus::Signalled)
+                    );
+                    untimed.reset();
+                }
+            });
+
+            if let (Some(reused), Some(fresh), Some(untimed)) =
+                (reused_allocations, fresh_allocations, untimed_allocations)
+            {
+                assert_eq!(
+                    (reused, fresh, untimed),
+                    (0, 10, 0),
+                    "(20 armed waits on reused batons, 10 fresh batons with an armed wait, \
+                     10 untimed waits)"
+                );
+            }
+            assert_eq!(
+                wheel().stats().scheduled,
+                33,
+                "every armed wait was scheduled on the wheel"
+            );
         });
     }
 

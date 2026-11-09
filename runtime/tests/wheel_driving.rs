@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::future::pending;
 use std::future::ready;
 use std::panic::panic_any;
+use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -14,13 +15,20 @@ use std::sync::mpsc;
 use std::task::Wake;
 use std::time::Instant;
 
+use futures::FutureExt;
 use futures::task::noop_waker;
 
 use super::*;
+use crate::cancellation::CancellationSource;
+use crate::cancellation::CancellationToken;
 use crate::host::LocalFuture;
 use crate::host::LocalHost;
 use crate::host::timer::Expiry;
 use crate::host::timer::Timeout;
+use crate::host::timer::tests::count_allocations;
+use crate::wait::CancellableBaton;
+use crate::wait::TimedBaton;
+use crate::wait::WaitStatus;
 use crate::worker::QuiesceDeadline;
 use crate::worker::WorkerContext;
 
@@ -78,6 +86,36 @@ where
         .recv_timeout(TEST_TIMEOUT)
         .expect("the paused worker finishes within the test timeout");
     owner.join().expect("the paused worker's thread exits");
+    output
+}
+
+/// Runs `test` on this thread beside a worker supervisor
+/// (`run_managed_driver`) that drives a wheel timer for the thread, as a
+/// hosted worker's owner thread does, then shuts the supervisor down. It must
+/// run inside a `LocalSet` on a runtime with time enabled. The supervisor
+/// installs the wheel before `test` is first polled, so the Tokio host
+/// reports the wheel to everything `test` makes. A panic of `test` is
+/// re-raised once the supervisor has shut down.
+pub(crate) async fn run_with_worker_wheel<Work: Future>(test: Work) -> Work::Output {
+    let (handle, driver) =
+        WorkerDriver::with_host(1, Host::tokio()).expect("worker driver is created");
+    let shutdown = handle.clone();
+    let test = async move {
+        let output = AssertUnwindSafe(async {
+            assert!(
+                Host::tokio().wheel_timer().is_some(),
+                "the supervisor installed its wheel"
+            );
+            test.await
+        })
+        .catch_unwind()
+        .await;
+        shutdown.begin_shutdown();
+        output
+    };
+    let (driven, output) = futures::future::join(run_managed_driver(handle, driver), test).await;
+    let output = output.unwrap_or_else(|payload| resume_unwind(payload));
+    driven.expect("the worker shuts down cleanly");
     output
 }
 
@@ -395,6 +433,24 @@ fn run_commands(handle: &WorkerHandle, polls: usize) {
     }
 }
 
+/// Runs commands on `handle`'s worker until its supervisor has been polled
+/// at least `polls` times since `since` was taken, and returns the counts
+/// then. Commands that the worker runs within one `LocalSet` tick share the
+/// supervisor poll after it, so how many commands that takes varies.
+fn poll_supervisor(handle: &WorkerHandle, since: WakeupCounts, polls: usize) -> WakeupCounts {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        let now = counts(handle);
+        if now.supervisor_polls - since.supervisor_polls >= polls {
+            return now;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the supervisor is polled {polls} times within the test timeout: {since:?} {now:?}"
+        );
+    }
+}
+
 /// The supervisor polls the wheel's sleep only when Tokio may have fired it,
 /// or when Tokio must take the supervisor's waker for it. Its other polls,
 /// after the wheel has emptied and while a far timeout is armed, poll no
@@ -573,6 +629,177 @@ fn a_worker_with_no_timers_allocates_no_sleep() {
     }
 }
 
+/// The zero-config guard for batons: untimed waits on timed and cancellable
+/// batons, signalled or cancelled, create no wheel and no `Sleep`, on hosted
+/// and managed workers.
+#[test]
+fn untimed_baton_waits_on_a_worker_create_no_wheel() {
+    let hosted = hosted_worker("rox-wheel-untimed-batons");
+    let managed = ManagedWorker::new(4).expect("managed worker starts");
+    for handle in [hosted.handle(), managed.handle()] {
+        wait(
+            handle
+                .call_local(|_| async {
+                    for baton in [TimedBaton::new(None), TimedBaton::new(Some(Duration::ZERO))] {
+                        let mut wait = pin!(baton.wait(CancellationToken::never()));
+                        assert!(futures::poll!(wait.as_mut()).is_pending());
+                        baton.signal();
+                        assert_eq!(wait.await, WaitStatus::Signalled);
+                    }
+                    let baton = CancellableBaton::new();
+                    let mut wait =
+                        pin!(baton.timed_wait(Duration::ZERO, CancellationToken::never()));
+                    assert!(futures::poll!(wait.as_mut()).is_pending());
+                    baton.signal();
+                    assert_eq!(wait.await, WaitStatus::Signalled);
+                    baton.reset();
+                    let source = CancellationSource::new();
+                    let mut wait = pin!(baton.wait(source.token()));
+                    assert!(futures::poll!(wait.as_mut()).is_pending());
+                    source.request_cancellation();
+                    assert_eq!(wait.await, WaitStatus::Cancelled);
+                })
+                .expect("command admitted"),
+        )
+        .expect("command returns");
+        let counts = counts(&handle);
+        assert_eq!(
+            (counts.wheels, counts.sleeps, counts.sleep_polls),
+            (0, 0, 0),
+            "(wheels, sleeps, sleep polls)"
+        );
+    }
+}
+
+/// On a worker, the Tokio host's `sleep_until` is a timeout on the worker's
+/// wheel instead of a Tokio `Sleep`: it takes a slot at its first poll,
+/// resolves at the instant a Tokio sleep with the same deadline does, never
+/// earlier, frees its slot when it resolves, and stays resolved.
+#[test]
+fn tokio_host_sleeps_use_the_worker_wheel() {
+    let (armed, slept, tokio_slept, after) = on_paused_worker(|_| async move {
+        let host = Host::tokio();
+        let wheel = host.wheel_timer().expect("the worker has a wheel");
+        let start = host.now();
+        let deadline = start + Duration::from_micros(7_500);
+        let mut sleep = host.sleep_until(deadline);
+        let mut tokio = Box::pin(tokio::time::sleep_until(deadline.into()));
+        assert!(futures::poll!(sleep.as_mut()).is_pending());
+        assert!(futures::poll!(tokio.as_mut()).is_pending());
+        let armed = wheel.stats();
+        let (mut slept, mut tokio_slept) = (None, None);
+        poll_fn(|task| {
+            let now = host.now() - start;
+            if slept.is_none() && sleep.as_mut().poll(task).is_ready() {
+                slept = Some(now);
+            }
+            if tokio_slept.is_none() && tokio.as_mut().poll(task).is_ready() {
+                tokio_slept = Some(now);
+            }
+            if slept.is_some() && tokio_slept.is_some() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        assert!(
+            futures::poll!(sleep.as_mut()).is_ready(),
+            "a resolved sleep stays resolved"
+        );
+        (armed, slept, tokio_slept, wheel.stats())
+    });
+    assert_eq!(
+        (armed.scheduled, armed.armed, armed.live_slots),
+        (1, 1, 1),
+        "(schedules, armed, slots) after the first poll: {armed:?}"
+    );
+    assert_eq!(slept, tokio_slept, "resolved when the Tokio sleep did");
+    assert!(
+        slept.is_some_and(|slept| slept >= Duration::from_micros(7_500)),
+        "never early: {slept:?}"
+    );
+    assert_eq!(
+        (after.fired, after.armed, after.live_slots),
+        (1, 0, 0),
+        "(fires, armed, slots) once resolved: {after:?}"
+    );
+}
+
+/// A Tokio host sleep still pending when its worker's wheel stops resolves at
+/// its deadline, as a Tokio sleep, never earlier; and so does one made after.
+#[test]
+fn a_host_sleep_outliving_its_wheel_resolves_at_its_deadline() {
+    let (pending, made_after) = on_paused_worker(|_| async move {
+        let host = Host::tokio();
+        let start = host.now();
+        let mut sleep = host.sleep_until(start + ms(10));
+        assert!(futures::poll!(sleep.as_mut()).is_pending());
+        host.wheel_timer().expect("the worker has a wheel").stop();
+        sleep.await;
+        let pending = host.now() - start;
+        let start = host.now();
+        host.sleep_until(start + ms(5)).await;
+        (pending, host.now() - start)
+    });
+    assert_eq!((pending, made_after), (ms(10), ms(5)));
+}
+
+/// On a worker, a Tokio host sleep whose deadline is due by its first poll is
+/// ready at that poll exactly when a Tokio sleep made then is, so it wins an
+/// arbitration that polls it first against ready work when that Tokio sleep
+/// would (Uniplex makes its flow, buffer and GOAWAY sleeps anew at each
+/// arbitration). Tokio rounds a deadline up to its next millisecond tick: at a
+/// deadline on a tick, and after one, both are ready; half a tick before the
+/// rounded deadline neither is. None schedules on the wheel.
+#[test]
+fn a_due_host_sleep_is_ready_at_its_first_poll_when_a_tokio_sleep_is() {
+    let (picks, scheduled) = on_paused_worker(|_| async move {
+        let host = Host::tokio();
+        let wheel = host.wheel_timer().expect("the worker has a wheel");
+        let start = host.now();
+        let on_tick = start + ms(5);
+        let off_tick = start + Duration::from_micros(6_500);
+        let half_tick = Duration::from_micros(500);
+        let mut picks = Vec::new();
+        for (advance, deadline) in [
+            (ms(5), on_tick),
+            (ms(1), on_tick),
+            (half_tick, off_tick),
+            (half_tick, off_tick),
+        ] {
+            tokio::time::advance(advance).await;
+            let host_pick = tokio::select! {
+                biased;
+                () = host.sleep_until(deadline) => "timer",
+                () = ready(()) => "work",
+            };
+            let tokio_pick = tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(deadline.into()) => "timer",
+                () = ready(()) => "work",
+            };
+            picks.push((host_pick, tokio_pick));
+        }
+        (picks, wheel.stats().scheduled)
+    });
+    assert_eq!(
+        picks,
+        [
+            ("timer", "timer"),
+            ("timer", "timer"),
+            ("work", "work"),
+            ("timer", "timer"),
+        ],
+        "(host sleep, Tokio sleep): at a deadline on a tick, 1 ms after it, at a deadline \
+         half a tick before its rounded deadline, and at that rounded deadline"
+    );
+    assert_eq!(
+        scheduled, 0,
+        "a due host sleep schedules nothing on the wheel"
+    );
+}
+
 /// Until a timer creates the wheel, a supervisor poll only checks that it
 /// does not exist, and never calls the wheel step, on hosted and managed
 /// workers.
@@ -588,11 +815,12 @@ fn a_supervisor_poll_with_no_wheel_calls_no_wheel_step() {
     }
 }
 
-/// Once a timer has created the wheel, every supervisor poll runs the wheel
-/// step (refreshing the supervisor's waker and checking the sleep), on hosted
-/// and managed workers, even with no timeout armed.
+/// Once a timer has created the wheel, a supervisor poll runs the wheel step
+/// only while the wheel's wakeup is due: never with nothing armed, and once
+/// for an arm, the poll that has Tokio take the supervisor's waker for the
+/// new sleep, on hosted and managed workers.
 #[test]
-fn once_the_wheel_exists_every_supervisor_poll_steps_it() {
+fn a_supervisor_poll_steps_the_wheel_only_while_its_wakeup_is_due() {
     let hosted = hosted_worker("rox-wheel-present");
     let managed = ManagedWorker::new(4).expect("managed worker starts");
     for handle in [hosted.handle(), managed.handle()] {
@@ -607,18 +835,247 @@ fn once_the_wheel_exists_every_supervisor_poll_steps_it() {
                 .expect("command admitted"),
         )
         .expect("command returns");
-        let before = counts(&handle);
-        run_commands(&handle, 50);
-        let after = counts(&handle);
-        let polls = after.supervisor_polls - before.supervisor_polls;
-        assert!(polls >= 50, "{before:?} {after:?}");
+        let created = counts(&handle);
+        let idle = poll_supervisor(&handle, created, 50);
         assert_eq!(
             (
-                after.wheel_drives - before.wheel_drives,
-                after.wheel_steps - before.wheel_steps
+                idle.wheel_drives - created.wheel_drives,
+                idle.wheel_steps - created.wheel_steps
             ),
-            (polls, polls),
-            "(wheel step calls, wheel steps) per supervisor poll: {before:?} {after:?}"
+            (0, 0),
+            "(wheel step calls, wheel steps) over 50 supervisor polls with nothing armed: {created:?} {idle:?}"
+        );
+
+        wait(
+            handle
+                .call(|context| {
+                    let mut timeout = Timeout::new(context.host());
+                    timeout.schedule_at(
+                        context.host().now() + Duration::from_secs(600),
+                        &noop_waker(),
+                    );
+                    KEPT.with_borrow_mut(|kept| kept.push(timeout));
+                })
+                .expect("command admitted"),
+        )
+        .expect("command returns");
+        let armed = poll_supervisor(&handle, idle, 50);
+        wait(
+            handle
+                .call(|_| drop(KEPT.take()))
+                .expect("command admitted"),
+        )
+        .expect("command returns");
+        assert_eq!(
+            (
+                armed.wheel_drives - idle.wheel_drives,
+                armed.wheel_steps - idle.wheel_steps,
+                armed.sleep_polls - idle.sleep_polls
+            ),
+            (1, 1, 1),
+            "(wheel step calls, wheel steps, sleep polls) for one far arm: {idle:?} {armed:?}"
+        );
+    }
+}
+
+/// The zero-config residue guard (LR-P39): with session timers off, a
+/// worker's only timed wait (an engine dial's connect bound) creates the
+/// wheel and arms its wakeup. Once that wait completes and its baton drops,
+/// the wheel has withdrawn the wakeup, dropping its Tokio sleep, so Tokio's
+/// parks are untimed again, and later supervisor polls leave the wheel alone,
+/// on hosted and managed workers.
+#[test]
+fn a_one_shot_wait_leaves_no_wakeup_behind() {
+    let hosted = hosted_worker("rox-wheel-one-shot");
+    let managed = ManagedWorker::new(4).expect("managed worker starts");
+    for handle in [hosted.handle(), managed.handle()] {
+        let before = counts(&handle);
+        let stats = wait(
+            handle
+                .call_local(|context| async move {
+                    {
+                        let baton = TimedBaton::new(Some(Duration::from_secs(30)));
+                        let mut wait = pin!(baton.wait(CancellationToken::never()));
+                        assert!(futures::poll!(wait.as_mut()).is_pending());
+                        tokio::task::yield_now().await;
+                        baton.signal();
+                        assert_eq!(wait.await, WaitStatus::Signalled);
+                    }
+                    context
+                        .host()
+                        .wheel_timer()
+                        .expect("the worker's host has a wheel")
+                        .stats()
+                })
+                .expect("command admitted"),
+        )
+        .expect("command returns");
+        let withdrawn = counts(&handle);
+        let after = poll_supervisor(&handle, withdrawn, 100);
+
+        assert_eq!(
+            (stats.scheduled, stats.armed, stats.live_slots),
+            (1, 0, 0),
+            "(schedules, armed, slots) once the baton dropped: {stats:?}"
+        );
+        assert_eq!(
+            (
+                withdrawn.wheels - before.wheels,
+                withdrawn.withdrawals - before.withdrawals
+            ),
+            (1, 1),
+            "(wheels created, wakeups withdrawn): {before:?} {withdrawn:?}"
+        );
+        assert_eq!(
+            (
+                after.wheel_drives - withdrawn.wheel_drives,
+                after.sleep_polls - withdrawn.sleep_polls
+            ),
+            (0, 0),
+            "(wheel step calls, sleep polls) over 100 supervisor polls after the withdrawal: {withdrawn:?} {after:?}"
+        );
+    }
+}
+
+/// A wakeup the wheel withdrew is re-armed by its next arm: the sleep is made
+/// anew in its box and the supervisor is woken once to have Tokio take its
+/// waker (design §2.5: arming never polls the sleep), and the timeout fires
+/// at its deadline, round after round, under a paused clock.
+#[test]
+fn a_re_arm_after_a_withdrawal_wakes_the_supervisor_once_and_fires_at_its_deadline() {
+    let rounds = on_paused_worker(|context| async move {
+        let host = context.host().clone();
+        let mut rounds = Vec::new();
+        for _ in 0..3 {
+            let mut withdrawn = Timeout::new(&host);
+            withdrawn.schedule_at(host.now() + Duration::from_secs(30), &noop_waker());
+            tokio::task::yield_now().await;
+            let freed = wakeup_counts();
+            drop(withdrawn);
+            let before = wakeup_counts();
+            let start = host.now();
+            let expiry = wait_timeout(host.clone(), ms(5)).await;
+            let after = wakeup_counts();
+            rounds.push((
+                expiry,
+                host.now() - start,
+                before.withdrawals - freed.withdrawals,
+                after.supervisor_wakes - before.supervisor_wakes,
+                after.sleeps - before.sleeps,
+            ));
+        }
+        rounds
+    });
+    assert_eq!(
+        rounds,
+        vec![(Expiry::Elapsed, ms(5), 1, 1, 1); 3],
+        "(expiry, fired after, withdrawals at the free, supervisor wakes, sleeps made) per round"
+    );
+}
+
+/// A cancelled slot stays linked, so a later arm no earlier than its link is
+/// covered by the wakeup without a new request: neither the cancel nor
+/// freeing another slot while it is linked withdraws the wakeup, and the
+/// re-armed slot fires at its deadline, under a paused clock.
+#[test]
+fn a_cancelled_slot_re_armed_while_linked_still_fires() {
+    async fn re_arm(timeout: &mut Timeout, deadline: Instant) -> Expiry {
+        let mut scheduled = false;
+        poll_fn(|task| {
+            if !scheduled {
+                timeout.schedule_at(deadline, task.waker());
+                scheduled = true;
+            }
+            timeout.poll_expired(task)
+        })
+        .await
+    }
+
+    let (lone, beside_freed) = on_paused_worker(|context| async move {
+        let host = context.host().clone();
+        let withdrawals = wakeup_counts().withdrawals;
+
+        let start = host.now();
+        let mut lone = Timeout::new(&host);
+        lone.schedule_at(start + ms(20), &noop_waker());
+        tokio::task::yield_now().await;
+        lone.cancel();
+        tokio::task::yield_now().await;
+        let expiry = re_arm(&mut lone, start + ms(20)).await;
+        let lone_fire = (
+            expiry,
+            host.now() - start,
+            wakeup_counts().withdrawals - withdrawals,
+        );
+        drop(lone);
+
+        let start = host.now();
+        let mut freed = Timeout::new(&host);
+        let mut cancelled = Timeout::new(&host);
+        freed.schedule_at(start + ms(10), &noop_waker());
+        cancelled.schedule_at(start + ms(20), &noop_waker());
+        tokio::task::yield_now().await;
+        cancelled.cancel();
+        drop(freed);
+        let expiry = re_arm(&mut cancelled, start + ms(20)).await;
+        let beside_freed = (
+            expiry,
+            host.now() - start,
+            wakeup_counts().withdrawals - withdrawals,
+        );
+        (lone_fire, beside_freed)
+    });
+    assert_eq!(
+        lone,
+        (Expiry::Elapsed, ms(20), 0),
+        "(expiry, fired after, withdrawals): a lone slot cancelled and re-armed"
+    );
+    assert_eq!(
+        beside_freed,
+        (Expiry::Elapsed, ms(20), 0),
+        "(expiry, fired after, withdrawals): a cancelled slot re-armed after another was freed"
+    );
+}
+
+/// Re-arming a withdrawn wakeup allocates nothing: the Tokio sleep is made
+/// anew in the box the first arm allocated. Observable only where std's
+/// allocations reach this crate's counting allocator (opt builds); the
+/// withdrawals and sleeps made are counted everywhere.
+#[test]
+fn a_re_arm_after_a_withdrawal_allocates_nothing() {
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime starts");
+    let (allocations, withdrawals, sleeps) = LocalSet::new().block_on(
+        &runtime,
+        run_with_worker_wheel(async {
+            let host = Host::tokio();
+            let waker = noop_waker();
+            let arm_and_free = || {
+                let mut timeout = Timeout::new(&host);
+                timeout.schedule_at(host.now() + Duration::from_secs(30), &waker);
+            };
+            arm_and_free();
+            let before = wakeup_counts();
+            let allocations = count_allocations(|| (0..10).for_each(|_| arm_and_free()));
+            let after = wakeup_counts();
+            (
+                allocations,
+                after.withdrawals - before.withdrawals,
+                after.sleeps - before.sleeps,
+            )
+        }),
+    );
+    assert_eq!(
+        (withdrawals, sleeps),
+        (10, 10),
+        "(withdrawals, sleeps made) for 10 arms, each of the wheel's only slot"
+    );
+    if let Some(allocations) = allocations {
+        assert_eq!(
+            allocations, 0,
+            "allocations for 10 re-arms after a withdrawal"
         );
     }
 }

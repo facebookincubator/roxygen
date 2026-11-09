@@ -372,10 +372,13 @@ impl WheelTimer {
         }
     }
 
-    /// Unlinks and frees a slot. Its waker is dropped after the state is
-    /// released.
+    /// Unlinks and frees a slot. Freeing the wheel's last slot withdraws the
+    /// wakeup, as folly's cancel does when `count_` reaches 0; a cancelled
+    /// slot stays linked, and a later arm of it is covered by the wakeup, so
+    /// only freeing the last slot does. The waker is dropped, and the wakeup
+    /// withdrawn, after the state is released.
     fn release(&self, index: u32) {
-        let _waker = {
+        let (_waker, withdraw) = {
             let mut state = self.state.borrow_mut();
             let state = &mut *state;
             if state.slots[index as usize].bucket != UNLINKED {
@@ -389,10 +392,15 @@ impl WheelTimer {
             slot.state = SlotState::Idle;
             slot.next = free;
             slot.lent = false;
+            let waker = slot.waker.take();
             state.free = index;
             state.stats.live_slots -= 1;
-            slot.waker.take()
+            let withdraw = state.stats.live_slots == 0 && state.armed_wakeup.take().is_some();
+            (waker, withdraw)
         };
+        if withdraw {
+            self.wakeup.disarm();
+        }
     }
 }
 
@@ -1022,4 +1030,4 @@ impl LazySleep {
 
 #[cfg(test)]
 #[path = "../../tests/timer.rs"]
-mod tests;
+pub(crate) mod tests;

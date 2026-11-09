@@ -15478,9 +15478,9 @@ fn stalled_request_body_gets_408_at_its_stream_read_timeout() {
 
 /// Each wait for request body is timed afresh, as Proxygen's per-read timeout: a body whose
 /// chunks each arrive within the stream read timeout is never answered 408, however long it
-/// takes in all. On the existing `TimedBaton` each armed wait costs one host sleep on either
-/// host (ST.3 moves the baton onto the wheel), and the stream read timeout takes no connection
-/// slot.
+/// takes in all. On a wheel host each armed wait is a store on the stream baton's one slot, with
+/// no host sleep; without a wheel each armed wait takes one host sleep, as before. The stream read
+/// timeout takes no connection slot.
 #[test]
 fn trickling_request_body_is_timed_per_wait() {
     on_both_hosts(|host, context| {
@@ -15549,13 +15549,25 @@ fn trickling_request_body_is_timed_per_wait() {
             });
             run.expect("the drained connection closes cleanly");
             assert!(probes.borrow()[0].cancelled.borrow().is_empty());
-            assert_eq!(
-                host.sleeps(),
-                gates.len(),
-                "one host sleep per armed wait for request body"
-            );
             if wheel {
-                assert_eq!(host.wheel_stats().scheduled, 0);
+                let stats = host.wheel_stats();
+                assert_eq!(
+                    (
+                        host.sleeps(),
+                        stats.scheduled,
+                        stats.relinked,
+                        stats.live_slots
+                    ),
+                    (0, gates.len() as u64, 1, 0),
+                    "(host sleeps, schedules, links, slots left): each armed wait for request body is a \
+                     store on one slot"
+                );
+            } else {
+                assert_eq!(
+                    host.sleeps(),
+                    gates.len(),
+                    "one host sleep per armed wait for request body"
+                );
             }
         })
     });

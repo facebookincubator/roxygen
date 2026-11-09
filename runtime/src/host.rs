@@ -6,10 +6,15 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::task::Context;
+use std::task::Poll;
+use std::task::ready;
 use std::thread::ThreadId;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::host::timer::Expiry;
+use crate::host::timer::Timeout;
 use crate::host::timer::WheelTimer;
 use crate::thread::current_id;
 
@@ -47,7 +52,7 @@ pub trait LocalHost {
     }
 
     /// The owner-local wheel timer this host drives, if any (a Roxygen-only
-    /// capability, `DIV-003`). A [`Timeout`](timer::Timeout) takes a slot on
+    /// capability, `DIV-003`). A [`Timeout`] takes a slot on
     /// it; without one, a `Timeout` keeps at most one `sleep_until` future.
     /// The host calls [`WheelTimer::expire`] when the wheel's wakeup fires.
     /// The default, `None`, keeps every timer on `sleep_until`.
@@ -216,10 +221,13 @@ impl LocalHost for TokioHost {
         tokio::time::Instant::now().into_std()
     }
 
+    /// On the thread of a hosted or managed worker, a timeout on the worker's
+    /// wheel timer; elsewhere a Tokio `Sleep`.
     fn sleep_until(&self, deadline: Instant) -> LocalFuture {
-        Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
-            deadline,
-        )))
+        match crate::tokio_host::worker_wheel_timer() {
+            Some(wheel) => Box::pin(WheelSleep::new(wheel, deadline)),
+            None => Box::pin(tokio_sleep_until(deadline)),
+        }
     }
 
     fn yield_to_io(&self) -> LocalFuture {
@@ -229,5 +237,85 @@ impl LocalHost for TokioHost {
     /// The wheel of the hosted or managed worker driving this thread, if any.
     fn wheel_timer(&self) -> Option<Rc<WheelTimer>> {
         crate::tokio_host::worker_wheel_timer()
+    }
+}
+
+fn tokio_sleep_until(deadline: Instant) -> tokio::time::Sleep {
+    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline))
+}
+
+/// The Tokio host's sleep on a worker's wheel timer: one [`Timeout`],
+/// scheduled at the first poll and released when it expires. The worker
+/// expires its wheel from one Tokio `Sleep` on Tokio's clock, so the sleep
+/// resolves when a Tokio sleep with the same deadline would; it then stays
+/// resolved. A deadline already past at the first poll is a Tokio sleep, so
+/// it is ready at that poll exactly when a Tokio sleep is. If the wheel stops
+/// first (`~HHWheelTimer`'s `cancelAll`, at the worker's teardown), the sleep
+/// continues as a Tokio sleep with the same deadline.
+struct WheelSleep {
+    deadline: Instant,
+    state: WheelSleepState,
+}
+
+enum WheelSleepState {
+    /// On the wheel, scheduled once first polled.
+    Wheel {
+        timeout: Timeout,
+        scheduled: bool,
+    },
+    Elapsed,
+    Tokio(Pin<Box<tokio::time::Sleep>>),
+}
+
+impl WheelSleep {
+    fn new(wheel: Rc<WheelTimer>, deadline: Instant) -> Self {
+        Self {
+            deadline,
+            state: WheelSleepState::Wheel {
+                timeout: Timeout::with_wheel(wheel),
+                scheduled: false,
+            },
+        }
+    }
+}
+
+impl Future for WheelSleep {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = &mut *self;
+        let unscheduled = matches!(
+            this.state,
+            WheelSleepState::Wheel {
+                scheduled: false,
+                ..
+            }
+        );
+        if unscheduled && this.deadline <= TokioHost.now() {
+            this.state = WheelSleepState::Tokio(Box::pin(tokio_sleep_until(this.deadline)));
+        }
+        let expiry = match &mut this.state {
+            WheelSleepState::Wheel { timeout, scheduled } => {
+                if !*scheduled {
+                    timeout.schedule_at(this.deadline, cx.waker());
+                    *scheduled = true;
+                }
+                ready!(timeout.poll_expired(cx))
+            }
+            WheelSleepState::Elapsed => return Poll::Ready(()),
+            WheelSleepState::Tokio(sleep) => return sleep.as_mut().poll(cx),
+        };
+        match expiry {
+            Expiry::Elapsed => {
+                this.state = WheelSleepState::Elapsed;
+                Poll::Ready(())
+            }
+            Expiry::Stopped => {
+                let mut sleep = Box::pin(tokio_sleep_until(this.deadline));
+                let poll = sleep.as_mut().poll(cx);
+                this.state = WheelSleepState::Tokio(sleep);
+                poll
+            }
+        }
     }
 }

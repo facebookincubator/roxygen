@@ -259,6 +259,8 @@ struct WakeupCounts {
     wheel_drives: usize,
     /// Tokio sleeps created.
     sleeps: usize,
+    /// Tokio sleeps dropped to withdraw the wakeup.
+    withdrawals: usize,
     /// Polls of a sleep.
     sleep_polls: usize,
     /// Supervisor wakes requested by `arm`.
@@ -284,10 +286,12 @@ fn count(update: impl FnOnce(&mut WakeupCounts)) {
 
 /// The host wakeup of a worker's wheel: one Tokio `Sleep`, created at the
 /// first arm and reset afterwards, polled by the worker's supervisor future,
-/// which expires the wheel when it resolves.
+/// which expires the wheel when it resolves. Withdrawing the wakeup drops the
+/// sleep, which deregisters it from Tokio's timer, and the next arm makes it
+/// anew in the same box.
 #[derive(Default)]
 struct TokioWakeup {
-    sleep: RefCell<Option<Pin<Box<Sleep>>>>,
+    sleep: RefCell<Option<Pin<Box<Option<Sleep>>>>>,
     /// The sleep's last poll was pending, so Tokio holds the supervisor's
     /// waker for it until it fires. After a ready poll this is false: Tokio
     /// keeps the waker then too, but not as a documented contract, so the
@@ -306,20 +310,21 @@ impl TokioWakeup {
     fn arm(&self, deadline: Instant) {
         let deadline = tokio::time::Instant::from_std(deadline);
         {
-            let mut sleep = self.sleep.borrow_mut();
-            match sleep.as_mut() {
+            let mut boxed = self.sleep.borrow_mut();
+            let boxed = boxed.get_or_insert_with(|| Box::pin(None));
+            match boxed.as_mut().as_pin_mut() {
                 Some(sleep) => {
                     // A sleep that fired after its pending poll gave the
                     // supervisor's waker up, and a reset does not restore it.
                     if sleep.is_elapsed() {
                         self.registered.set(false);
                     }
-                    sleep.as_mut().reset(deadline);
+                    sleep.reset(deadline);
                 }
                 None => {
                     #[cfg(test)]
                     count(|counts| counts.sleeps += 1);
-                    *sleep = Some(Box::pin(tokio::time::sleep_until(deadline)));
+                    boxed.set(Some(tokio::time::sleep_until(deadline)));
                 }
             }
         }
@@ -346,7 +351,9 @@ impl TokioWakeup {
 
     /// Whether the supervisor must poll the sleep: Tokio may have fired it,
     /// or must take the supervisor's waker for it. Otherwise the supervisor
-    /// leaves it alone, a resolved sleep included.
+    /// leaves it alone, a resolved or withdrawn sleep included. Inlined into
+    /// the supervisor, which runs the wheel step only then.
+    #[inline(always)]
     fn due(&self) -> bool {
         self.needs_poll.get()
             || (self.registered.get()
@@ -354,7 +361,22 @@ impl TokioWakeup {
                     .sleep
                     .borrow()
                     .as_ref()
+                    .and_then(|boxed| boxed.as_ref().as_pin_ref())
                     .is_some_and(|sleep| sleep.is_elapsed()))
+    }
+
+    /// Withdraws the wakeup: drops the sleep, which deregisters it from
+    /// Tokio's timer, and keeps its box for the next arm.
+    fn withdraw(&self) {
+        if let Some(boxed) = self.sleep.borrow_mut().as_mut()
+            && boxed.is_some()
+        {
+            #[cfg(test)]
+            count(|counts| counts.withdrawals += 1);
+            boxed.set(None);
+        }
+        self.registered.set(false);
+        self.needs_poll.set(false);
     }
 
     /// Polls the sleep with the supervisor's context. The supervisor's poll
@@ -362,13 +384,13 @@ impl TokioWakeup {
     /// a fresh coop budget, so coop never refuses this poll.
     fn poll_sleep(&self, context: &mut Context<'_>) -> Poll<()> {
         self.needs_poll.set(false);
-        let mut sleep = self.sleep.borrow_mut();
-        let Some(sleep) = sleep.as_mut() else {
+        let mut boxed = self.sleep.borrow_mut();
+        let Some(sleep) = boxed.as_mut().and_then(|boxed| boxed.as_mut().as_pin_mut()) else {
             return Poll::Pending;
         };
         #[cfg(test)]
         count(|counts| counts.sleep_polls += 1);
-        let poll = sleep.as_mut().poll(context);
+        let poll = sleep.poll(context);
         self.registered.set(poll.is_pending());
         poll
     }
@@ -382,10 +404,12 @@ impl WheelWakeup for SharedWakeup {
         self.0.arm(deadline);
     }
 
-    /// A Tokio sleep is withdrawn only by dropping it. The wheel disarms only
-    /// in `stop`, after which `expire` does nothing, and the teardown drops
-    /// the sleep right after.
-    fn disarm(&self) {}
+    /// A Tokio sleep is withdrawn only by dropping it. The wheel disarms when
+    /// it frees its last slot and in `stop`, after which `expire` does
+    /// nothing.
+    fn disarm(&self) {
+        self.0.withdraw();
+    }
 }
 
 /// The wheel timer of one hosted or managed worker and its wakeup. The wheel
@@ -418,23 +442,15 @@ impl WorkerWheel {
         Rc::clone(timer)
     }
 
-    /// Whether a timer has created the wheel: one load, inlined into the
-    /// supervisor, which calls `drive` only then.
-    #[inline(always)]
-    fn created(&self) -> bool {
-        self.timer.get().is_some()
-    }
-
-    /// The supervisor's wheel step, run at each of its polls once a timer has
-    /// created the wheel: polls the wheel's sleep only when it is due, and
-    /// expires the wheel when it resolves. A sleep that `expire` re-arms is
-    /// polled again, so that Tokio holds the supervisor's waker for it; if it
-    /// keeps resolving at once, the supervisor is woken to continue. Before
-    /// the wheel exists the supervisor does not call it: the supervisor's
-    /// waker, which the first arm needs, was taken when the supervisor
+    /// The supervisor's wheel step, run at its polls where the wheel's sleep
+    /// is due: polls the sleep, and expires the wheel when it resolves. A
+    /// sleep that `expire` re-arms is polled again, so that Tokio holds the
+    /// supervisor's waker for it; if it keeps resolving at once, the
+    /// supervisor is woken to continue. An arm while the sleep is not due
+    /// wakes the supervisor's waker stored here, or taken when the supervisor
     /// started. The panic of an owner's waker that `expire` re-raised (the
     /// wheel stays consistent and driven) goes to `wheel_panicked`. Out of
-    /// line, so that a supervisor poll without a wheel carries none of it.
+    /// line, so that a supervisor poll with no sleep due carries none of it.
     #[inline(never)]
     fn drive(
         &self,
@@ -570,7 +586,7 @@ async fn run_managed_driver(
         let context = &mut Context::from_waker(gate.waker());
         #[cfg(test)]
         count(|counts| counts.supervisor_polls += 1);
-        if wheel.created() {
+        if wheel.wakeup.due() {
             wheel.drive(context, &handle, &mut wheel_panic);
         }
         if handle.state() == WorkerState::Open {
@@ -1030,4 +1046,4 @@ pub fn caller_driven_worker(
 
 #[cfg(test)]
 #[path = "../tests/wheel_driving.rs"]
-mod wheel_driving_tests;
+pub(crate) mod wheel_driving_tests;

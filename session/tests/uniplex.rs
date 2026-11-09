@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::future::poll_fn;
+use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
 use std::pin::Pin;
@@ -41,6 +42,8 @@ use roxygen_core::source_holder::HttpSourceHolder;
 use roxygen_runtime::cancellation::CancellationSource;
 use roxygen_runtime::cancellation::CancellationToken;
 use roxygen_runtime::driver::WorkerDriver;
+use roxygen_runtime::tokio_host::HostedWorker;
+use roxygen_runtime::tokio_host::HostedWorkerOptions;
 use roxygen_runtime::wait::CancellableBaton;
 use roxygen_runtime::wait::WaitStatus;
 use roxygen_runtime::worker::WorkerContext;
@@ -1569,9 +1572,62 @@ fn run_local<T: 'static>(test: impl Future<Output = T> + 'static) -> T {
         .block_on(LocalSet::new().run_until(test))
 }
 
+thread_local! {
+    /// Whether `run_on_worker` runs its tests on a `HostedWorker`.
+    static ON_HOSTED_WORKER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `suite` with every `run_on_worker` test in it on a `HostedWorker`,
+/// whose owner thread drives a wheel timer: the session's timed batons and
+/// host sleeps take slots on it.
+pub(crate) fn on_hosted_workers(suite: impl FnOnce()) {
+    struct Restore(bool);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ON_HOSTED_WORKER.set(self.0);
+        }
+    }
+
+    let _restore = Restore(ON_HOSTED_WORKER.replace(true));
+    suite();
+}
+
+/// Whether `run_on_worker` tests run on a `HostedWorker` (`on_hosted_workers`).
+pub(crate) fn on_hosted_worker() -> bool {
+    ON_HOSTED_WORKER.get()
+}
+
+/// Runs `test` as a command on a fresh `HostedWorker` and joins the worker.
+pub(crate) fn run_on_hosted_worker<T: Send + 'static>(
+    test: impl FnOnce(WorkerContext) -> Pin<Box<dyn Future<Output = T>>> + Send + 'static,
+) -> T {
+    let worker = HostedWorker::spawn(HostedWorkerOptions {
+        command_capacity: NonZeroUsize::new(16).expect("nonzero capacity"),
+        thread_name: "uniplex-timers".to_owned(),
+    })
+    .expect("hosted worker starts");
+    let call = worker
+        .handle()
+        .call_local(move |context| {
+            assert!(
+                context.host().wheel_timer().is_some(),
+                "a hosted worker drives a wheel timer"
+            );
+            test(context)
+        })
+        .expect("worker call");
+    let result = futures::executor::block_on(call).expect("worker call completed");
+    drop(worker);
+    result
+}
+
 pub(crate) fn run_on_worker<T: Send + 'static>(
     test: impl FnOnce(WorkerContext) -> Pin<Box<dyn Future<Output = T>>> + Send + 'static,
 ) -> T {
+    if on_hosted_worker() {
+        return run_on_hosted_worker(test);
+    }
     run_local(async move {
         let (worker, driver) = WorkerDriver::new(16).unwrap();
         let call = worker
@@ -9242,6 +9298,30 @@ mod h1 {
         assert!(!output_contains(&outcome, b"HTTP/1.1 500"));
         assert!(output_contains(&outcome, b"HTTP/1.1 408"));
         assert!(!output_contains(&outcome, b"custom response generated"));
+    }
+
+    /// The HTTP/1.1 timer tests on a `HostedWorker`, whose wheel timer backs the
+    /// session's timed batons and host sleeps: write timeouts, upstream response and
+    /// downstream stream read timeouts (408), the connection read timeout's drain,
+    /// ingress backpressure, and custom timeout responses.
+    #[test]
+    fn timers_on_a_hosted_worker() {
+        on_hosted_workers(|| {
+            h12_upstream_session_test_write_timeout();
+            httpupstream_session_test_post_body_read_timeout();
+            httpupstream_session_test_post_read_timeout();
+            httpupstream_session_test_post_read_custom_timeout();
+            httpupstream_session_test_get_read_timeout();
+            header_only_response_timeout_begins_after_request_eom();
+            h1_downstream_session_test_ingress_backpressure_limit_exceeded_timeout();
+            h12_downstream_session_test_write_timeout();
+            httpdownstream_session_test_read_timeout();
+            connection_read_timeout_only_drains_active_request();
+            h1_downstream_session_test_headers_read_timeout();
+            h1_downstream_session_test_body_read_timeout();
+            httpdownstream_session_test_ingress_error_custom_response();
+            httpdownstream_session_test_ingress_error_custom_response_mismatch();
+        });
     }
 
     #[test]

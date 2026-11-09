@@ -638,6 +638,69 @@ fn cancel_and_later_rearm_are_stores() {
     assert_eq!(harness.wakeup.armed.get(), None);
 }
 
+/// Freeing the wheel's last slot withdraws the wakeup, once: folly withdraws
+/// its `AsyncTimeout` when `count_` reaches 0. A cancel is a store and
+/// withdraws nothing, and neither does freeing a slot while another,
+/// cancelled but still linked, remains: re-armed no earlier than its link,
+/// that slot is covered by the wakeup and fires. A wakeup that fired with
+/// nothing left to cover is not withdrawn, and an arm after a withdrawal
+/// requests a new one.
+#[test]
+fn freeing_the_last_slot_withdraws_the_wakeup() {
+    let harness = Harness::new(ms(1));
+    let start = harness.now();
+    let waker = futures::task::noop_waker();
+    let wakeup = || (harness.wakeup.disarms.get(), harness.wakeup.armed.get());
+    let mut freed = Timeout::with_wheel(Rc::clone(&harness.wheel));
+    let mut cancelled = Timeout::with_wheel(Rc::clone(&harness.wheel));
+
+    freed.schedule_at(start + ms(10), &waker);
+    cancelled.schedule_at(start + ms(20), &waker);
+    cancelled.cancel();
+    assert_eq!(wakeup(), (0, Some(start + ms(10))), "a cancel is a store");
+    drop(freed);
+    assert_eq!(
+        wakeup(),
+        (0, Some(start + ms(10))),
+        "a cancelled slot still linked keeps the wakeup"
+    );
+    cancelled.schedule_at(start + ms(20), &waker);
+    assert_eq!(
+        harness.wheel.stats().host_arms,
+        1,
+        "re-armed at its link: covered, no new request"
+    );
+    harness.run();
+    assert_eq!(cancelled.take_expired(), Some(Expiry::Elapsed));
+    assert_eq!(harness.now(), start + ms(20));
+    drop(cancelled);
+    assert_eq!(
+        wakeup(),
+        (0, None),
+        "a fired wakeup with nothing left to cover is not withdrawn"
+    );
+
+    let mut last = Timeout::with_wheel(Rc::clone(&harness.wheel));
+    last.schedule_at(start + ms(100), &waker);
+    assert_eq!(wakeup(), (0, Some(start + ms(100))));
+    drop(last);
+    assert_eq!(
+        wakeup(),
+        (1, None),
+        "freeing the last slot while its wakeup is armed withdraws it"
+    );
+    let mut next = Timeout::with_wheel(Rc::clone(&harness.wheel));
+    next.schedule_at(start + ms(200), &waker);
+    assert_eq!(
+        wakeup(),
+        (1, Some(start + ms(200))),
+        "an arm after a withdrawal requests a wakeup"
+    );
+    harness.run();
+    assert_eq!(next.take_expired(), Some(Expiry::Elapsed));
+    assert_eq!(harness.now(), start + ms(200));
+}
+
 /// `extend_to` changes only an armed timeout: it does nothing before the
 /// first schedule or after a cancel.
 #[test]
@@ -1640,7 +1703,7 @@ static ALLOCATOR: CountingAllocator = CountingAllocator;
 /// not observable: dev builds link a shared std whose internal allocations
 /// bypass this crate's `#[global_allocator]`, so counts are complete only when
 /// an allocation made inside std is observed.
-fn count_allocations(operation: impl FnOnce()) -> Option<usize> {
+pub(crate) fn count_allocations(operation: impl FnOnce()) -> Option<usize> {
     ALLOCATIONS.with(|count| count.set(0));
     COUNTING.with(|counting| counting.set(true));
     operation();

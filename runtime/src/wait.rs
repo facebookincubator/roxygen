@@ -1,6 +1,9 @@
+use std::cell::Ref;
 use std::cell::RefCell;
+use std::cell::RefMut;
 use std::fmt;
 use std::future::Future;
+use std::mem;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::Context;
@@ -13,6 +16,8 @@ use crate::cancellation::CancellationRegistration;
 use crate::cancellation::CancellationToken;
 use crate::host::Host;
 use crate::host::LocalFuture;
+use crate::host::timer::Expiry;
+use crate::host::timer::Timeout;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WaitStatus {
@@ -58,6 +63,132 @@ fn wake_waiter(waiter: &Option<WaiterRegistration>) -> Option<Waker> {
     waiter.as_ref().map(|waiter| waiter.waker.clone())
 }
 
+/// A baton's state and its waiter's timeout slot, shared by the baton and its
+/// waits.
+#[derive(Debug)]
+struct Shared<State> {
+    state: RefCell<State>,
+    timer: WaitTimer,
+}
+
+impl<State> Shared<State> {
+    fn new(state: State) -> Rc<Self> {
+        Rc::new(Self {
+            state: RefCell::new(state),
+            timer: WaitTimer::default(),
+        })
+    }
+
+    fn borrow(&self) -> Ref<'_, State> {
+        self.state.borrow()
+    }
+
+    fn borrow_mut(&self) -> RefMut<'_, State> {
+        self.state.borrow_mut()
+    }
+}
+
+/// The timeout of a baton's registered waiter. On a host with a wheel timer
+/// it is one [`Timeout`] slot, bound at the first armed wait and kept for the
+/// baton's lifetime: a later deadline no earlier than the slot's, and a
+/// disarm, only store. On a host without one it is the current arm's host
+/// sleep, made at each arm and dropped at each disarm. Only the waiter that
+/// armed it uses it, from its own poll and completion, with the baton's state
+/// released.
+#[derive(Default)]
+struct WaitTimer(RefCell<WaitSlot>);
+
+#[derive(Default)]
+enum WaitSlot {
+    #[default]
+    Unarmed,
+    Wheel(Timeout),
+    Sleep(LocalFuture),
+}
+
+impl WaitTimer {
+    /// Arms the timeout for `deadline` and discards an expiry not yet
+    /// observed. The expiry wakes `waker`. On a wheel host, a deadline already
+    /// past that was set before this poll (`registered_earlier`) is armed as
+    /// a host sleep, which the waiter polls in this poll as it polled every
+    /// arm's host sleep before the wheel: the wait times out in this poll
+    /// exactly when that sleep is ready at once (`RUN-004`).
+    fn schedule_at(&self, host: &Host, deadline: Instant, waker: &Waker, registered_earlier: bool) {
+        let past = || registered_earlier && deadline <= host.now();
+        let mut slot = self.0.borrow_mut();
+        let armed = match &mut *slot {
+            WaitSlot::Wheel(_) if past() => WaitSlot::Sleep(host.sleep_until(deadline)),
+            WaitSlot::Wheel(timeout) => {
+                timeout.schedule_at(deadline, waker);
+                return;
+            }
+            WaitSlot::Unarmed | WaitSlot::Sleep(_) => Self::bind(host, deadline, waker, past),
+        };
+        let replaced = mem::replace(&mut *slot, armed);
+        drop(slot);
+        drop(replaced);
+    }
+
+    /// A newly bound slot armed for `deadline`: a wheel slot on a wheel host,
+    /// unless `past`, and otherwise a host sleep.
+    fn bind(
+        host: &Host,
+        deadline: Instant,
+        waker: &Waker,
+        past: impl FnOnce() -> bool,
+    ) -> WaitSlot {
+        match host.wheel_timer() {
+            Some(_) if past() => WaitSlot::Sleep(host.sleep_until(deadline)),
+            Some(wheel) => {
+                let mut timeout = Timeout::with_wheel(wheel);
+                timeout.schedule_at(deadline, waker);
+                WaitSlot::Wheel(timeout)
+            }
+            None => WaitSlot::Sleep(host.sleep_until(deadline)),
+        }
+    }
+
+    /// Disarms the timeout and discards an expiry not yet observed.
+    fn cancel(&self) {
+        let mut slot = self.0.borrow_mut();
+        let dropped = match &mut *slot {
+            WaitSlot::Wheel(timeout) => {
+                timeout.cancel();
+                None
+            }
+            WaitSlot::Sleep(_) => Some(mem::take(&mut *slot)),
+            WaitSlot::Unarmed => None,
+        };
+        drop(slot);
+        drop(dropped);
+    }
+
+    /// Takes the timeout's expiry, keeping `cx`'s waker while it is armed.
+    fn poll_expired(&self, cx: &mut Context<'_>) -> Poll<Expiry> {
+        match &mut *self.0.borrow_mut() {
+            WaitSlot::Wheel(timeout) => timeout.poll_expired(cx),
+            WaitSlot::Sleep(sleep) => sleep.as_mut().poll(cx).map(|()| Expiry::Elapsed),
+            WaitSlot::Unarmed => Poll::Pending,
+        }
+    }
+}
+
+impl fmt::Debug for WaitTimer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("WaitTimer").finish_non_exhaustive()
+    }
+}
+
+/// The outcome a wait commits when its timeout slot expires: a stopped wheel
+/// (`~HHWheelTimer`'s `callbackCanceled`) cancels the wait, as destroying its
+/// baton does.
+fn expiry_status(expiry: Expiry) -> WaitStatus {
+    match expiry {
+        Expiry::Elapsed => WaitStatus::TimedOut,
+        Expiry::Stopped => WaitStatus::Cancelled,
+    }
+}
+
 #[derive(Debug)]
 struct TimedState {
     status: WaitStatus,
@@ -76,7 +207,7 @@ struct TimedState {
 #[derive(Debug)]
 pub struct TimedBaton {
     host: Host,
-    state: Rc<RefCell<TimedState>>,
+    state: Rc<Shared<TimedState>>,
 }
 
 impl TimedBaton {
@@ -87,14 +218,14 @@ impl TimedBaton {
     pub fn with_host(timeout: Option<Duration>, host: Host) -> Self {
         Self {
             host,
-            state: Rc::new(RefCell::new(TimedState {
+            state: Shared::new(TimedState {
                 status: WaitStatus::NotReady,
                 timeout: timeout.and_then(enabled_timeout),
                 timeout_registration: TimeoutRegistration::default(),
                 waiter: None,
                 next_waiter_id: 1,
                 destroyed: false,
-            })),
+            }),
         }
     }
 
@@ -107,7 +238,7 @@ impl TimedBaton {
             cancellation_waker_synchronized: false,
             waiter_id: None,
             timer_generation: 0,
-            sleep: None,
+            timer_armed: false,
             completed: false,
         }
     }
@@ -162,7 +293,7 @@ impl TimedBaton {
         self.state.borrow().timeout_registration.is_armed()
     }
 
-    fn signal_status(state: &Rc<RefCell<TimedState>>, status: WaitStatus) {
+    fn signal_status(state: &Shared<TimedState>, status: WaitStatus) {
         let wake = {
             let mut state = state.borrow_mut();
             if state.status == status {
@@ -205,13 +336,14 @@ impl Drop for TimedBaton {
 
 pub struct TimedWait {
     host: Host,
-    state: Rc<RefCell<TimedState>>,
+    state: Rc<Shared<TimedState>>,
     cancellation: CancellationToken,
     cancellation_registration: Option<CancellationRegistration>,
     cancellation_waker_synchronized: bool,
     waiter_id: Option<u64>,
     timer_generation: u64,
-    sleep: Option<LocalFuture>,
+    /// This wait armed the baton's timeout for `timer_generation`.
+    timer_armed: bool,
     completed: bool,
 }
 
@@ -271,12 +403,16 @@ impl TimedWait {
                 state.timeout_registration.disarm();
             }
         }
-        self.sleep = None;
+        self.disarm_timer();
         self.completed = true;
         cancellation_requested
     }
 
-    fn synchronize_timer(&mut self) {
+    /// Brings the baton's timeout to the registration's generation: arms it
+    /// for the registered deadline, waking `waker` at expiry, or disarms it.
+    /// If arming panics, the next poll retries. `registered_earlier`: the
+    /// waiter registered before this poll, so the deadline was set before it.
+    fn synchronize_timer(&mut self, waker: &Waker, registered_earlier: bool) {
         let (generation, deadline) = {
             let state = self.state.borrow();
             (
@@ -284,9 +420,24 @@ impl TimedWait {
                 state.timeout_registration.deadline,
             )
         };
-        if self.timer_generation != generation {
-            self.timer_generation = generation;
-            self.sleep = deadline.map(|deadline| self.host.sleep_until(deadline));
+        if self.timer_generation == generation {
+            return;
+        }
+        match deadline {
+            Some(deadline) => {
+                self.state
+                    .timer
+                    .schedule_at(&self.host, deadline, waker, registered_earlier);
+                self.timer_armed = true;
+            }
+            None => self.disarm_timer(),
+        }
+        self.timer_generation = generation;
+    }
+
+    fn disarm_timer(&mut self) {
+        if mem::take(&mut self.timer_armed) {
+            self.state.timer.cancel();
         }
     }
 }
@@ -307,6 +458,7 @@ impl Future for TimedWait {
         let synchronized = this.cancellation_waker_synchronized;
         // A callback panic must leave the retained wait unsynchronized.
         this.cancellation_waker_synchronized = false;
+        let registered_earlier = this.waiter_id.is_some();
         let unchanged = this.register_waiter(cx.waker());
         let cancellation_requested = if synchronized && unchanged {
             false
@@ -335,20 +487,20 @@ impl Future for TimedWait {
             });
         }
 
-        this.synchronize_timer();
-        if let Some(sleep) = &mut this.sleep {
-            if sleep.as_mut().poll(cx).is_ready() {
+        this.synchronize_timer(cx.waker(), registered_earlier);
+        if this.timer_armed
+            && let Poll::Ready(expiry) = this.state.timer.poll_expired(cx)
+        {
+            {
+                let mut state = this.state.borrow_mut();
+                if state.timeout_registration.generation == this.timer_generation
+                    && state.timeout_registration.is_armed()
                 {
-                    let mut state = this.state.borrow_mut();
-                    if state.timeout_registration.generation == this.timer_generation
-                        && state.timeout_registration.is_armed()
-                    {
-                        state.timeout_registration.disarm();
-                        state.status = WaitStatus::TimedOut;
-                    }
+                    state.timeout_registration.disarm();
+                    state.status = expiry_status(expiry);
                 }
-                cx.waker().wake_by_ref();
             }
+            cx.waker().wake_by_ref();
         }
         Poll::Pending
     }
@@ -379,7 +531,7 @@ struct CancellableState {
 #[derive(Debug)]
 pub struct CancellableBaton {
     host: Host,
-    state: Rc<RefCell<CancellableState>>,
+    state: Rc<Shared<CancellableState>>,
 }
 
 impl CancellableBaton {
@@ -390,7 +542,7 @@ impl CancellableBaton {
     pub fn with_host(host: Host) -> Self {
         Self {
             host,
-            state: Rc::new(RefCell::new(CancellableState {
+            state: Shared::new(CancellableState {
                 posted: false,
                 waiter_outcome: None,
                 active_cancellation: None,
@@ -398,7 +550,7 @@ impl CancellableBaton {
                 waiter: None,
                 next_waiter_id: 1,
                 destroyed: false,
-            })),
+            }),
         }
     }
 
@@ -420,7 +572,7 @@ impl CancellableBaton {
             cancellation_waker_synchronized: false,
             waiter_id: None,
             timer_generation: 0,
-            sleep: None,
+            timer_armed: false,
             completed: false,
         }
     }
@@ -513,14 +665,15 @@ impl Drop for CancellableBaton {
 
 pub struct CancellableWait {
     host: Host,
-    state: Rc<RefCell<CancellableState>>,
+    state: Rc<Shared<CancellableState>>,
     timeout: Option<Duration>,
     cancellation: CancellationToken,
     cancellation_registration: Option<CancellationRegistration>,
     cancellation_waker_synchronized: bool,
     waiter_id: Option<u64>,
     timer_generation: u64,
-    sleep: Option<LocalFuture>,
+    /// This wait armed the baton's timeout for `timer_generation`.
+    timer_armed: bool,
     completed: bool,
 }
 
@@ -585,12 +738,16 @@ impl CancellableWait {
                 state.timeout_registration.disarm();
             }
         }
-        self.sleep = None;
+        self.disarm_timer();
         self.completed = true;
         cancellation_requested
     }
 
-    fn synchronize_timer(&mut self) {
+    /// Brings the baton's timeout to the registration's generation: arms it
+    /// for the registered deadline, waking `waker` at expiry, or disarms it.
+    /// If arming panics, the next poll retries. `registered_earlier`: the
+    /// waiter registered before this poll, so the deadline was set before it.
+    fn synchronize_timer(&mut self, waker: &Waker, registered_earlier: bool) {
         let (generation, deadline) = {
             let state = self.state.borrow();
             (
@@ -598,9 +755,24 @@ impl CancellableWait {
                 state.timeout_registration.deadline,
             )
         };
-        if self.timer_generation != generation {
-            self.timer_generation = generation;
-            self.sleep = deadline.map(|deadline| self.host.sleep_until(deadline));
+        if self.timer_generation == generation {
+            return;
+        }
+        match deadline {
+            Some(deadline) => {
+                self.state
+                    .timer
+                    .schedule_at(&self.host, deadline, waker, registered_earlier);
+                self.timer_armed = true;
+            }
+            None => self.disarm_timer(),
+        }
+        self.timer_generation = generation;
+    }
+
+    fn disarm_timer(&mut self) {
+        if mem::take(&mut self.timer_armed) {
+            self.state.timer.cancel();
         }
     }
 }
@@ -623,6 +795,7 @@ impl Future for CancellableWait {
         let synchronized = this.cancellation_waker_synchronized;
         // A callback panic must leave the retained wait unsynchronized.
         this.cancellation_waker_synchronized = false;
+        let registered_earlier = this.waiter_id.is_some();
         let unchanged = this.register_waiter(cx.waker());
         let cancellation_requested = if synchronized && unchanged {
             false
@@ -658,23 +831,23 @@ impl Future for CancellableWait {
             });
         }
 
-        this.synchronize_timer();
-        if let Some(sleep) = &mut this.sleep {
-            if sleep.as_mut().poll(cx).is_ready() {
+        this.synchronize_timer(cx.waker(), registered_earlier);
+        if this.timer_armed
+            && let Poll::Ready(expiry) = this.state.timer.poll_expired(cx)
+        {
+            {
+                let mut state = this.state.borrow_mut();
+                if state.timeout_registration.generation == this.timer_generation
+                    && state.timeout_registration.is_armed()
                 {
-                    let mut state = this.state.borrow_mut();
-                    if state.timeout_registration.generation == this.timer_generation
-                        && state.timeout_registration.is_armed()
-                    {
-                        state.timeout_registration.disarm();
-                        state.posted = true;
-                        if state.waiter_outcome.is_none() {
-                            state.waiter_outcome = Some(WaitStatus::TimedOut);
-                        }
+                    state.timeout_registration.disarm();
+                    state.posted = true;
+                    if state.waiter_outcome.is_none() {
+                        state.waiter_outcome = Some(expiry_status(expiry));
                     }
                 }
-                cx.waker().wake_by_ref();
             }
+            cx.waker().wake_by_ref();
         }
         Poll::Pending
     }
