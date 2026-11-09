@@ -4509,6 +4509,8 @@ pub(super) struct QueuedWriteProbe {
     pub(super) fail_released: bool,
     /// A [`ReportingWriteQueue`]'s `start_write` reports saturation from then on.
     pub(super) saturate_on_write: bool,
+    /// The write timeout the queue was acquired with; the fixture never times a write.
+    pub(super) write_timeout: Duration,
 }
 
 pub(super) fn release_queued_writes(probe: &Rc<RefCell<QueuedWriteProbe>>, count: usize) {
@@ -4702,7 +4704,7 @@ impl UniplexTransport for QueuedFixtureTransport {
         timeout: Duration,
         cancellation: CancellationToken,
     ) -> Result<Option<Box<dyn crate::uniplex::UniplexWriteQueue>>, HttpError> {
-        assert!(timeout.is_zero());
+        self.probe.borrow_mut().write_timeout = timeout;
         assert!(!std::mem::replace(
             &mut self.probe.borrow_mut().acquired,
             true
@@ -7328,6 +7330,8 @@ pub(super) struct ScriptedWriteState {
     /// The queue's `is_saturated` answer; `true`, the trait's default, unless the test clears
     /// it.
     pub(super) saturated: bool,
+    /// The write timeout the queue was acquired with; the fixture never times a write.
+    pub(super) write_timeout: Duration,
 }
 
 impl ScriptedWriteState {
@@ -7562,6 +7566,7 @@ impl ScriptedWriteTransport {
                 on_write: None,
                 tasks: Vec::new(),
                 saturated: true,
+                write_timeout: Duration::ZERO,
             })),
         })
     }
@@ -7575,7 +7580,7 @@ impl UniplexTransport for ScriptedWriteTransport {
         timeout: Duration,
         _cancellation: CancellationToken,
     ) -> Result<Option<Box<dyn crate::uniplex::UniplexWriteQueue>>, HttpError> {
-        assert!(timeout.is_zero());
+        self.state.borrow_mut().write_timeout = timeout;
         Ok(Some(Box::new(ScriptedWriteQueue(Rc::clone(&self.state)))))
     }
 
@@ -8743,7 +8748,7 @@ pub(super) async fn drive_until(limit: usize, condition: impl Fn() -> bool) -> b
     condition()
 }
 
-async fn settle_turns(turns: usize) {
+pub(super) async fn settle_turns(turns: usize) {
     for _ in 0..turns {
         tokio::task::yield_now().await;
     }
@@ -12874,7 +12879,7 @@ fn owned_header_rate_limit_reports_drain_and_suppresses_ingress_message() {
 }
 
 /// The read idle timeout of the connection-timer tests.
-const IDLE: Duration = Duration::from_secs(10);
+pub(super) const IDLE: Duration = Duration::from_secs(10);
 
 /// The GOAWAY timeout of the connection-timer tests: the grace between a drain's two GOAWAYs.
 const GRACE: Duration = Duration::from_secs(1);
@@ -12885,7 +12890,7 @@ const GOAWAY_MAX: StreamId = StreamId::new(0x7fff_ffff);
 /// Serves the fixture's scripted reads and requires each to carry no timeout: the owned driver
 /// times its connection itself. A parked `WaitData` read, and a read past the script, end on
 /// transport cancellation.
-struct UntimedReads(Rc<FixtureTransport>);
+pub(super) struct UntimedReads(pub(super) Rc<FixtureTransport>);
 
 impl UniplexTransport for UntimedReads {
     fn read(
@@ -13007,11 +13012,11 @@ fn written_goaways(state: &RefCell<FixtureTransportState>) -> Vec<(StreamId, H2E
     written_frames(state, 1).goaways
 }
 
-type HostCase = fn(Rc<ManualHost>, WorkerContext) -> Pin<Box<dyn Future<Output = ()>>>;
+pub(super) type HostCase = fn(Rc<ManualHost>, WorkerContext) -> Pin<Box<dyn Future<Output = ()>>>;
 
 /// Runs `case` on a host that drives a wheel timer, as hosted workers do, and on one without a
 /// wheel, where the driver's timeouts fall back to host sleeps.
-fn on_both_hosts(case: HostCase) {
+pub(super) fn on_both_hosts(case: HostCase) {
     crate::external_host_tests::run_on_wheel_host_with(case);
     crate::external_host_tests::run_on_host_with(case);
 }
@@ -13358,7 +13363,7 @@ fn zero_timeouts_take_no_slot_sleep_or_clock_read() {
 
 /// Runs `test` on a caller-driven worker over a current-thread runtime whose clock is paused, so
 /// Tokio sleeps, the fixture's read timeouts and a host without a wheel all advance together.
-fn run_on_paused_worker<T: Send + 'static>(
+pub(super) fn run_on_paused_worker<T: Send + 'static>(
     test: impl FnOnce(WorkerContext) -> Pin<Box<dyn Future<Output = T>>> + Send + 'static,
 ) -> T {
     Builder::new_current_thread()
@@ -13395,9 +13400,9 @@ enum DrainStart {
 /// nonzero read timeout ends a read still waiting with `READ_TIMEOUT`, keeping its bytes for the
 /// next read, as a socket read does. Past the script, a read waits for cancellation or its
 /// timeout.
-struct GatedReads {
-    inner: Rc<FixtureTransport>,
-    script: Rc<RefCell<VecDeque<(Option<Arc<tokio::sync::Notify>>, Vec<u8>)>>>,
+pub(super) struct GatedReads {
+    pub(super) inner: Rc<FixtureTransport>,
+    pub(super) script: Rc<RefCell<VecDeque<(Option<Arc<tokio::sync::Notify>>, Vec<u8>)>>>,
 }
 
 impl UniplexTransport for GatedReads {
@@ -13851,6 +13856,836 @@ fn unobserved_connections_create_no_observation() {
             observe_lifecycle(&mut session);
             observe_lifecycle(&mut session);
             assert_eq!(crate::owned_h2::observations_created(), created + 1);
+        })
+    });
+}
+
+/// The write timeout of the write-timer tests: Proxygen's `writeTimeout_`, which bounds a stalled
+/// transport write and the writer's wait for flow-control credit.
+const WRITE: Duration = Duration::from_secs(1);
+
+/// How a downstream driver's session ended once its transport stopped accepting writes.
+#[derive(Debug, Eq, PartialEq)]
+struct StalledWriteEnd {
+    /// Milliseconds of paused time from the start to the end of the session.
+    ended_at: u128,
+    error: Option<HttpErrorCode>,
+    close: FixtureClose,
+}
+
+/// Runs a downstream driver, the owned one or `UniplexSession`, whose transport accepts no write:
+/// the fixture ends a stalled write with `WRITE_TIMEOUT` once its timeout passes.
+async fn stalled_write_end(context: WorkerContext, owned: bool) -> StalledWriteEnd {
+    let (_, preface) = ready_owner_requests(0);
+    let (transport, state) = FixtureTransport::new([FixtureRead::Data(preface)]);
+    state.borrow_mut().stall_writes = true;
+    let begun = tokio::time::Instant::now();
+    let result = if owned {
+        let (application, _probes) = Application::new(Vec::new());
+        let mut config = options(context, transport);
+        config.io.write_timeout = WRITE;
+        let (session, _handle) = OwnedH2Session::new(application, config).expect("owned H2");
+        session.run().await
+    } else {
+        let handler: Rc<dyn HttpHandler> = Rc::new(FixtureHandler {
+            status: 200,
+            response_body: 0,
+            response_error: None,
+            invocations: Rc::new(Cell::new(0)),
+            request_body: Rc::new(Cell::new(0)),
+        });
+        let config = UniplexConfig {
+            write_timeout: WRITE,
+            ..UniplexConfig::default()
+        };
+        let (session, _handle) = UniplexSession::new_http2(
+            context,
+            TransportDirection::Downstream,
+            transport,
+            Some(handler),
+            config,
+            Http2SessionConfig::default(),
+        )
+        .expect("Uniplex H2");
+        session.run().await
+    };
+    let ended_at = begun.elapsed().as_millis();
+    assert_eq!(state.borrow().stalled_writes_started, 1);
+    let close = state.borrow().close;
+    StalledWriteEnd {
+        ended_at,
+        error: result.err().map(|error| error.code()),
+        close,
+    }
+}
+
+/// The owned driver hands its write timeout to the transport, which arms it only while a write
+/// pends: a transport that accepts nothing fails the connection with `WRITE_TIMEOUT` and resets
+/// it, at the instant and in the way `UniplexSession` does.
+#[test]
+fn owned_write_stall_fails_the_connection_like_uniplex() {
+    let (owned, uniplex) = run_on_paused_worker(|context| {
+        Box::pin(async move {
+            let owned = stalled_write_end(context.clone(), true).await;
+            let uniplex = stalled_write_end(context, false).await;
+            (owned, uniplex)
+        })
+    });
+    assert_eq!(
+        uniplex,
+        StalledWriteEnd {
+            ended_at: WRITE.as_millis(),
+            error: Some(HttpErrorCode::WRITE_TIMEOUT),
+            close: FixtureClose::Reset,
+        }
+    );
+    assert_eq!(owned, uniplex);
+}
+
+/// Response bytes the flow-control timer tests send on a stream: more than the 65,535 bytes of
+/// credit the peer leaves on the blocked window.
+const FLOW_BODY: usize = 96 << 10;
+
+/// A downstream session over `reads` answering with `replies`, its other timeouts zero and
+/// `write_timeout` as given.
+fn write_timed_session(
+    context: WorkerContext,
+    reads: impl IntoIterator<Item = FixtureRead>,
+    replies: Vec<Reply>,
+    write_timeout: Duration,
+) -> (
+    OwnedH2Session<Application>,
+    OwnedH2Handle,
+    Rc<RefCell<FixtureTransportState>>,
+    Rc<RefCell<Vec<Rc<Probe>>>>,
+) {
+    let (fixture, state) = FixtureTransport::new(reads);
+    let (application, probes) = Application::new(replies);
+    let mut config = options(context, Rc::new(UntimedReads(fixture)));
+    config.io.write_timeout = write_timeout;
+    let (session, handle) = OwnedH2Session::new(application, config).expect("write-timed owned H2");
+    (session, handle, state, probes)
+}
+
+/// The client preface, a GET on stream 1, and a WINDOW_UPDATE of 65,535 that widens the
+/// connection window (`connection_blocked == false`, so the stream's window blocks the response)
+/// or the stream's (`connection_blocked`, so the connection's window does).
+fn flow_blocked_get(connection_blocked: bool) -> (Http2Codec, Vec<u8>) {
+    let (mut peer, mut input) = ready_owner_requests(1);
+    input.extend(eligibility_frame(
+        &mut peer,
+        EgressFrame::WindowUpdate {
+            stream: if connection_blocked {
+                StreamId::new(1)
+            } else {
+                StreamId::UNSPECIFIED
+            },
+            amount: 65_535,
+        },
+    ));
+    (peer, input)
+}
+
+/// A response blocked on its stream's send window is reset with FLOW_CONTROL_ERROR when the
+/// write timeout passes with no activity, not a millisecond earlier, as Proxygen's
+/// `handleWriteEventTimeout` resets every flow-blocked stream; the connection stays open.
+#[test]
+fn stream_flow_control_timeout_resets_the_blocked_stream() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, input) = flow_blocked_get(false);
+            let (session, handle, state, probes) = write_timed_session(
+                context,
+                [FixtureRead::Data(input)],
+                vec![Reply::Body(FLOW_BODY)],
+                WRITE,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                complete_credit_wait(|| written_frames(&state, 1).body_bytes == 65_535).await;
+                settle_turns(32).await;
+                host.advance(WRITE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert!(
+                    written_frames(&state, 1).resets.is_empty(),
+                    "the flow-control timeout came early"
+                );
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                let frames = written_frames(&state, 1);
+                assert_eq!(
+                    frames.resets,
+                    [(StreamId::new(1), H2ErrorCode::FLOW_CONTROL_ERROR)]
+                );
+                assert_eq!(frames.body_bytes, 65_535);
+                assert!(frames.goaways.is_empty(), "the connection stays open");
+                assert_eq!(
+                    probes.borrow()[0].cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::FLOW_CONTROL_ERROR, false)]
+                );
+                assert!(handle.initiate_drain().unwrap());
+            });
+            run.expect("the drained connection closes cleanly");
+            assert_eq!(state.borrow().close, FixtureClose::Closed);
+        })
+    });
+}
+
+/// A response blocked on the connection's send window, with its body waiting, fails the
+/// connection with FLOW_CONTROL_ERROR when the write timeout passes with no activity, not a
+/// millisecond earlier: Proxygen's `handleWriteEventTimeout` raises a connection error when the
+/// connection is out of credit and a stream has queued body.
+#[test]
+fn connection_flow_control_timeout_fails_the_connection() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, input) = flow_blocked_get(true);
+            let (session, _handle, state, probes) = write_timed_session(
+                context,
+                [FixtureRead::Data(input)],
+                vec![Reply::Body(FLOW_BODY)],
+                WRITE,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                complete_credit_wait(|| written_frames(&state, 1).body_bytes == 65_535).await;
+                settle_turns(32).await;
+                host.advance(WRITE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert!(
+                    written_goaways(&state).is_empty(),
+                    "the flow-control timeout came early"
+                );
+                assert_eq!(state.borrow().close, FixtureClose::Open);
+                host.advance(Duration::from_millis(1));
+            });
+            let error = run.expect_err("the flow-control timeout fails the connection");
+            assert_eq!(error.code(), HttpErrorCode::FLOW_CONTROL_ERROR);
+            let frames = written_frames(&state, 1);
+            assert_eq!(
+                frames.goaways,
+                [(StreamId::new(1), H2ErrorCode::FLOW_CONTROL_ERROR)]
+            );
+            assert!(frames.resets.is_empty());
+            assert_eq!(frames.body_bytes, 65_535);
+            assert_eq!(state.borrow().close, FixtureClose::Reset);
+            assert_eq!(
+                probes.borrow()[0].cancelled.borrow().as_slice(),
+                &[(HttpErrorCode::FLOW_CONTROL_ERROR, false)]
+            );
+        })
+    });
+}
+
+/// Activity restarts the flow-control timeout, as each write event restarts Proxygen's writer
+/// wait and Uniplex's `note_flow_timeout_activity` restamps its flow deadline: a PING halfway
+/// through the timeout, and the PING reply written for it, move the stream reset to a full write
+/// timeout after the PING.
+#[test]
+fn activity_restarts_the_flow_control_timeout() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (mut peer, input) = flow_blocked_get(false);
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let ping = eligibility_frame(&mut peer, EgressFrame::PingRequest { data: Some(7) });
+            let (session, handle, state, _probes) = write_timed_session(
+                context,
+                [
+                    FixtureRead::Data(input),
+                    FixtureRead::WaitData(Arc::clone(&gate), ping),
+                ],
+                vec![Reply::Body(FLOW_BODY)],
+                WRITE,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                complete_credit_wait(|| written_frames(&state, 1).body_bytes == 65_535).await;
+                settle_turns(32).await;
+                host.advance(WRITE / 2);
+                gate.notify_one();
+                complete_credit_wait(|| written_frames(&state, 1).ping_replies == [7]).await;
+                settle_turns(32).await;
+                host.advance(WRITE / 2);
+                settle_turns(32).await;
+                assert!(
+                    written_frames(&state, 1).resets.is_empty(),
+                    "the PING did not restart the flow-control timeout"
+                );
+                host.advance(WRITE / 2 - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert!(written_frames(&state, 1).resets.is_empty());
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    written_frames(&state, 1).resets,
+                    [(StreamId::new(1), H2ErrorCode::FLOW_CONTROL_ERROR)]
+                );
+                assert!(handle.initiate_drain().unwrap());
+            });
+            run.expect("the drained connection closes cleanly");
+        })
+    });
+}
+
+/// A drain requested in the turn that observes the flow-control expiry wins, as Proxygen's
+/// `initiateDrain` signals the writer's write event: its GOAWAYs go out, the stream stays, and
+/// the still-blocked stream is reset a full write timeout later, after which the drained
+/// connection closes.
+#[test]
+fn a_drain_in_the_expiry_turn_restarts_the_flow_control_timeout() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, input) = flow_blocked_get(false);
+            let (session, handle, state, _probes) = write_timed_session(
+                context,
+                [FixtureRead::Data(input)],
+                vec![Reply::Body(FLOW_BODY)],
+                WRITE,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                complete_credit_wait(|| written_frames(&state, 1).body_bytes == 65_535).await;
+                settle_turns(32).await;
+                host.advance(WRITE);
+                assert!(handle.initiate_drain().unwrap());
+                settle_turns(32).await;
+                let frames = written_frames(&state, 1);
+                assert_eq!(
+                    frames.goaways,
+                    [
+                        (GOAWAY_MAX, H2ErrorCode::NO_ERROR),
+                        (StreamId::new(1), H2ErrorCode::NO_ERROR)
+                    ]
+                );
+                assert!(frames.resets.is_empty(), "the expiry beat the drain");
+                host.advance(WRITE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert!(written_frames(&state, 1).resets.is_empty());
+                host.advance(Duration::from_millis(1));
+            });
+            run.expect("the drained connection closes once the stream is reset");
+            assert_eq!(
+                written_frames(&state, 1).resets,
+                [(StreamId::new(1), H2ErrorCode::FLOW_CONTROL_ERROR)]
+            );
+            assert_eq!(state.borrow().close, FixtureClose::Closed);
+        })
+    });
+}
+
+/// What a downstream driver wrote while its one response waited on flow control: each RST_STREAM
+/// and GOAWAY with the millisecond of paused time it was first seen at, and how the session
+/// ended.
+#[derive(Debug)]
+struct FlowWire {
+    resets: Vec<(u64, StreamId, H2ErrorCode)>,
+    goaways: Vec<(u64, StreamId, H2ErrorCode)>,
+    header_statuses: Vec<(StreamId, u16)>,
+    body_bytes: usize,
+    error: Option<HttpErrorCode>,
+    close: FixtureClose,
+}
+
+/// Serves `flow_blocked_get(connection_blocked)` with a response of `body` bytes on the owned
+/// driver or on `UniplexSession`, both with `WRITE` as the write timeout and a zero GOAWAY
+/// timeout. A PING arrives at `ping_at`, if given, and the application drains the connection at
+/// `drain_at` if it is still open.
+async fn flow_wire(
+    context: WorkerContext,
+    owned: bool,
+    connection_blocked: bool,
+    body: usize,
+    ping_at: Option<Duration>,
+    drain_at: Duration,
+) -> FlowWire {
+    let (mut peer, input) = flow_blocked_get(connection_blocked);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let mut script = VecDeque::from([(None, input)]);
+    if ping_at.is_some() {
+        script.push_back((
+            Some(Arc::clone(&gate)),
+            eligibility_frame(&mut peer, EgressFrame::PingRequest { data: Some(7) }),
+        ));
+    }
+    let (inner, state) = FixtureTransport::new([]);
+    let transport = Rc::new(GatedReads {
+        inner,
+        script: Rc::new(RefCell::new(script)),
+    });
+    let begun = tokio::time::Instant::now();
+    let done = Rc::new(Cell::new(false));
+    type Run = Pin<Box<dyn Future<Output = Result<UniplexRunSummary, HttpError>>>>;
+    let (session, drain): (Run, Box<dyn Fn()>) = if owned {
+        let (application, _probes) = Application::new(vec![Reply::Body(body)]);
+        let mut config = options(context, transport);
+        config.io.write_timeout = WRITE;
+        let (session, handle) = OwnedH2Session::new(application, config).expect("owned H2");
+        (
+            Box::pin(session.run()),
+            Box::new(move || assert!(handle.initiate_drain().unwrap())),
+        )
+    } else {
+        let handler: Rc<dyn HttpHandler> = Rc::new(FixtureHandler {
+            status: 200,
+            response_body: body,
+            response_error: None,
+            invocations: Rc::new(Cell::new(0)),
+            request_body: Rc::new(Cell::new(0)),
+        });
+        let config = UniplexConfig {
+            write_timeout: WRITE,
+            ..UniplexConfig::default()
+        };
+        let http2 = Http2SessionConfig {
+            goaway_timeout: Duration::ZERO,
+            ..Http2SessionConfig::default()
+        };
+        let (session, handle) = UniplexSession::new_http2(
+            context,
+            TransportDirection::Downstream,
+            transport,
+            Some(handler),
+            config,
+            http2,
+        )
+        .expect("Uniplex H2");
+        (
+            Box::pin(session.run()),
+            Box::new(move || assert!(handle.initiate_drain().unwrap())),
+        )
+    };
+    let monitor = async {
+        let (mut resets, mut goaways) = (Vec::new(), Vec::new());
+        let mut drained = false;
+        loop {
+            let at = begun.elapsed();
+            if ping_at.is_some_and(|ping_at| at >= ping_at) {
+                gate.notify_one();
+            }
+            if !drained && !done.get() && at >= drain_at {
+                drained = true;
+                drain();
+            }
+            let ms = at.as_millis() as u64;
+            let frames = written_frames(&state, 1);
+            resets.extend(
+                frames.resets[resets.len()..]
+                    .iter()
+                    .map(|(stream, code)| (ms, *stream, *code)),
+            );
+            goaways.extend(
+                frames.goaways[goaways.len()..]
+                    .iter()
+                    .map(|(stream, code)| (ms, *stream, *code)),
+            );
+            if done.get() {
+                return (resets, goaways);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    let run = async {
+        let result = session.await;
+        done.set(true);
+        result
+    };
+    let (result, (resets, goaways)) = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(run, monitor)
+    })
+    .await
+    .expect("the flow-blocked session ends");
+    let frames = written_frames(&state, 1);
+    let close = state.borrow().close;
+    FlowWire {
+        resets,
+        goaways,
+        header_statuses: frames.header_statuses,
+        body_bytes: frames.body_bytes,
+        error: result.err().map(|error| error.code()),
+        close,
+    }
+}
+
+/// Asserts `timeline` holds `expected`, each frame seen within the millisecond the timelines
+/// sample at.
+fn assert_timeline(
+    timeline: &[(u64, StreamId, H2ErrorCode)],
+    expected: &[(Duration, StreamId, H2ErrorCode)],
+) {
+    let at = |expected: &[(Duration, StreamId, H2ErrorCode)]| -> Vec<(u64, StreamId, H2ErrorCode)> {
+        expected
+            .iter()
+            .map(|(at, stream, code)| (at.as_millis() as u64, *stream, *code))
+            .collect()
+    };
+    assert_same_timeline(timeline, &at(expected));
+}
+
+/// Asserts the same frames, each seen within the millisecond the timelines sample at.
+fn assert_same_timeline(
+    owned: &[(u64, StreamId, H2ErrorCode)],
+    uniplex: &[(u64, StreamId, H2ErrorCode)],
+) {
+    let frames = |timeline: &[(u64, StreamId, H2ErrorCode)]| -> Vec<(StreamId, H2ErrorCode)> {
+        timeline
+            .iter()
+            .map(|(_, stream, code)| (*stream, *code))
+            .collect()
+    };
+    assert_eq!(
+        frames(owned),
+        frames(uniplex),
+        "owned {owned:?}, uniplex {uniplex:?}"
+    );
+    for ((owned_at, ..), (uniplex_at, ..)) in owned.iter().zip(uniplex) {
+        assert!(
+            owned_at.abs_diff(*uniplex_at) <= 1,
+            "owned {owned:?}, uniplex {uniplex:?}"
+        );
+    }
+}
+
+/// Flow-control timeouts, owned against `UniplexSession` on the same paused clock: a response
+/// blocked on its stream window is reset with FLOW_CONTROL_ERROR at the write timeout and the
+/// connection drains later, and one blocked on the connection window fails the connection with
+/// GOAWAY(FLOW_CONTROL_ERROR) and a transport reset at the write timeout. Both drivers write the
+/// same frames at the same instants and end with the same result. (A drained connection then
+/// closes differently, which is not a timer property: the owned driver closes the transport
+/// where `UniplexSession` shuts down its write side.)
+#[test]
+fn owned_flow_control_timeouts_match_uniplex() {
+    let drain_at = 3 * WRITE;
+    for connection_blocked in [false, true] {
+        let (owned, uniplex) = run_on_paused_worker(move |context| {
+            Box::pin(async move {
+                let owned = flow_wire(
+                    context.clone(),
+                    true,
+                    connection_blocked,
+                    FLOW_BODY,
+                    None,
+                    drain_at,
+                )
+                .await;
+                let uniplex = flow_wire(
+                    context,
+                    false,
+                    connection_blocked,
+                    FLOW_BODY,
+                    None,
+                    drain_at,
+                )
+                .await;
+                (owned, uniplex)
+            })
+        });
+        assert_same_timeline(&owned.resets, &uniplex.resets);
+        assert_same_timeline(&owned.goaways, &uniplex.goaways);
+        assert_eq!(owned.header_statuses, uniplex.header_statuses);
+        assert_eq!(owned.body_bytes, uniplex.body_bytes);
+        assert_eq!(owned.error, uniplex.error);
+        let timeout = [(WRITE, StreamId::new(1), H2ErrorCode::FLOW_CONTROL_ERROR)];
+        if connection_blocked {
+            assert_eq!(owned.close, uniplex.close);
+            assert!(owned.resets.is_empty());
+            assert_timeline(&owned.goaways, &timeout);
+            assert_eq!(owned.error, Some(HttpErrorCode::FLOW_CONTROL_ERROR));
+            assert_eq!(owned.close, FixtureClose::Reset);
+        } else {
+            assert_timeline(&owned.resets, &timeout);
+            assert_eq!(owned.error, None);
+        }
+    }
+}
+
+/// `UniplexSession`'s H2 buffer timeout, on the owned axis (`DIV-028`). A response blocked on its
+/// stream window fills Uniplex's egress body queue, which arms a buffer deadline that activity
+/// does not move; a PING halfway through the write timeout moves only the flow deadline, so
+/// Uniplex's buffer timeout fires first and fails the stream's source with READ_TIMEOUT ("timed
+/// out waiting for buffer space"). The owned driver reads response body only within credit and
+/// has no egress body queue to time: the PING restarts its flow-control timeout, which resets the
+/// stream with FLOW_CONTROL_ERROR a full write timeout after the PING.
+#[test]
+fn uniplex_buffer_timeout_is_a_flow_control_timeout_on_the_owned_driver() {
+    // Enough that what the window holds back fills Uniplex's 65,535-byte egress body queue.
+    const BUFFER_BODY: usize = 256 << 10;
+    let drain_at = 3 * WRITE;
+    let ping_at = WRITE / 2;
+    let (owned, uniplex) = run_on_paused_worker(move |context| {
+        Box::pin(async move {
+            let owned = flow_wire(
+                context.clone(),
+                true,
+                false,
+                BUFFER_BODY,
+                Some(ping_at),
+                drain_at,
+            )
+            .await;
+            let uniplex =
+                flow_wire(context, false, false, BUFFER_BODY, Some(ping_at), drain_at).await;
+            (owned, uniplex)
+        })
+    });
+    assert_timeline(
+        &owned.resets,
+        &[(
+            ping_at + WRITE,
+            StreamId::new(1),
+            H2ErrorCode::FLOW_CONTROL_ERROR,
+        )],
+    );
+    // Uniplex's buffer timeout fails the source with READ_TIMEOUT, which resets the stream with
+    // INTERNAL_ERROR, at the buffer deadline the PING did not move.
+    assert_timeline(
+        &uniplex.resets,
+        &[(WRITE, StreamId::new(1), H2ErrorCode::INTERNAL_ERROR)],
+    );
+    assert_eq!(owned.header_statuses, uniplex.header_statuses);
+    assert_eq!(owned.body_bytes, uniplex.body_bytes);
+    assert_same_timeline(&owned.goaways, &uniplex.goaways);
+    assert_eq!(owned.error, None);
+    assert_eq!(uniplex.error, None);
+}
+
+/// A hundred streams that block one after another hold one wheel slot for the connection's
+/// flow-control timeout: each arrival restamps it later, which is a store, not a relink, the
+/// wheel re-slots it about once per timeout period, and its one fire resets every blocked stream.
+#[test]
+fn staggered_blocked_streams_hold_one_flow_slot() {
+    const STREAMS: usize = 100;
+    const SPACING: Duration = Duration::from_millis(250);
+    crate::external_host_tests::run_on_wheel_host_with(|host, context| {
+        Box::pin(async move {
+            let (mut peer, mut preface) = ready_owner_requests(0);
+            preface.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::UNSPECIFIED,
+                    amount: i32::MAX as u32 - 65_535,
+                },
+            ));
+            let gates: Vec<_> = (0..STREAMS)
+                .map(|_| Arc::new(tokio::sync::Notify::new()))
+                .collect();
+            let requests = gates.iter().map(|gate| {
+                FixtureRead::WaitData(Arc::clone(gate), eligibility_request(&mut peer, 0))
+            });
+            let reads: Vec<_> = [FixtureRead::Data(preface)]
+                .into_iter()
+                .chain(requests)
+                .collect();
+            // One byte more than each stream's 65,535-byte window.
+            let (session, handle, state, probes) =
+                write_timed_session(context, reads, vec![Reply::Body(65_536); STREAMS], WRITE);
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                for (opened, gate) in gates.iter().enumerate() {
+                    host.advance(SPACING);
+                    gate.notify_one();
+                    complete_credit_wait(|| {
+                        written_frames(&state, STREAMS).body_bytes == 65_535 * (opened + 1)
+                    })
+                    .await;
+                    settle_turns(8).await;
+                }
+                let stats = host.wheel_stats();
+                assert_eq!(
+                    stats.live_slots, 1,
+                    "one slot for the connection's flow timeout"
+                );
+                assert_eq!(stats.fired, 0);
+                assert_eq!(stats.relinked, 1, "restamps are stores, not relinks");
+                let periods =
+                    (SPACING.as_millis() * STREAMS as u128).div_ceil(WRITE.as_millis()) as u64;
+                assert!(
+                    stats.reslotted <= 2 * periods,
+                    "{} re-slots over {periods} timeout periods",
+                    stats.reslotted
+                );
+                assert!(written_frames(&state, STREAMS).resets.is_empty());
+                host.advance(WRITE);
+                complete_credit_wait(|| written_frames(&state, STREAMS).resets.len() == STREAMS)
+                    .await;
+                assert_eq!(host.wheel_stats().fired, 1, "one fire resets every stream");
+                assert!(handle.initiate_drain().unwrap());
+            });
+            run.expect("the drained connection closes cleanly");
+            let resets = written_frames(&state, STREAMS).resets;
+            assert!(
+                resets
+                    .iter()
+                    .all(|(_, code)| *code == H2ErrorCode::FLOW_CONTROL_ERROR)
+            );
+            assert_eq!(
+                resets
+                    .iter()
+                    .map(|(stream, _)| stream.get())
+                    .collect::<Vec<_>>(),
+                (0..STREAMS as u64)
+                    .map(|index| 2 * index + 1)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                probes
+                    .borrow()
+                    .iter()
+                    .all(|probe| probe.cancelled.borrow().as_slice()
+                        == [(HttpErrorCode::FLOW_CONTROL_ERROR, false)])
+            );
+        })
+    });
+}
+
+/// A flow-blocked stream that gets credit and retires at its END_STREAM serialization, before its
+/// write completes (`DIV-028`), leaves nothing for the flow-control timeout: the slot is disarmed
+/// and never fires.
+#[test]
+fn flow_slot_disarms_when_the_blocked_stream_retires_early() {
+    crate::external_host_tests::run_on_wheel_host_with(|host, context| {
+        Box::pin(async move {
+            let (mut peer, input) = flow_blocked_get(false);
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let credit = eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::new(1),
+                    amount: 1,
+                },
+            );
+            // The peer's EOF waits for the drain, since a read past the script needs Tokio.
+            let end = Arc::new(tokio::sync::Notify::new());
+            let transport = QueuedFixtureTransport::reporting(
+                [
+                    FixtureRead::Data(input),
+                    FixtureRead::WaitData(Arc::clone(&gate), credit),
+                    FixtureRead::WaitDataEof(Arc::clone(&end), Vec::new()),
+                ],
+                Some(Rc::new(Cell::new(false))),
+                false,
+            );
+            let queue = Rc::clone(&transport.probe);
+            // One byte more than the stream's 65,535-byte window.
+            let (application, probes) = Application::new(vec![Reply::Body(65_536)]);
+            let mut config = options(context, transport);
+            config.io.write_timeout = WRITE;
+            let (session, handle) = OwnedH2Session::new(application, config).expect("owned H2");
+            assert_eq!(queue.borrow().write_timeout, WRITE);
+            let (run, ()) = futures::join!(session.run(), async {
+                // The queue holds two writes until they are released.
+                while queued_body_bytes(&queue) != 65_535 {
+                    release_all_queued_writes(&queue);
+                    tokio::task::yield_now().await;
+                }
+                release_all_queued_writes(&queue);
+                settle_turns(32).await;
+                assert_eq!(
+                    host.wheel_stats().armed,
+                    1,
+                    "the blocked stream arms the slot"
+                );
+                host.advance(WRITE / 2);
+                gate.notify_one();
+                let probe = Rc::clone(&probes.borrow()[0]);
+                drive_until(DRIVE_LIMIT, || probe.completed.get() == 1).await;
+                assert!(end_stream_accepted(&queue, 1));
+                assert!(
+                    queue.borrow().released < queue.borrow().accepted.len(),
+                    "the stream retired before its END_STREAM was written"
+                );
+                assert_eq!(
+                    host.wheel_stats().armed,
+                    0,
+                    "the retired stream disarmed the slot"
+                );
+                release_all_queued_writes(&queue);
+                host.advance(WRITE);
+                settle_turns(32).await;
+                assert_eq!(host.wheel_stats().fired, 0);
+                assert!(probe.cancelled.borrow().is_empty());
+                assert!(
+                    queued_transcript(&queue)
+                        .frames
+                        .iter()
+                        .all(|frame| frame.frame_type != FrameType::RST_STREAM.as_u8())
+                );
+                assert!(handle.initiate_drain().unwrap());
+                finish_queued_writes(&queue);
+                end.notify_one();
+            });
+            run.expect("the drained connection closes cleanly");
+        })
+    });
+}
+
+/// The DATA payload bytes the queue has accepted.
+fn queued_body_bytes(queue: &RefCell<QueuedWriteProbe>) -> usize {
+    queued_transcript(queue)
+        .frames
+        .iter()
+        .filter(|frame| frame.frame_type == FrameType::DATA.as_u8())
+        .map(|frame| frame.length as usize)
+        .sum()
+}
+
+/// The clock reads of a flow-blocked GET, a PING, the credit that unblocks the response and a
+/// drain, with every timeout zero: 2, as on the parent commit, which had no flow-control timer.
+const ZERO_CONFIG_BLOCKED_NOW_READS: usize = 2;
+
+/// With a zero write timeout a flow-blocked response arms nothing: no slot, no host sleep, and no
+/// clock read beyond the parent's, however long it stays blocked and however often the
+/// connection polls meanwhile.
+#[test]
+fn zero_write_timeout_blocked_stream_takes_no_slot_sleep_or_clock_read() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let wheel = context.host().wheel_timer().is_some();
+            let (mut peer, input) = flow_blocked_get(false);
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let ping = eligibility_frame(&mut peer, EgressFrame::PingRequest { data: Some(7) });
+            let credit_gate = Arc::new(tokio::sync::Notify::new());
+            let credit = eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::new(1),
+                    amount: (FLOW_BODY - 65_535) as u32,
+                },
+            );
+            let reads_before = host.now_reads();
+            let (session, handle, state, probes) = write_timed_session(
+                context,
+                [
+                    FixtureRead::Data(input),
+                    FixtureRead::WaitData(Arc::clone(&gate), ping),
+                    FixtureRead::WaitData(Arc::clone(&credit_gate), credit),
+                ],
+                vec![Reply::Body(FLOW_BODY)],
+                Duration::ZERO,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                complete_credit_wait(|| written_frames(&state, 1).body_bytes == 65_535).await;
+                settle_turns(32).await;
+                host.advance(10 * WRITE);
+                gate.notify_one();
+                complete_credit_wait(|| written_frames(&state, 1).ping_replies == [7]).await;
+                settle_turns(32).await;
+                host.advance(10 * WRITE);
+                settle_turns(32).await;
+                assert!(written_frames(&state, 1).resets.is_empty());
+                credit_gate.notify_one();
+                let probe = Rc::clone(&probes.borrow()[0]);
+                complete_credit_wait(|| probe.completed.get() == 1).await;
+                assert_eq!(written_frames(&state, 1).body_bytes, FLOW_BODY);
+                assert!(handle.initiate_drain().unwrap());
+            });
+            run.expect("the drained connection closes cleanly");
+            assert_eq!(
+                host.now_reads() - reads_before,
+                ZERO_CONFIG_BLOCKED_NOW_READS
+            );
+            assert_eq!(host.sleeps(), 0, "a zero-config session made a host sleep");
+            if wheel {
+                let stats = host.wheel_stats();
+                assert_eq!(stats.scheduled, 0);
+                assert_eq!(stats.live_slots, 0);
+            }
+            assert!(probes.borrow()[0].cancelled.borrow().is_empty());
         })
     });
 }

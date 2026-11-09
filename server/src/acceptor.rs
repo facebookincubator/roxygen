@@ -148,9 +148,10 @@ pub struct ServerSessionConfig {
     /// (`roxygen_session::owned_h2`) instead of `UniplexSession`, with no task per
     /// request. HTTP/1.1 connections are unchanged. The owned mode honors
     /// `connection_idle_timeout`, which drains an idle connection with GOAWAY
-    /// (`DIV-028`). It is stat-less: `stream_read_timeout` and
-    /// `write_timeout` must be zero (which also leaves HTTP/1.1 sessions untimed for
-    /// them), and `stats_factory` must be `None`. Server construction refuses
+    /// (`DIV-028`), and `write_timeout`, which bounds a stalled
+    /// transport write and a response's wait for flow-control credit (`DIV-028`). It is
+    /// stat-less: `stream_read_timeout` must be zero (which also leaves HTTP/1.1 sessions
+    /// untimed for it), and `stats_factory` must be `None`. Server construction refuses
     /// anything else with the reason, as
     /// `HttpServerError::InvalidConfig` (or, for `serve_transport`,
     /// `INVALID_STATE_TRANSITION`). It applies `http2_rate_limits`, as the managed driver does.
@@ -254,9 +255,6 @@ impl ServerSessionConfig {
         }
         if !self.stream_read_timeout.is_zero() {
             return Err("owned_http2 does not honor stream_read_timeout: it must be zero");
-        }
-        if !self.write_timeout.is_zero() {
-            return Err("owned_http2 does not honor write_timeout: it must be zero");
         }
         Ok(())
     }

@@ -6406,28 +6406,639 @@ fn cancel_before_release_still_resets() {
     assert!(released_after, "the retired stream releases its capacity");
 }
 
-/// The upstream driver still refuses the timers it does not honor: a connection read timeout
-/// and a stream read timeout or write timeout, before any transport or application work.
+/// The upstream driver still refuses the timer it does not honor, a stream read timeout, before
+/// any transport or application work.
 #[test]
 fn upstream_refuses_unhonored_timeouts() {
     run_on_worker(|context| {
         Box::pin(async move {
-            for case in 0..3 {
-                let (transport, state) = FixtureTransport::new([]);
-                let mut config = options(context.clone(), transport);
-                match case {
-                    0 => config.io.read_timeout = Duration::from_secs(1),
-                    1 => config.io.stream_read_timeout = Duration::from_secs(1),
-                    2 => config.io.write_timeout = Duration::from_secs(1),
-                    _ => unreachable!(),
-                }
-                let error = match OwnedH2UpstreamSession::new(config) {
-                    Err(error) => error,
-                    Ok(_) => panic!("unhonored upstream timeout {case} was accepted"),
-                };
-                assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
-                assert!(state.borrow().writes.is_empty());
-            }
+            let (transport, state) = FixtureTransport::new([]);
+            let mut config = options(context.clone(), transport);
+            config.io.stream_read_timeout = Duration::from_secs(1);
+            let error = match OwnedH2UpstreamSession::new(config) {
+                Err(error) => error,
+                Ok(_) => panic!("an upstream stream read timeout was accepted"),
+            };
+            assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+            assert!(state.borrow().writes.is_empty());
         })
     });
+}
+
+/// An idle upstream connection drains at its read timeout, not a millisecond earlier, as
+/// Proxygen's read timeout calls `initiateDrain`: one GOAWAY, admission closes, and with no
+/// stream left the connection closes.
+#[test]
+fn upstream_idle_connection_drains_at_its_read_timeout() {
+    super::owned::on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Downstream);
+            let settings = arming_origin_settings(&mut peer);
+            let (fixture, wire) = FixtureTransport::new([FixtureRead::Data(settings)]);
+            let mut config = options(context, Rc::new(super::owned::UntimedReads(fixture)));
+            config.io.read_timeout = super::owned::IDLE;
+            let (session, handle) =
+                OwnedH2UpstreamSession::new(config).expect("timed owned upstream H2");
+            let (run, ()) = futures::join!(session.run(), async {
+                super::owned::settle_turns(32).await;
+                host.advance(super::owned::IDLE - Duration::from_millis(1));
+                super::owned::settle_turns(32).await;
+                assert!(
+                    decode_client_frames(&wire.borrow().writes.concat())
+                        .goaways
+                        .is_empty(),
+                    "the drain came early"
+                );
+                assert_eq!(wire.borrow().close, FixtureClose::Open);
+                host.advance(Duration::from_millis(1));
+            });
+            run.expect("an idle drain closes cleanly");
+            assert_eq!(
+                decode_client_frames(&wire.borrow().writes.concat()).goaways,
+                [(StreamId::UNSPECIFIED, H2ErrorCode::NO_ERROR)]
+            );
+            assert_eq!(wire.borrow().close, FixtureClose::Closed);
+            assert!(
+                handle.reserve_request().is_err(),
+                "the drain closed admission"
+            );
+        })
+    });
+}
+
+/// What an upstream driver did while its connection idled past its read timeout: each GOAWAY
+/// with the millisecond of paused time it was first seen at, the response it delivered, and how
+/// the session ended.
+#[derive(Debug, Eq, PartialEq)]
+struct UpstreamIdleWire {
+    goaways: Vec<(u64, StreamId, H2ErrorCode)>,
+    /// The response's status and the millisecond it was read, for a request sent at the start.
+    response: Option<(u16, u64)>,
+    result: Result<(), HttpErrorCode>,
+}
+
+/// Runs an upstream connection with `super::owned::IDLE` as its read timeout on the owned driver
+/// or on `UniplexSession`. With `response_at`, a GET goes out at the start and the origin answers
+/// it at that instant.
+async fn upstream_idle_wire(
+    context: WorkerContext,
+    owned: bool,
+    response_at: Option<Duration>,
+) -> UpstreamIdleWire {
+    let mut peer = Http2Codec::new(TransportDirection::Downstream);
+    let mut script = VecDeque::from([(None, arming_origin_settings(&mut peer))]);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    if response_at.is_some() {
+        script.push_back((
+            Some(Arc::clone(&gate)),
+            response_head(&mut peer, StreamId::new(1), 200, true, None),
+        ));
+    }
+    let (inner, wire) = FixtureTransport::new([]);
+    let transport = Rc::new(super::owned::GatedReads {
+        inner,
+        script: Rc::new(RefCell::new(script)),
+    });
+    let begun = tokio::time::Instant::now();
+    let done = Rc::new(Cell::new(false));
+    let response = Rc::new(Cell::new(None));
+    type Run = Pin<Box<dyn Future<Output = Result<UniplexRunSummary, HttpError>>>>;
+    type Exchange = Pin<Box<dyn Future<Output = ()>>>;
+    let record = {
+        let response = Rc::clone(&response);
+        move |status: u16| response.set(Some((status, begun.elapsed().as_millis() as u64)))
+    };
+    let (session, exchange): (Run, Exchange) = if owned {
+        let mut config = options(context, transport);
+        config.io.read_timeout = super::owned::IDLE;
+        let (session, handle) = OwnedH2UpstreamSession::new(config).expect("owned upstream H2");
+        let exchange: Exchange = if response_at.is_some() {
+            let submission = handle.reserve_request().unwrap().submit(
+                request_head(HttpMethod::Get, true, None),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            Box::pin(async move {
+                let (_, mut source, _control) = submission
+                    .await
+                    .expect("the origin answers")
+                    .into_source_parts();
+                let mut head = source.read_header_event().await.expect("response head");
+                record(head.headers_mut().status_code().unwrap());
+            })
+        } else {
+            Box::pin(async {})
+        };
+        (Box::pin(session.run()), exchange)
+    } else {
+        let config = UniplexConfig {
+            read_timeout: super::owned::IDLE,
+            stream_read_timeout: Duration::ZERO,
+            write_timeout: Duration::ZERO,
+            ..UniplexConfig::default()
+        };
+        let http2 = Http2SessionConfig {
+            settings: vec![roxygen_codec::CodecSetting {
+                identifier: SettingsId::EnablePush.as_u16(),
+                value: 0,
+            }],
+            double_goaway_drain: false,
+            goaway_timeout: Duration::ZERO,
+            ..Http2SessionConfig::default()
+        };
+        let (session, handle) = UniplexSession::new_http2(
+            context,
+            TransportDirection::Upstream,
+            transport,
+            None,
+            config,
+            http2,
+        )
+        .expect("Uniplex upstream H2");
+        let exchange: Exchange = if response_at.is_some() {
+            Box::pin(async move {
+                let request =
+                    HttpFixedSource::make_get_request(b"/owned-upstream", None).expect("fixed GET");
+                let mut source = handle
+                    .send_request(
+                        HttpSourceHolder::new(Box::new(request)),
+                        CancellationSource::new().token(),
+                    )
+                    .await
+                    .expect("request admitted")
+                    .source;
+                let mut head = source.read_header_event().await.expect("response head");
+                record(head.headers_mut().status_code().unwrap());
+            })
+        } else {
+            Box::pin(async {})
+        };
+        (Box::pin(session.run()), exchange)
+    };
+    let monitor = async {
+        let mut goaways = Vec::new();
+        loop {
+            let at = begun.elapsed();
+            if response_at.is_some_and(|response_at| at >= response_at) {
+                gate.notify_one();
+            }
+            let ms = at.as_millis() as u64;
+            let written = decode_client_frames(&wire.borrow().writes.concat()).goaways;
+            goaways.extend(
+                written[goaways.len()..]
+                    .iter()
+                    .map(|(stream, code)| (ms, *stream, *code)),
+            );
+            if done.get() {
+                return goaways;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    let run = async {
+        let result = session.await;
+        done.set(true);
+        result
+    };
+    let (result, goaways, ()) = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(run, monitor, exchange)
+    })
+    .await
+    .expect("the idle upstream connection ends");
+    UpstreamIdleWire {
+        goaways,
+        response: response.get(),
+        result: result.map(|_| ()).map_err(|error| error.code()),
+    }
+}
+
+/// Upstream read-timeout drains, owned against `UniplexSession` on the same paused clock: an idle
+/// connection, and one whose request is still unanswered at the timeout, send the same GOAWAY at
+/// the same instant; the late response is still delivered, and both connections then close
+/// cleanly.
+#[test]
+fn owned_upstream_idle_drain_matches_uniplex() {
+    let idle = super::owned::IDLE.as_millis() as u64;
+    for response_at in [None, Some(super::owned::IDLE + Duration::from_millis(500))] {
+        let (owned, uniplex) = super::owned::run_on_paused_worker(move |context| {
+            Box::pin(async move {
+                let owned = upstream_idle_wire(context.clone(), true, response_at).await;
+                let uniplex = upstream_idle_wire(context, false, response_at).await;
+                (owned, uniplex)
+            })
+        });
+        assert_eq!(
+            owned
+                .goaways
+                .iter()
+                .map(|(_, stream, code)| (*stream, *code))
+                .collect::<Vec<_>>(),
+            uniplex
+                .goaways
+                .iter()
+                .map(|(_, stream, code)| (*stream, *code))
+                .collect::<Vec<_>>(),
+            "owned {owned:?}, uniplex {uniplex:?}"
+        );
+        for ((owned_at, ..), (uniplex_at, ..)) in owned.goaways.iter().zip(&uniplex.goaways) {
+            assert!(
+                owned_at.abs_diff(*uniplex_at) <= 1,
+                "owned {owned:?}, uniplex {uniplex:?}"
+            );
+        }
+        assert_eq!(
+            owned
+                .goaways
+                .iter()
+                .map(|(_, stream, code)| (*stream, *code))
+                .collect::<Vec<_>>(),
+            [(StreamId::UNSPECIFIED, H2ErrorCode::NO_ERROR)]
+        );
+        assert!(owned.goaways[0].0.abs_diff(idle) <= 1, "owned {owned:?}");
+        assert_eq!(
+            owned.response.map(|(status, _)| status),
+            response_at.map(|_| 200)
+        );
+        assert_eq!(
+            owned.response.map(|(status, _)| status),
+            uniplex.response.map(|(status, _)| status)
+        );
+        assert_eq!(owned.result, Ok(()));
+        assert_eq!(owned.result, uniplex.result);
+    }
+}
+
+/// An upload blocked on its stream's send window is reset with FLOW_CONTROL_ERROR when the write
+/// timeout passes with no activity, not a millisecond earlier, as Proxygen's
+/// `handleWriteEventTimeout` resets every flow-blocked stream, and its response fails with it.
+#[test]
+fn upstream_flow_control_timeout_resets_the_blocked_upload() {
+    super::owned::on_both_hosts(|host, context| {
+        Box::pin(async move {
+            const UPLOAD: usize = 96 << 10;
+            const WRITE: Duration = Duration::from_secs(1);
+            let mut peer = Http2Codec::new(TransportDirection::Downstream);
+            let mut input = arming_origin_settings(&mut peer);
+            input.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::UNSPECIFIED,
+                    amount: 65_535,
+                },
+            ));
+            let (fixture, wire) = FixtureTransport::new([FixtureRead::Data(input)]);
+            let mut config = options(context, Rc::new(super::owned::UntimedReads(fixture)));
+            config.io.write_timeout = WRITE;
+            let (session, handle) =
+                OwnedH2UpstreamSession::new(config).expect("write-timed owned upstream H2");
+            let (upload, _probe) = Upload::new(UPLOAD, 4096).held();
+            let submission = handle.reserve_request().unwrap().submit(
+                request_head(HttpMethod::Post, false, Some(UPLOAD)),
+                upload,
+                CancellationToken::never(),
+            );
+            let body_bytes = || decode_client_frames(&wire.borrow().writes.concat()).body_bytes;
+            let resets = || decode_client_frames(&wire.borrow().writes.concat()).resets;
+            let (run, ()) = futures::join!(session.run(), async {
+                let (_, mut source, _control) = submission
+                    .await
+                    .expect("the upload is committed")
+                    .into_source_parts();
+                complete_credit_wait(|| body_bytes() == 65_535).await;
+                super::owned::settle_turns(32).await;
+                host.advance(WRITE - Duration::from_millis(1));
+                super::owned::settle_turns(32).await;
+                assert!(resets().is_empty(), "the flow-control timeout came early");
+                host.advance(Duration::from_millis(1));
+                let error = match source.read_header_event().await {
+                    Ok(_) => panic!("the blocked upload got a response"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.code(), HttpErrorCode::FLOW_CONTROL_ERROR);
+                assert_eq!(
+                    resets(),
+                    [(StreamId::new(1), H2ErrorCode::FLOW_CONTROL_ERROR)]
+                );
+                assert_eq!(body_bytes(), 65_535);
+                assert!(handle.close_when_idle().unwrap());
+            });
+            run.expect("the drained connection closes cleanly");
+        })
+    });
+}
+
+/// Under a write timeout the writer's flow-control wait observes every queued write's
+/// completion. Over a capacity-only queue that still has room, the write that exhausts an
+/// upload's stream window completes while the upload awaits its response, which is no wake for
+/// an untimed session; the timed session still resets the upload at its flow-control timeout,
+/// not a millisecond later, and is polled only on its own wakes meanwhile.
+#[test]
+fn queued_upload_exhausting_its_window_is_reset_at_its_flow_control_timeout() {
+    const UPLOAD: usize = 96 << 10;
+    const WRITE: Duration = Duration::from_secs(1);
+    let (write_timeout, reset_at, error, resets) = super::owned::run_on_paused_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Downstream);
+            let mut input = arming_origin_settings(&mut peer);
+            input.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::UNSPECIFIED,
+                    amount: 65_535,
+                },
+            ));
+            let transport =
+                inline_arming_transport(vec![FixtureRead::Data(input)], ARMING_CAPACITY);
+            let begun = tokio::time::Instant::now();
+            run_upstream_arming(
+                context,
+                transport,
+                |config| config.io.write_timeout = WRITE,
+                &[],
+                async |handle, state, _counts| {
+                    let (upload, _probe) = Upload::new(UPLOAD, 4096).held();
+                    let submission = handle.reserve_request().unwrap().submit(
+                        request_head(HttpMethod::Post, false, Some(UPLOAD)),
+                        upload,
+                        CancellationToken::never(),
+                    );
+                    let (_, mut source, _control) = submission
+                        .await
+                        .expect("the upload is committed")
+                        .into_source_parts();
+                    let error = tokio::time::timeout(4 * WRITE, source.read_header_event())
+                        .await
+                        .map(|head| head.err().map(|error| error.code()));
+                    let reset_at = begun.elapsed();
+                    let resets = decode_client_frames(&state.borrow().writes.concat()).resets;
+                    (state.borrow().write_timeout, reset_at, error, resets)
+                },
+            )
+            .await
+        })
+    });
+    assert_eq!(write_timeout, WRITE);
+    assert_eq!(
+        error,
+        Ok(Some(HttpErrorCode::FLOW_CONTROL_ERROR)),
+        "the blocked upload was not reset"
+    );
+    assert_eq!(reset_at, WRITE);
+    assert_eq!(
+        resets,
+        [(StreamId::new(1), H2ErrorCode::FLOW_CONTROL_ERROR)]
+    );
+}
+
+/// What an upstream driver did while an upload waited on its stream's send window beside a
+/// header-only response the client consumed later: each RST_STREAM with the millisecond of
+/// paused time it was first seen at, and how the upload's response failed.
+#[derive(Debug)]
+struct RetirementFlowWire {
+    resets: Vec<(u64, StreamId, H2ErrorCode)>,
+    upload: Option<HttpErrorCode>,
+}
+
+/// Runs upload A (stream 1), blocked on its stream window, beside GET B (stream 3), on the owned
+/// driver or on `UniplexSession`, both with `write_timeout` as their write timeout. The origin
+/// answers B with a header-only response at `respond_at`; the client consumes it at
+/// `consume_at`, which retires B without a byte read or written. The client drains the connection
+/// at `drain_at`.
+async fn retirement_flow_wire(
+    context: WorkerContext,
+    owned: bool,
+    write_timeout: Duration,
+    respond_at: Duration,
+    consume_at: Duration,
+    drain_at: Duration,
+) -> RetirementFlowWire {
+    const UPLOAD: usize = 96 << 10;
+    let mut peer = Http2Codec::new(TransportDirection::Downstream);
+    let mut input = arming_origin_settings(&mut peer);
+    input.extend(eligibility_frame(
+        &mut peer,
+        EgressFrame::WindowUpdate {
+            stream: StreamId::UNSPECIFIED,
+            amount: 65_535,
+        },
+    ));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let script = VecDeque::from([
+        (None, input),
+        (
+            Some(Arc::clone(&gate)),
+            response_head(&mut peer, StreamId::new(3), 200, true, None),
+        ),
+    ]);
+    let (inner, wire) = FixtureTransport::new([]);
+    let transport = Rc::new(super::owned::GatedReads {
+        inner,
+        script: Rc::new(RefCell::new(script)),
+    });
+    let begun = tokio::time::Instant::now();
+    let done = Rc::new(Cell::new(false));
+    type Run = Pin<Box<dyn Future<Output = Result<UniplexRunSummary, HttpError>>>>;
+    type Response = Pin<Box<dyn Future<Output = Result<HttpSourceHolder, HttpError>>>>;
+    let (session, upload, fetch, drain): (Run, Response, Response, Box<dyn Fn()>) = if owned {
+        let mut config = options(context, transport);
+        config.io.write_timeout = write_timeout;
+        let (session, handle) = OwnedH2UpstreamSession::new(config).expect("owned upstream H2");
+        let (body, _probe) = Upload::new(UPLOAD, 4096).held();
+        let upload = handle.reserve_request().unwrap().submit(
+            request_head(HttpMethod::Post, false, Some(UPLOAD)),
+            body,
+            CancellationToken::never(),
+        );
+        let fetch = handle.reserve_request().unwrap().submit(
+            request_head(HttpMethod::Get, true, None),
+            HttpSourceHolder::empty(),
+            CancellationToken::never(),
+        );
+        let response = |submission: crate::owned_h2::OwnedH2UpstreamSubmission| -> Response {
+            Box::pin(async move {
+                let (_, source, _request) = submission.await?.into_source_parts();
+                Ok(source)
+            })
+        };
+        (
+            Box::pin(session.run()),
+            response(upload),
+            response(fetch),
+            Box::new(move || assert!(handle.close_when_idle().unwrap())),
+        )
+    } else {
+        let config = UniplexConfig {
+            read_timeout: Duration::ZERO,
+            stream_read_timeout: Duration::ZERO,
+            write_timeout,
+            ..UniplexConfig::default()
+        };
+        let http2 = Http2SessionConfig {
+            settings: vec![roxygen_codec::CodecSetting {
+                identifier: SettingsId::EnablePush.as_u16(),
+                value: 0,
+            }],
+            double_goaway_drain: false,
+            goaway_timeout: Duration::ZERO,
+            ..Http2SessionConfig::default()
+        };
+        let (session, handle) = UniplexSession::new_http2(
+            context,
+            TransportDirection::Upstream,
+            transport,
+            None,
+            config,
+            http2,
+        )
+        .expect("Uniplex upstream H2");
+        let handle = Rc::new(handle);
+        let ordered = Rc::new(tokio::sync::Notify::new());
+        let upload: Response = {
+            let (handle, ordered) = (Rc::clone(&handle), Rc::clone(&ordered));
+            Box::pin(async move {
+                let request = HttpFixedSource::make_fixed_request(
+                    b"/owned-upstream",
+                    HttpMethod::Post,
+                    Some(queue(&vec![b'u'; UPLOAD])),
+                )
+                .expect("fixed POST");
+                let sent = handle
+                    .send_request(
+                        HttpSourceHolder::new(Box::new(request)),
+                        CancellationSource::new().token(),
+                    )
+                    .await;
+                ordered.notify_one();
+                Ok(sent?.source)
+            })
+        };
+        let fetch: Response = {
+            let handle = Rc::clone(&handle);
+            Box::pin(async move {
+                ordered.notified().await;
+                let request =
+                    HttpFixedSource::make_get_request(b"/owned-upstream", None).expect("fixed GET");
+                Ok(handle
+                    .send_request(
+                        HttpSourceHolder::new(Box::new(request)),
+                        CancellationSource::new().token(),
+                    )
+                    .await?
+                    .source)
+            })
+        };
+        (
+            Box::pin(session.run()),
+            upload,
+            fetch,
+            Box::new(move || assert!(handle.initiate_drain().unwrap())),
+        )
+    };
+    let upload = async {
+        let mut source = upload.await.expect("the upload is admitted");
+        source
+            .read_header_event()
+            .await
+            .err()
+            .map(|error| error.code())
+    };
+    let fetch = async {
+        let source = fetch.await.expect("the GET is admitted");
+        tokio::time::sleep_until(begun + consume_at).await;
+        let mut source = source;
+        let head = source.read_header_event().await.expect("B's response head");
+        assert!(head.eom(), "B's response ends with its head");
+    };
+    let monitor = async {
+        let mut resets = Vec::new();
+        let mut drained = false;
+        loop {
+            let at = begun.elapsed();
+            if at >= respond_at {
+                gate.notify_one();
+            }
+            if !drained && !done.get() && at >= drain_at {
+                drained = true;
+                drain();
+            }
+            let ms = at.as_millis() as u64;
+            let written = decode_client_frames(&wire.borrow().writes.concat()).resets;
+            resets.extend(
+                written[resets.len()..]
+                    .iter()
+                    .map(|(stream, code)| (ms, *stream, *code)),
+            );
+            if done.get() {
+                return resets;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    let run = async {
+        let result = session.await;
+        done.set(true);
+        result
+    };
+    let (_, resets, upload, ()) = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(run, monitor, upload, fetch)
+    })
+    .await
+    .expect("the upstream connection ends");
+    RetirementFlowWire { resets, upload }
+}
+
+/// A stream that retires while an upload waits on flow control restarts the upload's
+/// flow-control timeout, as Proxygen's `checkForDetach` signals the writer and Uniplex records the
+/// detach as flow activity: B's header-only response, read when it arrives, is consumed halfway
+/// through the write timeout with no byte read or written, and both drivers reset the upload a
+/// full write timeout after that, at the same instant.
+#[test]
+fn owned_upstream_retirement_restarts_the_flow_control_timeout_like_uniplex() {
+    const WRITE: Duration = Duration::from_secs(1);
+    let respond_at = Duration::from_millis(100);
+    let consume_at = Duration::from_millis(500);
+    let drain_at = 3 * WRITE;
+    let (owned, uniplex) = super::owned::run_on_paused_worker(move |context| {
+        Box::pin(async move {
+            let owned = retirement_flow_wire(
+                context.clone(),
+                true,
+                WRITE,
+                respond_at,
+                consume_at,
+                drain_at,
+            )
+            .await;
+            let uniplex =
+                retirement_flow_wire(context, false, WRITE, respond_at, consume_at, drain_at).await;
+            (owned, uniplex)
+        })
+    });
+    let expected = [(
+        (consume_at + WRITE).as_millis() as u64,
+        StreamId::new(1),
+        H2ErrorCode::FLOW_CONTROL_ERROR,
+    )];
+    for (driver, wire) in [("uniplex", &uniplex), ("owned", &owned)] {
+        assert_eq!(
+            wire.resets
+                .iter()
+                .map(|(_, stream, code)| (*stream, *code))
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|(_, stream, code)| (*stream, *code))
+                .collect::<Vec<_>>(),
+            "{driver}: owned {owned:?}, uniplex {uniplex:?}"
+        );
+        assert!(
+            wire.resets[0].0.abs_diff(expected[0].0) <= 1,
+            "{driver}: owned {owned:?}, uniplex {uniplex:?}"
+        );
+        assert_eq!(
+            wire.upload,
+            Some(HttpErrorCode::FLOW_CONTROL_ERROR),
+            "{driver}"
+        );
+    }
 }

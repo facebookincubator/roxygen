@@ -2605,3 +2605,113 @@ fn owned_http2_enforces_configured_rate_limits() {
     wait(runtime.quiesce(TIMEOUT)).expect("cleanup joins");
     assert_eq!(owner.join().expect("physical join").workers_forced, 0);
 }
+
+/// Answers every request with `LargeHandler::BODY` bytes, after draining it.
+struct LargeHandler;
+
+impl LargeHandler {
+    const BODY: usize = 4096;
+}
+
+impl HttpHandler for LargeHandler {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        mut request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        Box::pin(async move {
+            let head = request.read_header_event().await?;
+            if !head.eom() {
+                loop {
+                    let event = request.read_body_event(1024).await?;
+                    if event.eom() {
+                        break;
+                    }
+                }
+            }
+            let body = BufQueue::copy_from_slice(&[b'r'; Self::BODY], Self::BODY)
+                .expect("large body fits");
+            Ok(HttpSourceHolder::new(Box::new(
+                HttpFixedSource::make_fixed_response(200, Some(body)).expect("valid response"),
+            )))
+        })
+    }
+}
+
+/// `owned_http2` honors `write_timeout`: a response blocked on a stream window the client never
+/// reopens is reset with FLOW_CONTROL_ERROR, as Proxygen's write-event timeout resets a
+/// flow-blocked stream, and the connection serves on.
+#[test]
+fn owned_http2_resets_a_flow_blocked_stream_at_its_write_timeout() {
+    const WINDOW: usize = 1024;
+    let mut owner = RuntimeOwner::start(RuntimeConfig {
+        workers: 1,
+        command_capacity: 4,
+    })
+    .expect("owner starts");
+    let runtime = owner.handle();
+    let worker = runtime.worker(0).expect("worker exists");
+    wait(
+        worker
+            .call_local(move |context| async move {
+                let mut session = untimed_owned(false, true);
+                session.write_timeout = Duration::from_millis(100);
+                let (io, peer) = tokio::io::duplex(64 * 1024);
+                let accepted = attach_for_test(
+                    &context,
+                    CodecProtocol::Http2,
+                    session,
+                    io,
+                    Rc::new(LargeHandler),
+                );
+                let control = accepted.control;
+                let run = tokio::task::spawn_local(accepted.session.run());
+                let (client, connection) = h2::client::Builder::new()
+                    .initial_window_size(WINDOW as u32)
+                    .handshake::<_, Bytes>(peer)
+                    .await
+                    .expect("H2 handshake");
+                let connection = tokio::task::spawn_local(connection);
+                let mut client = client.ready().await.expect("H2 client ready");
+                let request = http::Request::builder()
+                    .method("GET")
+                    .uri("http://localhost/large")
+                    .body(())
+                    .expect("request builds");
+                let (response, _stream) = client.send_request(request, true).expect("request sent");
+                let response = response.await.expect("response head");
+                assert_eq!(response.status(), http::StatusCode::OK);
+                let mut body = response.into_body();
+                let mut received = 0;
+                let error = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match body.data().await {
+                            Some(Ok(chunk)) => received += chunk.len(),
+                            Some(Err(error)) => break error,
+                            None => panic!("the blocked response ended"),
+                        }
+                    }
+                })
+                .await
+                .expect("the blocked stream is reset within the write timeout");
+                assert_eq!(received, WINDOW, "only the window's bytes arrive");
+                assert_eq!(error.reason(), Some(h2::Reason::FLOW_CONTROL_ERROR));
+                control.drain();
+                drop(client);
+                connection.abort();
+                if let Err(error) = connection.await {
+                    assert!(error.is_cancelled(), "the client connection task panicked");
+                }
+                let summary = run
+                    .await
+                    .expect("owned run task joins")
+                    .expect("owned run completes");
+                assert!(summary.bytes_written > 0);
+                assert!(control.is_finished());
+            })
+            .expect("initializer admitted"),
+    )
+    .expect("initializer finishes");
+    wait(runtime.quiesce(TIMEOUT)).expect("cleanup joins");
+    assert_eq!(owner.join().expect("physical join").workers_forced, 0);
+}

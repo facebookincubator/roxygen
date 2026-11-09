@@ -77,6 +77,7 @@ use roxygen_http2::flow_control::FlowControlledCodec;
 use roxygen_http2::settings::SettingsId;
 use roxygen_runtime::cancellation::CancellationSource;
 use roxygen_runtime::host::Host;
+use roxygen_runtime::host::timer::Expiry;
 use roxygen_runtime::host::timer::Timeout;
 use roxygen_runtime::panic::discard_panic;
 use roxygen_runtime::worker::WorkerContext;
@@ -247,6 +248,16 @@ struct ConnectionTimers {
     read_idle: Timeout,
     /// Proxygen's `GoawayTimeout`: `goaway_deadline` under a nonzero `goaway_timeout`.
     goaway: Timeout,
+    /// Proxygen's write-event wait under `writeTimeout_`, while flow control blocks egress.
+    flow: Timeout,
+    /// The blocked streams the `flow` slot is armed for, sorted by id; empty while it is not.
+    flow_blocked: Vec<StreamId>,
+    /// Whether the connection's send window blocks them, rather than their own.
+    flow_connection: bool,
+    /// The connection's progress when the `flow` slot was armed.
+    flow_marks: FlowMarks,
+    /// Scratch for the blocked streams of the next check.
+    flow_scan: Vec<StreamId>,
 }
 
 impl ConnectionTimers {
@@ -259,8 +270,27 @@ impl ConnectionTimers {
             wake,
             read_idle: Timeout::new(host),
             goaway: Timeout::new(host),
+            flow: Timeout::new(host),
+            flow_blocked: Vec::new(),
+            flow_connection: false,
+            flow_marks: FlowMarks::default(),
+            flow_scan: Vec::new(),
         })
     }
+}
+
+/// The progress that restarts the `flow` wait besides a change in the blocked streams: bytes read
+/// and scheduled for writing, EOF, and stream retirement. They cover Uniplex's
+/// `note_flow_timeout_activity` points (ingress parsing, writes, PING replies, resets, drains,
+/// detaches).
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct FlowMarks {
+    bytes_read: u64,
+    bytes_scheduled: u64,
+    eof: bool,
+    /// The live streams, which fall when one retires, as Proxygen's `checkForDetach` signals the
+    /// writer. A stream opens only with bytes read or scheduled.
+    streams: usize,
 }
 
 struct StreamWake {
@@ -785,6 +815,30 @@ where
     /// Counted in `ConnectionState::awaiting_ingress`.
     fn awaits_ingress(&self) -> bool {
         !self.wire_ingress_complete && !self.reset
+    }
+
+    /// Proxygen's `isStreamFlowControlBlocked`: the stream's egress is open and its send window
+    /// is exhausted.
+    fn send_blocked(&self) -> bool {
+        !self.reset
+            && !self.response_complete
+            && self.peer_reset.is_none()
+            && self.send_window.non_negative_size() == 0
+    }
+
+    /// Proxygen's `!isBodyQueueEmpty()` for a connection out of credit: the stream's next
+    /// event is body that needs send credit.
+    fn awaits_credit(&self) -> bool {
+        !self.reset
+            && matches!(
+                &self.pending,
+                Some(PendingEgress::Body(event))
+                    if matches!(
+                        event.kind(),
+                        HttpBodyEventKind::Body(bytes)
+                            if !bytes.is_empty() && (UPSTREAM || !self.request_head)
+                    )
+            )
     }
 
     fn can_serialize(&self, budget: SerializationBudget) -> bool {
@@ -1342,9 +1396,10 @@ fn owned_receive_window(
 
 impl<A: OwnedApplication> OwnedH2Session<A> {
     /// Creates the experimental opt-in session. It honors `read_timeout`, whose expiry drains
-    /// the connection with grace, and `goaway_timeout`, and refuses a nonzero
-    /// `stream_read_timeout` or `write_timeout` (`DIV-028`). It limits only the flood
-    /// categories that `Http2SessionConfig::rate_limits` bounds (`DIV-052`).
+    /// the connection with grace, `goaway_timeout`, and `write_timeout`, which bounds a stalled
+    /// transport write and the writer's wait for flow-control credit, and refuses a nonzero
+    /// `stream_read_timeout` (`DIV-028`). It limits only the flood categories that
+    /// `Http2SessionConfig::rate_limits` bounds (`DIV-052`).
     pub fn new(
         application: A,
         options: OwnedH2Options,
@@ -1436,9 +1491,7 @@ where
             || io.maximum_write_size > io.buffer_limit
             || (!UPSTREAM && !io.drain_request_body_on_drop)
             || (UPSTREAM && io.drain_request_body_on_drop)
-            || (UPSTREAM && !io.read_timeout.is_zero())
             || !io.stream_read_timeout.is_zero()
-            || !io.write_timeout.is_zero()
             || http2.stats.is_some()
             || http2
                 .ping_probes
@@ -1787,6 +1840,11 @@ where
                 progress = wrote;
                 ran = true;
             }
+            // At the writer's position: ingress read later in this turn does not beat the expiry.
+            if timer_fired && self.flow_timeout() {
+                progress = true;
+                ran = true;
+            }
             self.check_cancel_after(&mut ran);
             if let Some(read) = self.poll_read() {
                 progress |= read;
@@ -1914,6 +1972,9 @@ where
                 );
             }
             if !progress {
+                if !self.connection.state.config.write_timeout.is_zero() {
+                    self.sync_flow_timer();
+                }
                 if !UPSTREAM {
                     self.publish_quiescence();
                 }
@@ -2253,6 +2314,152 @@ where
         self.stamp_read_idle();
     }
 
+    /// Whether the writer waits for work: nothing to write and no write outstanding.
+    fn writer_idle(&self) -> bool {
+        self.egress.is_empty()
+            && !self.connection.state.zero_write_pending
+            && !self.writes_pending()
+            && self.failure.fatal.is_none()
+            && !self.transport_reset
+    }
+
+    /// Uniplex's `h2_blocked_streams`: with the connection out of send credit, the streams whose
+    /// next body needs credit, else the streams out of stream credit, sorted by id. Returns
+    /// whether the connection is out of credit.
+    fn flow_blocked_streams(&self, blocked: &mut Vec<StreamId>) -> bool {
+        let connection = self.connection.codec.available_send() == 0;
+        blocked.clear();
+        blocked.extend(
+            self.streams
+                .iter()
+                .filter(|(_, stream)| {
+                    if connection {
+                        stream.awaits_credit()
+                    } else {
+                        stream.send_blocked()
+                    }
+                })
+                .map(|(id, _)| *id),
+        );
+        blocked.sort_unstable();
+        connection
+    }
+
+    /// Proxygen's writer waits for its write event with `writeTimeout_` while it has nothing to
+    /// write (HTTPCoroSession.cpp:3258-3273). The `flow` slot is that wait while flow control
+    /// blocks egress: armed for the blocked streams, kept while they stay the same, and disarmed
+    /// once nothing is blocked.
+    #[cold]
+    #[inline(never)]
+    fn sync_flow_timer(&mut self) {
+        let (mut blocked, connection) = self.scan_flow_blocked();
+        if blocked.is_empty() {
+            if let Some(timers) = &mut self.timers {
+                if !timers.flow_blocked.is_empty() {
+                    timers.flow.cancel();
+                    timers.flow_blocked.clear();
+                }
+                timers.flow_scan = blocked;
+            }
+            return;
+        }
+        let marks = self.flow_marks();
+        let restamp = self.timers.as_ref().is_none_or(|timers| {
+            timers.flow_blocked != blocked
+                || timers.flow_connection != connection
+                || timers.flow_marks != marks
+        });
+        let deadline = restamp.then(|| {
+            self.context
+                .host()
+                .deadline_after(self.connection.state.config.write_timeout)
+        });
+        let ConnectionTimers {
+            flow,
+            waker,
+            flow_blocked,
+            flow_connection,
+            flow_marks,
+            flow_scan,
+            ..
+        } = self.timers();
+        if let Some(deadline) = deadline {
+            flow.schedule_at(deadline, waker);
+            std::mem::swap(flow_blocked, &mut blocked);
+            *flow_connection = connection;
+            *flow_marks = marks;
+        }
+        *flow_scan = blocked;
+    }
+
+    /// The blocked streams of an idle writer, none while it has work, in the reused scan buffer,
+    /// and whether the connection's send window blocks them.
+    fn scan_flow_blocked(&mut self) -> (Vec<StreamId>, bool) {
+        let mut blocked = self
+            .timers
+            .as_mut()
+            .map_or_else(Vec::new, |timers| std::mem::take(&mut timers.flow_scan));
+        blocked.clear();
+        let connection = self.writer_idle() && self.flow_blocked_streams(&mut blocked);
+        (blocked, connection)
+    }
+
+    fn flow_marks(&self) -> FlowMarks {
+        FlowMarks {
+            bytes_read: self.connection.state.summary.bytes_read,
+            bytes_scheduled: self.connection.state.summary.bytes_scheduled,
+            eof: self.eof,
+            streams: self.streams.len(),
+        }
+    }
+
+    /// Consumes an expiry of the `flow` slot and returns whether there was one: the writer's
+    /// wait timed out while flow control blocked egress. Proxygen's `handleWriteEventTimeout`
+    /// fails the connection with FLOW_CONTROL_ERROR when it is out of credit with body waiting,
+    /// and otherwise resets every flow-blocked stream with it. The expiry acts only if nothing
+    /// changed since the slot was armed, as activity would have restarted the wait; otherwise
+    /// the next idle check arms the slot again.
+    #[cold]
+    #[inline(never)]
+    fn flow_timeout(&mut self) -> bool {
+        let expired = self.timers.as_mut().is_some_and(|timers| {
+            !timers.flow_blocked.is_empty() && timers.flow.take_expired() == Some(Expiry::Elapsed)
+        });
+        if !expired {
+            return false;
+        }
+        let (blocked, connection) = self.scan_flow_blocked();
+        let marks = self.flow_marks();
+        let timers = self.timers.as_mut().expect("the flow slot fired");
+        let unchanged = !blocked.is_empty()
+            && timers.flow_blocked == blocked
+            && timers.flow_connection == connection
+            && timers.flow_marks == marks;
+        timers.flow_blocked.clear();
+        if unchanged && connection {
+            self.fail_connection(failure(
+                HttpErrorCode::FLOW_CONTROL_ERROR,
+                b"HTTP/2 connection flow-control timeout",
+            ));
+        } else if unchanged {
+            for &id in &blocked {
+                self.reset_stream(
+                    id,
+                    failure(
+                        HttpErrorCode::FLOW_CONTROL_ERROR,
+                        b"HTTP/2 stream flow-control timeout",
+                    ),
+                    false,
+                    Some(H2ErrorCode::FLOW_CONTROL_ERROR),
+                );
+            }
+        }
+        if let Some(timers) = &mut self.timers {
+            timers.flow_scan = blocked;
+        }
+        true
+    }
+
     #[cold]
     #[inline(never)]
     fn ingress_overflowed(&mut self) {
@@ -2290,7 +2497,9 @@ where
     /// ingress and nothing below holds, that ingress, or the stream's consumer, polls the
     /// session again, and the poll consumes the completion (`unarmed_write`). A downstream
     /// session with no streams left has nothing waiting on a receipt beyond what the other
-    /// terms arm for; its next request, EOF, cancel or drain consumes the receipt.
+    /// terms arm for; its next request, EOF, cancel or drain consumes the receipt. Under a
+    /// write timeout the writer's flow-control wait starts only once the receipt is consumed,
+    /// so every completion wakes the session.
     fn write_completion_needed(&self) -> bool {
         let state = &self.connection.state;
         (state.awaiting_ingress == 0 && (UPSTREAM || !self.streams.is_empty()))
@@ -2313,6 +2522,7 @@ where
                         .get(id)
                         .is_some_and(|stream| stream.consumed && stream.response_complete)
                 }))
+            || !state.config.write_timeout.is_zero()
     }
 
     fn start_write(&mut self) -> Result<(), HttpError> {
