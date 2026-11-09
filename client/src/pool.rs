@@ -21,6 +21,7 @@ use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 
+use roxygen_core::connection::ConnectionContext;
 use roxygen_core::connection::TransportSecurity;
 use roxygen_core::error::HttpError;
 use roxygen_core::error::HttpErrorCode;
@@ -37,6 +38,7 @@ use roxygen_runtime::worker::WorkerContext;
 use roxygen_runtime::worker::WorkerId;
 use roxygen_runtime::worker::WorkerState;
 use roxygen_session::session::RequestReservation;
+use roxygen_session::uniplex::UniplexRunSummary;
 use roxygen_transport::tls::TlsSessionStore;
 use thiserror::Error;
 use tokio::sync::Notify;
@@ -52,6 +54,8 @@ use crate::connector::LocalClientFuture;
 use crate::connector::ResolvedHost;
 use crate::connector::SessionConnector;
 use crate::connector::SessionParams;
+use crate::experimental::owned::OwnedClientSession;
+use crate::experimental::owned::worker_admits;
 
 const DEFAULT_MAX_POOLS: usize = 10;
 const DEFAULT_REAP_SCAN: usize = 5;
@@ -400,6 +404,12 @@ enum PoolBackend {
         max_retiring: Option<u32>,
         pending_connect_credit: u32,
     },
+    /// Native dials of owned client sessions (`DIV-046`).
+    Owned {
+        address: SocketAddress,
+        connection: ConnectionParams,
+        session: SessionParams,
+    },
 }
 
 impl PoolBackend {
@@ -409,7 +419,7 @@ impl PoolBackend {
 
     fn is_secure(&self) -> bool {
         match self {
-            Self::Native { connection, .. } => matches!(
+            Self::Native { connection, .. } | Self::Owned { connection, .. } => matches!(
                 &connection.transport,
                 crate::connector::ClientTransportOptions::Tls(_)
             ),
@@ -429,6 +439,27 @@ pub trait IdleSessionObserver: 'static {
 pub struct GetSessionResult {
     pub reservation: RequestReservation,
     pub session: ClientSession,
+}
+
+/// What an acquisition returns: one reservation on the session it selected.
+pub(crate) trait PoolReservation: Sized + 'static {
+    /// Reserves `session`, which `state`'s pool selected.
+    fn reserve(state: &Rc<RefCell<PoolState>>, session: PooledSession) -> Result<Self, PoolError>;
+}
+
+impl PoolReservation for GetSessionResult {
+    fn reserve(_state: &Rc<RefCell<PoolState>>, session: PooledSession) -> Result<Self, PoolError> {
+        let PooledSession::Uniplex(session) = session else {
+            return Err(PoolError::InvalidSessionState);
+        };
+        match session.reserve_request() {
+            Ok(reservation) => Ok(Self {
+                reservation,
+                session,
+            }),
+            Err(source) => Err(PoolError::ReservationFailed { source }),
+        }
+    }
 }
 
 pub struct DetachedClientSession(ClientSession);
@@ -502,8 +533,149 @@ impl HttpSessionFactory for SimpleHttpSessionFactory {
     }
 }
 
+/// A pooled session. A pool's backend creates one kind: native and attached
+/// pools hold uniplex `ClientSession`s, owned pools owned client sessions
+/// (`DIV-046`).
+#[derive(Clone)]
+pub(crate) enum PooledSession {
+    Uniplex(ClientSession),
+    Owned(OwnedClientSession),
+}
+
+impl PooledSession {
+    fn is_finished(&self) -> bool {
+        match self {
+            Self::Uniplex(session) => session.is_finished(),
+            Self::Owned(session) => session.is_finished(),
+        }
+    }
+
+    fn is_draining(&self) -> bool {
+        match self {
+            Self::Uniplex(session) => session.is_draining(),
+            Self::Owned(session) => session.is_draining(),
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        match self {
+            Self::Uniplex(session) => session.is_idle(),
+            Self::Owned(session) => session.is_pooled_idle(),
+        }
+    }
+
+    /// For an owned session, without its worker's admission, which an owned
+    /// pool's acquisition step checks once for all of its sessions.
+    fn supports_more_transactions(&self) -> bool {
+        match self {
+            Self::Uniplex(session) => session.supports_more_transactions(),
+            Self::Owned(session) => session.selectable_capacity() != 0,
+        }
+    }
+
+    fn available_transactions(&self) -> usize {
+        match self {
+            Self::Uniplex(session) => session.available_transactions(),
+            Self::Owned(session) => {
+                usize::try_from(session.available_capacity()).unwrap_or(usize::MAX)
+            }
+        }
+    }
+
+    fn admitted_transactions(&self) -> u32 {
+        match self {
+            Self::Uniplex(session) => session.admitted_transactions(),
+            Self::Owned(session) => session.admitted_transactions(),
+        }
+    }
+
+    fn active_transactions(&self) -> u32 {
+        match self {
+            Self::Uniplex(session) => session.active_transactions(),
+            Self::Owned(session) => session.admitted_transactions(),
+        }
+    }
+
+    fn close_admission(&self) {
+        match self {
+            Self::Uniplex(session) => session.close_admission(),
+            Self::Owned(session) => session.close_admission(),
+        }
+    }
+
+    fn initiate_drain(&self) -> Result<bool, HttpError> {
+        match self {
+            Self::Uniplex(session) => session.initiate_drain(),
+            Self::Owned(session) => session.initiate_drain(),
+        }
+    }
+
+    fn is_same_session(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Uniplex(session), Self::Uniplex(other)) => session.is_same_session(other),
+            (Self::Owned(session), Self::Owned(other)) => session.is_same_session(other),
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_client_session(&self, other: &ClientSession) -> bool {
+        matches!(self, Self::Uniplex(session) if session.is_same_session(other))
+    }
+
+    fn age(&self) -> Duration {
+        match self {
+            Self::Uniplex(session) => session.age(),
+            Self::Owned(session) => session.age(),
+        }
+    }
+
+    fn bind_pool(&self, pool: Weak<RefCell<PoolState>>) {
+        match self {
+            Self::Uniplex(session) => session.bind_pool(pool),
+            Self::Owned(session) => session.bind_pool(pool),
+        }
+    }
+
+    fn is_bound_to_pool(&self) -> bool {
+        match self {
+            Self::Uniplex(session) => session.is_bound_to_pool(),
+            Self::Owned(session) => session.is_bound_to_pool(),
+        }
+    }
+
+    fn worker_id(&self) -> WorkerId {
+        match self {
+            Self::Uniplex(session) => session.worker_id(),
+            Self::Owned(session) => session.worker_id(),
+        }
+    }
+
+    fn connection_context(&self) -> &Arc<ConnectionContext> {
+        match self {
+            Self::Uniplex(session) => session.connection_context(),
+            Self::Owned(session) => session.connection_context(),
+        }
+    }
+
+    fn wait_closed(&self) -> LocalClientFuture<Result<UniplexRunSummary, HttpError>> {
+        match self {
+            Self::Uniplex(session) => session.wait_closed(),
+            Self::Owned(session) => session.wait_closed(),
+        }
+    }
+
+    /// The uniplex session of a native or attached pool's entry.
+    fn into_client_session(self) -> ClientSession {
+        match self {
+            Self::Uniplex(session) => session,
+            Self::Owned(_) => unreachable!("native and attached pools hold uniplex sessions"),
+        }
+    }
+}
+
 struct SessionEntry {
-    session: ClientSession,
+    session: PooledSession,
     max_age: Duration,
     ownership: Option<Rc<SessionOwnership>>,
     /// When the session last lost its last active or reserved exchange, while it has none.
@@ -512,7 +684,7 @@ struct SessionEntry {
 
 impl SessionEntry {
     fn new(
-        session: ClientSession,
+        session: PooledSession,
         max_age: Duration,
         ownership: Option<Rc<SessionOwnership>>,
     ) -> Self {
@@ -823,6 +995,9 @@ pub(crate) struct PoolState {
     idle_retirement_passes: Cell<u64>,
     #[cfg(test)]
     idle_retirement_retiring_passes: Cell<u64>,
+    /// `notify_session_event` passes over the pool's sessions.
+    #[cfg(test)]
+    session_event_passes: Cell<u64>,
     next_waiter_id: u64,
     pooling_enabled: bool,
     draining: bool,
@@ -890,7 +1065,7 @@ impl PoolState {
                 pending_connect_credit,
                 ..
             } => *pending_connect_credit,
-            PoolBackend::Native { .. } => 1,
+            PoolBackend::Native { .. } | PoolBackend::Owned { .. } => 1,
         }
     }
 
@@ -1011,6 +1186,13 @@ impl PoolState {
         }
     }
 
+    /// Whether the pool's sessions may take an acquisition: an owned pool checks
+    /// its worker's admission here, once per acquisition step, for all of its
+    /// sessions (`DIV-046`), where a `ClientSession` checks its own.
+    fn admits_reservations(&self) -> bool {
+        !matches!(self.backend, PoolBackend::Owned { .. }) || worker_admits(self.context.handle())
+    }
+
     /// When the longest-idle session became idle; `None` while no session is idle.
     fn longest_idle_since(&self) -> Option<Instant> {
         self.sessions
@@ -1098,7 +1280,7 @@ fn cancel_waiters(waiters: Vec<Rc<Waiter>>, error: PoolError) {
     });
 }
 
-fn drain_sessions(sessions: Vec<ClientSession>) {
+fn drain_sessions(sessions: Vec<PooledSession>) {
     sessions.into_iter().for_each(|session| {
         let _ = catch_callback(|| session.initiate_drain());
     });
@@ -1109,10 +1291,10 @@ fn drain_sessions(sessions: Vec<ClientSession>) {
 /// left in it: the pool no longer reaches them, so a skipped drain would leave
 /// the connection open and the pool's drain waiting for it.
 #[derive(Default)]
-struct RetiredSessions(Vec<ClientSession>);
+struct RetiredSessions(Vec<PooledSession>);
 
 impl RetiredSessions {
-    fn push(&mut self, session: ClientSession) {
+    fn push(&mut self, session: PooledSession) {
         self.0.push(session);
     }
 
@@ -1166,7 +1348,7 @@ fn pop_next_session_for_teardown(state: &mut PoolState) -> Option<SessionEntry> 
 pub(crate) fn notify_session_event(
     pool: &Rc<RefCell<PoolState>>,
     worker: WorkerId,
-    changed_session: Option<&ClientSession>,
+    changed_session: Option<&PooledSession>,
     enqueue_back: bool,
     wake_count: usize,
     release_idle: bool,
@@ -1176,6 +1358,10 @@ pub(crate) fn notify_session_event(
         if state.context.worker_id() != worker {
             return;
         }
+        #[cfg(test)]
+        state
+            .session_event_passes
+            .set(state.session_event_passes.get() + 1);
         let prior_idle = state.idle_sessions;
         state
             .sessions
@@ -1242,6 +1428,34 @@ pub(crate) fn notify_session_event(
     drain_sessions(sessions_to_drain);
     for _ in 0..idle_changed {
         notify_idle_observer(pool);
+    }
+}
+
+/// Records a reservation an owned pool's acquisition made, as a
+/// `ClientSession`'s `TransactionAttached` reaches `notify_session_event`, on
+/// the session's entry alone (`DIV-046`): no longer idle, and moved to the back
+/// when `enqueue_back`. Every other session's state is unchanged: each idle
+/// transition was reported when it happened.
+pub(crate) fn record_reservation(
+    pool: &Rc<RefCell<PoolState>>,
+    session: &PooledSession,
+    was_idle: bool,
+    enqueue_back: bool,
+) {
+    let mut state = pool.borrow_mut();
+    let Some(index) = state
+        .sessions
+        .iter()
+        .position(|entry| entry.session.is_same_session(session))
+    else {
+        return;
+    };
+    state.sessions[index].idle_since = None;
+    if was_idle {
+        state.idle_sessions = state.idle_sessions.saturating_sub(1);
+    }
+    if enqueue_back && let Some(entry) = state.sessions.remove(index) {
+        state.sessions.push_back(entry);
     }
 }
 
@@ -1383,7 +1597,7 @@ struct SessionCompletion {
 }
 
 impl SessionCompletion {
-    fn new(session: &ClientSession, ownership: Rc<SessionOwnership>) -> Self {
+    fn new(session: &PooledSession, ownership: Rc<SessionOwnership>) -> Self {
         let closed = session.wait_closed();
         Self {
             closed: Box::pin(async move { closed.await.map(|_| ()) }),
@@ -1413,6 +1627,40 @@ enum ConnectionFactory {
         security: TransportSecurity,
         factory: Rc<dyn AttachedSessionFactoryWithCause>,
     },
+    Owned {
+        address: SocketAddress,
+    },
+}
+
+/// The configuration of one native or owned connection attempt, read from the
+/// pool's backend at each attempt.
+enum DialConfig {
+    Native(ConnectionParams, SessionParams),
+    Owned(ConnectionParams, SessionParams),
+}
+
+/// One connection attempt's dial: a uniplex session's, or an owned session's.
+enum Dial {
+    Uniplex(LocalClientFuture<Result<ClientSession, AttachedConnectFailure>>),
+    Owned(LocalClientFuture<Result<OwnedClientSession, HttpError>>),
+}
+
+impl Future for Dial {
+    type Output = Result<PooledSession, AttachedConnectFailure>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut() {
+            Self::Uniplex(future) => future
+                .as_mut()
+                .poll(context)
+                .map(|result| result.map(PooledSession::Uniplex)),
+            Self::Owned(future) => future.as_mut().poll(context).map(|result| {
+                result
+                    .map(PooledSession::Owned)
+                    .map_err(AttachedConnectFailure::from)
+            }),
+        }
+    }
 }
 
 struct ConnectionAttempt {
@@ -1426,7 +1674,7 @@ enum AcquireStep {
     /// `retired`: idle-expired sessions to drain once `session` is reserved, so
     /// that no callback their drain runs can reserve `session` first.
     Session {
-        session: ClientSession,
+        session: PooledSession,
         retired: RetiredSessions,
     },
     StartAndWait {
@@ -1484,15 +1732,42 @@ impl HttpSessionPool {
                 connector,
             },
         );
-        if let Err(error) = pool.install_supervisor() {
-            pool.drain();
-            let tasks = Rc::clone(&pool.state.borrow().tasks);
+        pool.start(pool_params);
+        pool
+    }
+
+    /// An owned pool (`DIV-046`): `with_connector`'s pool, dialing owned client
+    /// sessions with `connection` and `session`.
+    pub(crate) fn owned(
+        context: WorkerContext,
+        address: SocketAddress,
+        pool_params: PoolParams,
+        connection: ConnectionParams,
+        session: SessionParams,
+    ) -> Self {
+        let pool = Self::build(
+            context,
+            pool_params,
+            PoolBackend::Owned {
+                address,
+                connection,
+                session,
+            },
+        );
+        pool.start(pool_params);
+        pool
+    }
+
+    /// Installs a native or owned pool's supervisor, then its idle retirement.
+    fn start(&self, pool_params: PoolParams) {
+        if let Err(error) = self.install_supervisor() {
+            self.drain();
+            let tasks = Rc::clone(&self.state.borrow().tasks);
             tasks.fail(error.clone());
             tasks.completion.send_replace(Some(Err(error)));
         } else if !pool_params.idle_timeout.is_zero() {
-            pool.start_idle_retirement();
+            self.start_idle_retirement();
         }
-        pool
     }
 
     /// Creates a worker-local address-free pool after registering its supervisor.
@@ -1596,6 +1871,8 @@ impl HttpSessionPool {
                 idle_retirement_passes: Cell::default(),
                 #[cfg(test)]
                 idle_retirement_retiring_passes: Cell::default(),
+                #[cfg(test)]
+                session_event_passes: Cell::default(),
                 next_waiter_id: 1,
                 pooling_enabled,
                 draining: false,
@@ -1646,6 +1923,10 @@ impl HttpSessionPool {
         cancellation: CancellationToken,
     ) -> LocalClientFuture<Result<GetSessionResult, PoolError>> {
         acquire_session(Rc::clone(&self.state), cancellation)
+    }
+
+    pub(crate) fn state(&self) -> &Rc<RefCell<PoolState>> {
+        &self.state
     }
 
     pub fn set_max_connections(&self, maximum: u32) -> Result<(), PoolError> {
@@ -1849,6 +2130,13 @@ impl HttpSessionPool {
                 state.owned_connections,
                 state.waiters.len(),
             ),
+            PoolBackend::Owned { address, .. } => format!(
+                "OwnedHttpSessionPool(peer={:?}, sessions={}, pending={}, waiters={})",
+                address,
+                state.sessions.len(),
+                state.connects_in_progress,
+                state.waiters.len(),
+            ),
         }
     }
 
@@ -1931,6 +2219,14 @@ impl HttpSessionPool {
                     payloads.connector = Some(std::mem::replace(connector, Rc::new(HttpConnector)));
                 }
                 PoolBackend::Attached { factory, .. } => payloads.attached_factory = factory.take(),
+                PoolBackend::Owned {
+                    connection,
+                    session,
+                    ..
+                } => {
+                    payloads.connection_params = Some(std::mem::take(connection));
+                    payloads.session_params = Some(std::mem::take(session));
+                }
             }
             (waiters, Rc::clone(&state.tasks), payloads)
         };
@@ -2012,19 +2308,21 @@ impl HttpSessionPool {
         let entry = state.sessions.remove(index)?;
         state.idle_sessions = state.idle_sessions.saturating_sub(1);
         drop(state);
-        entry.session.unbind_pool();
+        let session = entry.session.into_client_session();
+        session.unbind_pool();
         if let Some(ownership) = entry.ownership {
             let _ = catch_callback(|| ownership.transferred.signal());
         }
         notify_idle_observer(&self.state);
-        Some(DetachedClientSession(entry.session))
+        Some(DetachedClientSession(session))
     }
 
     /// Establishes joined ownership before making a detached session available.
     /// Attached pools require matching security and an available ownership slot;
     /// native pools retain their original insertion and configuration policies.
     pub fn insert_idle_session(&self, session: DetachedClientSession) -> Result<(), PoolError> {
-        let session = session.0;
+        let client_session = session.0;
+        let session = PooledSession::Uniplex(client_session.clone());
         let owned = {
             let mut state = self.state.borrow_mut();
             ensure_pool_open(&state)?;
@@ -2060,7 +2358,7 @@ impl HttpSessionPool {
                 drain_sessions(vec![session]);
                 return Err(error);
             }
-            session.mark_available();
+            client_session.mark_available();
             session.bind_pool(Rc::downgrade(&self.state));
             let wake_count = session.available_transactions();
             let worker = state.context.worker_id();
@@ -2119,7 +2417,7 @@ impl HttpSessionPool {
         let entry = state
             .sessions
             .iter_mut()
-            .find(|entry| entry.session.is_same_session(session))
+            .find(|entry| entry.session.is_client_session(session))
             .expect("the session is pooled");
         let age = entry.session.age();
         assert!(!age.is_zero(), "the fixture established an aged session");
@@ -2144,7 +2442,7 @@ impl HttpSessionPool {
         let entry = state
             .sessions
             .iter_mut()
-            .find(|entry| entry.session.is_same_session(session))
+            .find(|entry| entry.session.is_client_session(session))
             .expect("the session is pooled");
         let since = entry.idle_since.expect("the fixture left the session idle");
         entry.idle_since = since.checked_sub(by);
@@ -2171,6 +2469,11 @@ impl HttpSessionPool {
         self.state.borrow().idle_retirement_passes.get()
     }
 
+    #[cfg(test)]
+    pub(crate) fn session_event_passes_for_test(&self) -> u64 {
+        self.state.borrow().session_event_passes.get()
+    }
+
     /// Idle-retirement passes that retired at least one session.
     #[cfg(test)]
     pub(crate) fn idle_retirement_retiring_passes_for_test(&self) -> u64 {
@@ -2179,7 +2482,7 @@ impl HttpSessionPool {
 
     #[cfg(test)]
     pub(crate) fn acquisition_step_for_test(&self, started: Instant) -> Result<(), PoolError> {
-        next_step(&self.state, started, false).map(|step| {
+        next_step(&self.state, &mut Some(started), false).map(|step| {
             if let AcquireStep::Session { retired, .. } = step {
                 retired.drain_propagating_panics();
             }
@@ -2188,6 +2491,7 @@ impl HttpSessionPool {
 
     #[cfg(test)]
     pub(crate) fn insert_session_for_teardown_test(&self, session: ClientSession) {
+        let session = PooledSession::Uniplex(session);
         session.bind_pool(Rc::downgrade(&self.state));
         let mut state = self.state.borrow_mut();
         if session.is_idle() {
@@ -2227,52 +2531,132 @@ impl Drop for HttpSessionPool {
     }
 }
 
-fn acquire_session(
+pub(crate) fn acquire_session<Reservation: PoolReservation>(
     state: Rc<RefCell<PoolState>>,
     cancellation: CancellationToken,
-) -> LocalClientFuture<Result<GetSessionResult, PoolError>> {
+) -> LocalClientFuture<Result<Reservation, PoolError>> {
     Box::pin(async move {
-        let started = Instant::now();
-        let mut woken = false;
-        loop {
-            if cancellation.is_cancellation_requested() {
-                return Err(PoolError::Cancelled);
+        let mut started = Some(Instant::now());
+        if cancellation.is_cancellation_requested() {
+            return Err(PoolError::Cancelled);
+        }
+        match acquisition_step(&state, &mut started, false)? {
+            Stepped::Reserved(reservation) => Ok(reservation),
+            Stepped::Wait(wait) => {
+                let started = started.expect("the acquisition anchored its deadline");
+                acquire_after_wait(state, cancellation, started, wait).await
             }
-            let step = next_step(&state, started, woken)?;
-            match step {
-                AcquireStep::Session { session, retired } => {
-                    let reservation = session.reserve_request();
-                    retired.drain_propagating_panics();
-                    return match reservation {
-                        Ok(reservation) => Ok(GetSessionResult {
-                            reservation,
-                            session,
-                        }),
-                        Err(source) => Err(PoolError::ReservationFailed { source }),
-                    };
-                }
-                AcquireStep::StartAndWait {
-                    attempt,
-                    waiter,
-                    registration,
-                    wait_timeout,
-                } => {
-                    start_connection(&state, attempt);
-                    wait_for_wakeup(waiter, registration, wait_timeout, cancellation.clone())
-                        .await?;
-                }
-                AcquireStep::Wait {
-                    waiter,
-                    registration,
-                    wait_timeout,
-                } => {
-                    wait_for_wakeup(waiter, registration, wait_timeout, cancellation.clone())
-                        .await?;
-                }
-            }
-            woken = true;
         }
     })
+}
+
+/// How an acquisition that did not end at its first step continues.
+pub(crate) enum AcquisitionStart<Reservation> {
+    Done(Result<Reservation, PoolError>),
+    Waiting(LocalClientFuture<Result<Reservation, PoolError>>),
+}
+
+/// Starts an acquisition now, for an owned pool's fast path (`DIV-046`): a
+/// first step that selects a session, or fails, ends it with no boxed future
+/// and no clock read for its deadline; only one that must wait for a session
+/// or a dial continues in a boxed future, its deadline anchored when that step
+/// found no session.
+pub(crate) fn start_acquisition<Reservation: PoolReservation>(
+    state: Rc<RefCell<PoolState>>,
+    cancellation: CancellationToken,
+) -> AcquisitionStart<Reservation> {
+    if cancellation.is_cancellation_requested() {
+        return AcquisitionStart::Done(Err(PoolError::Cancelled));
+    }
+    let mut started = None;
+    let wait = match acquisition_step(&state, &mut started, false) {
+        Ok(Stepped::Reserved(reservation)) => return AcquisitionStart::Done(Ok(reservation)),
+        Err(error) => return AcquisitionStart::Done(Err(error)),
+        Ok(Stepped::Wait(wait)) => wait,
+    };
+    let started = started.expect("a step that waits anchored the acquisition's deadline");
+    AcquisitionStart::Waiting(Box::pin(acquire_after_wait(
+        state,
+        cancellation,
+        started,
+        wait,
+    )))
+}
+
+/// A wait an acquisition step left, for a session or for the dial it started.
+struct PendingWait {
+    waiter: Rc<Waiter>,
+    registration: WaiterRegistration,
+    wait_timeout: Duration,
+}
+
+/// What one acquisition step did.
+enum Stepped<Reservation> {
+    Reserved(Reservation),
+    Wait(PendingWait),
+}
+
+/// Reserves the session the step selects, draining the idle-expired sessions it
+/// retired afterwards, or starts the dial it admits.
+fn acquisition_step<Reservation: PoolReservation>(
+    state: &Rc<RefCell<PoolState>>,
+    started: &mut Option<Instant>,
+    woken: bool,
+) -> Result<Stepped<Reservation>, PoolError> {
+    Ok(match next_step(state, started, woken)? {
+        AcquireStep::Session { session, retired } => {
+            let reservation = Reservation::reserve(state, session);
+            retired.drain_propagating_panics();
+            Stepped::Reserved(reservation?)
+        }
+        AcquireStep::StartAndWait {
+            attempt,
+            waiter,
+            registration,
+            wait_timeout,
+        } => {
+            start_connection(state, attempt);
+            Stepped::Wait(PendingWait {
+                waiter,
+                registration,
+                wait_timeout,
+            })
+        }
+        AcquireStep::Wait {
+            waiter,
+            registration,
+            wait_timeout,
+        } => Stepped::Wait(PendingWait {
+            waiter,
+            registration,
+            wait_timeout,
+        }),
+    })
+}
+
+/// Waits, then steps again, until a step reserves a session or fails.
+async fn acquire_after_wait<Reservation: PoolReservation>(
+    state: Rc<RefCell<PoolState>>,
+    cancellation: CancellationToken,
+    started: Instant,
+    mut wait: PendingWait,
+) -> Result<Reservation, PoolError> {
+    let mut started = Some(started);
+    loop {
+        let PendingWait {
+            waiter,
+            registration,
+            wait_timeout,
+        } = wait;
+        wait_for_wakeup(waiter, registration, wait_timeout, cancellation.clone()).await?;
+        if cancellation.is_cancellation_requested() {
+            return Err(PoolError::Cancelled);
+        }
+        wait = match acquisition_step(&state, &mut started, true)? {
+            Stepped::Reserved(reservation) => return Ok(reservation),
+            Stepped::Wait(wait) => wait,
+        };
+    }
 }
 
 async fn wait_for_wakeup(
@@ -2344,7 +2728,7 @@ async fn run_connection_attempt(
             return None;
         }
         let pool = state.upgrade()?;
-        let Some((timeout, native)) = ({
+        let Some((timeout, config)) = ({
             let pool = pool.borrow();
             if ensure_pool_open(&pool).is_err()
                 || pool.waiters.is_empty()
@@ -2359,7 +2743,12 @@ async fn run_connection_attempt(
                             connection,
                             session,
                             ..
-                        } => Some((connection.clone(), session.clone())),
+                        } => Some(DialConfig::Native(connection.clone(), session.clone())),
+                        PoolBackend::Owned {
+                            connection,
+                            session,
+                            ..
+                        } => Some(DialConfig::Owned(connection.clone(), session.clone())),
                         PoolBackend::Attached { .. } => None,
                     },
                 ))
@@ -2368,28 +2757,38 @@ async fn run_connection_attempt(
             break;
         };
         attempts = attempts.saturating_add(1);
-        let mut connecting = match &*factory {
-            ConnectionFactory::Native { address, connector } => {
-                let (connection, session) =
-                    native.expect("native backend retains native configuration");
-                Box::pin(NativeConnectFuture {
-                    future: connector.connect(
-                        context.clone(),
-                        address.clone(),
-                        timeout,
-                        connection,
-                        session,
-                        cancellation.clone(),
-                    ),
-                })
-                    as LocalClientFuture<Result<ClientSession, AttachedConnectFailure>>
+        let mut connecting = match (&*factory, config) {
+            (
+                ConnectionFactory::Native { address, connector },
+                Some(DialConfig::Native(connection, session)),
+            ) => Dial::Uniplex(Box::pin(NativeConnectFuture {
+                future: connector.connect(
+                    context.clone(),
+                    address.clone(),
+                    timeout,
+                    connection,
+                    session,
+                    cancellation.clone(),
+                ),
+            })),
+            (
+                ConnectionFactory::Owned { address },
+                Some(DialConfig::Owned(connection, session)),
+            ) => Dial::Owned(OwnedClientSession::connect(
+                context,
+                address.clone(),
+                timeout,
+                connection,
+                session,
+                cancellation.clone(),
+            )),
+            (ConnectionFactory::Attached { factory, .. }, _) => {
+                Dial::Uniplex(factory.create(context.clone(), timeout, cancellation.clone()))
             }
-            ConnectionFactory::Attached { factory, .. } => {
-                factory.create(context.clone(), timeout, cancellation.clone())
-            }
+            _ => unreachable!("a native or owned backend retains its dial configuration"),
         };
         drop(pool);
-        let outcome = connecting.as_mut().await;
+        let outcome = (&mut connecting).await;
         if catch_callback(|| drop(connecting)).is_err() {
             tasks.fail(PoolError::CleanupPanicked);
         }
@@ -2491,9 +2890,11 @@ async fn run_connection_attempt(
     None
 }
 
+/// `started` anchors the acquisition's deadline; a first step without one
+/// anchors it when it finds no session.
 fn next_step(
     state: &Rc<RefCell<PoolState>>,
-    started: Instant,
+    started: &mut Option<Instant>,
     woken: bool,
 ) -> Result<AcquireStep, PoolError> {
     let mut expired = RetiredSessions::default();
@@ -2504,6 +2905,7 @@ fn next_step(
         ensure_pool_open(&pool)?;
         pool.sessions
             .retain(|entry| !entry.session.is_finished() && !entry.session.is_draining());
+        let admitting = pool.admits_reservations();
         let bounded = pool.ownership_bound().is_some();
         let idle_timeout = pool.pool_params.idle_timeout;
         let idle_sweep = pool.pool_params.idle_sweep;
@@ -2514,6 +2916,7 @@ fn next_step(
         let checkout_at = now.filter(|_| idle_sweep == IdleSweep::Interval);
         while let Some(index) = pool.sessions.iter().position(|entry| {
             (entry.max_age != Duration::ZERO
+                && admitting
                 && entry.session.supports_more_transactions()
                 && entry.session.age() >= entry.max_age)
                 || expired_at.is_some_and(|now| entry.idle_expired(now, idle_timeout, idle_sweep))
@@ -2540,11 +2943,16 @@ fn next_step(
                 expired.push(entry.session);
             }
         }
-        let available = pool.sessions.iter().position(|entry| {
-            !entry.session.is_idle() && entry.session.supports_more_transactions()
-        });
-        let selected =
-            available.or_else(|| pool.select_idle_session(checkout_at, &mut idle_expired));
+        let selected = if admitting {
+            pool.sessions
+                .iter()
+                .position(|entry| {
+                    !entry.session.is_idle() && entry.session.supports_more_transactions()
+                })
+                .or_else(|| pool.select_idle_session(checkout_at, &mut idle_expired))
+        } else {
+            None
+        };
         Ok(if let Some(index) = selected {
             let session = pool
                 .sessions
@@ -2558,6 +2966,7 @@ fn next_step(
             }
         } else {
             let wait_timeout = pool.pool_params.connect_timeout;
+            let started = *started.get_or_insert_with(Instant::now);
             if (!pool.backend.is_attached() || !wait_timeout.is_zero())
                 && started.elapsed() > wait_timeout
             {
@@ -2626,6 +3035,9 @@ fn next_step(
                                 .as_ref()
                                 .expect("open attached pool retains its factory"),
                         ),
+                    },
+                    PoolBackend::Owned { address, .. } => ConnectionFactory::Owned {
+                        address: address.clone(),
                     },
                 };
                 AcquireStep::StartAndWait {

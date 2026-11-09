@@ -40,7 +40,19 @@
 //! Dropping every handle leaves the connection open until `close_when_idle`, `cancel`, its
 //! peer or its worker's quiescence closes it, where dropping the last `ClientSession`
 //! drains it (`DIV-020`): a drain would refuse a submission the driver has not committed yet.
+//!
+//! [`OwnedHttpSessionPool`] pools owned sessions to one address with `HttpSessionPool`'s
+//! scheduler and `PoolParams`, which it shares: the drivers' `capacity_available` and
+//! `admission_closed` callbacks, and the idleness a driver publishes at the end of a turn,
+//! which the session's run scope reports, feed the pool as a `ClientSession`'s lifecycle
+//! events do. Its acquisitions take a selected session on their first poll with no
+//! allocation and no clock read for their deadline ([`OwnedSessionAcquisition`]). A
+//! reservation taken on a pooled session's handle reaches its pool as one the pool's
+//! acquisition made, and the admission the pool closes on a session it retires or drains
+//! refuses the handle's reservations, as a `ClientSession`'s draining flag does.
 
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::future::Future;
 use std::future::poll_fn;
 use std::panic::AssertUnwindSafe;
@@ -48,11 +60,12 @@ use std::panic::catch_unwind;
 use std::pin::Pin;
 use std::pin::pin;
 use std::rc::Rc;
+use std::rc::Weak;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
-use std::task::ready;
 use std::time::Duration;
+use std::time::Instant;
 
 use roxygen_codec::CodecSetting;
 use roxygen_core::body_event_queue::HttpBodySource;
@@ -70,9 +83,11 @@ use roxygen_runtime::cancellation::CancellationWakeRegistration;
 use roxygen_runtime::panic::discard_panic;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_runtime::worker::WorkerHandle;
+use roxygen_runtime::worker::WorkerId;
 use roxygen_runtime::worker::WorkerQuiescing;
 use roxygen_session::experimental::OwnedRequestProgressExt;
 use roxygen_session::http2::Http2SessionConfig;
+use roxygen_session::owned::OwnedUpstreamObserver;
 use roxygen_session::owned_h1::Http1DriverConfig;
 use roxygen_session::owned_h1::OwnedH1ExclusiveSubmission;
 use roxygen_session::owned_h1::OwnedH1Options;
@@ -107,6 +122,16 @@ use crate::connector::http2_session_config;
 use crate::connector::non_abortive_close_with_tls;
 use crate::connector::uniplex_config_for_session_params;
 use crate::connector::wait_session_completion;
+use crate::pool::PoolState;
+use crate::pool::PooledSession;
+use crate::pool::notify_session_event;
+use crate::pool::record_reservation;
+
+mod pool;
+
+pub use pool::OwnedGetSessionResult;
+pub use pool::OwnedHttpSessionPool;
+pub use pool::OwnedSessionAcquisition;
 
 /// HTTP/2 `SETTINGS_ENABLE_PUSH`.
 const ENABLE_PUSH: u16 = 2;
@@ -125,6 +150,110 @@ struct SessionInner {
     completion: SessionCompletion,
     attachment: CancellationToken,
     worker: WorkerHandle,
+    worker_id: WorkerId,
+    started: Instant,
+    pool: PoolBinding,
+}
+
+/// A pooled session's link to its [`OwnedHttpSessionPool`] (`DIV-046`).
+struct PoolBinding {
+    pool: RefCell<Option<Weak<RefCell<PoolState>>>>,
+    /// Admission closed: the pool closed it, or the driver reported it.
+    draining: Cell<bool>,
+    /// No capacity was left when the session was last reserved or reported.
+    full: Cell<bool>,
+    /// The pool last saw the session idle, or the session is not pooled.
+    reported_idle: Cell<bool>,
+}
+
+impl Default for PoolBinding {
+    fn default() -> Self {
+        Self {
+            pool: RefCell::new(None),
+            draining: Cell::new(false),
+            full: Cell::new(false),
+            reported_idle: Cell::new(true),
+        }
+    }
+}
+
+/// What a pooled session reports to its pool, as a `ClientSession`'s lifecycle
+/// events report to an `HttpSessionPool`.
+#[derive(Clone, Copy)]
+enum PoolEvent {
+    /// A released slot left capacity available (`TransactionDetached`,
+    /// `OutgoingCapacityReleased`).
+    CapacityAvailable,
+    /// The driver closed admission (`OutgoingAdmissionClosed`).
+    AdmissionClosed,
+    /// The driver published the connection idle at the end of a turn
+    /// (`DeactivateConnection`).
+    Idle,
+}
+
+/// The driver's capacity and admission callbacks, which feed the pool's
+/// notifications.
+struct PoolObserver {
+    session: Weak<SessionInner>,
+}
+
+impl OwnedUpstreamObserver for PoolObserver {
+    fn capacity_available(&self) {
+        if let Some(inner) = self.session.upgrade() {
+            notify_pool(&inner, PoolEvent::CapacityAvailable);
+        }
+    }
+
+    fn admission_closed(&self) {
+        if let Some(inner) = self.session.upgrade() {
+            inner.pool.draining.set(true);
+            notify_pool(&inner, PoolEvent::AdmissionClosed);
+        }
+    }
+}
+
+/// Reports `event` to the session's pool, if it is pooled: a session with
+/// capacity again wakes as many waiters as it can serve, and one whose
+/// admission closed wakes one, which dials its replacement. As a
+/// `ClientSession`'s wake count, the capacity omits the worker's admission,
+/// which the woken acquisitions check.
+fn notify_pool(inner: &Rc<SessionInner>, event: PoolEvent) {
+    let Some(pool) = inner.pool.pool.borrow().as_ref().and_then(Weak::upgrade) else {
+        return;
+    };
+    let session = OwnedClientSession {
+        inner: Rc::clone(inner),
+    };
+    let (enqueue_back, wake_count, release_idle) = match event {
+        PoolEvent::CapacityAvailable => {
+            let available = session.selectable_capacity();
+            let was_full = inner.pool.full.replace(available == 0);
+            (
+                was_full && available != 0,
+                usize::try_from(available).unwrap_or(usize::MAX),
+                true,
+            )
+        }
+        PoolEvent::AdmissionClosed => (false, 1, false),
+        PoolEvent::Idle => {
+            let available = session.selectable_capacity();
+            inner.pool.full.set(available == 0);
+            (
+                available != 0,
+                usize::try_from(available).unwrap_or(usize::MAX),
+                true,
+            )
+        }
+    };
+    inner.pool.reported_idle.set(session.is_idle());
+    notify_session_event(
+        &pool,
+        inner.worker_id,
+        Some(&PooledSession::Owned(session)),
+        enqueue_back,
+        wake_count,
+        release_idle,
+    );
 }
 
 #[derive(Clone)]
@@ -134,6 +263,20 @@ enum Upstream {
 }
 
 impl Upstream {
+    fn available_capacity(&self) -> u32 {
+        match self {
+            Self::Http1(handle) => handle.available_capacity(),
+            Self::Http2(handle) => handle.available_capacity(),
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        match self {
+            Self::Http1(handle) => handle.is_idle(),
+            Self::Http2(handle) => handle.is_idle(),
+        }
+    }
+
     fn close_when_idle(&self) -> Result<bool, HttpError> {
         match self {
             Self::Http1(handle) => handle.close_when_idle(),
@@ -165,11 +308,7 @@ impl OwnedClientSession {
         let context = context.clone();
         Box::pin(async move {
             check_attachment_admission(&context, &cancellation)?;
-            if matches!(connection.transport, ClientTransportOptions::Tls(_)) {
-                return Err(refusal(
-                    "owned client sessions do not support TLS: they dial plaintext TCP",
-                ));
-            }
+            refuse_tls(&connection)?;
             let config = DriverConfig::new(connection.plaintext_protocol, &session)?;
             let post_connect_cancellation = cancellation.clone();
             let (transport, metadata) = dial_plaintext(
@@ -240,26 +379,20 @@ impl OwnedClientSession {
     }
 
     /// Requests the connection can admit now: 0 once the attachment is
-    /// cancelled or the worker stops accepting work; otherwise on HTTP/1.1 1
-    /// while its one slot is free and admission is open, and on HTTP/2 the
-    /// lower of its own and its peer's `MAX_CONCURRENT_STREAMS`, less the
-    /// reserved and active streams.
+    /// cancelled, the worker stops accepting work or the session's pool closes
+    /// its admission; otherwise on HTTP/1.1 1 while its one slot is free and
+    /// admission is open, and on HTTP/2 the lower of its own and its peer's
+    /// `MAX_CONCURRENT_STREAMS`, less the reserved and active streams.
     pub fn available_capacity(&self) -> u32 {
         if self.admission_closed() {
             return 0;
         }
-        match &self.inner.upstream {
-            Upstream::Http1(handle) => handle.available_capacity(),
-            Upstream::Http2(handle) => handle.available_capacity(),
-        }
+        self.inner.upstream.available_capacity()
     }
 
     /// No reservation, exchange, upload or write is outstanding.
     pub fn is_idle(&self) -> bool {
-        match &self.inner.upstream {
-            Upstream::Http1(handle) => handle.is_idle(),
-            Upstream::Http2(handle) => handle.is_idle(),
-        }
+        self.inner.upstream.is_idle()
     }
 
     /// The driver's run has completed.
@@ -271,16 +404,62 @@ impl OwnedClientSession {
     }
 
     /// Takes one admission slot. Fails with `DROPPED` once the attachment is
-    /// cancelled or the worker stops accepting work, as
-    /// `ClientSession::reserve_request` does, before the run observes either,
-    /// and otherwise with `REFUSED_STREAM` when no slot is available.
+    /// cancelled, the worker stops accepting work or the session's pool closes
+    /// its admission, as `ClientSession::reserve_request` does, before the run
+    /// observes any of them, and otherwise with `REFUSED_STREAM` when no slot
+    /// is available. A pooled session's pool records the reservation as one
+    /// its acquisition made.
     pub fn reserve_request(&self) -> Result<OwnedClientReservation, HttpError> {
         if self.admission_closed() {
-            return Err(client_error(
-                HttpErrorCode::DROPPED,
-                b"client session admission closed",
-            ));
+            return Err(admission_closed_error());
         }
+        let pool = self
+            .inner
+            .pool
+            .pool
+            .borrow()
+            .as_ref()
+            .and_then(Weak::upgrade);
+        match pool {
+            Some(pool) => self.reserve_for_pool(&pool),
+            None => self.reserve_upstream(),
+        }
+    }
+
+    /// As `reserve_request` on a session of `pool`, without the worker
+    /// admission check, which the pool's acquisition step made.
+    pub(crate) fn reserve_pooled(
+        &self,
+        pool: &Rc<RefCell<PoolState>>,
+    ) -> Result<OwnedClientReservation, HttpError> {
+        if self.session_admission_closed() {
+            return Err(admission_closed_error());
+        }
+        self.reserve_for_pool(pool)
+    }
+
+    /// Reserves a slot and records it with `pool`, as a `ClientSession`'s
+    /// `TransactionAttached` reaches its pool: the session is no longer idle,
+    /// and moves to the back when it was idle or became full.
+    fn reserve_for_pool(
+        &self,
+        pool: &Rc<RefCell<PoolState>>,
+    ) -> Result<OwnedClientReservation, HttpError> {
+        let was_idle = self.is_pooled_idle();
+        let reservation = self.reserve_upstream()?;
+        let full = self.selectable_capacity() == 0;
+        self.inner.pool.full.set(full);
+        self.inner.pool.reported_idle.set(false);
+        record_reservation(
+            pool,
+            &PooledSession::Owned(self.clone()),
+            was_idle,
+            was_idle || full,
+        );
+        Ok(reservation)
+    }
+
+    fn reserve_upstream(&self) -> Result<OwnedClientReservation, HttpError> {
         Ok(OwnedClientReservation(match &self.inner.upstream {
             Upstream::Http1(handle) => Reservation::Http1(handle.reserve_request()?),
             Upstream::Http2(handle) => Reservation::Http2(handle.reserve_request()?),
@@ -307,8 +486,116 @@ impl OwnedClientSession {
 
     /// As `ClientSession`'s admission check, ahead of the run's next poll.
     fn admission_closed(&self) -> bool {
-        self.inner.attachment.is_cancellation_requested() || !self.inner.worker.is_accepting()
+        self.session_admission_closed() || !worker_admits(&self.inner.worker)
     }
+
+    /// `admission_closed` without the worker admission check: the attachment
+    /// is cancelled, or the pool closed the session's admission (as a
+    /// `ClientSession`'s draining flag) or saw the driver close it.
+    fn session_admission_closed(&self) -> bool {
+        self.is_draining() || self.inner.attachment.is_cancellation_requested()
+    }
+
+    /// Admission closed for the pool: it closed it, or the driver reported it.
+    pub(crate) fn is_draining(&self) -> bool {
+        self.inner.pool.draining.get()
+    }
+
+    /// Idle and admitting, as a pool counts a `ClientSession` idle.
+    pub(crate) fn is_pooled_idle(&self) -> bool {
+        !self.is_draining() && self.is_idle()
+    }
+
+    /// `available_capacity` without the worker admission check, which the
+    /// pool's acquisition step makes once for all of its sessions.
+    pub(crate) fn selectable_capacity(&self) -> u32 {
+        if self.session_admission_closed() {
+            0
+        } else {
+            self.inner.upstream.available_capacity()
+        }
+    }
+
+    /// 0 while the session is idle, otherwise 1: an exchange, a reservation, an
+    /// upload or a write is outstanding.
+    pub(crate) fn admitted_transactions(&self) -> u32 {
+        u32::from(!self.is_idle())
+    }
+
+    /// Refuses further pool reservations ahead of `initiate_drain`.
+    pub(crate) fn close_admission(&self) {
+        self.inner.pool.draining.set(true);
+    }
+
+    /// Closes admission and closes the connection once its exchanges retire.
+    pub(crate) fn initiate_drain(&self) -> Result<bool, HttpError> {
+        self.close_admission();
+        self.close_when_idle()
+    }
+
+    pub(crate) fn is_same_session(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) fn age(&self) -> Duration {
+        self.inner.started.elapsed()
+    }
+
+    pub(crate) fn worker_id(&self) -> WorkerId {
+        self.inner.worker_id
+    }
+
+    /// Binds the session to its pool, whose notifications the driver's
+    /// capacity and admission callbacks then feed.
+    pub(crate) fn bind_pool(&self, pool: Weak<RefCell<PoolState>>) {
+        self.inner.pool.pool.replace(Some(pool));
+        self.inner.pool.reported_idle.set(self.is_idle());
+        let observer = Rc::new(PoolObserver {
+            session: Rc::downgrade(&self.inner),
+        });
+        // A finished session refuses the observer; the pool drops it at its next turn.
+        let _ = match &self.inner.upstream {
+            Upstream::Http1(handle) => handle.set_observer(observer),
+            Upstream::Http2(handle) => handle.set_observer(observer),
+        };
+    }
+
+    pub(crate) fn is_bound_to_pool(&self) -> bool {
+        self.inner.pool.pool.borrow().is_some()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static WORKER_ADMISSION_CHECKS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The worker admission checks owned sessions and pools made on this thread.
+#[cfg(test)]
+pub(crate) fn worker_admission_checks_for_test() -> u64 {
+    WORKER_ADMISSION_CHECKS.with(Cell::get)
+}
+
+/// Whether `worker` still accepts new work: an uncontended lock of its
+/// command queue.
+pub(crate) fn worker_admits(worker: &WorkerHandle) -> bool {
+    #[cfg(test)]
+    WORKER_ADMISSION_CHECKS.with(|checks| checks.set(checks.get() + 1));
+    worker.is_accepting()
+}
+
+fn admission_closed_error() -> HttpError {
+    client_error(HttpErrorCode::DROPPED, b"client session admission closed")
+}
+
+/// Refuses TLS: owned sessions dial plaintext TCP only.
+fn refuse_tls(connection: &ConnectionParams) -> Result<(), HttpError> {
+    if matches!(connection.transport, ClientTransportOptions::Tls(_)) {
+        return Err(refusal(
+            "owned client sessions do not support TLS: they dial plaintext TCP",
+        ));
+    }
+    Ok(())
 }
 
 /// The driver configuration a session's parameters select.
@@ -409,16 +696,29 @@ fn start(
     attachment: CancellationToken,
 ) -> Result<OwnedClientSession, HttpError> {
     let completion = SessionCompletion::default();
-    let completed = SessionCompletionPublisher::new(&completion);
     let scope = RunScope {
         attachment: attachment.wake_registration(),
         quiescing: context.quiescing(),
-        completed,
+        completed: SessionCompletionPublisher::new(&completion),
+        session: Weak::new(),
         aborting: false,
         draining: false,
         failure: None,
     };
-    let (upstream, protocol, registration) = match config {
+    let inner = |upstream, protocol| {
+        Rc::new(SessionInner {
+            upstream,
+            protocol,
+            connection,
+            completion,
+            attachment,
+            worker: context.handle().clone(),
+            worker_id: context.worker_id(),
+            started: Instant::now(),
+            pool: PoolBinding::default(),
+        })
+    };
+    let (inner, registration) = match config {
         DriverConfig::Http1(io) => {
             let (session, handle) = OwnedH1UpstreamSession::new(OwnedH1Options {
                 context: context.clone(),
@@ -426,12 +726,14 @@ fn start(
                 io,
                 http1: Http1DriverConfig::default(),
             })?;
-            let upstream = Upstream::Http1(handle);
-            (
-                upstream.clone(),
-                CodecProtocol::Http11,
-                context.register_scope(scope.run(upstream, session.run())),
-            )
+            let inner = inner(Upstream::Http1(handle), CodecProtocol::Http11);
+            let scope = RunScope {
+                session: Rc::downgrade(&inner),
+                ..scope
+            };
+            let registration =
+                context.register_scope(scope.run(inner.upstream.clone(), session.run()));
+            (inner, registration)
         }
         DriverConfig::Http2(io, http2) => {
             let (session, handle) = OwnedH2UpstreamSession::new(OwnedH2Options {
@@ -440,12 +742,14 @@ fn start(
                 io,
                 http2,
             })?;
-            let upstream = Upstream::Http2(handle);
-            (
-                upstream.clone(),
-                CodecProtocol::Http2,
-                context.register_scope(scope.run(upstream, session.run())),
-            )
+            let inner = inner(Upstream::Http2(handle), CodecProtocol::Http2);
+            let scope = RunScope {
+                session: Rc::downgrade(&inner),
+                ..scope
+            };
+            let registration =
+                context.register_scope(scope.run(inner.upstream.clone(), session.run()));
+            (inner, registration)
         }
     };
     registration
@@ -453,16 +757,7 @@ fn start(
         .activate()
         .map_err(|error| client_error(HttpErrorCode::DROPPED, error.to_string()))?
         .detach();
-    Ok(OwnedClientSession {
-        inner: Rc::new(SessionInner {
-            upstream,
-            protocol,
-            connection,
-            completion,
-            attachment,
-            worker: context.handle().clone(),
-        }),
-    })
+    Ok(OwnedClientSession { inner })
 }
 
 /// The session's worker scope, as `ClientSession`'s run owner: the
@@ -472,6 +767,7 @@ struct RunScope {
     attachment: CancellationWakeRegistration,
     quiescing: WorkerQuiescing,
     completed: SessionCompletionPublisher,
+    session: Weak<SessionInner>,
     aborting: bool,
     draining: bool,
     failure: Option<HttpError>,
@@ -492,12 +788,28 @@ impl RunScope {
         let mut run = pin!(run);
         let outcome = poll_fn(|context| {
             self.poll_stop(&upstream, context);
-            let outcome = ready!(run.as_mut().poll(context));
+            let Poll::Ready(outcome) = run.as_mut().poll(context) else {
+                self.report_idle();
+                return Poll::Pending;
+            };
             self.poll_stop(&upstream, context);
             Poll::Ready(outcome)
         })
         .await;
         self.completed.publish(self.failure.map_or(outcome, Err));
+    }
+
+    /// Reports a pooled session that became idle to its pool, as a
+    /// `ClientSession`'s `DeactivateConnection` does: the driver publishes
+    /// idleness at the end of a quiescent turn, after the callback that released
+    /// the last slot, so the pool can retire it and reuse it in order.
+    fn report_idle(&self) {
+        if let Some(inner) = self.session.upgrade()
+            && !inner.pool.reported_idle.get()
+            && inner.upstream.is_idle()
+        {
+            notify_pool(&inner, PoolEvent::Idle);
+        }
     }
 
     /// As `ClientSessionOwner::poll_stop`, the attachment's cancellation wins

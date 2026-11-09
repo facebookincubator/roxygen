@@ -1457,9 +1457,9 @@ impl LifecycleObserver for SessionLifecycle {
                 | LifecycleEvent::Destroy
         ) && let Some(pool) = pool
         {
-            let changed_session = ClientSession {
+            let changed_session = crate::pool::PooledSession::Uniplex(ClientSession {
                 inner: Rc::clone(&session),
-            };
+            });
             crate::pool::notify_session_event(
                 &pool,
                 session.worker_id,
