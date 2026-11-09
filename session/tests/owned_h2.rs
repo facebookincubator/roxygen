@@ -1318,7 +1318,7 @@ fn unsupported_config_is_rejected_before_transport_or_application_work() {
                 let mut config = options(context.clone(), transport);
                 match case {
                     0 => config.io.read_timeout = Duration::from_secs(1),
-                    1 => config.http2.rate_limits.control_frames.maximum = 100,
+                    1 => config.http2.stats = Some(Rc::new(StatsProbe::default())),
                     2 => config.http2.stream_receive_window = 0,
                     3 => state.borrow_mut().capability = ByteEventCapability::TransportEvents,
                     _ => unreachable!(),
@@ -5539,6 +5539,7 @@ enum StraddledBlock {
 async fn straddled_refusal(
     context: WorkerContext,
     block: StraddledBlock,
+    rate_limits: Option<Http2RateLimitConfig>,
 ) -> (
     DecodedServerFrames,
     (usize, u64),
@@ -5609,7 +5610,11 @@ async fn straddled_refusal(
     let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
     application.owner_poll_gate = Some(Rc::clone(&gate));
     application.response_date = Some(TRANSCRIPT_DATE);
-    let (session, handle) = OwnedH2Session::new(application, options(context, transport)).unwrap();
+    let mut config = options(context, transport);
+    if let Some(rate_limits) = rate_limits {
+        config.http2.rate_limits = rate_limits;
+    }
+    let (session, handle) = OwnedH2Session::new(application, config).unwrap();
     let written = || decode_server_frames_with_requests(&state.borrow().writes.concat(), 2);
     let script = async {
         wait_until(|| gate.polls.get() > 0).await;
@@ -5647,7 +5652,7 @@ fn refused_stream_is_forgotten_after_its_header_block() {
     ];
     for (block, remembered) in cases {
         let (written, transcript, discarded, run) =
-            run_on_worker(move |context| Box::pin(straddled_refusal(context, block)));
+            run_on_worker(move |context| Box::pin(straddled_refusal(context, block, None)));
         assert_eq!(
             written.goaways,
             [
@@ -12160,6 +12165,704 @@ fn owned_h2_default_path_has_no_observation() {
                 }))
                 .unwrap();
             assert!(session.observed());
+        })
+    });
+}
+
+// Opt-in flood limits (`DIV-052`).
+
+/// Every category unbounded except the ones the caller sets.
+fn unbounded_rates() -> Http2RateLimitConfig {
+    let unlimited = RateLimitConfig::new(u64::MAX, Duration::from_millis(100), 0);
+    Http2RateLimitConfig {
+        control_frames: unlimited,
+        header_frames: unlimited,
+        resets: unlimited,
+        direct_errors: unlimited,
+    }
+}
+
+/// What one exchange's probe recorded.
+struct ExchangeOutcome {
+    requested: usize,
+    request_bytes: usize,
+    completed: usize,
+    dropped: usize,
+    cancelled: Vec<(HttpErrorCode, bool)>,
+}
+
+fn exchange_outcomes(probes: &RefCell<Vec<Rc<Probe>>>) -> Vec<ExchangeOutcome> {
+    probes
+        .borrow()
+        .iter()
+        .map(|probe| ExchangeOutcome {
+            requested: probe.requested.get(),
+            request_bytes: probe.request_bytes.get(),
+            completed: probe.completed.get(),
+            dropped: probe.dropped.get(),
+            cancelled: probe.cancelled.borrow().clone(),
+        })
+        .collect()
+}
+
+/// Runs one downstream connection fed `reads` with `rate_limits`, each of `requests` requests
+/// answered with an empty 200. Returns the server's frames, the exchanges' outcomes, the run's
+/// outcome and how the transport closed.
+async fn rate_limited_run(
+    context: WorkerContext,
+    reads: Vec<FixtureRead>,
+    rate_limits: Http2RateLimitConfig,
+    requests: usize,
+) -> (
+    DecodedServerFrames,
+    Vec<ExchangeOutcome>,
+    Result<(), HttpErrorCode>,
+    FixtureClose,
+) {
+    let (transport, state) = FixtureTransport::new(reads);
+    let (application, probes) = Application::new(vec![Reply::Body(0); requests]);
+    let mut config = options(context, transport);
+    config.http2.rate_limits = rate_limits;
+    let (session, _) = OwnedH2Session::new(application, config).unwrap();
+    let run = tokio::time::timeout(Duration::from_secs(10), session.run())
+        .await
+        .expect("the rate-limited connection finishes");
+    let written = decode_server_frames_with_requests(&state.borrow().writes.concat(), requests);
+    let close = state.borrow().close;
+    (
+        written,
+        exchange_outcomes(&probes),
+        run.map(drop).map_err(|error| error.code()),
+        close,
+    )
+}
+
+/// A client preface and SETTINGS, then `count` GET requests, each ending its stream.
+fn peer_get_requests(count: usize) -> Vec<u8> {
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    let mut input = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+    input.extend(transcript_settings(&mut peer));
+    for _ in 0..count {
+        input.extend(eligibility_request(&mut peer, 3));
+    }
+    input
+}
+
+#[test]
+fn owned_h2_builds_no_rate_limiter_unless_a_category_is_bounded() {
+    let bounded = RateLimitConfig::new(10, Duration::from_secs(1), 0);
+    // (configuration, whether the downstream session counts)
+    let cases = [
+        (unbounded_rates(), false),
+        (
+            Http2RateLimitConfig {
+                header_frames: RateLimitConfig::new(0, Duration::from_secs(1), u64::MAX),
+                ..unbounded_rates()
+            },
+            false,
+        ),
+        (Http2RateLimitConfig::default(), true),
+        (
+            Http2RateLimitConfig {
+                resets: bounded,
+                ..unbounded_rates()
+            },
+            true,
+        ),
+        (
+            Http2RateLimitConfig {
+                direct_errors: RateLimitConfig::new(u64::MAX - 1, Duration::from_secs(1), 0),
+                ..unbounded_rates()
+            },
+            true,
+        ),
+    ];
+    for (index, (rate_limits, counts)) in cases.into_iter().enumerate() {
+        run_on_worker(move |context| {
+            Box::pin(async move {
+                let (transport, state) = FixtureTransport::new([]);
+                let mut config = options(context, transport);
+                config.http2.rate_limits = rate_limits;
+                let (application, _) = Application::new(Vec::new());
+                let (session, _) = OwnedH2Session::new(application, config)
+                    .unwrap_or_else(|error| panic!("case {index} was refused: {error:?}"));
+                assert_eq!(session.limits_rates(), counts, "case {index}");
+                drop(session);
+                assert!(state.borrow().writes.is_empty());
+            })
+        });
+    }
+}
+
+#[test]
+fn finite_rate_limits_are_accepted_downstream() {
+    let (written, probes, run, _) = run_on_worker(|context| {
+        Box::pin(rate_limited_run(
+            context,
+            vec![FixtureRead::DataEof(peer_two_requests_bytes())],
+            Http2RateLimitConfig::default(),
+            2,
+        ))
+    });
+    assert_eq!(run, Ok(()));
+    assert_eq!(
+        sorted_statuses(&written),
+        [(StreamId::new(1), 200), (StreamId::new(3), 200)]
+    );
+    assert!(written.resets.is_empty() && written.goaways.is_empty());
+    assert!(probes.iter().all(|probe| probe.completed == 1));
+}
+
+#[test]
+fn owned_control_rate_limit_counts_only_semantic_request_callbacks() {
+    let (written, _, run, close) = run_on_worker(|context| {
+        Box::pin(rate_limited_run(
+            context,
+            vec![FixtureRead::Data(peer_control_rate_limit_bytes())],
+            Http2RateLimitConfig {
+                control_frames: RateLimitConfig::new(3, Duration::from_secs(60), 0),
+                ..unbounded_rates()
+            },
+            1,
+        ))
+    });
+    // SETTINGS, PRIORITY_UPDATE and the first PING count; SETTINGS ACK, the PING ACK and
+    // WINDOW_UPDATE do not, so the second PING is the fourth control frame.
+    assert_eq!(run, Err(HttpErrorCode::CANCEL));
+    assert_eq!(close, FixtureClose::Reset);
+    assert_eq!(written.ping_replies, [11]);
+    assert_eq!(written.goaways, [(StreamId::new(1), H2ErrorCode::CANCEL)]);
+}
+
+#[test]
+fn owned_settings_flood_trips_control_limit_before_acknowledging() {
+    let (written, _, run, close) = run_on_worker(|context| {
+        let mut peer = Http2Codec::new(TransportDirection::Upstream);
+        let mut input = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+        for _ in 0..5 {
+            input.extend(transcript_settings(&mut peer));
+        }
+        Box::pin(rate_limited_run(
+            context,
+            vec![FixtureRead::Data(input)],
+            Http2RateLimitConfig {
+                control_frames: RateLimitConfig::new(2, Duration::from_secs(60), 0),
+                ..unbounded_rates()
+            },
+            0,
+        ))
+    });
+    assert_eq!(run, Err(HttpErrorCode::CANCEL));
+    assert_eq!(close, FixtureClose::Reset);
+    assert_eq!(
+        written.settings_acks, 2,
+        "the third SETTINGS breaches the limit before it is acknowledged"
+    );
+    assert_eq!(
+        written.goaways,
+        [(StreamId::UNSPECIFIED, H2ErrorCode::CANCEL)]
+    );
+}
+
+#[test]
+fn owned_rfc7540_priority_frames_are_not_counted() {
+    let (written, _, run, _) = run_on_worker(|context| {
+        let mut input = peer_control_bytes(&[]);
+        for _ in 0..10 {
+            // PRIORITY(3): exclusive bit clear, depends on stream 0, weight 16.
+            input.extend([0, 0, 5, 2, 0, 0, 0, 0, 3, 0, 0, 0, 0, 15]);
+        }
+        Box::pin(rate_limited_run(
+            context,
+            vec![FixtureRead::DataEof(input)],
+            Http2RateLimitConfig {
+                control_frames: RateLimitConfig::new(1, Duration::from_secs(60), 0),
+                ..unbounded_rates()
+            },
+            0,
+        ))
+    });
+    assert_eq!(run, Ok(()), "only the peer's SETTINGS counts");
+    assert!(written.goaways.is_empty());
+}
+
+#[test]
+fn owned_reset_rate_limit_cancels_unrelated_active_request() {
+    let (written, probes, run, close) = run_on_worker(|context| {
+        let (initial, resets) = peer_reset_rate_limit_bytes();
+        let mut rate_limits = Http2RateLimitConfig::default();
+        // Keep the reset burst in one accounting window under instrumentation.
+        rate_limits.resets.interval = Duration::from_secs(10);
+        Box::pin(async move {
+            let (transport, state) =
+                FixtureTransport::new([FixtureRead::Data(initial), FixtureRead::Data(resets)]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0); 2]);
+            application.retain_request = true;
+            let mut config = options(context, transport);
+            config.http2.rate_limits = rate_limits;
+            let (session, _) = OwnedH2Session::new(application, config).unwrap();
+            let run = tokio::time::timeout(Duration::from_secs(10), session.run())
+                .await
+                .expect("the reset flood ends the connection");
+            let written = decode_server_frames_with_requests(&state.borrow().writes.concat(), 2);
+            let close = state.borrow().close;
+            (
+                written,
+                exchange_outcomes(&probes),
+                run.map(drop).map_err(|error| error.code()),
+                close,
+            )
+        })
+    });
+    assert_eq!(run, Err(HttpErrorCode::CANCEL));
+    assert_eq!(close, FixtureClose::Reset);
+    assert_eq!(written.goaways, [(StreamId::new(3), H2ErrorCode::CANCEL)]);
+    assert_eq!(probes.len(), 2);
+    assert_eq!(
+        probes[0].cancelled.as_slice(),
+        [(HttpErrorCode::CANCEL, false)],
+        "the held POST is cancelled by the connection failure"
+    );
+    assert_eq!(probes[0].completed, 0);
+    assert_eq!(
+        probes[1].cancelled.first(),
+        Some(&(HttpErrorCode::CANCEL, false)),
+        "the reset GET, which never started, is cancelled by the connection failure"
+    );
+    assert_eq!(probes[1].completed, 0);
+}
+
+/// A client preface and SETTINGS, then `count` GETs, each reset by the client right after its
+/// HEADERS.
+fn peer_rapid_reset_bytes(count: usize) -> Vec<u8> {
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    let mut input = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+    input.extend(transcript_settings(&mut peer));
+    for index in 0..count {
+        input.extend(eligibility_request(&mut peer, 3));
+        input.extend(eligibility_frame(
+            &mut peer,
+            EgressFrame::Reset {
+                stream: StreamId::new(1 + 2 * index as u64),
+                code: H2ErrorCode::CANCEL,
+            },
+        ));
+    }
+    input
+}
+
+#[test]
+fn owned_rapid_reset_flood_trips_the_reset_limit() {
+    const PAIRS: usize = 200;
+    let (written, probes, run, close) = run_on_worker(|context| {
+        Box::pin(rate_limited_run(
+            context,
+            vec![FixtureRead::DataEof(peer_rapid_reset_bytes(PAIRS))],
+            Http2RateLimitConfig {
+                resets: RateLimitConfig::new(100, Duration::from_secs(60), 0),
+                ..unbounded_rates()
+            },
+            PAIRS,
+        ))
+    });
+    assert_eq!(run, Err(HttpErrorCode::CANCEL));
+    assert_eq!(close, FixtureClose::Reset);
+    assert_eq!(written.goaways.len(), 1);
+    assert_eq!(written.goaways[0].1, H2ErrorCode::CANCEL);
+    assert!(
+        probes.len() <= 101,
+        "{} exchanges started before the 101st reset",
+        probes.len()
+    );
+    assert!(probes.iter().all(|probe| probe.completed == 0));
+    assert!(written.header_statuses.is_empty());
+
+    let (written, probes, run, _) = run_on_worker(|context| {
+        Box::pin(rate_limited_run(
+            context,
+            vec![FixtureRead::DataEof(peer_rapid_reset_bytes(PAIRS))],
+            unbounded_rates(),
+            PAIRS,
+        ))
+    });
+    assert_eq!(run, Ok(()), "without a reset limit the flood is served");
+    assert_eq!(probes.len(), PAIRS);
+    assert!(written.goaways.is_empty());
+}
+
+#[test]
+fn owned_header_rate_limit_drains_without_resetting_the_crossing_stream() {
+    let (written, probes, run, _) = run_on_worker(|context| {
+        Box::pin(rate_limited_run(
+            context,
+            vec![FixtureRead::DataEof(peer_two_requests_bytes())],
+            Http2RateLimitConfig {
+                header_frames: RateLimitConfig::new(1, Duration::from_secs(60), 0),
+                ..unbounded_rates()
+            },
+            2,
+        ))
+    });
+    assert_eq!(run, Ok(()), "a header breach drains gracefully");
+    assert!(written.resets.is_empty());
+    assert_eq!(
+        written.goaways,
+        [(StreamId::new(3), H2ErrorCode::NO_ERROR)],
+        "one final GOAWAY covers the crossing stream, as Proxygen's RateLimitFilter sends"
+    );
+    assert_eq!(written.header_statuses, [(StreamId::new(1), 200)]);
+    assert_eq!(probes[0].completed, 1);
+    assert_eq!(probes[1].requested, 0, "the crossing head is not delivered");
+    assert_eq!(
+        probes[1].cancelled.as_slice(),
+        [(HttpErrorCode::CANCEL, false)]
+    );
+    assert_eq!(probes[1].dropped, 1);
+}
+
+#[test]
+fn owned_header_rate_limit_stays_breached_for_the_rest_of_the_window() {
+    let (written, probes, run, _) = run_on_worker(|context| {
+        Box::pin(rate_limited_run(
+            context,
+            vec![FixtureRead::DataEof(peer_get_requests(3))],
+            Http2RateLimitConfig {
+                header_frames: RateLimitConfig::new(1, Duration::from_secs(60), 0),
+                ..unbounded_rates()
+            },
+            3,
+        ))
+    });
+    assert_eq!(run, Ok(()));
+    assert!(written.resets.is_empty());
+    assert_eq!(written.goaways, [(StreamId::new(5), H2ErrorCode::NO_ERROR)]);
+    assert_eq!(written.header_statuses, [(StreamId::new(1), 200)]);
+    for probe in &probes[1..] {
+        assert_eq!(probe.cancelled.as_slice(), [(HttpErrorCode::CANCEL, false)]);
+        assert_eq!(probe.requested, 0);
+    }
+}
+
+#[test]
+fn owned_header_rate_limit_later_batch_stream_is_dropped_by_codec() {
+    const BODY: usize = 10;
+    let (written, probes, run, _) = run_on_worker(|context| {
+        let mut peer = Http2Codec::new(TransportDirection::Upstream);
+        let mut first = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+        first.extend(transcript_settings(&mut peer));
+        let (upload, headers) = padding_post_headers(&mut peer);
+        first.extend(headers);
+        first.extend(eligibility_request(&mut peer, 3));
+        let mut second = eligibility_request(&mut peer, 3);
+        second.extend(eligibility_frame(
+            &mut peer,
+            EgressFrame::Body {
+                stream: upload,
+                body: queue(&[b'q'; BODY]),
+                padding: None,
+                end_stream: true,
+            },
+        ));
+        Box::pin(rate_limited_run(
+            context,
+            vec![FixtureRead::Data(first), FixtureRead::DataEof(second)],
+            Http2RateLimitConfig {
+                header_frames: RateLimitConfig::new(1, Duration::from_secs(60), 0),
+                ..unbounded_rates()
+            },
+            2,
+        ))
+    });
+    assert_eq!(run, Ok(()));
+    assert_eq!(
+        probes.len(),
+        2,
+        "stream 5, above the final GOAWAY, never reaches the driver"
+    );
+    assert!(written.resets.is_empty());
+    assert_eq!(written.goaways, [(StreamId::new(3), H2ErrorCode::NO_ERROR)]);
+    assert_eq!(probes[0].request_bytes, BODY);
+    assert_eq!(probes[0].completed, 1);
+    assert_eq!(written.header_statuses, [(StreamId::new(1), 200)]);
+    assert_eq!(
+        probes[1].cancelled.as_slice(),
+        [(HttpErrorCode::CANCEL, false)]
+    );
+}
+
+#[test]
+fn owned_header_rate_limit_skips_forbidden_body_requests() {
+    let (written, _, run, _) = run_on_worker(|context| {
+        let mut peer = Http2Codec::new(TransportDirection::Upstream);
+        let mut input = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+        input.extend(transcript_settings(&mut peer));
+        let mut trace = HttpMessage::new();
+        trace.set_method(HttpMethod::Trace).unwrap();
+        trace.set_url(b"/trace", false).unwrap();
+        trace.set_http_version(1, 1);
+        trace
+            .headers_mut()
+            .set(HttpHeaderCode::Host, b"example.com");
+        trace.headers_mut().set(HttpHeaderCode::ContentLength, b"0");
+        let stream = peer.create_stream();
+        input.extend(eligibility_frame(
+            &mut peer,
+            EgressFrame::Headers {
+                stream,
+                message: &trace,
+                end_stream: true,
+                extra_headers: None,
+            },
+        ));
+        input.extend(eligibility_request(&mut peer, 3));
+        Box::pin(rate_limited_run(
+            context,
+            vec![FixtureRead::DataEof(input)],
+            Http2RateLimitConfig {
+                header_frames: RateLimitConfig::new(1, Duration::from_secs(60), 0),
+                ..unbounded_rates()
+            },
+            2,
+        ))
+    });
+    assert_eq!(run, Ok(()));
+    assert!(
+        written.goaways.is_empty(),
+        "the rejected TRACE is not counted, so the GET does not breach"
+    );
+    assert_eq!(
+        sorted_statuses(&written),
+        [(StreamId::new(1), 400), (StreamId::new(3), 200)]
+    );
+}
+
+#[test]
+fn owned_header_rate_limit_during_a_drain_sends_no_extra_goaway() {
+    // Stream 3's header block straddles the final GOAWAY of a local drain, so the driver refuses
+    // it, and its completed block is the second counted one.
+    let header_limit = Http2RateLimitConfig {
+        header_frames: RateLimitConfig::new(1, Duration::from_secs(60), 0),
+        ..unbounded_rates()
+    };
+    let (written, transcript, _, run) = run_on_worker(move |context| {
+        Box::pin(straddled_refusal(
+            context,
+            StraddledBlock::EndedPost,
+            Some(header_limit),
+        ))
+    });
+    assert_eq!(run, Ok(()));
+    assert_eq!(
+        written.goaways,
+        [
+            (StreamId::new(0x7fff_ffff), H2ErrorCode::NO_ERROR),
+            (StreamId::new(3), H2ErrorCode::NO_ERROR)
+        ],
+        "the breach during the drain adds no GOAWAY"
+    );
+    assert_eq!(
+        written.resets,
+        [(StreamId::new(3), H2ErrorCode::REFUSED_STREAM)]
+    );
+    assert_eq!(
+        transcript,
+        (6, 4_075_595_476_242_011_935),
+        "the wire equals the unlimited run's (`refused_stream_is_forgotten_after_its_header_block`)"
+    );
+}
+
+#[test]
+fn owned_direct_error_rate_limit_suppresses_the_crossing_semantic_error() {
+    let (written, _, run, close) = run_on_worker(|context| {
+        Box::pin(rate_limited_run(
+            context,
+            peer_duplicate_content_length_requests(51),
+            Http2RateLimitConfig {
+                direct_errors: RateLimitConfig::new(10, Duration::from_secs(60), 50),
+                ..unbounded_rates()
+            },
+            51,
+        ))
+    });
+    assert_eq!(
+        run,
+        Err(HttpErrorCode::CANCEL),
+        "the 51st direct semantic error breaches the limit"
+    );
+    assert_eq!(close, FixtureClose::Reset);
+    assert!(written.header_statuses.len() <= 50);
+    assert!(
+        written
+            .header_statuses
+            .iter()
+            .all(|&(stream, _)| stream != StreamId::new(101))
+    );
+}
+
+/// Polls `run` until `condition` holds; `run` must not finish first.
+async fn poll_until<F: Future>(run: &mut Pin<&mut F>, condition: impl Fn() -> bool) {
+    std::future::poll_fn(|context| {
+        assert!(
+            run.as_mut().poll(context).is_pending(),
+            "the connection ended early"
+        );
+        if condition() {
+            Poll::Ready(())
+        } else {
+            context.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
+#[test]
+fn owned_rate_limit_windows_roll_on_the_next_event_without_a_timer() {
+    let (replies, timers, run) = crate::external_host_tests::run_on_host_with(|host, context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let ping = |peer: &mut Http2Codec, data| {
+                eligibility_frame(peer, EgressFrame::PingRequest { data: Some(data) })
+            };
+            let mut first = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+            first.extend(transcript_settings(&mut peer));
+            first.extend(ping(&mut peer, 1));
+            let mut second = ping(&mut peer, 2);
+            second.extend(ping(&mut peer, 3));
+            let third = ping(&mut peer, 4);
+            let release_second = Arc::new(tokio::sync::Notify::new());
+            let release_third = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(first),
+                FixtureRead::WaitData(Arc::clone(&release_second), second),
+                FixtureRead::WaitDataEof(Arc::clone(&release_third), third),
+            ]);
+            let (application, _) = Application::new(Vec::new());
+            let mut config = options(context, transport);
+            config.http2.rate_limits = Http2RateLimitConfig {
+                control_frames: RateLimitConfig::new(2, Duration::from_secs(1), 0),
+                ..unbounded_rates()
+            };
+            let (session, _) = OwnedH2Session::new(application, config).unwrap();
+            let replies = || {
+                let written = state.borrow().writes.concat();
+                decode_server_frames_with_requests(&written, 0).ping_replies
+            };
+            let mut run = std::pin::pin!(session.run());
+            // SETTINGS and the first PING fill the 1 s window.
+            poll_until(&mut run, || replies().len() == 1).await;
+            host.advance(Duration::from_secs(1));
+            release_second.notify_one();
+            // The next PING finds the window elapsed and starts a new one.
+            poll_until(&mut run, || replies().len() == 3).await;
+            release_third.notify_one();
+            let run = run.await.map(drop).map_err(|error| error.code());
+            (replies(), host.timers_created(), run)
+        })
+    });
+    assert_eq!(replies, [1, 2, 3]);
+    assert_eq!(
+        run,
+        Err(HttpErrorCode::CANCEL),
+        "the third PING of the second window breaches it"
+    );
+    assert_eq!(timers, 0, "the windows need no timer");
+}
+
+#[test]
+fn owned_unbounded_categories_read_no_clock() {
+    // Control frames only: SETTINGS, two PINGs and SETTINGS ACK.
+    let input = || {
+        peer_control_bytes(&[
+            EgressFrame::PingRequest { data: Some(1) },
+            EgressFrame::PingRequest { data: Some(2) },
+            EgressFrame::SettingsAck,
+        ])
+    };
+    let clock_reads = |rate_limits: Http2RateLimitConfig| {
+        crate::external_host_tests::run_on_host_with(move |host, context| {
+            Box::pin(async move {
+                let (transport, _) = FixtureTransport::new([FixtureRead::DataEof(input())]);
+                let (application, _) = Application::new(Vec::new());
+                let mut config = options(context, transport);
+                config.http2.rate_limits = rate_limits;
+                let (session, _) = OwnedH2Session::new(application, config).unwrap();
+                let before = host.now_reads();
+                session.run().await.unwrap();
+                host.now_reads() - before
+            })
+        })
+    };
+    let unlimited = clock_reads(unbounded_rates());
+    let headers_bounded = clock_reads(Http2RateLimitConfig {
+        header_frames: RateLimitConfig::new(10, Duration::from_secs(1), 0),
+        ..unbounded_rates()
+    });
+    let control_bounded = clock_reads(Http2RateLimitConfig {
+        control_frames: RateLimitConfig::new(10, Duration::from_secs(1), 0),
+        ..unbounded_rates()
+    });
+    assert_eq!(
+        headers_bounded, unlimited,
+        "frames of an unbounded category read no clock"
+    );
+    assert_eq!(
+        control_bounded,
+        unlimited + 3,
+        "each counted control frame reads the clock once"
+    );
+}
+
+#[test]
+fn owned_header_rate_limit_reports_drain_and_suppresses_ingress_message() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (transport, _) =
+                FixtureTransport::new([FixtureRead::DataEof(peer_two_requests_bytes())]);
+            let (application, _) = Application::new(vec![Reply::Body(0); 2]);
+            let mut config = options(context, transport);
+            config.http2.rate_limits = Http2RateLimitConfig {
+                header_frames: RateLimitConfig::new(1, Duration::from_secs(60), 0),
+                ..unbounded_rates()
+            };
+            let (mut session, _) = OwnedH2Session::new(application, config).unwrap();
+            let events = Rc::new(RefCell::new(Vec::new()));
+            session
+                .add_lifecycle_observer(Rc::new(LifecycleProbe {
+                    events: Rc::clone(&events),
+                }))
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .unwrap()
+                .expect("a header breach drains gracefully");
+            let events = events.borrow();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, LifecycleEvent::Http2IngressMessage { .. }))
+                    .copied()
+                    .collect::<Vec<_>>(),
+                [LifecycleEvent::Http2IngressMessage {
+                    stream: StreamId::new(1)
+                }],
+                "the crossing head is not reported"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, LifecycleEvent::DrainStarted(_)))
+                    .copied()
+                    .collect::<Vec<_>>(),
+                [LifecycleEvent::DrainStarted(DrainTrigger::HeaderRateLimit)]
+            );
+            // `UniplexSession` aborts the crossing stream without queuing a codec failure.
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, LifecycleEvent::Http2IngressError { .. })),
+                "a header breach reports no ingress error: {events:?}"
+            );
         })
     });
 }

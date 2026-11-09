@@ -74,6 +74,8 @@ pub(crate) struct ManualHost {
     deferred_yields: RefCell<Vec<Weak<HostYield>>>,
     completed_yields: Rc<Cell<usize>>,
     spawns: Cell<usize>,
+    sleeps: Cell<usize>,
+    now_reads: Cell<usize>,
 }
 
 impl ManualHost {
@@ -89,6 +91,8 @@ impl ManualHost {
             deferred_yields: RefCell::new(Vec::new()),
             completed_yields: Rc::new(Cell::new(0)),
             spawns: Cell::new(0),
+            sleeps: Cell::new(0),
+            now_reads: Cell::new(0),
         });
         let host = Host::new(implementation.clone());
         (pool, implementation, host)
@@ -118,6 +122,16 @@ impl ManualHost {
     /// How many futures this host has been asked to spawn.
     pub(crate) fn spawns(&self) -> usize {
         self.spawns.get()
+    }
+
+    /// How many timers this host has created.
+    pub(crate) fn timers_created(&self) -> usize {
+        self.sleeps.get()
+    }
+
+    /// How many times this host's clock has been read.
+    pub(crate) fn now_reads(&self) -> usize {
+        self.now_reads.get()
     }
 
     /// Applies to `yield_to_io` futures created after this call.
@@ -150,10 +164,12 @@ impl LocalHost for ManualHost {
     }
 
     fn now(&self) -> Instant {
+        self.now_reads.set(self.now_reads.get() + 1);
         self.now.get()
     }
 
     fn sleep_until(&self, deadline: Instant) -> LocalFuture {
+        self.sleeps.set(self.sleeps.get() + 1);
         let timer = Rc::new(Timer {
             deadline,
             waker: RefCell::new(None),

@@ -1,6 +1,9 @@
 use std::time::Duration;
 use std::time::Instant;
 
+use roxygen_core::error::HttpError;
+use roxygen_core::error::HttpErrorCode;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RateLimitConfig {
     pub maximum: u64,
@@ -16,6 +19,16 @@ impl RateLimitConfig {
             minimum,
         }
     }
+
+    /// Whether the effective limit, the larger of `maximum` and `minimum`, never trips.
+    pub const fn is_unbounded(&self) -> bool {
+        let limit = if self.maximum > self.minimum {
+            self.maximum
+        } else {
+            self.minimum
+        };
+        limit == u64::MAX
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,6 +37,16 @@ pub struct Http2RateLimitConfig {
     pub header_frames: RateLimitConfig,
     pub resets: RateLimitConfig,
     pub direct_errors: RateLimitConfig,
+}
+
+impl Http2RateLimitConfig {
+    /// Whether no category can trip.
+    pub const fn is_unbounded(&self) -> bool {
+        self.control_frames.is_unbounded()
+            && self.header_frames.is_unbounded()
+            && self.resets.is_unbounded()
+            && self.direct_errors.is_unbounded()
+    }
 }
 
 impl Default for Http2RateLimitConfig {
@@ -134,8 +157,7 @@ impl Http2RateLimiter {
     }
 
     pub(crate) fn is_unbounded(&self, kind: RateLimitKind) -> bool {
-        let config = self.counters[kind as usize].config;
-        config.maximum.max(config.minimum) == u64::MAX
+        self.counters[kind as usize].config.is_unbounded()
     }
 
     pub fn record(&mut self, kind: RateLimitKind, now: Instant) -> (bool, Option<RateLimitSample>) {
@@ -169,4 +191,19 @@ impl Http2RateLimiter {
     pub fn next_deadline(&self) -> Option<Instant> {
         self.counters.iter().filter_map(Counter::deadline).min()
     }
+}
+
+/// The connection error a breach of `kind` raises, with `UniplexSession`'s messages.
+#[cold]
+#[inline(never)]
+pub(crate) fn rate_limit_exceeded(kind: RateLimitKind) -> HttpError {
+    HttpError::with_message(
+        HttpErrorCode::CANCEL,
+        match kind {
+            RateLimitKind::ControlFrames => b"HTTP/2 control-frame rate limit exceeded".as_slice(),
+            RateLimitKind::HeaderFrames => b"HTTP/2 header rate limit exceeded",
+            RateLimitKind::Resets => b"HTTP/2 reset rate limit exceeded",
+            RateLimitKind::DirectErrors => b"HTTP/2 direct-error rate limit exceeded",
+        },
+    )
 }

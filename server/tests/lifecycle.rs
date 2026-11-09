@@ -53,6 +53,8 @@ use roxygen_runtime::worker::WorkerCleanupTaskRegistration;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_runtime::worker::WorkerHandle;
 use roxygen_session::http2::Http2SessionConfig;
+use roxygen_session::http2::rate_limit::Http2RateLimitConfig;
+use roxygen_session::http2::rate_limit::RateLimitConfig;
 use roxygen_session::session::LifecycleEvent;
 use roxygen_session::session::LifecycleObserver;
 use roxygen_session::uniplex::UniplexConfig;
@@ -82,6 +84,7 @@ use crate::acceptor::ConnectionInfo;
 use crate::acceptor::ServerSessionConfig;
 use crate::acceptor::TlsHandshakeObserver;
 use crate::acceptor::http2_session_config;
+use crate::acceptor::owned_http2_session_config;
 use crate::scoped_server::ScopedHttpServer;
 use crate::server::ADMISSION_EVENT_LIMIT;
 use crate::server::AdmissionAttempt;
@@ -1581,6 +1584,35 @@ fn owned_http2_factory_panic_is_contained() {
             stage: ServerCallbackStage::LifecycleObserverFactory,
         })
     ));
+}
+
+#[test]
+fn http2_rate_limits_match_for_both_drivers() {
+    let default = ServerSessionConfig::default();
+    let defaults = Http2RateLimitConfig::default();
+    assert!(!defaults.is_unbounded());
+    assert_eq!(default.http2_rate_limits, defaults);
+    let unbounded = RateLimitConfig::new(u64::MAX, Duration::from_secs(1), 0);
+    for limits in [
+        defaults,
+        Http2RateLimitConfig {
+            resets: RateLimitConfig::new(7, Duration::from_secs(3), 1),
+            ..defaults
+        },
+        Http2RateLimitConfig {
+            control_frames: unbounded,
+            header_frames: unbounded,
+            resets: unbounded,
+            direct_errors: unbounded,
+        },
+    ] {
+        let config = ServerSessionConfig {
+            http2_rate_limits: limits,
+            ..default.clone()
+        };
+        assert_eq!(http2_session_config(&config).rate_limits, limits);
+        assert_eq!(owned_http2_session_config(&config).rate_limits, limits);
+    }
 }
 
 #[test]

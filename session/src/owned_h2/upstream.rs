@@ -1047,6 +1047,12 @@ impl OwnedH2UpstreamSession {
     pub(crate) fn with_stream_seed(self, seed: u64) -> Self {
         Self(self.0.with_stream_seed(seed))
     }
+
+    /// Whether the session built a flood-limit counter.
+    #[cfg(test)]
+    pub(crate) fn limits_rates(&self) -> bool {
+        self.0.limits_rates()
+    }
 }
 
 impl<A, const UPSTREAM: bool> Driver<A, UPSTREAM>

@@ -2456,3 +2456,89 @@ fn owned_http2_attachment_accepts_a_lifecycle_observer_factory() {
     );
     assert_eq!(events.last(), Some(&LifecycleEvent::Destroy));
 }
+
+/// Counts the PING acknowledgements in a server's frames.
+fn ping_acknowledgements(mut wire: &[u8]) -> usize {
+    let mut count = 0;
+    while wire.len() >= 9 {
+        let length = usize::from(wire[0]) << 16 | usize::from(wire[1]) << 8 | usize::from(wire[2]);
+        if wire.len() < 9 + length {
+            break;
+        }
+        count += usize::from(wire[3] == 6 && wire[4] & 1 == 1);
+        wire = &wire[9 + length..];
+    }
+    count
+}
+
+#[test]
+fn owned_http2_enforces_configured_rate_limits() {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    let mut owner = RuntimeOwner::start(RuntimeConfig {
+        workers: 1,
+        command_capacity: 4,
+    })
+    .expect("owner starts");
+    let runtime = owner.handle();
+    let worker = runtime.worker(0).expect("worker exists");
+    wait(
+        worker
+            .call_local(move |context| async move {
+                // The client preface, an empty SETTINGS and two PINGs.
+                let mut input = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+                input.extend([0, 0, 0, 4, 0, 0, 0, 0, 0]);
+                for data in [1, 2] {
+                    input.extend([0, 0, 8, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, data]);
+                }
+                for limited in [false, true] {
+                    let mut session = untimed_owned(false, true);
+                    if limited {
+                        session.http2_rate_limits =
+                            roxygen_session::http2::rate_limit::Http2RateLimitConfig {
+                                control_frames:
+                                    roxygen_session::http2::rate_limit::RateLimitConfig::new(
+                                        1,
+                                        Duration::from_secs(60),
+                                        0,
+                                    ),
+                                ..Default::default()
+                            };
+                    }
+                    let (io, mut peer) = tokio::io::duplex(64 * 1024);
+                    let accepted = attach_for_test(
+                        &context,
+                        CodecProtocol::Http2,
+                        session,
+                        io,
+                        Rc::new(FixedHandler),
+                    );
+                    let run = tokio::task::spawn_local(accepted.session.run());
+                    peer.write_all(&input).await.expect("client frames written");
+                    if limited {
+                        let error = run
+                            .await
+                            .expect("owned run task joins")
+                            .expect_err("the first PING exceeds the control-frame limit");
+                        assert_eq!(error.code(), HttpErrorCode::CANCEL);
+                    } else {
+                        let mut written = Vec::new();
+                        while ping_acknowledgements(&written) < 2 {
+                            let mut chunk = [0; 1024];
+                            let read = peer.read(&mut chunk).await.expect("server frames");
+                            assert_ne!(read, 0, "the server answers both PINGs");
+                            written.extend_from_slice(&chunk[..read]);
+                        }
+                        peer.shutdown().await.expect("client EOF");
+                        run.await
+                            .expect("owned run task joins")
+                            .expect("a connection within its default limits closes at EOF");
+                    }
+                }
+            })
+            .expect("initializer admitted"),
+    )
+    .expect("initializer finishes");
+    wait(runtime.quiesce(TIMEOUT)).expect("cleanup joins");
+    assert_eq!(owner.join().expect("physical join").workers_forced, 0);
+}

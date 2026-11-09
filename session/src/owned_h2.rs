@@ -106,6 +106,9 @@ use crate::http2::protocol::CodecFailureDisposition;
 use crate::http2::protocol::PeerSetting;
 use crate::http2::protocol::SentGoaway;
 use crate::http2::protocol::{self};
+use crate::http2::rate_limit::Http2RateLimiter;
+use crate::http2::rate_limit::RateLimitKind;
+use crate::http2::rate_limit::rate_limit_exceeded;
 use crate::http2::scheduler::PriorityEntry;
 use crate::http2::scheduler::PriorityQueue;
 pub use crate::owned::OwnedApplication as OwnedH2Application;
@@ -857,6 +860,9 @@ struct Failure {
     /// Set by `CodecInput::fail`: parsing ingress found the failure, which a lifecycle
     /// observer receives as `Http2IngressError`.
     ingress: bool,
+    /// The stream's header block breached the header rate limit: the stream is aborted
+    /// without a reset and the connection drains with one final GOAWAY.
+    header_rate_limit: bool,
 }
 
 impl Failure {
@@ -869,6 +875,7 @@ impl Failure {
             direction: HttpExceptionDirection::IngressAndEgress,
             new_stream: false,
             ingress: false,
+            header_rate_limit: false,
         }
     }
 }
@@ -1124,6 +1131,8 @@ struct ConnectionState {
     ingress_grace: bool,
     summary: UniplexRunSummary,
     observation: Option<Box<Observation>>,
+    /// Downstream flood limits (`DIV-052`); `None` while every category is unbounded.
+    rate_limits: Option<Box<Http2RateLimiter>>,
 }
 
 struct DriverFailure {
@@ -1228,6 +1237,13 @@ fn push_connection_failure(failures: &mut VecDeque<Failure>, error: HttpError) {
     failures.push_back(Failure::new(StreamId::UNSPECIFIED, error));
 }
 
+/// Counts one event of a category, reading the clock only when the category is bounded.
+#[cold]
+#[inline(never)]
+fn record_rate(limiter: &mut Http2RateLimiter, kind: RateLimitKind, host: &Host) -> bool {
+    !limiter.is_unbounded(kind) && limiter.record(kind, host.now()).0
+}
+
 /// A refused or rejected stream's head is reported as `UniplexSession` reports it: as an
 /// ingress message, unless it has a forbidden body.
 #[cold]
@@ -1274,8 +1290,8 @@ fn owned_receive_window(
 }
 
 impl<A: OwnedApplication> OwnedH2Session<A> {
-    /// Creates the experimental opt-in session with its current untimed, unbounded-rate H2
-    /// configuration.
+    /// Creates the experimental opt-in session. It is untimed, and it limits only the flood
+    /// categories that `Http2SessionConfig::rate_limits` bounds (`DIV-052`).
     pub fn new(
         application: A,
         options: OwnedH2Options,
@@ -1325,6 +1341,12 @@ impl<A: OwnedApplication> OwnedH2Session<A> {
     pub(crate) fn observed(&self) -> bool {
         self.0.connection.state.observation.is_some()
     }
+
+    /// Whether the session built a flood-limit counter.
+    #[cfg(test)]
+    pub(crate) fn limits_rates(&self) -> bool {
+        self.0.limits_rates()
+    }
 }
 
 impl<A, const UPSTREAM: bool> Driver<A, UPSTREAM>
@@ -1332,6 +1354,11 @@ where
     A: OwnedApplication,
     A::Exchange: ExchangeStorage<UPSTREAM>,
 {
+    #[cfg(test)]
+    fn limits_rates(&self) -> bool {
+        self.connection.state.rate_limits.is_some()
+    }
+
     #[cfg(test)]
     fn with_stream_seed(mut self, seed: u64) -> Self {
         assert!(
@@ -1350,7 +1377,6 @@ where
             mut http2,
         } = options;
         let io = io.validate()?;
-        let rates = http2.rate_limits;
         if !context.is_owner_thread()
             || context.is_cancelled()
             || io.buffer_limit == 0
@@ -1369,15 +1395,6 @@ where
                 .ping_probes
                 .is_some_and(|probes| !probes.interval.is_zero())
             || http2.connection_receive_window > i32::MAX as u32
-            || (!UPSTREAM
-                && [
-                    rates.control_frames,
-                    rates.header_frames,
-                    rates.resets,
-                    rates.direct_errors,
-                ]
-                .iter()
-                .any(|rate| rate.maximum != u64::MAX))
             || transport.byte_event_capability(&context)? != ByteEventCapability::Unsupported
         {
             return Err(failure(
@@ -1419,6 +1436,12 @@ where
                 b"owned upstream H2 requires nonzero admission and disabled push",
             ));
         }
+        let rate_limits = (!UPSTREAM && !http2.rate_limits.is_unbounded()).then(|| {
+            Box::new(Http2RateLimiter::new(
+                http2.rate_limits,
+                context.host().now(),
+            ))
+        });
         let ready = Arc::new(ReadyQueue::default());
         let upstream = UPSTREAM.then(|| {
             Rc::new(upstream::Admission::new(
@@ -1519,6 +1542,7 @@ where
                         ingress_grace: false,
                         summary: UniplexRunSummary::default(),
                         observation: None,
+                        rate_limits,
                     },
                 },
                 streams: StreamTable::with_hasher(stream_hash_state()),
@@ -2446,6 +2470,49 @@ where
         }
     }
 
+    /// Counts one `kind` event against the downstream flood limits; whether it breached them.
+    #[inline(always)]
+    fn rate_limited(&mut self, kind: RateLimitKind) -> bool {
+        !UPSTREAM
+            && match self.state.rate_limits.as_deref_mut() {
+                None => false,
+                Some(limiter) => record_rate(limiter, kind, self.context.host()),
+            }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fail_rate_limit(&mut self, kind: RateLimitKind) {
+        self.fail(Failure::new(
+            StreamId::UNSPECIFIED,
+            rate_limit_exceeded(kind),
+        ));
+    }
+
+    /// Counts a completed header block, unless its request has a forbidden body, which
+    /// `UniplexSession` rejects before counting. On a breach the stream's head is not
+    /// delivered and the stream is queued to be aborted without a reset.
+    #[cold]
+    #[inline(never)]
+    fn header_rate_limited(&mut self, stream: StreamId, message: &mut HttpMessage) -> bool {
+        if crate::uniplex::request_has_forbidden_body(message)
+            || !self.rate_limited(RateLimitKind::HeaderFrames)
+        {
+            return false;
+        }
+        self.state.discarded.remove(&stream);
+        if let Some(owner) = self.streams.get_mut(&stream) {
+            owner.ingress_rejected = true;
+        }
+        // Not `fail`: as in `UniplexSession`, a breach is no codec failure, so a lifecycle
+        // observer receives no `Http2IngressError` for it.
+        self.failures.push_back(Failure {
+            header_rate_limit: true,
+            ..Failure::new(stream, rate_limit_exceeded(RateLimitKind::HeaderFrames))
+        });
+        true
+    }
+
     fn new_stream(&mut self, id: StreamId) -> Result<(), HttpError> {
         let Entry::Vacant(entry) = self.streams.entry(id) else {
             return Err(failure(
@@ -2609,6 +2676,12 @@ where
                 stream,
                 mut message,
             } => {
+                if !UPSTREAM
+                    && self.state.rate_limits.is_some()
+                    && self.header_rate_limited(stream, &mut message)
+                {
+                    return actions.into();
+                }
                 // Once its header block completes, a refused stream is ownerless like any
                 // unknown one: its DATA returns credit, and its trailers, END_STREAM and codec
                 // errors are ignored.
@@ -2655,6 +2728,7 @@ where
                         direction: HttpExceptionDirection::Ingress,
                         new_stream: true,
                         ingress: false,
+                        header_rate_limit: false,
                     });
                     return actions.into();
                 }
@@ -2694,6 +2768,7 @@ where
                         direction: HttpExceptionDirection::Ingress,
                         new_stream: true,
                         ingress: false,
+                        header_rate_limit: false,
                     });
                     return actions.into();
                 }
@@ -2811,6 +2886,7 @@ where
                             direction: HttpExceptionDirection::Ingress,
                             new_stream: false,
                             ingress: false,
+                            header_rate_limit: false,
                         });
                     }
                 }
@@ -2820,6 +2896,13 @@ where
                 error,
                 new_stream,
             } => {
+                if !stream.is_unspecified()
+                    && error.codec_status_code().is_none()
+                    && self.rate_limited(RateLimitKind::DirectErrors)
+                {
+                    self.fail_rate_limit(RateLimitKind::DirectErrors);
+                    return actions.into();
+                }
                 let mut partial = error.partial_message().cloned();
                 let code = if !UPSTREAM
                     && partial
@@ -2842,9 +2925,14 @@ where
                     direction: error.direction(),
                     new_stream,
                     ingress: false,
+                    header_rate_limit: false,
                 });
             }
             CodecEvent::Abort { stream, code } => {
+                if self.rate_limited(RateLimitKind::Resets) {
+                    self.fail_rate_limit(RateLimitKind::Resets);
+                    return actions.into();
+                }
                 let code = h2_error_code_to_http_error_code(code);
                 let code = if code == HttpErrorCode::NO_ERROR {
                     HttpErrorCode::CANCEL
@@ -2901,6 +2989,10 @@ where
                 }
             }
             CodecEvent::Settings { settings } => {
+                if self.rate_limited(RateLimitKind::ControlFrames) {
+                    self.fail_rate_limit(RateLimitKind::ControlFrames);
+                    return actions.into();
+                }
                 if let Some(observation) = self.state.observation.as_deref() {
                     observation.settings(
                         &settings,
@@ -3018,6 +3110,10 @@ where
                 }
             }
             CodecEvent::PingRequest { data } => {
+                if self.rate_limited(RateLimitKind::ControlFrames) {
+                    self.fail_rate_limit(RateLimitKind::ControlFrames);
+                    return actions.into();
+                }
                 if let Some(observation) = self.state.observation.as_deref() {
                     observation.push(LifecycleEvent::Http2PingReplySent {
                         latency: Duration::ZERO,
@@ -3037,8 +3133,12 @@ where
                     observation.push(LifecycleEvent::Http2PingReplyReceived);
                 }
             }
+            CodecEvent::Priority { .. } => {
+                if self.rate_limited(RateLimitKind::ControlFrames) {
+                    self.fail_rate_limit(RateLimitKind::ControlFrames);
+                }
+            }
             CodecEvent::FrameHeader { .. }
-            | CodecEvent::Priority { .. }
             | CodecEvent::PushPriority { .. }
             | CodecEvent::GeneratedFrameHeader { .. }
             | CodecEvent::ChunkHeader { .. }
@@ -3191,6 +3291,7 @@ where
                     direction: HttpExceptionDirection::Ingress,
                     new_stream: false,
                     ingress: false,
+                    header_rate_limit: false,
                 });
                 self.check_cancel();
                 if self.failure.fatal.is_some() {
@@ -3708,6 +3809,54 @@ where
             resume_unwind(panic);
         }
     }
+
+    /// Aborts the stream whose header block breached the header rate limit, without a reset,
+    /// then drains with one final GOAWAY covering it, as Proxygen's `RateLimitFilter` does.
+    #[cold]
+    #[inline(never)]
+    fn header_rate_limit_breached(&mut self, stream: StreamId, error: HttpError) {
+        self.abort_stream_without_wire(stream, error);
+        self.start_final_drain(DrainTrigger::HeaderRateLimit);
+    }
+
+    /// Cancels a live stream's exchange and sources as a local reset does, but writes no
+    /// RST_STREAM.
+    #[cold]
+    fn abort_stream_without_wire(&mut self, id: StreamId, error: HttpError) {
+        let Some(mut stream) = self.streams.remove(&id) else {
+            return;
+        };
+        let aborted = catch_unwind(AssertUnwindSafe(|| {
+            if !stream.reset {
+                let mut connection = self.stream_connection().1;
+                connection.cancel_owner(id, &mut stream, &error, false);
+                connection.fence_reset(id, &mut stream);
+            }
+        }));
+        self.streams.insert(id, stream);
+        if let Err(panic) = aborted {
+            resume_unwind(panic);
+        }
+    }
+
+    /// Drains with one final GOAWAY that carries the last incoming stream, unless the
+    /// connection already drains or failed.
+    #[cold]
+    #[inline(never)]
+    fn start_final_drain(&mut self, trigger: DrainTrigger) {
+        if self.connection.state.draining || self.failure.fatal.is_some() {
+            return;
+        }
+        self.connection.state.draining = true;
+        self.connection.state.ingress_grace = false;
+        self.sent_initial_goaway = true;
+        if let Some(observation) = self.connection.state.observation.as_deref_mut() {
+            observation.drain(trigger);
+        }
+        if let Err(error) = self.generate_goaway(H2ErrorCode::NO_ERROR) {
+            self.abort(error);
+        }
+    }
 }
 
 impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
@@ -3766,21 +3915,30 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
                     push_connection_failure(&mut self.failure.failures, error);
                 }
             }
-            let offset = self
-                .connection
-                .state
-                .summary
-                .bytes_scheduled
-                .saturating_add(self.egress.chain_length() as u64);
-            stream.write_boundary = Some(offset);
-            stream.physically_complete = (self.transport_reset
-                || offset <= self.connection.state.summary.bytes_written)
-                && !self.writes_pending();
-            if !stream.physically_complete {
-                self.connection.state.write_fences.push_back((offset, id));
-            }
-            stream.wake.schedule();
+            self.fence_reset(id, stream);
         }
+    }
+
+    /// Completes a just-reset stream once everything serialized so far is written.
+    fn fence_reset<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        id: StreamId,
+        stream: &mut Stream<E, UPSTREAM>,
+    ) {
+        let offset = self
+            .connection
+            .state
+            .summary
+            .bytes_scheduled
+            .saturating_add(self.egress.chain_length() as u64);
+        stream.write_boundary = Some(offset);
+        stream.physically_complete = (self.transport_reset
+            || offset <= self.connection.state.summary.bytes_written)
+            && !self.writes_pending();
+        if !stream.physically_complete {
+            self.connection.state.write_fences.push_back((offset, id));
+        }
+        stream.wake.schedule();
     }
 }
 
@@ -3873,6 +4031,10 @@ where
 
     #[cold]
     fn handle_failure(&mut self, mut problem: Failure) {
+        if !UPSTREAM && problem.header_rate_limit {
+            self.header_rate_limit_breached(problem.stream, problem.error);
+            return;
+        }
         let owner = self.streams.get(&problem.stream);
         let decision = CodecFailureContext {
             direction: transport_direction::<UPSTREAM>(),

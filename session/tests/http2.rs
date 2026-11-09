@@ -18454,6 +18454,50 @@ pub mod h2 {
         }
     }
 
+    #[test]
+    fn rate_limit_config_is_unbounded_uses_the_effective_limit() {
+        let interval = Duration::from_secs(1);
+        for (maximum, minimum, unbounded) in [
+            (u64::MAX, 0, true),
+            (0, u64::MAX, true),
+            (u64::MAX, u64::MAX, true),
+            (u64::MAX - 1, 0, false),
+            (100, 50, false),
+            (0, 0, false),
+        ] {
+            let limit = RateLimitConfig::new(maximum, interval, minimum);
+            assert_eq!(limit.is_unbounded(), unbounded, "{limit:?}");
+            let limiter = Http2RateLimiter::new(
+                Http2RateLimitConfig {
+                    header_frames: limit,
+                    ..Http2RateLimitConfig::default()
+                },
+                Instant::now(),
+            );
+            assert_eq!(
+                limiter.is_unbounded(RateLimitKind::HeaderFrames),
+                unbounded,
+                "{limit:?}"
+            );
+        }
+        let unlimited = RateLimitConfig::new(u64::MAX, interval, 0);
+        let all = Http2RateLimitConfig {
+            control_frames: unlimited,
+            header_frames: unlimited,
+            resets: unlimited,
+            direct_errors: unlimited,
+        };
+        assert!(all.is_unbounded());
+        assert!(!Http2RateLimitConfig::default().is_unbounded());
+        assert!(
+            !Http2RateLimitConfig {
+                direct_errors: RateLimitConfig::new(100, interval, 50),
+                ..all
+            }
+            .is_unbounded()
+        );
+    }
+
     fn assert_real_reset_rate_limit_cancels_unrelated_active_request() {
         run_on_worker(|context| {
             Box::pin(async move {

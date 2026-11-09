@@ -28,7 +28,6 @@ use roxygen_session::http2::DEFAULT_STREAM_WINDOW;
 use roxygen_session::http2::Http2SessionConfig;
 use roxygen_session::http2::StreamReceiveWindowMode;
 use roxygen_session::http2::rate_limit::Http2RateLimitConfig;
-use roxygen_session::http2::rate_limit::RateLimitConfig;
 use roxygen_session::http2::stats::Http2SessionStats;
 use roxygen_session::owned_h1::OwnedH1Handle;
 use roxygen_session::owned_h2::OwnedH2Handle;
@@ -131,6 +130,9 @@ pub struct ServerSessionConfig {
     /// None preserves the ordinary session construction path.
     pub stats_factory:
         Option<Arc<dyn Fn(&ConnectionInfo) -> Rc<dyn Http2SessionStats> + Send + Sync>>,
+    /// HTTP/2 flood limits for both downstream drivers, using `Http2RateLimitConfig::default()`
+    /// unless overridden. Each category can be disabled with an unbounded threshold.
+    pub http2_rate_limits: Http2RateLimitConfig,
     /// Experimental, default off (`DIV-029`): serves HTTP/1.1 connections on the owned
     /// driver (`roxygen_session::owned_h1`) instead of `UniplexSession`, with no task per
     /// request. HTTP/2 connections are unchanged. The owned mode is untimed: the caller keeps
@@ -144,16 +146,17 @@ pub struct ServerSessionConfig {
     pub owned_http1: bool,
     /// Experimental, default off: serves HTTP/2 connections on the owned driver
     /// (`roxygen_session::owned_h2`) instead of `UniplexSession`, with no task per
-    /// request. HTTP/1.1 connections are unchanged. The owned mode is untimed,
-    /// unbounded-rate and stat-less: `stream_read_timeout`, `connection_idle_timeout`
+    /// request. HTTP/1.1 connections are unchanged. The owned mode is untimed and
+    /// stat-less: `stream_read_timeout`, `connection_idle_timeout`
     /// and `write_timeout` must be zero (which also leaves HTTP/1.1 sessions untimed).
     /// TLS handshakes keep their independent timeout. `stats_factory`
     /// must be `None`. Server construction refuses anything else with the reason, as
     /// `HttpServerError::InvalidConfig` (or, for `serve_transport`,
-    /// `INVALID_STATE_TRANSITION`). A `lifecycle_observer_factory` observer sees the
-    /// connection's lifecycle as under `UniplexSession`, with the differences recorded in
-    /// `DIV-051`: among them, events arrive at the end of each driver poll, and a stream
-    /// detaches when it retires. The driver requires the configured
+    /// `INVALID_STATE_TRANSITION`). It applies `http2_rate_limits`, as the managed driver does.
+    /// A `lifecycle_observer_factory` observer
+    /// sees the connection's lifecycle as under `UniplexSession`, with the differences
+    /// recorded in `DIV-051`: among them, events arrive at the end of each driver poll, and
+    /// a stream detaches when it retires. The driver requires the configured
     /// stream receive window to equal the advertised `INITIAL_WINDOW_SIZE`; the acceptor
     /// aligns the two (see `owned_http2_session_config`).
     pub owned_http2: bool,
@@ -203,6 +206,7 @@ impl Default for ServerSessionConfig {
                 .expect("default byte-stream limits are nonzero"),
             lifecycle_observer_factory: None,
             stats_factory: None,
+            http2_rate_limits: Http2RateLimitConfig::default(),
             owned_http1: false,
             owned_http2: false,
             abort_exchanges_on_eof: false,
@@ -831,19 +835,21 @@ pub(crate) fn http2_session_config(config: &ServerSessionConfig) -> Http2Session
         stream_receive_window,
         stream_receive_window_mode: StreamReceiveWindowMode::PreserveConfigured,
         max_concurrent_outgoing_streams: config.max_concurrent_outgoing_streams,
+        rate_limits: config.http2_rate_limits,
         ..Http2SessionConfig::default()
     }
 }
 
 /// The owned driver's HTTP/2 configuration: the managed session's, with the parts
 /// the driver cannot honor turned off instead of silently kept. It is untimed and
-/// unbounded-rate and records no statistics, so the GOAWAY timeout is zero, every
-/// rate maximum is `u64::MAX` and stats and ping probes are `None`. The driver
+/// records no statistics, so the GOAWAY timeout is zero and stats and ping probes
+/// are `None`. Its flood limits are `http2_rate_limits`, with the same defaults
+/// as the managed driver (`DIV-052`). The driver
 /// also requires its stream receive window to equal the advertised
 /// `INITIAL_WINDOW_SIZE`, so the window follows the advertised setting (the
 /// protocol default when `settings` carries none); where the setting is present,
 /// as the parity server sets it, this is the managed value unchanged.
-fn owned_http2_session_config(config: &ServerSessionConfig) -> Http2SessionConfig {
+pub(crate) fn owned_http2_session_config(config: &ServerSessionConfig) -> Http2SessionConfig {
     let mut http2 = http2_session_config(config);
     let advertised = http2
         .settings
@@ -853,14 +859,7 @@ fn owned_http2_session_config(config: &ServerSessionConfig) -> Http2SessionConfi
         .and_then(|setting| u32::try_from(setting.value).ok())
         .unwrap_or(DEFAULT_STREAM_WINDOW);
     http2.stream_receive_window = advertised;
-    let unbounded = RateLimitConfig::new(u64::MAX, Duration::from_millis(100), 0);
     Http2SessionConfig {
-        rate_limits: Http2RateLimitConfig {
-            control_frames: unbounded,
-            header_frames: unbounded,
-            resets: unbounded,
-            direct_errors: unbounded,
-        },
         stats: None,
         goaway_timeout: Duration::ZERO,
         ping_probes: None,

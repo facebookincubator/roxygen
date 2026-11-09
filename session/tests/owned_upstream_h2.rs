@@ -2261,6 +2261,29 @@ fn large_window_zero_timeout_settings_accept_finite_rates_and_close_with_one_ter
 }
 
 #[test]
+fn owned_upstream_h2_ignores_rate_limits() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (transport, _) = FixtureTransport::new([]);
+            let mut config = options(context, transport);
+            let tight = RateLimitConfig::new(0, Duration::from_secs(60), 0);
+            config.http2.rate_limits = Http2RateLimitConfig {
+                control_frames: tight,
+                header_frames: tight,
+                resets: tight,
+                direct_errors: tight,
+            };
+            let (session, _) = OwnedH2UpstreamSession::new(config)
+                .expect("the upstream driver accepts any rate limits");
+            assert!(
+                !session.limits_rates(),
+                "an upstream session counts nothing, as UniplexSession upstream does"
+            );
+        })
+    });
+}
+
+#[test]
 fn upload_resume_cancellation_prevents_admitting_another_body_read() {
     struct CancelResume {
         ready: LocalSourceFuture<()>,
