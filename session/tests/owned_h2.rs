@@ -23,6 +23,7 @@ use crate::owned_h2::OwnedH2Options;
 use crate::owned_h2::OwnedH2Session;
 use crate::owned_h2::OwnedH2UpstreamSession;
 use crate::owned_h2::stream_seed_order;
+use crate::owned_h2::take_discarded_streams;
 use crate::uniplex::UniplexRunSummary;
 
 #[derive(Clone, Copy)]
@@ -5510,6 +5511,267 @@ fn conflicting_receive_windows_are_refused() {
             }
         })
     });
+}
+
+/// Waits up to `TRANSCRIPT_WAIT` for `condition`; on timeout the caller's assertions report the
+/// difference instead.
+async fn wait_until(condition: impl Fn() -> bool) {
+    let _ = tokio::time::timeout(TRANSCRIPT_WAIT, complete_credit_wait(condition)).await;
+}
+
+/// How the peer finishes the header block of stream 3, which straddles the server's final
+/// GOAWAY.
+#[derive(Clone, Copy, Debug)]
+enum StraddledBlock {
+    /// A POST whose body never ends.
+    OpenPost,
+    /// A POST whose 10-byte body ends.
+    EndedPost,
+    /// A field section the codec rejects as malformed, which the peer then resets.
+    MalformedThenReset,
+}
+
+/// Holds stream 1, a GET, sends the first half of stream 3's header block, drains the session,
+/// and sends the rest of the block once the final GOAWAY is out, so the draining server refuses
+/// stream 3 itself. Returns what the server wrote, its transcript digest, the refused streams it
+/// still remembered after its last parse and the most it remembered at once, and how the run
+/// ended.
+async fn straddled_refusal(
+    context: WorkerContext,
+    block: StraddledBlock,
+) -> (
+    DecodedServerFrames,
+    (usize, u64),
+    (usize, usize),
+    Result<(), HttpErrorCode>,
+) {
+    take_discarded_streams();
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    let mut first = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+    first.extend(transcript_settings(&mut peer));
+    first.extend(eligibility_request(&mut peer, 3));
+    let (stream, headers) = padding_post_headers(&mut peer);
+    let fragment = match block {
+        StraddledBlock::OpenPost | StraddledBlock::EndedPost => {
+            raw_frames(&headers).remove(0).payload
+        }
+        // The last block on the connection, so the fresh encoder cannot desynchronize HPACK.
+        StraddledBlock::MalformedThenReset => HpackEncoder::new(true).encode(&[
+            HpackHeader::new(":method", "POST"),
+            HpackHeader::new(":scheme", "https"),
+            HpackHeader::new(":authority", "example.com"),
+            HpackHeader::new(":path", "/malformed"),
+            HpackHeader::new(":bogus", "x"),
+        ]),
+    };
+    let (head, tail) = fragment.split_at(fragment.len() / 2);
+    first.extend(raw_frame(
+        FrameType::HEADERS,
+        0,
+        u32::try_from(stream.get()).unwrap(),
+        head,
+    ));
+    let mut rest = raw_frame(
+        FrameType::CONTINUATION,
+        END_HEADERS,
+        u32::try_from(stream.get()).unwrap(),
+        tail,
+    );
+    rest.extend(eligibility_frame(
+        &mut peer,
+        match block {
+            StraddledBlock::OpenPost => EgressFrame::Body {
+                stream,
+                body: queue(&[b'p'; 10]),
+                padding: None,
+                end_stream: false,
+            },
+            StraddledBlock::EndedPost => EgressFrame::Body {
+                stream,
+                body: queue(&[b'p'; 10]),
+                padding: None,
+                end_stream: true,
+            },
+            StraddledBlock::MalformedThenReset => EgressFrame::Reset {
+                stream,
+                code: H2ErrorCode::CANCEL,
+            },
+        },
+    ));
+    let send_rest = Arc::new(tokio::sync::Notify::new());
+    let eof = Arc::new(tokio::sync::Notify::new());
+    let (transport, state) = FixtureTransport::new([
+        FixtureRead::Data(first),
+        FixtureRead::WaitData(Arc::clone(&send_rest), rest),
+        FixtureRead::WaitDataEof(Arc::clone(&eof), Vec::new()),
+    ]);
+    let gate = Rc::new(OwnerPollGate::default());
+    let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+    application.owner_poll_gate = Some(Rc::clone(&gate));
+    application.response_date = Some(TRANSCRIPT_DATE);
+    let (session, handle) = OwnedH2Session::new(application, options(context, transport)).unwrap();
+    let written = || decode_server_frames_with_requests(&state.borrow().writes.concat(), 2);
+    let script = async {
+        wait_until(|| gate.polls.get() > 0).await;
+        assert!(handle.initiate_drain().unwrap());
+        wait_until(|| written().goaways.len() == 2).await;
+        send_rest.notify_one();
+        wait_until(|| !written().resets.is_empty()).await;
+        gate.release();
+        wait_until(|| probes.borrow()[0].completed.get() == 1).await;
+        eof.notify_one();
+    };
+    let (run, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(session.run(), script)
+    })
+    .await
+    .expect("the straddled-refusal fixture finishes at EOF");
+    (
+        written(),
+        written_transcript(&state).digest(),
+        take_discarded_streams(),
+        run.map(drop).map_err(|error| error.code()),
+    )
+}
+
+#[test]
+fn refused_stream_is_forgotten_after_its_header_block() {
+    // (how stream 3's block ends, refused streams still remembered after the last parse)
+    let cases = [
+        (StraddledBlock::OpenPost, 0),
+        (StraddledBlock::EndedPost, 0),
+        // The block never completes, so the record stays and the codec error queued behind the
+        // refusal stays ignored instead of resetting stream 3 again. Only a block that straddles
+        // the final GOAWAY reaches this refusal, so a connection keeps at most one such record.
+        (StraddledBlock::MalformedThenReset, 1),
+    ];
+    for (block, remembered) in cases {
+        let (written, transcript, discarded, run) =
+            run_on_worker(move |context| Box::pin(straddled_refusal(context, block)));
+        assert_eq!(
+            written.goaways,
+            [
+                (StreamId::new(0x7fff_ffff), H2ErrorCode::NO_ERROR),
+                (StreamId::new(3), H2ErrorCode::NO_ERROR)
+            ],
+            "{block:?}: the final GOAWAY covers the stream whose block it interrupted"
+        );
+        assert_eq!(
+            written.resets,
+            [(StreamId::new(3), H2ErrorCode::REFUSED_STREAM)],
+            "{block:?}: the draining server refuses stream 3 once"
+        );
+        assert!(written.errors.is_empty(), "{block:?}");
+        assert_eq!(
+            written.header_statuses,
+            [(StreamId::new(1), 200)],
+            "{block:?}"
+        );
+        assert_eq!(run, Ok(()), "{block:?}");
+        assert_eq!(discarded, (remembered, 1), "{block:?}");
+        assert_eq!(
+            transcript,
+            (6, 4_075_595_476_242_011_935),
+            "{block:?}: transcript recorded with the driver that kept every refused stream \
+             until END_STREAM"
+        );
+    }
+}
+
+#[test]
+fn concurrency_refusals_leave_no_stream_record() {
+    const REFUSED: usize = 5_000;
+    const READS: usize = 2;
+    const DATA: usize = 10;
+    let (written, discarded, run) = run_on_worker(|context| {
+        Box::pin(async move {
+            take_discarded_streams();
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut first = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+            first.extend(transcript_settings(&mut peer));
+            first.extend(eligibility_request(&mut peer, 3));
+            // Each read carries 2,500 POSTs without END_STREAM, each with two DATA frames:
+            // 50,000 bytes, within the connection's 65,535-byte window.
+            let refusals: Vec<Vec<u8>> = (0..READS)
+                .map(|_| {
+                    (0..REFUSED / READS)
+                        .flat_map(|_| {
+                            let (stream, mut bytes) = padding_post_headers(&mut peer);
+                            bytes.extend(padding_data(&mut peer, stream, DATA, None));
+                            bytes.extend(padding_data(&mut peer, stream, DATA, None));
+                            bytes
+                        })
+                        .collect()
+                })
+                .collect();
+            let after = eligibility_request(&mut peer, 3);
+            let send_after = Arc::new(tokio::sync::Notify::new());
+            let reads = std::iter::once(FixtureRead::Data(first))
+                .chain(refusals.into_iter().map(FixtureRead::Data))
+                .chain([FixtureRead::WaitDataEof(Arc::clone(&send_after), after)]);
+            let (transport, state) = FixtureTransport::new(reads);
+            let gate = Rc::new(OwnerPollGate::default());
+            let (mut application, probes) = Application::new(vec![Reply::Body(0); 2]);
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            let mut config = options(context, transport);
+            config.http2.settings.push(CodecSetting {
+                identifier: SettingsId::MaxConcurrentStreams.as_u16(),
+                value: 1,
+            });
+            let (session, _handle) = OwnedH2Session::new(application, config).unwrap();
+            let streams = REFUSED + 2;
+            let written =
+                || decode_server_frames_with_requests(&state.borrow().writes.concat(), streams);
+            let script = async {
+                wait_until(|| gate.polls.get() > 0 && written().resets.len() == REFUSED).await;
+                gate.release();
+                wait_until(|| probes.borrow()[0].completed.get() == 1).await;
+                send_after.notify_one();
+            };
+            let (run, ()) = tokio::time::timeout(Duration::from_secs(20), async {
+                tokio::join!(session.run(), script)
+            })
+            .await
+            .expect("the concurrency-refusal fixture finishes at EOF");
+            (
+                written(),
+                take_discarded_streams(),
+                run.map(drop).map_err(|error| error.code()),
+            )
+        })
+    });
+    assert_eq!(
+        written.resets,
+        (0..REFUSED as u64)
+            .map(|index| (StreamId::new(3 + 2 * index), H2ErrorCode::REFUSED_STREAM))
+            .collect::<Vec<_>>(),
+        "every POST beyond the limit is refused once"
+    );
+    assert_eq!(
+        discarded,
+        (0, 0),
+        "the codec refuses streams beyond MAX_CONCURRENT_STREAMS before the driver sees them"
+    );
+    assert_eq!(
+        written
+            .window_updates
+            .iter()
+            .filter(|(stream, _)| stream.is_unspecified())
+            .map(|&(_, amount)| amount as usize)
+            .sum::<usize>(),
+        REFUSED * 2 * DATA,
+        "the refused streams' DATA returns all of its connection credit"
+    );
+    assert_eq!(
+        written.header_statuses,
+        [
+            (StreamId::new(1), 200),
+            (StreamId::new(3 + 2 * REFUSED as u64), 200)
+        ],
+        "the held stream and a later one are served"
+    );
+    assert!(written.errors.is_empty() && written.goaways.is_empty());
+    assert_eq!(run, Ok(()));
 }
 
 #[test]

@@ -876,6 +876,18 @@ pub(crate) fn owner_write_state_reads() -> usize {
     OWNER_WRITE_STATE_READS.with(Cell::get)
 }
 
+#[cfg(test)]
+thread_local! {
+    static DISCARDED_STREAMS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+}
+
+/// The refused streams that a downstream session on this thread still remembered after its last
+/// parse, and the most it remembered at once; resets both.
+#[cfg(test)]
+pub(crate) fn take_discarded_streams() -> (usize, usize) {
+    DISCARDED_STREAMS.with(|streams| streams.replace((0, 0)))
+}
+
 /// A concrete-exchange H2 driver, selected only by experimental opt-in integrations.
 ///
 /// Policy and body futures are children owned directly by each stream. No
@@ -996,6 +1008,8 @@ struct ConnectionState {
     consumed_streams: usize,
     /// Set before the first byte-event registration; until then the observer holds no events.
     byte_events_registered: bool,
+    /// Streams this session refused itself, until their header block completes; a codec
+    /// error for one is ignored, since the refusal already reset it.
     discarded: BTreeMap<StreamId, bool>,
     rejected_credit: usize,
     draining: bool,
@@ -2353,6 +2367,11 @@ where
                     || (self.state.draining && !self.state.ingress_grace)
                 {
                     self.state.discarded.insert(stream, false);
+                    #[cfg(test)]
+                    DISCARDED_STREAMS.with(|streams| {
+                        let (current, peak) = streams.get();
+                        streams.set((current, peak.max(self.state.discarded.len())));
+                    });
                     actions.push(CodecCallbackAction::Generate(OwnedEgressFrame::Reset {
                         stream,
                         code: H2ErrorCode::REFUSED_STREAM,
@@ -2365,7 +2384,10 @@ where
                 stream,
                 mut message,
             } => {
-                if self.state.discarded.contains_key(&stream) {
+                // Once its header block completes, a refused stream is ownerless like any
+                // unknown one: its DATA returns credit, and its trailers, END_STREAM and codec
+                // errors are ignored.
+                if self.state.discarded.remove(&stream).is_some() {
                     return actions.into();
                 }
                 let owner = self.streams.get_mut(&stream);
@@ -2884,6 +2906,11 @@ where
                 }
             }
         }
+        #[cfg(test)]
+        DISCARDED_STREAMS.with(|streams| {
+            let (_, peak) = streams.get();
+            streams.set((self.connection.state.discarded.len(), peak));
+        });
         Ok(consumed != 0 || finishing_eof)
     }
 
