@@ -12,6 +12,7 @@ use std::task::Poll;
 use std::task::Waker;
 use std::thread::ThreadId;
 use std::time::Duration;
+use std::time::Instant;
 
 use bytes::Bytes;
 use roxygen_client::HttpClient;
@@ -45,6 +46,8 @@ use roxygen_runtime::managed::RuntimeOwner;
 use roxygen_runtime::worker::SubmitError;
 use roxygen_runtime::worker::WorkerHandle;
 use roxygen_runtime::worker::WorkerState;
+use roxygen_session::http2::rate_limit::Http2RateLimitConfig;
+use roxygen_session::http2::rate_limit::RateLimitConfig;
 use roxygen_session::session::LifecycleEvent;
 use roxygen_session::session::LifecycleObserver;
 use roxygen_transport::byte_stream::ByteStreamLimits;
@@ -2904,4 +2907,400 @@ fn owned_http2_resets_a_flow_blocked_stream_at_its_write_timeout() {
     .expect("initializer finishes");
     wait(runtime.quiesce(TIMEOUT)).expect("cleanup joins");
     assert_eq!(owner.join().expect("physical join").workers_forced, 0);
+}
+
+/// The client preface and an empty SETTINGS.
+const H2_CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0";
+
+/// The last stream id of a drain's first GOAWAY, 2^31-1.
+const GOAWAY_MAX: u32 = 0x7fff_ffff;
+
+/// A GET for `/` that ends client stream `stream`. Its header block uses only HPACK's static
+/// table, so it leaves the server's dynamic table alone.
+fn raw_h2_get(stream: u32) -> Vec<u8> {
+    let block: &[u8] = b"\x82\x86\x84\x01\x09localhost";
+    let mut frame = vec![0, 0, block.len() as u8, 1, 0x5];
+    frame.extend(stream.to_be_bytes());
+    frame.extend_from_slice(block);
+    frame
+}
+
+/// One frame a server wrote.
+struct RawFrame<'a> {
+    kind: u8,
+    flags: u8,
+    stream: u32,
+    payload: &'a [u8],
+}
+
+/// A raw HTTP/2 client: it writes frames as given and decodes the server's.
+struct RawH2Peer {
+    io: tokio::io::DuplexStream,
+    wire: Vec<u8>,
+    eof: bool,
+}
+
+impl RawH2Peer {
+    fn new(io: tokio::io::DuplexStream) -> Self {
+        Self {
+            io,
+            wire: Vec::new(),
+            eof: false,
+        }
+    }
+
+    async fn write(&mut self, bytes: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        self.io
+            .write_all(bytes)
+            .await
+            .expect("client frames written");
+    }
+
+    /// The complete frames read so far.
+    fn frames(&self) -> Vec<RawFrame<'_>> {
+        let mut frames = Vec::new();
+        let mut wire = self.wire.as_slice();
+        while wire.len() >= 9 {
+            let length =
+                usize::from(wire[0]) << 16 | usize::from(wire[1]) << 8 | usize::from(wire[2]);
+            if wire.len() < 9 + length {
+                break;
+            }
+            frames.push(RawFrame {
+                kind: wire[3],
+                flags: wire[4],
+                stream: u32::from_be_bytes([wire[5], wire[6], wire[7], wire[8]]) & GOAWAY_MAX,
+                payload: &wire[9..9 + length],
+            });
+            wire = &wire[9 + length..];
+        }
+        frames
+    }
+
+    /// Whether the server acknowledged the client's SETTINGS, so it read the preface.
+    fn settings_acknowledged(&self) -> bool {
+        self.frames()
+            .iter()
+            .any(|frame| frame.kind == 4 && frame.flags & 1 == 1)
+    }
+
+    /// Each GOAWAY's last stream id and error code.
+    fn goaways(&self) -> Vec<(u32, u32)> {
+        self.frames()
+            .iter()
+            .filter(|frame| frame.kind == 7)
+            .map(|frame| {
+                let word = |at: usize| {
+                    u32::from_be_bytes(frame.payload[at..at + 4].try_into().expect("4 bytes"))
+                };
+                (word(0) & GOAWAY_MAX, word(4))
+            })
+            .collect()
+    }
+
+    /// The streams the server reset.
+    fn resets(&self) -> Vec<u32> {
+        self.frames()
+            .iter()
+            .filter(|frame| frame.kind == 3)
+            .map(|frame| frame.stream)
+            .collect()
+    }
+
+    /// The DATA `stream` received, and whether its END_STREAM came.
+    fn body(&self, stream: u32) -> (Vec<u8>, bool) {
+        let frames = self.frames();
+        let data = frames
+            .iter()
+            .filter(|frame| frame.kind == 0 && frame.stream == stream);
+        (
+            data.clone()
+                .flat_map(|frame| frame.payload)
+                .copied()
+                .collect(),
+            data.clone().any(|frame| frame.flags & 1 == 1),
+        )
+    }
+
+    /// Reads until `done` holds or the server closes the connection; returns whether `done`
+    /// holds.
+    async fn read_until(&mut self, done: impl Fn(&Self) -> bool) -> bool {
+        use tokio::io::AsyncReadExt;
+        while !done(self) && !self.eof {
+            let mut chunk = [0; 4096];
+            let read = self.io.read(&mut chunk).await.expect("server frames");
+            self.eof = read == 0;
+            self.wire.extend_from_slice(&chunk[..read]);
+        }
+        done(self)
+    }
+
+    /// Reads what the server writes within `period`.
+    async fn read_for(&mut self, period: Duration) {
+        let _ = tokio::time::timeout(period, self.read_until(|_| false)).await;
+    }
+
+    /// Reads until the server closes the connection.
+    async fn read_to_eof(&mut self) {
+        self.read_until(|_| false).await;
+    }
+}
+
+/// Answers each request with `owned-http2` once `release` is notified, after recording that it
+/// was called.
+struct GatedHandler {
+    called: Rc<std::cell::Cell<bool>>,
+    release: Rc<tokio::sync::Notify>,
+}
+
+impl HttpHandler for GatedHandler {
+    fn handle_request(
+        &self,
+        context: HandlerSessionContext,
+        request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        self.called.set(true);
+        let release = Rc::clone(&self.release);
+        let response = FixedHandler.handle_request(context, request);
+        Box::pin(async move {
+            release.notified().await;
+            response.await
+        })
+    }
+}
+
+/// Attaches an owned HTTP/2 session over a raw client and runs it until the server has read the
+/// client's preface.
+async fn raw_owned_h2(
+    context: &roxygen_runtime::worker::WorkerContext,
+    session: crate::acceptor::ServerSessionConfig,
+    handler: roxygen_core::handler::HttpHandlerRef,
+) -> (
+    crate::acceptor::SessionControl,
+    tokio::task::JoinHandle<
+        Result<roxygen_session::uniplex::UniplexRunSummary, roxygen_core::error::HttpError>,
+    >,
+    RawH2Peer,
+) {
+    let (io, peer) = tokio::io::duplex(64 * 1024);
+    let accepted = attach_for_test(context, CodecProtocol::Http2, session, io, handler);
+    assert_eq!(
+        accepted.session.kind(),
+        crate::acceptor::ServerSessionKind::OwnedHttp2
+    );
+    let run = tokio::task::spawn_local(accepted.session.run());
+    let mut peer = RawH2Peer::new(peer);
+    peer.write(H2_CLIENT_PREFACE).await;
+    assert!(
+        peer.read_until(RawH2Peer::settings_acknowledged).await,
+        "the server reads the preface"
+    );
+    (accepted.control, run, peer)
+}
+
+/// `owned_http2` honors `goaway_timeout`, as `UniplexSession` does: a drain sends GOAWAY(2^31-1)
+/// and holds the final GOAWAY for the timeout, so a request that races the drain, here one sent
+/// after the first GOAWAY, is served instead of refused. The final GOAWAY covers it.
+#[test]
+fn owned_http2_drain_serves_a_request_inside_the_goaway_timeout() {
+    const GRACE: Duration = Duration::from_millis(500);
+    on_worker(|context, _runtime| async move {
+        let session = crate::acceptor::ServerSessionConfig {
+            goaway_timeout: GRACE,
+            ..untimed_owned(false, true)
+        };
+        let (control, run, mut peer) = raw_owned_h2(&context, session, Rc::new(FixedHandler)).await;
+        let drained = Instant::now();
+        control.drain();
+        assert!(peer.read_until(|peer| !peer.goaways().is_empty()).await);
+        peer.read_for(Duration::from_millis(50)).await;
+        assert_eq!(
+            peer.goaways(),
+            [(GOAWAY_MAX, 0)],
+            "the final GOAWAY waits for the GOAWAY timeout"
+        );
+        peer.write(&raw_h2_get(1)).await;
+        assert!(
+            peer.read_until(|peer| peer.body(1).1).await,
+            "the racing request is answered"
+        );
+        assert_eq!(peer.body(1), (b"owned-http2".to_vec(), true));
+        assert!(
+            peer.resets().is_empty(),
+            "the racing request is not refused"
+        );
+        assert!(peer.read_until(|peer| peer.goaways().len() == 2).await);
+        assert!(drained.elapsed() >= GRACE, "the final GOAWAY came early");
+        assert_eq!(peer.goaways(), [(GOAWAY_MAX, 0), (1, 0)]);
+        peer.read_to_eof().await;
+        run.await
+            .expect("owned run task joins")
+            .expect("the drain completes the session");
+        assert!(control.is_finished());
+    });
+}
+
+/// A zero `goaway_timeout` keeps the owned mode's drain as it was: both GOAWAYs at once, then
+/// the connection closes. A connection with every timeout zero arms no timer, through its drain
+/// too.
+#[test]
+fn owned_http2_zero_goaway_timeout_sends_both_goaways_at_once() {
+    on_worker(|context, _runtime| async move {
+        let wheel = context
+            .host()
+            .wheel_timer()
+            .expect("a managed worker drives a wheel timer");
+        let before = wheel.stats();
+        let session = crate::acceptor::ServerSessionConfig {
+            goaway_timeout: Duration::ZERO,
+            ..untimed_owned(false, true)
+        };
+        let (control, run, mut peer) = raw_owned_h2(&context, session, Rc::new(FixedHandler)).await;
+        peer.write(&raw_h2_get(1)).await;
+        assert!(peer.read_until(|peer| peer.body(1).1).await);
+        control.drain();
+        peer.read_to_eof().await;
+        assert_eq!(peer.goaways(), [(GOAWAY_MAX, 0), (1, 0)]);
+        run.await
+            .expect("owned run task joins")
+            .expect("the drain completes the session");
+        let after = wheel.stats();
+        assert_eq!(
+            after.scheduled, before.scheduled,
+            "a connection with every timeout zero armed a timer"
+        );
+        assert_eq!(after.live_slots, before.live_slots);
+    });
+}
+
+/// The default `goaway_timeout`, `UniplexSession`'s second, now applies to `owned_http2`. It arms
+/// nothing until a drain, so a connection with every other timeout zero serves requests without
+/// a timer; the drain arms the one GOAWAY slot, and the final GOAWAY follows the default timeout.
+#[test]
+fn owned_http2_default_goaway_timeout_arms_no_timer_until_a_drain() {
+    on_worker(|context, _runtime| async move {
+        let wheel = context
+            .host()
+            .wheel_timer()
+            .expect("a managed worker drives a wheel timer");
+        let session = untimed_owned(false, true);
+        let timeout = session.goaway_timeout;
+        assert_eq!(timeout, Duration::from_secs(1));
+        let before = wheel.stats();
+        let (control, run, mut peer) = raw_owned_h2(&context, session, Rc::new(FixedHandler)).await;
+        for stream in [1, 3] {
+            peer.write(&raw_h2_get(stream)).await;
+            assert!(peer.read_until(|peer| peer.body(stream).1).await);
+        }
+        assert_eq!(
+            wheel.stats().scheduled,
+            before.scheduled,
+            "serving requests armed a timer"
+        );
+        let drained = Instant::now();
+        control.drain();
+        assert!(peer.read_until(|peer| !peer.goaways().is_empty()).await);
+        assert_eq!(
+            wheel.stats().scheduled - before.scheduled,
+            1,
+            "the drain arms the GOAWAY slot"
+        );
+        peer.read_to_eof().await;
+        assert!(drained.elapsed() >= timeout, "the final GOAWAY came early");
+        assert_eq!(peer.goaways(), [(GOAWAY_MAX, 0), (3, 0)]);
+        run.await
+            .expect("owned run task joins")
+            .expect("the drain completes the session");
+    });
+}
+
+/// A stream active when a drain starts outlives both GOAWAYs of a nonzero `goaway_timeout` and
+/// is answered; the connection closes after it.
+#[test]
+fn owned_http2_drain_completes_an_active_stream_after_the_goaway_timeout() {
+    const GRACE: Duration = Duration::from_millis(300);
+    on_worker(|context, _runtime| async move {
+        let called = Rc::new(std::cell::Cell::new(false));
+        let release = Rc::new(tokio::sync::Notify::new());
+        let handler = GatedHandler {
+            called: Rc::clone(&called),
+            release: Rc::clone(&release),
+        };
+        let session = crate::acceptor::ServerSessionConfig {
+            goaway_timeout: GRACE,
+            ..untimed_owned(false, true)
+        };
+        let (control, run, mut peer) = raw_owned_h2(&context, session, Rc::new(handler)).await;
+        peer.write(&raw_h2_get(1)).await;
+        tokio::time::timeout(TIMEOUT, async {
+            while !called.get() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the request reaches its handler");
+        let drained = Instant::now();
+        control.drain();
+        assert!(peer.read_until(|peer| !peer.goaways().is_empty()).await);
+        peer.read_for(Duration::from_millis(50)).await;
+        assert_eq!(
+            peer.goaways(),
+            [(GOAWAY_MAX, 0)],
+            "the final GOAWAY waits for the GOAWAY timeout"
+        );
+        assert!(peer.read_until(|peer| peer.goaways().len() == 2).await);
+        assert!(drained.elapsed() >= GRACE, "the final GOAWAY came early");
+        assert_eq!(peer.goaways(), [(GOAWAY_MAX, 0), (1, 0)]);
+        assert_eq!(
+            peer.body(1),
+            (Vec::new(), false),
+            "the stream is still open"
+        );
+        assert!(!peer.eof);
+        release.notify_one();
+        assert!(
+            peer.read_until(|peer| peer.body(1).1).await,
+            "the active stream is answered"
+        );
+        assert_eq!(peer.body(1), (b"owned-http2".to_vec(), true));
+        assert!(peer.resets().is_empty());
+        peer.read_to_eof().await;
+        run.await
+            .expect("owned run task joins")
+            .expect("the drain completes the session");
+    });
+}
+
+/// A header-rate breach's one final GOAWAY (`DIV-052`) is not held for `goaway_timeout`: the
+/// breach drains at once with no GOAWAY(2^31-1), and the connection closes long before the
+/// timeout.
+#[test]
+fn owned_http2_header_rate_breach_skips_the_goaway_timeout() {
+    on_worker(|context, _runtime| async move {
+        let session = crate::acceptor::ServerSessionConfig {
+            goaway_timeout: Duration::from_secs(60),
+            http2_rate_limits: Http2RateLimitConfig {
+                header_frames: RateLimitConfig::new(1, Duration::from_secs(60), 0),
+                ..Http2RateLimitConfig::default()
+            },
+            ..untimed_owned(false, true)
+        };
+        let (control, run, mut peer) = raw_owned_h2(&context, session, Rc::new(FixedHandler)).await;
+        let requests = [raw_h2_get(1), raw_h2_get(3)].concat();
+        peer.write(&requests).await;
+        tokio::time::timeout(Duration::from_secs(5), peer.read_to_eof())
+            .await
+            .expect("the breach closes the connection without the GOAWAY timeout");
+        assert_eq!(
+            peer.goaways(),
+            [(3, 0)],
+            "one final GOAWAY covers the crossing stream"
+        );
+        assert_eq!(peer.body(1), (b"owned-http2".to_vec(), true));
+        run.await
+            .expect("owned run task joins")
+            .expect("a header breach drains gracefully");
+        assert!(control.is_finished());
+    });
 }

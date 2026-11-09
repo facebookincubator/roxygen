@@ -1616,6 +1616,38 @@ fn http2_rate_limits_match_for_both_drivers() {
 }
 
 #[test]
+fn goaway_timeout_defaults_to_the_managed_sessions_and_reaches_both_drivers() {
+    let default = ServerSessionConfig::default();
+    assert_eq!(
+        default.goaway_timeout,
+        Http2SessionConfig::default().goaway_timeout,
+        "the default is UniplexSession's"
+    );
+    for goaway_timeout in [
+        default.goaway_timeout,
+        Duration::ZERO,
+        Duration::from_millis(250),
+    ] {
+        let config = ServerSessionConfig {
+            goaway_timeout,
+            owned_http2: true,
+            ..ServerSessionConfig::default()
+        };
+        assert_eq!(http2_session_config(&config).goaway_timeout, goaway_timeout);
+        assert_eq!(
+            owned_http2_session_config(&config).goaway_timeout,
+            goaway_timeout,
+            "owned_http2 honors the configured GOAWAY timeout"
+        );
+        assert_eq!(
+            config.check_owned_http2(),
+            Ok(()),
+            "owned_http2 accepts {goaway_timeout:?}"
+        );
+    }
+}
+
+#[test]
 fn tls_accept_success_precedes_connection_rejection() {
     let (options, certificate) = generated_tls();
     let observer = Arc::new(HandshakeObserver::default());
