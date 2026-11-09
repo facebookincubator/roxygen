@@ -17,9 +17,9 @@
 //! It fails with `INVALID_STATE_TRANSITION` for anything else: a nonzero `read_timeout`,
 //! `stream_read_timeout` or `write_timeout` (the driver is untimed; the caller keeps timeout
 //! responsibility), `drain_request_body_on_drop` false, `wait_for_http1_response_on_drain`
-//! true, `maximum_write_size` above `buffer_limit` or too small to carry a chunk's framing
-//! beside one body byte, a transport with byte-event capability, or
-//! a context that is not the cancellation-free owner thread.
+//! or `abort_exchanges_on_eof` true, `maximum_write_size` above `buffer_limit` or too small
+//! to carry a chunk's framing beside one body byte, a transport with byte-event capability,
+//! or a context that is not the cancellation-free owner thread.
 //!
 //! Framing, close and upgrade follow `UniplexSession`'s port of the Proxygen HTTP/1.1 session
 //! ([`Http1UpgradePolicy::Proxygen`]): trailers are carried in both directions, the
@@ -722,6 +722,7 @@ impl<A: OwnedApplication> Driver<A> {
             || !io.write_timeout.is_zero()
             || !io.drain_request_body_on_drop
             || io.wait_for_http1_response_on_drain
+            || io.abort_exchanges_on_eof
             || transport.byte_event_capability(&context)? != ByteEventCapability::Unsupported
         {
             return Err(failure(

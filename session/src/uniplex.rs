@@ -388,6 +388,10 @@ pub struct UniplexConfig {
     /// Keep downstream HTTP/1 admission open during a local drain until the next
     /// response can carry `Connection: close`.
     pub wait_for_http1_response_on_drain: bool,
+    /// Fail a downstream HTTP/1.1 connection, as a reset does, when the peer's EOF
+    /// arrives while a transaction other than an established tunnel is open, reading past
+    /// a request that closes the connection to see it (`DIV-053`).
+    pub abort_exchanges_on_eof: bool,
 }
 
 impl Default for UniplexConfig {
@@ -403,6 +407,7 @@ impl Default for UniplexConfig {
             write_timeout: DEFAULT_IO_TIMEOUT,
             drain_request_body_on_drop: false,
             wait_for_http1_response_on_drain: false,
+            abort_exchanges_on_eof: false,
         }
     }
 }
@@ -1302,10 +1307,14 @@ struct DriverState {
     stream_read_timeout: Duration,
     ingress_buffer_limit: u32,
     wait_for_http1_response_on_drain: bool,
+    abort_exchanges_on_eof: bool,
     flow_control_paused: bool,
     anti_pipeline_paused: bool,
     upgrade_paused: bool,
     close_after_ingress: bool,
+    /// Reads continue past a close-delimited request only to see the peer's EOF
+    /// (`abort_exchanges_on_eof`); what they return is discarded.
+    eof_watch: bool,
     ingress_close_stream: Option<StreamId>,
     close_egress_boundary: Option<StreamId>,
     upgrade_stream_awaiting_detach: Option<StreamId>,
@@ -3876,10 +3885,12 @@ impl UniplexSession {
             stream_read_timeout: config.stream_read_timeout,
             ingress_buffer_limit: config.ingress_buffer_limit,
             wait_for_http1_response_on_drain: config.wait_for_http1_response_on_drain,
+            abort_exchanges_on_eof: config.abort_exchanges_on_eof,
             flow_control_paused: false,
             anti_pipeline_paused: false,
             upgrade_paused: false,
             close_after_ingress: false,
+            eof_watch: false,
             ingress_close_stream: None,
             close_egress_boundary: None,
             upgrade_stream_awaiting_detach: None,
@@ -4793,7 +4804,11 @@ async fn read_loop(
             let mut state = state.borrow_mut();
             state.bytes_read = state.bytes_read.saturating_add(bytes_read as u64);
             let mut data = read.into_data();
-            state.ingress.append(&mut data).err()
+            if state.eof_watch {
+                None
+            } else {
+                state.ingress.append(&mut data).err()
+            }
         };
         if let Some(error) = append_error {
             fail_connection(
@@ -5367,6 +5382,10 @@ fn parse_one_prefix(state: &Rc<RefCell<DriverState>>) -> Result<ParseOutcome, Co
     if state.flow_control_paused || state.anti_pipeline_paused || state.upgrade_paused {
         return Ok(ParseOutcome::Blocked);
     }
+    if state.eof_watch {
+        drop(state.ingress.take());
+        return Ok(ParseOutcome::Blocked);
+    }
     let input = state.ingress.clone_shared();
     let input_len = input.chain_length();
     let (
@@ -5395,6 +5414,8 @@ fn parse_one_prefix(state: &Rc<RefCell<DriverState>>) -> Result<ParseOutcome, Co
             anti_pipeline_paused,
             upgrade_paused,
             close_after_ingress,
+            abort_exchanges_on_eof,
+            eof_watch,
             ingress_close_stream,
             reads_closed,
             stream_byte_event_cancellations,
@@ -5415,6 +5436,8 @@ fn parse_one_prefix(state: &Rc<RefCell<DriverState>>) -> Result<ParseOutcome, Co
             anti_pipeline_paused,
             upgrade_paused,
             close_after_ingress,
+            abort_exchanges_on_eof: *abort_exchanges_on_eof,
+            eof_watch,
             ingress_close_stream,
             reads_closed,
             stream_byte_event_cancellations,
@@ -5552,6 +5575,8 @@ struct SessionCodecCallback<'a> {
     anti_pipeline_paused: &'a mut bool,
     upgrade_paused: &'a mut bool,
     close_after_ingress: &'a mut bool,
+    abort_exchanges_on_eof: bool,
+    eof_watch: &'a mut bool,
     ingress_close_stream: &'a mut Option<StreamId>,
     reads_closed: &'a mut bool,
     stream_byte_event_cancellations: &'a mut Vec<(StreamId, HttpError)>,
@@ -6146,7 +6171,11 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
                 }
                 if self.core.direction().is_downstream() && *self.close_after_ingress {
                     *self.close_after_ingress = false;
-                    *self.reads_closed = true;
+                    if self.abort_exchanges_on_eof {
+                        *self.eof_watch = true;
+                    } else {
+                        *self.reads_closed = true;
+                    }
                     actions.push(roxygen_codec::CodecCallbackAction::SetParserPaused(true));
                 }
                 let discarded = self.stream_is_discarded(stream);
@@ -9658,6 +9687,8 @@ fn handle_eof(
             anti_pipeline_paused,
             upgrade_paused,
             close_after_ingress,
+            abort_exchanges_on_eof,
+            eof_watch,
             ingress_close_stream,
             reads_closed,
             stream_byte_event_cancellations,
@@ -9685,6 +9716,8 @@ fn handle_eof(
             anti_pipeline_paused,
             upgrade_paused,
             close_after_ingress,
+            abort_exchanges_on_eof: *abort_exchanges_on_eof,
+            eof_watch,
             ingress_close_stream,
             reads_closed,
             stream_byte_event_cancellations,
@@ -9732,7 +9765,27 @@ fn handle_eof(
         .iter()
         .filter_map(|(stream, meta)| (!meta.complete && !meta.discard).then_some(*stream))
         .collect();
-    if downstream {
+    // An upgraded tunnel's EOF is a half-close: its egress may still finish.
+    let abort_exchanges = downstream && {
+        let state = state.borrow();
+        let core = state.core();
+        state.abort_exchanges_on_eof
+            && state.codec.protocol() == CodecProtocol::Http11
+            && core.stream_ids().into_iter().any(|stream| {
+                core.stream_if_present(stream)
+                    .is_some_and(|stream| !stream.is_upgraded())
+            })
+    };
+    if abort_exchanges {
+        capture_panic(&mut first_panic, || {
+            fail_connection(
+                state,
+                write_wake,
+                HttpError::with_message(HttpErrorCode::TRANSPORT_EOF, b"transport EOF"),
+                true,
+            );
+        });
+    } else if downstream {
         for stream in incomplete {
             capture_panic(&mut first_panic, || {
                 let mut core = DetachedSessionCore::take(state);

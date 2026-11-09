@@ -145,6 +145,15 @@ pub struct ServerSessionConfig {
     /// receive window to equal the advertised `INITIAL_WINDOW_SIZE`; the acceptor
     /// aligns the two (see `owned_http2_session_config`).
     pub owned_http2: bool,
+    /// Experimental, default off (`DIV-053`): when a downstream HTTP/1.1 peer's EOF arrives
+    /// while a transaction other than an established tunnel is open, fail the connection as a
+    /// reset does, cancelling every handler and discarding unwritten egress. Reads go on past
+    /// a request that closes the connection, discarding what they return, to see its EOF. The
+    /// default ends only incomplete requests and keeps serving one whose request completed, so
+    /// a half-closed client still gets its response. The EOF is seen only while reads run, so
+    /// an ingress pause (flow control, pipelining) defers it. HTTP/2 connections are
+    /// unchanged, and `owned_http1` refuses the option.
+    pub abort_exchanges_on_eof: bool,
     #[cfg(test)]
     pub(crate) accepted_socket_profile: Option<Arc<AcceptedSocketProfile>>,
 }
@@ -183,6 +192,7 @@ impl Default for ServerSessionConfig {
             stats_factory: None,
             owned_http1: false,
             owned_http2: false,
+            abort_exchanges_on_eof: false,
             #[cfg(test)]
             accepted_socket_profile: None,
         }
@@ -200,6 +210,9 @@ impl ServerSessionConfig {
         }
         if self.lifecycle_observer_factory.is_some() {
             return Err("owned_http1 does not support lifecycle_observer_factory");
+        }
+        if self.abort_exchanges_on_eof {
+            return Err("owned_http1 does not support abort_exchanges_on_eof");
         }
         if !self.stream_read_timeout.is_zero() {
             return Err("owned_http1 is untimed: stream_read_timeout must be zero");
@@ -614,6 +627,7 @@ pub(crate) fn attach_session(
         write_timeout: config.session.write_timeout,
         drain_request_body_on_drop: false,
         wait_for_http1_response_on_drain: false,
+        abort_exchanges_on_eof: config.session.abort_exchanges_on_eof,
     };
     if let Some(limits) = transport_limits {
         uniplex.maximum_read_size = uniplex.maximum_read_size.min(limits.maximum_read_size());

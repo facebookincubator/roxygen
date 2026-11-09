@@ -1197,6 +1197,7 @@ impl UpstreamDriver {
             || !io.write_timeout.is_zero()
             || io.drain_request_body_on_drop
             || io.wait_for_http1_response_on_drain
+            || io.abort_exchanges_on_eof
             || transport.byte_event_capability(&context)? != ByteEventCapability::Unsupported
         {
             return Err(failure(

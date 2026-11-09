@@ -1463,6 +1463,8 @@ fn owned_http1_attachment_rejects_unsupported_configuration() {
                 lifecycle.lifecycle_observer_factory = Some(Arc::new(|| {
                     unreachable!("a refused configuration builds no observer")
                 }));
+                let mut abort = untimed();
+                abort.abort_exchanges_on_eof = true;
                 let mut timed = untimed();
                 timed.write_timeout = Duration::from_secs(1);
                 for (session, message) in [
@@ -1470,6 +1472,10 @@ fn owned_http1_attachment_rejects_unsupported_configuration() {
                     (
                         lifecycle,
                         &b"owned_http1 does not support lifecycle_observer_factory"[..],
+                    ),
+                    (
+                        abort,
+                        &b"owned_http1 does not support abort_exchanges_on_eof"[..],
                     ),
                     (
                         timed,

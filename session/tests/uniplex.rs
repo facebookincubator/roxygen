@@ -557,6 +557,20 @@ struct PendingHandler {
     started: Rc<tokio::sync::Notify>,
 }
 
+struct EofProbeHandler {
+    started: Rc<tokio::sync::Notify>,
+    release: Rc<tokio::sync::Notify>,
+    drops: Rc<Cell<usize>>,
+}
+
+struct DropCount(Rc<Cell<usize>>);
+
+impl Drop for DropCount {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
 struct ContinueThenTimeoutHandler;
 
 struct ContinueThenTimeoutResponse {
@@ -637,6 +651,25 @@ impl HttpHandler for PendingHandler {
             request_source.read_header_event().await?;
             started.notify_one();
             std::future::pending().await
+        })
+    }
+}
+
+impl HttpHandler for EofProbeHandler {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        mut request_source: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        let started = Rc::clone(&self.started);
+        let release = Rc::clone(&self.release);
+        let drops = DropCount(Rc::clone(&self.drops));
+        Box::pin(async move {
+            let _drops = drops;
+            request_source.read_header_event().await?;
+            started.notify_one();
+            release.notified().await;
+            Ok(fixed_response(200, 0))
         })
     }
 }
@@ -1582,6 +1615,84 @@ fn downstream(input: Vec<ReadAction>, mode: HandlerMode) -> Outcome {
                 bodies: bodies.get(),
                 error: result.err().map(|error| error.code()),
             }
+        })
+    })
+}
+
+const KEEPALIVE_GET: &[u8] = b"GET / HTTP/1.1\r\nHost: example\r\n\r\n";
+const CLOSE_GET: &[u8] = b"GET / HTTP/1.1\r\nHost: example\r\nConnection: close\r\n\r\n";
+
+/// When the peer's EOF follows a request whose handler parks after the request head.
+#[derive(Clone, Copy)]
+enum PeerEof {
+    WhileParked,
+    AfterResponse,
+    Never,
+}
+
+/// Sends `request`, delivers the peer's EOF at `eof`, and releases the parked handler.
+/// Returns the outcome and how many times the handler future was dropped before release.
+fn peer_eof(
+    request: &'static [u8],
+    eof: PeerEof,
+    abort_exchanges_on_eof: bool,
+) -> (Outcome, usize) {
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let eof_ready = Arc::new(tokio::sync::Notify::new());
+            let mut reads = vec![ReadAction::Data(request.to_vec())];
+            if !matches!(eof, PeerEof::Never) {
+                reads.push(ReadAction::WaitEof(Arc::clone(&eof_ready)));
+            }
+            let (transport, state) = ScriptedTransport::new(reads);
+            let started = Rc::new(tokio::sync::Notify::new());
+            let release = Rc::new(tokio::sync::Notify::new());
+            let drops = Rc::new(Cell::new(0));
+            let handler: HttpHandlerRef = Rc::new(EofProbeHandler {
+                started: Rc::clone(&started),
+                release: Rc::clone(&release),
+                drops: Rc::clone(&drops),
+            });
+            let erased: Rc<dyn UniplexTransport> = transport;
+            let (session, _handle) = UniplexSession::new(
+                context,
+                TransportDirection::Downstream,
+                erased,
+                Some(handler),
+                UniplexConfig {
+                    abort_exchanges_on_eof,
+                    ..UniplexConfig::default()
+                },
+            )
+            .unwrap();
+            let run = tokio::task::spawn_local(session.run());
+            tokio::time::timeout(Duration::from_secs(1), started.notified())
+                .await
+                .expect("handler parked after the request head");
+            // The current-thread runtime runs the session's pending work before each timer
+            // fires: the EOF read, or the response write.
+            if matches!(eof, PeerEof::WhileParked) {
+                eof_ready.notify_one();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let drops_before_release = drops.get();
+            release.notify_one();
+            if matches!(eof, PeerEof::AfterResponse) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                eof_ready.notify_one();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(1), run)
+                .await
+                .expect("session finished")
+                .expect("session task completed");
+            let state = state.borrow();
+            let outcome = Outcome {
+                output: state.writes.concat(),
+                close: state.close,
+                bodies: 0,
+                error: result.err().map(|error| error.code()),
+            };
+            (outcome, drops_before_release)
         })
     })
 }
@@ -5944,6 +6055,59 @@ fn downstream_connect_round_trip() -> Outcome {
     })
 }
 
+/// A CONNECT tunnel, with `abort_exchanges_on_eof`, whose peer sends EOF only after the
+/// `200` head is written.
+fn downstream_connect_eof_after_response() -> Outcome {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut request = b"CONNECT example:443 HTTP/1.1\r\nHost: example:443\r\n\r\n".to_vec();
+            request.extend_from_slice(&[b'x'; 100]);
+            let eof = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = ScriptedTransport::new([
+                ReadAction::Data(request),
+                ReadAction::WaitEof(Arc::clone(&eof)),
+            ]);
+            let bodies = Rc::new(Cell::new(0));
+            let handler: HttpHandlerRef = Rc::new(ConnectHandler {
+                bodies: Rc::clone(&bodies),
+            });
+            let erased: Rc<dyn UniplexTransport> = transport;
+            let (session, _handle) = UniplexSession::new(
+                context,
+                TransportDirection::Downstream,
+                erased,
+                Some(handler),
+                UniplexConfig {
+                    abort_exchanges_on_eof: true,
+                    ..UniplexConfig::default()
+                },
+            )
+            .unwrap();
+            let mut run = session.run();
+            tokio::select! {
+                biased;
+                _ = &mut run => panic!("CONNECT tunnel completed before the peer's EOF"),
+                _ = async {
+                    while !state.borrow().writes.concat().starts_with(b"HTTP/1.1 200") {
+                        tokio::task::yield_now().await;
+                    }
+                } => {},
+            }
+            eof.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(1), run)
+                .await
+                .expect("CONNECT tunnel reached bidirectional EOM");
+            let state = state.borrow();
+            Outcome {
+                output: state.writes.concat(),
+                close: state.close,
+                bodies: bodies.get(),
+                error: result.err().map(|error| error.code()),
+            }
+        })
+    })
+}
+
 fn rejected_upgrade_unpauses_before_close() -> (Outcome, usize, bool) {
     run_on_worker(|context| {
         Box::pin(async move {
@@ -8713,6 +8877,69 @@ mod h1 {
             HandlerMode::Consume(200, 0),
         );
         assert_ok_response(outcome, 200);
+    }
+
+    fn assert_aborted_at_eof((outcome, drops_before_release): (Outcome, usize)) {
+        assert_eq!(drops_before_release, 1, "EOF cancels the parked handler");
+        assert_eq!(outcome.output, Vec::<u8>::new());
+        assert_eq!(outcome.close, CloseKind::Reset);
+        assert_eq!(outcome.error, Some(HttpErrorCode::TRANSPORT_EOF));
+    }
+
+    fn assert_served((outcome, drops_before_release): (Outcome, usize)) {
+        assert_eq!(drops_before_release, 0, "the handler runs until released");
+        assert_ok_response(outcome, 200);
+    }
+
+    #[test]
+    fn downstream_eof_keeps_a_completed_exchange_by_default() {
+        assert_served(peer_eof(KEEPALIVE_GET, PeerEof::WhileParked, false));
+    }
+
+    #[test]
+    fn downstream_eof_aborts_a_completed_exchange_when_enabled() {
+        assert_aborted_at_eof(peer_eof(KEEPALIVE_GET, PeerEof::WhileParked, true));
+    }
+
+    #[test]
+    fn downstream_eof_keeps_a_connection_close_exchange_by_default() {
+        assert_served(peer_eof(CLOSE_GET, PeerEof::WhileParked, false));
+    }
+
+    #[test]
+    fn downstream_eof_aborts_a_connection_close_exchange_when_enabled() {
+        assert_aborted_at_eof(peer_eof(CLOSE_GET, PeerEof::WhileParked, true));
+    }
+
+    #[test]
+    fn downstream_connection_close_exchange_ends_without_eof_when_enabled() {
+        let request = b"GET / HTTP/1.1\r\nHost: example\r\nConnection: close\r\n\r\nGET /after HTTP/1.1\r\nHost: example\r\n\r\n";
+        let (outcome, drops_before_release) = peer_eof(request, PeerEof::Never, true);
+        assert_eq!(drops_before_release, 0);
+        assert_eq!(
+            outcome
+                .output
+                .windows(b"HTTP/1.1".len())
+                .filter(|wire| *wire == b"HTTP/1.1")
+                .count(),
+            1,
+            "the request after `Connection: close` is discarded unparsed"
+        );
+        assert_ok_response(outcome, 200);
+    }
+
+    #[test]
+    fn downstream_eof_after_the_response_closes_gracefully_when_enabled() {
+        assert_served(peer_eof(KEEPALIVE_GET, PeerEof::AfterResponse, true));
+    }
+
+    #[test]
+    fn downstream_eof_keeps_an_established_tunnel_when_enabled() {
+        let outcome = downstream_connect_eof_after_response();
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.bodies, 100);
+        assert!(output_contains(&outcome, b"HTTP/1.1 200"));
+        assert!(outcome.output.ends_with(&[b'y'; 100]));
     }
 
     #[test]

@@ -1702,7 +1702,7 @@ fn cancel_tears_down_cleanly() {
 #[test]
 fn owned_h1_rejects_unsupported_config() {
     type Change = fn(&mut UniplexConfig);
-    let cases: [(&str, Change, ByteEventCapability); 9] = [
+    let cases: [(&str, Change, ByteEventCapability); 10] = [
         (
             "read_timeout",
             |io| io.read_timeout = Duration::from_secs(1),
@@ -1726,6 +1726,11 @@ fn owned_h1_rejects_unsupported_config() {
         (
             "wait_for_http1_response_on_drain",
             |io| io.wait_for_http1_response_on_drain = true,
+            ByteEventCapability::Unsupported,
+        ),
+        (
+            "abort_exchanges_on_eof",
+            |io| io.abort_exchanges_on_eof = true,
             ByteEventCapability::Unsupported,
         ),
         (
