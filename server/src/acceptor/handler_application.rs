@@ -240,6 +240,10 @@ impl OwnedExchange for HandlerExchange {
         Poll::Ready(result)
     }
 
+    fn handler_active(&self) -> bool {
+        matches!(self.state, ExchangeState::Handling(_))
+    }
+
     fn cancel(&mut self, error: &HttpError, _peer_reset: bool) {
         self.retire(Some(error.code()));
     }

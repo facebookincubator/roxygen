@@ -130,6 +130,9 @@ use crate::uniplex::UniplexWriteQueue;
 
 const TURN_BUDGET: usize = 64;
 
+/// The status of the error response that answers a downstream stream read timeout.
+const REQUEST_TIMEOUT: u16 = 408;
+
 /// Inputs selected once, before starting an experimental HTTP/2 connection.
 pub struct OwnedH2Options {
     pub context: WorkerContext,
@@ -356,6 +359,8 @@ struct IngressSignals {
     consumed: Cell<usize>,
     acknowledge: Cell<usize>,
     completed: Cell<Option<Result<(), HttpError>>>,
+    /// The source completed with `READ_TIMEOUT`: a stream read timeout.
+    read_timed_out: Cell<bool>,
     /// Something waits on the source's completion, so it always wakes the owner.
     wake_on_completion: Cell<bool>,
 }
@@ -428,6 +433,11 @@ impl HttpStreamSourceSharedCallback for IngressSignals {
             && self.control.can_fold(0);
         self.source_complete.set(true);
         self.finish_protocol();
+        self.read_timed_out.set(
+            error
+                .as_ref()
+                .is_some_and(|error| error.code() == HttpErrorCode::READ_TIMEOUT),
+        );
         self.completed.set(Some(error.map_or(Ok(()), Err)));
         if fold {
             self.control.early_completed.borrow_mut().push(self.wake.id);
@@ -771,6 +781,8 @@ where
     stalled: bool,
     pending: Option<PendingEgress>,
     response_headers: bool,
+    /// The request body's read timed out while the handler ran: its final head must be a 408.
+    expects_408: bool,
     response_complete: bool,
     write_boundary: Option<u64>,
     physically_complete: bool,
@@ -1396,9 +1408,10 @@ fn owned_receive_window(
 
 impl<A: OwnedApplication> OwnedH2Session<A> {
     /// Creates the experimental opt-in session. It honors `read_timeout`, whose expiry drains
-    /// the connection with grace, `goaway_timeout`, and `write_timeout`, which bounds a stalled
-    /// transport write and the writer's wait for flow-control credit, and refuses a nonzero
-    /// `stream_read_timeout` (`DIV-028`). It limits only the flood categories that
+    /// the connection with grace, `goaway_timeout`, `write_timeout`, which bounds a stalled
+    /// transport write and the writer's wait for flow-control credit, and
+    /// `stream_read_timeout`, which bounds each wait for request body and answers 408 while
+    /// the response head is unsent (`DIV-028`). It limits only the flood categories that
     /// `Http2SessionConfig::rate_limits` bounds (`DIV-052`).
     pub fn new(
         application: A,
@@ -1491,7 +1504,6 @@ where
             || io.maximum_write_size > io.buffer_limit
             || (!UPSTREAM && !io.drain_request_body_on_drop)
             || (UPSTREAM && io.drain_request_body_on_drop)
-            || !io.stream_read_timeout.is_zero()
             || http2.stats.is_some()
             || http2
                 .ping_probes
@@ -2863,6 +2875,7 @@ where
             consumed: Cell::new(0),
             acknowledge: Cell::new(0),
             completed: Cell::new(None),
+            read_timed_out: Cell::new(false),
             wake_on_completion: Cell::new(false),
         });
         let source = HttpIngressBody::new_shared(
@@ -2878,6 +2891,12 @@ where
             )
         })?;
         let producer = source.producer();
+        // Proxygen's `HTTPStreamSource::setReadTimeout` and Uniplex time a request body from the
+        // stream's creation.
+        let stream_read_timeout = self.state.config.stream_read_timeout;
+        if !stream_read_timeout.is_zero() {
+            producer.set_read_timeout(stream_read_timeout);
+        }
         let drain = source.drain_on_drop();
         let ingress = source
             .ingress_completion()
@@ -2914,6 +2933,7 @@ where
                 stalled: false,
                 pending: None,
                 response_headers: false,
+                expects_408: false,
                 response_complete: false,
                 write_boundary: None,
                 physically_complete: false,
@@ -3787,21 +3807,7 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
                 exchange.poll_response_observer(&mut context);
             }
         }
-        // The shared source publishes once, before waking this owner.
-        let completion = if !stream.consumed && stream.signals.source_complete.get() {
-            stream.signals.completed.take()
-        } else {
-            None
-        };
-        if let Some(completion) = completion {
-            stream.consumed = true;
-            self.connection.state.consumed_streams += 1;
-            if !stream.reset
-                && let Err(error) = completion
-            {
-                self.source_failed(id, stream, error);
-            }
-        }
+        self.take_completion(id, stream, None);
         let consumed = stream.signals.consumed.replace(0);
         let acknowledge = stream.signals.acknowledge.replace(0);
         if self.failure.fatal.is_none() {
@@ -3920,7 +3926,16 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
             if !stream.wake.take_headers_ready() {
                 return Ok(());
             }
-            match application.poll_headers(&mut context) {
+            let handler_active = application.handler_active();
+            let polled = application.poll_headers(&mut context);
+            if polled.is_ready()
+                && stream.signals.read_timed_out.get()
+                && !stream.consumed
+                && self.read_timeout_settled(id, stream, handler_active)
+            {
+                return Ok(());
+            }
+            match polled {
                 Poll::Pending => {}
                 Poll::Ready(Err(error)) => return Err(error),
                 Poll::Ready(Ok(headers)) => {
@@ -3930,6 +3945,9 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
                         .headers_poll_ready
                         .store(true, Ordering::Release);
                     stream.pending = Some(PendingEgress::Headers(headers));
+                    if stream.expects_408 && self.replaced_unexpected_head(id, stream) {
+                        return Ok(());
+                    }
                     self.connection
                         .state
                         .scheduler
@@ -3937,10 +3955,18 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
                 }
             }
         } else {
-            match application.poll_body(
+            let polled = application.poll_body(
                 &mut context,
                 self.connection.state.config.buffer_limit.min(64 << 10) as u32,
-            ) {
+            );
+            if polled.is_ready()
+                && stream.signals.read_timed_out.get()
+                && !stream.consumed
+                && self.read_timeout_settled(id, stream, false)
+            {
+                return Ok(());
+            }
+            match polled {
                 Poll::Pending => {}
                 Poll::Ready(Err(error)) => return Err(error),
                 Poll::Ready(Ok(event)) => {
@@ -3978,6 +4004,82 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
         Ok(())
     }
 
+    /// Consumes the source's completion, which the shared source publishes once, before waking
+    /// this owner. Inlined: every owner poll runs it. `handler_active` is whether the handler ran
+    /// when the source completed, if known; otherwise the exchange says whether it runs now.
+    #[inline(always)]
+    fn take_completion<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        id: StreamId,
+        stream: &mut Stream<E, UPSTREAM>,
+        handler_active: Option<bool>,
+    ) {
+        let completion = if !stream.consumed && stream.signals.source_complete.get() {
+            stream.signals.completed.take()
+        } else {
+            None
+        };
+        if let Some(completion) = completion {
+            stream.consumed = true;
+            self.connection.state.consumed_streams += 1;
+            if !stream.reset
+                && let Err(error) = completion
+            {
+                self.source_failed(id, stream, error, handler_active);
+            }
+        }
+    }
+
+    /// Whether a request body read timeout that the application's last poll observed has
+    /// settled the stream. The session core runs the source's completion callback, queued
+    /// inside that read, before the handler's result or the response's failure, so the timeout
+    /// decides the outcome and the poll's result is moot. `handler_active` is whether the
+    /// handler ran before that poll, so when the read timed out.
+    #[cold]
+    #[inline(never)]
+    fn read_timeout_settled<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        id: StreamId,
+        stream: &mut Stream<E, UPSTREAM>,
+        handler_active: bool,
+    ) -> bool {
+        self.take_completion(id, stream, Some(handler_active));
+        stream.reset
+    }
+
+    /// Applies the 408 that a request body read timeout expects of a running handler to its
+    /// pending head (session.rs `ExpectedStatusSource`): a final 408 goes out as answered, and
+    /// any other final head cancels the exchange and becomes a bare 408. Whether it replaced
+    /// the head.
+    #[cold]
+    #[inline(never)]
+    fn replaced_unexpected_head<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        id: StreamId,
+        stream: &mut Stream<E, UPSTREAM>,
+    ) -> bool {
+        let Some(PendingEgress::Headers(headers)) = &mut stream.pending else {
+            unreachable!("a polled head is pending");
+        };
+        if !matches!(headers.is_final(), Ok(true)) {
+            return false;
+        }
+        stream.expects_408 = false;
+        if headers
+            .headers_mut()
+            .status_code()
+            .is_ok_and(|status| status == REQUEST_TIMEOUT)
+        {
+            return false;
+        }
+        let error = failure(
+            HttpErrorCode::CANCEL,
+            b"handler answered a request body read timeout without 408",
+        );
+        self.respond_with_error(id, stream, REQUEST_TIMEOUT, &error);
+        true
+    }
+
     #[cold]
     #[inline(never)]
     fn source_failed<E: ExchangeStorage<UPSTREAM>>(
@@ -3985,6 +4087,7 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
         id: StreamId,
         stream: &mut Stream<E, UPSTREAM>,
         error: HttpError,
+        handler_active: Option<bool>,
     ) {
         if UPSTREAM {
             if !stream.response_complete || !stream.wire_ingress_complete {
@@ -4012,6 +4115,19 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
         } else if error.code() == HttpErrorCode::NO_ERROR {
             if !stream.response_complete {
                 stream.reset_after_response = !stream.wire_ingress_complete;
+            }
+        } else if error.code() == HttpErrorCode::READ_TIMEOUT && !stream.response_headers {
+            // The session core's stream read timeout before the response head: 408, from a
+            // running handler when it answers, otherwise at once.
+            let handler_active = handler_active.unwrap_or_else(|| {
+                stream.application.as_mut().is_some_and(|application| {
+                    <E as ExchangeStorage<UPSTREAM>>::downstream(application).handler_active()
+                })
+            });
+            if handler_active {
+                stream.expects_408 = true;
+            } else {
+                self.respond_with_error(id, stream, REQUEST_TIMEOUT, &error);
             }
         } else if !stream.response_complete || !stream.wire_ingress_complete {
             let code = crate::session::source_complete_reset_code(error.code());
@@ -4089,6 +4205,41 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
                 .cancel_stream_events(self.context, id, error)
         });
         capture(&mut self.failure.panic, || stream.wake.schedule());
+    }
+
+    /// Cancels the owner with `error` and answers with a bodiless `status` that ends the stream,
+    /// the session core's error response.
+    #[cold]
+    fn respond_with_error<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        id: StreamId,
+        stream: &mut Stream<E, UPSTREAM>,
+        status: u16,
+        error: &HttpError,
+    ) {
+        self.cancel_owner(id, stream, error, false);
+        let mut message = HttpMessage::new();
+        message
+            .set_status_code(status)
+            .expect("error response status was validated");
+        message.set_http_version(1, 1);
+        message.set_wants_keepalive(false);
+        message
+            .headers_mut()
+            .set(HttpHeaderCode::ContentLength, b"0");
+        let headers =
+            HttpHeaderEvent::new(message, true).expect("final error response accepts EOM");
+        stream.pending = Some(PendingEgress::Headers(headers));
+        stream.response_complete = false;
+        stream.signals.error_response_pending();
+        stream.reset_after_response = false;
+        stream.wake.schedule();
+        if stream.signals.source_complete.get() {
+            self.connection
+                .state
+                .scheduler
+                .enqueue(id, &mut stream.scheduling);
+        }
     }
 }
 
@@ -4413,34 +4564,12 @@ where
                     {
                         source.initialize_body_only(&mut message, false);
                     }
-                    self.stream_connection().1.cancel_owner(
+                    self.stream_connection().1.respond_with_error(
                         problem.stream,
                         &mut stream,
+                        status,
                         &problem.error,
-                        false,
                     );
-                    let mut message = HttpMessage::new();
-                    message
-                        .set_status_code(status)
-                        .expect("codec error HTTP status was validated");
-                    message.set_http_version(1, 1);
-                    message.set_wants_keepalive(false);
-                    message
-                        .headers_mut()
-                        .set(HttpHeaderCode::ContentLength, b"0");
-                    let headers = HttpHeaderEvent::new(message, true)
-                        .expect("final error response accepts EOM");
-                    stream.pending = Some(PendingEgress::Headers(headers));
-                    stream.response_complete = false;
-                    stream.signals.error_response_pending();
-                    stream.reset_after_response = false;
-                    stream.wake.schedule();
-                    if stream.signals.source_complete.get() {
-                        self.connection
-                            .state
-                            .scheduler
-                            .enqueue(problem.stream, &mut stream.scheduling);
-                    }
                 }));
                 self.streams.insert(problem.stream, stream);
                 if let Err(panic) = response {

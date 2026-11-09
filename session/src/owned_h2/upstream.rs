@@ -1020,9 +1020,9 @@ pub struct OwnedH2UpstreamSession(Driver<UpstreamApplication, true>);
 
 impl OwnedH2UpstreamSession {
     /// Creates the experimental upstream session. It honors `read_timeout`, whose expiry drains
-    /// the connection, and `write_timeout`, which bounds a stalled transport write and an
-    /// upload's wait for flow-control credit, and refuses a nonzero `stream_read_timeout`
-    /// (`DIV-028`).
+    /// the connection, `write_timeout`, which bounds a stalled transport write and an upload's
+    /// wait for flow-control credit, and `stream_read_timeout`, which bounds each wait for
+    /// response data from the request's EOM on (`DIV-028`).
     pub fn new(options: OwnedH2Options) -> Result<(Self, OwnedH2UpstreamHandle), HttpError> {
         let (session, handle) =
             Driver::<UpstreamApplication, true>::new(UpstreamApplication, options)?;
@@ -1179,6 +1179,7 @@ where
             consumed: Cell::new(0),
             acknowledge: Cell::new(0),
             completed: Cell::new(None),
+            read_timed_out: Cell::new(false),
             wake_on_completion: Cell::new(false),
         });
         let source = HttpResponseSource::new_shared(
@@ -1197,7 +1198,11 @@ where
             source.skip_content_length_validation();
         }
         let producer = source.producer();
-        producer.defer_read_timeout(DeferredReadTimeout::DeferUpdates(Duration::ZERO));
+        // Untimed until the request's EOM is serialized, as in Proxygen (HTTPCoroSession.cpp:816)
+        // and Uniplex's H2 deferral.
+        producer.defer_read_timeout(DeferredReadTimeout::DeferUpdates(
+            self.connection.state.config.stream_read_timeout,
+        ));
         let status = Rc::clone(&submission.status);
         status.stream.set(Some(id));
         *status.ingress.borrow_mut() = source.ingress_completion();
@@ -1256,6 +1261,7 @@ where
                 stalled: false,
                 pending: Some(PendingEgress::Headers(headers)),
                 response_headers: false,
+                expects_408: false,
                 response_complete: false,
                 write_boundary: None,
                 physically_complete: false,

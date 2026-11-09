@@ -140,6 +140,21 @@ struct Application {
     drain_request_last: bool,
     /// Drops the request body unread as soon as the request head arrives.
     drop_request_body: bool,
+    /// Awaits the resume of each suspend event while reading the request body, as
+    /// `FixtureHandler` does, instead of reading on at once.
+    await_request_resume: bool,
+    /// Answers with the response head at once and reads the request body before the first
+    /// response body event, instead of before the head.
+    upload_after_head: bool,
+    /// Fails the response head with this code instead of producing it.
+    response_head_error: Option<HttpErrorCode>,
+    /// Answers a request body read timeout with its own 408 head, as the server's handler
+    /// adapter answers a handler's `READ_TIMEOUT` result, instead of failing the head with it.
+    answer_read_timeout: bool,
+    /// When a request body read times out, awaits this cleanup (a sleep, if nonzero), then
+    /// answers with this status and its reply's body, reporting itself a running handler until
+    /// it answers.
+    late_answer: Option<(u16, Duration)>,
     hold_headers: bool,
     empty_terminal: Option<Arc<tokio::sync::Notify>>,
     body_chunk: usize,
@@ -164,6 +179,11 @@ impl Application {
                 retain_request: false,
                 drain_request_last: false,
                 drop_request_body: false,
+                await_request_resume: false,
+                upload_after_head: false,
+                response_head_error: None,
+                answer_read_timeout: false,
+                late_answer: None,
                 hold_headers: false,
                 empty_terminal: None,
                 body_chunk: 4096,
@@ -190,6 +210,14 @@ struct Exchange {
     retain_request: bool,
     drain_request_last: bool,
     drop_request_body: bool,
+    await_request_resume: bool,
+    upload_after_head: bool,
+    response_head_error: Option<HttpErrorCode>,
+    answer_read_timeout: bool,
+    late_answer: Option<(u16, Duration)>,
+    cleanup: Option<Pin<Box<tokio::time::Sleep>>>,
+    late_status: Option<u16>,
+    answered: bool,
     drained_request: Option<HttpSourceHolder>,
     hold_headers: bool,
     body_chunk: usize,
@@ -229,6 +257,14 @@ impl OwnedH2Application for Application {
             retain_request: self.retain_request,
             drain_request_last: self.drain_request_last,
             drop_request_body: self.drop_request_body,
+            await_request_resume: self.await_request_resume,
+            upload_after_head: self.upload_after_head,
+            response_head_error: self.response_head_error,
+            answer_read_timeout: self.answer_read_timeout,
+            late_answer: self.late_answer,
+            cleanup: None,
+            late_status: None,
+            answered: false,
             drained_request: None,
             hold_headers: self.hold_headers,
             body_chunk: self.body_chunk,
@@ -270,6 +306,7 @@ impl OwnedH2Exchange for Exchange {
             *self.probe.held_body.borrow_mut() = Some(body);
         } else {
             let probe = Rc::clone(&self.probe);
+            let await_resume = self.await_request_resume;
             self.upload = Some(Box::pin(async move {
                 loop {
                     let event = body.read_body_event(4096).await?;
@@ -285,6 +322,9 @@ impl OwnedH2Exchange for Exchange {
                     if event.eom() {
                         return Ok(());
                     }
+                    if await_resume && let HttpBodyEventKind::Suspend(resume) = event.into_kind() {
+                        let _ = resume.await;
+                    }
                 }
             }));
         }
@@ -296,6 +336,12 @@ impl OwnedH2Exchange for Exchange {
     ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
         if self.hold_headers {
             return Poll::Pending;
+        }
+        if let Some(code) = self.response_head_error {
+            return Poll::Ready(Err(HttpError::with_message(
+                code,
+                b"scripted response head error",
+            )));
         }
         if let Some((ordinal, gate)) = &self.owner_poll_gate {
             gate.polls.set(gate.polls.get() + 1);
@@ -323,15 +369,46 @@ impl OwnedH2Exchange for Exchange {
                 return Poll::Pending;
             }
         }
-        if let Some(upload) = &mut self.upload {
+        if !self.upload_after_head
+            && let Some(upload) = &mut self.upload
+        {
             match upload.as_mut().poll(context) {
                 Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error))
+                    if self.answer_read_timeout && error.code() == HttpErrorCode::READ_TIMEOUT =>
+                {
+                    self.upload.take();
+                    let mut response = HttpMessage::new();
+                    response.set_status_code(408).unwrap();
+                    response.set_http_version(1, 1);
+                    response.set_wants_keepalive(false);
+                    response
+                        .headers_mut()
+                        .set(HttpHeaderCode::ContentLength, b"0");
+                    return Poll::Ready(Ok(HttpHeaderEvent::new(response, true).unwrap()));
+                }
+                Poll::Ready(Err(error))
+                    if self.late_answer.is_some()
+                        && error.code() == HttpErrorCode::READ_TIMEOUT =>
+                {
+                    let (status, cleanup) = self.late_answer.expect("checked by the guard");
+                    self.upload.take();
+                    self.late_status = Some(status);
+                    if !cleanup.is_zero() {
+                        self.cleanup = Some(Box::pin(tokio::time::sleep(cleanup)));
+                    }
+                }
                 Poll::Ready(result) => {
                     self.upload.take();
                     result?;
                 }
             }
         }
+        if let Some(cleanup) = &mut self.cleanup {
+            std::task::ready!(cleanup.as_mut().poll(context));
+            self.cleanup.take();
+        }
+        let status = self.late_status.unwrap_or(200);
         let panic_at = if let Some((at, ready)) = &mut self.callback_panic {
             if ready.as_mut().poll(context).is_pending() {
                 return Poll::Pending;
@@ -345,7 +422,7 @@ impl OwnedH2Exchange for Exchange {
             panic_any("application header poll");
         }
         let mut response = HttpMessage::new();
-        response.set_status_code(200).unwrap();
+        response.set_status_code(status).unwrap();
         response.set_http_version(1, 1);
         if let Some(priority) = self.response_priority {
             response.set_http_priority(priority);
@@ -370,7 +447,12 @@ impl OwnedH2Exchange for Exchange {
         if matches!(panic_at, Some(CallbackPanicAt::HeaderEncoded)) {
             headers.set_egress_headers_callback(|_| panic_any("application encoded headers"));
         }
+        self.answered = true;
         Poll::Ready(Ok(headers))
+    }
+
+    fn handler_active(&self) -> bool {
+        self.late_answer.is_some() && !self.answered
     }
 
     fn poll_body(
@@ -379,6 +461,17 @@ impl OwnedH2Exchange for Exchange {
         maximum: u32,
     ) -> Poll<Result<HttpBodyEvent, HttpError>> {
         self.probe.body_polls.set(self.probe.body_polls.get() + 1);
+        if self.upload_after_head
+            && let Some(upload) = &mut self.upload
+        {
+            match upload.as_mut().poll(context) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => {
+                    self.upload.take();
+                    result?;
+                }
+            }
+        }
         if let Some((_, gate)) = &self.owner_poll_gate
             && let Some(ready) = gate.control_read.borrow_mut().take()
         {
@@ -14678,6 +14771,846 @@ fn zero_write_timeout_blocked_stream_takes_no_slot_sleep_or_clock_read() {
             assert_eq!(
                 host.now_reads() - reads_before,
                 ZERO_CONFIG_BLOCKED_NOW_READS
+            );
+            assert_eq!(host.sleeps(), 0, "a zero-config session made a host sleep");
+            if wheel {
+                let stats = host.wheel_stats();
+                assert_eq!(stats.scheduled, 0);
+                assert_eq!(stats.live_slots, 0);
+            }
+            assert!(probes.borrow()[0].cancelled.borrow().is_empty());
+        })
+    });
+}
+
+/// The stream read timeout of the stream-read-timeout tests.
+const STREAM_READ: Duration = Duration::from_secs(1);
+
+/// The cleanup a handler awaits after its request body read times out, before it answers.
+const CLEANUP: Duration = Duration::from_millis(30);
+
+/// How the request body that stalls is consumed.
+#[derive(Clone, Copy, Debug)]
+enum Stall {
+    /// The application reads the request body before answering.
+    Handler,
+    /// The application holds the request body, which the test reads outside the session's poll,
+    /// and never produces its response head.
+    HeldHeadUnsent,
+    /// The application holds the request body, which the test reads outside the session's poll,
+    /// and answers a header-only 200 at once.
+    HeldHeadSent,
+    /// The application answers with its head at once and reads the request body before its
+    /// one-byte response body.
+    BodyAfterHead,
+    /// No request body stalls: the application's response head fails with `READ_TIMEOUT`, as a
+    /// response source whose head read times out does on `UniplexSession`.
+    HeadError,
+    /// As `Handler`, but the owned application answers the read timeout with its own 408 head,
+    /// in the poll that observed it, as the server's handler adapter does.
+    AnsweredHandler,
+    /// The handler reads the request body; when a read times out it awaits this cleanup (a
+    /// sleep, if nonzero), then answers this status with a 4-byte body.
+    CleanupThenAnswer(u16, Duration),
+}
+
+/// Reads the request body as `FixtureHandler`; when a read times out, awaits `cleanup` (a sleep,
+/// if nonzero) and answers `status` with the body `rrrr`.
+struct CleanupThenAnswerHandler {
+    status: u16,
+    cleanup: Duration,
+}
+
+impl HttpHandler for CleanupThenAnswerHandler {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        mut request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        let (status, cleanup) = (self.status, self.cleanup);
+        Box::pin(async move {
+            request.read_header_event().await?;
+            loop {
+                match request.read_body_event(u32::MAX).await {
+                    Ok(event) if event.eom() => break,
+                    Ok(event) => {
+                        if let HttpBodyEventKind::Suspend(resume) = event.into_kind() {
+                            let _ = resume.await;
+                        }
+                    }
+                    Err(error) if error.code() == HttpErrorCode::READ_TIMEOUT => {
+                        if !cleanup.is_zero() {
+                            tokio::time::sleep(cleanup).await;
+                        }
+                        let response =
+                            HttpFixedSource::make_fixed_response(status, Some(queue(b"rrrr")))
+                                .expect("fixture response");
+                        return Ok(HttpSourceHolder::new(Box::new(response)));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            panic!("the request body stalls");
+        })
+    }
+}
+
+/// What a downstream driver wrote for one request whose body stalls.
+#[derive(Debug)]
+struct StreamReadWire {
+    /// `(milliseconds since start, stream, status)` of each response head, sampled every
+    /// millisecond of paused time.
+    statuses: Vec<(u64, StreamId, u16)>,
+    resets: Vec<(u64, StreamId, H2ErrorCode)>,
+    goaways: Vec<(u64, StreamId, H2ErrorCode)>,
+    /// Everything written, with any date normalized.
+    written: (usize, u64),
+    /// How the test's read of a held request body ended, and when.
+    held_read: Option<(u64, HttpErrorCode, Vec<u8>)>,
+    result: Result<(), HttpErrorCode>,
+}
+
+/// A response whose head never arrives, so a handler that returned it is inactive while the
+/// response head is still unsent.
+struct UnsentHead;
+
+impl HttpSource for UnsentHead {
+    fn read_header_event(&mut self) -> LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn read_body_event(
+        &mut self,
+        _maximum: u32,
+    ) -> LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {}
+}
+
+/// Holds the request and answers with `head_sent`'s response: a header-only 200 with
+/// `Content-Length: 0`, as the fixture application's, or `UnsentHead`.
+struct HoldingHandler {
+    held: Rc<RefCell<Option<HttpSourceHolder>>>,
+    head_sent: bool,
+}
+
+impl HttpHandler for HoldingHandler {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        mut request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        let held = Rc::clone(&self.held);
+        let head_sent = self.head_sent;
+        Box::pin(async move {
+            request.read_header_event().await?;
+            held.replace(Some(request));
+            let response: Box<dyn HttpSource> = if head_sent {
+                Box::new(
+                    HttpFixedSource::make_fixed_response(200, Some(queue(&[]))).expect("fixed 200"),
+                )
+            } else {
+                Box::new(UnsentHead)
+            };
+            Ok(HttpSourceHolder::new(response))
+        })
+    }
+}
+
+/// Answers a 200 with `Content-Length: 1` at once and reads the request body, awaiting each
+/// suspend's resume, before its one body byte.
+struct BodyAfterHeadHandler;
+
+struct BodyAfterHeadSource(Rc<RefCell<HttpSourceHolder>>);
+
+impl HttpHandler for BodyAfterHeadHandler {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        mut request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        Box::pin(async move {
+            request.read_header_event().await?;
+            Ok(HttpSourceHolder::new(Box::new(BodyAfterHeadSource(
+                Rc::new(RefCell::new(request)),
+            ))))
+        })
+    }
+}
+
+impl HttpSource for BodyAfterHeadSource {
+    fn read_header_event(&mut self) -> LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
+        let mut response = HttpMessage::new();
+        response.set_status_code(200).unwrap();
+        response.set_http_version(1, 1);
+        response
+            .headers_mut()
+            .set(HttpHeaderCode::ContentLength, b"1");
+        Box::pin(std::future::ready(Ok(HttpHeaderEvent::new(
+            response, false,
+        )
+        .unwrap())))
+    }
+
+    fn read_body_event(
+        &mut self,
+        _maximum: u32,
+    ) -> LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
+        let request = Rc::clone(&self.0);
+        Box::pin(async move {
+            loop {
+                let read = request.borrow_mut().read_body_event(u32::MAX);
+                let event = read.await?;
+                if event.eom() {
+                    return Ok(HttpBodyEvent::body(queue(b"r"), true));
+                }
+                if let HttpBodyEventKind::Suspend(resume) = event.into_kind() {
+                    let _ = resume.await;
+                }
+            }
+        })
+    }
+
+    fn stop_reading(&mut self, error: Option<HttpErrorCode>) {
+        self.0.borrow_mut().stop_reading(error);
+    }
+}
+
+/// Reads a held request body until it fails, awaiting each suspend's resume, and returns the
+/// failure and the millisecond it came.
+async fn read_held_body(
+    held: impl Fn() -> Option<HttpSourceHolder>,
+    begun: tokio::time::Instant,
+) -> (u64, HttpErrorCode, Vec<u8>) {
+    let mut body = loop {
+        if let Some(body) = held() {
+            break body;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    loop {
+        match body.read_body_event(u32::MAX).await {
+            Ok(event) => {
+                assert!(!event.eom(), "the stalled request body never ends");
+                if let HttpBodyEventKind::Suspend(resume) = event.into_kind() {
+                    let _ = resume.await;
+                }
+            }
+            Err(error) => {
+                return (
+                    begun.elapsed().as_millis() as u64,
+                    error.code(),
+                    error.message().to_vec(),
+                );
+            }
+        }
+    }
+}
+
+/// Serves `input` on the owned driver (the fixture application) or on `UniplexSession` (a
+/// handler that does the same), both with `STREAM_READ` as the stream read timeout and every
+/// other timeout zero; `stall` says how the request body is consumed. The application drains
+/// the connection at `drain_at` if it is still open.
+async fn stream_read_wire(
+    context: WorkerContext,
+    owned: bool,
+    stall: Stall,
+    input: Vec<u8>,
+    drain_at: Duration,
+) -> StreamReadWire {
+    let (inner, state) = FixtureTransport::new([]);
+    let transport = Rc::new(GatedReads {
+        inner,
+        script: Rc::new(RefCell::new(VecDeque::from([(None, input)]))),
+    });
+    let mut config = options(context, transport);
+    config.io.stream_read_timeout = STREAM_READ;
+    let begun = tokio::time::Instant::now();
+    let done = Rc::new(Cell::new(false));
+    let held_by_test = matches!(stall, Stall::HeldHeadUnsent | Stall::HeldHeadSent);
+    type Run = Pin<Box<dyn Future<Output = Result<UniplexRunSummary, HttpError>>>>;
+    type Held = Box<dyn Fn() -> Option<HttpSourceHolder>>;
+    let (session, drain, held): (Run, Box<dyn Fn()>, Held) = if owned {
+        let reply = match stall {
+            Stall::BodyAfterHead => Reply::Body(1),
+            Stall::CleanupThenAnswer(..) => Reply::Body(4),
+            _ => Reply::Body(0),
+        };
+        let (mut application, probes) = Application::new(vec![reply]);
+        application.await_request_resume = true;
+        application.retain_request = held_by_test;
+        application.hold_headers = matches!(stall, Stall::HeldHeadUnsent);
+        application.upload_after_head = matches!(stall, Stall::BodyAfterHead);
+        if matches!(stall, Stall::HeadError) {
+            application.response_head_error = Some(HttpErrorCode::READ_TIMEOUT);
+        }
+        application.answer_read_timeout = matches!(stall, Stall::AnsweredHandler);
+        if let Stall::CleanupThenAnswer(status, cleanup) = stall {
+            application.late_answer = Some((status, cleanup));
+        }
+        let (session, handle) =
+            OwnedH2Session::new(application, config).expect("stream-read-timed owned H2");
+        (
+            Box::pin(session.run()),
+            Box::new(move || assert!(handle.initiate_drain().unwrap())),
+            Box::new(move || {
+                let probe = probes.borrow().first().cloned()?;
+                probe.held_body.borrow_mut().take()
+            }),
+        )
+    } else {
+        let held = Rc::new(RefCell::new(None));
+        let handler: Rc<dyn HttpHandler> = match stall {
+            Stall::Handler | Stall::AnsweredHandler => Rc::new(FixtureHandler {
+                status: 200,
+                response_body: 0,
+                response_error: None,
+                invocations: Rc::new(Cell::new(0)),
+                request_body: Rc::new(Cell::new(0)),
+            }),
+            Stall::HeldHeadUnsent | Stall::HeldHeadSent => Rc::new(HoldingHandler {
+                held: Rc::clone(&held),
+                head_sent: matches!(stall, Stall::HeldHeadSent),
+            }),
+            Stall::BodyAfterHead => Rc::new(BodyAfterHeadHandler),
+            Stall::CleanupThenAnswer(status, cleanup) => {
+                Rc::new(CleanupThenAnswerHandler { status, cleanup })
+            }
+            Stall::HeadError => Rc::new(FixtureHandler {
+                status: 200,
+                response_body: 0,
+                response_error: Some(HttpErrorCode::READ_TIMEOUT),
+                invocations: Rc::new(Cell::new(0)),
+                request_body: Rc::new(Cell::new(0)),
+            }),
+        };
+        let OwnedH2Options {
+            context,
+            transport,
+            io,
+            http2,
+        } = config;
+        let (session, handle) = UniplexSession::new_http2(
+            context,
+            TransportDirection::Downstream,
+            transport,
+            Some(handler),
+            io,
+            http2,
+        )
+        .expect("Uniplex H2");
+        (
+            Box::pin(session.run()),
+            Box::new(move || assert!(handle.initiate_drain().unwrap())),
+            Box::new(move || held.borrow_mut().take()),
+        )
+    };
+    let monitor = async {
+        let (mut statuses, mut resets, mut goaways) = (Vec::new(), Vec::new(), Vec::new());
+        let mut drained = false;
+        loop {
+            let at = begun.elapsed();
+            if !drained && !done.get() && at >= drain_at {
+                drained = true;
+                drain();
+            }
+            let ms = at.as_millis() as u64;
+            let frames = written_frames(&state, 1);
+            statuses.extend(
+                frames.header_statuses[statuses.len()..]
+                    .iter()
+                    .map(|(stream, status)| (ms, *stream, *status)),
+            );
+            resets.extend(
+                frames.resets[resets.len()..]
+                    .iter()
+                    .map(|(stream, code)| (ms, *stream, *code)),
+            );
+            goaways.extend(
+                frames.goaways[goaways.len()..]
+                    .iter()
+                    .map(|(stream, code)| (ms, *stream, *code)),
+            );
+            if done.get() {
+                return (statuses, resets, goaways);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    let run = async {
+        let result = session.await;
+        done.set(true);
+        result
+    };
+    let reader = async {
+        if held_by_test {
+            Some(read_held_body(held, begun).await)
+        } else {
+            None
+        }
+    };
+    let (result, (statuses, resets, goaways), held_read) =
+        tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::join!(run, monitor, reader)
+        })
+        .await
+        .expect("the stalled request's session ends");
+    let written = dateless_digest(&state.borrow().writes.concat());
+    StreamReadWire {
+        statuses,
+        resets,
+        goaways,
+        written,
+        held_read,
+        result: result.map(|_| ()).map_err(|error| error.code()),
+    }
+}
+
+/// Runs `stall` on `UniplexSession`, then on the owned driver, on one paused clock, over a POST
+/// whose 5 body bytes arrive without END_STREAM (or a GET, for `Stall::HeadError`).
+fn stream_read_wires(stall: Stall) -> (StreamReadWire, StreamReadWire) {
+    let input = move || match stall {
+        Stall::HeadError => ready_owner_requests(1).1,
+        _ => peer_incomplete_post_bytes(5),
+    };
+    run_on_paused_worker(move |context| {
+        Box::pin(async move {
+            let drain_at = 3 * STREAM_READ;
+            let uniplex = stream_read_wire(context.clone(), false, stall, input(), drain_at).await;
+            let owned = stream_read_wire(context, true, stall, input(), drain_at).await;
+            (owned, uniplex)
+        })
+    })
+}
+
+/// Asserts the reader's read timed out within a millisecond of `at`.
+fn assert_held_read_timed_out(wire: &StreamReadWire, at: Duration) {
+    let Some((read_at, code, message)) = &wire.held_read else {
+        panic!("the held body was not read: {wire:?}");
+    };
+    assert_eq!(*code, HttpErrorCode::READ_TIMEOUT, "{wire:?}");
+    assert_eq!(message.as_slice(), b"Read timeout after 1000", "{wire:?}");
+    assert!(read_at.abs_diff(at.as_millis() as u64) <= 1, "{wire:?}");
+}
+
+/// Asserts the same response heads, resets and GOAWAYs at the same instants, the same bytes and
+/// the same result.
+fn assert_same_stream_read_wire(owned: &StreamReadWire, uniplex: &StreamReadWire) {
+    let heads = |wire: &StreamReadWire| -> Vec<(StreamId, u16)> {
+        wire.statuses
+            .iter()
+            .map(|(_, stream, status)| (*stream, *status))
+            .collect()
+    };
+    assert_eq!(
+        heads(owned),
+        heads(uniplex),
+        "owned {owned:?}, uniplex {uniplex:?}"
+    );
+    for ((owned_at, ..), (uniplex_at, ..)) in owned.statuses.iter().zip(&uniplex.statuses) {
+        assert!(
+            owned_at.abs_diff(*uniplex_at) <= 1,
+            "owned {owned:?}, uniplex {uniplex:?}"
+        );
+    }
+    assert_same_timeline(&owned.resets, &uniplex.resets);
+    assert_same_timeline(&owned.goaways, &uniplex.goaways);
+    assert_eq!(
+        owned.written, uniplex.written,
+        "owned {owned:?}, uniplex {uniplex:?}"
+    );
+    assert_eq!(owned.result, uniplex.result);
+}
+
+/// A handler blocked on the request body is answered 408 at the stream read timeout, owned
+/// against `UniplexSession` on the same paused clock: the same frames at the same instants and
+/// the same bytes, then the same drain. Both handlers read the 5 buffered bytes, then await the
+/// source's suspend event, whose wait times out first (the handler reads on), then the next read
+/// times out: 408 at twice the stream read timeout.
+#[test]
+fn stalled_request_body_gets_408_like_uniplex() {
+    let (owned, uniplex) = stream_read_wires(Stall::Handler);
+    let stream_read = STREAM_READ.as_millis() as u64;
+    assert_eq!(
+        uniplex
+            .statuses
+            .iter()
+            .map(|(_, stream, status)| (*stream, *status))
+            .collect::<Vec<_>>(),
+        [(StreamId::new(1), 408)],
+        "uniplex {uniplex:?}"
+    );
+    assert!(
+        uniplex.statuses[0].0.abs_diff(2 * stream_read) <= 1,
+        "uniplex {uniplex:?}"
+    );
+    assert!(uniplex.resets.is_empty(), "uniplex {uniplex:?}");
+    assert_same_stream_read_wire(&owned, &uniplex);
+}
+
+/// A held request body whose read times out outside the application's poll, while the response
+/// head is unsent, is answered 408 as `UniplexSession` answers it when its handler has returned
+/// a response that has not produced its head: the same frames and bytes, and the reader gets
+/// the same read timeout.
+#[test]
+fn held_request_body_timeout_before_the_head_gets_408_like_uniplex() {
+    let (owned, uniplex) = stream_read_wires(Stall::HeldHeadUnsent);
+    assert_held_read_timed_out(&uniplex, 2 * STREAM_READ);
+    assert_held_read_timed_out(&owned, 2 * STREAM_READ);
+    assert_eq!(
+        uniplex
+            .statuses
+            .iter()
+            .map(|(_, stream, status)| (*stream, *status))
+            .collect::<Vec<_>>(),
+        [(StreamId::new(1), 408)],
+        "uniplex {uniplex:?}"
+    );
+    assert!(uniplex.resets.is_empty(), "uniplex {uniplex:?}");
+    assert_same_stream_read_wire(&owned, &uniplex);
+}
+
+/// A held request body whose read times out after the response went out resets the stream as
+/// `UniplexSession` does.
+#[test]
+fn held_request_body_timeout_after_the_head_resets_like_uniplex() {
+    let (owned, uniplex) = stream_read_wires(Stall::HeldHeadSent);
+    assert_held_read_timed_out(&uniplex, 2 * STREAM_READ);
+    assert_held_read_timed_out(&owned, 2 * STREAM_READ);
+    assert_eq!(
+        uniplex
+            .resets
+            .iter()
+            .map(|(_, stream, code)| (*stream, *code))
+            .collect::<Vec<_>>(),
+        [(StreamId::new(1), H2ErrorCode::CANCEL)],
+        "uniplex {uniplex:?}"
+    );
+    assert_same_stream_read_wire(&owned, &uniplex);
+}
+
+/// A response body that waits on a request body whose read times out after the response head
+/// went out resets the stream with CANCEL, as on `UniplexSession`: the request body's failure,
+/// published while the response body was polled, is handled before the poll's result (Uniplex
+/// runs the source's completion callback before the egress producer's failure).
+#[test]
+fn request_body_timeout_after_a_sent_head_resets_like_uniplex() {
+    let (owned, uniplex) = stream_read_wires(Stall::BodyAfterHead);
+    assert_eq!(
+        uniplex
+            .resets
+            .iter()
+            .map(|(_, stream, code)| (*stream, *code))
+            .collect::<Vec<_>>(),
+        [(StreamId::new(1), H2ErrorCode::CANCEL)],
+        "uniplex {uniplex:?}"
+    );
+    assert_same_stream_read_wire(&owned, &uniplex);
+}
+
+/// A `READ_TIMEOUT` response head that no request body read caused resets the stream with
+/// INTERNAL_ERROR, as `UniplexSession` resets a stream whose response source fails its head read
+/// with it: only the request body's read timeout is answered 408.
+#[test]
+fn response_head_read_timeout_resets_like_uniplex() {
+    let (owned, uniplex) = stream_read_wires(Stall::HeadError);
+    assert_eq!(
+        uniplex
+            .resets
+            .iter()
+            .map(|(_, stream, code)| (*stream, *code))
+            .collect::<Vec<_>>(),
+        [(StreamId::new(1), H2ErrorCode::INTERNAL_ERROR)],
+        "uniplex {uniplex:?}"
+    );
+    assert!(uniplex.statuses.is_empty(), "uniplex {uniplex:?}");
+    assert_same_stream_read_wire(&owned, &uniplex);
+}
+
+/// An application that answers the request body's read timeout with its own 408 head in the
+/// poll that observed it, as the server's handler adapter does, gets the same wire as
+/// `UniplexSession`: one 408 and no RST_STREAM after it. The read timeout is handled before the
+/// polled head, as the session core handles the source's completion before the handler result.
+#[test]
+fn application_408_for_a_stalled_request_body_matches_uniplex() {
+    let (owned, uniplex) = stream_read_wires(Stall::AnsweredHandler);
+    assert!(uniplex.resets.is_empty(), "uniplex {uniplex:?}");
+    assert_same_stream_read_wire(&owned, &uniplex);
+}
+
+/// A running handler whose request body read times out keeps running: its own 408, answered
+/// after a cleanup, goes out with its body, as `UniplexSession` waits for an active handler and
+/// keeps a 408 it answers.
+#[test]
+fn running_handlers_own_408_after_a_read_timeout_is_kept_like_uniplex() {
+    let (owned, uniplex) = stream_read_wires(Stall::CleanupThenAnswer(408, CLEANUP));
+    let answered = (2 * STREAM_READ + CLEANUP).as_millis() as u64;
+    assert_eq!(
+        uniplex
+            .statuses
+            .iter()
+            .map(|(_, stream, status)| (*stream, *status))
+            .collect::<Vec<_>>(),
+        [(StreamId::new(1), 408)],
+        "uniplex {uniplex:?}"
+    );
+    assert!(
+        uniplex.statuses[0].0.abs_diff(answered) <= 1,
+        "the handler's 408 follows its cleanup: uniplex {uniplex:?}"
+    );
+    assert!(uniplex.resets.is_empty(), "uniplex {uniplex:?}");
+    assert_same_stream_read_wire(&owned, &uniplex);
+}
+
+/// A running handler that answers its request body's read timeout with its own 408 in the poll
+/// that observed it keeps that 408 and its body, as `UniplexSession` handles the source's
+/// completion while the handler is still active, before the handler's result: the driver asks
+/// whether the handler ran before that poll, not after it.
+#[test]
+fn running_handlers_own_408_in_the_timed_out_poll_is_kept_like_uniplex() {
+    let (owned, uniplex) = stream_read_wires(Stall::CleanupThenAnswer(408, Duration::ZERO));
+    assert_eq!(
+        uniplex
+            .statuses
+            .iter()
+            .map(|(_, stream, status)| (*stream, *status))
+            .collect::<Vec<_>>(),
+        [(StreamId::new(1), 408)],
+        "uniplex {uniplex:?}"
+    );
+    assert!(uniplex.resets.is_empty(), "uniplex {uniplex:?}");
+    assert_same_stream_read_wire(&owned, &uniplex);
+}
+
+/// A running handler whose request body read times out and then answers anything but 408 has
+/// that answer replaced with a bare 408 when it answers, as `UniplexSession` replaces an active
+/// handler's response that is not the expected 408.
+#[test]
+fn running_handlers_non_408_after_a_read_timeout_becomes_408_like_uniplex() {
+    let (owned, uniplex) = stream_read_wires(Stall::CleanupThenAnswer(200, CLEANUP));
+    let answered = (2 * STREAM_READ + CLEANUP).as_millis() as u64;
+    assert_eq!(
+        uniplex
+            .statuses
+            .iter()
+            .map(|(_, stream, status)| (*stream, *status))
+            .collect::<Vec<_>>(),
+        [(StreamId::new(1), 408)],
+        "uniplex {uniplex:?}"
+    );
+    assert!(
+        uniplex.statuses[0].0.abs_diff(answered) <= 1,
+        "the replacement waits for the handler: uniplex {uniplex:?}"
+    );
+    assert!(uniplex.resets.is_empty(), "uniplex {uniplex:?}");
+    assert_same_stream_read_wire(&owned, &uniplex);
+}
+
+/// A downstream session over `reads`, answering with `replies`, with the given stream read
+/// timeout and every other timeout zero.
+fn stream_read_timed_session(
+    context: WorkerContext,
+    reads: impl IntoIterator<Item = FixtureRead>,
+    replies: Vec<Reply>,
+    stream_read_timeout: Duration,
+) -> (
+    OwnedH2Session<Application>,
+    OwnedH2Handle,
+    Rc<RefCell<FixtureTransportState>>,
+    Rc<RefCell<Vec<Rc<Probe>>>>,
+) {
+    let (fixture, state) = FixtureTransport::new(reads);
+    let (application, probes) = Application::new(replies);
+    let mut config = options(context, Rc::new(UntimedReads(fixture)));
+    config.io.stream_read_timeout = stream_read_timeout;
+    let (session, handle) =
+        OwnedH2Session::new(application, config).expect("stream-read-timed owned H2");
+    (session, handle, state, probes)
+}
+
+/// An application blocked on a stalled request body is answered 408 at the stream read
+/// timeout, not a millisecond earlier, and its exchange is cancelled with the read timeout.
+#[test]
+fn stalled_request_body_gets_408_at_its_stream_read_timeout() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (session, handle, state, probes) = stream_read_timed_session(
+                context,
+                [FixtureRead::Data(peer_incomplete_post_bytes(5))],
+                vec![Reply::Body(0)],
+                STREAM_READ,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                complete_credit_wait(|| {
+                    probes
+                        .borrow()
+                        .first()
+                        .is_some_and(|probe| probe.request_bytes.get() == 5)
+                })
+                .await;
+                settle_turns(32).await;
+                host.advance(STREAM_READ - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert!(
+                    written_frames(&state, 1).header_statuses.is_empty(),
+                    "the 408 came early"
+                );
+                host.advance(Duration::from_millis(1));
+                let probe = Rc::clone(&probes.borrow()[0]);
+                complete_credit_wait(|| !probe.cancelled.borrow().is_empty()).await;
+                settle_turns(32).await;
+                let frames = written_frames(&state, 1);
+                assert_eq!(frames.header_statuses, [(StreamId::new(1), 408)]);
+                assert!(frames.resets.is_empty());
+                assert_eq!(
+                    probe.cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::READ_TIMEOUT, false)]
+                );
+                assert!(handle.initiate_drain().unwrap());
+            });
+            run.expect("the drained connection closes cleanly");
+            assert_eq!(probes.borrow()[0].completed.get(), 0);
+        })
+    });
+}
+
+/// Each wait for request body is timed afresh, as Proxygen's per-read timeout: a body whose
+/// chunks each arrive within the stream read timeout is never answered 408, however long it
+/// takes in all. On the existing `TimedBaton` each armed wait costs one host sleep on either
+/// host (ST.3 moves the baton onto the wheel), and the stream read timeout takes no connection
+/// slot.
+#[test]
+fn trickling_request_body_is_timed_per_wait() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let wheel = context.host().wheel_timer().is_some();
+            let gates: Vec<_> = (0..3)
+                .map(|_| Arc::new(tokio::sync::Notify::new()))
+                .collect();
+            let chunks = [(0, b"a"), (0, b"b"), (END_STREAM, b"c")];
+            let mut request = HttpMessage::new();
+            request.set_method(HttpMethod::Post).unwrap();
+            request.set_url(b"/", false).unwrap();
+            request.set_http_version(1, 1);
+            request
+                .headers_mut()
+                .set(HttpHeaderCode::Host, b"example.com");
+            request
+                .headers_mut()
+                .set(HttpHeaderCode::ContentLength, b"8");
+            let head = peer_request_message_bytes(request, Some(queue(b"xxxxx")), false);
+            let reads = std::iter::once(FixtureRead::Data(head)).chain(
+                gates.iter().zip(chunks).map(|(gate, (flags, chunk))| {
+                    FixtureRead::WaitData(
+                        Arc::clone(gate),
+                        raw_frame(FrameType::DATA, flags, 1, chunk),
+                    )
+                }),
+            );
+            let (session, handle, state, probes) =
+                stream_read_timed_session(context, reads, vec![Reply::Body(0)], STREAM_READ);
+            let (run, ()) = futures::join!(session.run(), async {
+                complete_credit_wait(|| {
+                    probes
+                        .borrow()
+                        .first()
+                        .is_some_and(|probe| probe.request_bytes.get() == 5)
+                })
+                .await;
+                let probe = Rc::clone(&probes.borrow()[0]);
+                for (index, gate) in gates.iter().enumerate() {
+                    settle_turns(32).await;
+                    host.advance(STREAM_READ * 3 / 4);
+                    settle_turns(32).await;
+                    assert!(
+                        written_frames(&state, 1).header_statuses.is_empty(),
+                        "a chunk that came within the timeout was answered"
+                    );
+                    gate.notify_one();
+                    assert!(
+                        drive_until(1024, || probe.request_bytes.get() == 6 + index).await,
+                        "chunk {index} was not read: {} bytes, {:?}",
+                        probe.request_bytes.get(),
+                        written_frames(&state, 1).header_statuses
+                    );
+                }
+                assert!(
+                    drive_until(1024, || probe.completed.get() == 1).await,
+                    "the exchange did not complete: {:?}",
+                    written_frames(&state, 1).header_statuses
+                );
+                assert_eq!(
+                    written_frames(&state, 1).header_statuses,
+                    [(StreamId::new(1), 200)]
+                );
+                assert!(handle.initiate_drain().unwrap());
+            });
+            run.expect("the drained connection closes cleanly");
+            assert!(probes.borrow()[0].cancelled.borrow().is_empty());
+            assert_eq!(
+                host.sleeps(),
+                gates.len(),
+                "one host sleep per armed wait for request body"
+            );
+            if wheel {
+                assert_eq!(host.wheel_stats().scheduled, 0);
+            }
+        })
+    });
+}
+
+/// The clock reads of a POST whose body waits 20 s for its END_STREAM, then a drain, with every
+/// timeout zero, measured on the parent commit, which did not honor stream read timeouts.
+const ZERO_CONFIG_WAITING_BODY_NOW_READS: usize = 2;
+
+/// With a zero stream read timeout a request body that the application waits on arms nothing:
+/// no slot, no host sleep, and no clock read beyond the parent's, however long it waits.
+#[test]
+fn zero_stream_read_timeout_takes_no_slot_sleep_or_clock_read() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let wheel = context.host().wheel_timer().is_some();
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let reads_before = host.now_reads();
+            let (session, handle, state, probes) = stream_read_timed_session(
+                context,
+                [
+                    FixtureRead::Data(peer_incomplete_post_bytes(5)),
+                    FixtureRead::WaitData(
+                        Arc::clone(&gate),
+                        raw_frame(FrameType::DATA, END_STREAM, 1, &[]),
+                    ),
+                ],
+                vec![Reply::Body(0)],
+                Duration::ZERO,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                complete_credit_wait(|| {
+                    probes
+                        .borrow()
+                        .first()
+                        .is_some_and(|probe| probe.request_bytes.get() == 5)
+                })
+                .await;
+                settle_turns(32).await;
+                host.advance(20 * STREAM_READ);
+                settle_turns(32).await;
+                assert!(written_frames(&state, 1).header_statuses.is_empty());
+                gate.notify_one();
+                let probe = Rc::clone(&probes.borrow()[0]);
+                complete_credit_wait(|| probe.completed.get() == 1).await;
+                assert_eq!(
+                    written_frames(&state, 1).header_statuses,
+                    [(StreamId::new(1), 200)]
+                );
+                assert!(handle.initiate_drain().unwrap());
+            });
+            run.expect("the drained connection closes cleanly");
+            assert_eq!(
+                host.now_reads() - reads_before,
+                ZERO_CONFIG_WAITING_BODY_NOW_READS
             );
             assert_eq!(host.sleeps(), 0, "a zero-config session made a host sleep");
             if wheel {

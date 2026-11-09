@@ -6406,25 +6406,6 @@ fn cancel_before_release_still_resets() {
     assert!(released_after, "the retired stream releases its capacity");
 }
 
-/// The upstream driver still refuses the timer it does not honor, a stream read timeout, before
-/// any transport or application work.
-#[test]
-fn upstream_refuses_unhonored_timeouts() {
-    run_on_worker(|context| {
-        Box::pin(async move {
-            let (transport, state) = FixtureTransport::new([]);
-            let mut config = options(context.clone(), transport);
-            config.io.stream_read_timeout = Duration::from_secs(1);
-            let error = match OwnedH2UpstreamSession::new(config) {
-                Err(error) => error,
-                Ok(_) => panic!("an upstream stream read timeout was accepted"),
-            };
-            assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
-            assert!(state.borrow().writes.is_empty());
-        })
-    });
-}
-
 /// An idle upstream connection drains at its read timeout, not a millisecond earlier, as
 /// Proxygen's read timeout calls `initiateDrain`: one GOAWAY, admission closes, and with no
 /// stream left the connection closes.
@@ -7041,4 +7022,592 @@ fn owned_upstream_retirement_restarts_the_flow_control_timeout_like_uniplex() {
             "{driver}"
         );
     }
+}
+
+/// The stream read timeout of the upstream stream-read-timeout tests.
+const STREAM_READ: Duration = Duration::from_secs(1);
+
+/// An upstream session over the origin's SETTINGS followed by `reads`, with `STREAM_READ` as
+/// its stream read timeout and every other timeout zero.
+fn stream_read_timed_upstream(
+    context: WorkerContext,
+    reads: impl IntoIterator<Item = FixtureRead>,
+) -> (
+    OwnedH2UpstreamSession,
+    OwnedH2UpstreamHandle,
+    Rc<RefCell<FixtureTransportState>>,
+) {
+    let mut peer = Http2Codec::new(TransportDirection::Downstream);
+    let settings = arming_origin_settings(&mut peer);
+    let (fixture, wire) =
+        FixtureTransport::new(std::iter::once(FixtureRead::Data(settings)).chain(reads));
+    let mut config = options(context, Rc::new(super::owned::UntimedReads(fixture)));
+    config.io.stream_read_timeout = STREAM_READ;
+    let (session, handle) =
+        OwnedH2UpstreamSession::new(config).expect("stream-read-timed owned upstream H2");
+    (session, handle, wire)
+}
+
+fn written_resets(wire: &RefCell<FixtureTransportState>) -> Vec<(StreamId, H2ErrorCode)> {
+    decode_client_frames(&wire.borrow().writes.concat()).resets
+}
+
+/// A response that stalls after the request's EOM fails its `HttpResponseReader` read with "Read
+/// timeout after 1000" at the stream read timeout, not a millisecond earlier, and the stream is
+/// reset with CANCEL.
+#[test]
+fn upstream_stall_after_eom_times_out_the_response_read() {
+    super::owned::on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (session, handle, wire) = stream_read_timed_upstream(context, []);
+            let (run, ()) = futures::join!(session.run(), async {
+                let response = handle
+                    .reserve_request()
+                    .unwrap()
+                    .submit_exclusive(
+                        request_head(HttpMethod::Get, true, None),
+                        HttpSourceHolder::empty(),
+                        CancellationToken::never(),
+                    )
+                    .await
+                    .expect("the request is committed");
+                let (owner, mut reader) = response.source.split();
+                reader.arm_header(&owner).unwrap();
+                let mut read = std::pin::pin!(poll_fn(|context| reader.poll_header(context)));
+                assert!(futures::poll!(read.as_mut()).is_pending());
+                super::owned::settle_turns(32).await;
+                host.advance(STREAM_READ - Duration::from_millis(1));
+                super::owned::settle_turns(32).await;
+                assert!(still_pending(&mut read).await, "the read timed out early");
+                host.advance(Duration::from_millis(1));
+                let Err(error) = read.await else {
+                    panic!("the stalled response read must time out");
+                };
+                assert_eq!(error.code(), HttpErrorCode::READ_TIMEOUT);
+                assert_eq!(error.message(), b"Read timeout after 1000");
+                super::owned::settle_turns(32).await;
+                assert_eq!(
+                    written_resets(&wire),
+                    [(StreamId::new(1), H2ErrorCode::CANCEL)]
+                );
+                drop((owner, reader));
+                assert!(handle.close_when_idle().unwrap());
+            });
+            run.expect("the drained upstream connection closes cleanly");
+        })
+    });
+}
+
+/// What an upstream driver did with one request whose response stalls.
+#[derive(Debug)]
+struct UpstreamStallWire {
+    /// `(milliseconds since start, stream, code)` of each RST_STREAM written.
+    resets: Vec<(u64, StreamId, H2ErrorCode)>,
+    /// How the response head read ended, and when.
+    read: (u64, Result<u16, (HttpErrorCode, Vec<u8>)>),
+    result: Result<(), HttpErrorCode>,
+}
+
+/// Sends a GET on the owned driver or on `UniplexSession`, both with `STREAM_READ` as the
+/// stream read timeout and every other timeout zero, to an origin that sends only its SETTINGS
+/// (or, with `response_at`, answers 200 at that instant), then closes the connection once the
+/// response read has ended.
+async fn upstream_stall_wire(
+    context: WorkerContext,
+    owned: bool,
+    response_at: Option<Duration>,
+) -> UpstreamStallWire {
+    let mut peer = Http2Codec::new(TransportDirection::Downstream);
+    let mut script = VecDeque::from([(None, arming_origin_settings(&mut peer))]);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    if response_at.is_some() {
+        script.push_back((
+            Some(Arc::clone(&gate)),
+            response_head(&mut peer, StreamId::new(1), 200, true, None),
+        ));
+    }
+    let (inner, wire) = FixtureTransport::new([]);
+    let transport = Rc::new(super::owned::GatedReads {
+        inner,
+        script: Rc::new(RefCell::new(script)),
+    });
+    let begun = tokio::time::Instant::now();
+    let done = Rc::new(Cell::new(false));
+    type Run = Pin<Box<dyn Future<Output = Result<UniplexRunSummary, HttpError>>>>;
+    type Exchange = Pin<Box<dyn Future<Output = (u64, Result<u16, (HttpErrorCode, Vec<u8>)>)>>>;
+    let read_head = async move |mut source: HttpSourceHolder| {
+        let result = match source.read_header_event().await {
+            Ok(mut head) => Ok(head.headers_mut().status_code().unwrap()),
+            Err(error) => Err((error.code(), error.message().to_vec())),
+        };
+        (begun.elapsed().as_millis() as u64, result)
+    };
+    let (session, exchange, close): (Run, Exchange, Box<dyn Fn()>) = if owned {
+        let mut config = options(context, transport);
+        config.io.stream_read_timeout = STREAM_READ;
+        let (session, handle) = OwnedH2UpstreamSession::new(config).expect("owned upstream H2");
+        let submission = handle.reserve_request().unwrap().submit(
+            request_head(HttpMethod::Get, true, None),
+            HttpSourceHolder::empty(),
+            CancellationToken::never(),
+        );
+        let exchange: Exchange = Box::pin(async move {
+            let (_, source, _request) = submission
+                .await
+                .expect("the request is committed")
+                .into_source_parts();
+            read_head(source).await
+        });
+        (
+            Box::pin(session.run()),
+            exchange,
+            Box::new(move || assert!(handle.close_when_idle().unwrap())),
+        )
+    } else {
+        let config = UniplexConfig {
+            read_timeout: Duration::ZERO,
+            stream_read_timeout: STREAM_READ,
+            write_timeout: Duration::ZERO,
+            ..UniplexConfig::default()
+        };
+        let http2 = Http2SessionConfig {
+            settings: vec![roxygen_codec::CodecSetting {
+                identifier: SettingsId::EnablePush.as_u16(),
+                value: 0,
+            }],
+            double_goaway_drain: false,
+            goaway_timeout: Duration::ZERO,
+            ..Http2SessionConfig::default()
+        };
+        let (session, handle) = UniplexSession::new_http2(
+            context,
+            TransportDirection::Upstream,
+            transport,
+            None,
+            config,
+            http2,
+        )
+        .expect("Uniplex upstream H2");
+        let sender = handle.clone();
+        let exchange: Exchange = Box::pin(async move {
+            let request =
+                HttpFixedSource::make_get_request(b"/owned-upstream", None).expect("fixed GET");
+            let source = sender
+                .send_request(
+                    HttpSourceHolder::new(Box::new(request)),
+                    CancellationSource::new().token(),
+                )
+                .await
+                .expect("request admitted")
+                .source;
+            read_head(source).await
+        });
+        (
+            Box::pin(session.run()),
+            exchange,
+            Box::new(move || assert!(handle.close_when_idle().unwrap())),
+        )
+    };
+    let exchange = async {
+        let read = exchange.await;
+        close();
+        read
+    };
+    let monitor = async {
+        let mut resets = Vec::new();
+        loop {
+            let at = begun.elapsed();
+            if response_at.is_some_and(|response_at| at >= response_at) {
+                gate.notify_one();
+            }
+            let ms = at.as_millis() as u64;
+            let written = written_resets(&wire);
+            resets.extend(
+                written[resets.len()..]
+                    .iter()
+                    .map(|(stream, code)| (ms, *stream, *code)),
+            );
+            if done.get() {
+                return resets;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    let run = async {
+        let result = session.await;
+        done.set(true);
+        result
+    };
+    let (result, resets, read) = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(run, monitor, exchange)
+    })
+    .await
+    .expect("the upstream connection ends");
+    UpstreamStallWire {
+        resets,
+        read,
+        result: result.map(|_| ()).map_err(|error| error.code()),
+    }
+}
+
+/// An upstream response that stalls after the request's EOM, owned against `UniplexSession` on
+/// the same paused clock: both reads fail with "Read timeout after 1000" at the stream read
+/// timeout, both write RST_STREAM(CANCEL) then, and both connections then close cleanly; a
+/// response that arrives within the timeout is delivered by both.
+#[test]
+fn owned_upstream_stream_read_timeout_matches_uniplex() {
+    for response_at in [None, Some(STREAM_READ / 2)] {
+        let (owned, uniplex) = super::owned::run_on_paused_worker(move |context| {
+            Box::pin(async move {
+                let uniplex = upstream_stall_wire(context.clone(), false, response_at).await;
+                let owned = upstream_stall_wire(context, true, response_at).await;
+                (owned, uniplex)
+            })
+        });
+        let expected_read = match response_at {
+            None => (
+                STREAM_READ.as_millis() as u64,
+                Err((
+                    HttpErrorCode::READ_TIMEOUT,
+                    b"Read timeout after 1000".to_vec(),
+                )),
+            ),
+            Some(at) => (at.as_millis() as u64, Ok(200)),
+        };
+        for wire in [&owned, &uniplex] {
+            assert_eq!(
+                wire.read.1, expected_read.1,
+                "owned {owned:?}, uniplex {uniplex:?}"
+            );
+            assert!(
+                wire.read.0.abs_diff(expected_read.0) <= 1,
+                "owned {owned:?}, uniplex {uniplex:?}"
+            );
+        }
+        let resets = |wire: &UpstreamStallWire| -> Vec<(StreamId, H2ErrorCode)> {
+            wire.resets
+                .iter()
+                .map(|(_, stream, code)| (*stream, *code))
+                .collect()
+        };
+        assert_eq!(
+            resets(&owned),
+            resets(&uniplex),
+            "owned {owned:?}, uniplex {uniplex:?}"
+        );
+        for ((owned_at, ..), (uniplex_at, ..)) in owned.resets.iter().zip(&uniplex.resets) {
+            assert!(
+                owned_at.abs_diff(*uniplex_at) <= 1,
+                "owned {owned:?}, uniplex {uniplex:?}"
+            );
+        }
+        assert_eq!(owned.result, Ok(()), "owned {owned:?}");
+        assert_eq!(owned.result, uniplex.result);
+    }
+}
+
+/// Whether `read` is still pending after two polls: a timed wait commits its timeout in one poll
+/// and returns it from the next.
+async fn still_pending<F: Future + Unpin>(read: &mut F) -> bool {
+    futures::poll!(&mut *read).is_pending() && futures::poll!(&mut *read).is_pending()
+}
+
+/// Submits a POST whose 128-byte body waits for `upload_gate`, takes its response source once
+/// the head is committed, and polls the response head read once.
+async fn gated_post_read(
+    handle: &OwnedH2UpstreamHandle,
+    upload_gate: &Arc<tokio::sync::Notify>,
+) -> (
+    HttpSourceHolder,
+    LocalSourceFuture<Result<HttpHeaderEvent, HttpError>>,
+    crate::owned_h2::OwnedH2UpstreamRequest,
+) {
+    let mut upload = Upload::new(128, 128);
+    upload.gate = Some((0, Arc::clone(upload_gate)));
+    let submission = handle.reserve_request().unwrap().submit(
+        request_head(HttpMethod::Post, false, Some(128)),
+        upload.held().0,
+        CancellationToken::never(),
+    );
+    let (_, mut source, request) = submission
+        .await
+        .expect("the request head is committed")
+        .into_source_parts();
+    let mut read = source.read_header_event();
+    assert!(futures::poll!(&mut read).is_pending());
+    (source, read, request)
+}
+
+/// The response read is not timed while the request uploads, however long that takes: the
+/// timeout starts when the request's EOM is serialized, and the read fails a full stream read
+/// timeout after it.
+#[test]
+fn upstream_response_read_is_untimed_during_the_upload() {
+    super::owned::on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (session, handle, wire) = stream_read_timed_upstream(context, []);
+            let upload_gate = Arc::new(tokio::sync::Notify::new());
+            let (run, ()) = futures::join!(session.run(), async {
+                let (source, mut read, _request) = gated_post_read(&handle, &upload_gate).await;
+                super::owned::settle_turns(32).await;
+                host.advance(3 * STREAM_READ);
+                super::owned::settle_turns(32).await;
+                assert!(
+                    still_pending(&mut read).await,
+                    "the read was timed during the upload"
+                );
+                upload_gate.notify_one();
+                super::owned::settle_turns(64).await;
+                assert_eq!(
+                    decode_client_frames(&wire.borrow().writes.concat()).body_bytes,
+                    128,
+                    "the upload ended"
+                );
+                host.advance(STREAM_READ - Duration::from_millis(1));
+                super::owned::settle_turns(32).await;
+                assert!(
+                    still_pending(&mut read).await,
+                    "the read timed out before a full timeout after the request's EOM"
+                );
+                host.advance(Duration::from_millis(1));
+                let Err(error) = read.await else {
+                    panic!("the stalled response read must time out");
+                };
+                assert_eq!(error.code(), HttpErrorCode::READ_TIMEOUT);
+                assert_eq!(error.message(), b"Read timeout after 1000");
+                drop(source);
+                super::owned::settle_turns(32).await;
+                assert!(handle.close_when_idle().unwrap());
+            });
+            run.expect("the drained upstream connection closes cleanly");
+        })
+    });
+}
+
+/// A read timeout the caller sets on the response before the request's EOM replaces the
+/// session's and, like it, starts at the EOM (Uniplex's `DeferUpdates`).
+#[test]
+fn caller_read_timeout_before_the_eom_wins() {
+    super::owned::on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (session, handle, _wire) = stream_read_timed_upstream(context, []);
+            let upload_gate = Arc::new(tokio::sync::Notify::new());
+            let (run, ()) = futures::join!(session.run(), async {
+                let (mut source, mut read, _request) = gated_post_read(&handle, &upload_gate).await;
+                host.advance(2 * STREAM_READ);
+                source.set_read_timeout(3 * STREAM_READ);
+                super::owned::settle_turns(32).await;
+                upload_gate.notify_one();
+                super::owned::settle_turns(64).await;
+                host.advance(3 * STREAM_READ - Duration::from_millis(1));
+                super::owned::settle_turns(32).await;
+                assert!(
+                    still_pending(&mut read).await,
+                    "the caller's timeout did not replace the session's, or started early"
+                );
+                host.advance(Duration::from_millis(1));
+                let Err(error) = read.await else {
+                    panic!("the stalled response read must time out");
+                };
+                assert_eq!(error.code(), HttpErrorCode::READ_TIMEOUT);
+                assert_eq!(error.message(), b"Read timeout after 3000");
+                drop(source);
+                super::owned::settle_turns(32).await;
+                assert!(handle.close_when_idle().unwrap());
+            });
+            run.expect("the drained upstream connection closes cleanly");
+        })
+    });
+}
+
+/// A response that the driver hands to the source at the read's deadline, before the waiting
+/// reader is polled again, beats the timeout: the reader gets the response.
+#[test]
+fn response_published_before_the_reader_polls_beats_the_timeout() {
+    super::owned::on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Downstream);
+            let _ = arming_origin_settings(&mut peer);
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let response = response_head(&mut peer, StreamId::new(1), 200, true, None);
+            let (session, handle, wire) = stream_read_timed_upstream(
+                context,
+                [FixtureRead::WaitData(Arc::clone(&gate), response)],
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                let submission = handle.reserve_request().unwrap().submit(
+                    request_head(HttpMethod::Get, true, None),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                let (_, source, _request) = submission
+                    .await
+                    .expect("the request is committed")
+                    .into_source_parts();
+                let mut source = source;
+                let mut read = source.read_header_event();
+                assert!(futures::poll!(&mut read).is_pending());
+                super::owned::settle_turns(32).await;
+                host.advance(STREAM_READ);
+                gate.notify_one();
+                super::owned::settle_turns(64).await;
+                let Poll::Ready(Ok(mut head)) = futures::poll!(&mut read) else {
+                    panic!("the published response must beat the timeout");
+                };
+                assert_eq!(head.headers_mut().status_code().unwrap(), 200);
+                assert!(written_resets(&wire).is_empty());
+                drop(source);
+                super::owned::settle_turns(32).await;
+                assert!(handle.close_when_idle().unwrap());
+            });
+            run.expect("the drained upstream connection closes cleanly");
+        })
+    });
+}
+
+/// Each wait for response data is timed afresh from the request's EOM on: a response whose head
+/// and body chunks each arrive within the stream read timeout is delivered whole, however long
+/// it takes in all. On the existing `TimedBaton` each armed wait costs one host sleep on either
+/// host (ST.3 moves the baton onto the wheel), and the stream read timeout takes no connection
+/// slot.
+#[test]
+fn trickling_response_is_timed_per_wait() {
+    super::owned::on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let wheel = context.host().wheel_timer().is_some();
+            let mut peer = Http2Codec::new(TransportDirection::Downstream);
+            let _ = arming_origin_settings(&mut peer);
+            let stream = StreamId::new(1);
+            let frames: Vec<_> =
+                std::iter::once(response_head(&mut peer, stream, 200, false, Some(3)))
+                    .chain([(b"a", false), (b"b", false), (b"c", true)].map(
+                        |(chunk, end_stream)| {
+                            eligibility_frame(
+                                &mut peer,
+                                EgressFrame::Body {
+                                    stream,
+                                    body: queue(chunk),
+                                    padding: None,
+                                    end_stream,
+                                },
+                            )
+                        },
+                    ))
+                    .collect();
+            let gates: Vec<_> = frames
+                .iter()
+                .map(|_| Arc::new(tokio::sync::Notify::new()))
+                .collect();
+            let (session, handle, wire) = stream_read_timed_upstream(
+                context,
+                gates
+                    .iter()
+                    .zip(frames)
+                    .map(|(gate, frame)| FixtureRead::WaitData(Arc::clone(gate), frame)),
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                let submission = handle.reserve_request().unwrap().submit(
+                    request_head(HttpMethod::Get, true, None),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                let (_, mut source, _request) = submission
+                    .await
+                    .expect("the request is committed")
+                    .into_source_parts();
+                let fetched = {
+                    let mut fetch = std::pin::pin!(read_fetched(&mut source));
+                    for gate in &gates {
+                        super::owned::settle_turns(32).await;
+                        assert!(still_pending(&mut fetch).await, "the response ended early");
+                        host.advance(STREAM_READ * 3 / 4);
+                        super::owned::settle_turns(32).await;
+                        assert!(
+                            still_pending(&mut fetch).await,
+                            "a read whose data came within the timeout timed out"
+                        );
+                        gate.notify_one();
+                    }
+                    fetch.await
+                };
+                assert_eq!(fetched, Ok((200, b"abc".to_vec())));
+                assert!(written_resets(&wire).is_empty());
+                drop(source);
+                super::owned::settle_turns(32).await;
+                assert!(handle.close_when_idle().unwrap());
+            });
+            run.expect("the drained upstream connection closes cleanly");
+            assert_eq!(
+                host.sleeps(),
+                gates.len(),
+                "one host sleep per armed wait for response data"
+            );
+            if wheel {
+                assert_eq!(host.wheel_stats().scheduled, 0);
+            }
+        })
+    });
+}
+
+/// The clock reads of a GET whose response arrives after 20 s, then a close, with every timeout
+/// zero, measured on the parent commit, which did not honor stream read timeouts.
+const ZERO_CONFIG_LATE_RESPONSE_NOW_READS: usize = 1;
+
+/// With a zero stream read timeout an upstream response read arms nothing at the request's EOM:
+/// no slot, no host sleep, and no clock read beyond the parent's, however long the origin takes.
+#[test]
+fn zero_stream_read_timeout_upstream_takes_no_slot_sleep_or_clock_read() {
+    super::owned::on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let wheel = context.host().wheel_timer().is_some();
+            let mut peer = Http2Codec::new(TransportDirection::Downstream);
+            let settings = arming_origin_settings(&mut peer);
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let response = response_head(&mut peer, StreamId::new(1), 200, true, None);
+            let (fixture, wire) = FixtureTransport::new([
+                FixtureRead::Data(settings),
+                FixtureRead::WaitData(Arc::clone(&gate), response),
+            ]);
+            let config = options(context, Rc::new(super::owned::UntimedReads(fixture)));
+            let reads_before = host.now_reads();
+            let (session, handle) = OwnedH2UpstreamSession::new(config).expect("owned upstream H2");
+            let (run, ()) = futures::join!(session.run(), async {
+                let submission = handle.reserve_request().unwrap().submit(
+                    request_head(HttpMethod::Get, true, None),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                let (_, mut source, _request) = submission
+                    .await
+                    .expect("the request is committed")
+                    .into_source_parts();
+                let mut read = source.read_header_event();
+                assert!(still_pending(&mut read).await);
+                super::owned::settle_turns(32).await;
+                host.advance(20 * STREAM_READ);
+                super::owned::settle_turns(32).await;
+                assert!(still_pending(&mut read).await);
+                gate.notify_one();
+                let Ok(mut head) = read.await else {
+                    panic!("the late response arrives");
+                };
+                assert_eq!(head.headers_mut().status_code().unwrap(), 200);
+                drop(source);
+                super::owned::settle_turns(32).await;
+                assert!(handle.close_when_idle().unwrap());
+            });
+            run.expect("the closed upstream connection ends cleanly");
+            assert_eq!(
+                host.now_reads() - reads_before,
+                ZERO_CONFIG_LATE_RESPONSE_NOW_READS
+            );
+            assert_eq!(host.sleeps(), 0, "a zero-config session made a host sleep");
+            if wheel {
+                let stats = host.wheel_stats();
+                assert_eq!(stats.scheduled, 0);
+                assert_eq!(stats.live_slots, 0);
+            }
+            assert!(written_resets(&wire).is_empty());
+        })
+    });
 }

@@ -44,6 +44,13 @@ pub trait OwnedExchange: 'static {
         context: &mut Context<'_>,
         maximum: u32,
     ) -> Poll<Result<HttpBodyEvent, HttpError>>;
+    /// Whether the exchange's handler is still running, so it has not yet returned its response.
+    /// When the request body's read times out before the final response head, as in
+    /// `UniplexSession`, the driver waits for a running handler and sends a final 408 it answers
+    /// (any other final response becomes a bare 408), and otherwise sends a bare 408 at once.
+    fn handler_active(&self) -> bool {
+        false
+    }
     /// Cancels the owned policy/body operation with its selected cause. `peer_reset` is true
     /// when the peer reset the stream (HTTP/2 RST_STREAM) or closed the connection before the
     /// exchange finished (HTTP/1.1). All synchronous callback/destructor work runs outside

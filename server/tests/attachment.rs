@@ -1864,43 +1864,34 @@ fn owned_http2_attachment_rejects_unsupported_configuration() {
                 stats.stats_factory = Some(Arc::new(|_: &ConnectionInfo| {
                     unreachable!("a refused configuration builds no recorder")
                 }));
-                let mut timed = untimed_owned(false, true);
-                timed.stream_read_timeout = Duration::from_secs(1);
-                for (session, message) in [
-                    (stats, &b"owned_http2 does not support stats_factory"[..]),
-                    (
-                        timed,
-                        &b"owned_http2 does not honor stream_read_timeout: it must be zero"[..],
+                let (io, _peer) = tokio::io::duplex(64);
+                let transport = adopt_local(
+                    &context,
+                    EstablishedIo::new(
+                        io,
+                        TransportEndpoint::Unknown,
+                        TransportEndpoint::Unknown,
+                        None,
                     ),
-                ] {
-                    let (io, _peer) = tokio::io::duplex(64);
-                    let transport = adopt_local(
-                        &context,
-                        EstablishedIo::new(
-                            io,
-                            TransportEndpoint::Unknown,
-                            TransportEndpoint::Unknown,
-                            None,
-                        ),
-                        limits(),
-                    )
-                    .expect("I/O adopted");
-                    let mut options = ServeTransportOptions::new(
-                        CodecProtocol::Http2,
-                        TransportSecurity::Plaintext,
-                    );
-                    options.session = session;
-                    let error = serve_transport(
-                        &context,
-                        transport,
-                        Rc::new(RecordingHandler(Arc::new(Evidence::default()))),
-                        options,
-                    )
-                    .err()
-                    .expect("the unsupported configuration is refused");
-                    assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
-                    assert_eq!(error.message(), message);
-                }
+                    limits(),
+                )
+                .expect("I/O adopted");
+                let mut options =
+                    ServeTransportOptions::new(CodecProtocol::Http2, TransportSecurity::Plaintext);
+                options.session = stats;
+                let error = serve_transport(
+                    &context,
+                    transport,
+                    Rc::new(RecordingHandler(Arc::new(Evidence::default()))),
+                    options,
+                )
+                .err()
+                .expect("the unsupported configuration is refused");
+                assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+                assert_eq!(
+                    error.message(),
+                    b"owned_http2 does not support stats_factory"
+                );
             })
             .expect("initializer admitted"),
     )
@@ -1970,6 +1961,205 @@ fn owned_http2_reaps_an_idle_connection() {
     .expect("initializer finishes");
     wait(runtime.quiesce(TIMEOUT)).expect("cleanup joins");
     assert_eq!(owner.join().expect("physical join").workers_forced, 0);
+}
+
+/// `owned_http2` honors `stream_read_timeout`: a handler blocked on a request body that stalls
+/// is answered 408, as in the managed mode, the stream is not reset after it, and the
+/// connection then drains cleanly.
+#[test]
+fn owned_http2_answers_a_stalled_request_body_with_408() {
+    let mut owner = RuntimeOwner::start(RuntimeConfig {
+        workers: 1,
+        command_capacity: 4,
+    })
+    .expect("owner starts");
+    let runtime = owner.handle();
+    let worker = runtime.worker(0).expect("worker exists");
+    wait(
+        worker
+            .call_local(move |context| async move {
+                let mut session = untimed_owned(false, true);
+                session.stream_read_timeout = Duration::from_millis(100);
+                let (io, peer) = tokio::io::duplex(64 * 1024);
+                let accepted = attach_for_test(
+                    &context,
+                    CodecProtocol::Http2,
+                    session,
+                    io,
+                    Rc::new(FixedHandler),
+                );
+                let control = accepted.control;
+                let run = tokio::task::spawn_local(accepted.session.run());
+                let (client, connection) = h2::client::handshake(peer).await.expect("H2 handshake");
+                let connection = tokio::task::spawn_local(connection);
+                let mut client = client.ready().await.expect("H2 client ready");
+                let request = http::Request::builder()
+                    .method("POST")
+                    .uri("http://localhost/upload")
+                    .body(())
+                    .expect("request builds");
+                let (response, mut upload) =
+                    client.send_request(request, false).expect("request sent");
+                upload
+                    .send_data(Bytes::from_static(b"part"), false)
+                    .expect("partial body sent");
+                let response = tokio::time::timeout(Duration::from_secs(5), response)
+                    .await
+                    .expect("the stalled request is answered within the timeout")
+                    .expect("response head");
+                assert_eq!(response.status(), http::StatusCode::REQUEST_TIMEOUT);
+                let mut body = response.into_body();
+                assert!(body.data().await.is_none(), "the 408 has no body");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(
+                    std::future::poll_fn(|cx| Poll::Ready(upload.poll_reset(cx)))
+                        .await
+                        .is_pending(),
+                    "the stream was reset after its 408"
+                );
+                control.drain();
+                drop(upload);
+                drop(client);
+                connection.abort();
+                if let Err(error) = connection.await {
+                    assert!(error.is_cancelled(), "the client connection task panicked");
+                }
+                let summary = run
+                    .await
+                    .expect("owned run task joins")
+                    .expect("owned run completes");
+                assert!(summary.bytes_written > 0);
+                assert!(control.is_finished());
+            })
+            .expect("initializer admitted"),
+    )
+    .expect("initializer finishes");
+    wait(runtime.quiesce(TIMEOUT)).expect("cleanup joins");
+    assert_eq!(owner.join().expect("physical join").workers_forced, 0);
+}
+
+/// A handler that catches its request body's read timeout, awaits a cleanup and then answers
+/// with its own 408 keeps that work and that response on `owned_http2`, as in the managed mode
+/// (`UniplexSession` waits for an active handler and keeps a handler's 408).
+#[test]
+fn owned_http2_keeps_a_handlers_own_408_after_its_cleanup_like_the_managed_mode() {
+    let mut owner = RuntimeOwner::start(RuntimeConfig {
+        workers: 1,
+        command_capacity: 4,
+    })
+    .expect("owner starts");
+    let runtime = owner.handle();
+    let worker = runtime.worker(0).expect("worker exists");
+    let outcomes = wait(
+        worker
+            .call_local(move |context| async move {
+                let mut outcomes = Vec::new();
+                for owned in [false, true] {
+                    let cleaned = Rc::new(std::cell::Cell::new(false));
+                    let mut session = untimed_owned(false, owned);
+                    session.stream_read_timeout = Duration::from_millis(100);
+                    let (io, peer) = tokio::io::duplex(64 * 1024);
+                    let accepted = attach_for_test(
+                        &context,
+                        CodecProtocol::Http2,
+                        session,
+                        io,
+                        Rc::new(CleanupThen408 {
+                            cleaned: Rc::clone(&cleaned),
+                        }),
+                    );
+                    let control = accepted.control;
+                    let run = tokio::task::spawn_local(accepted.session.run());
+                    let (client, connection) =
+                        h2::client::handshake(peer).await.expect("H2 handshake");
+                    let connection = tokio::task::spawn_local(connection);
+                    let mut client = client.ready().await.expect("H2 client ready");
+                    let request = http::Request::builder()
+                        .method("POST")
+                        .uri("http://localhost/upload")
+                        .body(())
+                        .expect("request builds");
+                    let (response, mut upload) =
+                        client.send_request(request, false).expect("request sent");
+                    upload
+                        .send_data(Bytes::from_static(b"part"), false)
+                        .expect("partial body sent");
+                    let response = tokio::time::timeout(Duration::from_secs(5), response)
+                        .await
+                        .expect("the stalled request is answered")
+                        .expect("response head");
+                    let status = response.status().as_u16();
+                    let mut body = response.into_body();
+                    let mut bytes = Vec::new();
+                    while let Some(chunk) = body.data().await {
+                        bytes.extend_from_slice(&chunk.expect("response body"));
+                    }
+                    outcomes.push((owned, status, bytes, cleaned.get()));
+                    control.drain();
+                    drop(upload);
+                    drop(client);
+                    connection.abort();
+                    let _ = connection.await;
+                    let _ = run.await;
+                }
+                outcomes
+            })
+            .expect("initializer admitted"),
+    )
+    .expect("initializer finishes");
+    wait(runtime.quiesce(TIMEOUT)).expect("cleanup joins");
+    assert_eq!(owner.join().expect("physical join").workers_forced, 0);
+    let managed = &outcomes[0];
+    assert_eq!(
+        (managed.1, managed.2.as_slice(), managed.3),
+        (408, &b"late"[..], true),
+        "managed {outcomes:?}"
+    );
+    let owned = &outcomes[1];
+    assert_eq!(
+        (owned.1, owned.2.as_slice(), owned.3),
+        (managed.1, managed.2.as_slice(), managed.3),
+        "owned against managed: {outcomes:?}"
+    );
+}
+
+/// Reads the request body; when a read times out, awaits a 30 ms cleanup and answers with its
+/// own 408 carrying the body `late`.
+struct CleanupThen408 {
+    cleaned: Rc<std::cell::Cell<bool>>,
+}
+
+impl HttpHandler for CleanupThen408 {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        mut request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        let cleaned = Rc::clone(&self.cleaned);
+        Box::pin(async move {
+            request.read_header_event().await?;
+            loop {
+                match request.read_body_event(1024).await {
+                    Ok(event) if event.eom() => break,
+                    Ok(_) => {}
+                    Err(error) if error.code() == HttpErrorCode::READ_TIMEOUT => {
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        cleaned.set(true);
+                        let body = BufQueue::copy_from_slice(b"late", 4).expect("body fits");
+                        return Ok(HttpSourceHolder::new(Box::new(
+                            HttpFixedSource::make_fixed_response(408, Some(body))
+                                .expect("valid response"),
+                        )));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let body = BufQueue::copy_from_slice(b"done", 4).expect("body fits");
+            Ok(HttpSourceHolder::new(Box::new(
+                HttpFixedSource::make_fixed_response(200, Some(body)).expect("valid response"),
+            )))
+        })
+    }
 }
 
 /// Answers every request with a fixed body, after draining it.
