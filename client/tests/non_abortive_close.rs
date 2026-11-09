@@ -114,6 +114,7 @@ where
     let worker = HostedWorker::spawn(HostedWorkerOptions {
         command_capacity: NonZeroUsize::new(64).expect("nonzero capacity"),
         thread_name: "non-abortive-client".to_owned(),
+        on_owner_thread_stop: None,
     })
     .expect("hosted client worker starts");
     let hosted = bounded(

@@ -76,7 +76,8 @@ where
                 output
             };
             let (output, driven) =
-                futures::future::join(command, run_managed_driver(handle.clone(), driver)).await;
+                futures::future::join(command, run_managed_driver(handle.clone(), driver, None))
+                    .await;
             driven.expect("the worker shuts down cleanly");
             output.expect("command returns")
         });
@@ -113,7 +114,8 @@ pub(crate) async fn run_with_worker_wheel<Work: Future>(test: Work) -> Work::Out
         shutdown.begin_shutdown();
         output
     };
-    let (driven, output) = futures::future::join(run_managed_driver(handle, driver), test).await;
+    let (driven, output) =
+        futures::future::join(run_managed_driver(handle, driver, None), test).await;
     let output = output.unwrap_or_else(|payload| resume_unwind(payload));
     driven.expect("the worker shuts down cleanly");
     output
@@ -123,6 +125,7 @@ fn hosted_worker(thread_name: &str) -> HostedWorker {
     HostedWorker::spawn(HostedWorkerOptions {
         command_capacity: NonZeroUsize::new(4).expect("nonzero capacity"),
         thread_name: thread_name.to_owned(),
+        on_owner_thread_stop: None,
     })
     .expect("hosted worker starts")
 }
@@ -1371,6 +1374,157 @@ fn a_waker_panic_during_teardown_is_reported_after_it() {
             completed,
             Err(ManagedWorkerError::OwnerThreadPanicked),
             "after_expiry_panic: {after_expiry_panic}"
+        );
+        assert_eq!(handle.state(), WorkerState::Closed);
+    }
+}
+
+/// A bounded teardown's deadline (`HostedWorker::shutdown_by`, `DIV-043`).
+const BOUNDED_TEARDOWN: Duration = Duration::from_millis(300);
+
+/// Reports, as it is dropped, whether the thread's Tokio host still reported
+/// the worker's wheel and what the first timeout kept on the thread had
+/// completed with by then.
+struct WheelAtDrop(mpsc::Sender<(bool, Option<Expiry>)>);
+
+impl Drop for WheelAtDrop {
+    fn drop(&mut self) {
+        let kept = KEPT.with_borrow_mut(|kept| kept.first_mut().and_then(Timeout::take_expired));
+        let _ = self.0.send((Host::tokio().wheel_timer().is_some(), kept));
+    }
+}
+
+/// Starts a hosted worker whose command keeps a timeout armed on the wheel for
+/// ten minutes with `waker`, then registers a cleanup that arms a timeout of
+/// its own and holds it, never finishing, with a `WheelAtDrop` that reports
+/// to the returned receiver. `observe` runs as the owner thread's stop hook.
+fn park_a_cleanup_holding_a_wheel_timeout(
+    thread_name: &str,
+    waker: Waker,
+    observe: Option<Box<dyn FnOnce() + Send + 'static>>,
+) -> (HostedWorker, mpsc::Receiver<(bool, Option<Expiry>)>) {
+    let worker = HostedWorker::spawn(HostedWorkerOptions {
+        command_capacity: NonZeroUsize::new(4).expect("nonzero capacity"),
+        thread_name: thread_name.to_owned(),
+        on_owner_thread_stop: observe,
+    })
+    .expect("hosted worker starts");
+    let (dropped_tx, dropped_rx) = mpsc::channel();
+    let (parked_tx, parked_rx) = mpsc::channel();
+    worker
+        .handle()
+        .spawn_local(move |context| async move {
+            let host = context.host().clone();
+            KEPT_WHEEL.set(host.wheel_timer());
+            let mut kept = Timeout::new(&host);
+            kept.schedule_at(host.now() + Duration::from_secs(600), &waker);
+            KEPT.with_borrow_mut(|timeouts| timeouts.push(kept));
+            let _cleanup = context
+                .register_cleanup_task(async move {
+                    let _probe = WheelAtDrop(dropped_tx);
+                    let mut held = Timeout::new(&host);
+                    held.schedule_at(host.now() + Duration::from_secs(600), &noop_waker());
+                    pending::<()>().await;
+                })
+                .expect("cleanup registered while open");
+            parked_tx.send(()).expect("the test observes the command");
+            pending::<()>().await;
+        })
+        .expect("command admitted");
+    parked_rx
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("the command parks");
+    (worker, dropped_rx)
+}
+
+fn published(worker: &HostedWorker) -> Result<(), ManagedWorkerError> {
+    let mut completion = worker.completion();
+    wait(async move {
+        completion
+            .wait_for(Option::is_some)
+            .await
+            .expect("the owner thread publishes completion")
+            .clone()
+            .expect("completion is published")
+    })
+}
+
+/// A bounded teardown whose deadline passes while a cleanup holds an armed
+/// wheel timeout ends with `TeardownDeadlineExceeded` and stops the wheel only
+/// after the final join: the cleanup, dropped there, still sees the wheel
+/// installed and a timeout kept armed across the teardown not yet completed.
+/// After the teardown that timeout has completed as stopped and its owner was
+/// woken once, a later schedule completes as stopped at once, nothing fires,
+/// and the thread's Tokio host reports no wheel (the owner thread's stop hook
+/// observes it); completion is then published.
+#[test]
+fn a_bounded_teardown_past_its_deadline_stops_the_wheel_after_the_final_join() {
+    let owner = Arc::new(CountingWake::default());
+    let (report_tx, report_rx) = mpsc::channel();
+    let probe_owner = Arc::clone(&owner);
+    let (worker, dropped_rx) = park_a_cleanup_holding_a_wheel_timeout(
+        "rox-wheel-bounded-teardown",
+        Waker::from(Arc::clone(&owner)),
+        Some(Box::new(move || observe_teardown(probe_owner, report_tx))),
+    );
+    let handle = worker.handle();
+    let deadline = Instant::now() + BOUNDED_TEARDOWN;
+    assert!(worker.shutdown_by(deadline));
+
+    assert_eq!(
+        published(&worker),
+        Err(ManagedWorkerError::TeardownDeadlineExceeded)
+    );
+    assert!(
+        Instant::now() >= deadline,
+        "the cleanup ran until the deadline"
+    );
+    assert_eq!(
+        dropped_rx.try_recv(),
+        Ok((true, None)),
+        "(wheel installed, kept timeout's expiry) as the final join dropped the cleanup"
+    );
+    assert_eq!(
+        report_rx.try_recv(),
+        Ok(Teardown {
+            expiry: Some(Expiry::Stopped),
+            owner_wakes: 1,
+            rescheduled: Some(Expiry::Stopped),
+            fired: 0,
+            armed: 0,
+            live_slots: 1,
+            host_has_wheel: false,
+        })
+    );
+    assert_eq!(handle.state(), WorkerState::Closed);
+}
+
+/// A timeout waker that panics when a bounded teardown, past its deadline,
+/// stops the wheel after the final join is reported as the owner thread's
+/// panic, over `TeardownDeadlineExceeded`, also when the payload's destructor
+/// panics: the owner thread publishes completion and the process does not
+/// abort.
+#[test]
+fn a_waker_panic_as_a_bounded_teardown_stops_the_wheel_is_reported_over_its_deadline() {
+    for payload_drop_panics in [false, true] {
+        let (worker, dropped_rx) = park_a_cleanup_holding_a_wheel_timeout(
+            "rox-wheel-bounded-stop-panic",
+            PanickingWake::waker(payload_drop_panics),
+            None,
+        );
+        let handle = worker.handle();
+        assert!(worker.shutdown_by(Instant::now() + BOUNDED_TEARDOWN));
+
+        assert_eq!(
+            published(&worker),
+            Err(ManagedWorkerError::OwnerThreadPanicked),
+            "payload_drop_panics: {payload_drop_panics}"
+        );
+        assert_eq!(
+            dropped_rx.try_recv(),
+            Ok((true, None)),
+            "the final join dropped the cleanup before the wheel stopped, payload_drop_panics: \
+             {payload_drop_panics}"
         );
         assert_eq!(handle.state(), WorkerState::Closed);
     }

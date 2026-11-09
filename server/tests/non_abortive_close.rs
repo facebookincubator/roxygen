@@ -83,6 +83,7 @@ where
     let worker = HostedWorker::spawn(HostedWorkerOptions {
         command_capacity: NonZeroUsize::new(4).expect("nonzero capacity"),
         thread_name: "non-abortive".to_owned(),
+        on_owner_thread_stop: None,
     })
     .expect("hosted worker starts");
     wait(worker.handle().call_local(test).expect("test admitted")).expect("test finishes");

@@ -249,6 +249,7 @@ fn on_workers(prior_exchanges: usize) -> [FinCommit; 2] {
     let worker = HostedWorker::spawn(HostedWorkerOptions {
         command_capacity: NonZeroUsize::new(64).expect("nonzero capacity"),
         thread_name: "read-before-write".to_owned(),
+        on_owner_thread_stop: None,
     })
     .expect("hosted client worker starts");
     let hosted = bounded(

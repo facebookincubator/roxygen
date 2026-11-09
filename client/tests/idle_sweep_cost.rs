@@ -158,6 +158,7 @@ fn measure(engine: SocketAddr, pools: usize) -> IdleSweepCost {
     let worker = HostedWorker::spawn(HostedWorkerOptions {
         command_capacity: NonZeroUsize::new(4).expect("nonzero capacity"),
         thread_name: "rox-sweep".to_owned(),
+        on_owner_thread_stop: None,
     })
     .expect("worker starts");
     let call = worker

@@ -1644,6 +1644,7 @@ mod task_wrapping {
             let worker = HostedWorker::spawn(HostedWorkerOptions {
                 command_capacity: NonZeroUsize::new(8).expect("non-zero capacity"),
                 thread_name: "task-wrapping-worker".to_owned(),
+                on_owner_thread_stop: None,
             })
             .expect("hosted worker starts");
             let sink = Sink::default();

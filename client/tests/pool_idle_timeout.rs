@@ -199,6 +199,7 @@ where
     let worker = HostedWorker::spawn(HostedWorkerOptions {
         command_capacity: NonZeroUsize::new(64).expect("nonzero capacity"),
         thread_name: "pool-idle".to_owned(),
+        on_owner_thread_stop: None,
     })
     .expect("hosted client worker starts");
     bounded(

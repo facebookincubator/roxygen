@@ -110,6 +110,7 @@ impl ConnectRuntime {
         let worker = HostedWorker::spawn(HostedWorkerOptions {
             command_capacity: NonZeroUsize::MIN,
             thread_name: "roxygen-connect".to_owned(),
+            on_owner_thread_stop: None,
         })
         .map_err(|error| ConnectError::closed(false).with_source(error))?;
         // Every queued command holds an admission permit, so admission never finds it full.

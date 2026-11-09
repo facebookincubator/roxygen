@@ -2042,6 +2042,7 @@ fn spawn_worker(
     HostedWorker::spawn(HostedWorkerOptions {
         command_capacity,
         thread_name: format!("{prefix}-{index}"),
+        on_owner_thread_stop: None,
     })
 }
 

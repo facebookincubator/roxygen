@@ -36,6 +36,7 @@ mod hosted_worker {
     use crate::task_group::TaskGroupError;
     use crate::tokio_host::HostedWorker;
     use crate::tokio_host::HostedWorkerBlockingPool;
+    use crate::tokio_host::HostedWorkerJoin;
     use crate::tokio_host::HostedWorkerOptions;
     use crate::tokio_host::ManagedWorker;
     use crate::tokio_host::ManagedWorkerError;
@@ -58,6 +59,7 @@ mod hosted_worker {
         HostedWorkerOptions {
             command_capacity: NonZeroUsize::new(command_capacity).expect("nonzero capacity"),
             thread_name: thread_name.to_owned(),
+            on_owner_thread_stop: None,
         }
     }
 
@@ -539,6 +541,66 @@ mod hosted_worker {
                 assert!(handle.was_forced(), "{kind}, round {round}");
                 assert_eq!(completed(completion), Ok(()), "{kind}, round {round}");
             }
+        }
+    }
+
+    #[test]
+    fn a_cleanup_woken_after_the_teardown_deadline_is_dropped_before_it_runs() {
+        // As for the quiesce deadline above: a round tests the teardown deadline
+        // only if the wake reaches the worker before tokio fires the deadline's
+        // timer, which it rounds up to the next millisecond; most rounds do.
+        const GRACE: Duration = Duration::from_millis(5);
+        const ROUNDS: usize = 20;
+        for round in 0..ROUNDS {
+            let worker = HostedWorker::spawn(options("rox-hosted-wake-after-teardown", 2))
+                .expect("worker starts");
+            let released = Arc::new(AtomicBool::new(false));
+            let parked = Arc::new(Mutex::new(None::<Waker>));
+            let (started_tx, started_rx) = oneshot::channel();
+            let (cleanup_parked_tx, cleanup_parked_rx) = mpsc::channel();
+            worker
+                .handle()
+                .spawn_local({
+                    let (released, parked) = (Arc::clone(&released), Arc::clone(&parked));
+                    move |context| async move {
+                        let _cleanup = context
+                            .register_cleanup_task(poll_fn(move |task| {
+                                if released.load(Ordering::SeqCst) {
+                                    return Poll::Ready(());
+                                }
+                                *parked.lock().expect("waker slot") = Some(task.waker().clone());
+                                let _ = cleanup_parked_tx.send(());
+                                Poll::Pending
+                            }))
+                            .expect("cleanup registered while open");
+                        started_tx.send(()).expect("test observes startup");
+                        pending::<()>().await;
+                    }
+                })
+                .expect("command admitted");
+            wait(started_rx).expect("command parked");
+
+            assert!(worker.shutdown());
+            let cleanup_parked = cleanup_parked_rx.recv_timeout(TEST_TIMEOUT);
+            let deadline = Instant::now() + GRACE;
+            assert!(!worker.shutdown_by(deadline));
+            cleanup_parked.expect("the cleanup runs and parks during the teardown");
+            while Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+            released.store(true, Ordering::SeqCst);
+            parked
+                .lock()
+                .expect("waker slot")
+                .take()
+                .expect("the cleanup parked its waker")
+                .wake();
+
+            assert_eq!(
+                completed(worker.completion()),
+                Err(ManagedWorkerError::TeardownDeadlineExceeded),
+                "round {round}: the teardown deadline passed before the cleanup's wake"
+            );
         }
     }
 
@@ -1129,6 +1191,7 @@ mod hosted_worker {
                     .unwrap()
                     .push(std::thread::current().name().map(str::to_owned));
             })),
+            on_thread_stop: None,
         };
         (started, pool)
     }
@@ -1199,6 +1262,1302 @@ mod hosted_worker {
                 Err(ManagedWorkerError::ThreadSpawn(_))
             ),
             "a NUL byte is a spawn error, not a panic on the first blocking thread"
+        );
+    }
+
+    /// Teardown deadline of the bounded-shutdown oracles (`DIV-043`).
+    const TEARDOWN_DEADLINE: Duration = Duration::from_millis(400);
+    /// How long past a teardown deadline these oracles join a worker.
+    const JOIN_SLACK: Duration = Duration::from_secs(2);
+    /// Bound on how late past its deadline a bounded wait may return.
+    const LATENESS: Duration = Duration::from_secs(1);
+
+    /// Reports the dropping thread and when it dropped.
+    struct TimedDropProbe(mpsc::Sender<(ThreadId, Instant)>);
+
+    impl Drop for TimedDropProbe {
+        fn drop(&mut self) {
+            let _ = self.0.send((std::thread::current().id(), Instant::now()));
+        }
+    }
+
+    thread_local! {
+        static TIMED_THREAD_EXIT: RefCell<Option<TimedDropProbe>> = const { RefCell::new(None) };
+    }
+
+    /// Reports the owner thread, and when it exited, from its last thread-local
+    /// destructor.
+    fn record_timed_thread_exit(handle: &WorkerHandle) -> mpsc::Receiver<(ThreadId, Instant)> {
+        let (exited_tx, exited_rx) = mpsc::channel();
+        wait(
+            handle
+                .call(move |_| {
+                    TIMED_THREAD_EXIT
+                        .with(|slot| *slot.borrow_mut() = Some(TimedDropProbe(exited_tx)));
+                })
+                .expect("exit probe admitted"),
+        )
+        .expect("exit probe installed");
+        exited_rx
+    }
+
+    /// Logs its label, the dropping thread and when it dropped.
+    struct LogProbe {
+        label: &'static str,
+        log: Arc<Mutex<Vec<(&'static str, ThreadId, Instant)>>>,
+    }
+
+    impl Drop for LogProbe {
+        fn drop(&mut self) {
+            self.log.lock().unwrap().push((
+                self.label,
+                std::thread::current().id(),
+                Instant::now(),
+            ));
+        }
+    }
+
+    /// Starts blocking-pool work on the worker that runs until the returned
+    /// sender releases it (or is dropped) and then reports its thread. With
+    /// `awaited`, a command awaits it, as a command awaiting
+    /// `tokio::net::lookup_host`, which resolves on the blocking pool, awaits a
+    /// held resolver; otherwise nothing does.
+    fn hold_blocking_work(
+        handle: &WorkerHandle,
+        awaited: bool,
+    ) -> (mpsc::Sender<()>, mpsc::Receiver<ThreadId>) {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        handle
+            .spawn_local(move |_| async move {
+                let blocking = tokio::task::spawn_blocking(move || {
+                    blocked_tx
+                        .send(())
+                        .expect("test observes the blocking work");
+                    let _ = release_rx.recv();
+                    let _ = finished_tx.send(std::thread::current().id());
+                });
+                if awaited {
+                    let _ = blocking.await;
+                }
+            })
+            .expect("command admitted");
+        blocked_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the blocking work starts");
+        (release_tx, finished_rx)
+    }
+
+    /// Parks a command that runs until the worker drops it.
+    fn park_command(handle: &WorkerHandle) {
+        let (started_tx, started_rx) = oneshot::channel();
+        handle
+            .spawn_local(move |_| async move {
+                started_tx.send(()).expect("test observes startup");
+                pending::<()>().await;
+            })
+            .expect("command admitted");
+        wait(started_rx).expect("command parked");
+    }
+
+    /// Runs `join` on a new thread and returns its result and when it returned;
+    /// a join that is not back by `bound` fails the test instead of hanging it.
+    fn join_off_owner_thread<Joined: Send + 'static>(
+        bound: Instant,
+        join: impl FnOnce() -> Joined + Send + 'static,
+    ) -> (Joined, Instant) {
+        let (joined_tx, joined_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let joined = join();
+            let _ = joined_tx.send((joined, Instant::now()));
+        });
+        joined_rx
+            .recv_timeout(bound.saturating_duration_since(Instant::now()) + LATENESS)
+            .expect("the bounded join returns by its deadline")
+    }
+
+    #[test]
+    fn a_teardown_deadline_abandons_held_blocking_work_and_ends_the_owner_thread() {
+        for awaited in [false, true] {
+            let worker =
+                HostedWorker::spawn(options("rox-hosted-deadline", 2)).expect("worker starts");
+            let handle = worker.handle();
+            let exited = record_timed_thread_exit(&handle);
+            let completion = worker.completion();
+            let (release, finished) = hold_blocking_work(&handle, awaited);
+
+            let deadline = Instant::now() + TEARDOWN_DEADLINE;
+            assert!(
+                worker.shutdown_by(deadline),
+                "the first call starts shutdown"
+            );
+            let join_deadline = deadline + JOIN_SLACK;
+            let (joined, returned) =
+                join_off_owner_thread(join_deadline, move || worker.join_by(join_deadline));
+            assert_eq!(
+                joined,
+                HostedWorkerJoin::Joined(Ok(())),
+                "awaited: {awaited}"
+            );
+            assert!(
+                returned < deadline + LATENESS,
+                "the join returned soon after the teardown deadline, awaited: {awaited}"
+            );
+            let (thread, exited_at) = exited
+                .try_recv()
+                .expect("the join waited for the owner thread's thread-local destructors");
+            assert_eq!(thread, handle.owner_thread());
+            assert!(
+                exited_at >= deadline,
+                "the held work kept the owner thread until the deadline, awaited: {awaited}"
+            );
+            assert_eq!(completion.borrow().clone(), Some(Ok(())));
+            assert_eq!(
+                finished.try_recv(),
+                Err(mpsc::TryRecvError::Empty),
+                "the blocking work was abandoned, still running, awaited: {awaited}"
+            );
+            release.send(()).expect("the blocking work still waits");
+            assert!(
+                finished.recv_timeout(TEST_TIMEOUT).is_ok(),
+                "abandoned blocking work still runs to its end"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_shutdowns_of_many_workers_do_not_wait_for_ones_held_in_blocking_work() {
+        const WORKERS: usize = 4;
+        const DEADLINE: Duration = Duration::from_secs(1);
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|index| {
+                HostedWorker::spawn(options(&format!("rox-hosted-many-{index}"), 2))
+                    .expect("worker starts")
+            })
+            .collect();
+        let exits: Vec<_> = workers
+            .iter()
+            .map(|worker| record_timed_thread_exit(&worker.handle()))
+            .collect();
+        // Worker 0 holds blocking work nothing awaits, worker 1 a held "resolver"
+        // its command awaits; workers 2 and 3 are healthy.
+        let held = [
+            hold_blocking_work(&workers[0].handle(), false),
+            hold_blocking_work(&workers[1].handle(), true),
+        ];
+        workers[2..]
+            .iter()
+            .for_each(|worker| park_command(&worker.handle()));
+
+        let start = Instant::now();
+        let deadline = start + DEADLINE;
+        for worker in &workers {
+            assert!(worker.shutdown_by(deadline));
+        }
+        // Joined in order, the held workers first, as one join thread would.
+        let join_deadline = deadline + JOIN_SLACK;
+        let (joined, returned) = join_off_owner_thread(join_deadline, move || {
+            workers
+                .into_iter()
+                .map(|worker| worker.join_by(join_deadline))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(joined, vec![HostedWorkerJoin::Joined(Ok(())); WORKERS]);
+        assert!(
+            returned < deadline + LATENESS,
+            "the joins returned soon after the shared deadline"
+        );
+        for (index, exited) in exits.iter().enumerate() {
+            let (_, exited_at) = exited.try_recv().expect("every owner thread exited");
+            if index < 2 {
+                assert!(
+                    exited_at >= deadline,
+                    "held worker {index} exited at the deadline"
+                );
+            } else {
+                assert!(
+                    exited_at < start + DEADLINE / 2,
+                    "healthy worker {index} exited without waiting for the held workers"
+                );
+            }
+        }
+        for (release, finished) in held {
+            release.send(()).expect("the blocking work still waits");
+            assert!(finished.recv_timeout(TEST_TIMEOUT).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_teardown_deadline_drops_tasks_whose_cleanup_never_finishes() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let hook_log = Arc::clone(&log);
+        let worker = HostedWorker::spawn(HostedWorkerOptions {
+            on_owner_thread_stop: Some(Box::new(move || {
+                hook_log.lock().unwrap().push((
+                    "hook",
+                    std::thread::current().id(),
+                    Instant::now(),
+                ));
+            })),
+            ..options("rox-hosted-deadline-cleanup", 2)
+        })
+        .expect("worker starts");
+        let handle = worker.handle();
+        let completion = worker.completion();
+        let probe = |label| LogProbe {
+            label,
+            log: Arc::clone(&log),
+        };
+        let (command, cleanup, local, runtime) = (
+            probe("command"),
+            probe("cleanup"),
+            probe("local"),
+            probe("runtime"),
+        );
+        let (started_tx, started_rx) = oneshot::channel();
+        handle
+            .spawn_local(move |context| async move {
+                let _cleanup = context
+                    .register_cleanup_task(async move {
+                        let _probe = cleanup;
+                        pending::<()>().await;
+                    })
+                    .expect("cleanup registered while open");
+                drop(tokio::task::spawn_local(async move {
+                    let _probe = local;
+                    pending::<()>().await;
+                }));
+                drop(tokio::spawn(async move {
+                    let _probe = runtime;
+                    pending::<()>().await;
+                }));
+                let _probe = command;
+                started_tx.send(()).expect("test observes startup");
+                pending::<()>().await;
+            })
+            .expect("command admitted");
+        wait(started_rx).expect("command parked");
+
+        let deadline = Instant::now() + TEARDOWN_DEADLINE;
+        assert!(worker.shutdown_by(deadline));
+        let join_deadline = deadline + JOIN_SLACK;
+        let (joined, returned) =
+            join_off_owner_thread(join_deadline, move || worker.join_by(join_deadline));
+        assert_eq!(
+            joined,
+            HostedWorkerJoin::Joined(Err(ManagedWorkerError::TeardownDeadlineExceeded))
+        );
+        assert!(returned < deadline + LATENESS);
+        assert_eq!(
+            completion.borrow().clone(),
+            Some(Err(ManagedWorkerError::TeardownDeadlineExceeded))
+        );
+        let log = log.lock().unwrap();
+        let mut labels: Vec<_> = log.iter().map(|(label, _, _)| *label).collect();
+        assert_eq!(
+            labels.pop(),
+            Some("hook"),
+            "the stop hook ran after every task was dropped, though the cleanup overran the \
+             deadline"
+        );
+        labels.sort_unstable();
+        assert_eq!(labels, ["cleanup", "command", "local", "runtime"]);
+        assert!(
+            log.iter()
+                .all(|(_, thread, _)| *thread == handle.owner_thread()),
+            "every LocalSet and runtime task was dropped, and the hook run, on the owner thread: \
+             {log:?}"
+        );
+        let cleanup_dropped = log
+            .iter()
+            .find_map(|(label, _, at)| (*label == "cleanup").then_some(*at))
+            .expect("cleanup dropped");
+        assert!(
+            cleanup_dropped >= deadline,
+            "the unfinished cleanup ran until the deadline"
+        );
+    }
+
+    #[test]
+    fn a_deadline_set_after_shutdown_began_still_drops_unfinished_cleanup() {
+        for first_deadline in [None, Some(Duration::from_secs(3600))] {
+            let worker =
+                HostedWorker::spawn(options("rox-hosted-late-deadline", 2)).expect("worker starts");
+            let handle = worker.handle();
+            let (started_tx, started_rx) = oneshot::channel();
+            handle
+                .spawn_local(move |context| async move {
+                    let _cleanup = context
+                        .register_cleanup_task(pending::<()>())
+                        .expect("cleanup registered while open");
+                    started_tx.send(()).expect("test observes startup");
+                    pending::<()>().await;
+                })
+                .expect("command admitted");
+            wait(started_rx).expect("command parked");
+
+            let started = match first_deadline {
+                None => worker.shutdown(),
+                Some(far) => worker.shutdown_by(Instant::now() + far),
+            };
+            assert!(started);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                worker.completion().borrow().is_none(),
+                "teardown waits for the cleanup, first deadline: {first_deadline:?}"
+            );
+            assert!(
+                !worker.shutdown_by(Instant::now() + Duration::from_millis(100)),
+                "shutdown had already started"
+            );
+            assert_eq!(
+                completed(worker.completion()),
+                Err(ManagedWorkerError::TeardownDeadlineExceeded),
+                "an earlier deadline set later bounds the teardown, first deadline: \
+                 {first_deadline:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_owner_thread_stop_hook_runs_on_the_owner_thread_after_every_task_is_dropped() {
+        for bounded in [false, true] {
+            stop_hook_runs_after_every_task_is_dropped(bounded);
+        }
+    }
+
+    /// With `bounded`, the teardown has a deadline it does not reach.
+    fn stop_hook_runs_after_every_task_is_dropped(bounded: bool) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let hook_log = Arc::clone(&log);
+        let completion_slot = Arc::new(Mutex::new(None::<Completion>));
+        let hook_completion = Arc::clone(&completion_slot);
+        let hook_saw = Arc::new(Mutex::new(None));
+        let hook_report = Arc::clone(&hook_saw);
+        let worker = HostedWorker::spawn(HostedWorkerOptions {
+            on_owner_thread_stop: Some(Box::new(move || {
+                *hook_report.lock().unwrap() = hook_completion
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|completion| completion.borrow().is_none());
+                hook_log.lock().unwrap().push((
+                    "hook",
+                    std::thread::current().id(),
+                    Instant::now(),
+                ));
+            })),
+            ..options("rox-hosted-stop-hook", 2)
+        })
+        .expect("worker starts");
+        *completion_slot.lock().unwrap() = Some(worker.completion());
+        let handle = worker.handle();
+        let probe = |label| LogProbe {
+            label,
+            log: Arc::clone(&log),
+        };
+        let (command, cleanup, local, runtime, blocking) = (
+            probe("command"),
+            probe("cleanup"),
+            probe("local"),
+            probe("runtime"),
+            probe("blocking"),
+        );
+        let (started_tx, started_rx) = oneshot::channel();
+        handle
+            .spawn_local(move |context| async move {
+                let _cleanup = context
+                    .register_cleanup_task(async move {
+                        let _probe = cleanup;
+                        tokio::task::yield_now().await;
+                    })
+                    .expect("cleanup registered while open");
+                drop(tokio::task::spawn_local(async move {
+                    let _probe = local;
+                    pending::<()>().await;
+                }));
+                drop(tokio::spawn(async move {
+                    let _probe = runtime;
+                    pending::<()>().await;
+                }));
+                drop(tokio::task::spawn_blocking(move || {
+                    let _probe = blocking;
+                    std::thread::sleep(Duration::from_millis(50));
+                }));
+                let _probe = command;
+                started_tx.send(()).expect("test observes startup");
+                pending::<()>().await;
+            })
+            .expect("command admitted");
+        wait(started_rx).expect("command parked");
+
+        if bounded {
+            assert!(worker.shutdown_by(Instant::now() + Duration::from_secs(3600)));
+        } else {
+            assert!(worker.shutdown());
+        }
+        assert_eq!(completed(worker.completion()), Ok(()));
+        let log = log.lock().unwrap();
+        let mut entries: Vec<_> = log
+            .iter()
+            .map(|(label, thread, _)| (*label, *thread == handle.owner_thread()))
+            .collect();
+        assert_eq!(
+            entries.pop(),
+            Some(("hook", true)),
+            "the hook ran last, on the owner thread, bounded: {bounded}: {log:?}"
+        );
+        entries.sort_unstable();
+        assert_eq!(
+            entries,
+            [
+                ("blocking", false),
+                ("cleanup", true),
+                ("command", true),
+                ("local", true),
+                ("runtime", true),
+            ],
+            "every task was dropped, the worker's on the owner thread, before the hook ran, \
+             bounded: {bounded}"
+        );
+        assert_eq!(
+            *hook_saw.lock().unwrap(),
+            Some(true),
+            "completion was published after the hook, bounded: {bounded}"
+        );
+        drop(worker);
+    }
+
+    #[test]
+    fn a_panicking_owner_thread_stop_hook_is_reported_as_an_owner_thread_panic() {
+        let worker = HostedWorker::spawn(HostedWorkerOptions {
+            on_owner_thread_stop: Some(Box::new(|| {
+                panic_any("injected owner-thread stop hook panic");
+            })),
+            ..options("rox-hosted-stop-hook-panic", 1)
+        })
+        .expect("worker starts");
+        let handle = worker.handle();
+        let exited = record_thread_exit(&handle);
+        let completion = worker.completion();
+        assert!(
+            drop_off_owner_thread(worker).is_ok(),
+            "Drop does not unwind"
+        );
+        assert_eq!(exited.try_recv(), Ok(handle.owner_thread()));
+        assert_eq!(
+            completion.borrow().clone(),
+            Some(Err(ManagedWorkerError::OwnerThreadPanicked))
+        );
+    }
+
+    #[test]
+    fn blocking_pool_threads_run_the_stop_hook_as_they_exit() {
+        for blocking_work in [true, false] {
+            let (started, mut pool) = blocking_pool("rox-w3-blk");
+            let stopped = Arc::new(Mutex::new(Vec::new()));
+            let log = Arc::clone(&stopped);
+            pool.on_thread_stop = Some(Arc::new(move || {
+                log.lock().unwrap().push((
+                    std::thread::current().name().map(str::to_owned),
+                    STARTED_BY_HOOK.with(std::cell::Cell::get),
+                ));
+            }));
+            let worker = HostedWorker::spawn_with_blocking_pool(options("rox-w3", 1), pool)
+                .expect("worker starts");
+            if blocking_work {
+                wait(
+                    worker
+                        .handle()
+                        .call_local(|_context| async {
+                            tokio::task::spawn_blocking(|| ())
+                                .await
+                                .expect("blocking work completes");
+                        })
+                        .expect("probe admitted"),
+                )
+                .expect("probe completes");
+            }
+            drop(worker);
+            let expected = if blocking_work {
+                vec![(Some("rox-w3-blk".to_owned()), true)]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                *stopped.lock().unwrap(),
+                expected,
+                "the stop hook ran on each blocking thread, the start hook's, as the runtime \
+                 joined it, and never on the owner thread"
+            );
+            assert_eq!(started.lock().unwrap().len(), expected.len());
+        }
+    }
+
+    #[test]
+    fn join_by_detaches_an_owner_thread_still_tearing_down_at_its_deadline() {
+        let worker = HostedWorker::spawn(options("rox-hosted-detach", 2)).expect("worker starts");
+        let handle = worker.handle();
+        let exited = record_thread_exit(&handle);
+        let completion = worker.completion();
+        let (release, finished) = hold_blocking_work(&handle, false);
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let (joined, returned) = join_off_owner_thread(deadline, move || worker.join_by(deadline));
+        assert_eq!(joined, HostedWorkerJoin::Detached);
+        assert!(returned >= deadline && returned < deadline + LATENESS);
+        assert!(
+            completion.borrow().is_none(),
+            "without a teardown deadline, teardown still waits for blocking work"
+        );
+        assert!(exited.try_recv().is_err(), "the owner thread still runs");
+
+        release.send(()).expect("the blocking work still waits");
+        assert!(finished.recv_timeout(TEST_TIMEOUT).is_ok());
+        assert_eq!(completed(completion), Ok(()));
+        assert_eq!(
+            exited.recv_timeout(TEST_TIMEOUT),
+            Ok(handle.owner_thread()),
+            "the detached owner thread exits once its teardown finishes"
+        );
+    }
+
+    #[test]
+    fn drop_after_shutdown_by_returns_by_the_teardown_deadline() {
+        let worker =
+            HostedWorker::spawn(options("rox-hosted-drop-deadline", 2)).expect("worker starts");
+        let handle = worker.handle();
+        let exited = record_timed_thread_exit(&handle);
+        let (release, finished) = hold_blocking_work(&handle, true);
+
+        let deadline = Instant::now() + TEARDOWN_DEADLINE;
+        assert!(worker.shutdown_by(deadline));
+        let ((), returned) = join_off_owner_thread(deadline, move || drop(worker));
+        assert!(
+            returned < deadline + LATENESS,
+            "Drop returned by the deadline"
+        );
+        let (thread, exited_at) = exited
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the owner thread exits");
+        assert_eq!(thread, handle.owner_thread());
+        assert!(exited_at >= deadline);
+        assert_eq!(finished.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release.send(()).expect("the blocking work still waits");
+        assert!(finished.recv_timeout(TEST_TIMEOUT).is_ok());
+    }
+
+    /// Reports that the owner thread's thread-local destructors reached it, holds
+    /// them until released (or until the release sender is dropped), then
+    /// reports that it returned.
+    struct HeldThreadExit {
+        entered: mpsc::Sender<ThreadId>,
+        release: mpsc::Receiver<()>,
+        returned: mpsc::Sender<()>,
+    }
+
+    impl Drop for HeldThreadExit {
+        fn drop(&mut self) {
+            let _ = self.entered.send(std::thread::current().id());
+            let _ = self.release.recv();
+            let _ = self.returned.send(());
+        }
+    }
+
+    thread_local! {
+        static HELD_THREAD_EXIT: RefCell<Option<HeldThreadExit>> = const { RefCell::new(None) };
+    }
+
+    /// Installs a thread-local destructor on the owner thread that runs after
+    /// `completion()` is published and holds the thread until the returned
+    /// sender releases it; the receivers report its entry and its return.
+    fn hold_thread_exit(
+        handle: &WorkerHandle,
+    ) -> (
+        mpsc::Sender<()>,
+        mpsc::Receiver<ThreadId>,
+        mpsc::Receiver<()>,
+    ) {
+        let (release_tx, release) = mpsc::channel();
+        let (entered, entered_rx) = mpsc::channel();
+        let (returned, returned_rx) = mpsc::channel();
+        wait(
+            handle
+                .call(move |_| {
+                    HELD_THREAD_EXIT.with(|slot| {
+                        *slot.borrow_mut() = Some(HeldThreadExit {
+                            entered,
+                            release,
+                            returned,
+                        });
+                    });
+                })
+                .expect("held exit admitted"),
+        )
+        .expect("held exit installed");
+        (release_tx, entered_rx, returned_rx)
+    }
+
+    #[test]
+    fn bounded_joins_return_by_their_deadline_while_a_thread_local_destructor_holds_the_owner_thread()
+     {
+        for by_drop in [false, true] {
+            let worker =
+                HostedWorker::spawn(options("rox-hosted-held-tls", 2)).expect("worker starts");
+            let handle = worker.handle();
+            let completion = worker.completion();
+            let (release, entered, returned_from_destructor) = hold_thread_exit(&handle);
+
+            let deadline = Instant::now() + TEARDOWN_DEADLINE;
+            assert!(worker.shutdown_by(deadline));
+            let (joined, returned) = if by_drop {
+                let ((), returned) = join_off_owner_thread(deadline, move || drop(worker));
+                (None, returned)
+            } else {
+                let (joined, returned) =
+                    join_off_owner_thread(deadline, move || worker.join_by(deadline));
+                (Some(joined), returned)
+            };
+            assert!(
+                joined.is_none_or(|joined| joined == HostedWorkerJoin::Detached),
+                "join_by detached the owner thread held in its destructors, by drop: {by_drop}"
+            );
+            assert!(
+                returned >= deadline && returned < deadline + LATENESS,
+                "the join waited for the thread's exit until the deadline, and no longer, by drop: \
+                 {by_drop}"
+            );
+            assert_eq!(
+                entered.try_recv(),
+                Ok(handle.owner_thread()),
+                "the owner thread was in its thread-local destructors"
+            );
+            assert_eq!(completion.borrow().clone(), Some(Ok(())));
+            assert_eq!(
+                returned_from_destructor.try_recv(),
+                Err(mpsc::TryRecvError::Empty),
+                "the destructor still holds the detached owner thread"
+            );
+            release.send(()).expect("the destructor still waits");
+            assert_eq!(
+                returned_from_destructor.recv_timeout(TEST_TIMEOUT),
+                Ok(()),
+                "the detached owner thread finishes its destructors once released"
+            );
+        }
+    }
+
+    #[test]
+    fn a_join_after_its_deadline_still_reports_an_owner_thread_that_exited_in_time() {
+        let held = HostedWorker::spawn(options("rox-hosted-held-first", 2)).expect("worker starts");
+        let healthy =
+            HostedWorker::spawn(options("rox-hosted-exits-early", 2)).expect("worker starts");
+        let healthy_exited = record_timed_thread_exit(&healthy.handle());
+        let (release, _, _) = hold_thread_exit(&held.handle());
+
+        let deadline = Instant::now() + TEARDOWN_DEADLINE;
+        assert!(held.shutdown_by(deadline));
+        assert!(healthy.shutdown_by(deadline));
+        // Joined in order, as one join thread would: the held worker uses up the
+        // deadline, so the healthy one is joined after it.
+        let (joined, _) = join_off_owner_thread(deadline, move || {
+            [held, healthy].map(|worker| worker.join_by(deadline))
+        });
+        let (_, healthy_exited_at) = healthy_exited
+            .try_recv()
+            .expect("the healthy owner thread exited");
+        assert!(healthy_exited_at < deadline);
+        assert_eq!(
+            joined,
+            [HostedWorkerJoin::Detached, HostedWorkerJoin::Joined(Ok(()))],
+            "a worker whose owner thread exited before the deadline is joined, though the join \
+             starts after it"
+        );
+        release.send(()).expect("the destructor still waits");
+    }
+
+    #[test]
+    fn a_shorter_deadline_set_during_the_runtimes_blocking_wait_ends_the_teardown_by_it() {
+        let worker = HostedWorker::spawn(options("rox-hosted-shorten", 2)).expect("worker starts");
+        let handle = worker.handle();
+        let exited = record_timed_thread_exit(&handle);
+        let completion = worker.completion();
+        let (release, finished) = hold_blocking_work(&handle, false);
+        // The runtime drops its tasks before it waits for blocking work, so this
+        // task's drop marks that the teardown has reached the runtime.
+        let (runtime_dropped_tx, runtime_dropped) = mpsc::channel();
+        wait(
+            handle
+                .call(move |_| {
+                    drop(tokio::spawn(async move {
+                        let _probe = TimedDropProbe(runtime_dropped_tx);
+                        pending::<()>().await;
+                    }));
+                })
+                .expect("runtime task admitted"),
+        )
+        .expect("runtime task spawned");
+
+        assert!(worker.shutdown_by(Instant::now() + Duration::from_secs(3600)));
+        runtime_dropped
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the teardown drops the runtime's tasks before waiting for blocking work");
+        // Lets the owner thread finish dropping the runtime and start waiting, by the
+        // far deadline, for the held blocking work.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            completion.borrow().is_none(),
+            "the runtime teardown waits for the held blocking work"
+        );
+        let deadline = Instant::now() + TEARDOWN_DEADLINE;
+        assert!(
+            !worker.shutdown_by(deadline),
+            "shutdown had already started"
+        );
+        let join_deadline = deadline + JOIN_SLACK;
+        let (joined, returned) =
+            join_off_owner_thread(join_deadline, move || worker.join_by(join_deadline));
+        assert_eq!(joined, HostedWorkerJoin::Joined(Ok(())));
+        assert!(
+            returned < deadline + LATENESS,
+            "the teardown ended by the shorter deadline"
+        );
+        let (thread, exited_at) = exited
+            .try_recv()
+            .expect("the join waited for the owner thread to exit");
+        assert_eq!(thread, handle.owner_thread());
+        assert!(exited_at >= deadline, "the owner thread waited until then");
+        assert_eq!(
+            finished.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "the blocking work was abandoned, still running"
+        );
+        release.send(()).expect("the blocking work still waits");
+        assert!(finished.recv_timeout(TEST_TIMEOUT).is_ok());
+    }
+
+    #[test]
+    fn a_runtime_task_whose_drop_releases_blocking_work_lets_a_bounded_teardown_finish_promptly() {
+        let worker = HostedWorker::spawn(options("rox-hosted-gated", 2)).expect("worker starts");
+        let handle = worker.handle();
+        let (blocked_tx, blocked) = mpsc::channel();
+        let (finished_tx, finished) = mpsc::channel();
+        let (task_dropped_tx, task_dropped) = mpsc::channel();
+        wait(
+            handle
+                .call(move |_| {
+                    let (gate_tx, gate) = mpsc::channel::<()>();
+                    drop(tokio::task::spawn_blocking(move || {
+                        blocked_tx
+                            .send(())
+                            .expect("test observes the blocking work");
+                        // Returns once the runtime task holding the sender is dropped.
+                        let _ = gate.recv();
+                        let _ = finished_tx.send(());
+                    }));
+                    drop(tokio::spawn(async move {
+                        let _gate = gate_tx;
+                        let _probe = DropProbe(task_dropped_tx);
+                        pending::<()>().await;
+                    }));
+                })
+                .expect("work admitted"),
+        )
+        .expect("work started");
+        blocked
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the blocking work waits on the runtime task");
+
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(5);
+        assert!(worker.shutdown_by(deadline));
+        let (joined, returned) = join_off_owner_thread(deadline, move || worker.join_by(deadline));
+        assert_eq!(joined, HostedWorkerJoin::Joined(Ok(())));
+        assert!(
+            returned < start + Duration::from_secs(2),
+            "dropping the runtime's tasks first released the blocking work, so the teardown \
+             finished well before its deadline"
+        );
+        assert_eq!(
+            finished.try_recv(),
+            Ok(()),
+            "the blocking work ran to its end"
+        );
+        let dropped_on = task_dropped
+            .try_recv()
+            .expect("the runtime task was dropped");
+        assert_eq!(
+            dropped_on,
+            handle.owner_thread(),
+            "with a teardown deadline the runtime's tasks are still dropped on the owner thread"
+        );
+    }
+
+    #[test]
+    fn a_command_panic_is_still_reported_when_its_cleanup_overruns_the_teardown_deadline() {
+        let worker =
+            HostedWorker::spawn(options("rox-hosted-panic-deadline", 2)).expect("worker starts");
+        let handle = worker.handle();
+        handle
+            .spawn_local(move |context| async move {
+                let _cleanup = context
+                    .register_cleanup_task(pending::<()>())
+                    .expect("cleanup registered while open");
+                tokio::task::yield_now().await;
+                panic!("injected hosted command panic");
+            })
+            .expect("command admitted");
+        wait(handle.quiescing());
+        assert_eq!(handle.state(), WorkerState::Closing);
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        assert!(!worker.shutdown_by(deadline), "the panic started shutdown");
+        assert_eq!(
+            completed(worker.completion()),
+            Err(ManagedWorkerError::TaskGroup(TaskGroupError::TaskPanicked)),
+            "the panic is reported, not a clean overrun"
+        );
+    }
+
+    #[test]
+    fn a_driver_panic_is_still_reported_when_cleanup_overruns_the_teardown_deadline() {
+        let worker =
+            HostedWorker::spawn(options("rox-hosted-driver-panic", 2)).expect("worker starts");
+        let handle = worker.handle();
+        let (started_tx, started_rx) = oneshot::channel();
+        handle
+            .spawn_local(move |context| async move {
+                let _cleanup = context
+                    .register_cleanup_task(pending::<()>())
+                    .expect("cleanup registered while open");
+                started_tx.send(()).expect("test observes startup");
+                pending::<()>().await;
+            })
+            .expect("command admitted");
+        wait(started_rx).expect("command parked");
+        // The next driver pass on the owner thread panics outside any command.
+        wait(
+            handle
+                .call(|_| {
+                    crate::worker::set_driver_intake_hook(Some(|_: &WorkerHandle| {
+                        panic_any("injected worker driver panic");
+                    }));
+                })
+                .expect("hook admitted"),
+        )
+        .expect("hook installed");
+        wait(handle.quiescing());
+        assert_eq!(handle.state(), WorkerState::Closing);
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        assert!(!worker.shutdown_by(deadline), "the panic started shutdown");
+        assert_eq!(
+            completed(worker.completion()),
+            Err(ManagedWorkerError::TaskGroup(TaskGroupError::TaskPanicked)),
+            "the driver's panic is reported, not a clean overrun"
+        );
+    }
+
+    #[test]
+    fn drop_after_shutdown_by_detaches_an_owner_thread_that_cannot_finish_by_the_deadline() {
+        let worker =
+            HostedWorker::spawn(options("rox-hosted-drop-detach", 2)).expect("worker starts");
+        let handle = worker.handle();
+        let exited = record_thread_exit(&handle);
+        let completion = worker.completion();
+        // A held borrow keeps the owner thread from publishing completion, which
+        // no teardown deadline can bound.
+        let borrowed = completion.borrow();
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        assert!(worker.shutdown_by(deadline));
+        let ((), returned) = join_off_owner_thread(deadline, move || drop(worker));
+        assert!(
+            returned >= deadline && returned < deadline + LATENESS,
+            "Drop waited until the deadline and then detached the owner thread"
+        );
+        assert!(borrowed.is_none());
+        assert!(exited.try_recv().is_err(), "the owner thread still runs");
+        drop(borrowed);
+        assert_eq!(
+            exited.recv_timeout(TEST_TIMEOUT),
+            Ok(handle.owner_thread()),
+            "the detached owner thread exits once it can publish"
+        );
+        assert_eq!(completion.borrow().clone(), Some(Ok(())));
+    }
+
+    /// What a [`ThreadAffine`] value does when it is dropped off its owner thread.
+    #[derive(Clone, Copy, Debug)]
+    enum OnForeignDrop {
+        /// Reports it, then panics (Tokio catches a panic dropping a task).
+        Panic,
+        /// Aborts the process, as the router's `LocalOnly` bridge does.
+        Abort,
+    }
+
+    /// A value bound to the thread that creates it, such as a request body the
+    /// router wraps in its `LocalOnly` Send bridge: it reports whether it was
+    /// dropped on that thread and whether the owner-thread stop hook had run
+    /// by then, and panics or aborts if it was dropped anywhere else.
+    struct ThreadAffine {
+        owner: ThreadId,
+        on_foreign_drop: OnForeignDrop,
+        hook_ran: Arc<AtomicBool>,
+        report: mpsc::Sender<(bool, bool)>,
+    }
+
+    impl Drop for ThreadAffine {
+        fn drop(&mut self) {
+            let on_owner = std::thread::current().id() == self.owner;
+            let _ = self
+                .report
+                .send((on_owner, self.hook_ran.load(Ordering::SeqCst)));
+            if on_owner {
+                return;
+            }
+            match self.on_foreign_drop {
+                OnForeignDrop::Panic => {
+                    panic!("a thread-affine value was dropped off its owner thread")
+                }
+                OnForeignDrop::Abort => {
+                    eprintln!("a thread-affine value was dropped off its owner thread");
+                    std::process::abort();
+                }
+            }
+        }
+    }
+
+    /// Stops a worker with `shutdown_by` while a pending `tokio::spawn` task
+    /// holds a [`ThreadAffine`] value created on the owner thread, as a hidden
+    /// prefill drain holds a `LocalOnly` engine response. With `overrun`, a
+    /// registered cleanup that never finishes holds the teardown past its
+    /// deadline. Returns how the join ended and the value's report.
+    fn stop_with_a_pending_thread_affine_runtime_task(
+        overrun: bool,
+        on_foreign_drop: OnForeignDrop,
+    ) -> (HostedWorkerJoin, (bool, bool)) {
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let hook_flag = Arc::clone(&hook_ran);
+        let worker = HostedWorker::spawn(HostedWorkerOptions {
+            on_owner_thread_stop: Some(Box::new(move || hook_flag.store(true, Ordering::SeqCst))),
+            ..options("rox-hosted-affine", 2)
+        })
+        .expect("worker starts");
+        let handle = worker.handle();
+        let (report_tx, report) = mpsc::channel();
+        let (started_tx, started_rx) = oneshot::channel();
+        handle
+            .spawn_local(move |context| async move {
+                let _cleanup = overrun.then(|| {
+                    context
+                        .register_cleanup_task(pending::<()>())
+                        .expect("cleanup registered while open")
+                });
+                let affine = ThreadAffine {
+                    owner: std::thread::current().id(),
+                    on_foreign_drop,
+                    hook_ran,
+                    report: report_tx,
+                };
+                drop(tokio::spawn(async move {
+                    let _affine = affine;
+                    pending::<()>().await;
+                }));
+                started_tx.send(()).expect("test observes startup");
+                pending::<()>().await;
+            })
+            .expect("command admitted");
+        wait(started_rx).expect("command parked");
+
+        let deadline = Instant::now() + TEARDOWN_DEADLINE;
+        assert!(worker.shutdown_by(deadline));
+        let join_deadline = deadline + JOIN_SLACK;
+        let (joined, _) =
+            join_off_owner_thread(join_deadline, move || worker.join_by(join_deadline));
+        let report = report
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the runtime task's value was dropped");
+        (joined, report)
+    }
+
+    #[test]
+    fn a_pending_runtime_task_is_dropped_on_the_owner_thread_before_the_hook_under_a_teardown_deadline()
+     {
+        for (overrun, expected) in [
+            (false, HostedWorkerJoin::Joined(Ok(()))),
+            (
+                true,
+                HostedWorkerJoin::Joined(Err(ManagedWorkerError::TeardownDeadlineExceeded)),
+            ),
+        ] {
+            let (joined, (on_owner, hook_ran)) =
+                stop_with_a_pending_thread_affine_runtime_task(overrun, OnForeignDrop::Panic);
+            assert_eq!(joined, expected, "overrun: {overrun}");
+            assert!(
+                on_owner,
+                "the runtime task was dropped on the owner thread, overrun: {overrun}"
+            );
+            assert!(
+                !hook_ran,
+                "the runtime task was dropped before the stop hook ran, overrun: {overrun}"
+            );
+        }
+    }
+
+    const THREAD_AFFINE_CHILD: &str = "ROXYGEN_HOSTED_WORKER_THREAD_AFFINE_CHILD";
+
+    #[test]
+    fn a_bounded_teardown_never_drops_a_thread_affine_runtime_task_off_the_owner_thread() {
+        if std::env::var_os(THREAD_AFFINE_CHILD).is_some() {
+            for overrun in [false, true] {
+                let (_, report) =
+                    stop_with_a_pending_thread_affine_runtime_task(overrun, OnForeignDrop::Abort);
+                assert_eq!(report, (true, false), "overrun: {overrun}");
+            }
+            return;
+        }
+        let child = run_in_child_process(
+            "a_bounded_teardown_never_drops_a_thread_affine_runtime_task_off_the_owner_thread",
+            THREAD_AFFINE_CHILD,
+        );
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            child.status.success() && stdout.contains("1 passed"),
+            "a pending runtime task holding a value that aborts the process when dropped off its \
+             owner thread survives a clean and an overrun bounded teardown: {}\nstdout:\n\
+             {stdout}\nstderr:\n{}",
+            child.status,
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
+    #[test]
+    fn a_bounded_teardown_waits_for_a_blocking_thread_still_in_its_start_hook() {
+        let (entered_tx, entered) = mpsc::channel();
+        let (gate_tx, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let worker = HostedWorker::spawn_with_blocking_pool(
+            options("rox-w4", 2),
+            HostedWorkerBlockingPool {
+                thread_name: "rox-w4-blk".to_owned(),
+                on_thread_start: Some(Arc::new(move || {
+                    let _ = entered_tx.send(());
+                    let _ = gate.lock().unwrap().recv();
+                })),
+                on_thread_stop: None,
+            },
+        )
+        .expect("worker starts");
+        let handle = worker.handle();
+        let completion = worker.completion();
+        let (finished_tx, finished) = mpsc::channel();
+        wait(
+            handle
+                .call(move |_| {
+                    drop(tokio::task::spawn_blocking(move || {
+                        let _ = finished_tx.send(());
+                    }));
+                })
+                .expect("work admitted"),
+        )
+        .expect("work spawned");
+        entered
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the blocking thread runs its start hook");
+
+        assert!(worker.shutdown_by(Instant::now() + Duration::from_secs(3600)));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            completion.borrow().is_none(),
+            "the teardown waits for a blocking thread that has not finished starting"
+        );
+        drop(gate_tx);
+        assert_eq!(completed(completion), Ok(()));
+        assert_eq!(
+            finished.try_recv(),
+            Ok(()),
+            "the work queued for that thread ran before completion was published"
+        );
+        drop(worker);
+    }
+
+    #[test]
+    fn a_bounded_teardown_waits_for_blocking_work_its_cleanup_spawns_as_it_ends() {
+        // Each round's teardown reaches its wait for blocking-pool threads microseconds
+        // after the cleanup spawned the thread, often before that thread has started.
+        for round in 0..500 {
+            let finished = Arc::new(AtomicBool::new(false));
+            let hook_saw = Arc::new(Mutex::new(None));
+            let (hook_finished, hook_report) = (Arc::clone(&finished), Arc::clone(&hook_saw));
+            let worker = HostedWorker::spawn(HostedWorkerOptions {
+                on_owner_thread_stop: Some(Box::new(move || {
+                    *hook_report.lock().unwrap() = Some(hook_finished.load(Ordering::SeqCst));
+                })),
+                ..options("rox-hosted-late-blocking", 2)
+            })
+            .expect("worker starts");
+            let work_finished = Arc::clone(&finished);
+            let (started_tx, started_rx) = oneshot::channel();
+            worker
+                .handle()
+                .spawn_local(move |context| async move {
+                    let _cleanup = context
+                        .register_cleanup_task(async move {
+                            drop(tokio::task::spawn_blocking(move || {
+                                work_finished.store(true, Ordering::SeqCst);
+                            }));
+                        })
+                        .expect("cleanup registered while open");
+                    started_tx.send(()).expect("test observes startup");
+                    pending::<()>().await;
+                })
+                .expect("command admitted");
+            wait(started_rx).expect("command parked");
+
+            assert!(worker.shutdown_by(Instant::now() + Duration::from_secs(3600)));
+            assert_eq!(completed(worker.completion()), Ok(()));
+            assert_eq!(
+                *hook_saw.lock().unwrap(),
+                Some(true),
+                "the blocking work the cleanup spawned finished before the stop hook, round \
+                 {round}"
+            );
+            drop(worker);
+        }
+    }
+
+    #[test]
+    fn a_dropped_worker_releases_its_runtime_and_blocking_pool_hooks() {
+        for bounded in [false, true] {
+            let sentinel = Arc::new(());
+            let held = Arc::clone(&sentinel);
+            let worker = HostedWorker::spawn_with_blocking_pool(
+                options("rox-w7", 1),
+                HostedWorkerBlockingPool {
+                    thread_name: "rox-w7-blk".to_owned(),
+                    on_thread_start: Some(Arc::new(move || {
+                        let _ = &held;
+                    })),
+                    on_thread_stop: None,
+                },
+            )
+            .expect("worker starts");
+            if bounded {
+                assert!(worker.shutdown_by(Instant::now() + TEST_TIMEOUT));
+            }
+            assert!(drop_off_owner_thread(worker).is_ok());
+            assert_eq!(
+                Arc::strong_count(&sentinel),
+                1,
+                "the runtime, which owns the blocking-pool hooks, was released, bounded: {bounded}"
+            );
+        }
+    }
+
+    /// Stops a worker whose blocking pool ran a thread with `pool`'s hooks
+    /// under a far teardown deadline; returns how long the join took.
+    fn bounded_teardown_after_a_blocking_thread(
+        thread_name: &str,
+        pool: HostedWorkerBlockingPool,
+        started: mpsc::Receiver<()>,
+    ) -> (HostedWorkerJoin, Duration) {
+        let worker = HostedWorker::spawn_with_blocking_pool(options(thread_name, 2), pool)
+            .expect("worker starts");
+        wait(
+            worker
+                .handle()
+                .call(|_| drop(tokio::task::spawn_blocking(|| ())))
+                .expect("work admitted"),
+        )
+        .expect("work spawned");
+        started
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the blocking thread starts");
+
+        let start = Instant::now();
+        assert!(worker.shutdown_by(start + Duration::from_secs(3600)));
+        let join_deadline = start + Duration::from_secs(5);
+        let (joined, returned) =
+            join_off_owner_thread(join_deadline, move || worker.join_by(join_deadline));
+        (joined, returned - start)
+    }
+
+    #[test]
+    fn a_panicking_blocking_stop_hook_does_not_hold_a_bounded_teardown() {
+        let (started_tx, started) = mpsc::channel();
+        let (joined, took) = bounded_teardown_after_a_blocking_thread(
+            "rox-w5",
+            HostedWorkerBlockingPool {
+                thread_name: "rox-w5-blk".to_owned(),
+                on_thread_start: Some(Arc::new(move || {
+                    let _ = started_tx.send(());
+                })),
+                on_thread_stop: Some(Arc::new(|| {
+                    panic_any("injected blocking stop hook panic");
+                })),
+            },
+            started,
+        );
+        assert_eq!(joined, HostedWorkerJoin::Joined(Ok(())));
+        assert!(
+            took < Duration::from_secs(2),
+            "the blocking thread counted as exited though its stop hook panicked: {took:?}"
+        );
+    }
+
+    #[test]
+    fn a_panicking_blocking_start_hook_does_not_hold_a_bounded_teardown() {
+        let (panicked_tx, panicked) = mpsc::channel();
+        let first = AtomicBool::new(true);
+        let worker = HostedWorker::spawn_with_blocking_pool(
+            options("rox-w6", 2),
+            HostedWorkerBlockingPool {
+                thread_name: "rox-w6-blk".to_owned(),
+                on_thread_start: Some(Arc::new(move || {
+                    if first.swap(false, Ordering::SeqCst) {
+                        let _ = panicked_tx.send(());
+                        panic_any("injected blocking start hook panic");
+                    }
+                })),
+                on_thread_stop: None,
+            },
+        )
+        .expect("worker starts");
+        let handle = worker.handle();
+        wait(
+            handle
+                .call(|_| drop(tokio::task::spawn_blocking(|| ())))
+                .expect("work admitted"),
+        )
+        .expect("work spawned");
+        panicked
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the first blocking thread's start hook panics");
+        // A second blocking thread runs this and the work the first one left queued,
+        // which Tokio would otherwise keep queued, holding the runtime, forever.
+        wait(
+            handle
+                .call_local(|_| async {
+                    tokio::task::spawn_blocking(|| ())
+                        .await
+                        .expect("blocking work completes");
+                })
+                .expect("work admitted"),
+        )
+        .expect("work completes");
+
+        let start = Instant::now();
+        assert!(worker.shutdown_by(start + Duration::from_secs(3600)));
+        let join_deadline = start + Duration::from_secs(5);
+        let (joined, returned) =
+            join_off_owner_thread(join_deadline, move || worker.join_by(join_deadline));
+        assert_eq!(joined, HostedWorkerJoin::Joined(Ok(())));
+        assert!(
+            returned - start < Duration::from_secs(2),
+            "the blocking thread whose start hook panicked counted as exited: {:?}",
+            returned - start
         );
     }
 }

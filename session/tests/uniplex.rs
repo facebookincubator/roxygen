@@ -1605,6 +1605,7 @@ pub(crate) fn run_on_hosted_worker<T: Send + 'static>(
     let worker = HostedWorker::spawn(HostedWorkerOptions {
         command_capacity: NonZeroUsize::new(16).expect("nonzero capacity"),
         thread_name: "uniplex-timers".to_owned(),
+        on_owner_thread_stop: None,
     })
     .expect("hosted worker starts");
     let call = worker
