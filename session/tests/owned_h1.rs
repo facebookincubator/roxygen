@@ -254,6 +254,47 @@ struct H1App {
     drain_in: CancelIn,
     /// The first exchange panics from this point of its retirement: `complete` or `drop`.
     panic_in: Option<&'static str>,
+    /// Each exchange with a request body keeps it unread and stops it with this code, at this
+    /// point.
+    stop_request: Option<(HttpErrorCode, StopAt)>,
+    /// Where each exchange keeps its request body for `StopAt::Script`.
+    script_held: Rc<RefCell<Option<HttpSourceHolder>>>,
+}
+
+/// Where an exchange with `H1App::stop_request` stops its request body.
+#[derive(Clone, Copy, Debug)]
+enum StopAt {
+    /// In `poll_headers`, just before it returns the response head.
+    Head,
+    /// In `poll_body`, once `H1App::body_gate` is notified. That poll returns `Pending`, so the
+    /// driver sees the stop before the response's next event.
+    Body,
+    /// In `poll_body`, once `H1App::body_gate` is notified, in the poll that returns the
+    /// response's last event.
+    Last,
+    /// In the cancellation callback of a byte event registered on the response's last event,
+    /// which the driver refuses before it serializes that event.
+    Refusal,
+    /// By the test, outside the driver's poll, from `H1App::script_held`. The response waits
+    /// for `H1App::body_gate`.
+    Script,
+}
+
+/// Stops a held request body from a byte event's cancellation callback.
+struct StopOnRefusal {
+    code: HttpErrorCode,
+    held: RefCell<Option<HttpSourceHolder>>,
+}
+
+impl HttpByteEventCallback for StopOnRefusal {
+    fn on_byte_event(&self, _event: HttpByteEvent) {}
+
+    fn on_byte_event_cancelled(&self, _event: HttpByteEvent, _error: HttpError) {
+        let held = self.held.borrow_mut().take();
+        if let Some(mut body) = held {
+            body.stop_reading(Some(self.code));
+        }
+    }
 }
 
 type CancelIn = Rc<RefCell<Option<(&'static str, OwnedH1Handle)>>>;
@@ -384,6 +425,8 @@ impl H1App {
                 cancel_in: Rc::default(),
                 drain_in: Rc::default(),
                 panic_in: None,
+                stop_request: None,
+                script_held: Rc::default(),
             },
             probes,
         )
@@ -398,6 +441,13 @@ struct H1Exchange {
     cancel_in: CancelIn,
     drain_in: CancelIn,
     panic_in: Option<&'static str>,
+    stop_request: Option<(HttpErrorCode, StopAt)>,
+    /// The request body kept unread until `stop_request` stops it.
+    held: Option<HttpSourceHolder>,
+    /// Holds the request body instead of `held` for `StopAt::Refusal`.
+    refusal: Option<Rc<StopOnRefusal>>,
+    /// Holds the request body instead of `held` for `StopAt::Script`.
+    script_held: Rc<RefCell<Option<HttpSourceHolder>>>,
     probe: Rc<H1Probe>,
     upload: Option<LocalSourceFuture<Result<(), HttpError>>>,
     interim: VecDeque<HttpHeaderEvent>,
@@ -434,6 +484,24 @@ impl OwnedApplication for H1App {
                     .push(HttpByteEventRegistration::new(None, write, &probe));
             }
         }
+        let refusal = match self.stop_request {
+            Some((code, StopAt::Refusal)) => {
+                let stop = Rc::new(StopOnRefusal {
+                    code,
+                    held: RefCell::default(),
+                });
+                body.back_mut()
+                    .expect("the response has a last event")
+                    .byte_event_registrations_mut()
+                    .push(HttpByteEventRegistration::new(
+                        None,
+                        ByteEventType::TransportWrite.bit(),
+                        &stop,
+                    ));
+                Some(stop)
+            }
+            _ => None,
+        };
         note("new", ordinal);
         cancel_from(&self.cancel_in, "new_exchange");
         H1Exchange {
@@ -444,6 +512,10 @@ impl OwnedApplication for H1App {
             cancel_in: Rc::clone(&self.cancel_in),
             drain_in: Rc::clone(&self.drain_in),
             panic_in: self.panic_in.filter(|_| ordinal == 0),
+            stop_request: self.stop_request,
+            held: None,
+            refusal,
+            script_held: Rc::clone(&self.script_held),
             probe,
             upload: None,
             interim: response.interim_events(),
@@ -463,6 +535,13 @@ impl H1Exchange {
         self.upload.take();
         Poll::Ready(result)
     }
+
+    /// Stops the held request body with `code`.
+    fn stop_held(&mut self, code: HttpErrorCode) {
+        if let Some(mut body) = self.held.take() {
+            body.stop_reading(Some(code));
+        }
+    }
 }
 
 impl OwnedExchange for H1Exchange {
@@ -472,6 +551,24 @@ impl OwnedExchange for H1Exchange {
         drain_from(&self.drain_in, "request");
         let mut body = body.into_source_holder();
         if eom || self.respond_early {
+            return;
+        }
+        if let Some((_, at)) = self.stop_request {
+            match (&self.refusal, at) {
+                (Some(stop), _) => *stop.held.borrow_mut() = Some(body),
+                (None, StopAt::Script) => {
+                    *self.script_held.borrow_mut() = Some(body);
+                    let gate = self
+                        .body_gate
+                        .clone()
+                        .expect("a script stop releases the response");
+                    self.upload = Some(Box::pin(async move {
+                        gate.notified().await;
+                        Ok(())
+                    }));
+                }
+                (None, _) => self.held = Some(body),
+            }
             return;
         }
         let probe = Rc::clone(&self.probe);
@@ -494,6 +591,9 @@ impl OwnedExchange for H1Exchange {
         if !self.tunnel {
             std::task::ready!(self.poll_upload(context))?;
         }
+        if let Some((code, StopAt::Head)) = self.stop_request {
+            self.stop_held(code);
+        }
         self.probe
             .headers_polled
             .set(self.probe.headers_polled.get() + 1);
@@ -510,6 +610,37 @@ impl OwnedExchange for H1Exchange {
         context: &mut Context<'_>,
         maximum: u32,
     ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        if let Some((code, StopAt::Body)) = self.stop_request
+            && self.held.is_some()
+        {
+            if self.upload.is_none()
+                && let Some(gate) = self.body_gate.clone()
+            {
+                self.upload = Some(Box::pin(async move {
+                    gate.notified().await;
+                    Ok(())
+                }));
+            }
+            std::task::ready!(self.poll_upload(context))?;
+            self.stop_held(code);
+            context.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        if let Some((code, StopAt::Last)) = self.stop_request
+            && self.held.is_some()
+            && self.body.len() == 1
+        {
+            if self.upload.is_none()
+                && let Some(gate) = self.body_gate.clone()
+            {
+                self.upload = Some(Box::pin(async move {
+                    gate.notified().await;
+                    Ok(())
+                }));
+            }
+            std::task::ready!(self.poll_upload(context))?;
+            self.stop_held(code);
+        }
         std::task::ready!(self.poll_upload(context))?;
         cancel_from(&self.cancel_in, "poll_body");
         assert_ne!(
@@ -4501,4 +4632,919 @@ fn idle_close_parks_until_the_read_completes() {
             assert_eq!(state.borrow().close, CloseKind::ShutdownWrite);
         })
     });
+}
+
+/// A chunked POST whose upload is still open.
+const OPEN_UPLOAD: &[u8] =
+    b"POST /u HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n";
+/// The rest of `OPEN_UPLOAD`'s body.
+const UPLOAD_END: &[u8] = b"5\r\nfinal\r\n0\r\n\r\n";
+const NEXT_GET: &[u8] = b"GET /2 HTTP/1.1\r\nHost: a\r\n\r\n";
+/// The end of `trailered_response`'s bytes.
+const TRAILERED_END: &str = "\r\n\r\n5\r\nreply\r\n0\r\nx-trailer: t\r\n\r\n";
+/// Yields a `stop_run` script allows the connection to finish before it offers more input.
+const STOP_SETTLE: usize = 256;
+
+/// A chunked response whose trailer section ends it.
+fn trailered_response() -> Response {
+    Response {
+        content_length: false,
+        trailers: vec![("x-trailer", "t")],
+        ..Response::fixed(200, b"reply")
+    }
+}
+
+/// One `stop_run`.
+struct StopCase {
+    stop: (HttpErrorCode, StopAt),
+    first: Vec<u8>,
+    /// Offered once the connection settles, if it still reads; peer EOF follows it.
+    rest: Vec<u8>,
+    response: Response,
+    /// A write that carries these bytes completes only once `rest` was offered and the
+    /// connection settled.
+    hold: Option<&'static [u8]>,
+}
+
+struct StopRun {
+    wire: Wire,
+    /// What the transport had written when `StopAt::Body` or `StopAt::Last` released the stop,
+    /// or when `StopAt::Script` stopped the request; empty for `StopAt::Head` and
+    /// `StopAt::Refusal`.
+    before_stop: String,
+    observed: Vec<Observed>,
+}
+
+/// Yields until `done` is set, at most `STOP_SETTLE` times.
+async fn settle_unless_done(context: &WorkerContext, done: &Cell<bool>) {
+    for _ in 0..STOP_SETTLE {
+        if done.get() {
+            return;
+        }
+        context.host().yield_to_io().await;
+    }
+}
+
+/// Serves `case` with the owned driver; each exchange with a request body stops it with
+/// `case.stop`, and `StopAt::Body` or `StopAt::Last` releases the stop once the transport has
+/// written something. `StopAt::Script` releases the response, lets the connection settle, and
+/// then stops the request.
+fn stop_run(case: StopCase) -> StopRun {
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let offer = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = ScriptedTransport::new([
+                ReadAction::Data(case.first),
+                ReadAction::WaitDataOrCancellation(Arc::clone(&offer), case.rest),
+                ReadAction::Eof,
+            ]);
+            let release = Rc::new(tokio::sync::Notify::new());
+            if let Some(held) = case.hold {
+                state.borrow_mut().write_gate = Some((held.to_vec(), Rc::clone(&release)));
+            }
+            let gate = Rc::new(tokio::sync::Notify::new());
+            let (mut application, probes) = H1App::new(vec![case.response]);
+            application.stop_request = Some(case.stop);
+            application.body_gate = Some(Rc::clone(&gate));
+            let script_held = Rc::clone(&application.script_held);
+            let (session, _handle) =
+                OwnedH1Session::new(application, owned_options(context.clone(), transport))
+                    .unwrap();
+            let done = Cell::new(false);
+            let run = async {
+                let result = session.run().await;
+                done.set(true);
+                result
+            };
+            let script = async {
+                let mut before_stop = Vec::new();
+                if matches!(case.stop.1, StopAt::Body | StopAt::Last) {
+                    before_stop = first_writes(&context, &state).await;
+                    gate.notify_one();
+                }
+                if matches!(case.stop.1, StopAt::Script) {
+                    gate.notify_one();
+                    settle_unless_done(&context, &done).await;
+                    before_stop = state.borrow().writes.concat();
+                    let held = script_held.borrow_mut().take();
+                    if let Some(mut body) = held {
+                        body.stop_reading(Some(case.stop.0));
+                    }
+                }
+                if let Some(held) = case.hold {
+                    for _ in 0..STOP_SETTLE {
+                        let written = state.borrow().writes.concat();
+                        if done.get() || written.windows(held.len()).any(|part| part == held) {
+                            break;
+                        }
+                        context.host().yield_to_io().await;
+                    }
+                    offer.notify_one();
+                    settle_unless_done(&context, &done).await;
+                    release.notify_one();
+                } else {
+                    settle_unless_done(&context, &done).await;
+                    offer.notify_one();
+                }
+                before_stop
+            };
+            let (result, before_stop) = futures::join!(run, script);
+            let observed = probes
+                .borrow()
+                .iter()
+                .map(|probe| probe.observed())
+                .collect();
+            StopRun {
+                wire: wire_of(&state, result),
+                before_stop: String::from_utf8_lossy(&before_stop).into_owned(),
+                observed,
+            }
+        })
+    })
+}
+
+/// The exchange got its whole response and completed once, uncancelled.
+fn assert_completed_once(probe: &Observed, label: &str) {
+    assert_eq!(probe.response_complete, 1, "{label}");
+    assert_eq!(probe.completed, 1, "{label}");
+    assert!(probe.cancelled.is_empty(), "{label}: {:?}", probe.cancelled);
+}
+
+/// A request whose reader stops it without error (`NO_ERROR`) before its response begins,
+/// with its upload still open, gets its whole response, which says `Connection: close` and
+/// ends with its trailer section; then the connection closes, and no more of the upload is
+/// read as a request (`DIV-054`).
+#[test]
+fn a_request_stopped_without_error_gets_its_response_with_connection_close() {
+    let run = stop_run(StopCase {
+        stop: (HttpErrorCode::NO_ERROR, StopAt::Head),
+        first: OPEN_UPLOAD.to_vec(),
+        rest: [UPLOAD_END, NEXT_GET].concat(),
+        response: trailered_response(),
+        hold: None,
+    });
+    let output = String::from_utf8_lossy(&run.wire.output);
+    assert_eq!(run.wire.error, None, "{output:?}");
+    assert_eq!(output.matches("HTTP/1.1 200 ").count(), 1, "{output:?}");
+    assert!(output.contains("\r\nConnection: close\r\n"), "{output:?}");
+    assert!(
+        output.ends_with(TRAILERED_END),
+        "the whole response, trailer section included: {output:?}"
+    );
+    assert_eq!(
+        run.wire.close,
+        CloseKind::ShutdownWrite,
+        "then the transport closes"
+    );
+    assert_eq!(run.observed.len(), 1, "no next request is read");
+    assert_completed_once(&run.observed[0], "the stopped request");
+}
+
+/// A request whose reader stops it with `CANCEL` before its response ends still fails the
+/// connection: nothing more is written, and the transport resets.
+#[test]
+fn a_request_stopped_with_cancel_still_fails_the_connection() {
+    for at in [StopAt::Head, StopAt::Body] {
+        let label = format!("{at:?}");
+        let run = stop_run(StopCase {
+            stop: (HttpErrorCode::CANCEL, at),
+            first: OPEN_UPLOAD.to_vec(),
+            rest: [UPLOAD_END, NEXT_GET].concat(),
+            response: trailered_response(),
+            hold: None,
+        });
+        assert_eq!(run.wire.error, Some(HttpErrorCode::CANCEL), "{label}");
+        assert_eq!(run.wire.close, CloseKind::Reset, "{label}");
+        assert_eq!(
+            String::from_utf8_lossy(&run.wire.output),
+            run.before_stop,
+            "{label}: nothing is written after the stop"
+        );
+        assert_eq!(run.observed.len(), 1, "{label}");
+        assert_eq!(run.observed[0].completed, 0, "{label}");
+        assert_eq!(
+            run.observed[0].cancelled,
+            [(HttpErrorCode::CANCEL, false)],
+            "{label}"
+        );
+    }
+}
+
+/// A request read to its end, then answered, leaves the connection serving the next request.
+#[test]
+fn a_request_read_to_its_end_keeps_the_connection_alive() {
+    let input = [
+        OPEN_UPLOAD,
+        UPLOAD_END,
+        b"GET /2 HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+    ]
+    .concat();
+    let (owned, probes) = owned_wire(vec![ReadAction::Data(input)], vec![trailered_response()]);
+    assert_eq!(owned.error, None);
+    let urls: Vec<_> = probes.iter().map(|probe| probe.url.clone()).collect();
+    assert_eq!(urls, [b"/u".to_vec(), b"/2".to_vec()]);
+    assert_eq!(probes[0].request_body, b"firstfinal");
+    for probe in &probes {
+        assert_completed_once(probe, "each request");
+    }
+    let head =
+        "HTTP/1.1 200 \r\nDate: Tue, 03 Nov 2026 00:00:00 GMT\r\nTransfer-Encoding: chunked\r\n";
+    let body = "\r\n5\r\nreply\r\n0\r\nx-trailer: t\r\n\r\n";
+    assert_eq!(
+        String::from_utf8_lossy(&owned.output),
+        format!("{head}Connection: keep-alive\r\n{body}{head}Connection: close\r\n{body}"),
+        "the first response keeps the connection, the second closes it"
+    );
+    assert_eq!(owned.close, CloseKind::ShutdownWrite);
+}
+
+/// A CONNECT tunnel whose reader stops its request body without error before the tunnel's
+/// response ends still fails the connection: nothing more is written, and the transport resets.
+#[test]
+fn a_tunnel_stopped_without_error_still_fails_the_connection() {
+    for at in [StopAt::Head, StopAt::Body] {
+        let label = format!("{at:?}");
+        let run = stop_run(StopCase {
+            stop: (HttpErrorCode::NO_ERROR, at),
+            first: [CONNECT_HEAD, b"up"].concat(),
+            rest: b"more".to_vec(),
+            response: Response::tunnel(200, b"down", false),
+            hold: None,
+        });
+        if matches!(at, StopAt::Body) {
+            assert!(
+                run.before_stop.starts_with("HTTP/1.1 200 "),
+                "the tunnel was accepted: {:?}",
+                run.before_stop
+            );
+        }
+        assert_eq!(run.wire.error, Some(HttpErrorCode::NO_ERROR), "{label}");
+        assert_eq!(run.wire.close, CloseKind::Reset, "{label}");
+        assert_eq!(
+            String::from_utf8_lossy(&run.wire.output),
+            run.before_stop,
+            "{label}: nothing is written after the stop"
+        );
+        assert_eq!(run.observed.len(), 1, "{label}");
+        assert_eq!(run.observed[0].completed, 0, "{label}");
+        assert_eq!(
+            run.observed[0].cancelled,
+            [(HttpErrorCode::NO_ERROR, false)],
+            "{label}"
+        );
+    }
+}
+
+/// A request whose reader stops it without error after its response head went out with
+/// `Connection: keep-alive`, while its upload is still open, gets the rest of its response,
+/// chunked with its trailer section or to its fixed length, and then the connection closes;
+/// no more of the upload is read as a request (`DIV-054`).
+#[test]
+fn a_request_stopped_after_a_keep_alive_head_closes_after_its_response() {
+    let fixed = Response::fixed(200, b"reply");
+    for (response, end) in [
+        (
+            trailered_response(),
+            "5\r\nreply\r\n0\r\nx-trailer: t\r\n\r\n",
+        ),
+        (fixed, "reply"),
+    ] {
+        let label = format!("content_length {}", response.content_length);
+        let run = stop_run(StopCase {
+            stop: (HttpErrorCode::NO_ERROR, StopAt::Body),
+            first: OPEN_UPLOAD.to_vec(),
+            rest: [UPLOAD_END, NEXT_GET].concat(),
+            response,
+            hold: None,
+        });
+        assert!(
+            run.before_stop.contains("\r\nConnection: keep-alive\r\n")
+                && run.before_stop.ends_with("\r\n\r\n"),
+            "{label}: the head alone was written before the stop: {:?}",
+            run.before_stop
+        );
+        assert_eq!(run.wire.error, None, "{label}");
+        assert_eq!(
+            String::from_utf8_lossy(&run.wire.output),
+            format!("{}{end}", run.before_stop),
+            "{label}: the rest of the response follows the head"
+        );
+        assert_eq!(run.wire.close, CloseKind::ShutdownWrite, "{label}");
+        assert_eq!(run.observed.len(), 1, "{label}: no next request is read");
+        assert_completed_once(&run.observed[0], &label);
+    }
+}
+
+/// A request whose reader stops it without error in the same poll that returns its response's
+/// last event, after a `Connection: keep-alive` head and with its upload still open, gets the
+/// rest of its response, and then the connection closes; no more of the upload is read as a
+/// request (`DIV-054`).
+#[test]
+fn a_request_stopped_with_its_last_response_event_closes_after_its_response() {
+    for (response, end) in [
+        (
+            trailered_response(),
+            "5\r\nreply\r\n0\r\nx-trailer: t\r\n\r\n",
+        ),
+        (Response::fixed(200, b"reply"), "\r\n\r\nreply"),
+    ] {
+        let label = format!("content_length {}", response.content_length);
+        let run = stop_run(StopCase {
+            stop: (HttpErrorCode::NO_ERROR, StopAt::Last),
+            first: OPEN_UPLOAD.to_vec(),
+            rest: [UPLOAD_END, NEXT_GET].concat(),
+            response,
+            hold: None,
+        });
+        assert!(
+            run.before_stop.contains("\r\nConnection: keep-alive\r\n"),
+            "{label}: the head was written before the stop: {:?}",
+            run.before_stop
+        );
+        let output = String::from_utf8_lossy(&run.wire.output);
+        assert_eq!(run.wire.error, None, "{label}: {output:?}");
+        assert_eq!(
+            output.matches("HTTP/1.1 200 ").count(),
+            1,
+            "{label}: {output:?}"
+        );
+        assert!(
+            output.ends_with(end),
+            "{label}: the whole response: {output:?}"
+        );
+        assert_eq!(run.wire.close, CloseKind::ShutdownWrite, "{label}");
+        assert_eq!(run.observed.len(), 1, "{label}: no next request is read");
+        assert_completed_once(&run.observed[0], &label);
+    }
+}
+
+/// A request whose reader stops it without error from the cancellation callback of a byte
+/// event on its response's last event, which the driver refuses before it serializes that
+/// event, after a `Connection: keep-alive` head and with its upload still open, gets the rest
+/// of its response, and then the connection closes; no more of the upload is read as a
+/// request (`DIV-054`).
+#[test]
+fn a_request_stopped_by_its_last_response_events_byte_event_refusal_closes_after_it() {
+    for (response, end) in [
+        (
+            trailered_response(),
+            "5\r\nreply\r\n0\r\nx-trailer: t\r\n\r\n",
+        ),
+        (Response::fixed(200, b"reply"), "\r\n\r\nreply"),
+    ] {
+        let label = format!("content_length {}", response.content_length);
+        let run = stop_run(StopCase {
+            stop: (HttpErrorCode::NO_ERROR, StopAt::Refusal),
+            first: OPEN_UPLOAD.to_vec(),
+            rest: [UPLOAD_END, NEXT_GET].concat(),
+            response,
+            hold: None,
+        });
+        let output = String::from_utf8_lossy(&run.wire.output);
+        assert_eq!(run.wire.error, None, "{label}: {output:?}");
+        assert_eq!(
+            output.matches("HTTP/1.1 200 ").count(),
+            1,
+            "{label}: {output:?}"
+        );
+        assert!(
+            output.contains("\r\nConnection: keep-alive\r\n"),
+            "{label}: the head was serialized before the stop: {output:?}"
+        );
+        assert!(
+            output.ends_with(end),
+            "{label}: the whole response: {output:?}"
+        );
+        assert_eq!(run.wire.close, CloseKind::ShutdownWrite, "{label}");
+        assert_eq!(run.observed.len(), 1, "{label}: no next request is read");
+        assert_completed_once(&run.observed[0], &label);
+    }
+}
+
+/// After its reader stops a request without error, no more of its upload is parsed: input,
+/// and peer EOF inside the request, read while the response is still being written do not end
+/// the exchange, which gets its whole response before the connection closes (`DIV-054`).
+#[test]
+fn a_stopped_upload_is_not_parsed_while_its_response_is_written() {
+    let run = stop_run(StopCase {
+        stop: (HttpErrorCode::NO_ERROR, StopAt::Head),
+        first: OPEN_UPLOAD.to_vec(),
+        rest: b"5\r\nmore!\r\n".to_vec(),
+        response: trailered_response(),
+        hold: Some(b"x-trailer"),
+    });
+    let output = String::from_utf8_lossy(&run.wire.output);
+    assert_eq!(run.wire.error, None, "{output:?}");
+    assert!(output.contains("\r\nConnection: close\r\n"), "{output:?}");
+    assert!(output.ends_with(TRAILERED_END), "{output:?}");
+    assert_eq!(run.wire.close, CloseKind::ShutdownWrite);
+    assert_eq!(run.observed.len(), 1);
+    assert_completed_once(&run.observed[0], "the stopped request");
+}
+
+/// A request that arrived whole before its reader stopped it without error leaves nothing of
+/// its upload unread on the connection: it gets its whole response with
+/// `Connection: keep-alive`, and the connection serves the next request.
+#[test]
+fn a_whole_request_stopped_without_error_keeps_the_connection_alive() {
+    let run = stop_run(StopCase {
+        stop: (HttpErrorCode::NO_ERROR, StopAt::Head),
+        first: [OPEN_UPLOAD, UPLOAD_END].concat(),
+        rest: NEXT_GET.to_vec(),
+        response: trailered_response(),
+        hold: None,
+    });
+    let output = String::from_utf8_lossy(&run.wire.output);
+    assert_eq!(run.wire.error, None, "{output:?}");
+    assert!(
+        output.starts_with(
+            "HTTP/1.1 200 \r\nDate: Tue, 03 Nov 2026 00:00:00 GMT\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nreply\r\n0\r\nx-trailer: t\r\n\r\nHTTP/1.1 200 "
+        ),
+        "the whole first response keeps the connection: {output:?}"
+    );
+    let urls: Vec<_> = run.observed.iter().map(|probe| probe.url.clone()).collect();
+    assert_eq!(urls, [b"/u".to_vec(), b"/2".to_vec()]);
+    for probe in &run.observed {
+        assert_completed_once(probe, "each request");
+    }
+    assert_eq!(run.wire.close, CloseKind::ShutdownWrite);
+}
+
+/// A request whose reader stops it without error only once its whole response was written,
+/// with its upload still open, keeps the connection as before (`DIV-054`'s "Unchanged"): the
+/// rest of the upload is read and discarded, and the next request is served.
+#[test]
+fn a_request_stopped_after_its_response_ended_keeps_the_connection() {
+    let run = stop_run(StopCase {
+        stop: (HttpErrorCode::NO_ERROR, StopAt::Script),
+        first: OPEN_UPLOAD.to_vec(),
+        rest: [UPLOAD_END, NEXT_GET].concat(),
+        response: trailered_response(),
+        hold: None,
+    });
+    assert!(
+        run.before_stop.contains("\r\nConnection: keep-alive\r\n")
+            && run.before_stop.ends_with(TRAILERED_END),
+        "the whole response was written before the stop: {:?}",
+        run.before_stop
+    );
+    let output = String::from_utf8_lossy(&run.wire.output);
+    assert_eq!(run.wire.error, None, "{output:?}");
+    let urls: Vec<_> = run.observed.iter().map(|probe| probe.url.clone()).collect();
+    assert_eq!(urls, [b"/u".to_vec(), b"/2".to_vec()], "{output:?}");
+    for probe in &run.observed {
+        assert_completed_once(probe, "each request");
+    }
+    assert_eq!(output.matches("HTTP/1.1 200 ").count(), 2, "{output:?}");
+    assert_eq!(run.wire.close, CloseKind::ShutdownWrite);
+}
+
+/// One `staged_close_run`.
+struct StagedClose {
+    wire: Wire,
+    /// Whether the run was still going when the transport's write side shut down.
+    reading_after_shutdown: bool,
+    /// Scripted reads the driver never took.
+    unread: usize,
+    /// With `fill`, the scripted reads the driver had not taken when the held write was
+    /// released.
+    unread_at_release: Option<usize>,
+    /// With `offer`, the scripted reads the driver had not taken when the script stopped the
+    /// request.
+    unread_at_stop: Option<usize>,
+    observed: Vec<Observed>,
+}
+
+/// Serves `reads` with the owned driver, configured by `configure`; each exchange with a
+/// request body stops it without error in `poll_headers`. With `fill`, the write carrying the
+/// response's trailer section is held: `fill` is notified once that write starts, and the
+/// write completes once the connection settled. With `offer`, the stop comes from outside the
+/// driver's poll instead: once the exchange holds its request body, the script, in one step,
+/// stops it without error, notifies `offer` and releases the response, so the driver's next
+/// poll finds both the stop and whatever read `offer` completes. `go` is notified once the
+/// transport's write side shuts down, or once the run ends.
+fn staged_close_run(
+    reads: Vec<ReadAction>,
+    fill: Option<Arc<tokio::sync::Notify>>,
+    offer: Option<Arc<tokio::sync::Notify>>,
+    go: Arc<tokio::sync::Notify>,
+    configure: impl FnOnce(&mut UniplexConfig) + Send + 'static,
+) -> StagedClose {
+    const HELD: &[u8] = b"x-trailer";
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let (transport, state) = ScriptedTransport::new(reads);
+            let release = Rc::new(tokio::sync::Notify::new());
+            if fill.is_some() {
+                state.borrow_mut().write_gate = Some((HELD.to_vec(), Rc::clone(&release)));
+            }
+            let (mut application, probes) = H1App::new(vec![trailered_response()]);
+            let at = if offer.is_some() {
+                StopAt::Script
+            } else {
+                StopAt::Head
+            };
+            application.stop_request = Some((HttpErrorCode::NO_ERROR, at));
+            let gate = Rc::new(tokio::sync::Notify::new());
+            if offer.is_some() {
+                application.body_gate = Some(Rc::clone(&gate));
+            }
+            let script_held = Rc::clone(&application.script_held);
+            let mut options = owned_options(context.clone(), transport);
+            configure(&mut options.io);
+            let (session, _handle) = OwnedH1Session::new(application, options).unwrap();
+            let done = Cell::new(false);
+            let run = async {
+                let result = session.run().await;
+                done.set(true);
+                result
+            };
+            let script = async {
+                let mut unread_at_release = None;
+                let mut unread_at_stop = None;
+                if let Some(offer) = &offer {
+                    for _ in 0..STOP_SETTLE {
+                        if done.get() || script_held.borrow().is_some() {
+                            break;
+                        }
+                        context.host().yield_to_io().await;
+                    }
+                    unread_at_stop = Some(state.borrow().reads.len());
+                    let held = script_held.borrow_mut().take();
+                    if let Some(mut body) = held {
+                        body.stop_reading(Some(HttpErrorCode::NO_ERROR));
+                    }
+                    offer.notify_one();
+                    gate.notify_one();
+                }
+                if let Some(fill) = &fill {
+                    for _ in 0..STOP_SETTLE {
+                        let written = state.borrow().writes.concat();
+                        if done.get() || written.windows(HELD.len()).any(|part| part == HELD) {
+                            break;
+                        }
+                        context.host().yield_to_io().await;
+                    }
+                    fill.notify_one();
+                    settle_unless_done(&context, &done).await;
+                    unread_at_release = Some(state.borrow().reads.len());
+                    release.notify_one();
+                }
+                for _ in 0..STOP_SETTLE {
+                    if done.get() || state.borrow().close != CloseKind::Open {
+                        break;
+                    }
+                    context.host().yield_to_io().await;
+                }
+                let reading = !done.get() && state.borrow().close == CloseKind::ShutdownWrite;
+                go.notify_one();
+                (reading, unread_at_release, unread_at_stop)
+            };
+            let (result, (reading_after_shutdown, unread_at_release, unread_at_stop)) =
+                futures::join!(run, script);
+            let observed = probes
+                .borrow()
+                .iter()
+                .map(|probe| probe.observed())
+                .collect();
+            let unread = state.borrow().reads.len();
+            StagedClose {
+                wire: wire_of(&state, result),
+                reading_after_shutdown,
+                unread,
+                unread_at_release,
+                unread_at_stop,
+                observed,
+            }
+        })
+    })
+}
+
+/// RFC 9112 §9.6's staged close after a request's reader stops it without error while its
+/// upload is still open (`DIV-054`): once the response is written, the write side shuts down
+/// first, and the connection keeps reading the rest of the upload, without parsing it, until
+/// the peer's EOF, so it does not close with input unread.
+#[test]
+fn a_stopped_upload_is_read_to_peer_eof_after_the_write_side_shuts_down() {
+    let go = Arc::new(tokio::sync::Notify::new());
+    let run = staged_close_run(
+        vec![
+            ReadAction::Data(OPEN_UPLOAD.to_vec()),
+            ReadAction::WaitDataOrCancellation(Arc::clone(&go), [UPLOAD_END, NEXT_GET].concat()),
+            ReadAction::Eof,
+        ],
+        None,
+        None,
+        go,
+        |_| {},
+    );
+    let output = String::from_utf8_lossy(&run.wire.output);
+    assert_eq!(run.wire.error, None, "{output:?}");
+    assert!(
+        run.reading_after_shutdown,
+        "the write side shuts down while the connection still reads"
+    );
+    assert_eq!(
+        run.unread, 0,
+        "the rest of the upload and the peer's EOF are read before the run ends"
+    );
+    assert_eq!(run.wire.close, CloseKind::ShutdownWrite);
+    assert_eq!(output.matches("HTTP/1.1 200 ").count(), 1, "{output:?}");
+    assert!(output.contains("\r\nConnection: close\r\n"), "{output:?}");
+    assert!(output.ends_with(TRAILERED_END), "{output:?}");
+    assert_eq!(
+        run.observed.len(),
+        1,
+        "nothing read after the stop is parsed as a request"
+    );
+    assert_completed_once(&run.observed[0], "the stopped request");
+}
+
+/// A staged close after a stopped upload reads at most `buffer_limit` bytes after its write
+/// side shuts down, then closes with the rest of the upload unread (`DIV-054`).
+#[test]
+fn a_staged_close_reads_a_stopped_upload_only_up_to_the_buffer_limit() {
+    const LIMIT: usize = 4 << 10;
+    const READ: usize = 1 << 10;
+    let go = Arc::new(tokio::sync::Notify::new());
+    let mut reads = vec![
+        ReadAction::Data(OPEN_UPLOAD.to_vec()),
+        ReadAction::WaitDataOrCancellation(Arc::clone(&go), vec![b'u'; READ]),
+    ];
+    reads.extend((0..LIMIT / READ).map(|_| ReadAction::Data(vec![b'u'; READ])));
+    reads.push(ReadAction::Eof);
+    let run = staged_close_run(reads, None, None, go, |io| {
+        io.buffer_limit = LIMIT;
+        io.ingress_buffer_limit = LIMIT as u32;
+        io.maximum_read_size = READ;
+        io.read_allocation_size = READ;
+        io.maximum_write_size = LIMIT;
+    });
+    let output = String::from_utf8_lossy(&run.wire.output);
+    assert_eq!(run.wire.error, None, "{output:?}");
+    assert!(
+        run.reading_after_shutdown,
+        "the write side shuts down while the connection still reads"
+    );
+    assert_eq!(
+        run.unread, 2,
+        "{LIMIT} bytes are read after the write side shuts down; one more read and the \
+         peer's EOF are not"
+    );
+    assert_eq!(run.wire.close, CloseKind::ShutdownWrite);
+    assert!(output.ends_with(TRAILERED_END), "{output:?}");
+    assert_eq!(run.observed.len(), 1);
+    assert_completed_once(&run.observed[0], "the stopped request");
+}
+
+/// A staged close after a stopped upload still reads after the write side shuts down when the
+/// upload filled the input buffer, `buffer_limit`, while the response was still being written:
+/// the connection reads on, without parsing, until the peer's EOF (`DIV-054`).
+#[test]
+fn a_staged_close_reads_after_the_write_side_shuts_down_when_the_upload_filled_its_buffer() {
+    const LIMIT: usize = 4 << 10;
+    const READ: usize = 1 << 10;
+    let fill = Arc::new(tokio::sync::Notify::new());
+    let go = Arc::new(tokio::sync::Notify::new());
+    let mut reads = vec![
+        ReadAction::Data(OPEN_UPLOAD.to_vec()),
+        ReadAction::WaitDataOrCancellation(Arc::clone(&fill), vec![b'u'; READ]),
+    ];
+    reads.extend((1..LIMIT / READ).map(|_| ReadAction::Data(vec![b'u'; READ])));
+    reads.push(ReadAction::WaitDataOrCancellation(
+        Arc::clone(&go),
+        vec![b'u'; READ],
+    ));
+    reads.push(ReadAction::Eof);
+    let run = staged_close_run(reads, Some(fill), None, go, |io| {
+        io.buffer_limit = LIMIT;
+        io.ingress_buffer_limit = LIMIT as u32;
+        io.maximum_read_size = READ;
+        io.read_allocation_size = READ;
+        io.maximum_write_size = LIMIT;
+    });
+    let output = String::from_utf8_lossy(&run.wire.output);
+    assert_eq!(run.wire.error, None, "{output:?}");
+    assert_eq!(
+        run.unread_at_release,
+        Some(2),
+        "{LIMIT} bytes of the upload filled the input buffer before the response's last write \
+         completed"
+    );
+    assert!(
+        run.reading_after_shutdown,
+        "the write side shuts down while the connection still reads"
+    );
+    assert_eq!(
+        run.unread, 0,
+        "the rest of the upload and the peer's EOF are read after the write side shuts down"
+    );
+    assert_eq!(run.wire.close, CloseKind::ShutdownWrite);
+    assert_eq!(output.matches("HTTP/1.1 200 ").count(), 1, "{output:?}");
+    assert!(output.contains("\r\nConnection: close\r\n"), "{output:?}");
+    assert!(output.ends_with(TRAILERED_END), "{output:?}");
+    assert_eq!(
+        run.observed.len(),
+        1,
+        "nothing read after the stop is parsed as a request"
+    );
+    assert_completed_once(&run.observed[0], "the stopped request");
+}
+
+/// A stop reported outside the driver's poll takes effect before the input that poll reads is
+/// parsed (`DIV-054`): peer EOF inside the stopped request, read in the same poll that finds the
+/// stop, does not end the exchange, which gets its whole response before the connection closes.
+#[test]
+fn a_stop_found_with_peer_eof_in_the_same_poll_still_gets_its_response() {
+    let offer = Arc::new(tokio::sync::Notify::new());
+    let run = staged_close_run(
+        vec![
+            ReadAction::Data(OPEN_UPLOAD.to_vec()),
+            ReadAction::WaitDataOrCancellation(Arc::clone(&offer), b"5\r\nmore!\r\n".to_vec()),
+            ReadAction::Eof,
+        ],
+        None,
+        Some(offer),
+        Arc::new(tokio::sync::Notify::new()),
+        |_| {},
+    );
+    assert_eq!(
+        run.unread_at_stop,
+        Some(1),
+        "the read the stop's step completes was outstanding at the stop, and the EOF behind it \
+         untaken"
+    );
+    let output = String::from_utf8_lossy(&run.wire.output);
+    assert_eq!(run.wire.error, None, "{output:?}");
+    assert_eq!(run.unread, 0, "the peer's EOF was read");
+    assert_eq!(output.matches("HTTP/1.1 200 ").count(), 1, "{output:?}");
+    assert!(output.contains("\r\nConnection: close\r\n"), "{output:?}");
+    assert!(output.ends_with(TRAILERED_END), "{output:?}");
+    assert_eq!(run.wire.close, CloseKind::ShutdownWrite);
+    assert_eq!(run.observed.len(), 1);
+    assert_completed_once(&run.observed[0], "the stopped request");
+}
+
+/// A stop reported outside the driver's poll takes effect before the input that poll reads is
+/// parsed (`DIV-054`): the rest of the stopped upload and a next request, read in the same poll
+/// that finds the stop, are not parsed, so the request does not end and the connection is not
+/// kept. The response says `Connection: close`, and the staged close follows it.
+#[test]
+fn a_stop_found_with_the_rest_of_the_upload_in_the_same_poll_closes_after_the_response() {
+    let offer = Arc::new(tokio::sync::Notify::new());
+    let go = Arc::new(tokio::sync::Notify::new());
+    let run = staged_close_run(
+        vec![
+            ReadAction::Data(OPEN_UPLOAD.to_vec()),
+            ReadAction::WaitDataOrCancellation(Arc::clone(&offer), [UPLOAD_END, NEXT_GET].concat()),
+            ReadAction::WaitEof(Arc::clone(&go)),
+        ],
+        None,
+        Some(offer),
+        go,
+        |_| {},
+    );
+    assert_eq!(
+        run.unread_at_stop,
+        Some(1),
+        "the read the stop's step completes was outstanding at the stop"
+    );
+    let output = String::from_utf8_lossy(&run.wire.output);
+    assert_eq!(run.wire.error, None, "{output:?}");
+    assert_eq!(output.matches("HTTP/1.1 200 ").count(), 1, "{output:?}");
+    assert!(output.contains("\r\nConnection: close\r\n"), "{output:?}");
+    assert!(output.ends_with(TRAILERED_END), "{output:?}");
+    assert_eq!(
+        run.observed.len(),
+        1,
+        "nothing read with the stop is parsed as a request"
+    );
+    assert_completed_once(&run.observed[0], "the stopped request");
+    assert!(
+        run.reading_after_shutdown,
+        "the write side shuts down while the connection still reads"
+    );
+    assert_eq!(run.unread, 0, "the peer's EOF is read before the run ends");
+    assert_eq!(run.wire.close, CloseKind::ShutdownWrite);
+}
+
+/// Records the write side's shutdown on a [`ScriptedTransport`], then reports it failed.
+struct FailedShutdownTransport(Rc<ScriptedTransport>);
+
+impl UniplexTransport for FailedShutdownTransport {
+    fn read(
+        &self,
+        context: &WorkerContext,
+        maximum: usize,
+        allocation_size: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        self.0
+            .read(context, maximum, allocation_size, timeout, cancellation)
+    }
+
+    fn write(
+        &self,
+        context: &WorkerContext,
+        data: BufQueue,
+        flags: ByteEventWriteFlags,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        self.0.write(context, data, flags, timeout, cancellation)
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.0.shutdown_write(context)?;
+        Err(HttpError::with_message(
+            HttpErrorCode::TRANSPORT_WRITE_ERROR,
+            b"scripted shutdown failure",
+        ))
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.0.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.0.close_with_reset(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.0.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.0.register_byte_event(context, registration)
+    }
+}
+
+/// A staged close after a stopped upload whose write shutdown fails returns that error at once
+/// (`DIV-054`): it does not wait for the peer's EOF or for `buffer_limit` more bytes from a peer
+/// that sends nothing more.
+#[test]
+fn a_staged_close_returns_a_failed_write_shutdown_without_waiting_for_the_peer() {
+    let (wire, returned_before_cancel, observed) = run_on_host(|context| {
+        Box::pin(async move {
+            let (inner, state) = ScriptedTransport::new([ReadAction::Data(OPEN_UPLOAD.to_vec())]);
+            let transport = Rc::new(FailedShutdownTransport(inner));
+            let (mut application, probes) = H1App::new(vec![trailered_response()]);
+            application.stop_request = Some((HttpErrorCode::NO_ERROR, StopAt::Head));
+            let (session, handle) =
+                OwnedH1Session::new(application, owned_options(context.clone(), transport))
+                    .unwrap();
+            let done = Cell::new(false);
+            let run = async {
+                let result = session.run().await;
+                done.set(true);
+                result
+            };
+            let script = async {
+                for _ in 0..STOP_SETTLE {
+                    if done.get() || state.borrow().close != CloseKind::Open {
+                        break;
+                    }
+                    context.host().yield_to_io().await;
+                }
+                settle_unless_done(&context, &done).await;
+                let returned = done.get();
+                if !returned {
+                    handle.cancel();
+                }
+                returned
+            };
+            let (result, returned_before_cancel) = futures::join!(run, script);
+            let observed: Vec<_> = probes
+                .borrow()
+                .iter()
+                .map(|probe| probe.observed())
+                .collect();
+            (wire_of(&state, result), returned_before_cancel, observed)
+        })
+    });
+    let output = String::from_utf8_lossy(&wire.output);
+    assert!(
+        returned_before_cancel,
+        "the run returns once the write shutdown fails, with the peer idle: {:?}",
+        wire.error
+    );
+    assert_eq!(
+        wire.error,
+        Some(HttpErrorCode::TRANSPORT_WRITE_ERROR),
+        "{output:?}"
+    );
+    assert_eq!(wire.close, CloseKind::ShutdownWrite);
+    assert_eq!(output.matches("HTTP/1.1 200 ").count(), 1, "{output:?}");
+    assert!(output.contains("\r\nConnection: close\r\n"), "{output:?}");
+    assert!(output.ends_with(TRAILERED_END), "{output:?}");
+    assert_eq!(observed.len(), 1);
+    assert_completed_once(&observed[0], "the stopped request");
 }

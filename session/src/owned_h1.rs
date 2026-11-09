@@ -28,9 +28,13 @@
 //! before the connection is reset, and an accepted upgrade or CONNECT carries the tunnel as
 //! the exchange's request and response bodies, with no request after it. Response byte-event
 //! registrations are cancelled, never fired. DIV-029 lists where this driver differs from
-//! `UniplexSession`. Under the Roxygen-only [`Http1UpgradePolicy::AsOrdinaryRequest`]
-//! (DIV-030), an upgrade or CONNECT request is served as an ordinary request instead, and the
-//! connection stays HTTP/1.1.
+//! `UniplexSession`. A request whose reader stops it without error (`NO_ERROR`) before it
+//! ends still gets its whole response; nothing more of its upload is parsed, and after the
+//! response the connection closes in stages: its write side first, then its read side at peer
+//! EOF or once `buffer_limit` bytes are read after the write side shut down (DIV-054). Under
+//! the Roxygen-only [`Http1UpgradePolicy::AsOrdinaryRequest`] (DIV-030), an upgrade or
+//! CONNECT request is served as an ordinary request instead, and the connection stays
+//! HTTP/1.1.
 
 use std::any::Any;
 use std::cell::Cell;
@@ -251,6 +255,21 @@ struct IngressSignals {
     stream: Arc<Signal>,
 }
 
+impl IngressSignals {
+    /// Whether the source completed with `NO_ERROR`, its reader having stopped without error,
+    /// and the driver has yet to take that completion.
+    fn stopped(&self) -> bool {
+        if !self.source_complete.get() {
+            return false;
+        }
+        let completed = self.completed.take();
+        let stopped =
+            matches!(&completed, Some(Err(error)) if error.code() == HttpErrorCode::NO_ERROR);
+        self.completed.set(completed);
+        stopped
+    }
+}
+
 impl HttpStreamSourceSharedCallback for IngressSignals {
     fn bytes_processed(&self, _id: StreamId, _amount: usize, _acknowledge: usize) {
         self.stream.wake_by_ref();
@@ -300,6 +319,8 @@ struct Exchange<E: OwnedExchange> {
     head: Option<Box<HttpMessage>>,
     started: bool,
     body_events: bool,
+    /// An upgrade or CONNECT request, which parsing hands over at its final response head.
+    upgrade: bool,
     ingress_complete: bool,
     consumed: bool,
     response_headers: bool,
@@ -408,6 +429,16 @@ fn drain_codec(codec: &mut Http1xCodec, egress: &mut BufQueue) -> Result<(), Htt
         .map(drop)
 }
 
+/// `DIV-054`: the request's reader stopped it without error before it ended. HTTP/1.1 cannot
+/// reset one request, so nothing more of the upload is parsed, and the codec stops keep-alive:
+/// a response head not yet serialized says `Connection: close`, and the connection closes once
+/// the response is written.
+#[cold]
+fn stop_request_ingress(codec: &mut Http1xCodec, ingress_stopped: &mut bool) {
+    *ingress_stopped = true;
+    codec.generate_immediate_goaway();
+}
+
 /// A poll-driven HTTP/1.1 downstream connection with one exchange at a time.
 pub struct OwnedH1Session<A: OwnedApplication>(Driver<A>);
 
@@ -497,6 +528,11 @@ struct Driver<A: OwnedApplication> {
     /// Parsing waits past an upgrade or CONNECT request head until its final response head
     /// resolves the upgrade in the codec, as `UniplexSession`'s upgrade pause.
     upgrade_pending: bool,
+    /// The request's reader stopped it without error before it ended: nothing more is parsed
+    /// (`DIV-054`).
+    ingress_stopped: bool,
+    /// The write side's shutdown, once a staged close after a stopped upload took it.
+    write_shutdown: Option<Result<(), HttpError>>,
     /// The response body was not polled because the next write must make room for it.
     body_awaits_egress: bool,
     fatal: Option<HttpError>,
@@ -576,6 +612,7 @@ impl<A: OwnedApplication> CodecInput<'_, A> {
             head: None,
             started: false,
             body_events: false,
+            upgrade: false,
             ingress_complete: false,
             consumed: false,
             response_headers: false,
@@ -622,6 +659,7 @@ impl<A: OwnedApplication> HttpCodecCallback for CodecInput<'_, A> {
                 // The codec marks a downstream CONNECT upgraded and a WebSocket upgrade request
                 // as one, unless it parses them as ordinary requests (`DIV-030`).
                 let upgrade = message.is_ingress_websocket_upgrade() || message.is_upgraded();
+                exchange.upgrade = upgrade;
                 exchange.head = Some(message);
                 self.stream_wake.mark();
                 if upgrade {
@@ -789,6 +827,8 @@ impl<A: OwnedApplication> Driver<A> {
                 exchange_pause: false,
                 flow_pause: false,
                 upgrade_pending: false,
+                ingress_stopped: false,
+                write_shutdown: None,
                 body_awaits_egress: false,
                 fatal: None,
                 closing_error: None,
@@ -832,6 +872,7 @@ impl<A: OwnedApplication> Driver<A> {
                 // A drain requested from the read admits nothing it carried.
                 self.observe_drain();
             }
+            self.observe_stop();
             // A busy codec may hold a completion it deferred while the parser was paused. As
             // `UniplexSession`, an idle draining connection admits no further request.
             if self.fatal.is_none()
@@ -945,6 +986,18 @@ impl<A: OwnedApplication> Driver<A> {
         }
     }
 
+    /// A stop the request's reader reported since the last poll takes effect before anything
+    /// read with it is parsed (`DIV-054`); as in `poll_exchange`, not once the response ended.
+    fn observe_stop(&mut self) {
+        if let Some(exchange) = &self.exchange
+            && !exchange.ingress_complete
+            && !exchange.response_complete
+            && exchange.signals.stopped()
+        {
+            stop_request_ingress(&mut self.codec, &mut self.ingress_stopped);
+        }
+    }
+
     fn poll_budget_yield(&mut self, context: &mut Context<'_>) -> Poll<()> {
         let Some(mut wait) = self.budget_yield.take() else {
             return Poll::Ready(());
@@ -1038,10 +1091,10 @@ impl<A: OwnedApplication> Driver<A> {
         Ok(consumed != 0 || finishing_eof || upgrade_completed)
     }
 
-    /// Whether this driver holds the parser: a request awaits its exchange's retirement, or
-    /// its unread body is at `ingress_buffer_limit`.
+    /// Whether this driver holds the parser: a request awaits its exchange's retirement, its
+    /// unread body is at `ingress_buffer_limit`, or its reader stopped it.
     fn ingress_paused(&self) -> bool {
-        self.exchange_pause || self.flow_pause || self.upgrade_pending
+        self.exchange_pause || self.flow_pause || self.upgrade_pending || self.ingress_stopped
     }
 
     /// Whether a failed read waits for what was read before it: `UniplexSession` reads only once
@@ -1078,7 +1131,14 @@ impl<A: OwnedApplication> Driver<A> {
             if let Some(Err(error)) = exchange.signals.completed.take()
                 && !exchange.response_complete
             {
-                return Err(error);
+                // A reader that stopped an ordinary request without error leaves its response
+                // to finish (`DIV-054`).
+                if error.code() != HttpErrorCode::NO_ERROR || exchange.upgrade {
+                    return Err(error);
+                }
+                if !exchange.ingress_complete {
+                    stop_request_ingress(&mut self.codec, &mut self.ingress_stopped);
+                }
             }
         }
         let mut context = Context::from_waker(&self.stream_waker);
@@ -1136,6 +1196,10 @@ impl<A: OwnedApplication> Driver<A> {
                 self.draining = true;
                 drain_codec(&mut self.codec, &mut self.egress)?;
             }
+            // So does a stop the exchange's callbacks reported (`DIV-054`).
+            if !exchange.ingress_complete && exchange.signals.stopped() {
+                stop_request_ingress(&mut self.codec, &mut self.ingress_stopped);
+            }
             let generated = self.codec.generate(
                 &mut self.egress,
                 EgressFrame::Headers {
@@ -1190,6 +1254,11 @@ impl<A: OwnedApplication> Driver<A> {
             let registrations = event.take_byte_event_registrations();
             exchange.registered_byte_events |= !registrations.is_empty();
             refuse_byte_events(registrations, &self.control, &self.context)?;
+            // A stop reported with this event, which may be the response's last, or from its
+            // byte events' cancellation (`DIV-054`).
+            if !exchange.ingress_complete && exchange.signals.stopped() {
+                stop_request_ingress(&mut self.codec, &mut self.ingress_stopped);
+            }
             let eom = event.eom();
             match event.into_kind() {
                 HttpBodyEventKind::Body(body) => {
@@ -1466,19 +1535,39 @@ impl<A: OwnedApplication> Driver<A> {
         Some(progress)
     }
 
-    /// `None` while the outstanding read has yet to observe cancellation.
+    /// `None` while the outstanding read has yet to observe cancellation, or while a staged
+    /// close still reads.
     fn close_idle(&mut self) -> Option<Result<UniplexRunSummary, HttpError>> {
+        if self.ingress_stopped && self.stages_close() {
+            return None;
+        }
         if self.cancellation.request_cancellation() {
             self.read_wake.mark();
         }
         if self.read.is_some() {
             return None;
         }
-        Some(
-            self.transport
-                .shutdown_write(&self.context)
-                .map(|()| self.summary),
-        )
+        let shutdown = self
+            .write_shutdown
+            .take()
+            .unwrap_or_else(|| self.transport.shutdown_write(&self.context));
+        Some(shutdown.map(|()| self.summary))
+    }
+
+    /// RFC 9112 §9.6's staged close after a stopped upload (`DIV-054`): the write side shuts
+    /// down first, and the input read but never to be parsed is discarded, so a full input
+    /// buffer still leaves room to read; then the rest of the upload is read, unparsed, until
+    /// peer EOF or until `buffer_limit` more bytes are read. A failed shutdown ends it at once,
+    /// so the run returns that error. Whether it is still reading.
+    #[cold]
+    fn stages_close(&mut self) -> bool {
+        if self.write_shutdown.is_none() {
+            self.write_shutdown = Some(self.transport.shutdown_write(&self.context));
+            self.ingress.trim_start_at_most(usize::MAX);
+        }
+        matches!(self.write_shutdown, Some(Ok(())))
+            && !self.eof
+            && self.ingress.remaining_capacity() != 0
     }
 
     /// Cancels the live exchange, queues the error response with `status`, and resets the
