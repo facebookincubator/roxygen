@@ -1,5 +1,7 @@
 //! Owner-local execution, clock, and I/O fairness capabilities.
 
+pub mod timer;
+
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
