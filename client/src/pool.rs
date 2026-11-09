@@ -589,6 +589,36 @@ impl PooledSession {
         }
     }
 
+    /// An owned session an acquisition may wait for instead of dialing, since
+    /// its driver returns a slot at its next turn (`DIV-046`); never a uniplex
+    /// session.
+    fn claimable(&self) -> bool {
+        match self {
+            Self::Uniplex(_) => false,
+            Self::Owned(session) => session.claimable(),
+        }
+    }
+
+    fn claim(&self, waiter: u64) {
+        if let Self::Owned(session) = self {
+            session.claim(waiter);
+        }
+    }
+
+    /// The waiter whose acquisition waits for the session's returning slot.
+    fn claimant(&self) -> Option<u64> {
+        match self {
+            Self::Uniplex(_) => None,
+            Self::Owned(session) => session.claimant(),
+        }
+    }
+
+    fn release_claim(&self, waiter: u64) {
+        if let Self::Owned(session) = self {
+            session.release_claim(waiter);
+        }
+    }
+
     fn active_transactions(&self) -> u32 {
         match self {
             Self::Uniplex(session) => session.active_transactions(),
@@ -754,6 +784,9 @@ struct PoolTasks {
     changed: Notify,
     failure: RefCell<Option<PoolError>>,
     completion: watch::Sender<Option<Result<(), PoolError>>>,
+    /// Tasks `spawn_pool_task` spawned.
+    #[cfg(test)]
+    spawned: Cell<u64>,
 }
 
 impl PoolTasks {
@@ -792,7 +825,10 @@ where
         .spawn_local(move |cancellation| async move {
             let _notice = notice;
             factory(cancellation).await;
-        })
+        })?;
+    #[cfg(test)]
+    tasks.spawned.set(tasks.spawned.get() + 1);
+    Ok(())
 }
 
 fn catch_callback<Output>(callback: impl FnOnce() -> Output) -> Result<Output, ()> {
@@ -998,6 +1034,9 @@ pub(crate) struct PoolState {
     /// `notify_session_event` passes over the pool's sessions.
     #[cfg(test)]
     session_event_passes: Cell<u64>,
+    /// Connection attempts the pool started.
+    #[cfg(test)]
+    connection_attempts: Cell<u64>,
     next_waiter_id: u64,
     pooling_enabled: bool,
     draining: bool,
@@ -1353,7 +1392,7 @@ pub(crate) fn notify_session_event(
     wake_count: usize,
     release_idle: bool,
 ) {
-    let (sessions_to_drain, waiters, idle_changed, idle_wake) = {
+    let (sessions_to_drain, claimer, waiters, idle_changed, idle_wake) = {
         let mut state = pool.borrow_mut();
         if state.context.worker_id() != worker {
             return;
@@ -1410,12 +1449,19 @@ pub(crate) fn notify_session_event(
         } else {
             wake_count
         };
-        let waiters = state.take_waiters(wake_count);
+        // The acquisition that waits for the session's returning slot takes the
+        // session's wake, whatever it reports (`DIV-046`).
+        let claimer = changed_session
+            .and_then(PooledSession::claimant)
+            .and_then(|id| state.waiters.iter().position(|waiter| waiter.id == id))
+            .and_then(|index| state.waiters.remove(index));
+        let waiters = state.take_waiters(wake_count.saturating_sub(usize::from(claimer.is_some())));
         let idle_wake = state
-            .track_idle_sessions(!waiters.is_empty())
+            .track_idle_sessions(claimer.is_some() || !waiters.is_empty())
             .then(|| Rc::clone(&state.idle_wake));
         (
             sessions_to_drain,
+            claimer,
             waiters,
             prior_idle.abs_diff(idle),
             idle_wake,
@@ -1423,6 +1469,9 @@ pub(crate) fn notify_session_event(
     };
     if let Some(idle_wake) = idle_wake {
         let _ = catch_callback(|| idle_wake.signal());
+    }
+    if let Some(claimer) = claimer {
+        let _ = catch_callback(|| claimer.signal());
     }
     signal_waiters(waiters);
     drain_sessions(sessions_to_drain);
@@ -1483,10 +1532,15 @@ struct WaiterRegistration {
     state: Weak<RefCell<PoolState>>,
     id: u64,
     credit: Option<Rc<ConnectCredit>>,
+    /// The session whose returning slot the waiter waits for (`DIV-046`).
+    claim: Option<PooledSession>,
 }
 
 impl Drop for WaiterRegistration {
     fn drop(&mut self) {
+        if let Some(session) = self.claim.take() {
+            session.release_claim(self.id);
+        }
         if let Some(credit) = self.credit.take() {
             credit.waiters.set(credit.waiters.get().saturating_sub(1));
         }
@@ -1848,6 +1902,8 @@ impl HttpSessionPool {
             changed: Notify::new(),
             failure: RefCell::new(None),
             completion,
+            #[cfg(test)]
+            spawned: Cell::default(),
         });
         Self {
             state: Rc::new(RefCell::new(PoolState {
@@ -1873,6 +1929,8 @@ impl HttpSessionPool {
                 idle_retirement_retiring_passes: Cell::default(),
                 #[cfg(test)]
                 session_event_passes: Cell::default(),
+                #[cfg(test)]
+                connection_attempts: Cell::default(),
                 next_waiter_id: 1,
                 pooling_enabled,
                 draining: false,
@@ -2474,6 +2532,16 @@ impl HttpSessionPool {
         self.state.borrow().session_event_passes.get()
     }
 
+    #[cfg(test)]
+    pub(crate) fn connection_attempts_for_test(&self) -> u64 {
+        self.state.borrow().connection_attempts.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pool_task_spawns_for_test(&self) -> u64 {
+        self.state.borrow().tasks.spawned.get()
+    }
+
     /// Idle-retirement passes that retired at least one session.
     #[cfg(test)]
     pub(crate) fn idle_retirement_retiring_passes_for_test(&self) -> u64 {
@@ -2678,6 +2746,11 @@ async fn wait_for_wakeup(
 }
 
 fn start_connection(state: &Rc<RefCell<PoolState>>, attempt: ConnectionAttempt) {
+    #[cfg(test)]
+    {
+        let attempts = &state.borrow().connection_attempts;
+        attempts.set(attempts.get() + 1);
+    }
     notify_pending_observer(attempt.guard.observer.clone(), 1);
     let weak_state = Rc::downgrade(state);
     let tasks = Rc::clone(&state.borrow().tasks);
@@ -2988,6 +3061,17 @@ fn next_step(
                 relayed = pool.take_uncovered_waiter();
             }
             let waits = at_connection_capacity || absorbed.is_some();
+            // An owned pool's acquisition that would dial waits instead for a
+            // session whose driver returns a slot at its next turn (`DIV-046`).
+            let claim = if waits || !admitting || !matches!(pool.backend, PoolBackend::Owned { .. })
+            {
+                None
+            } else {
+                pool.sessions
+                    .iter()
+                    .find(|entry| entry.session.claimable())
+                    .map(|entry| entry.session.clone())
+            };
             let credit = if !waits && pool.pending_connect_credit() > 1 {
                 let credit = Rc::new(ConnectCredit {
                     waiters: Cell::new(1),
@@ -3005,12 +3089,17 @@ fn next_step(
             });
             pool.next_waiter_id = pool.next_waiter_id.wrapping_add(1);
             pool.waiters.push_back(Rc::clone(&waiter));
+            if let Some(session) = &claim {
+                session.claim(waiter.id);
+            }
+            let claimed = claim.is_some();
             let registration = WaiterRegistration {
                 state: Rc::downgrade(state),
                 id: waiter.id,
                 credit: credit.clone(),
+                claim,
             };
-            if waits {
+            if waits || claimed {
                 AcquireStep::Wait {
                     registration,
                     waiter,

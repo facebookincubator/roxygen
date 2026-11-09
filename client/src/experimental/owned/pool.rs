@@ -63,8 +63,13 @@ impl PoolReservation for OwnedGetSessionResult {
 /// entry alone. A nonzero `idle_timeout` or `max_age` still reads the clock
 /// for the sessions' expiry, as `HttpSessionPool`'s step does. Only an
 /// acquisition that waits for a session or a dial continues in a boxed future.
+/// One that finds no session to take, below `max_connections`, waits for an
+/// HTTP/1.1 session whose driver returns its slot at its next turn, if no other
+/// acquisition waits for it, instead of starting a connection attempt; that
+/// session's next notification wakes it ahead of earlier waiters (`DIV-046`).
 /// Dropping it before it resolves abandons the acquisition, as dropping
-/// `HttpSessionPool`'s does.
+/// `HttpSessionPool`'s does, and leaves a returning session it waited for to
+/// the next acquisition.
 pub struct OwnedSessionAcquisition(Acquisition);
 
 enum Acquisition {
@@ -168,5 +173,15 @@ impl OwnedHttpSessionPool {
     #[cfg(test)]
     pub(crate) fn session_event_passes_for_test(&self) -> u64 {
         self.0.session_event_passes_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connection_attempts_for_test(&self) -> u64 {
+        self.0.connection_attempts_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pool_task_spawns_for_test(&self) -> u64 {
+        self.0.pool_task_spawns_for_test()
     }
 }

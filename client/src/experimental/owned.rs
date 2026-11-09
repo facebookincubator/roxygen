@@ -46,10 +46,11 @@
 //! `admission_closed` callbacks, and the idleness a driver publishes at the end of a turn,
 //! which the session's run scope reports, feed the pool as a `ClientSession`'s lifecycle
 //! events do. Its acquisitions take a selected session on their first poll with no
-//! allocation and no clock read for their deadline ([`OwnedSessionAcquisition`]). A
-//! reservation taken on a pooled session's handle reaches its pool as one the pool's
-//! acquisition made, and the admission the pool closes on a session it retires or drains
-//! refuses the handle's reservations, as a `ClientSession`'s draining flag does.
+//! allocation and no clock read for their deadline ([`OwnedSessionAcquisition`]), and one
+//! that would dial waits instead for an HTTP/1.1 session whose driver returns its slot at
+//! its next turn. A reservation taken on a pooled session's handle reaches its pool as one
+//! the pool's acquisition made, and the admission the pool closes on a session it retires or
+//! drains refuses the handle's reservations, as a `ClientSession`'s draining flag does.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -168,6 +169,9 @@ struct PoolBinding {
     /// pool does not count it idle, as a `ClientSession` is not idle before its
     /// first `DeactivateConnection`.
     reserved: Cell<bool>,
+    /// The waiter of the acquisition that waits for the slot the driver is
+    /// about to return, instead of dialing.
+    claimant: Cell<Option<u64>>,
 }
 
 impl Default for PoolBinding {
@@ -178,6 +182,7 @@ impl Default for PoolBinding {
             full: Cell::new(false),
             reported_idle: Cell::new(true),
             reserved: Cell::new(false),
+            claimant: Cell::new(None),
         }
     }
 }
@@ -279,6 +284,16 @@ impl Upstream {
         match self {
             Self::Http1(handle) => handle.is_idle(),
             Self::Http2(handle) => handle.is_idle(),
+        }
+    }
+
+    /// Slots the driver returns at its next turn. The owned HTTP/2 driver
+    /// releases a stream's slot when it parses the response's end, so none
+    /// waits for its consumer there.
+    fn returning_capacity(&self) -> u32 {
+        match self {
+            Self::Http1(handle) => handle.returning_capacity(),
+            Self::Http2(_) => 0,
         }
     }
 
@@ -522,6 +537,33 @@ impl OwnedClientSession {
             0
         } else {
             self.inner.upstream.available_capacity()
+        }
+    }
+
+    /// Whether an acquisition may wait for this session instead of dialing: no
+    /// other acquisition waits for it, its admission is open, and its driver
+    /// returns a slot at its next turn, which the read response's completion
+    /// woke (`OwnedH1UpstreamHandle::returning_capacity`).
+    pub(crate) fn claimable(&self) -> bool {
+        self.inner.pool.claimant.get().is_none()
+            && !self.session_admission_closed()
+            && self.inner.upstream.returning_capacity() != 0
+    }
+
+    /// Records that `waiter`'s acquisition waits for the returning slot.
+    pub(crate) fn claim(&self, waiter: u64) {
+        self.inner.pool.claimant.set(Some(waiter));
+    }
+
+    /// The waiter whose acquisition waits for the returning slot.
+    pub(crate) fn claimant(&self) -> Option<u64> {
+        self.inner.pool.claimant.get()
+    }
+
+    /// Ends `waiter`'s claim, if it still holds it.
+    pub(crate) fn release_claim(&self, waiter: u64) {
+        if self.inner.pool.claimant.get() == Some(waiter) {
+            self.inner.pool.claimant.set(None);
         }
     }
 

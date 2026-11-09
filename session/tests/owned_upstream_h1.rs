@@ -871,6 +871,67 @@ fn returned_slot_follows_the_released_submission_order() {
     }
 }
 
+/// An exchange's slot is returning once only the driver's retirement still holds it: its
+/// request written and its response read to its end, on a connection that its codec leaves
+/// reusable. The driver's next turn then returns the slot, so a pool can wait for it instead
+/// of dialing (`OwnedH1UpstreamHandle::returning_capacity`).
+#[test]
+fn a_finished_exchange_s_slot_is_returning_until_the_driver_retires_it() {
+    // (case, first response, whether the request's write waits until its response is read,
+    // `returning_capacity` once the request is committed, once its response is complete and
+    // unread, once it is read and before the driver's next turn, and once the driver retired
+    // the exchange)
+    let cases: [(&str, &'static [u8], bool, [u32; 4]); 3] = [
+        ("keep-alive", OK_RESPONSE, false, [0, 0, 1, 0]),
+        ("connection close", CLOSE_RESPONSE, false, [0, 0, 0, 0]),
+        ("request unwritten", OK_RESPONSE, true, [0, 0, 0, 0]),
+    ];
+    for (case, response, held_write, expected) in cases {
+        let observed = run_on_host(move |context| {
+            Box::pin(async move {
+                let respond = Arc::new(tokio::sync::Notify::new());
+                let second = Arc::new(tokio::sync::Notify::new());
+                let (transport, state) =
+                    ScriptedTransport::new(reuse_reads(&respond, &second, response, false));
+                let write_gate = Rc::new(tokio::sync::Notify::new());
+                if held_write {
+                    state.borrow_mut().write_gate = Some((b"GET".to_vec(), Rc::clone(&write_gate)));
+                }
+                let (session, handle) =
+                    OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+                let submission = handle.reserve_request().unwrap().submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                let (run, observed) = futures::join!(session.run(), async {
+                    let response = submission.await.unwrap();
+                    let committed = handle.returning_capacity();
+                    respond.notify_one();
+                    yield_until(|| response.control.capacity_released()).await;
+                    let unread = handle.returning_capacity();
+                    let (_stream, mut source, _control) = response.into_source_parts();
+                    assert_eq!(read_response(&mut source).await.body, b"ok");
+                    drop(source);
+                    // No yield since the read: the driver has not run.
+                    let read = handle.returning_capacity();
+                    write_gate.notify_one();
+                    yield_until(|| handle.is_idle() || handle.is_finished()).await;
+                    let retired = handle.returning_capacity();
+                    if handle.is_idle() {
+                        assert_eq!(handle.available_capacity(), 1, "{case}: the slot returned");
+                        assert!(handle.close_when_idle().unwrap());
+                    }
+                    [committed, unread, read, retired]
+                });
+                run.unwrap();
+                observed
+            })
+        });
+        assert_eq!(observed, expected, "{case}");
+    }
+}
+
 #[test]
 fn close_when_idle_closes_an_idle_connection() {
     run_on_host(|context| {

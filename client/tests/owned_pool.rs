@@ -14,6 +14,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -61,6 +62,7 @@ use crate::connector::ClientTransportOptions;
 use crate::connector::ConnectionParams;
 use crate::connector::SessionParams;
 use crate::experimental::owned::OwnedClientReservation;
+use crate::experimental::owned::OwnedClientResponse;
 use crate::experimental::owned::OwnedClientSession;
 use crate::experimental::owned::OwnedGetSessionResult;
 use crate::experimental::owned::OwnedHttpSessionPool;
@@ -312,11 +314,20 @@ async fn request(path: &str) -> (HttpHeaderEvent, HttpSourceHolder) {
 
 /// Sends `path` on `reservation` and returns the 200 response's whole body.
 async fn exchange(reservation: OwnedClientReservation, path: &str) -> Vec<u8> {
+    read_body(submit(reservation, path).await).await
+}
+
+/// Sends `path` on `reservation` and returns its response once the request is committed.
+async fn submit(reservation: OwnedClientReservation, path: &str) -> OwnedClientResponse {
     let (head, body) = request(path).await;
-    let response = reservation
+    reservation
         .submit(head, body, CancellationToken::never())
         .await
-        .expect("request is committed");
+        .expect("request is committed")
+}
+
+/// Reads the 200 `response` to its end and returns its whole body.
+async fn read_body(response: OwnedClientResponse) -> Vec<u8> {
     let mut source = response.source.into_source_owner().into_source_holder();
     let head = source.read_header_event().await.expect("response head");
     assert_eq!(head.headers().response_status(), Some(200));
@@ -2030,6 +2041,314 @@ fn max_connections_zero_disables_reuse() {
             (true, true, b"ok".to_vec(), 2),
             "{protocol:?}: the released session closes, and the next exchange dials anew"
         );
+    }
+}
+
+/// Polls `future` once, with the current task's waker.
+async fn poll_once<Work: Future>(mut future: Pin<&mut Work>) -> Poll<Work::Output> {
+    std::future::poll_fn(|context| Poll::Ready(future.as_mut().poll(context))).await
+}
+
+/// B2's pool parameters as the router sets them (`MostRecentlyUsed`, a 90 s idle timeout
+/// swept on an interval), with `max_connections`.
+fn router_params(max_connections: u32) -> PoolParams {
+    idle_params(
+        max_connections,
+        SessionReuseOrder::MostRecentlyUsed,
+        Duration::from_secs(90),
+        IdleSweep::Interval,
+    )
+}
+
+/// On HTTP/1.1 a stream's next request arrives before the owned driver has returned the slot
+/// of the response the stream just read. The acquisition waits for that slot instead of
+/// starting a connection attempt that would never dial: back-to-back exchanges on one
+/// session start no attempt and spawn no pool task, and each is served on that session.
+#[test]
+fn back_to_back_http1_acquisitions_wait_for_the_returning_session_without_an_attempt() {
+    for (name, params) in [("default", params(4)), ("router", router_params(4))] {
+        let origin = Origin::start(CodecProtocol::Http11);
+        let address = origin.address;
+        let (attempts, spawns, same, sessions) = run_on_worker(move |context| async move {
+            let pool = idle_pool(&context, address, CodecProtocol::Http11, params);
+            let first = acquire(&pool).await;
+            let session = local(&first.session);
+            assert_eq!(exchange(first.reservation, "/").await, b"ok");
+            let attempts = pool.connection_attempts_for_test();
+            let spawns = pool.pool_task_spawns_for_test();
+            let mut same = Vec::new();
+            for _ in 0..3 {
+                // No yield since the previous response was read: its slot is returning.
+                let next = acquire(&pool).await;
+                same.push(local(&next.session) == session);
+                assert_eq!(exchange(next.reservation, "/").await, b"ok");
+            }
+            (
+                pool.connection_attempts_for_test() - attempts,
+                pool.pool_task_spawns_for_test() - spawns,
+                same,
+                pool.session_count(),
+            )
+        });
+        assert_eq!(
+            (attempts, spawns, same, sessions, origin.accepted()),
+            (0, 0, vec![true; 3], 1, 1),
+            "{name}: (attempts, pool task spawns, served on the first session, sessions, \
+             connections)"
+        );
+    }
+}
+
+/// An acquisition that waits for a returning session takes it when the driver returns it,
+/// ahead of an earlier waiter whose own dial is still pending, and starts no attempt itself.
+#[test]
+fn a_waiter_for_a_returning_session_takes_it_ahead_of_an_earlier_waiter_s_dial() {
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let (took_returning, earlier_dialed, attempts) = run_on_worker(move |context| async move {
+        let pool = pool(&context, address, CodecProtocol::Http11, 4);
+        let one = acquire(&pool).await;
+        let two = acquire(&pool).await;
+        let first = submit(one.reservation, "/").await;
+        let second = submit(two.reservation, "/").await;
+        // Both responses are complete; neither slot returns while its response is unread.
+        until(|| first.request.capacity_released() && second.request.capacity_released()).await;
+        let attempts = pool.connection_attempts_for_test();
+        let mut earlier = pin!(pool.get_session_with_reservation(CancellationToken::never()));
+        assert!(
+            poll_once(earlier.as_mut()).await.is_pending(),
+            "no slot is free"
+        );
+        // Read from the buffer, with no yield: the second session's slot is returning.
+        assert_eq!(read_body(second).await, b"ok");
+        let mut next = pin!(pool.get_session_with_reservation(CancellationToken::never()));
+        assert!(
+            poll_once(next.as_mut()).await.is_pending(),
+            "the slot is not back yet"
+        );
+        let next = next.await.expect("the returned session serves");
+        let took_returning = local(&next.session) == local(&two.session);
+        let earlier = earlier.await.expect("the earlier waiter's dial serves");
+        let earlier_dialed =
+            ![local(&one.session), local(&two.session)].contains(&local(&earlier.session));
+        assert_eq!(exchange(next.reservation, "/").await, b"ok");
+        assert_eq!(exchange(earlier.reservation, "/").await, b"ok");
+        assert_eq!(read_body(first).await, b"ok");
+        (
+            took_returning,
+            earlier_dialed,
+            pool.connection_attempts_for_test() - attempts,
+        )
+    });
+    assert_eq!(
+        (took_returning, earlier_dialed, attempts, origin.accepted()),
+        (true, true, 1, 3),
+        "(the waiter took the returning session, the earlier waiter its own dial, attempts, \
+         connections)"
+    );
+}
+
+/// An acquisition dropped or cancelled while it waits for a returning session gives up its
+/// claim on it: the next acquisition waits for that session instead of dialing.
+#[test]
+fn a_cancelled_acquisition_releases_the_returning_session_it_waited_for() {
+    // (whether the acquisition is dropped, or cancelled through its token)
+    for dropped in [true, false] {
+        let origin = Origin::start(CodecProtocol::Http11);
+        let address = origin.address;
+        let (cancelled, attempts, same) = run_on_worker(move |context| async move {
+            let pool = pool(&context, address, CodecProtocol::Http11, 4);
+            let first = acquire(&pool).await;
+            assert_eq!(exchange(first.reservation, "/").await, b"ok");
+            let attempts = pool.connection_attempts_for_test();
+            let cancellation = CancellationSource::new();
+            let mut waiting = Box::pin(pool.get_session_with_reservation(cancellation.token()));
+            assert!(poll_once(waiting.as_mut()).await.is_pending());
+            let cancelled = if dropped {
+                drop(waiting);
+                true
+            } else {
+                cancellation.request_cancellation();
+                matches!(
+                    poll_once(waiting.as_mut()).await,
+                    Poll::Ready(Err(PoolError::Cancelled))
+                )
+            };
+            let next = acquire(&pool).await;
+            let same = local(&next.session) == local(&first.session);
+            assert_eq!(exchange(next.reservation, "/").await, b"ok");
+            (
+                cancelled,
+                pool.connection_attempts_for_test() - attempts,
+                same,
+            )
+        });
+        assert_eq!(
+            (cancelled, attempts, same, origin.accepted()),
+            (true, 0, true, 1),
+            "dropped: {dropped}: (cancelled, attempts, served on the first session, \
+             connections)"
+        );
+    }
+}
+
+/// An HTTP/1.1 origin that accepts one connection and then closes its listener, so that a
+/// later dial to its address is refused, and answers `ok` to every request on that
+/// connection until the client closes it.
+struct OneConnectionOrigin {
+    address: SocketAddr,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OneConnectionOrigin {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("origin binds");
+        let address = listener.local_addr().expect("origin address");
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("origin accepts");
+            drop(listener);
+            let mut pending = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let read = match std::io::Read::read(&mut stream, &mut buffer) {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => read,
+                };
+                pending.extend_from_slice(&buffer[..read]);
+                while let Some(end) = pending.windows(4).position(|part| part == b"\r\n\r\n") {
+                    pending.drain(..end + 4);
+                    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                    if std::io::Write::write_all(&mut stream, response).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        Self {
+            address,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for OneConnectionOrigin {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A session that fails while an acquisition waits for its returning slot leaves that
+/// acquisition to dial a replacement, or to fail with the dial's error, as an acquisition that
+/// had started its own attempt did.
+#[test]
+fn an_acquisition_waiting_for_a_returning_session_that_fails_dials_or_errors_as_before() {
+    // (whether the origin accepts a replacement connection)
+    for accepting in [true, false] {
+        let hyper_origin = accepting.then(|| Origin::start(CodecProtocol::Http11));
+        let refusing_origin = (!accepting).then(OneConnectionOrigin::start);
+        let address = hyper_origin.as_ref().map_or_else(
+            || refusing_origin.as_ref().expect("one origin").address,
+            |origin| origin.address,
+        );
+        let (pending, outcome) = run_on_worker(move |context| async move {
+            let pool = pool(&context, address, CodecProtocol::Http11, 4);
+            let first = acquire(&pool).await;
+            let session = first.session.clone();
+            assert_eq!(exchange(first.reservation, "/").await, b"ok");
+            let mut next = pin!(pool.get_session_with_reservation(CancellationToken::never()));
+            let first_poll = poll_once(next.as_mut()).await;
+            let pending = first_poll.is_pending();
+            // The session fails before its driver returns the slot.
+            session.cancel();
+            let acquired = match first_poll {
+                Poll::Ready(acquired) => acquired,
+                Poll::Pending => next.await,
+            };
+            let outcome = match acquired {
+                Ok(acquired) => {
+                    let replaced = local(&acquired.session) != local(&session);
+                    assert_eq!(exchange(acquired.reservation, "/").await, b"ok");
+                    format!("served, replaced: {replaced}")
+                }
+                Err(PoolError::ConnectFailed { .. }) => "connect failed".to_owned(),
+                Err(error) => format!("{error:?}"),
+            };
+            (pending, outcome)
+        });
+        let expected = if accepting {
+            "served, replaced: true"
+        } else {
+            "connect failed"
+        };
+        assert_eq!(
+            (pending, outcome.as_str()),
+            (true, expected),
+            "accepting: {accepting}"
+        );
+        if let Some(origin) = hyper_origin {
+            assert_eq!(origin.accepted(), 2, "the replacement was dialed");
+        }
+    }
+}
+
+/// Pool limits bound an acquisition that meets a returning session as before: at
+/// `max_connections` it waits for the slot like any waiter, and `max_waiters` refuses it
+/// there; and with a 1 ns idle timeout (S2.7) the returned session is idle and expired when
+/// the acquisition takes its turn, so it is retired and the acquisition dials.
+#[test]
+fn pool_limits_and_idle_retirement_bound_a_back_to_back_acquisition_as_before() {
+    let cases = [
+        (
+            "at max_connections",
+            params(1),
+            "served on the first session",
+        ),
+        (
+            "no waiter allowed at max_connections",
+            PoolParams {
+                max_waiters: 0,
+                ..params(1)
+            },
+            "MaxWaiters",
+        ),
+        (
+            "1 ns idle timeout",
+            idle_params(
+                4,
+                SessionReuseOrder::MostRecentlyUsed,
+                Duration::from_nanos(1),
+                IdleSweep::Interval,
+            ),
+            "served on another session",
+        ),
+    ];
+    for (name, params, expected) in cases {
+        let origin = Origin::start(CodecProtocol::Http11);
+        let address = origin.address;
+        let outcome = run_on_worker(move |context| async move {
+            let pool = idle_pool(&context, address, CodecProtocol::Http11, params);
+            let first = acquire(&pool).await;
+            let session = local(&first.session);
+            assert_eq!(exchange(first.reservation, "/").await, b"ok");
+            match pool
+                .get_session_with_reservation(CancellationToken::never())
+                .await
+            {
+                Ok(next) => {
+                    let same = local(&next.session) == session;
+                    assert_eq!(exchange(next.reservation, "/").await, b"ok");
+                    if same {
+                        "served on the first session".to_owned()
+                    } else {
+                        "served on another session".to_owned()
+                    }
+                }
+                Err(error) => format!("{error:?}"),
+            }
+        });
+        assert_eq!(outcome, expected, "{name}");
     }
 }
 

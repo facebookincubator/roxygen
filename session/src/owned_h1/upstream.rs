@@ -73,6 +73,9 @@ struct Shared {
     spent: Cell<bool>,
     /// Requests committed on the connection (`DIV-035`).
     committed: Cell<u64>,
+    /// The live exchange's response signals once only its consumer's completion and the
+    /// driver's retirement keep its slot (`OwnedH1UpstreamHandle::returning_capacity`).
+    retiring: RefCell<Option<Rc<IngressSignals>>>,
     closed: RefCell<Option<HttpError>>,
     observer: RefCell<Option<Rc<dyn OwnedUpstreamObserver>>>,
     queued: RefCell<Option<Submission>>,
@@ -182,6 +185,25 @@ impl OwnedH1UpstreamHandle {
         } else {
             self.0.available()
         }
+    }
+
+    /// 1 while the connection's slot is held only by an exchange whose request is written and
+    /// whose response is complete and read to its end (its source completed), on a connection
+    /// that `Http1xCodec` left reusable after that response: unless the connection fails first,
+    /// the driver's next turn, which the source's completion woke, retires the exchange and
+    /// returns the slot (`capacity_available`). Otherwise 0.
+    pub fn returning_capacity(&self) -> u32 {
+        let shared = &self.0;
+        u32::from(
+            shared
+                .retiring
+                .borrow()
+                .as_ref()
+                .is_some_and(|signals| signals.source_complete.get())
+                && shared.closed.borrow().is_none()
+                && !shared.cancelled()
+                && !shared.complete.get(),
+        )
     }
 
     /// Installs the connection's one observer. Fails with `INVALID_STATE_TRANSITION` once an
@@ -1307,6 +1329,7 @@ impl UpstreamDriver {
             used: Cell::new(0),
             spent: Cell::new(false),
             committed: Cell::new(0),
+            retiring: RefCell::new(None),
             closed: RefCell::new(None),
             observer: RefCell::new(None),
             queued: RefCell::new(None),
@@ -1971,8 +1994,20 @@ impl UpstreamDriver {
             && exchange.consumed
             && exchange.write_boundary <= self.summary.bytes_written)
         {
+            // Only the consumer's completion is left: the turn it wakes returns the slot.
+            if exchange.request_complete
+                && exchange.response_complete
+                && exchange.status.ingress_succeeded()
+                && exchange.write_boundary <= self.summary.bytes_written
+                && self.codec.is_reusable()
+                && !self.codec.is_busy()
+                && self.shared.retiring.borrow().is_none()
+            {
+                *self.shared.retiring.borrow_mut() = Some(Rc::clone(&exchange.signals));
+            }
             return false;
         }
+        self.shared.retiring.take();
         let exchange = self.exchange.take().expect("the exchange was present");
         capture(&mut self.panic, || drop(exchange));
         // As OwnedH2: a retirement panic fails the connection, and `run` resumes it.
@@ -2241,6 +2276,7 @@ impl UpstreamDriver {
     fn close_and_cancel(&mut self, error: &HttpError) {
         // Admission closes first, so the exchange's capacity release announces no capacity.
         capture(&mut self.panic, || self.shared.close(error.clone()));
+        self.shared.retiring.take();
         if let Some(mut exchange) = self.exchange.take() {
             capture(&mut self.panic, || exchange.cancel(error));
             capture(&mut self.panic, || drop(exchange));
