@@ -2,6 +2,7 @@
 // with the same input, the same zero-timeout `UniplexConfig` and the same scripted response,
 // whose fixed `date` keeps the clock out of the comparison.
 
+use std::sync::atomic::AtomicBool;
 use std::task::Context;
 use std::task::Waker;
 
@@ -27,10 +28,13 @@ use crate::owned_h1::Http1UpgradePolicy;
 use crate::owned_h1::OwnedH1Handle;
 use crate::owned_h1::OwnedH1Options;
 use crate::owned_h1::OwnedH1Session;
+use crate::owned_h1::SignalProbe;
+use crate::owned_h1::after_next_body_event_serialized;
 use crate::owned_h1::codec_parses;
 use crate::owned_h1::driver_turns;
 use crate::owned_h1::phase_checks;
 use crate::owned_h1::read_start_checks;
+use crate::owned_h1::read_write_polls_and_signal_takes;
 use crate::uniplex::UniplexWriteCompletion;
 use crate::uniplex::UniplexWriteQueue;
 
@@ -1063,9 +1067,10 @@ fn owned_h1_polls_a_drained_reader_once_per_read() {
 
 /// Serves a keep-alive GET, read in one read that drains the transport, with a chunked response
 /// whose body events the test pushes while the reader stays parked: it waits for its waker,
-/// with no read started. Returns the driver turns and read starts evaluated for each of three
-/// pushed events, then the wire once the response ended and `end` ended the connection.
-fn parked_h1(end: ParkedEnd) -> (Vec<(usize, usize)>, Wire) {
+/// with no read started. Returns, for each of three pushed events, the driver turns, the read
+/// starts evaluated, the read and write-completion phases entered and the wake signals taken;
+/// then the wire once the response ended and `end` ended the connection.
+fn parked_h1(end: ParkedEnd) -> (Vec<(usize, usize, usize, usize, usize)>, Wire) {
     run_on_host(move |context| {
         Box::pin(async move {
             let mut reads = vec![ReadAction::Data(KEEP_ALIVE_GET.to_vec())];
@@ -1096,10 +1101,21 @@ fn parked_h1(end: ParkedEnd) -> (Vec<(usize, usize)>, Wire) {
             assert_eq!(state.borrow().writes.len(), 1, "the head is written first");
             let counts = [b"one".as_slice(), b"two", b"three"]
                 .map(|chunk| {
-                    let before = (driver_turns(), read_start_checks());
+                    let before = (
+                        driver_turns(),
+                        read_start_checks(),
+                        read_write_polls_and_signal_takes(),
+                    );
                     body.push(HttpBodyEvent::body(queue(chunk), false));
                     assert!(run.as_mut().poll(&mut poll).is_pending());
-                    (driver_turns() - before.0, read_start_checks() - before.1)
+                    let (reads, writes, takes) = read_write_polls_and_signal_takes();
+                    (
+                        driver_turns() - before.0,
+                        read_start_checks() - before.1,
+                        reads - before.2.0,
+                        writes - before.2.1,
+                        takes - before.2.2,
+                    )
                 })
                 .to_vec();
             body.push(HttpBodyEvent::body(queue(b"end"), true));
@@ -1116,14 +1132,18 @@ fn parked_h1(end: ParkedEnd) -> (Vec<(usize, usize)>, Wire) {
 }
 
 /// H2-L6b: while a drained reader waits for its waker ("parked"), each driver turn leaves the
-/// read phase without evaluating a read start. Each pushed body event's two turns evaluate none;
-/// without the fast exit each turn would evaluate one.
+/// read phase without evaluating a read start. Each pushed body event's turn evaluates none;
+/// without the fast exit the turn would evaluate one.
 #[test]
 fn owned_h1_a_parked_reader_evaluates_no_read_start_while_a_response_body_is_pushed() {
     let (counts, wire) = parked_h1(ParkedEnd::Close);
+    let counts: Vec<_> = counts
+        .iter()
+        .map(|&(turns, starts, ..)| (turns, starts))
+        .collect();
     assert_eq!(
         counts,
-        [(2, 0); 3],
+        [(1, 0); 3],
         "(driver turns, read starts evaluated) per pushed body event"
     );
     assert!(
@@ -1133,6 +1153,27 @@ fn owned_h1_a_parked_reader_evaluates_no_read_start_while_a_response_body_is_pus
         String::from_utf8_lossy(&wire.output)
     );
     assert_eq!(wire.error, None);
+}
+
+/// With the reader parked, as an owned connection over TCP is between requests, each pushed body
+/// event's one turn enters the read phase once, where the parked reader's two loads end it, and
+/// the write-completion phase twice: once in the turn, where no write is ready, and once after
+/// the event's write starts, which takes its completion. It takes three wake signals: the
+/// exchange's and the write's in the turn, and the write's after it; the body's second poll
+/// clears the exchange's signal in place of taking it. A second turn would add one read phase,
+/// one write-completion phase and both of its signal takes.
+#[test]
+fn owned_h1_a_pushed_body_event_enters_the_read_phase_once_and_the_write_phase_twice() {
+    let (counts, _) = parked_h1(ParkedEnd::Close);
+    let counts: Vec<_> = counts
+        .iter()
+        .map(|&(_, _, reads, writes, takes)| (reads, writes, takes))
+        .collect();
+    assert_eq!(
+        counts,
+        [(1, 2, 3); 3],
+        "(read phases, write-completion phases, signal takes) per pushed body event"
+    );
 }
 
 /// H2-L6b: a parked reader still ends. The next read's EOF or failure wakes it, and the driver's
@@ -2796,6 +2837,8 @@ struct WriteFence {
     /// `true`, as `UniplexWriteQueue`'s default does).
     unsaturated: Cell<bool>,
     saturation_queries: Cell<usize>,
+    /// The write queue's `can_write` calls.
+    capacity_checks: Cell<usize>,
     /// Run once, from inside the transport, by the named callback: `read` (a read completes),
     /// `write_complete` (a write completes) or `can_write` (the write queue's capacity check).
     reentry: RefCell<Option<(&'static str, Box<dyn Fn()>)>>,
@@ -2852,6 +2895,9 @@ struct FenceQueue {
 
 impl UniplexWriteQueue for FenceQueue {
     fn can_write(&self, _bytes: usize) -> bool {
+        self.fence
+            .capacity_checks
+            .set(self.fence.capacity_checks.get() + 1);
         self.fence.reenter("can_write");
         self.fence.receipts.borrow().len() < 4
     }
@@ -6097,6 +6143,19 @@ fn a_staged_close_returns_a_failed_write_shutdown_without_waiting_for_the_peer()
 struct PushedBody {
     events: RefCell<VecDeque<HttpBodyEvent>>,
     waker: RefCell<Option<Waker>>,
+    /// `poll_body` calls.
+    polls: Cell<usize>,
+    /// When set, the exchange hands its request body source to `request`, unread; otherwise it
+    /// drops it.
+    keep_request: bool,
+    request: RefCell<Option<HttpSourceHolder>>,
+    /// When set, a poll that returns an event wakes its waker first, as a source that finds more
+    /// ready behind the event may.
+    wake_with_event: bool,
+    /// Run once by the next poll that returns `Pending`, after it keeps its waker.
+    on_pending: RefCell<Option<Box<dyn FnOnce()>>>,
+    /// `response_complete` calls.
+    response_completes: Cell<usize>,
 }
 
 impl PushedBody {
@@ -6136,7 +6195,11 @@ impl OwnedApplication for PushedApp {
 }
 
 impl OwnedExchange for PushedExchange {
-    fn request(&mut self, _head: Box<HttpMessage>, _body: HttpStreamSourceOwner, _eom: bool) {}
+    fn request(&mut self, _head: Box<HttpMessage>, body: HttpStreamSourceOwner, _eom: bool) {
+        if self.body.keep_request {
+            *self.body.request.borrow_mut() = Some(body.into_source_holder());
+        }
+    }
 
     fn poll_headers(
         &mut self,
@@ -6153,26 +6216,39 @@ impl OwnedExchange for PushedExchange {
         context: &mut Context<'_>,
         _maximum: u32,
     ) -> Poll<Result<HttpBodyEvent, HttpError>> {
-        if let Some(event) = self.body.events.borrow_mut().pop_front() {
+        self.body.polls.set(self.body.polls.get() + 1);
+        let event = self.body.events.borrow_mut().pop_front();
+        if let Some(event) = event {
+            if self.body.wake_with_event {
+                context.waker().wake_by_ref();
+            }
             return Poll::Ready(Ok(event));
         }
         *self.body.waker.borrow_mut() = Some(context.waker().clone());
+        let on_pending = self.body.on_pending.borrow_mut().take();
+        if let Some(on_pending) = on_pending {
+            on_pending();
+        }
         Poll::Pending
     }
 
     fn cancel(&mut self, _error: &HttpError, _peer_reset: bool) {}
 
-    fn response_complete(&mut self) {}
+    fn response_complete(&mut self) {
+        self.body
+            .response_completes
+            .set(self.body.response_completes.get() + 1);
+    }
 
     fn complete(self) {}
 }
 
 /// Serves a keep-alive GET whose chunked response head is written at once, then pushes each of
-/// `chunks` to its body and polls the driver once; returns the driver turns, codec parses and
-/// phase checks each push took, and every write.
+/// `chunks` to its body and polls the driver once; returns the driver turns, codec parses, phase
+/// checks and body polls each push took, and every write.
 fn pushed_body_turns(
     chunks: &'static [&'static [u8]],
-) -> (Vec<(usize, usize, usize)>, Vec<Vec<u8>>) {
+) -> (Vec<(usize, usize, usize, usize)>, Vec<Vec<u8>>) {
     pushed_body_turns_through(false, chunks)
 }
 
@@ -6182,7 +6258,7 @@ fn pushed_body_turns(
 fn pushed_body_turns_through(
     queued: bool,
     chunks: &'static [&'static [u8]],
-) -> (Vec<(usize, usize, usize)>, Vec<Vec<u8>>) {
+) -> (Vec<(usize, usize, usize, usize)>, Vec<Vec<u8>>) {
     run_on_host(move |context| {
         Box::pin(async move {
             let reads = [ReadAction::Data(KEEP_ALIVE_GET.to_vec())];
@@ -6209,13 +6285,19 @@ fn pushed_body_turns_through(
             assert_eq!(state.borrow().writes.len(), 1, "the head is written first");
             let mut turns = Vec::new();
             for chunk in chunks {
-                let before = (driver_turns(), codec_parses(), phase_checks());
+                let before = (
+                    driver_turns(),
+                    codec_parses(),
+                    phase_checks(),
+                    body.polls.get(),
+                );
                 body.push(HttpBodyEvent::body(queue(chunk), false));
                 assert!(run.as_mut().poll(&mut poll).is_pending());
                 turns.push((
                     driver_turns() - before.0,
                     codec_parses() - before.1,
                     phase_checks() - before.2,
+                    body.polls.get() - before.3,
                 ));
             }
             body.push(HttpBodyEvent::body(queue(b"end"), true));
@@ -6227,23 +6309,25 @@ fn pushed_body_turns_through(
     })
 }
 
-/// Each response body event pushed to a waiting exchange takes two driver turns: one serializes
-/// it, and one finds the body pending again and, as no phase before the write has work left,
-/// starts the event's write, then takes the write's completion where the next turn would have
-/// taken it first. No turn runs only to take that completion, directly or through a write queue,
-/// and the parser, paused behind the request, is handed nothing.
+/// Each response body event pushed to a waiting exchange takes one driver turn. The turn
+/// serializes it and, as no phase other than the exchange's has work left, polls the body again
+/// in place of the next turn, and counts it as that turn; the body is pending, so the event's
+/// write starts, and the write's completion is taken where the next turn would have taken it
+/// first. The body is still polled twice per event, once for the event and once until it is
+/// pending; no turn runs only to poll it again or to take the write's completion, directly or
+/// through a write queue, and the parser, paused behind the request, is handed nothing.
 #[test]
-fn a_pushed_response_body_event_takes_two_driver_turns() {
+fn a_pushed_response_body_event_takes_one_driver_turn() {
     for queued in [false, true] {
         let (counts, writes) = pushed_body_turns_through(queued, &[b"one", b"two", b"three"]);
         let turns: Vec<_> = counts
             .iter()
-            .map(|&(turns, parses, _)| (turns, parses))
+            .map(|&(turns, parses, _, polls)| (turns, parses, polls))
             .collect();
         assert_eq!(
             turns,
-            [(2, 0); 3],
-            "queued {queued}: (driver turns, codec parses) per event"
+            [(1, 0, 2); 3],
+            "queued {queued}: (driver turns, codec parses, body polls) per event"
         );
         assert!(
             writes[0].starts_with(b"HTTP/1.1 200 \r\n"),
@@ -6268,18 +6352,19 @@ fn a_pushed_response_body_event_takes_two_driver_turns() {
 /// holds the write back and is due in the next turn too, so the turn ends without a second check;
 /// or starts the write, after which the next turn's first phases, up to the write's completion,
 /// run at once and one check decides whether the rest of that turn would act. So each pushed body
-/// event checks three times in its two turns: the write check of each, and once after its write.
+/// event checks twice in its one turn: the write check, and once after its write. The check
+/// before the body is polled again in the turn is a separate one, which leaves out the exchange.
 #[test]
-fn a_pushed_response_body_event_checks_the_phases_three_times() {
+fn a_pushed_response_body_event_checks_the_phases_twice() {
     for queued in [false, true] {
         let (counts, _) = pushed_body_turns_through(queued, &[b"one", b"two", b"three"]);
         let checks: Vec<_> = counts
             .iter()
-            .map(|&(turns, _, checks)| (turns, checks))
+            .map(|&(turns, _, checks, _)| (turns, checks))
             .collect();
         assert_eq!(
             checks,
-            [(2, 3); 3],
+            [(1, 2); 3],
             "queued {queued}: (driver turns, phase checks) per event"
         );
     }
@@ -6323,16 +6408,17 @@ fn fenced_pushed_body_turns(queued: bool) -> ((usize, usize), Vec<Vec<u8>>) {
     })
 }
 
-/// A pushed body event whose write does not complete when first polled takes two driver turns
-/// as well: the second starts the write and finds its completion pending where the next turn
-/// would have, and the poll ends. The poll that the write's completion wakes takes it in one turn.
+/// A pushed body event whose write does not complete when first polled takes one driver turn
+/// as well: it serializes the event, polls the body again until it is pending, starts the write
+/// and finds its completion pending where the next turn would have, and the poll ends. The poll
+/// that the write's completion wakes takes it in one turn.
 #[test]
-fn a_pushed_body_event_whose_write_waits_takes_two_driver_turns() {
+fn a_pushed_body_event_whose_write_waits_takes_one_driver_turn() {
     for queued in [false, true] {
         let (turns, writes) = fenced_pushed_body_turns(queued);
         assert_eq!(
             turns,
-            (2, 1),
+            (1, 1),
             "queued {queued}: driver turns of the push's poll and of the completion's poll"
         );
         assert_eq!(
@@ -6341,6 +6427,478 @@ fn a_pushed_body_event_whose_write_waits_takes_two_driver_turns() {
             "queued {queued}"
         );
     }
+}
+
+/// A cancel that lands right after a body event is serialized, where another thread's worker
+/// cancellation can land, is observed before the body is polled again, as when it landed before
+/// the next turn: the exchange gets no further body poll, and the serialized event and the one
+/// queued behind it are not written.
+#[test]
+fn a_cancel_landing_after_a_body_event_is_serialized_gets_no_further_body_poll() {
+    let (polls, wire) = run_on_host(|context| {
+        Box::pin(async move {
+            let (transport, state) =
+                ScriptedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())]);
+            let body = Rc::new(PushedBody::default());
+            let application = PushedApp {
+                body: Rc::clone(&body),
+            };
+            let (session, handle) =
+                OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+            let mut run = std::pin::pin!(session.run());
+            assert!(
+                run.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert_eq!(state.borrow().writes.len(), 1, "the head is written first");
+            body.push(HttpBodyEvent::body(queue(b"one"), false));
+            body.push(HttpBodyEvent::body(queue(b"two"), false));
+            let at_cancel = Rc::new(Cell::new(None));
+            let (polls_at_cancel, polled) = (Rc::clone(&at_cancel), Rc::clone(&body));
+            after_next_body_event_serialized(move || {
+                polls_at_cancel.set(Some(polled.polls.get()));
+                handle.cancel();
+            });
+            let result = run.await;
+            let at_cancel = at_cancel.get().expect("a body event was serialized");
+            (body.polls.get() - at_cancel, wire_of(&state, result))
+        })
+    });
+    assert_eq!(polls, 0, "no body poll follows the cancel");
+    assert_eq!(wire.error, Some(HttpErrorCode::CORO_CANCELLED));
+    assert_eq!(wire.close, CloseKind::Reset);
+    assert_eq!(wire.writes.len(), 1, "only the head is written");
+}
+
+/// A read that completes right after a body event is serialized, here the peer's EOF under
+/// `abort_exchanges_on_eof` (`DIV-053`), is handled before the body is polled again, as when it
+/// completed before the next turn: the EOF finds the exchange open and aborts it, so the event
+/// queued behind the serialized one is never serialized; the serialized one is written, then the
+/// connection resets.
+#[test]
+fn a_read_landing_after_a_body_event_is_serialized_is_handled_before_the_body_is_polled_again() {
+    let wire = run_on_host(|context| {
+        Box::pin(async move {
+            let (scripted, state) = ScriptedTransport::new([
+                ReadAction::Data(KEEP_ALIVE_GET.to_vec()),
+                ReadAction::Eof,
+            ]);
+            let (transport, gate) = GatedReaderTransport::new(scripted);
+            let body = Rc::new(PushedBody::default());
+            let application = PushedApp {
+                body: Rc::clone(&body),
+            };
+            let mut options = owned_options(context, transport);
+            options.io.abort_exchanges_on_eof = true;
+            let (session, _handle) = OwnedH1Session::new(application, options).unwrap();
+            let mut run = std::pin::pin!(session.run());
+            let mut poll = Context::from_waker(Waker::noop());
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            gate.open_one();
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            assert!(
+                gate.waiting(),
+                "the request's read drained the transport and parked the reader"
+            );
+            assert_eq!(state.borrow().writes.len(), 1, "the head is written first");
+            body.push(HttpBodyEvent::body(queue(b"one"), false));
+            body.push(HttpBodyEvent::body(queue(b"two"), false));
+            let eof = Rc::clone(&gate);
+            after_next_body_event_serialized(move || eof.open_one());
+            let result = run.await;
+            wire_of(&state, result)
+        })
+    });
+    assert_eq!(wire.error, Some(HttpErrorCode::TRANSPORT_EOF));
+    assert_eq!(wire.close, CloseKind::Reset);
+    assert!(
+        wire.output.ends_with(b"\r\n\r\n3\r\none\r\n"),
+        "only the serialized event follows the head: {:?}",
+        String::from_utf8_lossy(&wire.output)
+    );
+}
+
+/// A request body read that lands right after a response body event is serialized, as an
+/// exchange that reads its request body while it streams its response makes, and that takes the
+/// unread body below `ingress_buffer_limit`, lifts the flow-control pause before the
+/// body is polled again, as when it landed before the next turn: parsing resumes in that poll,
+/// and the request's end, which waited behind the pause, reaches the exchange.
+#[test]
+fn a_request_body_read_landing_after_a_body_event_is_serialized_resumes_parsing_in_that_poll() {
+    let (read, parses, end) = run_on_host(|context| {
+        Box::pin(async move {
+            let upload = patterned(4 << 10);
+            let mut request = format!(
+                "POST /u HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n",
+                upload.len()
+            )
+            .into_bytes();
+            request.extend_from_slice(&upload);
+            let (transport, _state) = ScriptedTransport::new([ReadAction::Data(request)]);
+            let body = Rc::new(PushedBody {
+                keep_request: true,
+                ..PushedBody::default()
+            });
+            let application = PushedApp {
+                body: Rc::clone(&body),
+            };
+            let mut options = owned_options(context, transport);
+            options.io.ingress_buffer_limit = 1 << 10;
+            let (session, handle) = OwnedH1Session::new(application, options).unwrap();
+            let mut run = std::pin::pin!(session.run());
+            let mut poll = Context::from_waker(Waker::noop());
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            let request = Rc::new(RefCell::new(
+                body.request
+                    .borrow_mut()
+                    .take()
+                    .expect("the exchange keeps its request body"),
+            ));
+            let read = Rc::new(Cell::new(0));
+            let (reader, bytes) = (Rc::clone(&request), Rc::clone(&read));
+            after_next_body_event_serialized(move || {
+                let mut next = reader.borrow_mut().read_body_event(u32::MAX);
+                let Poll::Ready(event) =
+                    next.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+                else {
+                    panic!("the paused request body is buffered");
+                };
+                let event = event.expect("the request body reads");
+                bytes.set(event.as_body().map_or(0, |body| body.chain_length()));
+            });
+            body.push(HttpBodyEvent::body(queue(b"one"), false));
+            let before = codec_parses();
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            let parses = codec_parses() - before;
+            let end = {
+                let mut next = request.borrow_mut().read_body_event(u32::MAX);
+                match next.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                    Poll::Ready(Ok(event)) => event.eom(),
+                    Poll::Ready(Err(error)) => panic!("the request body fails: {error:?}"),
+                    Poll::Pending => false,
+                }
+            };
+            drop(request);
+            body.push(HttpBodyEvent::body(queue(b"end"), true));
+            assert!(handle.initiate_drain().unwrap());
+            run.await.unwrap();
+            (read.get(), parses, end)
+        })
+    });
+    assert!(
+        read >= 1 << 10,
+        "the read takes the unread body below the limit: {read} bytes"
+    );
+    assert_eq!(
+        parses, 1,
+        "parsing resumes in the poll that serialized the event"
+    );
+    assert!(end, "the request's end reaches the exchange in that poll");
+}
+
+/// A body whose poll wakes its own waker as it returns each event, as a source that finds more
+/// ready behind the event may, is still polled twice per event, as before: the poll that follows
+/// the event consumes that wake, finds the body pending, and the event is written alone in one
+/// turn. The wake is not left to hold the write back for a further turn and poll.
+#[test]
+fn a_body_that_wakes_its_waker_with_each_event_is_polled_twice_per_event() {
+    let (counts, writes) = run_on_host(|context| {
+        Box::pin(async move {
+            let (transport, state) =
+                ScriptedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())]);
+            let body = Rc::new(PushedBody {
+                wake_with_event: true,
+                ..PushedBody::default()
+            });
+            let application = PushedApp {
+                body: Rc::clone(&body),
+            };
+            let (session, handle) =
+                OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+            let mut run = std::pin::pin!(session.run());
+            let mut poll = Context::from_waker(Waker::noop());
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            let counts: Vec<_> = [b"one".as_slice(), b"two", b"three"]
+                .into_iter()
+                .map(|chunk| {
+                    let before = (driver_turns(), body.polls.get());
+                    body.push(HttpBodyEvent::body(queue(chunk), false));
+                    assert!(run.as_mut().poll(&mut poll).is_pending());
+                    (driver_turns() - before.0, body.polls.get() - before.1)
+                })
+                .collect();
+            body.push(HttpBodyEvent::body(queue(b"end"), true));
+            assert!(handle.initiate_drain().unwrap());
+            run.await.unwrap();
+            let writes = state.borrow().writes.clone();
+            (counts, writes)
+        })
+    });
+    assert_eq!(
+        counts,
+        [(1, 2); 3],
+        "(driver turns, body polls) per pushed body event"
+    );
+    assert_eq!(
+        writes[1..],
+        [
+            b"3\r\none\r\n".to_vec(),
+            b"3\r\ntwo\r\n".to_vec(),
+            b"5\r\nthree\r\n".to_vec(),
+            b"3\r\nend\r\n0\r\n\r\n".to_vec(),
+        ]
+    );
+}
+
+/// The write decision that follows each serialized body event checks the write queue's capacity
+/// even though the write waits behind the exchange, and that check may cancel from inside the
+/// transport. The cancel is observed before the body is polled again, as when that decision
+/// ended its turn: the exchange gets no further body poll, so the response's last event, queued
+/// behind the first, is neither polled nor completed, and the capacity is checked once.
+#[test]
+fn a_cancel_from_the_capacity_check_after_a_body_event_gets_no_further_body_poll() {
+    let (polls, completes, checks, wire) = run_on_host(|context| {
+        Box::pin(async move {
+            let (transport, state, fence) =
+                FencedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())], true);
+            fence.open.set(true);
+            let body = Rc::new(PushedBody::default());
+            let application = PushedApp {
+                body: Rc::clone(&body),
+            };
+            let (session, handle) =
+                OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+            let mut run = std::pin::pin!(session.run());
+            assert!(
+                run.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert_eq!(state.borrow().writes.len(), 1, "the head is written first");
+            let before = (body.polls.get(), fence.capacity_checks.get());
+            *fence.reentry.borrow_mut() = Some(("can_write", Box::new(move || handle.cancel())));
+            body.push(HttpBodyEvent::body(queue(b"one"), false));
+            body.push(HttpBodyEvent::body(queue(b"end"), true));
+            let result = run.await;
+            fence.reentry.borrow_mut().take();
+            (
+                body.polls.get() - before.0,
+                body.response_completes.get(),
+                fence.capacity_checks.get() - before.1,
+                wire_of(&state, result),
+            )
+        })
+    });
+    assert_eq!(polls, 1, "only the first event is polled");
+    assert_eq!(completes, 0, "the response is not completed");
+    assert_eq!(
+        checks, 1,
+        "the capacity is checked once, by the decision whose check cancels"
+    );
+    assert_eq!(wire.error, Some(HttpErrorCode::CORO_CANCELLED));
+    assert_eq!(wire.writes.len(), 1, "only the head is written");
+}
+
+/// Waits until `arrived` reaches `target` after adding this thread's arrival; yields now and
+/// then, so a round ends on a busy host too.
+fn meet(arrived: &AtomicUsize, target: usize) {
+    arrived.fetch_add(1, Ordering::AcqRel);
+    wait_for(|| arrived.load(Ordering::Acquire) >= target);
+}
+
+fn wait_for(done: impl Fn() -> bool) {
+    let mut spins = 0u32;
+    while !done() {
+        spins = spins.wrapping_add(1);
+        if spins.is_multiple_of(1024) {
+            std::thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+/// A xorshift spin of 0 to 7 hints, which staggers two racing threads' starts.
+struct Jitter(u32);
+
+impl Jitter {
+    fn spin(&mut self) {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
+        (0..self.0 % 8).for_each(|_| std::hint::spin_loop());
+    }
+}
+
+/// A wake flag of its own cache line, so racing flags do not share one.
+#[repr(align(128))]
+struct Flag(AtomicBool);
+
+/// The driver clears the exchange's wake signal before it polls the body again in its turn
+/// (`poll_exchange`), in place of the next turn's take. A wake from another thread, whose
+/// publication the poll after the clear misses, still stands once both are done, so the driver
+/// polls the body again. Each round marks every signal, as a wake during the event's own poll
+/// does; then one thread clears each signal and reads its body's state, while the other
+/// publishes that state (a release store, as a lock-free source makes) and marks the signal, as
+/// the source's wake does. A clear that lands after the mark in the signal's order while the
+/// read misses the publication loses the wake.
+#[test]
+fn clearing_a_wake_signal_keeps_a_wake_from_another_thread_whose_publication_the_poll_misses() {
+    const ROUNDS: usize = 20_000;
+    const SIGNALS: usize = 64;
+    let probes: Vec<_> = (0..SIGNALS).map(|_| SignalProbe::new()).collect();
+    let published: Arc<Vec<_>> =
+        Arc::new((0..SIGNALS).map(|_| Flag(AtomicBool::new(false))).collect());
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let woken = Arc::new(AtomicUsize::new(0));
+    let producer = std::thread::spawn({
+        let (probes, published, arrived, woken) = (
+            probes.clone(),
+            Arc::clone(&published),
+            Arc::clone(&arrived),
+            Arc::clone(&woken),
+        );
+        move || {
+            let mut jitter = Jitter(0x9e37_79b9);
+            for round in 1..=ROUNDS {
+                meet(&arrived, 2 * round);
+                jitter.spin();
+                for (probe, flag) in probes.iter().zip(published.iter()) {
+                    flag.0.store(true, Ordering::Release);
+                    probe.mark();
+                }
+                woken.store(round, Ordering::Release);
+            }
+        }
+    });
+    let mut jitter = Jitter(0x85eb_ca6b);
+    let mut seen = [false; SIGNALS];
+    let lost: usize = (1..=ROUNDS)
+        .map(|round| {
+            for (probe, flag) in probes.iter().zip(published.iter()) {
+                probe.mark();
+                flag.0.store(false, Ordering::Relaxed);
+            }
+            meet(&arrived, 2 * round);
+            jitter.spin();
+            for (seen, (probe, flag)) in seen.iter_mut().zip(probes.iter().zip(published.iter())) {
+                probe.clear();
+                *seen = flag.0.load(Ordering::Acquire);
+            }
+            wait_for(|| woken.load(Ordering::Acquire) >= round);
+            seen.iter()
+                .zip(&probes)
+                .filter(|&(&seen, probe)| !seen && !probe.is_ready())
+                .count()
+        })
+        .sum();
+    producer.join().unwrap();
+    assert_eq!(
+        lost, 0,
+        "wakes lost in {ROUNDS} rounds of {SIGNALS} signals"
+    );
+}
+
+/// A body event that becomes ready while the body is polled again after the event before it,
+/// whose producer wakes the waker that poll left, is polled and written with that event, as
+/// when it became ready during the poll of the next turn: the poll consumed the earlier wake
+/// before it ran, so this wake stands.
+#[test]
+fn a_body_event_ready_during_the_poll_after_an_event_is_written_with_it() {
+    let writes = run_on_host(|context| {
+        Box::pin(async move {
+            let (transport, state) =
+                ScriptedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())]);
+            let body = Rc::new(PushedBody::default());
+            let application = PushedApp {
+                body: Rc::clone(&body),
+            };
+            let (session, handle) =
+                OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+            let mut run = std::pin::pin!(session.run());
+            let mut poll = Context::from_waker(Waker::noop());
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            body.push(HttpBodyEvent::body(queue(b"one"), false));
+            let producer = Rc::clone(&body);
+            *body.on_pending.borrow_mut() = Some(Box::new(move || {
+                producer.push(HttpBodyEvent::body(queue(b"two"), false));
+            }));
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            body.push(HttpBodyEvent::body(queue(b"end"), true));
+            assert!(handle.initiate_drain().unwrap());
+            // A lost wake stalls the manual host, which then panics.
+            run.await.unwrap();
+            state.borrow().writes.clone()
+        })
+    });
+    assert_eq!(
+        writes[1..],
+        [
+            b"3\r\none\r\n3\r\ntwo\r\n".to_vec(),
+            b"3\r\nend\r\n0\r\n\r\n".to_vec(),
+        ]
+    );
+}
+
+/// Pushes `events` body events of 40 bytes at once to a `PushedApp` exchange whose head was
+/// written, under a 32-byte write size, and polls the driver once. The exchange ignores the
+/// `maximum` each poll offers, which the driver tolerates: each event fills a write on its own.
+/// Returns that poll's host yields and the length of every write.
+fn oversized_events_in_one_poll(events: usize) -> (usize, Vec<usize>) {
+    run_on_host_with(move |host, context| {
+        Box::pin(async move {
+            let (transport, state) =
+                ScriptedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())]);
+            let body = Rc::new(PushedBody::default());
+            let application = PushedApp {
+                body: Rc::clone(&body),
+            };
+            let mut options = owned_options(context, transport);
+            options.io.maximum_write_size = 32;
+            let (session, handle) = OwnedH1Session::new(application, options).unwrap();
+            let mut run = std::pin::pin!(session.run());
+            let mut poll = Context::from_waker(Waker::noop());
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            let before = host.yields();
+            for _ in 0..events {
+                body.push(HttpBodyEvent::body(queue(&[b'x'; 40]), false));
+            }
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            let yields = host.yields() - before;
+            body.push(HttpBodyEvent::body(queue(b"end"), true));
+            assert!(handle.initiate_drain().unwrap());
+            run.await.unwrap();
+            let writes = state.borrow().writes.iter().map(Vec::len).collect();
+            (yields, writes)
+        })
+    })
+}
+
+/// Body events that each reach the write size are each written before the body is polled
+/// again, in the same turn, so they spend the budget as before (recorded from the driver at
+/// `b5789b56aee8`): a body polled again before such an event's write would spend one more turn
+/// per event, and the driver would yield sooner.
+#[test]
+fn oversized_body_events_ready_at_once_yield_as_before() {
+    let recorded: &[(usize, usize, usize)] = &[(16, 0, 29), (21, 0, 37), (22, 0, 38), (32, 1, 53)];
+    let actual: Vec<String> = [16, 21, 22, 32]
+        .into_iter()
+        .map(|events| {
+            let (yields, writes) = oversized_events_in_one_poll(events);
+            format!("({events}, {yields}, {}),", writes.len())
+        })
+        .collect();
+    let expected: Vec<String> = recorded
+        .iter()
+        .map(|(events, yields, writes)| format!("({events}, {yields}, {writes}),"))
+        .collect();
+    assert_eq!(
+        actual,
+        expected,
+        "(events, yields, writes):\n{}",
+        actual.join("\n")
+    );
 }
 
 /// Pushes `events` one-byte body events at once to a `PushedApp` exchange whose head was
@@ -6375,12 +6933,14 @@ fn pushed_events_in_one_poll(events: usize) -> (usize, usize, Vec<usize>) {
     })
 }
 
-/// Body events ready at once are serialized one per turn and written together once the body is
-/// pending. When that write starts in the turn before the budget's last, the budget still runs
-/// out after the write's completion is taken, and the driver yields, as when a whole turn took
-/// that completion (recorded from the driver at `5e14be54f168`): 61 events take turns 1 to 61,
-/// the write counts as turns 62 and 63, and the completion uses the 64th. One event fewer ends
-/// the poll without a yield; one more starts the write in the last turn, which yields at once.
+/// Body events ready at once are serialized one per turn, each poll of the body after the first
+/// counting as a turn even when it runs inside the turn before, and written together once the
+/// body is pending. When that write starts in the turn before the budget's last, the budget
+/// still runs out after the write's completion is taken, and the driver yields, as when a whole
+/// turn took that completion (recorded from the driver at `5e14be54f168`): 61 events take turns
+/// 1 to 61, the write counts as turns 62 and 63, and the completion uses the 64th. One event
+/// fewer ends the poll without a yield; one more starts the write in the last turn, which
+/// yields at once.
 #[test]
 fn a_write_started_at_the_turn_budget_edge_yields_as_before() {
     let recorded: &[(usize, usize, &[usize])] = &[

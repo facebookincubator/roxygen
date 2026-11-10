@@ -131,6 +131,11 @@ thread_local! {
     static DYN_RESPONSE_DELIVERIES: Cell<usize> = const { Cell::new(0) };
     static BYTE_EVENT_REFUSALS: Cell<usize> = const { Cell::new(0) };
     static READ_START_CHECKS: Cell<usize> = const { Cell::new(0) };
+    static READ_POLLS: Cell<usize> = const { Cell::new(0) };
+    static WRITE_POLLS: Cell<usize> = const { Cell::new(0) };
+    static SIGNAL_TAKES: Cell<usize> = const { Cell::new(0) };
+    static AFTER_BODY_EVENT_SERIALIZED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// How many turns the owned HTTP/1.1 drivers on this thread have run.
@@ -189,6 +194,60 @@ pub(crate) fn byte_event_refusals() -> usize {
 #[cfg(test)]
 pub(crate) fn read_start_checks() -> usize {
     READ_START_CHECKS.with(Cell::get)
+}
+
+/// How many times the owned HTTP/1.1 drivers on this thread have entered their read phase
+/// (`poll_read_once`) and their write-completion phase (`poll_write`), and taken a wake signal
+/// (`Signal::take_ready`).
+#[cfg(test)]
+pub(crate) fn read_write_polls_and_signal_takes() -> (usize, usize, usize) {
+    (
+        READ_POLLS.with(Cell::get),
+        WRITE_POLLS.with(Cell::get),
+        SIGNAL_TAKES.with(Cell::get),
+    )
+}
+
+/// Runs `hook` once, right after the next response body event this thread's owned HTTP/1.1
+/// downstream drivers serialize, before the driver decides what to do next: where an input
+/// from another thread, the transport or a request body read can land.
+#[cfg(test)]
+pub(crate) fn after_next_body_event_serialized(hook: impl FnOnce() + 'static) {
+    AFTER_BODY_EVENT_SERIALIZED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn body_event_serialized() {
+    let hook = AFTER_BODY_EVENT_SERIALIZED.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// One of a driver's wake signals, for a test that marks it from another thread, as its source's
+/// wake does first (`Signal::wake_by_ref`), while the driver consumes the wake to poll that
+/// source at once (`Signal::clear`).
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct SignalProbe(Arc<Signal>);
+
+#[cfg(test)]
+impl SignalProbe {
+    pub(crate) fn new() -> Self {
+        Self(Signal::new(&Arc::new(TaskWaker::default())))
+    }
+
+    pub(crate) fn mark(&self) {
+        self.0.mark();
+    }
+
+    pub(crate) fn clear(&self) {
+        self.0.clear();
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        self.0.is_ready()
+    }
 }
 
 #[cfg(test)]
@@ -309,7 +368,20 @@ impl Signal {
         self.ready.load(Ordering::Acquire)
     }
 
+    /// Consumes a wake in place of `take_ready`, by a driver that polls this signal's source at
+    /// once. As `take_ready`'s, the swap acquires the mark of a wake it overwrites, so the poll
+    /// sees what that wake's source published first; a wake after it marks the signal again. A
+    /// plain store could overwrite a mark from another thread whose publication the poll missed.
+    #[inline]
+    fn clear(&self) {
+        if self.is_ready() {
+            self.ready.swap(false, Ordering::AcqRel);
+        }
+    }
+
     fn take_ready(&self) -> bool {
+        #[cfg(test)]
+        count(&SIGNAL_TAKES);
         self.is_ready() && self.ready.swap(false, Ordering::AcqRel)
     }
 }
@@ -521,6 +593,15 @@ fn check_cancel(control: &Control, context: &WorkerContext) -> Result<(), HttpEr
         return Err(cancelled());
     }
     Ok(())
+}
+
+/// Whether parsing paused behind the unread request body may resume: it is below
+/// `ingress_buffer_limit`, or the source no longer buffers any.
+#[inline]
+fn resumes_parsing(producer: &HttpStreamSourceProducer, ingress_buffer_limit: u32) -> bool {
+    producer
+        .body_bytes_buffered()
+        .is_none_or(|buffered| buffered < ingress_buffer_limit)
 }
 
 #[cold]
@@ -1070,8 +1151,15 @@ impl<A: OwnedApplication> Driver<A> {
             }
             if self.fatal.is_none() && self.stream_wake.take_ready() {
                 progress = true;
-                if let Err(error) = self.poll_exchange() {
-                    self.abort(error);
+                match self.poll_exchange(&mut turn) {
+                    Ok(false) => {}
+                    // The exchange ran this turn's write decision, which held the write back, and
+                    // the rest of the turn would do nothing.
+                    Ok(true) => {
+                        turn += 1;
+                        continue;
+                    }
+                    Err(error) => self.abort(error),
                 }
             }
             if self.fatal.is_none() && self.retire_exchange() {
@@ -1088,8 +1176,7 @@ impl<A: OwnedApplication> Driver<A> {
                 && self.egress.chain_length() < self.config.maximum_write_size
                 && turn + 1 < TURN_BUDGET
                 && self.fatal.is_none();
-            let write_ready =
-                !self.transport_reset && !self.egress.is_empty() && self.can_start_write();
+            let write_ready = self.write_ready();
             let write_started = write_ready && (!write_waits || !self.phases_due_before_write());
             if write_started {
                 if write_waits {
@@ -1206,13 +1293,49 @@ impl<A: OwnedApplication> Driver<A> {
         self.write_wake.is_ready()
             || self.read_wake.is_ready()
             || (self.fatal.is_none() && self.stream_wake.is_ready())
-            || (!self.transport_reset && cancel_requested(&self.control, &self.context))
+            || self.unsignalled_phases_due()
+    }
+
+    /// The terms of `phases_due_before_write` that follow its signals.
+    #[inline(always)]
+    fn unsignalled_phases_due(&self) -> bool {
+        (!self.transport_reset && cancel_requested(&self.control, &self.context))
             || (self.control.drain.get() && !self.draining && self.fatal.is_none())
             || (!self.read.is_reading() && !self.read.is_drained() && self.read_capacity() != 0)
             || self.parse_due()
             || (self.read_error.is_some() && !self.holds_read_error())
             || (self.fatal.is_none() && self.retire_due())
             || self.eof_abort_due()
+    }
+
+    /// Whether this turn, right after the exchange serialized a body event that does not end the
+    /// response, has nothing left to do up to its write decision, and that decision holds the
+    /// write back behind the exchange's signal, which the event marks (`write_waits`): the
+    /// retirement has nothing to retire before the response ends, `DIV-053`'s EOF is not due,
+    /// and the write is below the write size within the budget. Nothing after the decision acts
+    /// either, while the exchange is live.
+    #[inline(always)]
+    fn write_held_after_body_event(&self, turn: usize) -> bool {
+        turn + 1 < TURN_BUDGET
+            && self.egress.chain_length() < self.config.maximum_write_size
+            && !self.eof_abort_due()
+    }
+
+    /// Whether, after a turn whose write decision held the write back behind a body event
+    /// (`write_held_after_body_event`), the next turn would only poll the body again: no phase
+    /// other than the exchange's would act in it. That is `phases_due_before_write` without the
+    /// exchange's signal, plus the flow-control lift that precedes `poll_exchange`'s body poll;
+    /// its other preamble steps are `retire_due`'s and `eof_abort_due`'s. Each term is exact
+    /// or wider, so polling the body now runs that turn.
+    #[inline(always)]
+    fn body_polls_again(&self) -> bool {
+        !self.write_wake.is_ready()
+            && !self.read_wake.is_ready()
+            && !self.unsignalled_phases_due()
+            && !(self.flow_pause
+                && self.exchange.as_ref().is_some_and(|exchange| {
+                    resumes_parsing(&exchange.producer, self.config.ingress_buffer_limit)
+                }))
     }
 
     /// Whether the parse phase acts: the input or the codec changed since a parse consumed all
@@ -1425,16 +1548,18 @@ impl<A: OwnedApplication> Driver<A> {
             })
     }
 
-    /// Hands the request to the exchange and serializes what its response produces.
-    fn poll_exchange(&mut self) -> Result<(), HttpError> {
+    /// Hands the request to the exchange and serializes what its response produces. After a
+    /// response body event that does not end the response, while the rest of the turn would do
+    /// nothing but hold the write back (`write_held_after_body_event`), it runs that write
+    /// decision's capacity check, which may reenter. Then it polls the body again in place of the
+    /// next turn while that turn would do nothing else (`body_polls_again`), and counts each such
+    /// poll as that turn. Otherwise it ends the turn there: it returns `true` when this turn's
+    /// write decision has run.
+    fn poll_exchange(&mut self, turn: &mut usize) -> Result<bool, HttpError> {
         let Some(exchange) = self.exchange.as_mut() else {
-            return Ok(());
+            return Ok(false);
         };
-        if self.flow_pause
-            && exchange
-                .producer
-                .body_bytes_buffered()
-                .is_none_or(|buffered| buffered < self.config.ingress_buffer_limit)
+        if self.flow_pause && resumes_parsing(&exchange.producer, self.config.ingress_buffer_limit)
         {
             self.flow_pause = false;
             self.codec.get_mut().set_parser_paused(self.exchange_pause);
@@ -1476,7 +1601,7 @@ impl<A: OwnedApplication> Driver<A> {
             // As `UniplexSession`, whose read loop reaches a failed read it already holds before
             // the handler it spawned for the request runs: the failure ends the exchange first.
             if self.read_error.is_some() && !self.holds_read_error() {
-                return Ok(());
+                return Ok(false);
             }
         }
         // `DIV-053`: an EOF already read is judged before another response event is serialized,
@@ -1484,27 +1609,27 @@ impl<A: OwnedApplication> Driver<A> {
         // application is still polled; what it returns is not serialized: the exchange is open,
         // so the judgment aborts it.
         let eof_due = self.eof_abort_due() && self.exchange_open();
-        let exchange = self
+        let mut exchange = self
             .exchange
             .as_mut()
             .expect("nothing above removes the exchange");
         if !exchange.started || exchange.response_complete {
-            return Ok(());
+            return Ok(false);
         }
         let stream = self.codec.last_incoming_stream_id();
-        let application = exchange
+        let mut application = exchange
             .application
             .as_mut()
             .expect("the application remains owned");
         let eom = if !exchange.response_headers {
             let Poll::Ready(headers) = application.poll_headers(&mut context) else {
-                return Ok(());
+                return Ok(false);
             };
             check_cancel(&self.control, &self.context)?;
             if eof_due {
                 drop(headers);
                 self.judge_eof();
-                return Ok(());
+                return Ok(false);
             }
             let mut headers: HttpHeaderEvent = headers?;
             let registrations = headers.take_byte_event_registrations();
@@ -1556,77 +1681,104 @@ impl<A: OwnedApplication> Driver<A> {
             // whatever its status. The resume future is caller code.
             if let Some(resume) = &mut exchange.resume {
                 if resume.as_mut().poll(&mut context).is_pending() {
-                    return Ok(());
+                    return Ok(false);
                 }
                 exchange.resume = None;
                 check_cancel(&self.control, &self.context)?;
             }
-            // As OwnedH2's serialization budget: what is already queued and the framing count
-            // against one write.
-            let room = self
-                .config
-                .maximum_write_size
-                .saturating_sub(self.egress.chain_length())
-                .min(self.egress.remaining_capacity())
-                .saturating_sub(CHUNK_OVERHEAD);
-            if room == 0 {
-                self.body_awaits_egress = true;
-                return Ok(());
-            }
-            let Poll::Ready(event) = application.poll_body(&mut context, room as u32) else {
-                return Ok(());
-            };
-            check_cancel(&self.control, &self.context)?;
-            if eof_due {
-                drop(event);
-                self.judge_eof();
-                return Ok(());
-            }
-            let mut event = event?;
-            let registrations = event.take_byte_event_registrations();
-            exchange.registered_byte_events |= !registrations.is_empty();
-            refuse_byte_events(registrations, &self.control, &self.context)?;
-            // A stop reported with this event, which may be the response's last, or from its
-            // byte events' cancellation (`DIV-054`).
-            if !exchange.ingress_complete && exchange.signals.stopped() {
-                stop_request_ingress(self.codec.get_mut(), &mut self.ingress_stopped);
-            }
-            let eom = event.eom();
-            match event.into_kind() {
-                HttpBodyEventKind::Body(body) => {
-                    self.codec.get_mut().generate(
-                        &mut self.egress,
-                        EgressFrame::Body {
-                            stream,
-                            body,
-                            padding: None,
-                            end_stream: eom,
-                        },
-                        &mut NoopCallback,
-                    )?;
+            loop {
+                // As OwnedH2's serialization budget: what is already queued and the framing count
+                // against one write.
+                let room = self
+                    .config
+                    .maximum_write_size
+                    .saturating_sub(self.egress.chain_length())
+                    .min(self.egress.remaining_capacity())
+                    .saturating_sub(CHUNK_OVERHEAD);
+                if room == 0 {
+                    self.body_awaits_egress = true;
+                    return Ok(false);
                 }
-                HttpBodyEventKind::Trailers(trailers) => {
-                    self.codec.get_mut().generate(
-                        &mut self.egress,
-                        EgressFrame::Trailers {
-                            stream,
-                            trailers: &trailers,
-                        },
-                        &mut NoopCallback,
-                    )?;
+                let Poll::Ready(event) = application.poll_body(&mut context, room as u32) else {
+                    return Ok(false);
+                };
+                check_cancel(&self.control, &self.context)?;
+                if eof_due {
+                    drop(event);
+                    self.judge_eof();
+                    return Ok(false);
                 }
-                HttpBodyEventKind::Suspend(resume) => exchange.resume = Some(resume),
-                _ => {
-                    return Err(failure(
-                        HttpErrorCode::PROTOCOL_ERROR,
-                        b"owned H1 response event is not supported",
-                    ));
+                let mut event = event?;
+                let registrations = event.take_byte_event_registrations();
+                exchange.registered_byte_events |= !registrations.is_empty();
+                refuse_byte_events(registrations, &self.control, &self.context)?;
+                // A stop reported with this event, which may be the response's last, or from its
+                // byte events' cancellation (`DIV-054`).
+                if !exchange.ingress_complete && exchange.signals.stopped() {
+                    stop_request_ingress(self.codec.get_mut(), &mut self.ingress_stopped);
                 }
+                let eom = event.eom();
+                match event.into_kind() {
+                    HttpBodyEventKind::Body(body) => {
+                        self.codec.get_mut().generate(
+                            &mut self.egress,
+                            EgressFrame::Body {
+                                stream,
+                                body,
+                                padding: None,
+                                end_stream: eom,
+                            },
+                            &mut NoopCallback,
+                        )?;
+                        #[cfg(test)]
+                        body_event_serialized();
+                        if !eom && self.write_held_after_body_event(*turn) {
+                            // The decision's result does not matter: the write waits.
+                            let _ = self.write_ready();
+                            if !self.body_polls_again() {
+                                self.stream_wake.mark();
+                                return Ok(true);
+                            }
+                            *turn += 1;
+                            self.stream_wake.clear();
+                            exchange = self
+                                .exchange
+                                .as_mut()
+                                .expect("nothing above removes the exchange");
+                            application = exchange
+                                .application
+                                .as_mut()
+                                .expect("the application remains owned");
+                            continue;
+                        }
+                    }
+                    HttpBodyEventKind::Trailers(trailers) => {
+                        self.codec.get_mut().generate(
+                            &mut self.egress,
+                            EgressFrame::Trailers {
+                                stream,
+                                trailers: &trailers,
+                            },
+                            &mut NoopCallback,
+                        )?;
+                    }
+                    HttpBodyEventKind::Suspend(resume) => exchange.resume = Some(resume),
+                    _ => {
+                        return Err(failure(
+                            HttpErrorCode::PROTOCOL_ERROR,
+                            b"owned H1 response event is not supported",
+                        ));
+                    }
+                }
+                break eom;
             }
-            eom
         };
         self.stream_wake.mark();
         if eom {
+            let exchange = self
+                .exchange
+                .as_mut()
+                .expect("nothing above removes the exchange");
             exchange.response_complete = true;
             // `DIV-028`'s rule, as OwnedH2 applies it downstream: the terms run in this order, so
             // only an otherwise eligible exchange queries the queue.
@@ -1640,10 +1792,14 @@ impl<A: OwnedApplication> Driver<A> {
                 .summary
                 .bytes_scheduled
                 .saturating_add(self.egress.chain_length() as u64);
-            application.response_complete();
+            exchange
+                .application
+                .as_mut()
+                .expect("the application remains owned")
+                .response_complete();
             check_cancel(&self.control, &self.context)?;
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Retires the exchange after ingress consumption, response completion and its write.
@@ -1704,6 +1860,8 @@ impl<A: OwnedApplication> Driver<A> {
 
     /// `None` when no read was outstanding to poll.
     fn poll_read_once(&mut self) -> Option<ReadPoll> {
+        #[cfg(test)]
+        count(&READ_POLLS);
         // Until a drained reader's waker fires, a call checks only that waker, as for an
         // outstanding read.
         if self.read.is_drained() && !self.read_wake.is_ready() {
@@ -1789,6 +1947,13 @@ impl<A: OwnedApplication> Driver<A> {
                 .is_some_and(|queue| !queue.is_idle())
     }
 
+    /// Whether a write may start: something is serialized and the transport takes it. A write
+    /// queue's capacity check is transport code, which may reenter.
+    #[inline(always)]
+    fn write_ready(&self) -> bool {
+        !self.transport_reset && !self.egress.is_empty() && self.can_start_write()
+    }
+
     fn can_start_write(&self) -> bool {
         match &self.write_queue {
             Some(queue) => queue.can_write(
@@ -1827,6 +1992,8 @@ impl<A: OwnedApplication> Driver<A> {
 
     /// `None` when no write was ready to poll.
     fn poll_write(&mut self) -> Option<bool> {
+        #[cfg(test)]
+        count(&WRITE_POLLS);
         if !self.write_wake.take_ready() {
             return None;
         }
