@@ -3950,6 +3950,426 @@ mod hpack_codec {
         );
     }
 
+    /// An FNV-1a digest fed incrementally, so a long stream need not be held in memory.
+    struct StreamDigest {
+        hash: u64,
+        length: usize,
+    }
+
+    impl StreamDigest {
+        fn new() -> Self {
+            Self {
+                hash: 0xcbf2_9ce4_8422_2325,
+                length: 0,
+            }
+        }
+
+        fn bytes(&mut self, bytes: &[u8]) {
+            for &byte in bytes {
+                self.hash = (self.hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+            }
+            self.length += bytes.len();
+        }
+
+        fn part(&mut self, bytes: &[u8]) {
+            let length = u32::try_from(bytes.len()).expect("digest part length fits in u32");
+            self.bytes(&length.to_le_bytes());
+            self.bytes(bytes);
+        }
+    }
+
+    /// Every decode event, length-prefixed, in the order the decoder reports it.
+    #[derive(Default)]
+    struct DecodeEvents(Vec<u8>);
+
+    impl DecodeEvents {
+        fn part(&mut self, bytes: &[u8]) {
+            let length = u32::try_from(bytes.len()).expect("event part length fits in u32");
+            self.0.extend_from_slice(&length.to_le_bytes());
+            self.0.extend_from_slice(bytes);
+        }
+
+        fn header(&mut self, name: &[u8], value: &[u8]) {
+            self.0.push(b'h');
+            self.part(name);
+            self.part(value);
+        }
+
+        fn size(&mut self, tag: u8, size: HttpHeaderSize) {
+            self.0.push(tag);
+            for value in [size.compressed, size.compressed_block, size.uncompressed] {
+                self.0.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+
+        fn error(&mut self, tag: u8, error: HpackError) {
+            self.0.push(tag);
+            self.part(format!("{error:?}").as_bytes());
+        }
+
+        fn streaming_result(&mut self, result: Result<HttpHeaderSize, HpackError>) {
+            match result {
+                Ok(size) => self.size(b'r', size),
+                Err(error) => self.error(b'x', error),
+            }
+        }
+
+        fn block_result(&mut self, result: Result<DecodedHeaderBlock, HpackError>) {
+            match result {
+                Ok(decoded) => {
+                    for header in &decoded.headers {
+                        self.header(header.name.as_bytes(), &header.value);
+                    }
+                    self.size(b'r', decoded.size);
+                    let consumed =
+                        u32::try_from(decoded.bytes_consumed).expect("consumed fits in u32");
+                    self.0.push(b'n');
+                    self.0.extend_from_slice(&consumed.to_le_bytes());
+                }
+                Err(error) => self.error(b'x', error),
+            }
+        }
+
+        /// The decoder's sticky error and its dynamic table's capacity, size, bytes and inserts.
+        fn decoder_state(&mut self, decoder: &HpackDecoder) {
+            match decoder.error() {
+                Some(error) => self.error(b'E', error),
+                None => self.0.push(b'O'),
+            }
+            let table = decoder.context().table();
+            for value in [
+                table.capacity(),
+                table.size(),
+                table.bytes(),
+                table.insert_count(),
+            ] {
+                self.0.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+
+    impl StreamingCallback for DecodeEvents {
+        fn on_header(&mut self, name: &HeaderName, value: &[u8]) {
+            self.header(name.as_bytes(), value);
+        }
+
+        fn on_headers_complete(&mut self, decoded_size: HttpHeaderSize, acknowledge: bool) {
+            self.size(b'c', decoded_size);
+            self.0.push(u8::from(acknowledge));
+        }
+
+        fn on_decode_error(&mut self, error: HpackError) {
+            self.error(b'e', error);
+        }
+    }
+
+    /// A decoder's dynamic table capacity, bytes and entries, newest first. `HeaderTable`'s
+    /// `PartialEq` compares only the entry count and bytes.
+    fn table_contents(decoder: &HpackDecoder) -> (u32, u32, Vec<HpackHeader>) {
+        let table = decoder.context().table();
+        (
+            table.capacity(),
+            table.bytes(),
+            table.entries().cloned().collect(),
+        )
+    }
+
+    /// A block that gives a new decoder `reference`'s dynamic table: a size update to its
+    /// capacity, then each entry, oldest first, as a raw literal with incremental indexing.
+    fn table_priming_block(reference: &HpackDecoder) -> Vec<u8> {
+        let table = reference.context().table();
+        let mut entries: Vec<_> = table.entries().collect();
+        entries.reverse();
+        let mut block = HpackEncodeBuffer::new(false);
+        block.encode_integer_parts(
+            u64::from(table.capacity()),
+            TABLE_SIZE_UPDATE.code,
+            TABLE_SIZE_UPDATE.prefix_length,
+        );
+        for entry in entries {
+            block.encode_integer_parts(0, LITERAL_INC_INDEX.code, LITERAL_INC_INDEX.prefix_length);
+            block.encode_literal(entry.name.as_bytes());
+            block.encode_literal(&entry.value);
+        }
+        block.into_bytes()
+    }
+
+    /// Decodes `wire` four ways, each on a new decoder holding `reference`'s dynamic table, and
+    /// feeds every decode's events and final decoder state to `digest`: (a) contiguous; (b) split
+    /// into two segments at every byte boundary, then into 1-byte segments; (c) from a one-segment
+    /// queue holding all of `wire`, with `total_bytes` cut at every length; (d) truncated at every
+    /// length. Then `reference` decodes `wire` and the contiguous result is checked against it.
+    fn digest_block_decodes(
+        digest: &mut StreamDigest,
+        reference: &mut HpackDecoder,
+        table_size: u32,
+        wire: &[u8],
+    ) {
+        let priming = table_priming_block(reference);
+        let primed = || {
+            let mut decoder = HpackDecoder::with_limits(table_size, DEFAULT_MAX_UNCOMPRESSED);
+            decoder
+                .decode(&priming)
+                .expect("the table priming block decodes");
+            assert_eq!(
+                table_contents(&decoder),
+                table_contents(reference),
+                "the primed table matches the reference table"
+            );
+            decoder
+        };
+        type Decode<'f> = dyn FnMut(&mut HpackDecoder, &mut DecodeEvents) + 'f;
+        let mut record = |way: u8, point: usize, decode: &mut Decode<'_>| {
+            let mut decoder = primed();
+            let mut events = DecodeEvents::default();
+            decode(&mut decoder, &mut events);
+            events.decoder_state(&decoder);
+            digest.bytes(&[way]);
+            digest.bytes(
+                &u32::try_from(point)
+                    .expect("point fits in u32")
+                    .to_le_bytes(),
+            );
+            digest.part(&events.0);
+            events.0
+        };
+
+        let contiguous = record(b'a', 0, &mut |decoder, events| {
+            let result = decoder.decode_streaming(wire, events);
+            events.streaming_result(result);
+        });
+        for split in 0..=wire.len() {
+            record(b'b', split, &mut |decoder, events| {
+                let result = decoder.decode_segments([&wire[..split], &wire[split..]], wire.len());
+                events.block_result(result);
+            });
+        }
+        record(b'B', 0, &mut |decoder, events| {
+            let result = decoder.decode_segments(wire.chunks(1), wire.len());
+            events.block_result(result);
+        });
+        let queue = BufQueue::copy_from_slice(wire, wire.len()).expect("the block fits a queue");
+        for cut in 0..=wire.len() {
+            record(b'c', cut, &mut |decoder, events| {
+                let result = decoder.decode_streaming_buf_queue(&queue, cut, events);
+                events.streaming_result(result);
+            });
+        }
+        for cut in 0..=wire.len() {
+            record(b'd', cut, &mut |decoder, events| {
+                let result = decoder.decode_streaming(&wire[..cut], events);
+                events.streaming_result(result);
+            });
+        }
+
+        let decoded = reference.decode(wire).expect("the reference block decodes");
+        let mut expected = DecodeEvents::default();
+        for header in &decoded.headers {
+            expected.header(header.name.as_bytes(), &header.value);
+        }
+        assert!(
+            contiguous.starts_with(&expected.0),
+            "the primed contiguous decode emits the reference decode's headers"
+        );
+    }
+
+    /// RFC 7541 Appendix C header blocks, as (decoder table size, one connection's blocks):
+    /// C.2.1-C.2.4 each on a new decoder, then C.3, C.4, C.5 and C.6.
+    const RFC_7541_BLOCKS: [(u32, &[&str]); 8] = [
+        (
+            DEFAULT_TABLE_SIZE,
+            &["400a637573746f6d2d6b65790d637573746f6d2d686561646572"],
+        ),
+        (DEFAULT_TABLE_SIZE, &["040c2f73616d706c652f70617468"]),
+        (DEFAULT_TABLE_SIZE, &["100870617373776f726406736563726574"]),
+        (DEFAULT_TABLE_SIZE, &["82"]),
+        (
+            DEFAULT_TABLE_SIZE,
+            &[
+                "828684410f7777772e6578616d706c652e636f6d",
+                "828684be58086e6f2d6361636865",
+                "828785bf400a637573746f6d2d6b65790c637573746f6d2d76616c7565",
+            ],
+        ),
+        (
+            DEFAULT_TABLE_SIZE,
+            &[
+                "828684418cf1e3c2e5f23a6ba0ab90f4ff",
+                "828684be5886a8eb10649cbf",
+                "828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf",
+            ],
+        ),
+        (
+            256,
+            &[
+                "4803333032580770726976617465611d4d6f6e2c203231204f637420323031332032303a31333a323120474d546e1768747470733a2f2f7777772e6578616d706c652e636f6d",
+                "4803333037c1c0bf",
+                "88c1611d4d6f6e2c203231204f637420323031332032303a31333a323220474d54c05a04677a69707738666f6f3d4153444a4b48514b425a584f5157454f50495541585157454f49553b206d61782d6167653d333630303b2076657273696f6e3d31",
+            ],
+        ),
+        (
+            256,
+            &[
+                "488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f0b97c8e9ae82ae43d3",
+                "4883640effc1c0bf",
+                "88c16196d07abe941054d444a8200595040b8166e084a62d1bffc05a839bd9ab77ad94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007",
+            ],
+        ),
+    ];
+
+    #[test]
+    fn segmented_and_truncated_decodes_are_unchanged() {
+        let mut digest = StreamDigest::new();
+        for (table_size, blocks) in RFC_7541_BLOCKS {
+            let mut reference = HpackDecoder::with_limits(table_size, DEFAULT_MAX_UNCOMPRESSED);
+            for block in blocks {
+                digest_block_decodes(&mut digest, &mut reference, table_size, &hex(block));
+            }
+        }
+        let mut references = [HpackDecoder::new(), HpackDecoder::new()];
+        for (block, wire) in golden_blocks().iter().enumerate() {
+            digest_block_decodes(
+                &mut digest,
+                &mut references[block % 2],
+                DEFAULT_TABLE_SIZE,
+                wire,
+            );
+        }
+        assert_eq!(
+            (digest.hash, digest.length),
+            (0x62ba_44e6_5f2e_f974, 82_210_029),
+            "the RFC 7541 Appendix C and golden blocks decoded contiguously, split, from a cut \
+             queue and truncated: every decode's events and final decoder state, recorded at \
+             e56cb47a8dee"
+        );
+    }
+
+    /// Each RFC 7541 Appendix C block, and the consumer-shaped forwarded request encoded twice
+    /// (literals, then references), decodes from a two-segment queue split at every byte boundary
+    /// and from a queue of 1-byte segments, with `total_bytes` cut at every length, exactly as that
+    /// prefix decodes contiguously: the result, the sticky error and the dynamic table. Every
+    /// decode runs on a new decoder holding the connection's table so far.
+    #[test]
+    fn split_queue_decodes_match_contiguous_prefix_decodes() {
+        let fields = forwarded_request_fields();
+        let mut encoder = HpackEncoder::new(true);
+        let forwarded: Vec<Vec<u8>> = (0..2).map(|_| encoder.encode(&fields)).collect();
+        let connections = RFC_7541_BLOCKS
+            .iter()
+            .map(|&(table_size, blocks)| {
+                (table_size, blocks.iter().map(|block| hex(block)).collect())
+            })
+            .chain([(DEFAULT_TABLE_SIZE, forwarded)]);
+        for (table_size, blocks) in connections {
+            let mut reference = HpackDecoder::with_limits(table_size, DEFAULT_MAX_UNCOMPRESSED);
+            for wire in blocks {
+                let priming = table_priming_block(&reference);
+                let primed = || {
+                    let mut decoder =
+                        HpackDecoder::with_limits(table_size, DEFAULT_MAX_UNCOMPRESSED);
+                    decoder
+                        .decode(&priming)
+                        .expect("the table priming block decodes");
+                    decoder
+                };
+                let mut queues = Vec::new();
+                for split in 0..=wire.len() {
+                    let mut queue = BufQueue::new(wire.len());
+                    for segment in [&wire[..split], &wire[split..]] {
+                        queue.push_copy(segment).expect("the block fits its queue");
+                    }
+                    queues.push((format!("split {split}"), queue));
+                }
+                let mut bytes = BufQueue::new(wire.len());
+                for byte in wire.chunks(1) {
+                    bytes.push_copy(byte).expect("the block fits its queue");
+                }
+                queues.push(("1-byte segments".to_owned(), bytes));
+                for (shape, queue) in &queues {
+                    for total in 0..=wire.len() {
+                        let mut contiguous = primed();
+                        let mut segmented = primed();
+                        let expected = contiguous.decode(&wire[..total]);
+                        assert_eq!(
+                            segmented.decode_buf_queue(queue, total),
+                            expected,
+                            "{shape}, total {total}"
+                        );
+                        let state = |decoder: &HpackDecoder| {
+                            (
+                                decoder.error(),
+                                decoder.context().table().insert_count(),
+                                table_contents(decoder),
+                            )
+                        };
+                        assert_eq!(
+                            state(&segmented),
+                            state(&contiguous),
+                            "{shape}, total {total}: sticky error, inserts and table"
+                        );
+                    }
+                }
+                reference
+                    .decode(&wire)
+                    .expect("the reference block decodes");
+            }
+        }
+    }
+
+    /// A 21-field consumer-shaped forwarded request.
+    fn forwarded_request_fields() -> Vec<HpackHeader> {
+        headers(&[
+            (":method", "POST"),
+            (":scheme", "https"),
+            (":authority", "c1"),
+            (":path", "/v1/route/items"),
+            ("content-type", "application/grpc"),
+            ("te", "trailers"),
+            ("user-agent", "grpc-client/1.0"),
+            ("x-request-id", "5f0c2a9e41b7d3c8"),
+            ("x-routing-key", "shard-0042/region-7"),
+            ("x-routing-key-copy", "shard-0042/region-7"),
+            ("x-timeout-ms", "1500"),
+            ("x-pad-req", "pppppppppppppppppppppppp"),
+            ("x-forwarded-for", "203.0.113.7"),
+            ("x-forwarded-proto", "https"),
+            ("accept-encoding", "gzip"),
+            ("grpc-accept-encoding", "identity,deflate,gzip"),
+            ("grpc-timeout", "1499m"),
+            (
+                "traceparent",
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            ),
+            ("x-client-id", "client-17"),
+            ("content-length", "128"),
+            ("x-tenant", "tenant-3"),
+        ])
+    }
+
+    #[test]
+    fn contiguous_decode_reads_each_field_start_once_off_the_slow_path() {
+        let fields = forwarded_request_fields();
+        assert_eq!(fields.len(), 21);
+        let mut encoder = HpackEncoder::new(true);
+        let mut decoder = HpackDecoder::new();
+        // The first block inserts literals, the second refers to them.
+        for block in 0..2 {
+            let wire = encoder.encode(&fields);
+            HpackDecodeBuffer::take_slow_path_entries();
+            decoder.take_field_start_reads();
+            let decoded = decoder.decode(&wire).expect("the request decodes");
+            assert_eq!(decoded.headers, fields, "block {block}");
+            assert_eq!(
+                (
+                    HpackDecodeBuffer::take_slow_path_entries(),
+                    decoder.take_field_start_reads(),
+                ),
+                (0, fields.len()),
+                "block {block}: (slow-path entries, field-start reads) of a contiguous decode"
+            );
+        }
+    }
+
     #[test]
     fn encode_stats_are_unchanged() {
         let mut stats = Vec::new();

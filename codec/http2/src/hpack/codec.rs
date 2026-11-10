@@ -548,6 +548,8 @@ pub struct HpackDecoder {
     scratch: [u8; LITERAL_SCRATCH],
     #[cfg(test)]
     decode_calls: usize,
+    #[cfg(test)]
+    field_start_reads: usize,
 }
 
 impl HpackDecoder {
@@ -568,7 +570,15 @@ impl HpackDecoder {
             scratch: [0; LITERAL_SCRATCH],
             #[cfg(test)]
             decode_calls: 0,
+            #[cfg(test)]
+            field_start_reads: 0,
         }
+    }
+
+    /// Returns and resets how many field-representation first bytes the decode loop has read.
+    #[cfg(test)]
+    pub(crate) fn take_field_start_reads(&mut self) -> usize {
+        std::mem::take(&mut self.field_start_reads)
     }
 
     pub fn decode(&mut self, bytes: &[u8]) -> Result<DecodedHeaderBlock, HpackError> {
@@ -656,6 +666,10 @@ impl HpackDecoder {
         let mut emitted = 0_u64;
         let mut table_size_update_allowed = true;
         while !input.is_empty() {
+            #[cfg(test)]
+            {
+                self.field_start_reads += 1;
+            }
             let byte = match input.peek() {
                 Ok(byte) => byte,
                 Err(error) => {
@@ -677,7 +691,7 @@ impl HpackDecoder {
             if !table_size_update {
                 self.memo_fields = self.memo_fields.saturating_add(1);
             }
-            let header_size = match self.decode_header(input, callback) {
+            let header_size = match self.decode_header(input, byte, callback) {
                 Ok(size) => size,
                 Err(error) => {
                     self.error = Some(error);
@@ -729,12 +743,13 @@ impl HpackDecoder {
         &self.context
     }
 
+    /// Decodes one field representation, whose first byte the caller has peeked as `byte`.
     fn decode_header(
         &mut self,
         input: &mut HpackDecodeBuffer<'_>,
+        byte: u8,
         callback: &mut dyn StreamingCallback,
     ) -> Result<u32, HpackError> {
-        let byte = input.peek()?;
         if byte & INDEX_REF.code != 0 {
             let index = u32::try_from(input.decode_integer(INDEX_REF.prefix_length)?)
                 .map_err(|_| HpackError::InvalidIndex)?;

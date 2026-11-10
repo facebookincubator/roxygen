@@ -19,6 +19,7 @@ thread_local! {
     static OWNED_LITERAL_COPIES: Cell<usize> = const { Cell::new(0) };
     static BLOCK_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
     static HUFFMAN_HEAP_DECODES: Cell<usize> = const { Cell::new(0) };
+    static SLOW_PATH_ENTRIES: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Counts one header block buffer allocation (an initial allocation, or growth during an encode).
@@ -342,7 +343,22 @@ impl<'a> HpackDecodeBuffer<'a> {
         self.remaining == 0
     }
 
+    /// Returns the next byte without consuming it. A byte left in the current segment is returned
+    /// inline; every other state takes `peek_slow`.
+    #[inline]
     pub fn peek(&mut self) -> Result<u8, HpackError> {
+        if self.remaining != 0 {
+            if let Some(&byte) = self.segment.get(self.offset) {
+                return Ok(byte);
+            }
+        }
+        self.peek_slow()
+    }
+
+    /// `peek` when no bytes remain or the current segment is used up.
+    #[cold]
+    #[inline(never)]
+    fn peek_slow(&mut self) -> Result<u8, HpackError> {
         self.skip_empty_segments();
         if self.remaining == 0 {
             return Err(HpackError::BufferUnderflow);
@@ -353,6 +369,7 @@ impl<'a> HpackDecodeBuffer<'a> {
             .ok_or(HpackError::BufferUnderflow)
     }
 
+    #[inline]
     pub(crate) fn read_byte(&mut self) -> Result<u8, HpackError> {
         let byte = self.peek()?;
         self.offset += 1;
@@ -360,17 +377,30 @@ impl<'a> HpackDecodeBuffer<'a> {
         Ok(byte)
     }
 
+    #[inline]
     pub fn decode_integer(&mut self, nbits: u8) -> Result<u64, HpackError> {
         if !(1..=8).contains(&nbits) {
             return Err(HpackError::InvalidEncoding);
         }
-        let mask = NBIT_MASKS[usize::from(nbits)];
-        let first = self.read_byte()? & mask;
-        let mut integer = u64::from(first);
-        if first != mask {
-            return Ok(integer);
-        }
+        let first = self.read_byte()?;
+        self.decode_integer_from(first, NBIT_MASKS[usize::from(nbits)])
+    }
 
+    /// Finishes an integer whose first byte, `first`, has been read: a prefix below `mask` is the
+    /// whole value, and a full prefix continues out of line.
+    #[inline]
+    fn decode_integer_from(&mut self, first: u8, mask: u8) -> Result<u64, HpackError> {
+        let prefix = first & mask;
+        if prefix != mask {
+            return Ok(u64::from(prefix));
+        }
+        self.decode_integer_continuation(u64::from(prefix))
+    }
+
+    /// Reads the 7-bit groups that follow a full prefix and adds them to `integer`, the prefix's
+    /// value.
+    #[inline(never)]
+    fn decode_integer_continuation(&mut self, mut integer: u64) -> Result<u64, HpackError> {
         let mut shift = 0_u32;
         loop {
             let byte = self.read_byte()?;
@@ -448,13 +478,22 @@ impl<'a> HpackDecodeBuffer<'a> {
         HUFFMAN_HEAP_DECODES.take()
     }
 
+    /// Returns how many times this thread has entered the segment-advancing slow path since the
+    /// last call.
+    #[cfg(test)]
+    pub(crate) fn take_slow_path_entries() -> usize {
+        SLOW_PATH_ENTRIES.take()
+    }
+
     fn take_literal(&mut self, nbits: u8) -> Result<(bool, Cow<'a, [u8]>), HpackError> {
         if !(1..=7).contains(&nbits) {
             return Err(HpackError::InvalidEncoding);
         }
-        let huffman = self.peek()? & (1 << nbits) != 0;
-        let size = usize::try_from(self.decode_integer(nbits)?)
-            .map_err(|_| HpackError::IntegerOverflow)?;
+        let first = self.read_byte()?;
+        let huffman = first & (1 << nbits) != 0;
+        let size =
+            usize::try_from(self.decode_integer_from(first, NBIT_MASKS[usize::from(nbits)])?)
+                .map_err(|_| HpackError::IntegerOverflow)?;
         if size > self.remaining {
             return Err(HpackError::BufferUnderflow);
         }
@@ -472,7 +511,9 @@ impl<'a> HpackDecodeBuffer<'a> {
         if length == 0 {
             return Ok(Cow::Borrowed(&[]));
         }
-        self.skip_empty_segments();
+        if self.offset == self.segment.len() {
+            self.skip_empty_segments();
+        }
         if length <= self.segment.len() - self.offset {
             let bytes = &self.segment[self.offset..self.offset + length];
             self.offset += length;
@@ -485,7 +526,11 @@ impl<'a> HpackDecodeBuffer<'a> {
             .map(Cow::Owned)
     }
 
+    #[cold]
+    #[inline(never)]
     fn skip_empty_segments(&mut self) {
+        #[cfg(test)]
+        SLOW_PATH_ENTRIES.set(SLOW_PATH_ENTRIES.get() + 1);
         while self.offset == self.segment.len() {
             let Some(segment) = self.segments.next() else {
                 break;
