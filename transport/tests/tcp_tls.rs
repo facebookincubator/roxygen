@@ -8719,6 +8719,7 @@ mod tcp_tls {
 
     mod owned_reader {
         use super::*;
+        use crate::byte_stream::read_queue_rebuilds_for_test;
         use crate::tcp::io_read_futures_for_test;
         use crate::tcp_tls_tests::tcp_tls::native_write_queue::with_accepted_tcp;
 
@@ -8793,6 +8794,98 @@ mod tcp_tls {
                 );
                 transport.close(&context).unwrap();
             });
+        }
+
+        /// N3c: the TCP backend bounds a read's queue at the read's maximum, so a reader read
+        /// whose bytes fit one allocation-size buffer returns that queue instead of moving its
+        /// bytes into a new one, with the same bound, bytes and backing.
+        #[test]
+        fn tcp_reader_reads_within_their_bounds_keep_the_backends_queue() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                let rebuilds = read_queue_rebuilds_for_test();
+                for chunk in [&b"one "[..], b"two ", b"six "] {
+                    peer.write_all(chunk).await.unwrap();
+                    reader.start_read(64, 64).unwrap();
+                    let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                    assert_eq!(read.data().limit(), 64);
+                    assert_eq!(read.data().remaining_capacity(), 60);
+                    assert_eq!(read.data().backing_capacity_upper_bound(), Some(64));
+                    assert_eq!(read_bytes(read), chunk);
+                }
+                assert_eq!(
+                    read_queue_rebuilds_for_test(),
+                    rebuilds,
+                    "reader reads within their bounds keep the backend's queue",
+                );
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// N3c through `read`: an ordinary TCP read within its bounds also returns the queue the
+        /// backend built.
+        #[test]
+        fn tcp_reads_within_their_bounds_keep_the_backends_queue() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let rebuilds = read_queue_rebuilds_for_test();
+                for chunk in [&b"one "[..], b"two ", b"six "] {
+                    peer.write_all(chunk).await.unwrap();
+                    let read = transport
+                        .read(&context, 64, 64, Duration::ZERO, CancellationToken::never())
+                        .await
+                        .unwrap();
+                    assert_eq!(read.data().limit(), 64);
+                    assert_eq!(read.data().remaining_capacity(), 60);
+                    assert_eq!(
+                        read.data().backing_capacity_upper_bound(),
+                        Some(64),
+                        "a TCP read's first buffer has the allocation size",
+                    );
+                    assert_eq!(read_bytes(read), chunk);
+                }
+                assert_eq!(
+                    read_queue_rebuilds_for_test(),
+                    rebuilds,
+                    "reads within their bounds keep the backend's queue",
+                );
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// A TCP reader read that continues past its first buffer (`DIV-017`) gathers buffers
+        /// longer than the allocation size, so its queue is still rebuilt in allocation-size views.
+        #[test]
+        fn a_tcp_reader_read_past_its_first_buffer_still_returns_allocation_size_views() {
+            with_observed_tcp(
+                limits(),
+                |context, transport, mut peer, observer| async move {
+                    let mut reader = transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    let burst = pattern(64, 5);
+                    peer.write_all(&burst).await.unwrap();
+                    wait_until_queued(&observer, burst.len()).await;
+                    let rebuilds = read_queue_rebuilds_for_test();
+                    reader.start_read(64, 7).unwrap();
+                    let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                    assert_eq!(read.data().limit(), 64);
+                    assert!(
+                        read.data().segments().all(|segment| segment.len() <= 7),
+                        "{:?}",
+                        read.data()
+                            .segments()
+                            .map(|segment| segment.len())
+                            .collect::<Vec<_>>(),
+                    );
+                    assert!(read_bytes(read) == burst);
+                    assert_eq!(read_queue_rebuilds_for_test(), rebuilds + 1);
+                    transport.close(&context).unwrap();
+                },
+            );
         }
 
         /// `DIV-018`, toward `IOBufQueue::preallocate`: while earlier reads' bytes are held, a

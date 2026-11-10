@@ -967,6 +967,7 @@ std::thread_local! {
 std::thread_local! {
     static READ_DEADLINE_BATONS: Cell<usize> = const { Cell::new(0) };
     static READER_WAKE_REGISTRATIONS: Cell<usize> = const { Cell::new(0) };
+    static READ_QUEUE_REBUILDS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Read-direction deadline batons built on this thread.
@@ -984,6 +985,12 @@ fn record_reader_wake_registration() {
 #[cfg(test)]
 pub(crate) fn reader_wake_registrations_for_test() -> usize {
     READER_WAKE_REGISTRATIONS.with(Cell::get)
+}
+
+/// Completed reads whose bytes `normalize_read` moved into a new queue on this thread.
+#[cfg(test)]
+pub(crate) fn read_queue_rebuilds_for_test() -> usize {
+    READ_QUEUE_REBUILDS.with(Cell::get)
 }
 
 /// Write progress cells built on this thread.
@@ -3050,6 +3057,9 @@ impl Drop for WriteOperation {
     }
 }
 
+/// Returns a completed read's bytes in a queue bounded at `maximum`, in segments of at most
+/// `allocation_size` bytes. A backend queue that already has both, as a Tokio-backed read's
+/// does, is returned as it is.
 fn normalize_read(
     result: TransportRead,
     maximum: usize,
@@ -3061,13 +3071,19 @@ fn normalize_read(
             b"byte-stream adapter exceeded the requested read bound",
         ));
     }
+    let fits = result
+        .data()
+        .segments()
+        .all(|segment| segment.len() <= allocation_size);
+    if fits && result.data().limit() == maximum {
+        return Ok(result);
+    }
     let eof = result.is_eof();
     let mut data = result.into_data();
+    #[cfg(test)]
+    READ_QUEUE_REBUILDS.with(|count| count.set(count.get() + 1));
     let mut bounded = BufQueue::new(maximum);
-    if data
-        .segments()
-        .all(|segment| segment.len() <= allocation_size)
-    {
+    if fits {
         bounded
             .append(&mut data)
             .map_err(|_| read_error(b"byte-stream read buffer exceeded its bound"))?;

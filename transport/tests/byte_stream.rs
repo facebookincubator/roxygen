@@ -50,6 +50,7 @@ mod byte_stream {
     use crate::byte_stream::WriteInfo;
     use crate::byte_stream::WriteProgress;
     use crate::byte_stream::close_path_errors_for_test;
+    use crate::byte_stream::read_queue_rebuilds_for_test;
     use crate::byte_stream::write_deadline_batons_for_test;
 
     const BUFFER_LIMIT: usize = 1 << 20;
@@ -73,6 +74,7 @@ mod byte_stream {
     struct FakeState {
         owner: ThreadId,
         inbound: BufQueue,
+        bound_reads_at_maximum: bool,
         read_eof: bool,
         read_error: Option<HttpError>,
         read_waker: Option<Waker>,
@@ -98,6 +100,7 @@ mod byte_stream {
             Self {
                 owner: std::thread::current().id(),
                 inbound: BufQueue::new(BUFFER_LIMIT),
+                bound_reads_at_maximum: false,
                 read_eof: false,
                 read_error: None,
                 read_waker: None,
@@ -268,6 +271,12 @@ mod byte_stream {
             }
         }
 
+        /// Makes the backend return each read's bytes in a queue bounded at that read's
+        /// maximum, as the TCP backend does, instead of in a split of its inbound queue.
+        fn bound_reads_at_maximum(&self) {
+            self.state.borrow_mut().bound_reads_at_maximum = true;
+        }
+
         fn eof(&self) {
             let wake = {
                 let mut state = self.state.borrow_mut();
@@ -385,7 +394,12 @@ mod byte_stream {
                     return Poll::Ready(Err(error));
                 }
                 if !state.inbound.is_empty() {
-                    let data = state.inbound.split_at_most(maximum);
+                    let mut data = state.inbound.split_at_most(maximum);
+                    if state.bound_reads_at_maximum {
+                        let mut bounded = BufQueue::new(maximum);
+                        bounded.append(&mut data).unwrap();
+                        data = bounded;
+                    }
                     let eof = state.read_eof && state.inbound.is_empty();
                     state.read_waker = None;
                     return Poll::Ready(Ok(TransportRead::from_io(data, eof)));
@@ -790,6 +804,130 @@ mod byte_stream {
                 );
                 assert_eq!(flatten(read.data()), b"abcde");
             }
+        });
+    }
+
+    /// N3c: a read whose backend queue is already bounded at the read's maximum, with every
+    /// segment within the allocation size, returns that queue instead of moving its bytes into
+    /// a new one. The result keeps the bound, remaining capacity, backing bound and segment
+    /// views that the moved copy had, and data with EOF still defers the EOF to the next read.
+    #[test]
+    fn a_read_bounded_at_its_maximum_keeps_the_backends_queue() {
+        run_worker(|context| async move {
+            let (transport, control) = transport(&context, ByteEventCapability::Unsupported, None);
+            control.bound_reads_at_maximum();
+            let mut first = Vec::with_capacity(4096);
+            first.extend_from_slice(b"abc");
+            let mut second = Vec::with_capacity(2048);
+            second.extend_from_slice(b"de");
+            let pointers = [first.as_ptr(), second.as_ptr()];
+            let capacity = first.capacity() + second.capacity();
+            let mut inbound = BufQueue::new(32);
+            inbound.push_vec(first).unwrap();
+            inbound.push_vec(second).unwrap();
+            control.feed(inbound, true);
+
+            let rebuilds = read_queue_rebuilds_for_test();
+            let read = transport
+                .read(&context, 8, 3, Duration::ZERO, CancellationToken::never())
+                .await
+                .unwrap();
+            assert!(
+                !read.is_eof(),
+                "EOF after data is deferred to the next read"
+            );
+            assert_eq!(read.bytes_read(), 5);
+            assert_eq!(read.data().limit(), 8);
+            assert_eq!(read.data().remaining_capacity(), 3);
+            assert_eq!(read.data().backing_capacity_upper_bound(), Some(capacity));
+            assert_eq!(
+                read.data()
+                    .segments()
+                    .map(|segment| (segment.as_ptr(), segment.len()))
+                    .collect::<Vec<_>>(),
+                vec![(pointers[0], 3), (pointers[1], 2)]
+            );
+            let eof = transport
+                .read(&context, 8, 3, Duration::ZERO, CancellationToken::never())
+                .await
+                .unwrap();
+            assert!(eof.is_eof());
+            assert_eq!(eof.bytes_read(), 0);
+            assert_eq!(
+                read_queue_rebuilds_for_test(),
+                rebuilds,
+                "a read already bounded at its maximum keeps the backend's queue",
+            );
+            transport.close(&context).unwrap();
+        });
+    }
+
+    /// A backend queue bounded at the read's maximum that holds a segment longer than the
+    /// allocation size is still split into allocation-size views of the same backing.
+    #[test]
+    fn a_read_bounded_at_its_maximum_still_splits_segments_over_the_allocation_size() {
+        run_worker(|context| async move {
+            let (transport, control) = transport(&context, ByteEventCapability::Unsupported, None);
+            control.bound_reads_at_maximum();
+            let allocation = b"abcdef".to_vec();
+            let start = allocation.as_ptr();
+            let mut inbound = BufQueue::new(allocation.len());
+            inbound.push_vec(allocation).unwrap();
+            control.feed(inbound, false);
+
+            let rebuilds = read_queue_rebuilds_for_test();
+            let read = transport
+                .read(&context, 6, 3, Duration::ZERO, CancellationToken::never())
+                .await
+                .unwrap();
+            assert_eq!(read.data().limit(), 6);
+            assert_eq!(
+                read.data()
+                    .segments()
+                    .map(|segment| (segment.as_ptr(), segment.len()))
+                    .collect::<Vec<_>>(),
+                vec![(start, 3), (start.wrapping_add(3), 3)]
+            );
+            assert_eq!(flatten(read.data()), b"abcdef");
+            assert_eq!(read_queue_rebuilds_for_test(), rebuilds + 1);
+            transport.close(&context).unwrap();
+        });
+    }
+
+    /// A backend queue with another bound is moved into a queue bounded at the read's
+    /// maximum, keeping its segment views and backing bound.
+    #[test]
+    fn a_read_whose_backend_queue_has_another_bound_is_rebounded_at_its_maximum() {
+        run_worker(|context| async move {
+            let (transport, control) = transport(&context, ByteEventCapability::Unsupported, None);
+            let allocation = Vec::from(&b"abcde"[..]);
+            let start = allocation.as_ptr();
+            let capacity = allocation.capacity();
+            let mut inbound = BufQueue::new(32);
+            inbound.push_vec(allocation).unwrap();
+            control.feed(inbound, false);
+
+            let rebuilds = read_queue_rebuilds_for_test();
+            let read = transport
+                .read(&context, 8, 8, Duration::ZERO, CancellationToken::never())
+                .await
+                .unwrap();
+            assert_eq!(
+                read.data().limit(),
+                8,
+                "the backend's queue is bounded at 1 MiB"
+            );
+            assert_eq!(read.data().remaining_capacity(), 3);
+            assert_eq!(read.data().backing_capacity_upper_bound(), Some(capacity));
+            assert_eq!(
+                read.data()
+                    .segments()
+                    .map(|segment| (segment.as_ptr(), segment.len()))
+                    .collect::<Vec<_>>(),
+                vec![(start, 5)]
+            );
+            assert_eq!(read_queue_rebuilds_for_test(), rebuilds + 1);
+            transport.close(&context).unwrap();
         });
     }
 
