@@ -350,14 +350,14 @@ fn a_polling_response_source_streams_over_owned_http1() {
 
 /// On the owned HTTP/1.1 driver, the exchange polls a polling response source
 /// through its holder in place (`HttpSourceHolder::poll_body_event_exclusive`),
-/// so polling saves the source's boxed read future and the holder read the
-/// exchange boxed around it, two heap allocations per body event. The driver's
-/// own allocations are not a whole number per event, so the two modes are
-/// compared at each length and the saving differenced across lengths. Both
-/// saved allocations are made by code compiled into this test crate, so Buck
-/// counts them too.
+/// so polling saves the source's boxed read future, one heap allocation per
+/// body event; the exchange holds a read-future source's holder read inline, so
+/// there is no boxed holder read to save. The driver's own allocations are not
+/// a whole number per event, so the two modes are compared at each length and
+/// the saving differenced across lengths. The saved allocation is made by code
+/// compiled into this test crate, so Buck counts it too.
 #[test]
-fn a_polling_response_source_saves_two_allocations_per_body_event_over_owned_http1() {
+fn a_polling_response_source_saves_one_allocation_per_body_event_over_owned_http1() {
     let saved = |events| {
         let (boxed, boxed_body) = serve_tokens_on(events, false, false, Serving::OwnedHttp1);
         let (polled, polled_body) = serve_tokens_on(events, true, false, Serving::OwnedHttp1);
@@ -368,15 +368,16 @@ fn a_polling_response_source_saves_two_allocations_per_body_event_over_owned_htt
     let (short, long) = (saved(200), saved(400));
     assert_eq!(
         long - short,
-        400,
+        200,
         "{short} allocations saved over 200 body events, {long} over 400"
     );
 }
 
 /// The owned HTTP/2 driver shares the owned HTTP/1.1 exchange
 /// (`handler_application.rs`), so it too polls a polling response source in
-/// place and saves both boxed reads, two heap allocations per body event,
-/// counted as in the owned HTTP/1.1 test, after a first connection that takes
+/// place and holds a read-future source's holder read inline: polling saves
+/// the source's boxed read future, one heap allocation per body event, counted
+/// as in the owned HTTP/1.1 test, after a first connection that takes
 /// the HTTP/2 path's one-time allocations (about 100 on the first connection a
 /// process serves).
 #[test]
@@ -392,7 +393,7 @@ fn a_polling_response_source_streams_over_owned_http2_without_read_futures() {
     let (short, long) = (saved(200), saved(400));
     assert_eq!(
         long - short,
-        400,
+        200,
         "{short} allocations saved over 200 body events, {long} over 400"
     );
 }

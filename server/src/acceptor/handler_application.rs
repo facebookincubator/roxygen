@@ -25,6 +25,7 @@ use roxygen_core::ids::StreamId;
 use roxygen_core::ingress_completion::IngressCompletion;
 use roxygen_core::message::HttpMessage;
 use roxygen_core::source::HttpSource;
+use roxygen_core::source_holder::HolderBodyRead;
 use roxygen_core::source_holder::HolderHeaderRead;
 use roxygen_core::source_holder::HttpSourceHolder;
 use roxygen_core::stream_source::HttpStreamSourceOwner;
@@ -85,7 +86,7 @@ enum BodyRead {
     /// A polling source's read (`DIV-039`), polled through the exclusively owned
     /// holder with the allowance it started with.
     InPlace(u32),
-    Future(Pin<Box<dyn Future<Output = Result<HttpBodyEvent, HttpError>> + 'static>>),
+    Future(HolderBodyRead),
 }
 
 enum ExchangeState {
@@ -180,7 +181,7 @@ impl OwnedExchange for HandlerExchange {
             .context
             .take()
             .expect("an exchange receives one request");
-        let future = match HttpHeaderEvent::new(*head, eom) {
+        let future = match HttpHeaderEvent::from_boxed_headers(head, eom) {
             Ok(head) => {
                 let request = HttpSourceHolder::new(Box::new(HttpHybridSource::from_header_event(
                     head,
@@ -244,12 +245,12 @@ impl OwnedExchange for HandlerExchange {
             if response.polls_body_events() {
                 BodyRead::InPlace(maximum)
             } else {
-                BodyRead::Future(Box::pin(response.read_body_event_unboxed(maximum)))
+                BodyRead::Future(response.read_body_event_unboxed(maximum))
             }
         });
         let result = std::task::ready!(match read {
             BodyRead::InPlace(maximum) => response.poll_body_event_exclusive(context, *maximum),
-            BodyRead::Future(read) => read.as_mut().poll(context),
+            BodyRead::Future(read) => Pin::new(read).poll(context),
         });
         *body_read = None;
         Poll::Ready(result)

@@ -441,7 +441,11 @@ impl Future for HolderHeaderRead {
     }
 }
 
-pub(crate) struct HolderBodyRead(HolderRead<HttpBodyEvent>);
+/// The body read [`HttpSourceHolder::read_body_event_unboxed`] returns.
+///
+/// It owns its read state and retires a terminal source generation exactly as
+/// the boxed holder read does.
+pub struct HolderBodyRead(HolderRead<HttpBodyEvent>);
 
 impl Future for HolderBodyRead {
     type Output = Result<HttpBodyEvent, HttpError>;
@@ -562,10 +566,7 @@ impl HttpSourceHolder {
     /// returned future polls it in place (`DIV-039`), and fails with `DROPPED` once
     /// the source was stopped, cleared, replaced, or destroyed with the holder; a
     /// read pending then is woken, since its source may never wake it.
-    pub fn read_body_event_unboxed(
-        &mut self,
-        maximum: u32,
-    ) -> impl Future<Output = Result<HttpBodyEvent, HttpError>> + Unpin + 'static + use<> {
+    pub fn read_body_event_unboxed(&mut self, maximum: u32) -> HolderBodyRead {
         self.read_body_event_concrete(maximum)
     }
 
