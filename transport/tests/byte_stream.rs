@@ -78,6 +78,7 @@ mod byte_stream {
         read_eof: bool,
         read_error: Option<HttpError>,
         read_waker: Option<Waker>,
+        panic_next_read_poll: bool,
         reads_started: usize,
         read_sizes: Vec<(usize, usize)>,
         block_writes: bool,
@@ -104,6 +105,7 @@ mod byte_stream {
                 read_eof: false,
                 read_error: None,
                 read_waker: None,
+                panic_next_read_poll: false,
                 reads_started: 0,
                 read_sizes: Vec::new(),
                 block_writes: false,
@@ -277,6 +279,11 @@ mod byte_stream {
             self.state.borrow_mut().bound_reads_at_maximum = true;
         }
 
+        /// Makes the next poll of a backend read panic before it looks at its bytes.
+        fn panic_on_next_read_poll(&self) {
+            self.state.borrow_mut().panic_next_read_poll = true;
+        }
+
         fn eof(&self) {
             let wake = {
                 let mut state = self.state.borrow_mut();
@@ -389,6 +396,10 @@ mod byte_stream {
             let state = Rc::clone(&self.state);
             Box::pin(std::future::poll_fn(move |context| {
                 let mut state = state.borrow_mut();
+                assert!(
+                    !std::mem::take(&mut state.panic_next_read_poll),
+                    "scripted read poll panic"
+                );
                 if let Some(error) = state.read_error.take() {
                     state.read_waker = None;
                     return Poll::Ready(Err(error));
@@ -4495,6 +4506,113 @@ mod byte_stream {
                     .await
                     .unwrap();
                 assert_eq!(flatten(read.data()), b"ok");
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// Each reader read returns its bytes within its own bounds: a queue bounded at that
+        /// read's maximum, in views of at most that read's allocation size, whatever an earlier
+        /// read's bounds were.
+        #[test]
+        fn each_owned_reader_read_keeps_its_own_bounds() {
+            run_worker(|context| async move {
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                control.bound_reads_at_maximum();
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                // (maximum, allocation size, bytes fed, segment lengths returned)
+                for (maximum, allocation_size, bytes, segments) in [
+                    (8, 8, &b"abcdefgh"[..], vec![8]),
+                    (4, 2, b"wxyz", vec![2, 2]),
+                    (6, 3, b"pq", vec![2]),
+                ] {
+                    control.feed(queue(&[bytes], bytes.len()), false);
+                    reader.start_read(maximum, allocation_size).unwrap();
+                    let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                    assert_eq!(read.data().limit(), maximum, "bounded at its own maximum");
+                    assert_eq!(
+                        read.data()
+                            .segments()
+                            .map(|segment| segment.len())
+                            .collect::<Vec<_>>(),
+                        segments,
+                        "split at its own allocation size ({maximum}, {allocation_size})",
+                    );
+                    assert_eq!(flatten(read.data()), bytes);
+                }
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// A reader read whose poll panics stays started: a new read is refused, and the next
+        /// poll finishes the same read with the bytes that arrive.
+        #[test]
+        fn a_reader_read_whose_poll_panics_stays_started() {
+            run_worker(|context| async move {
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                reader.start_read(1_024, 1_024).unwrap();
+                control.panic_on_next_read_poll();
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| {
+                        reader.poll_read(&mut Context::from_waker(Waker::noop()))
+                    }))
+                    .is_err()
+                );
+                assert!(transport.has_pending_read(&context).unwrap());
+                assert_eq!(
+                    reader.start_read(1_024, 1_024).unwrap_err().code(),
+                    HttpErrorCode::INVALID_STATE_TRANSITION,
+                    "the read whose poll panicked is still started",
+                );
+                control.feed(queue(&[b"ok"], 2), false);
+                let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                assert_eq!(flatten(read.data()), b"ok");
+                assert!(!transport.has_pending_read(&context).unwrap());
+                assert_eq!(control.reads_started(), 1, "the same backend read finished");
+                assert!(control.actions().is_empty(), "nothing was cancelled");
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// Dropping a reader whose last read was returned leaves the transport's next read,
+        /// from the read API, pending and uncancelled.
+        #[test]
+        fn dropping_an_idle_owned_reader_cancels_nothing() {
+            run_worker(|context| async move {
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                control.feed(queue(&[b"ok"], 2), false);
+                reader.start_read(1_024, 1_024).unwrap();
+                poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                let mut pending = transport.read(
+                    &context,
+                    1_024,
+                    1_024,
+                    Duration::ZERO,
+                    CancellationToken::never(),
+                );
+                assert!(poll_once(pending.as_mut()).is_pending());
+                drop(reader);
+                assert!(
+                    transport.has_pending_read(&context).unwrap(),
+                    "the read API's read stays registered",
+                );
+                assert!(control.actions().is_empty(), "nothing was cancelled");
+                control.feed(queue(&[b"next"], 4), false);
+                let read = pending.await.unwrap();
+                assert_eq!(flatten(read.data()), b"next");
                 transport.close(&context).unwrap();
             });
         }

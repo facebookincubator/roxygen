@@ -380,26 +380,36 @@ pub trait ByteStreamTransport: 'static {
 /// through which the owned uniplex drivers read instead of with one read future
 /// per read.
 ///
-/// It starts one read at a time. Each read has `read`'s entry checks, clamps,
-/// results, close and cancellation outcomes, and `DIV-016`/`DIV-017`/`DIV-018`
-/// behavior, except for timing: it has no deadline, its completion wakes no
-/// task, and over a Tokio-backed stream its I/O state lives in the backend, so
-/// it allocates no future. Over TCP its first poll fills the tailroom of a
-/// buffer that the transport keeps between reads (`DIV-018`), where a `read`
-/// starts a new buffer. A cancellation wakes a pending read, as a timed
-/// read's wait does. The reader registers that wake once for all its reads, so
-/// a cancellation requested while no read is started wakes the task that last
-/// polled a pending read (`DIV-018`). Dropping the reader with a read started
-/// cancels that read, as dropping a read future does.
+/// It starts one read at a time, and its reads reuse one read operation. Each
+/// read has `read`'s entry checks, clamps, results, close and cancellation
+/// outcomes, and `DIV-016`/`DIV-017`/`DIV-018` behavior, except for timing: it
+/// has no deadline, its completion wakes no task, and over a Tokio-backed
+/// stream its I/O state lives in the backend, so it allocates no future. Over
+/// TCP its first poll fills the tailroom of a buffer that the transport keeps
+/// between reads (`DIV-018`), where a `read` starts a new buffer. A
+/// cancellation wakes a pending read, as a timed read's wait does. The reader
+/// registers that wake once for all its reads, so a cancellation requested
+/// while no read is started wakes the task that last polled a pending read
+/// (`DIV-018`). Dropping the reader with a read started cancels that read, as
+/// dropping a read future does.
 pub struct OwnedReader {
-    io: Weak<dyn ByteStreamIo>,
-    state: Rc<RefCell<TransportState>>,
     worker: WorkerHandle,
     limits: ByteStreamLimits,
     context: WorkerContext,
     cancellation: ReaderCancellation,
     /// The started read, until `poll_read` returns its result.
-    read: Option<ReadStart>,
+    read: ReaderRead,
+    /// The operation slot. Every read reuses it, with its transport handles.
+    operation: ReadOperation,
+}
+
+/// The read an [`OwnedReader`] has started.
+enum ReaderRead {
+    Idle,
+    /// The operation slot holds the read.
+    Reading,
+    /// The read ended at entry with this result.
+    Finished(Result<TransportRead, HttpError>),
 }
 
 /// An [`OwnedReader`]'s cancellation: its token, and the one wake registration
@@ -425,19 +435,19 @@ impl OwnedReader {
     /// `allocation_size` bytes, with `read`'s entry checks and clamps. An error
     /// is interface misuse: a started read has not yet been returned.
     pub fn start_read(&mut self, maximum: usize, allocation_size: usize) -> Result<(), HttpError> {
-        if self.read.is_some() {
+        if !matches!(self.read, ReaderRead::Idle) {
             return Err(HttpError::with_message(
                 HttpErrorCode::INVALID_STATE_TRANSITION,
                 b"owned reader already has a started read",
             ));
         }
         let target = ReadTarget {
-            io: &self.io,
-            state: &self.state,
+            io: &self.operation.io,
+            state: &self.operation.state,
             worker: &self.worker,
             limits: self.limits,
         };
-        self.read = Some(start_read_operation(
+        match start_read_operation(
             target,
             &self.context,
             maximum,
@@ -445,7 +455,17 @@ impl OwnedReader {
             ReadKind::Reader {
                 cancellation: &self.cancellation.token,
             },
-        ));
+        ) {
+            ReadStart::Started {
+                operation,
+                maximum,
+                allocation_size,
+            } => {
+                self.operation.restart(operation, maximum, allocation_size);
+                self.read = ReaderRead::Reading;
+            }
+            ReadStart::Finished(result) => self.read = ReaderRead::Finished(result),
+        }
         Ok(())
     }
 
@@ -455,25 +475,28 @@ impl OwnedReader {
         &mut self,
         context: &mut Context<'_>,
     ) -> Poll<Result<TransportRead, HttpError>> {
-        let Some(read) = self.read.as_mut() else {
-            return Poll::Ready(Err(HttpError::with_message(
-                HttpErrorCode::INVALID_STATE_TRANSITION,
-                b"owned reader has no started read",
-            )));
-        };
-        let result = match read {
-            ReadStart::Started(operation) => {
-                ready!(operation.poll_with(context, Some(&mut self.cancellation)))
+        match self.read {
+            ReaderRead::Reading => {
+                let result = ready!(
+                    self.operation
+                        .poll_with(context, Some(&mut self.cancellation))
+                );
+                self.read = ReaderRead::Idle;
+                Poll::Ready(result)
             }
-            ReadStart::Finished(_) => {
-                let Some(ReadStart::Finished(result)) = self.read.take() else {
+            ReaderRead::Finished(_) => {
+                let ReaderRead::Finished(result) =
+                    std::mem::replace(&mut self.read, ReaderRead::Idle)
+                else {
                     unreachable!("the started read finished at entry");
                 };
-                result
+                Poll::Ready(result)
             }
-        };
-        self.read = None;
-        Poll::Ready(result)
+            ReaderRead::Idle => Poll::Ready(Err(HttpError::with_message(
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"owned reader has no started read",
+            ))),
+        }
     }
 }
 
@@ -968,6 +991,13 @@ std::thread_local! {
     static READ_DEADLINE_BATONS: Cell<usize> = const { Cell::new(0) };
     static READER_WAKE_REGISTRATIONS: Cell<usize> = const { Cell::new(0) };
     static READ_QUEUE_REBUILDS: Cell<usize> = const { Cell::new(0) };
+    static READ_OPERATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// `ReadOperation`s built on this thread.
+#[cfg(test)]
+pub(crate) fn read_operations_for_test() -> usize {
+    READ_OPERATIONS.with(Cell::get)
 }
 
 /// Read-direction deadline batons built on this thread.
@@ -1765,7 +1795,17 @@ impl OwnedByteStream {
                 cancellation,
             },
         ) {
-            ReadStart::Started(operation) => Box::pin(operation),
+            ReadStart::Started {
+                operation,
+                maximum,
+                allocation_size,
+            } => Box::pin(ReadOperation::new(
+                self.io.clone(),
+                Rc::clone(&self.state),
+                operation,
+                maximum,
+                allocation_size,
+            )),
             ReadStart::Finished(result) => Box::pin(std::future::ready(result)),
         }
     }
@@ -1897,7 +1937,13 @@ impl ReadTarget<'_> {
 
 /// A read that [`start_read_operation`] began, or the result it ended with at entry.
 enum ReadStart {
-    Started(ReadOperation),
+    /// The transport's read `operation`, with its clamped bounds, for the
+    /// [`ReadOperation`] that the caller builds or restarts.
+    Started {
+        operation: u64,
+        maximum: usize,
+        allocation_size: usize,
+    },
     Finished(Result<TransportRead, HttpError>),
 }
 
@@ -2014,13 +2060,11 @@ fn start_read_operation(
         drive,
         waker: None,
     });
-    ReadStart::Started(ReadOperation::new(
-        target.io.clone(),
-        Rc::clone(target.state),
+    ReadStart::Started {
         operation,
         maximum,
         allocation_size,
-    ))
+    }
 }
 
 /// A write that [`start_write_operation`] began, or the result it ended with at entry.
@@ -2537,13 +2581,12 @@ impl ByteStreamTransport for OwnedByteStream {
             return Ok(None);
         }
         Ok(Some(OwnedReader {
-            io: self.io.clone(),
-            state: Rc::clone(&self.state),
             worker: self.worker.clone(),
             limits: self.limits,
             context: context.clone(),
             cancellation: ReaderCancellation::new(cancellation),
-            read: None,
+            read: ReaderRead::Idle,
+            operation: ReadOperation::idle(self.io.clone(), Rc::clone(&self.state)),
         }))
     }
 }
@@ -2585,6 +2628,8 @@ impl ReadOperation {
         maximum: usize,
         allocation_size: usize,
     ) -> Self {
+        #[cfg(test)]
+        READ_OPERATIONS.with(|count| count.set(count.get() + 1));
         Self {
             io,
             state,
@@ -2593,6 +2638,22 @@ impl ReadOperation {
             allocation_size,
             complete: false,
         }
+    }
+
+    /// An [`OwnedReader`]'s operation slot, complete until its first read.
+    fn idle(io: Weak<dyn ByteStreamIo>, state: Rc<RefCell<TransportState>>) -> Self {
+        let mut slot = Self::new(io, state, 0, 0, 0);
+        slot.complete = true;
+        slot
+    }
+
+    /// Reuses a complete slot for the transport's read `operation`.
+    fn restart(&mut self, operation: u64, maximum: usize, allocation_size: usize) {
+        debug_assert!(self.complete, "only a complete read's slot is reused");
+        self.operation = operation;
+        self.maximum = maximum;
+        self.allocation_size = allocation_size;
+        self.complete = false;
     }
 
     fn finish(&mut self, cancel: Option<HttpErrorCode>) {

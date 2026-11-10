@@ -8719,6 +8719,7 @@ mod tcp_tls {
 
     mod owned_reader {
         use super::*;
+        use crate::byte_stream::read_operations_for_test;
         use crate::byte_stream::read_queue_rebuilds_for_test;
         use crate::tcp::io_read_futures_for_test;
         use crate::tcp_tls_tests::tcp_tls::native_write_queue::with_accepted_tcp;
@@ -9034,6 +9035,40 @@ mod tcp_tls {
                     .unwrap();
                 assert_eq!(read_bytes(read), b"six ");
                 assert_eq!(io_read_futures_for_test(), futures + 1);
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// A reader builds one read operation, its slot, and its reads reuse it, where an
+        /// operation per read would build three.
+        #[test]
+        fn tcp_reader_reads_reuse_the_readers_operation_slot() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let operations = read_operations_for_test();
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                for chunk in [&b"one "[..], b"two ", b"six "] {
+                    peer.write_all(chunk).await.unwrap();
+                    reader.start_read(64, 64).unwrap();
+                    let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                    assert_eq!(read_bytes(read), chunk);
+                }
+                assert_eq!(
+                    read_operations_for_test(),
+                    operations + 1,
+                    "a reader builds one read operation, its slot, and its reads reuse it",
+                );
+                drop(reader);
+                // Control: the read API builds one read operation per read.
+                peer.write_all(b"ten ").await.unwrap();
+                let read = transport
+                    .read(&context, 64, 64, Duration::ZERO, CancellationToken::never())
+                    .await
+                    .unwrap();
+                assert_eq!(read_bytes(read), b"ten ");
+                assert_eq!(read_operations_for_test(), operations + 2);
                 transport.close(&context).unwrap();
             });
         }
