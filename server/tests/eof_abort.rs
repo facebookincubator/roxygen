@@ -931,6 +931,48 @@ fn http1_eof_aborts_a_no_error_stopped_upload_when_enabled() {
     });
 }
 
+/// By default, a request whose reader stopped its upload with `NO_ERROR` gets
+/// its response, then the owned driver's staged close (`DIV-054`) shuts the
+/// write side down and reads the rest of the upload through the TCP reader:
+/// chunks that trickle in after the response, then the peer's FIN, which ends
+/// the connection cleanly.
+#[test]
+fn owned_http1_staged_close_reads_a_trickled_upload_to_peer_eof_over_tcp() {
+    on_worker(|context| async move {
+        let held = Rc::new(Held::default());
+        let (connection, mut client) = serve_loopback(
+            &context,
+            CodecProtocol::Http11,
+            session(true, false),
+            Rc::new(StoppingHandler(Rc::clone(&held))),
+        )
+        .await;
+        let chunk = [b'a'; 1000];
+        client
+            .write_all(b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5000\r\n\r\n")
+            .await
+            .expect("request head written");
+        client.write_all(&chunk).await.expect("first chunk written");
+        until(|| held.invoked.get()).await;
+        held.release.notify_one();
+        let (wire, reset) = read_until_closed(&mut client).await;
+        assert!(wire.starts_with(b"HTTP/1.1 200"), "{wire:?}");
+        assert!(!reset, "the staged close shuts the write side down");
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            client
+                .write_all(&chunk)
+                .await
+                .expect("trickled chunk written");
+        }
+        client.shutdown().await.expect("client half-closes");
+        tokio::time::timeout(Duration::from_secs(2), connection.wait_closed())
+            .await
+            .expect("the staged close ends at the peer's EOF")
+            .expect("the staged close ends cleanly");
+    });
+}
+
 /// The EOF waits behind the pipelined request: the first exchange is answered,
 /// then the second, open when the EOF is read, is aborted.
 #[test]

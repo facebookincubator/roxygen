@@ -106,6 +106,7 @@ use roxygen_transport::byte_stream::ByteEventCapability;
 use roxygen_transport::byte_stream::ByteEventRegistrationError;
 use roxygen_transport::byte_stream::ByteStreamTransport;
 use roxygen_transport::byte_stream::LocalTransportFuture;
+use roxygen_transport::byte_stream::OwnedReader;
 use roxygen_transport::byte_stream::OwnedWriteQueue;
 use roxygen_transport::byte_stream::PeerIdentity;
 use roxygen_transport::byte_stream::TransportWriteError;
@@ -269,6 +270,33 @@ impl UniplexWriteQueue for OwnedWriteQueue {
     }
 }
 
+/// An exclusive, poll-based reader: one read at a time, each with `UniplexTransport::read`'s
+/// results, through which a connection's owner reads without a future per read.
+pub trait UniplexReader: 'static {
+    /// Starts a read of at most `maximum` bytes that first offers `allocation_size` bytes. Errors
+    /// indicate interface misuse: a started read has not yet been returned; entry failures are
+    /// delivered by `poll_read`.
+    fn start_read(&mut self, maximum: usize, allocation_size: usize) -> Result<(), HttpError>;
+    /// Registers the owner waker and returns the started read's result once it is ready.
+    fn poll_read(&mut self, context: &mut Context<'_>) -> Poll<Result<UniplexRead, HttpError>>;
+}
+
+/// The native byte stream's poll-based reader (`ByteStreamTransport::reader`).
+impl UniplexReader for OwnedReader {
+    fn start_read(&mut self, maximum: usize, allocation_size: usize) -> Result<(), HttpError> {
+        OwnedReader::start_read(self, maximum, allocation_size)
+    }
+
+    fn poll_read(&mut self, context: &mut Context<'_>) -> Poll<Result<UniplexRead, HttpError>> {
+        OwnedReader::poll_read(self, context).map(|result| {
+            result.map(|read| {
+                let eof = read.is_eof();
+                UniplexRead::new(read.into_data(), eof)
+            })
+        })
+    }
+}
+
 /// Byte-stream surface used by the uniplex loops.
 ///
 /// Every `ByteStreamTransport`, including `OwnedByteStream`, implements this
@@ -288,6 +316,17 @@ pub trait UniplexTransport: 'static {
         _timeout: Duration,
         _cancellation: CancellationToken,
     ) -> Result<Option<Box<dyn UniplexWriteQueue>>, HttpError> {
+        Ok(None)
+    }
+
+    /// Acquires an optional poll-based reader, which reads with `timeout` and `cancellation`.
+    /// Unsupported configurations retain `read`, including its timeout behavior.
+    fn try_reader(
+        &self,
+        _context: &WorkerContext,
+        _timeout: Duration,
+        _cancellation: CancellationToken,
+    ) -> Result<Option<Box<dyn UniplexReader>>, HttpError> {
         Ok(None)
     }
 
@@ -345,6 +384,18 @@ impl<T: ByteStreamTransport> UniplexTransport for T {
             cancellation,
         )?
         .map(|queue| Box::new(queue) as Box<dyn UniplexWriteQueue>))
+    }
+
+    fn try_reader(
+        &self,
+        context: &WorkerContext,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<Option<Box<dyn UniplexReader>>, HttpError> {
+        Ok(
+            ByteStreamTransport::reader(self, context, timeout, cancellation)?
+                .map(|reader| Box::new(reader) as Box<dyn UniplexReader>),
+        )
     }
 
     fn read(

@@ -64,6 +64,7 @@ use crate::session::LifecycleObserver;
 use crate::uniplex::UniplexConfig;
 use crate::uniplex::UniplexHandle;
 use crate::uniplex::UniplexRead;
+use crate::uniplex::UniplexReader;
 use crate::uniplex::UniplexSession;
 use crate::uniplex::UniplexTransport;
 use crate::uniplex::egress_stream_is_ready_for_test;
@@ -368,6 +369,156 @@ impl UniplexTransport for DropProbeTransport {
     fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
         self.reset_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.close_with_reset(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.inner.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.inner.register_byte_event(context, registration)
+    }
+}
+
+/// Reads started through each path of a [`ReaderTransport`].
+#[derive(Default)]
+pub(crate) struct ReadCounts {
+    pub(crate) direct: Cell<usize>,
+    pub(crate) reader: Cell<usize>,
+}
+
+/// Delegates to `inner`, and offers `inner`'s reads through a [`UniplexReader`] as well as
+/// through `read`, counting the reads each path starts.
+pub(crate) struct ReaderTransport {
+    inner: Rc<dyn UniplexTransport>,
+    counts: Rc<ReadCounts>,
+}
+
+impl ReaderTransport {
+    pub(crate) fn new(inner: Rc<dyn UniplexTransport>) -> (Rc<Self>, Rc<ReadCounts>) {
+        let counts = Rc::new(ReadCounts::default());
+        (
+            Rc::new(Self {
+                inner,
+                counts: Rc::clone(&counts),
+            }),
+            counts,
+        )
+    }
+}
+
+/// Reads one `inner.read` future at a time.
+struct FutureReader {
+    inner: Rc<dyn UniplexTransport>,
+    context: WorkerContext,
+    timeout: Duration,
+    cancellation: CancellationToken,
+    read: Option<LocalTransportFuture<Result<UniplexRead, HttpError>>>,
+    counts: Rc<ReadCounts>,
+}
+
+impl UniplexReader for FutureReader {
+    fn start_read(&mut self, maximum: usize, allocation_size: usize) -> Result<(), HttpError> {
+        assert!(self.read.is_none(), "one read at a time");
+        self.counts.reader.set(self.counts.reader.get() + 1);
+        self.read = Some(self.inner.read(
+            &self.context,
+            maximum,
+            allocation_size,
+            self.timeout,
+            self.cancellation.clone(),
+        ));
+        Ok(())
+    }
+
+    fn poll_read(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> Poll<Result<UniplexRead, HttpError>> {
+        let read = self.read.as_mut().expect("a polled read was started");
+        let result = std::task::ready!(read.as_mut().poll(context));
+        self.read = None;
+        Poll::Ready(result)
+    }
+}
+
+impl UniplexTransport for ReaderTransport {
+    fn try_write_queue(
+        &self,
+        context: &WorkerContext,
+        maximum_write_size: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<Option<Box<dyn crate::uniplex::UniplexWriteQueue>>, HttpError> {
+        self.inner
+            .try_write_queue(context, maximum_write_size, timeout, cancellation)
+    }
+
+    fn try_reader(
+        &self,
+        context: &WorkerContext,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<Option<Box<dyn UniplexReader>>, HttpError> {
+        Ok(Some(Box::new(FutureReader {
+            inner: Rc::clone(&self.inner),
+            context: context.clone(),
+            timeout,
+            cancellation,
+            read: None,
+            counts: Rc::clone(&self.counts),
+        })))
+    }
+
+    fn read(
+        &self,
+        context: &WorkerContext,
+        maximum: usize,
+        allocation_size: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        self.counts.direct.set(self.counts.direct.get() + 1);
+        self.inner
+            .read(context, maximum, allocation_size, timeout, cancellation)
+    }
+
+    fn write(
+        &self,
+        context: &WorkerContext,
+        data: BufQueue,
+        flags: ByteEventWriteFlags,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        self.inner
+            .write(context, data, flags, timeout, cancellation)
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.shutdown_write(context)
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close_with_reset(context)
+    }
+
+    fn peer_identity(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<Option<roxygen_transport::byte_stream::PeerIdentity>, HttpError> {
+        self.inner.peer_identity(context)
     }
 
     fn byte_event_capability(

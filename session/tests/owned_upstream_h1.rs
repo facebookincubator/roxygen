@@ -607,6 +607,55 @@ struct Wire {
     error: Option<HttpErrorCode>,
 }
 
+/// The driver reads through the transport's reader when it offers one, with the same outcome as
+/// when it reads through `read`.
+#[test]
+fn owned_h1_upstream_reads_through_the_transport_reader() {
+    let (direct, direct_wire) = owned_get(OK_RESPONSE);
+    let (read, wire, counts) = run_on_host(move |context| {
+        Box::pin(async move {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (scripted, state) = ScriptedTransport::new([
+                ReadAction::WaitData(Arc::clone(&gate), OK_RESPONSE.to_vec()),
+                ReadAction::Eof,
+            ]);
+            let (transport, counts) = ReaderTransport::new(scripted);
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            let (run, read) = futures::join!(session.run(), async {
+                let (_stream, mut source, _control) = submission.await.unwrap().into_source_parts();
+                gate.notify_one();
+                read_response(&mut source).await
+            });
+            let state = state.borrow();
+            (
+                read,
+                Wire {
+                    close: state.close,
+                    error: run.err().map(|error| error.code()),
+                },
+                (counts.direct.get(), counts.reader.get()),
+            )
+        })
+    });
+    assert_eq!(
+        counts,
+        (0, 2),
+        "the response and the EOF are read through the reader"
+    );
+    assert_eq!(read.statuses, direct.statuses);
+    assert_eq!(read.body, direct.body);
+    assert_eq!(read.eom, direct.eom);
+    assert_eq!(read.error, direct.error);
+    assert_eq!(wire.close, direct_wire.close);
+    assert_eq!(wire.error, direct_wire.error);
+}
+
 #[test]
 fn chunked_response_trailers_reach_the_reader() {
     let (read, wire) = owned_get(

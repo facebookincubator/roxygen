@@ -118,13 +118,13 @@ pub use crate::owned::OwnedApplication as OwnedH2Application;
 use crate::owned::OwnedApplication;
 pub use crate::owned::OwnedExchange as OwnedH2Exchange;
 use crate::owned::OwnedExchange;
+use crate::owned::ReadSlot;
 use crate::session::LifecycleEvent;
 use crate::session::LifecycleObserver;
 use crate::session::LifecycleObserverId;
 use crate::shutdown::DrainTrigger;
 use crate::uniplex::UniplexConfig;
 use crate::uniplex::UniplexLifecycleDispatcher;
-use crate::uniplex::UniplexRead;
 use crate::uniplex::UniplexRunSummary;
 use crate::uniplex::UniplexTransport;
 use crate::uniplex::UniplexWriteQueue;
@@ -1211,7 +1211,7 @@ where
     streams: StreamTable<A::Exchange, UPSTREAM>,
     ingress: BufQueue,
     egress: BufQueue,
-    read: Option<LocalTransportFuture<Result<UniplexRead, HttpError>>>,
+    read: ReadSlot,
     write: Option<LocalTransportFuture<Result<WriteInfo, TransportWriteError>>>,
     write_queue: Option<Box<dyn UniplexWriteQueue>>,
     read_wake: Arc<IoWake>,
@@ -1662,6 +1662,13 @@ where
             io.write_timeout,
             write_cancellation.token(),
         )?;
+        // The driver times reads itself (`read_timeout`'s idle slot), so the reader is untimed.
+        let read = ReadSlot::new(
+            transport.as_ref(),
+            &context,
+            Duration::ZERO,
+            cancellation.token(),
+        )?;
         Ok((
             Self {
                 context,
@@ -1696,7 +1703,7 @@ where
                 streams: StreamTable::with_hasher(stream_hash_state()),
                 ingress: BufQueue::new(io.buffer_limit),
                 egress,
-                read: None,
+                read,
                 write: None,
                 write_queue,
                 read_waker: Waker::from(Arc::clone(&read_wake)),
@@ -1897,7 +1904,7 @@ where
                 ran = true;
             }
             // Data or EOF the read phase just observed beats an expiry in the same turn.
-            if timer_fired && self.read.is_some() && self.read_idle_expired() {
+            if timer_fired && self.read.is_reading() && self.read_idle_expired() {
                 self.read_idle_timeout();
                 ran = true;
             }
@@ -1979,7 +1986,7 @@ where
             }
             if self.transport_reset
                 && !self.writes_pending()
-                && self.read.is_none()
+                && !self.read.is_reading()
                 && self.streams.is_empty()
             {
                 return Poll::Ready(Err(self.take_fatal()));
@@ -2215,7 +2222,7 @@ where
         if self.cancellation.request_cancellation() {
             self.read_wake.ready.store(true, Ordering::Release);
         }
-        if self.read.is_some() {
+        if self.read.is_reading() {
             return None;
         }
         Some(
@@ -2257,7 +2264,7 @@ where
 
     /// `None` when an outstanding read was not ready and nothing was polled.
     fn poll_read(&mut self) -> Option<bool> {
-        if self.read.is_none()
+        if !self.read.is_reading()
             && !self.eof
             && self.failure.fatal.is_none()
             && !self.cancelled()
@@ -2270,18 +2277,15 @@ where
                 .maximum_read_size
                 .min(self.ingress.remaining_capacity());
             if maximum != 0 {
-                self.read = Some(
-                    self.transport.read(
-                        &self.context,
-                        maximum,
-                        self.connection
-                            .state
-                            .config
-                            .read_allocation_size
-                            .min(maximum),
-                        Duration::ZERO,
-                        self.cancellation.token(),
-                    ),
+                self.read.start(
+                    self.transport.as_ref(),
+                    &self.context,
+                    maximum,
+                    self.connection
+                        .state
+                        .config
+                        .read_allocation_size
+                        .min(maximum),
                 );
                 self.read_wake.ready.store(true, Ordering::Release);
                 if !self.connection.state.config.read_timeout.is_zero() {
@@ -2289,17 +2293,16 @@ where
                 }
             }
         }
-        let Some(read) = &mut self.read else {
+        if !self.read.is_reading() {
             return Some(false);
-        };
+        }
         if !self.read_wake.take_ready() {
             return None;
         }
         let mut context = Context::from_waker(&self.read_waker);
-        let Poll::Ready(result) = read.as_mut().poll(&mut context) else {
+        let Poll::Ready(result) = self.read.poll(&mut context) else {
             return Some(false);
         };
-        self.read.take();
         match result {
             Ok(read) => {
                 if let Some(observation) = self.connection.state.observation.as_deref() {

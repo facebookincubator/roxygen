@@ -54,6 +54,7 @@ use crate::byte_stream::LocalTransportFuture;
 use crate::byte_stream::OwnedByteStream;
 use crate::byte_stream::OwnedTransportReset;
 use crate::byte_stream::PeerIdentity;
+use crate::byte_stream::PolledReader;
 use crate::byte_stream::QueuedWriter;
 use crate::byte_stream::TransportPanic;
 use crate::byte_stream::TransportRead;
@@ -433,6 +434,13 @@ fn poll_tcp_first(
 #[cfg(test)]
 std::thread_local! {
     static IO_WRITE_FUTURES: Cell<usize> = const { Cell::new(0) };
+    static IO_READ_FUTURES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Boxed `ByteStreamIo::read` futures built on this thread.
+#[cfg(test)]
+pub(crate) fn io_read_futures_for_test() -> usize {
+    IO_READ_FUTURES.with(Cell::get)
 }
 
 /// Boxed `ByteStreamIo::write` futures built on this thread.
@@ -928,6 +936,8 @@ struct TokioIoShared<S> {
     non_abortive_close: Cell<bool>,
     /// An `OwnedWriteQueue` write's state while it is active (`QueuedWriter`).
     queued_write: RefCell<Option<IoWrite>>,
+    /// An `OwnedReader` read's state while it is active (`PolledReader`).
+    polled_read: RefCell<Option<IoRead>>,
 }
 
 // Drop order follows declaration order here and in `TokioIoShared`: the I/O
@@ -956,6 +966,7 @@ impl<S> TokioByteStreamIo<S> {
                 close_wait_waker: RefCell::new(None),
                 non_abortive_close: Cell::new(false),
                 queued_write: RefCell::new(None),
+                polled_read: RefCell::new(None),
             }),
             close_drain,
         }
@@ -980,36 +991,11 @@ where
         maximum: usize,
         allocation_size: usize,
     ) -> LocalTransportFuture<Result<TransportRead, HttpError>> {
+        #[cfg(test)]
+        IO_READ_FUTURES.with(|count| count.set(count.get() + 1));
         let shared = Rc::clone(&self.shared);
-        Box::pin(async move {
-            if let Some(error) = shared.read_error.take() {
-                return Err(error);
-            }
-            let mut read = OwnedRead::new(maximum);
-            let ended = poll_fn(|context| {
-                let mut stream = shared.stream.borrow_mut();
-                let Some(stream) = stream.as_mut() else {
-                    return Poll::Ready(Err(dropped_error()));
-                };
-                stream
-                    .poll_read_owned(context, maximum, allocation_size, &mut read)
-                    .map_err(read_io_error)
-            })
-            .await;
-            let eof = match ended {
-                Ok(eof) => eof,
-                Err(error) if read.is_empty() => return Err(error),
-                // A socket reports a failure once, so the next read returns it
-                // after these bytes, as EOF is deferred (`deferredReadEOF_`).
-                // Folly's `Transport::read` throws instead, so Proxygen never
-                // parses these bytes (`DIV-016`).
-                Err(error) => {
-                    shared.read_error.set(Some(error));
-                    false
-                }
-            };
-            Ok(TransportRead::from_io(read.into_data()?, eof))
-        })
+        let mut read = IoRead::new(maximum, allocation_size);
+        Box::pin(async move { poll_fn(|context| poll_io_read(&shared, context, &mut read)).await })
     }
 
     fn prepare_write_timeout(&self, timeout: Duration) {
@@ -1092,6 +1078,10 @@ where
 
     fn queued_writer(&self) -> Option<Rc<dyn QueuedWriter>> {
         S::WRITE_QUEUE.then(|| Rc::clone(&self.shared) as Rc<dyn QueuedWriter>)
+    }
+
+    fn polled_reader(&self) -> Option<Rc<dyn PolledReader>> {
+        Some(Rc::clone(&self.shared) as Rc<dyn PolledReader>)
     }
 
     fn enable_zero_copy(
@@ -1455,6 +1445,106 @@ where
                 return Poll::Ready(result);
             }
         }
+    }
+}
+
+/// One read's progress through [`poll_io_read`].
+struct IoRead {
+    maximum: usize,
+    allocation_size: usize,
+    /// The gathered bytes, from the first poll on.
+    read: Option<OwnedRead>,
+}
+
+impl IoRead {
+    fn new(maximum: usize, allocation_size: usize) -> Self {
+        Self {
+            maximum,
+            allocation_size,
+            read: None,
+        }
+    }
+}
+
+/// Returns a read error deferred from the previous read, or else gathers at
+/// most `maximum` bytes; an error after gathered bytes is deferred to the next
+/// read (`DIV-016`).
+fn poll_io_read<S>(
+    shared: &TokioIoShared<S>,
+    context: &mut Context<'_>,
+    io: &mut IoRead,
+) -> Poll<Result<TransportRead, HttpError>>
+where
+    S: TokioByteStream,
+{
+    let IoRead {
+        maximum,
+        allocation_size,
+        read,
+    } = io;
+    let gathered = match read {
+        Some(read) => read,
+        None => {
+            if let Some(error) = shared.read_error.take() {
+                return Poll::Ready(Err(error));
+            }
+            read.insert(OwnedRead::new(*maximum))
+        }
+    };
+    let ended = {
+        let mut stream = shared.stream.borrow_mut();
+        match stream.as_mut() {
+            Some(stream) => {
+                ready!(stream.poll_read_owned(context, *maximum, *allocation_size, gathered))
+                    .map_err(read_io_error)
+            }
+            None => Err(dropped_error()),
+        }
+    };
+    let read = read.take().expect("a polled read holds its gathered bytes");
+    let eof = match ended {
+        Ok(eof) => eof,
+        Err(error) if read.is_empty() => return Poll::Ready(Err(error)),
+        // A socket reports a failure once, so the next read returns it
+        // after these bytes, as EOF is deferred (`deferredReadEOF_`).
+        // Folly's `Transport::read` throws instead, so Proxygen never
+        // parses these bytes (`DIV-016`).
+        Err(error) => {
+            shared.read_error.set(Some(error));
+            false
+        }
+    };
+    Poll::Ready(
+        read.into_data()
+            .map(|data| TransportRead::from_io(data, eof)),
+    )
+}
+
+impl<S> PolledReader for TokioIoShared<S>
+where
+    S: TokioByteStream,
+{
+    fn start_read(&self, maximum: usize, allocation_size: usize) {
+        let replaced = self
+            .polled_read
+            .replace(Some(IoRead::new(maximum, allocation_size)));
+        assert!(replaced.is_none(), "a polled read ended before the next");
+    }
+
+    fn poll_read(&self, context: &mut Context<'_>) -> Poll<Result<TransportRead, HttpError>> {
+        let polled = {
+            let mut read = self.polled_read.borrow_mut();
+            let read = read.as_mut().expect("a polled read is active");
+            poll_io_read(self, context, read)
+        };
+        if polled.is_ready() {
+            drop(self.polled_read.take());
+        }
+        polled
+    }
+
+    fn retire_read(&self) {
+        drop(self.polled_read.take());
     }
 }
 

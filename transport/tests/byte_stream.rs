@@ -3832,4 +3832,401 @@ mod byte_stream {
             });
         }
     }
+
+    mod owned_reader {
+        use std::future::poll_fn;
+
+        use super::*;
+        use crate::byte_stream::read_deadline_batons_for_test;
+
+        #[test]
+        fn owned_reader_is_offered_only_untimed() {
+            run_worker(|context| async move {
+                let (transport, _control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                assert!(
+                    transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .is_some(),
+                    "an untimed owned byte stream offers its poll-based reader",
+                );
+                assert!(
+                    transport
+                        .reader(&context, Duration::from_secs(5), CancellationToken::never())
+                        .unwrap()
+                        .is_none(),
+                    "a read timeout keeps the read API, which times each read",
+                );
+                transport.close(&context).unwrap();
+            });
+        }
+
+        #[test]
+        fn owned_reader_reads_bytes_then_a_deferred_eof() {
+            run_worker(|context| async move {
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                reader.start_read(1_024, 1_024).unwrap();
+                assert!(
+                    transport.has_pending_read(&context).unwrap(),
+                    "a started read is registered with the transport",
+                );
+                assert!(
+                    reader
+                        .poll_read(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                control.feed(queue(&[b"ab"], 2), true);
+                let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                assert_eq!(flatten(read.data()), b"ab");
+                assert!(
+                    !read.is_eof(),
+                    "an EOF that arrives with bytes is deferred to the next read",
+                );
+                assert!(!transport.has_pending_read(&context).unwrap());
+                reader.start_read(1_024, 1_024).unwrap();
+                let eof = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                assert!(eof.is_eof());
+                assert_eq!(eof.bytes_read(), 0);
+                assert_eq!(
+                    control.reads_started(),
+                    1,
+                    "the deferred EOF needs no backend read"
+                );
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// `start_read` has `read`'s entry results and clamps: the read offered to the backend,
+        /// an empty read for a zero maximum, a zero allocation size refused, and a read refused
+        /// while another is pending.
+        #[test]
+        fn owned_reader_reads_keep_reads_entry_results_and_clamps() {
+            run_worker(|context| async move {
+                // `transport` caps reads at a 131_072-byte maximum_read_size.
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                for (maximum, allocation_size) in [(8_192, 1_024), (100, 4_000), (200_000, 4_000)] {
+                    control.feed(queue(&[b"x"], 1), false);
+                    reader.start_read(maximum, allocation_size).unwrap();
+                    let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                    assert_eq!(flatten(read.data()), b"x");
+                }
+                assert_eq!(
+                    control.read_sizes(),
+                    vec![(8_192, 1_024), (100, 100), (131_072, 4_000)],
+                    "the backend receives the maximum clamped to the limit and the allocation \
+                     size clamped to that maximum",
+                );
+
+                reader.start_read(0, 0).unwrap();
+                let empty = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                assert_eq!(empty.bytes_read(), 0);
+                assert!(!empty.is_eof());
+                assert_eq!(control.reads_started(), 3, "a zero maximum reads nothing");
+
+                reader.start_read(1_024, 0).unwrap();
+                assert_eq!(
+                    poll_fn(|context| reader.poll_read(context))
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    HttpErrorCode::INVALID_STATE_TRANSITION,
+                );
+
+                let mut pending = transport.read(
+                    &context,
+                    1_024,
+                    1_024,
+                    Duration::ZERO,
+                    CancellationToken::never(),
+                );
+                assert!(poll_once(pending.as_mut()).is_pending());
+                reader.start_read(1_024, 1_024).unwrap();
+                assert_eq!(
+                    poll_fn(|context| reader.poll_read(context))
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    HttpErrorCode::INVALID_STATE_TRANSITION,
+                    "a read is refused while another is pending",
+                );
+                assert_eq!(control.reads_started(), 4);
+                drop(pending);
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// Starting a read while one is started, or polling without one, is refused and changes
+        /// nothing.
+        #[test]
+        fn owned_reader_refuses_misuse() {
+            run_worker(|context| async move {
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                let Poll::Ready(Err(error)) =
+                    reader.poll_read(&mut Context::from_waker(Waker::noop()))
+                else {
+                    panic!("polling a reader with no started read is refused");
+                };
+                assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+
+                reader.start_read(1_024, 1_024).unwrap();
+                assert_eq!(
+                    reader.start_read(1_024, 1_024).unwrap_err().code(),
+                    HttpErrorCode::INVALID_STATE_TRANSITION,
+                    "a second read cannot start before the first is returned",
+                );
+                control.feed(queue(&[b"ok"], 2), false);
+                let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                assert_eq!(flatten(read.data()), b"ok");
+                assert_eq!(
+                    control.reads_started(),
+                    1,
+                    "the refused start began no read"
+                );
+
+                reader.start_read(0, 0).unwrap();
+                assert_eq!(
+                    reader.start_read(1_024, 1_024).unwrap_err().code(),
+                    HttpErrorCode::INVALID_STATE_TRANSITION,
+                    "a read that finished at entry is started until it is returned",
+                );
+                let empty = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                assert_eq!(empty.bytes_read(), 0);
+                assert_eq!(control.reads_started(), 1);
+                transport.close(&context).unwrap();
+            });
+        }
+
+        #[test]
+        fn a_pending_owned_reader_read_arms_no_deadline_baton() {
+            run_worker(|context| async move {
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                let batons = read_deadline_batons_for_test();
+                reader.start_read(1_024, 1_024).unwrap();
+                assert!(
+                    reader
+                        .poll_read(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                control.feed(queue(&[b"ok"], 2), false);
+                poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                assert_eq!(
+                    read_deadline_batons_for_test(),
+                    batons,
+                    "an untimed reader read builds no per-read deadline",
+                );
+
+                // Control: the read API builds one deadline per read.
+                control.feed(queue(&[b"ok"], 2), false);
+                transport
+                    .read(
+                        &context,
+                        1_024,
+                        1_024,
+                        Duration::ZERO,
+                        CancellationToken::never(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(read_deadline_batons_for_test(), batons + 1);
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// Cancelling a pending read wakes its task, as the read API's wait does, and the read
+        /// fails with `CORO_CANCELLED`; bytes that arrived first still win; a cancelled token
+        /// refuses a read at entry.
+        #[test]
+        fn owned_reader_cancellation_wakes_and_fails_the_pending_read() {
+            run_worker(|context| async move {
+                let owner = std::thread::current().id();
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                let cancel = CancellationSource::new();
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, cancel.token())
+                    .unwrap()
+                    .unwrap();
+                reader.start_read(1_024, 1_024).unwrap();
+                let signal = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&signal));
+                assert!(
+                    reader
+                        .poll_read(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                cancel.request_cancellation();
+                assert!(signal.take(), "cancelling a pending read wakes its task");
+                let Poll::Ready(Err(error)) = reader.poll_read(&mut Context::from_waker(&waker))
+                else {
+                    panic!("the woken read observes its cancellation");
+                };
+                assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+                assert!(!transport.has_pending_read(&context).unwrap());
+                assert_eq!(
+                    control.actions(),
+                    vec![IoAction::CancelRead(HttpErrorCode::CORO_CANCELLED, owner)],
+                );
+                reader.start_read(1_024, 1_024).unwrap();
+                assert_eq!(
+                    poll_fn(|context| reader.poll_read(context))
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    HttpErrorCode::CORO_CANCELLED,
+                    "a cancelled reader refuses a read at entry",
+                );
+                assert_eq!(control.reads_started(), 1);
+
+                let partial = CancellationSource::new();
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, partial.token())
+                    .unwrap()
+                    .unwrap();
+                reader.start_read(2, 2).unwrap();
+                assert!(
+                    reader
+                        .poll_read(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                control.feed(queue(&[b"ok"], 2), false);
+                partial.request_cancellation();
+                let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                assert_eq!(flatten(read.data()), b"ok", "bytes that arrived first win");
+                assert_eq!(
+                    control.actions().len(),
+                    1,
+                    "a read that returns bytes cancels nothing"
+                );
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// A reset or a graceful close ends a pending reader read, wakes it, and cancels the
+        /// backend read, as for the read API.
+        #[test]
+        fn owned_reader_close_and_reset_end_the_pending_read() {
+            run_worker(|context| async move {
+                let owner = std::thread::current().id();
+                for graceful in [false, true] {
+                    let (transport, control) =
+                        transport(&context, ByteEventCapability::Unsupported, None);
+                    let mut reader = transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    reader.start_read(1_024, 1_024).unwrap();
+                    let signal = Arc::new(WakeSignal::default());
+                    let waker = Waker::from(Arc::clone(&signal));
+                    assert!(
+                        reader
+                            .poll_read(&mut Context::from_waker(&waker))
+                            .is_pending()
+                    );
+                    if graceful {
+                        transport.close(&context).unwrap();
+                    } else {
+                        transport.close_with_reset(&context).unwrap();
+                    }
+                    assert!(
+                        signal.take(),
+                        "closing the transport wakes the pending read"
+                    );
+                    let Poll::Ready(result) = reader.poll_read(&mut Context::from_waker(&waker))
+                    else {
+                        panic!("the woken read observes the close");
+                    };
+                    if graceful {
+                        assert!(
+                            result.unwrap().is_eof(),
+                            "a graceful close ends the read at EOF"
+                        );
+                        assert_eq!(
+                            control.actions(),
+                            vec![
+                                IoAction::CancelRead(HttpErrorCode::TRANSPORT_EOF, owner),
+                                IoAction::Close(owner),
+                            ],
+                        );
+                    } else {
+                        assert_eq!(
+                            result.unwrap_err().code(),
+                            HttpErrorCode::TRANSPORT_READ_ERROR
+                        );
+                        assert_eq!(
+                            control.actions(),
+                            vec![
+                                IoAction::CancelRead(HttpErrorCode::TRANSPORT_READ_ERROR, owner),
+                                IoAction::Reset(owner),
+                            ],
+                        );
+                    }
+                    assert!(!transport.has_pending_read(&context).unwrap());
+                }
+            });
+        }
+
+        /// Dropping a reader cancels its pending read, as dropping a read future does, so a
+        /// later read can start.
+        #[test]
+        fn dropping_an_owned_reader_cancels_its_pending_read() {
+            run_worker(|context| async move {
+                let owner = std::thread::current().id();
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                reader.start_read(1_024, 1_024).unwrap();
+                assert!(
+                    reader
+                        .poll_read(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                drop(reader);
+                assert!(
+                    !transport.has_pending_read(&context).unwrap(),
+                    "the dropped reader's read is unregistered",
+                );
+                assert_eq!(
+                    control.actions(),
+                    vec![IoAction::CancelRead(HttpErrorCode::CORO_CANCELLED, owner)],
+                );
+                control.feed(queue(&[b"ok"], 2), false);
+                let read = transport
+                    .read(
+                        &context,
+                        1_024,
+                        1_024,
+                        Duration::ZERO,
+                        CancellationToken::never(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(flatten(read.data()), b"ok");
+                transport.close(&context).unwrap();
+            });
+        }
+    }
 }

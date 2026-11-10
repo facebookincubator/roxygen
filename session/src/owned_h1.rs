@@ -95,8 +95,8 @@ use roxygen_transport::byte_stream::WriteInfo;
 
 use crate::owned::OwnedApplication;
 use crate::owned::OwnedExchange;
+use crate::owned::ReadSlot;
 use crate::uniplex::UniplexConfig;
-use crate::uniplex::UniplexRead;
 use crate::uniplex::UniplexRunSummary;
 use crate::uniplex::UniplexTransport;
 use crate::uniplex::UniplexWriteQueue;
@@ -611,7 +611,7 @@ struct Driver<A: OwnedApplication> {
     exchange: Option<Box<Exchange<A::Exchange>>>,
     ingress: BufQueue,
     egress: BufQueue,
-    read: Option<LocalTransportFuture<Result<UniplexRead, HttpError>>>,
+    read: ReadSlot,
     write: Option<LocalTransportFuture<Result<WriteInfo, TransportWriteError>>>,
     write_queue: Option<Box<dyn UniplexWriteQueue>>,
     task: Arc<TaskWaker>,
@@ -904,6 +904,12 @@ impl<A: OwnedApplication> Driver<A> {
             io.write_timeout,
             write_cancellation.token(),
         )?;
+        let read = ReadSlot::new(
+            transport.as_ref(),
+            &context,
+            io.read_timeout,
+            cancellation.token(),
+        )?;
         let mut codec = Http1xCodec::with_options(
             TransportDirection::Downstream,
             false,
@@ -924,7 +930,7 @@ impl<A: OwnedApplication> Driver<A> {
                 exchange: None,
                 ingress: BufQueue::new(io.buffer_limit),
                 egress: BufQueue::new(io.buffer_limit),
-                read: None,
+                read,
                 write: None,
                 write_queue,
                 task,
@@ -1057,7 +1063,7 @@ impl<A: OwnedApplication> Driver<A> {
             }
             if self.transport_reset
                 && !self.writes_pending()
-                && self.read.is_none()
+                && !self.read.is_reading()
                 && self.exchange.is_none()
             {
                 return Poll::Ready(Err(self
@@ -1147,7 +1153,7 @@ impl<A: OwnedApplication> Driver<A> {
             || (self.fatal.is_none() && self.stream_wake.is_ready())
             || (!self.transport_reset && cancel_requested(&self.control, &self.context))
             || (self.control.drain.get() && !self.draining && self.fatal.is_none())
-            || (self.read.is_none() && self.read_capacity() != 0)
+            || (!self.read.is_reading() && self.read_capacity() != 0)
             || self.parse_due()
             || (self.read_error.is_some() && !self.holds_read_error())
             || (self.fatal.is_none() && self.retire_due())
@@ -1643,28 +1649,25 @@ impl<A: OwnedApplication> Driver<A> {
 
     /// `None` when no read was outstanding to poll.
     fn poll_read_once(&mut self) -> Option<ReadPoll> {
-        if self.read.is_none() {
+        if !self.read.is_reading() {
             let maximum = self.read_capacity();
             if maximum != 0 {
-                self.read = Some(self.transport.read(
+                self.read.start(
+                    self.transport.as_ref(),
                     &self.context,
                     maximum,
                     self.config.read_allocation_size.min(maximum),
-                    self.config.read_timeout,
-                    self.cancellation.token(),
-                ));
+                );
                 self.read_wake.mark();
             }
         }
-        let read = self.read.as_mut()?;
-        if !self.read_wake.take_ready() {
+        if !self.read.is_reading() || !self.read_wake.take_ready() {
             return None;
         }
         let mut context = Context::from_waker(&self.read_waker);
-        let Poll::Ready(result) = read.as_mut().poll(&mut context) else {
+        let Poll::Ready(result) = self.read.poll(&mut context) else {
             return Some(ReadPoll::Pending);
         };
-        self.read.take();
         match result {
             Ok(read) if read.bytes_read() == 0 && !read.is_eof() => return Some(ReadPoll::Empty),
             Ok(read) => {
@@ -1879,7 +1882,7 @@ impl<A: OwnedApplication> Driver<A> {
         if self.cancellation.request_cancellation() {
             self.read_wake.mark();
         }
-        if self.read.is_some() {
+        if self.read.is_reading() {
             return None;
         }
         let shutdown = self

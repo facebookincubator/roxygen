@@ -1004,6 +1004,45 @@ fn owned_h1_serves_a_get_on_a_manual_host() {
     assert!(probe.cancelled.is_empty());
 }
 
+/// The driver reads through the transport's reader when it offers one, and writes the same
+/// wire as when it reads through `read`.
+#[test]
+fn owned_h1_reads_through_the_transport_reader() {
+    let reads = || {
+        vec![
+            ReadAction::Data(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec()),
+            ReadAction::Eof,
+        ]
+    };
+    let responses = vec![Response::fixed(200, b"hello")];
+    let (direct, _) = owned_wire(reads(), responses.clone());
+    let (wire, counts) = run_on_host(move |context| {
+        Box::pin(async move {
+            let (scripted, state) = ScriptedTransport::new(reads());
+            let (transport, counts) = ReaderTransport::new(scripted);
+            let (application, _probes) = H1App::new(responses);
+            let (session, _handle) =
+                OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+            let result = session.run().await;
+            (
+                wire_of(&state, result),
+                (counts.direct.get(), counts.reader.get()),
+            )
+        })
+    });
+    assert_eq!(
+        counts,
+        (0, 2),
+        "the request and the EOF are read through the reader"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&wire.output),
+        String::from_utf8_lossy(&direct.output)
+    );
+    assert_eq!(wire.close, direct.close);
+    assert_eq!(wire.error, direct.error);
+}
+
 /// `count` keep-alive GETs in one read; the last one asks to close the connection.
 fn pipelined_gets(count: usize) -> Vec<u8> {
     (0..count)

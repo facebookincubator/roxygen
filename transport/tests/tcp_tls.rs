@@ -7465,7 +7465,7 @@ mod tcp_tls {
 
         /// Runs `test` on a worker with an accepted TCP transport bounded by `limits` and the
         /// connecting peer's Tokio stream.
-        fn with_accepted_tcp<F, Fut>(limits: ByteStreamLimits, test: F)
+        pub(super) fn with_accepted_tcp<F, Fut>(limits: ByteStreamLimits, test: F)
         where
             F: FnOnce(WorkerContext, OwnedByteStream, TcpStream) -> Fut + Send + 'static,
             Fut: Future<Output = ()> + 'static,
@@ -8123,6 +8123,248 @@ mod tcp_tls {
                     peer.read_to_end(&mut drained).await.unwrap_err().kind(),
                     io::ErrorKind::ConnectionReset,
                 );
+            });
+        }
+    }
+
+    mod owned_reader {
+        use super::*;
+        use crate::tcp::io_read_futures_for_test;
+        use crate::tcp_tls_tests::tcp_tls::native_write_queue::with_accepted_tcp;
+
+        #[test]
+        fn tcp_reader_reads_build_no_io_read_future() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                let futures = io_read_futures_for_test();
+                for chunk in [&b"one "[..], b"two "] {
+                    peer.write_all(chunk).await.unwrap();
+                    reader.start_read(64, 64).unwrap();
+                    let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                    assert_eq!(read_bytes(read), chunk);
+                }
+                assert_eq!(
+                    io_read_futures_for_test(),
+                    futures,
+                    "reader reads keep their I/O state in the backend, not in a boxed future",
+                );
+                // Control: the read API builds one I/O future per read.
+                peer.write_all(b"six ").await.unwrap();
+                let read = transport
+                    .read(&context, 64, 64, Duration::ZERO, CancellationToken::never())
+                    .await
+                    .unwrap();
+                assert_eq!(read_bytes(read), b"six ");
+                assert_eq!(io_read_futures_for_test(), futures + 1);
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// A reader read that ends unfinished, dropped or cancelled, releases its backend state,
+        /// so the next read starts clean.
+        #[test]
+        fn an_unfinished_tcp_reader_read_releases_its_backend_state() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                for cancel in [false, true] {
+                    let source = CancellationSource::new();
+                    let mut reader = transport
+                        .reader(&context, Duration::ZERO, source.token())
+                        .unwrap()
+                        .unwrap();
+                    reader.start_read(64, 64).unwrap();
+                    assert!(
+                        reader
+                            .poll_read(&mut Context::from_waker(Waker::noop()))
+                            .is_pending()
+                    );
+                    if cancel {
+                        source.request_cancellation();
+                        assert_eq!(
+                            poll_fn(|context| reader.poll_read(context))
+                                .await
+                                .unwrap_err()
+                                .code(),
+                            HttpErrorCode::CORO_CANCELLED,
+                        );
+                    }
+                    drop(reader);
+                    let mut reader = transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    peer.write_all(b"next").await.unwrap();
+                    reader.start_read(64, 64).unwrap();
+                    let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                    assert_eq!(read_bytes(read), b"next", "cancelled: {cancel}");
+                }
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// `DIV-016` through a reader: the bytes queued before a TCP reset come first although
+        /// the read's continuation poll met the reset, the next read reports the reset once,
+        /// and the one after is EOF.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn tcp_reader_returns_bytes_before_a_later_reset() {
+            Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(LocalSet::new().run_until(async move {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let peer = TcpStream::connect(listener.local_addr().unwrap())
+                        .await
+                        .unwrap();
+                    let (accepted, _) = listener.accept().await.unwrap();
+                    let accepted = accepted.into_std().unwrap();
+                    let observer = accepted.try_clone().unwrap();
+                    let (worker, driver) = WorkerDriver::new(8).unwrap();
+                    let call = worker
+                        .call_local(move |context| async move {
+                            let transport = TcpTransport::from_accepted(
+                                &context,
+                                accepted,
+                                ByteStreamLimits::new(8_000, 1024, 8).unwrap(),
+                            )
+                            .unwrap();
+                            let burst = pattern(1_000, 9);
+                            let mut peer = peer;
+                            peer.write_all(&burst).await.unwrap();
+                            #[expect(deprecated, reason = "Tokio's only linger-zero reset setter")]
+                            let linger = peer.set_linger(Some(Duration::ZERO));
+                            linger.unwrap();
+                            drop(peer);
+                            TcpStream::from_std(observer)
+                                .unwrap()
+                                .ready(Interest::ERROR)
+                                .await
+                                .unwrap();
+                            let mut reader = transport
+                                .reader(&context, Duration::ZERO, CancellationToken::never())
+                                .unwrap()
+                                .unwrap();
+                            reader.start_read(8_000, 1_000).unwrap();
+                            let first = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                            assert!(!first.is_eof());
+                            assert!(
+                                read_bytes(first) == burst,
+                                "the bytes queued before the reset come first",
+                            );
+                            reader.start_read(8_000, 1_000).unwrap();
+                            let error = poll_fn(|context| reader.poll_read(context))
+                                .await
+                                .unwrap_err();
+                            assert_eq!(error.code(), HttpErrorCode::TRANSPORT_READ_ERROR);
+                            let cause =
+                                error.source().unwrap().downcast_ref::<io::Error>().unwrap();
+                            assert_eq!(cause.kind(), io::ErrorKind::ConnectionReset);
+                            reader.start_read(8_000, 1_000).unwrap();
+                            assert!(
+                                poll_fn(|context| reader.poll_read(context))
+                                    .await
+                                    .unwrap()
+                                    .is_eof(),
+                                "the socket reports the reset only once",
+                            );
+                            transport.close_with_reset(&context).unwrap();
+                        })
+                        .unwrap();
+                    let driver_task = tokio::task::spawn_local(driver);
+                    time::timeout(Duration::from_secs(5), call)
+                        .await
+                        .expect("reader reads after a TCP reset remain bounded")
+                        .unwrap();
+                    worker.begin_shutdown();
+                    driver_task.await.unwrap();
+                }));
+        }
+
+        /// Reader reads are bounded by the maximum, keep every byte, and end at EOF, as
+        /// `read`'s do.
+        #[test]
+        fn tcp_reader_reads_keep_their_sizes_bytes_and_eof() {
+            // As `allocation_sized_reads_preserve_bytes_and_eof`: a 7-byte allocation size and
+            // a 64-byte maximum read a 1_000-byte payload in fifteen 64-byte reads and a 40-byte
+            // one.
+            Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(LocalSet::new().run_until(async move {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+                        .await
+                        .unwrap();
+                    let (accepted, _) = listener.accept().await.unwrap();
+                    let payload = pattern(1_000, 3);
+                    peer.write_all(&payload).await.unwrap();
+                    peer.shutdown().await.unwrap();
+                    let mut queued = vec![0; payload.len()];
+                    while accepted.peek(&mut queued).await.unwrap() < payload.len() {
+                        tokio::task::yield_now().await;
+                    }
+                    let accepted = accepted.into_std().unwrap();
+                    let (worker, driver) = WorkerDriver::new(8).unwrap();
+                    let call = worker
+                        .call_local(move |context| async move {
+                            let transport =
+                                TcpTransport::from_accepted(&context, accepted, limits()).unwrap();
+                            let mut reader = transport
+                                .reader(&context, Duration::ZERO, CancellationToken::never())
+                                .unwrap()
+                                .unwrap();
+                            let mut received = Vec::new();
+                            let mut sizes = Vec::new();
+                            loop {
+                                reader.start_read(64, 7).unwrap();
+                                let read =
+                                    poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                                if read.is_eof() {
+                                    assert_eq!(read.bytes_read(), 0, "EOF follows the last bytes");
+                                    break;
+                                }
+                                sizes.push(read.bytes_read());
+                                received.extend(read_bytes(read));
+                            }
+                            assert!(received == payload);
+                            assert_eq!(sizes, [vec![64; 15], vec![40]].concat());
+                            transport.close(&context).unwrap();
+                        })
+                        .unwrap();
+                    let driver_task = tokio::task::spawn_local(driver);
+                    time::timeout(Duration::from_secs(5), call)
+                        .await
+                        .expect("TCP reader reads to EOF remain bounded")
+                        .unwrap();
+                    worker.begin_shutdown();
+                    driver_task.await.unwrap();
+                    drop(peer);
+                }));
+        }
+
+        /// `DIV-018` through a reader: a TCP reader read's first buffer has the allocation size's
+        /// capacity, as `read`'s does.
+        #[test]
+        fn tcp_reader_read_first_buffer_has_the_allocation_size() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                peer.write_all(b"abc").await.unwrap();
+                reader.start_read(64, 7).unwrap();
+                let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                assert_eq!(
+                    read.data().backing_capacity_upper_bound(),
+                    Some(7),
+                    "the 3 bytes arrive in the 7-byte first buffer",
+                );
+                assert_eq!(read_bytes(read), b"abc");
+                transport.close(&context).unwrap();
             });
         }
     }

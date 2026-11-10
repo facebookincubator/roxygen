@@ -2,6 +2,8 @@
 
 use std::task::Context;
 use std::task::Poll;
+use std::task::ready;
+use std::time::Duration;
 use std::time::Instant;
 
 use roxygen_core::error::HttpError;
@@ -12,6 +14,13 @@ use roxygen_core::ingress_completion::IngressCompletion;
 use roxygen_core::message::HttpMessage;
 use roxygen_core::stream_source::HttpIngressBody;
 use roxygen_core::stream_source::HttpStreamSourceOwner;
+use roxygen_runtime::cancellation::CancellationToken;
+use roxygen_runtime::worker::WorkerContext;
+use roxygen_transport::byte_stream::LocalTransportFuture;
+
+use crate::uniplex::UniplexRead;
+use crate::uniplex::UniplexReader;
+use crate::uniplex::UniplexTransport;
 
 /// An application exchange remains owned until ingress consumption, application
 /// body retirement, and physical write completion have all been observed, except where a
@@ -93,4 +102,85 @@ pub trait OwnedResponseObserver: 'static {
 
     /// Consumes the observer before applying producer completion or deadline policy.
     fn response_complete(self: Box<Self>, completed: Result<Instant, HttpError>);
+}
+
+/// An owned driver's read: through the transport's [`UniplexReader`] when it offers one, else
+/// through one `UniplexTransport::read` future per read.
+pub(crate) struct ReadSlot {
+    reader: Option<Box<dyn UniplexReader>>,
+    timeout: Duration,
+    cancellation: CancellationToken,
+    read: Option<SlotRead>,
+}
+
+/// A started read.
+enum SlotRead {
+    Future(LocalTransportFuture<Result<UniplexRead, HttpError>>),
+    /// The reader's started read.
+    Reader,
+}
+
+impl ReadSlot {
+    /// Acquires `transport`'s reader for reads with `timeout` and `cancellation`.
+    pub(crate) fn new(
+        transport: &dyn UniplexTransport,
+        context: &WorkerContext,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<Self, HttpError> {
+        Ok(Self {
+            reader: transport.try_reader(context, timeout, cancellation.clone())?,
+            timeout,
+            cancellation,
+            read: None,
+        })
+    }
+
+    /// Whether a started read has not yet been returned by `poll`.
+    pub(crate) fn is_reading(&self) -> bool {
+        self.read.is_some()
+    }
+
+    /// Starts a read of at most `maximum` bytes that first offers `allocation_size` bytes.
+    pub(crate) fn start(
+        &mut self,
+        transport: &dyn UniplexTransport,
+        context: &WorkerContext,
+        maximum: usize,
+        allocation_size: usize,
+    ) {
+        self.read = Some(match &mut self.reader {
+            Some(reader) => {
+                reader
+                    .start_read(maximum, allocation_size)
+                    .expect("a driver starts a read only when none is started");
+                SlotRead::Reader
+            }
+            None => SlotRead::Future(transport.read(
+                context,
+                maximum,
+                allocation_size,
+                self.timeout,
+                self.cancellation.clone(),
+            )),
+        });
+    }
+
+    /// Polls the started read; `Ready` returns it.
+    pub(crate) fn poll(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<UniplexRead, HttpError>> {
+        let result = match self.read.as_mut().expect("a polled read was started") {
+            SlotRead::Future(future) => ready!(future.as_mut().poll(context)),
+            SlotRead::Reader => ready!(
+                self.reader
+                    .as_mut()
+                    .expect("a reader read keeps its reader")
+                    .poll_read(context)
+            ),
+        };
+        self.read = None;
+        Poll::Ready(result)
+    }
 }

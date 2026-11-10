@@ -890,6 +890,57 @@ fn terminal_head_and_small_bodies_round_trip_over_fragmented_ingress() {
     }
 }
 
+/// The driver reads through the transport's reader when it offers one, and writes the same bytes
+/// as when it reads through `read`.
+#[test]
+fn owned_h2_reads_through_the_transport_reader() {
+    let serve = |reader: bool| {
+        run_on_worker(move |context| {
+            Box::pin(async move {
+                let input = peer_request_bytes(
+                    HttpMethod::Post,
+                    &vec![b'q'; 1024],
+                    None,
+                    PeerControl::None,
+                );
+                let reads = input
+                    .chunks(7)
+                    .map(|chunk| FixtureRead::Data(chunk.to_vec()))
+                    .chain([FixtureRead::DataEof(Vec::new())]);
+                let (fixture, state) = FixtureTransport::new(reads);
+                let read_count = input.chunks(7).count() + 1;
+                let (transport, counts): (Rc<dyn UniplexTransport>, _) = if reader {
+                    let (transport, counts) = crate::uniplex_tests::ReaderTransport::new(fixture);
+                    (transport, Some(counts))
+                } else {
+                    (fixture, None)
+                };
+                let (application, probes) = Application::new(vec![Reply::Body(1024)]);
+                let (session, _) =
+                    OwnedH2Session::new(application, options(context, transport)).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), session.run())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(probes.borrow()[0].completed.get(), 1);
+                let counts = counts.map(|counts| (counts.direct.get(), counts.reader.get()));
+                (state.borrow().writes.concat(), counts, read_count)
+            })
+        })
+    };
+    let (direct, _, _) = serve(false);
+    let (through_reader, counts, read_count) = serve(true);
+    assert_eq!(
+        counts,
+        Some((0, read_count)),
+        "every read goes through the reader"
+    );
+    assert!(
+        through_reader == direct,
+        "the reader path writes the same bytes"
+    );
+}
+
 #[test]
 fn held_write_allows_bounded_body_progress_without_completing_the_exchange() {
     run_on_worker(|context| {

@@ -1182,7 +1182,7 @@ struct UpstreamDriver {
     exchange: Option<Box<Exchange>>,
     ingress: BufQueue,
     egress: BufQueue,
-    read: Option<LocalTransportFuture<Result<UniplexRead, HttpError>>>,
+    read: ReadSlot,
     write: Option<LocalTransportFuture<Result<WriteInfo, TransportWriteError>>>,
     write_queue: Option<Box<dyn UniplexWriteQueue>>,
     task: Arc<TaskWaker>,
@@ -1406,6 +1406,12 @@ impl UpstreamDriver {
             io.write_timeout,
             write_cancellation.token(),
         )?;
+        let read = ReadSlot::new(
+            transport.as_ref(),
+            &context,
+            io.read_timeout,
+            cancellation.token(),
+        )?;
         let mut codec =
             Http1xCodec::with_options(TransportDirection::Upstream, false, http1.strict_validation);
         let ordinary_upgrades = http1.upgrade_policy == Http1UpgradePolicy::AsOrdinaryRequest;
@@ -1421,7 +1427,7 @@ impl UpstreamDriver {
                 exchange: None,
                 ingress: BufQueue::new(io.buffer_limit),
                 egress: BufQueue::new(io.buffer_limit),
-                read: None,
+                read,
                 write: None,
                 write_queue,
                 task,
@@ -1548,7 +1554,7 @@ impl UpstreamDriver {
             }
             if self.transport_reset
                 && !self.writes_pending()
-                && self.read.is_none()
+                && !self.read.is_reading()
                 && self.exchange.is_none()
             {
                 return Poll::Ready(Err(self
@@ -1652,7 +1658,7 @@ impl UpstreamDriver {
                     Some(exchange) => exchange.cancel_requested(),
                     None => self.shared.cancelled(),
                 })
-            || (self.read.is_none() && self.read_capacity() != 0)
+            || (!self.read.is_reading() && self.read_capacity() != 0)
             || (self.fatal.is_none()
                 && (self.admission_due() || (!self.ingress.is_empty() && self.exchange.is_none())))
             || self.parse_due()
@@ -2224,28 +2230,25 @@ impl UpstreamDriver {
     }
 
     fn poll_read_once(&mut self) -> Option<ReadPoll> {
-        if self.read.is_none() {
+        if !self.read.is_reading() {
             let maximum = self.read_capacity();
             if maximum != 0 {
-                self.read = Some(self.transport.read(
+                self.read.start(
+                    self.transport.as_ref(),
                     &self.context,
                     maximum,
                     self.config.read_allocation_size.min(maximum),
-                    self.config.read_timeout,
-                    self.cancellation.token(),
-                ));
+                );
                 self.read_wake.mark();
             }
         }
-        let read = self.read.as_mut()?;
-        if !self.read_wake.take_ready() {
+        if !self.read.is_reading() || !self.read_wake.take_ready() {
             return None;
         }
         let mut context = Context::from_waker(&self.read_waker);
-        let Poll::Ready(result) = read.as_mut().poll(&mut context) else {
+        let Poll::Ready(result) = self.read.poll(&mut context) else {
             return Some(ReadPoll::Pending);
         };
-        self.read.take();
         match result {
             Ok(read) if read.bytes_read() == 0 && !read.is_eof() => return Some(ReadPoll::Empty),
             Ok(read) => {
@@ -2383,7 +2386,7 @@ impl UpstreamDriver {
         if self.cancellation.request_cancellation() {
             self.read_wake.mark();
         }
-        if self.read.is_some() {
+        if self.read.is_reading() {
             return None;
         }
         Some(

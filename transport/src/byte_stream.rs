@@ -12,6 +12,7 @@ use std::rc::Weak;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
+use std::task::ready;
 use std::thread::ThreadId;
 use std::time::Duration;
 use std::time::Instant;
@@ -361,6 +362,94 @@ pub trait ByteStreamTransport: 'static {
     ) -> Result<Option<OwnedWriteQueue>, HttpError> {
         Ok(None)
     }
+
+    /// Acquires the transport's poll-based reader, which is untimed, so it is
+    /// offered only for a zero `timeout`. `None` keeps the read API, including
+    /// its timeout.
+    fn reader(
+        &self,
+        _context: &WorkerContext,
+        _timeout: Duration,
+        _cancellation: CancellationToken,
+    ) -> Result<Option<OwnedReader>, HttpError> {
+        Ok(None)
+    }
+}
+
+/// The poll-based reader of an [`OwnedByteStream`] ([`ByteStreamTransport::reader`]),
+/// through which the owned uniplex drivers read instead of with one read future
+/// per read.
+///
+/// It starts one read at a time. Each read has `read`'s entry checks, clamps,
+/// results, close and cancellation outcomes, and `DIV-016`/`DIV-017`/`DIV-018`
+/// behavior, except for timing: it has no deadline, its completion wakes no
+/// task, and over a Tokio-backed stream its I/O state lives in the backend, so
+/// it allocates no future. A cancellation wakes a pending read, as a timed
+/// read's wait does. Dropping the reader with a read started cancels that read,
+/// as dropping a read future does.
+pub struct OwnedReader {
+    io: Weak<dyn ByteStreamIo>,
+    state: Rc<RefCell<TransportState>>,
+    worker: WorkerHandle,
+    limits: ByteStreamLimits,
+    context: WorkerContext,
+    cancellation: CancellationToken,
+    /// The started read, until `poll_read` returns its result.
+    read: Option<ReadStart>,
+}
+
+impl OwnedReader {
+    /// Starts a read of at most `maximum` bytes that first offers
+    /// `allocation_size` bytes, with `read`'s entry checks and clamps. An error
+    /// is interface misuse: a started read has not yet been returned.
+    pub fn start_read(&mut self, maximum: usize, allocation_size: usize) -> Result<(), HttpError> {
+        if self.read.is_some() {
+            return Err(HttpError::with_message(
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"owned reader already has a started read",
+            ));
+        }
+        let target = ReadTarget {
+            io: &self.io,
+            state: &self.state,
+            worker: &self.worker,
+            limits: self.limits,
+        };
+        self.read = Some(start_read_operation(
+            target,
+            &self.context,
+            maximum,
+            allocation_size,
+            ReadKind::Reader,
+            self.cancellation.clone(),
+        ));
+        Ok(())
+    }
+
+    /// Polls the started read with `context`'s waker. Polling with no started
+    /// read is interface misuse, refused with an error.
+    pub fn poll_read(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<TransportRead, HttpError>> {
+        let Some(read) = self.read.as_mut() else {
+            return Poll::Ready(Err(HttpError::with_message(
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"owned reader has no started read",
+            )));
+        };
+        let result = match read {
+            ReadStart::Started(operation) => ready!(Pin::new(operation).poll(context)),
+            ReadStart::Finished(_) => {
+                let Some(ReadStart::Finished(result)) = self.read.take() else {
+                    unreachable!("the started read finished at entry");
+                };
+                result
+            }
+        };
+        self.read = None;
+        Poll::Ready(result)
+    }
 }
 
 /// Unconsumed receipts an [`OwnedWriteQueue`] holds before it refuses submissions.
@@ -691,6 +780,12 @@ pub(crate) trait ByteStreamIo: 'static {
         None
     }
 
+    /// The reader of an [`OwnedReader`]'s reads over this backend; `None`
+    /// reads through `read`'s future.
+    fn polled_reader(&self) -> Option<Rc<dyn PolledReader>> {
+        None
+    }
+
     fn enable_zero_copy(
         &self,
         _context: &WorkerContext,
@@ -728,10 +823,64 @@ enum CloseState {
 
 struct ActiveRead {
     operation: u64,
-    io_future: LocalTransportFuture<Result<TransportRead, HttpError>>,
-    deadline: TimedBaton,
-    wait: Pin<Box<TimedWait>>,
+    io: ActiveReadIo,
+    wait: ReadWait,
     waker: Option<Waker>,
+}
+
+/// The I/O of one read: `ByteStreamIo::read`'s boxed future, or the backend
+/// that holds an [`OwnedReader`] read's state.
+enum ActiveReadIo {
+    Future(LocalTransportFuture<Result<TransportRead, HttpError>>),
+    Polled(PolledReadIo),
+}
+
+impl ActiveReadIo {
+    fn poll(&mut self, context: &mut Context<'_>) -> Poll<Result<TransportRead, HttpError>> {
+        match self {
+            Self::Future(future) => future.as_mut().poll(context),
+            Self::Polled(polled) => polled.0.poll_read(context),
+        }
+    }
+}
+
+/// A read that a [`PolledReader`] holds. Dropping it ends the read, as
+/// dropping `ByteStreamIo::read`'s future does; after `Ready` that does
+/// nothing.
+struct PolledReadIo(Rc<dyn PolledReader>);
+
+impl Drop for PolledReadIo {
+    fn drop(&mut self) {
+        self.0.retire_read();
+    }
+}
+
+/// A backend that keeps one read's state itself, so that an [`OwnedReader`]
+/// read allocates no future. Each read has the effects of
+/// `ByteStreamIo::read`'s future.
+pub(crate) trait PolledReader {
+    fn start_read(&self, maximum: usize, allocation_size: usize);
+
+    /// `Ready` ends the read.
+    fn poll_read(&self, context: &mut Context<'_>) -> Poll<Result<TransportRead, HttpError>>;
+
+    /// Ends an unfinished read, as dropping `ByteStreamIo::read`'s future does.
+    fn retire_read(&self);
+}
+
+/// A read's deadline and cancellation.
+enum ReadWait {
+    /// Fields drop in order: the baton before its wait.
+    Timed {
+        deadline: TimedBaton,
+        wait: Pin<Box<TimedWait>>,
+    },
+    /// An [`OwnedReader`]'s read: no deadline. While it pends, `listener`
+    /// wakes it on cancellation, as a timed read's wait does.
+    Untimed {
+        cancellation: CancellationToken,
+        listener: Option<CancellationWakeRegistration>,
+    },
 }
 
 #[cfg(test)]
@@ -743,6 +892,17 @@ std::thread_local! {
 #[cfg(test)]
 std::thread_local! {
     static WRITE_PROGRESS_CELLS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static READ_DEADLINE_BATONS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Read-direction deadline batons built on this thread.
+#[cfg(test)]
+pub(crate) fn read_deadline_batons_for_test() -> usize {
+    READ_DEADLINE_BATONS.with(Cell::get)
 }
 
 /// Write progress cells built on this thread.
@@ -885,15 +1045,16 @@ fn transition_close_resources(
     }
     if let Some(active) = active_read {
         let ActiveRead {
-            io_future,
-            deadline,
-            wait,
-            waker,
-            ..
+            io, wait, waker, ..
         } = active;
-        retire_transport_value(wait, &mut failure);
-        retire_transport_value(deadline, &mut failure);
-        retire_transport_value(io_future, &mut failure);
+        match wait {
+            ReadWait::Timed { deadline, wait } => {
+                retire_transport_value(wait, &mut failure);
+                retire_transport_value(deadline, &mut failure);
+            }
+            wait => retire_transport_value(wait, &mut failure),
+        }
+        retire_transport_value(io, &mut failure);
         retire_transport_value(waker, &mut failure);
     }
     if let Some(active) = active_write {
@@ -1492,75 +1653,26 @@ impl OwnedByteStream {
         timeout: Duration,
         cancellation: CancellationToken,
     ) -> LocalTransportFuture<Result<TransportRead, HttpError>> {
-        if let Err(error) = self.check_context(context) {
-            return Box::pin(std::future::ready(Err(error)));
-        }
-        if cancellation.is_cancellation_requested() {
-            return Box::pin(std::future::ready(Err(cancelled_error(
-                b"byte-stream read cancelled before entry",
-            ))));
-        }
-        if maximum == 0 {
-            return Box::pin(std::future::ready(Ok(TransportRead::empty())));
-        }
-        if allocation_size == 0 {
-            return Box::pin(std::future::ready(Err(HttpError::with_message(
-                HttpErrorCode::INVALID_STATE_TRANSITION,
-                b"byte-stream read allocation size must be non-zero",
-            ))));
-        }
-
-        let maximum = maximum.min(self.limits.maximum_read_size);
-        let allocation_size = allocation_size.min(maximum);
-        let operation = {
-            let mut state = self.state.borrow_mut();
-            match state.close_state {
-                CloseState::Open => {}
-                CloseState::Graceful => {
-                    return Box::pin(std::future::ready(Ok(TransportRead::eof())));
-                }
-                CloseState::Reset => {
-                    return Box::pin(std::future::ready(Err(read_error(
-                        b"byte-stream was reset",
-                    ))));
-                }
-                CloseState::Dropped => {
-                    return Box::pin(std::future::ready(Err(dropped_error())));
-                }
-            }
-            if state.deferred_eof {
-                state.deferred_eof = false;
-                return Box::pin(std::future::ready(Ok(TransportRead::eof())));
-            }
-            if state.active_read.is_some() {
-                return Box::pin(std::future::ready(Err(HttpError::with_message(
-                    HttpErrorCode::INVALID_STATE_TRANSITION,
-                    b"byte-stream already has a pending read",
-                ))));
-            }
-            state.next_operation()
-        };
-
-        let Some(io) = self.io.upgrade() else {
-            return Box::pin(std::future::ready(Err(dropped_error())));
-        };
-        let io_future = io.read(maximum, allocation_size);
-        let deadline = TimedBaton::with_host(Some(timeout), context.host().clone());
-        let wait = Box::pin(deadline.wait(cancellation));
-        self.state.borrow_mut().active_read = Some(ActiveRead {
-            operation,
-            io_future,
-            deadline,
-            wait,
-            waker: None,
-        });
-        Box::pin(ReadOperation::new(
-            self.io.clone(),
-            Rc::clone(&self.state),
-            operation,
+        match start_read_operation(
+            self.read_target(),
+            context,
             maximum,
             allocation_size,
-        ))
+            ReadKind::Ordinary { timeout },
+            cancellation,
+        ) {
+            ReadStart::Started(operation) => Box::pin(operation),
+            ReadStart::Finished(result) => Box::pin(std::future::ready(result)),
+        }
+    }
+
+    fn read_target(&self) -> ReadTarget<'_> {
+        ReadTarget {
+            io: &self.io,
+            state: &self.state,
+            worker: &self.worker,
+            limits: self.limits,
+        }
     }
 
     fn begin_write(
@@ -1646,6 +1758,135 @@ impl WriteTarget<'_> {
         }
         Ok(())
     }
+}
+
+/// What a read needs from its transport: borrowed from an [`OwnedByteStream`], or from the
+/// handles its [`OwnedReader`] holds.
+#[derive(Clone, Copy)]
+struct ReadTarget<'a> {
+    io: &'a Weak<dyn ByteStreamIo>,
+    state: &'a Rc<RefCell<TransportState>>,
+    worker: &'a WorkerHandle,
+    limits: ByteStreamLimits,
+}
+
+impl ReadTarget<'_> {
+    fn check_context(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        check_transport_context(self.state, self.worker, context)
+    }
+}
+
+/// A read that [`start_read_operation`] began, or the result it ended with at entry.
+enum ReadStart {
+    Started(ReadOperation),
+    Finished(Result<TransportRead, HttpError>),
+}
+
+/// How [`start_read_operation`] reads.
+#[derive(Clone, Copy)]
+enum ReadKind {
+    /// An ordinary read, timed by `timeout`.
+    Ordinary { timeout: Duration },
+    /// An [`OwnedReader`]'s read: untimed, and its I/O state kept by the
+    /// backend's [`PolledReader`] when it has one.
+    Reader,
+}
+
+fn start_read_operation(
+    target: ReadTarget<'_>,
+    context: &WorkerContext,
+    maximum: usize,
+    allocation_size: usize,
+    kind: ReadKind,
+    cancellation: CancellationToken,
+) -> ReadStart {
+    if let Err(error) = target.check_context(context) {
+        return ReadStart::Finished(Err(error));
+    }
+    if cancellation.is_cancellation_requested() {
+        return ReadStart::Finished(Err(cancelled_error(
+            b"byte-stream read cancelled before entry",
+        )));
+    }
+    if maximum == 0 {
+        return ReadStart::Finished(Ok(TransportRead::empty()));
+    }
+    if allocation_size == 0 {
+        return ReadStart::Finished(Err(HttpError::with_message(
+            HttpErrorCode::INVALID_STATE_TRANSITION,
+            b"byte-stream read allocation size must be non-zero",
+        )));
+    }
+
+    let maximum = maximum.min(target.limits.maximum_read_size);
+    let allocation_size = allocation_size.min(maximum);
+    let operation = {
+        let mut state = target.state.borrow_mut();
+        match state.close_state {
+            CloseState::Open => {}
+            CloseState::Graceful => {
+                return ReadStart::Finished(Ok(TransportRead::eof()));
+            }
+            CloseState::Reset => {
+                return ReadStart::Finished(Err(read_error(b"byte-stream was reset")));
+            }
+            CloseState::Dropped => {
+                return ReadStart::Finished(Err(dropped_error()));
+            }
+        }
+        if state.deferred_eof {
+            state.deferred_eof = false;
+            return ReadStart::Finished(Ok(TransportRead::eof()));
+        }
+        if state.active_read.is_some() {
+            return ReadStart::Finished(Err(HttpError::with_message(
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"byte-stream already has a pending read",
+            )));
+        }
+        state.next_operation()
+    };
+
+    let Some(io) = target.io.upgrade() else {
+        return ReadStart::Finished(Err(dropped_error()));
+    };
+    let polled_reader = match kind {
+        ReadKind::Ordinary { .. } => None,
+        ReadKind::Reader => io.polled_reader(),
+    };
+    let io = match polled_reader {
+        Some(reader) => {
+            reader.start_read(maximum, allocation_size);
+            ActiveReadIo::Polled(PolledReadIo(reader))
+        }
+        None => ActiveReadIo::Future(io.read(maximum, allocation_size)),
+    };
+    let wait = match kind {
+        ReadKind::Ordinary { timeout } => {
+            #[cfg(test)]
+            READ_DEADLINE_BATONS.with(|count| count.set(count.get() + 1));
+            let deadline = TimedBaton::with_host(Some(timeout), context.host().clone());
+            let wait = Box::pin(deadline.wait(cancellation));
+            ReadWait::Timed { deadline, wait }
+        }
+        ReadKind::Reader => ReadWait::Untimed {
+            cancellation,
+            listener: None,
+        },
+    };
+    target.state.borrow_mut().active_read = Some(ActiveRead {
+        operation,
+        io,
+        wait,
+        waker: None,
+    });
+    ReadStart::Started(ReadOperation::new(
+        target.io.clone(),
+        Rc::clone(target.state),
+        operation,
+        maximum,
+        allocation_size,
+    ))
 }
 
 /// A write that [`start_write_operation`] began, or the result it ended with at entry.
@@ -2017,6 +2258,26 @@ impl ByteStreamTransport for OwnedByteStream {
             receipts: VecDeque::with_capacity(WRITE_QUEUE_RECEIPTS),
         }))
     }
+
+    fn reader(
+        &self,
+        context: &WorkerContext,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<Option<OwnedReader>, HttpError> {
+        if !timeout.is_zero() {
+            return Ok(None);
+        }
+        Ok(Some(OwnedReader {
+            io: self.io.clone(),
+            state: Rc::clone(&self.state),
+            worker: self.worker.clone(),
+            limits: self.limits,
+            context: context.clone(),
+            cancellation,
+            read: None,
+        }))
+    }
 }
 
 impl Drop for OwnedByteStream {
@@ -2131,11 +2392,33 @@ impl Future for ReadOperation {
                 .filter(|active| active.operation == self.operation)
                 .expect("an open read operation remains registered with its transport");
             active.waker = Some(context.waker().clone());
-            if active.deadline.status() == WaitStatus::TimedOut {
+            if matches!(
+                &active.wait,
+                ReadWait::Timed { deadline, .. } if deadline.status() == WaitStatus::TimedOut
+            ) {
                 ReadPoll::TimedOut
             } else {
-                let io = active.io_future.as_mut().poll(context);
-                let wait = active.wait.as_mut().poll(context);
+                let io = active.io.poll(context);
+                let wait = match &mut active.wait {
+                    ReadWait::Timed { wait, .. } => wait.as_mut().poll(context),
+                    ReadWait::Untimed {
+                        cancellation,
+                        listener,
+                    } => {
+                        let cancelled = if io.is_pending() {
+                            listener
+                                .get_or_insert_with(|| cancellation.wake_registration())
+                                .update_waker(context.waker())
+                        } else {
+                            cancellation.is_cancellation_requested()
+                        };
+                        if cancelled {
+                            Poll::Ready(WaitStatus::Cancelled)
+                        } else {
+                            Poll::Pending
+                        }
+                    }
+                };
                 match (io, wait) {
                     (Poll::Ready(Err(error)), _) => ReadPoll::Io(Err(error)),
                     (

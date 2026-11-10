@@ -270,3 +270,71 @@ fn external_transport_delivers_data_and_eof_under_uniplex() {
 fn external_transport_empty_read_is_not_eof_under_uniplex() {
     assert_served_once(&serve(vec![(b"", false), (REQUEST, false), (b"", true)]), 3);
 }
+
+/// A native TCP byte stream offers its poll-based reader through `UniplexTransport`, through
+/// which the owned drivers read.
+#[test]
+fn tcp_byte_stream_offers_its_reader_through_uniplex() {
+    use tokio::io::AsyncWriteExt;
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(tokio::task::LocalSet::new().run_until(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (worker, driver) = roxygen_runtime::driver::WorkerDriver::new(8).unwrap();
+            let call = worker
+                .call_local(move |context| async move {
+                    let accept = async { listener.accept().await.unwrap().0 };
+                    let connect = roxygen_transport::tcp::TcpTransport::connect(
+                        &context,
+                        SocketAddress::new("127.0.0.1", port),
+                        roxygen_transport::byte_stream::ByteStreamLimits::new(1024, 1024, 8)
+                            .unwrap(),
+                        Duration::from_secs(5),
+                        CancellationToken::never(),
+                    );
+                    let (mut peer, transport) = tokio::join!(accept, connect);
+                    let transport: Rc<dyn UniplexTransport> = Rc::new(transport.unwrap());
+                    assert!(
+                        transport
+                            .try_reader(
+                                &context,
+                                Duration::from_secs(5),
+                                CancellationToken::never()
+                            )
+                            .unwrap()
+                            .is_none(),
+                        "a read timeout keeps the read API"
+                    );
+                    let mut reader = transport
+                        .try_reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .expect("an untimed TCP transport offers its reader");
+                    peer.write_all(b"ok").await.unwrap();
+                    reader.start_read(1024, 1024).unwrap();
+                    let read = std::future::poll_fn(|context| reader.poll_read(context))
+                        .await
+                        .unwrap();
+                    assert!(!read.is_eof());
+                    assert_eq!(bytes_of(&read.into_data()), b"ok");
+                    drop(peer);
+                    reader.start_read(1024, 1024).unwrap();
+                    let eof = std::future::poll_fn(|context| reader.poll_read(context))
+                        .await
+                        .unwrap();
+                    assert!(eof.is_eof(), "the peer's close ends the next read");
+                    transport.close(&context).unwrap();
+                })
+                .unwrap();
+            let driver_task = tokio::task::spawn_local(driver);
+            tokio::time::timeout(Duration::from_secs(10), call)
+                .await
+                .expect("the reader test is bounded")
+                .unwrap();
+            worker.begin_shutdown();
+            driver_task.await.unwrap();
+        }));
+}
