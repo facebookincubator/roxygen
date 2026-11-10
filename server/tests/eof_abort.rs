@@ -588,7 +588,7 @@ fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
 
 /// The client preface, empty SETTINGS, and a complete GET on stream 1:
 /// GET / on localhost.
-fn h2_request() -> Vec<u8> {
+pub(crate) fn h2_request() -> Vec<u8> {
     let mut wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
     wire.extend(h2_frame(0x4, 0, 0, &[]));
     // :method GET, :scheme http, :path /, then :authority localhost.

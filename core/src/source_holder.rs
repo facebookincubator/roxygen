@@ -26,7 +26,9 @@ struct SourceEntry {
     source: Box<dyn HttpSource>,
     /// The task of this generation's last in-place read poll that returned
     /// `Pending` (`DIV-039`), woken if the generation goes away while that read
-    /// is still active, since the source it was polling may never wake it.
+    /// is still active, since the source it was polling may never wake it. A
+    /// task it replaces, and the reader of a generation that is retired or
+    /// finished, are dropped outside the holder's borrow.
     reader: Option<Waker>,
 }
 
@@ -75,7 +77,7 @@ impl HolderState {
             Some(entry) => self.source.replace(entry),
             None => self.source.take(),
         };
-        SourceRetirement::of(previous, error, active_read || forwarded)
+        SourceRetirement::of(previous, error, true, active_read || forwarded)
     }
 
     /// Whether a forwarded poll is pending on the current generation, which is
@@ -138,36 +140,48 @@ pub(crate) fn retire_source<S>(
 pub(crate) struct SourceRetirement {
     source: Option<Box<dyn HttpSource>>,
     error: Option<HttpErrorCode>,
-    /// A pending in-place read of the retired generation, woken once its
-    /// source is stopped and dropped.
+    /// Whether the source is unfinished and so is stopped before it is dropped.
+    stop: bool,
+    /// The generation's cached reader, dropped once its source is stopped and
+    /// dropped, and first woken if `wake_reader`.
     reader: Option<Waker>,
+    wake_reader: bool,
 }
 
 impl SourceRetirement {
-    /// Retires a generation taken out of its holder; `active_read` says whether
-    /// its reader is still waiting.
-    fn of(entry: Option<SourceEntry>, error: Option<HttpErrorCode>, active_read: bool) -> Self {
-        let (source, reader) = entry.map_or((None, None), |entry| {
-            (Some(entry.source), entry.reader.filter(|_| active_read))
-        });
+    /// Retires a generation taken out of its holder, outside the holder's
+    /// borrow: its source is stopped (if `stop`) and dropped, then its cached
+    /// reader is woken (if `wake_reader`, a read still waiting on it) and dropped.
+    fn of(
+        entry: Option<SourceEntry>,
+        error: Option<HttpErrorCode>,
+        stop: bool,
+        wake_reader: bool,
+    ) -> Self {
+        let (source, reader) =
+            entry.map_or((None, None), |entry| (Some(entry.source), entry.reader));
         Self {
             source,
             error,
+            stop,
             reader,
+            wake_reader,
         }
     }
 
     fn retire_inner(&mut self) -> Option<RetirementPanic> {
-        let mut first = self
-            .source
-            .take()
-            .and_then(|source| retire_source(source, |source| source.stop_reading(self.error)));
-        if let Some(reader) = self.reader.take() {
-            retain_retirement_panic(
-                &mut first,
-                catch_unwind(AssertUnwindSafe(|| reader.wake())).err(),
-            );
-        }
+        let (stop, error) = (self.stop, self.error);
+        let mut first = self.source.take().and_then(|source| {
+            retire_source(source, |source| {
+                if stop {
+                    source.stop_reading(error);
+                }
+            })
+        });
+        retain_retirement_panic(
+            &mut first,
+            retire_reader(self.reader.take(), self.wake_reader),
+        );
         first
     }
 
@@ -181,6 +195,37 @@ impl Drop for SourceRetirement {
         let unwinding = std::thread::panicking();
         let first = self.retire_inner();
         finish_retirement_panic(first, unwinding);
+    }
+}
+
+/// Wakes (if `wake`) and drops a generation's cached reader, each in its own
+/// panic containment, so a panicking wake cannot drop the waker while unwinding.
+#[inline]
+fn retire_reader(reader: Option<Waker>, wake: bool) -> Option<RetirementPanic> {
+    reader.and_then(|reader| retire_some_reader(reader, wake))
+}
+
+#[cold]
+#[inline(never)]
+fn retire_some_reader(reader: Waker, wake: bool) -> Option<RetirementPanic> {
+    let mut first = if wake {
+        catch_unwind(AssertUnwindSafe(|| reader.wake_by_ref())).err()
+    } else {
+        None
+    };
+    retain_retirement_panic(
+        &mut first,
+        catch_unwind(AssertUnwindSafe(|| drop(reader))).err(),
+    );
+    first
+}
+
+/// Drops a generation a terminal event or error consumed, unstopped, outside
+/// the holder's borrow: its source, then its cached reader.
+#[inline]
+fn retire_finished(entry: Option<SourceEntry>) {
+    if entry.is_some() {
+        drop(SourceRetirement::of(entry, None, false, false));
     }
 }
 
@@ -244,31 +289,79 @@ fn poll_in_place<T>(
     maximum: u32,
     context: &mut Context<'_>,
 ) -> Poll<Result<T, HttpError>> {
-    let Ok(mut state) = state.try_borrow_mut() else {
-        return Poll::Ready(Err(HttpSourceHolder::concurrent_read_error()));
-    };
-    match state.source.as_mut() {
-        Some(entry) if Rc::ptr_eq(&entry.identity, source_identity) => {
-            let polled = poll(entry.source.as_mut(), context, maximum);
-            if polled.is_pending() {
-                register_reader(entry, context);
+    {
+        let Ok(mut state) = state.try_borrow_mut() else {
+            return Poll::Ready(Err(HttpSourceHolder::concurrent_read_error()));
+        };
+        match state.source.as_mut() {
+            Some(entry) if Rc::ptr_eq(&entry.identity, source_identity) => {
+                let polled = poll(entry.source.as_mut(), context, maximum);
+                if polled.is_ready() || reader_registered(entry, context) {
+                    return polled;
+                }
+                if entry.reader.is_none() {
+                    entry.reader = Some(context.waker().clone());
+                    return polled;
+                }
             }
-            polled
+            _ => return Poll::Ready(Err(HttpSourceHolder::unavailable_error())),
         }
-        _ => Poll::Ready(Err(HttpSourceHolder::unavailable_error())),
+    }
+    if replace_reader(state, source_identity, context, true) {
+        Poll::Pending
+    } else {
+        Poll::Ready(Err(HttpSourceHolder::unavailable_error()))
     }
 }
 
-/// Records the task of a `Pending` in-place poll with its generation, without
-/// a clone while the same task polls again.
-fn register_reader(entry: &mut SourceEntry, context: &Context<'_>) {
-    if !entry
+/// Whether the generation's cached reader already wakes this poll's task.
+#[inline(always)]
+fn reader_registered(entry: &SourceEntry, context: &Context<'_>) -> bool {
+    entry
         .reader
         .as_ref()
         .is_some_and(|reader| reader.will_wake(context.waker()))
-    {
-        entry.reader = Some(context.waker().clone());
-    }
+}
+
+/// Whether a read of generation `source_identity` still waits on it: an
+/// admitted read (`admitted`) or a pending forwarded poll.
+fn reader_waits(state: &HolderState, source_identity: &Rc<()>, admitted: bool) -> bool {
+    (if admitted {
+        state.active_read
+    } else {
+        !state.active_read && state.forwarded == ForwardedPoll::Pending
+    }) && state
+        .source
+        .as_ref()
+        .is_some_and(|entry| Rc::ptr_eq(&entry.identity, source_identity))
+}
+
+/// The slow path of a `Pending` poll whose task is not the cached reader: the
+/// task is cloned and installed, and the reader it replaces dropped, outside
+/// the holder's borrow, since a waker's clone or drop may reach the holder.
+/// Returns whether the read still waits on its generation afterwards.
+#[cold]
+#[inline(never)]
+fn replace_reader(
+    state: &RefCell<HolderState>,
+    source_identity: &Rc<()>,
+    context: &Context<'_>,
+    admitted: bool,
+) -> bool {
+    let mut replacement = Some(context.waker().clone());
+    let previous = {
+        let mut state = state.borrow_mut();
+        if reader_waits(&state, source_identity, admitted) {
+            let entry = state.source.as_mut().expect("a waiting read has a source");
+            std::mem::replace(&mut entry.reader, replacement.take())
+        } else {
+            None
+        }
+    };
+    let mut first = retire_reader(previous, false);
+    retain_retirement_panic(&mut first, retire_reader(replacement, false));
+    finish_retirement_panic(first, std::thread::panicking());
+    reader_waits(&state.borrow(), source_identity, admitted)
 }
 
 impl<T> Future for HolderReadFuture<T>
@@ -294,8 +387,7 @@ where
         };
         this.completed = true;
         let terminal = result.as_ref().map_or(true, TerminalEvent::is_terminal);
-        let retired_source = finish_read(&this.state, &this.source_identity, terminal);
-        drop(retired_source);
+        retire_finished(finish_read(&this.state, &this.source_identity, terminal));
         poll
     }
 }
@@ -394,22 +486,24 @@ impl HttpSourceHolder {
     }
 
     /// Takes the source out unstopped. A consumer polling the holder as a
-    /// source whose poll is pending is woken, and its next poll fails.
+    /// source whose poll is pending is woken, and its next poll fails. If that
+    /// wake, or the drop of the generation's cached waker, panics, the source
+    /// cannot be handed out: it is stopped and dropped, then the panic resumes.
     pub fn release(&mut self) -> Result<Option<Box<dyn HttpSource>>, SourceReleaseError> {
-        let (entry, forwarded) = {
+        let mut retirement = {
             let mut state = self.state.borrow_mut();
             if state.active_read {
                 return Err(SourceReleaseError::ReadInProgress);
             }
             let forwarded = state.orphan_forwarded_poll();
-            (state.source.take(), forwarded)
+            SourceRetirement::of(state.source.take(), None, true, forwarded)
         };
-        Ok(entry.map(|mut entry| {
-            if let Some(reader) = entry.reader.take().filter(|_| forwarded) {
-                reader.wake();
-            }
-            entry.source
-        }))
+        let mut first = retire_reader(retirement.reader.take(), retirement.wake_reader);
+        if first.is_some() {
+            retain_retirement_panic(&mut first, retirement.retire_inner());
+            finish_retirement_panic(first, std::thread::panicking());
+        }
+        Ok(retirement.source.take())
     }
 
     pub fn set_source(&mut self, source: Box<dyn HttpSource>) {
@@ -507,6 +601,42 @@ impl HttpSourceHolder {
         }))
     }
 
+    /// Roxygen-only (`DIV-039`): polls the held source in place for a consumer
+    /// that owns this holder outright, as [`HttpSource::poll_body_event`] does
+    /// for a consumer polling it as a source, with the caller's `context`
+    /// unchanged. Only such an owner can clear, stop, replace, release or
+    /// destroy the generation it polls, so it needs no wake when that
+    /// generation goes away, and no failure of its next poll after it installs
+    /// a replacement itself. While no read of this holder, no other handle to
+    /// its state, and no pending forwarded poll exists, this poll therefore
+    /// borrows nothing and registers no task; otherwise it is that forwarded
+    /// poll. Call it only while [`HttpSource::polls_body_events`] is `true`; a
+    /// terminal event or error consumes the source, as it does for a read.
+    pub fn poll_body_event_exclusive(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        // A unique state has no read future, so no read is active and nothing borrows it.
+        let Some(state) = Rc::get_mut(&mut self.state)
+            .map(RefCell::get_mut)
+            .filter(|state| state.forwarded == ForwardedPoll::Idle)
+        else {
+            return HttpSource::poll_body_event(self, context, maximum);
+        };
+        debug_assert!(!state.active_read, "an active read holds the state");
+        let Some(entry) = state.source.as_mut() else {
+            return Poll::Ready(Err(Self::unavailable_error()));
+        };
+        let poll = entry.source.poll_body_event(context, maximum);
+        if let Poll::Ready(result) = &poll {
+            if result.as_ref().map_or(true, TerminalEvent::is_terminal) {
+                retire_finished(state.source.take());
+            }
+        }
+        poll
+    }
+
     fn unavailable_error() -> HttpError {
         HttpError::with_message(HttpErrorCode::DROPPED, b"HTTP source is no longer readable")
     }
@@ -597,7 +727,7 @@ impl HttpSource for HttpSourceHolder {
         context: &mut Context<'_>,
         maximum: u32,
     ) -> Poll<Result<HttpBodyEvent, HttpError>> {
-        let (poll, retired) = {
+        let (poll, retired, replaced) = {
             let Ok(mut state) = self.state.try_borrow_mut() else {
                 return Poll::Ready(Err(Self::concurrent_read_error()));
             };
@@ -610,16 +740,30 @@ impl HttpSource for HttpSourceHolder {
                 return Poll::Ready(Err(Self::unavailable_error()));
             };
             let poll = entry.source.poll_body_event(context, maximum);
-            let Poll::Ready(result) = &poll else {
-                register_reader(entry, context);
-                state.forwarded = ForwardedPoll::Pending;
-                return poll;
-            };
-            let terminal = result.as_ref().map_or(true, TerminalEvent::is_terminal);
-            let retired = if terminal { state.source.take() } else { None };
-            (poll, retired)
+            match &poll {
+                Poll::Pending => {
+                    state.forwarded = ForwardedPoll::Pending;
+                    if reader_registered(entry, context) {
+                        return poll;
+                    }
+                    if entry.reader.is_none() {
+                        entry.reader = Some(context.waker().clone());
+                        return poll;
+                    }
+                    (poll, None, Some(Rc::clone(&entry.identity)))
+                }
+                Poll::Ready(result) => {
+                    let terminal = result.as_ref().map_or(true, TerminalEvent::is_terminal);
+                    (poll, terminal.then(|| state.source.take()).flatten(), None)
+                }
+            }
         };
-        drop(retired);
+        retire_finished(retired);
+        if let Some(identity) = replaced {
+            if !replace_reader(&self.state, &identity, context, false) {
+                return Poll::Ready(Err(Self::unavailable_error()));
+            }
+        }
         poll
     }
 }
@@ -630,6 +774,9 @@ impl Drop for HttpSourceHolder {
     }
 }
 
+/// Releases a dropped read's admission, then drops its generation's cached
+/// reader; a panic in that drop resumes, unless the read is dropped while
+/// unwinding, when it is discarded instead of aborting.
 fn release_read(state: &Rc<RefCell<HolderState>>, source_identity: &Rc<()>) {
     let reader = {
         let mut state = state.borrow_mut();
@@ -642,14 +789,14 @@ fn release_read(state: &Rc<RefCell<HolderState>>, source_identity: &Rc<()>) {
             _ => None,
         }
     };
-    drop(reader);
+    finish_retirement_panic(retire_reader(reader, false), std::thread::panicking());
 }
 
 fn finish_read(
     state: &Rc<RefCell<HolderState>>,
     source_identity: &Rc<()>,
     terminal: bool,
-) -> Option<Box<dyn HttpSource>> {
+) -> Option<SourceEntry> {
     let mut state = state.borrow_mut();
     if state
         .source
@@ -658,7 +805,7 @@ fn finish_read(
     {
         state.active_read = false;
         if terminal {
-            return state.source.take().map(|entry| entry.source);
+            return state.source.take();
         }
     }
     None

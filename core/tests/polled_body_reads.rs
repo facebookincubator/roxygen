@@ -4,11 +4,16 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::panic::catch_unwind;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
+use std::task::Wake;
 use std::task::Waker;
+use std::thread::ThreadId;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -645,6 +650,12 @@ fn assert_forwarded_read_fails(invalidation: HolderInvalidation, through_outer_h
         },
         "{case}: every source generation is dropped"
     );
+    if matches!(invalidation, HolderInvalidation::Release) {
+        assert!(
+            log.stops.borrow().is_empty(),
+            "release transfers the source unstopped"
+        );
+    }
 }
 
 /// A consumer polling a holder as a source (`HttpSource::poll_body_event`) is
@@ -678,4 +689,666 @@ fn a_pending_in_place_read_through_a_forwarding_source_is_woken_when_the_inner_h
     ] {
         assert_forwarded_read_fails(invalidation, true);
     }
+}
+
+struct WakerCallbacks {
+    on_wake: Option<Box<dyn FnOnce()>>,
+    on_drop: Option<Box<dyn FnOnce()>>,
+}
+
+thread_local! {
+    static WAKER_CALLBACKS: RefCell<Option<WakerCallbacks>> = const { RefCell::new(None) };
+}
+
+/// A waker whose wake and last drop run owner-local callbacks (kept in TLS, so
+/// the waker itself holds only thread-safe data), as a custom executor's waker
+/// may run code that reaches the holder.
+struct OwnerWaker(ThreadId);
+
+impl Wake for OwnerWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        assert_eq!(self.0, std::thread::current().id());
+        let callback = WAKER_CALLBACKS.with(|callbacks| {
+            callbacks
+                .borrow_mut()
+                .as_mut()
+                .and_then(|callbacks| callbacks.on_wake.take())
+        });
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+}
+
+impl Drop for OwnerWaker {
+    fn drop(&mut self) {
+        assert_eq!(self.0, std::thread::current().id());
+        let callbacks = WAKER_CALLBACKS.with(|callbacks| callbacks.borrow_mut().take());
+        if let Some(callback) = callbacks.and_then(|callbacks| callbacks.on_drop) {
+            callback();
+        }
+    }
+}
+
+fn owner_waker(on_wake: Option<Box<dyn FnOnce()>>, on_drop: Option<Box<dyn FnOnce()>>) -> Waker {
+    WAKER_CALLBACKS.with(|callbacks| {
+        let mut callbacks = callbacks.borrow_mut();
+        assert!(callbacks.is_none(), "one owner waker at a time");
+        *callbacks = Some(WakerCallbacks { on_wake, on_drop });
+    });
+    Waker::from(Arc::new(OwnerWaker(std::thread::current().id())))
+}
+
+/// Whether the holder's state was mutably borrowed when `probe` ran.
+fn borrowed_during(probe: &dyn Fn() -> bool) -> bool {
+    catch_unwind(AssertUnwindSafe(probe)).is_err()
+}
+
+/// A stale cached waker, left by a finished in-place read, whose destructor
+/// panics is dropped only after the retired generation was stopped and
+/// dropped, outside the holder's borrow, for a clear and for a replacement.
+#[test]
+fn cached_waker_drop_panic_does_not_skip_clear_retirement() {
+    for replace in [false, true] {
+        let log = Rc::new(Log::default());
+        let mut holder = HttpSourceHolder::new(ScriptedSource::new(
+            &log,
+            true,
+            [Poll::Pending, body(b"more", false)],
+        ));
+        let probe = holder.readable_probe();
+        let observation = Rc::new(Cell::new(None));
+        let on_drop_observation = Rc::clone(&observation);
+        let on_drop_log = Rc::clone(&log);
+        let woken = Rc::new(Cell::new(false));
+        let on_wake = Rc::clone(&woken);
+        let waker = owner_waker(
+            Some(Box::new(move || on_wake.set(true))),
+            Some(Box::new(move || {
+                on_drop_observation.set(Some((
+                    probe(),
+                    on_drop_log.stops.borrow().len(),
+                    on_drop_log.drops.get(),
+                )));
+                panic!("cached reader drop");
+            })),
+        );
+        let mut read = holder.read_body_event_unboxed(7);
+        assert!(
+            Pin::new(&mut read)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        drop(waker);
+        assert!(matches!(poll(&mut read), Poll::Ready(Ok(_))));
+        drop(read);
+
+        let successor = Rc::new(Log::default());
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            if replace {
+                holder.set_source(ScriptedSource::new(&successor, true, []));
+            } else {
+                holder.clear(Some(HttpErrorCode::CANCEL));
+            }
+        }))
+        .expect_err("the cached reader destructor panics");
+        let expected_stop = if replace {
+            None
+        } else {
+            Some(HttpErrorCode::CANCEL)
+        };
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"cached reader drop"));
+        assert_eq!(
+            observation.get(),
+            Some((replace, 1, 1)),
+            "replace {replace}: (readable, stops, drops) when the cached waker drops"
+        );
+        assert!(!woken.get(), "a completed read is not woken");
+        assert_eq!(*log.stops.borrow(), [expected_stop], "replace {replace}");
+        assert_eq!(log.drops.get(), 1);
+        assert_eq!(holder.readable(), replace);
+        holder.clear(None);
+        assert_eq!(log.drops.get(), 1);
+    }
+}
+
+/// A terminal event or error drops the generation's cached waker after its
+/// source, outside the holder's borrow, for a read and for a forwarded poll.
+#[test]
+fn terminal_read_drops_cached_waker_after_source_outside_holder_borrow() {
+    for forwarded in [false, true] {
+        for error in [false, true] {
+            let log = Rc::new(Log::default());
+            let last = if error {
+                Poll::Ready(Err(HttpError::new(HttpErrorCode::INTERNAL_ERROR)))
+            } else {
+                body(b"last", true)
+            };
+            let mut holder =
+                HttpSourceHolder::new(ScriptedSource::new(&log, true, [Poll::Pending, last]));
+            let probe = holder.readable_probe();
+            let observation = Rc::new(Cell::new(None));
+            let on_drop_observation = Rc::clone(&observation);
+            let on_drop_log = Rc::clone(&log);
+            let waker = owner_waker(
+                None,
+                Some(Box::new(move || {
+                    on_drop_observation.set(Some((
+                        probe(),
+                        on_drop_log.stops.borrow().len(),
+                        on_drop_log.drops.get(),
+                    )));
+                })),
+            );
+            let result = if forwarded {
+                assert!(
+                    holder
+                        .poll_body_event(&mut Context::from_waker(&waker), 7)
+                        .is_pending()
+                );
+                drop(waker);
+                holder.poll_body_event(&mut Context::from_waker(Waker::noop()), 7)
+            } else {
+                let mut read = holder.read_body_event_unboxed(7);
+                assert!(
+                    Pin::new(&mut read)
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                drop(waker);
+                poll(&mut read)
+            };
+            let Poll::Ready(result) = result else {
+                panic!("the terminal read completes");
+            };
+            assert_eq!(result.is_err(), error);
+            assert_eq!(
+                observation.get(),
+                Some((false, 0, 1)),
+                "forwarded {forwarded}, error {error}: (readable, stops, drops) at the waker's drop"
+            );
+            assert!(!holder.readable());
+        }
+    }
+}
+
+/// A pending read that registers a new task drops the task it replaces
+/// outside the holder's borrow, so that destructor may replace the source and
+/// start a read of the successor; the old read then fails, and the successor
+/// keeps its admission.
+#[test]
+fn replacing_pending_waker_can_replace_source_without_retiring_successor() {
+    let old_log = Rc::new(Log::default());
+    let new_log = Rc::new(Log::default());
+    let holder = Rc::new(RefCell::new(HttpSourceHolder::new(ScriptedSource::new(
+        &old_log,
+        true,
+        [Poll::Pending, Poll::Pending],
+    ))));
+    let successor = Rc::new(RefCell::new(None));
+    let on_drop_holder = Rc::clone(&holder);
+    let on_drop_successor = Rc::clone(&successor);
+    let on_drop_log = Rc::clone(&new_log);
+    let waker = owner_waker(
+        None,
+        Some(Box::new(move || {
+            let mut holder = on_drop_holder.borrow_mut();
+            holder.set_source(ScriptedSource::new(
+                &on_drop_log,
+                true,
+                [Poll::Pending, body(b"new", true)],
+            ));
+            let mut read = holder.read_body_event_unboxed(9);
+            assert!(poll(&mut read).is_pending());
+            *on_drop_successor.borrow_mut() = Some(read);
+        })),
+    );
+    let mut old = holder.borrow_mut().read_body_event_unboxed(7);
+    assert!(
+        Pin::new(&mut old)
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    drop(waker);
+    let Poll::Ready(Err(error)) = poll(&mut old) else {
+        panic!("the old generation was replaced during reader registration");
+    };
+    assert_eq!(error.code(), HttpErrorCode::DROPPED);
+    drop(old);
+    let mut rejected = holder.borrow_mut().read_body_event_unboxed(1);
+    let Poll::Ready(Err(error)) = poll(&mut rejected) else {
+        panic!("the successor still owns admission");
+    };
+    assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+    let mut next = successor
+        .borrow_mut()
+        .take()
+        .expect("the callback admitted a read");
+    let Poll::Ready(Ok(event)) = poll(&mut next) else {
+        panic!("the successor completes");
+    };
+    assert_eq!(bytes_of(&event), b"new");
+    assert_eq!(*old_log.stops.borrow(), [None]);
+    assert_eq!(old_log.drops.get(), 1);
+    assert!(new_log.stops.borrow().is_empty());
+    assert_eq!(new_log.drops.get(), 1);
+}
+
+/// The same holds for a forwarded poll: the task a pending poll replaces is
+/// dropped outside the holder's borrow, and the poll stays registered.
+#[test]
+fn a_forwarded_poll_drops_the_task_it_replaces_outside_the_holder_borrow() {
+    let log = Rc::new(Log::default());
+    let mut holder = HttpSourceHolder::new(ScriptedSource::new(
+        &log,
+        true,
+        [Poll::Pending, Poll::Pending],
+    ));
+    let probe = holder.readable_probe();
+    let borrowed = Rc::new(Cell::new(None));
+    let on_drop_borrowed = Rc::clone(&borrowed);
+    let waker = owner_waker(
+        None,
+        Some(Box::new(move || {
+            on_drop_borrowed.set(Some(borrowed_during(&*probe)));
+        })),
+    );
+    assert!(
+        holder
+            .poll_body_event(&mut Context::from_waker(&waker), 7)
+            .is_pending()
+    );
+    drop(waker);
+    assert!(
+        holder
+            .poll_body_event(&mut Context::from_waker(Waker::noop()), 7)
+            .is_pending()
+    );
+    assert_eq!(
+        borrowed.get(),
+        Some(false),
+        "the replaced task is dropped with the holder's state free"
+    );
+    assert_eq!(*log.polls.borrow(), [7, 7]);
+}
+
+/// Dropping a pending read releases its admission before its task is dropped,
+/// so that destructor can start the next read of the same generation.
+#[test]
+fn pending_read_waker_drop_can_admit_same_generation_successor() {
+    let log = Rc::new(Log::default());
+    let holder = Rc::new(RefCell::new(HttpSourceHolder::new(ScriptedSource::new(
+        &log,
+        true,
+        [Poll::Pending, Poll::Pending, body(b"next", true)],
+    ))));
+    let successor = Rc::new(RefCell::new(None));
+    let on_drop_holder = Rc::clone(&holder);
+    let on_drop_successor = Rc::clone(&successor);
+    let waker = owner_waker(
+        None,
+        Some(Box::new(move || {
+            let mut read = on_drop_holder.borrow_mut().read_body_event_unboxed(9);
+            assert!(poll(&mut read).is_pending());
+            *on_drop_successor.borrow_mut() = Some(read);
+        })),
+    );
+    let mut old = holder.borrow_mut().read_body_event_unboxed(7);
+    assert!(
+        Pin::new(&mut old)
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    drop(waker);
+    drop(old);
+    let mut rejected = holder.borrow_mut().read_body_event_unboxed(1);
+    let Poll::Ready(Err(error)) = poll(&mut rejected) else {
+        panic!("the reentrant read still owns admission");
+    };
+    assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+    let mut next = successor
+        .borrow_mut()
+        .take()
+        .expect("the callback admitted a read");
+    let Poll::Ready(Ok(event)) = poll(&mut next) else {
+        panic!("the successor completes");
+    };
+    assert_eq!(bytes_of(&event), b"next");
+    assert_eq!(*log.polls.borrow(), [7, 9, 9]);
+    assert!(log.stops.borrow().is_empty());
+    assert_eq!(log.drops.get(), 1);
+}
+
+/// A release whose pending forwarded poll's wake panics cannot hand the source
+/// out: it stops and drops it, then resumes the panic.
+#[test]
+fn release_wake_panic_stops_and_drops_detached_source() {
+    let log = Rc::new(Log::default());
+    let mut holder = HttpSourceHolder::new(ScriptedSource::new(&log, true, [Poll::Pending]));
+    let probe = holder.readable_probe();
+    let observation = Rc::new(Cell::new(None));
+    let on_wake_observation = Rc::clone(&observation);
+    let waker = owner_waker(
+        Some(Box::new(move || {
+            on_wake_observation.set(Some(probe()));
+            panic!("released reader wake");
+        })),
+        None,
+    );
+    assert!(
+        holder
+            .poll_body_event(&mut Context::from_waker(&waker), 7)
+            .is_pending()
+    );
+    drop(waker);
+    let panic = catch_unwind(AssertUnwindSafe(|| holder.release()))
+        .err()
+        .expect("the released reader wake panics");
+    assert_eq!(panic.downcast_ref::<&str>(), Some(&"released reader wake"));
+    assert_eq!(observation.get(), Some(false));
+    assert_eq!(*log.stops.borrow(), [None]);
+    assert_eq!(log.drops.get(), 1);
+    assert!(!holder.readable());
+    assert!(holder.release().expect("no admitted read").is_none());
+}
+
+/// A retired pending read's task is woken and dropped in separate panic
+/// containment, after the source is stopped and dropped: a wake that panics
+/// and a drop that panics do not abort the process, and the first panic wins.
+#[test]
+fn pending_read_wake_and_drop_panics_follow_source_retirement() {
+    let log = Rc::new(Log::default());
+    let mut holder = HttpSourceHolder::new(ScriptedSource::new(&log, true, [Poll::Pending]));
+    let probe = holder.readable_probe();
+    let observation = Rc::new(Cell::new(None));
+    let on_wake_observation = Rc::clone(&observation);
+    let on_wake_log = Rc::clone(&log);
+    let reader_dropped = Rc::new(Cell::new(false));
+    let on_drop = Rc::clone(&reader_dropped);
+    let waker = owner_waker(
+        Some(Box::new(move || {
+            on_wake_observation.set(Some((
+                probe(),
+                on_wake_log.stops.borrow().len(),
+                on_wake_log.drops.get(),
+            )));
+            panic!("retired reader wake");
+        })),
+        Some(Box::new(move || {
+            on_drop.set(true);
+            panic!("retired reader drop");
+        })),
+    );
+    let mut read = holder.read_body_event_unboxed(7);
+    assert!(
+        Pin::new(&mut read)
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    drop(waker);
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        holder.clear(Some(HttpErrorCode::CANCEL))
+    }))
+    .expect_err("the retired reader wake panics");
+    assert_eq!(panic.downcast_ref::<&str>(), Some(&"retired reader wake"));
+    assert!(
+        reader_dropped.get(),
+        "reader destruction was attempted after wake panicked"
+    );
+    assert_eq!(observation.get(), Some((false, 1, 1)));
+    assert_eq!(*log.stops.borrow(), [Some(HttpErrorCode::CANCEL)]);
+    assert_eq!(log.drops.get(), 1);
+    let Poll::Ready(Err(error)) = poll(&mut read) else {
+        panic!("the read was invalidated before waking its reader");
+    };
+    assert_eq!(error.code(), HttpErrorCode::DROPPED);
+}
+
+/// Dropping a pending read whose task's destructor panics releases admission
+/// first and resumes the panic; while the thread is already unwinding, the
+/// destructor's panic is contained instead of aborting the process.
+#[test]
+fn a_dropped_pending_read_contains_its_task_drop_panic_while_unwinding() {
+    for unwinding in [false, true] {
+        let log = Rc::new(Log::default());
+        let mut holder = HttpSourceHolder::new(ScriptedSource::new(
+            &log,
+            true,
+            [Poll::Pending, body(b"after", true)],
+        ));
+        let waker = owner_waker(None, Some(Box::new(|| panic!("abandoned reader drop"))));
+        let mut read = holder.read_body_event_unboxed(7);
+        assert!(
+            Pin::new(&mut read)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        drop(waker);
+        let panic = catch_unwind(AssertUnwindSafe(move || {
+            let _read = read;
+            if unwinding {
+                panic!("already unwinding");
+            }
+        }))
+        .expect_err("a panic leaves the drop");
+        let expected = if unwinding {
+            "already unwinding"
+        } else {
+            "abandoned reader drop"
+        };
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&expected),
+            "unwinding {unwinding}"
+        );
+        let mut next = holder.read_body_event_unboxed(9);
+        let Poll::Ready(Ok(event)) = poll(&mut next) else {
+            panic!("unwinding {unwinding}: the dropped read released admission");
+        };
+        assert_eq!(bytes_of(&event), b"after");
+        assert!(log.stops.borrow().is_empty());
+    }
+}
+
+/// Counts wakes; its strong count shows whether a poll kept a clone of the task.
+#[derive(Default)]
+struct CountingWake(std::sync::atomic::AtomicUsize);
+
+impl Wake for CountingWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl CountingWake {
+    fn wakes(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The holder's owner polls its source in place, with each poll's `maximum`,
+/// and no read future; a terminal event consumes the source unstopped.
+#[test]
+fn an_exclusive_poll_serves_a_polling_source_in_place() {
+    let log = Rc::new(Log::default());
+    let mut holder = HttpSourceHolder::new(ScriptedSource::new(
+        &log,
+        true,
+        [body(b"first", false), Poll::Pending, body(b"last", true)],
+    ));
+    let mut context = Context::from_waker(Waker::noop());
+    let Poll::Ready(Ok(event)) = holder.poll_body_event_exclusive(&mut context, 7) else {
+        panic!("the first poll is ready");
+    };
+    assert_eq!(bytes_of(&event), b"first");
+    assert!(
+        holder
+            .poll_body_event_exclusive(&mut context, 5)
+            .is_pending()
+    );
+    let Poll::Ready(Ok(event)) = holder.poll_body_event_exclusive(&mut context, 6) else {
+        panic!("the third poll is ready");
+    };
+    assert_eq!(bytes_of(&event), b"last");
+    assert!(event.eom());
+    assert_eq!(*log.polls.borrow(), [7, 5, 6]);
+    assert_eq!(log.reads.get(), 0, "no boxed read was made");
+    assert!(!holder.readable(), "the terminal event consumed the source");
+    assert_eq!(log.drops.get(), 1);
+    assert!(log.stops.borrow().is_empty());
+    let Poll::Ready(Err(error)) = holder.poll_body_event_exclusive(&mut context, 7) else {
+        panic!("a consumed holder fails");
+    };
+    assert_eq!(error.code(), HttpErrorCode::DROPPED);
+    assert_eq!(*log.polls.borrow(), [7, 5, 6]);
+}
+
+#[test]
+fn an_exclusive_poll_error_is_terminal() {
+    let log = Rc::new(Log::default());
+    let error = HttpError::with_message(HttpErrorCode::INTERNAL_ERROR, b"failed");
+    let mut holder =
+        HttpSourceHolder::new(ScriptedSource::new(&log, true, [Poll::Ready(Err(error))]));
+    let Poll::Ready(Err(error)) =
+        holder.poll_body_event_exclusive(&mut Context::from_waker(Waker::noop()), 7)
+    else {
+        panic!("the error is returned");
+    };
+    assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+    assert!(!holder.readable());
+    assert_eq!(log.drops.get(), 1);
+    assert!(log.stops.borrow().is_empty());
+}
+
+#[test]
+fn an_exclusive_poll_of_an_empty_holder_fails_dropped() {
+    let mut holder = HttpSourceHolder::empty();
+    let Poll::Ready(Err(error)) =
+        holder.poll_body_event_exclusive(&mut Context::from_waker(Waker::noop()), 7)
+    else {
+        panic!("an empty holder fails");
+    };
+    assert_eq!(error.code(), HttpErrorCode::DROPPED);
+}
+
+/// Only the owner can end the generation an exclusive poll polls, so a
+/// `Pending` exclusive poll keeps no clone of its task, ending the generation
+/// wakes nothing, and a source the owner installs after that poll serves the
+/// next one; a forwarded poll registers its task, as before.
+#[test]
+fn a_pending_exclusive_poll_registers_no_task_and_leaves_no_orphan() {
+    let wake = Arc::new(CountingWake::default());
+    let waker = Waker::from(Arc::clone(&wake));
+    let log = Rc::new(Log::default());
+    let mut holder = HttpSourceHolder::new(ScriptedSource::new(&log, true, [Poll::Pending]));
+    assert!(
+        holder
+            .poll_body_event_exclusive(&mut Context::from_waker(&waker), 7)
+            .is_pending()
+    );
+    assert_eq!(Arc::strong_count(&wake), 2, "no task clone was kept");
+    holder.set_source(ScriptedSource::new(&log, true, [body(b"successor", true)]));
+    assert_eq!(wake.wakes(), 0, "ending the generation woke nothing");
+    let Poll::Ready(Ok(event)) =
+        holder.poll_body_event_exclusive(&mut Context::from_waker(&waker), 9)
+    else {
+        panic!("the owner's replacement serves the next poll");
+    };
+    assert_eq!(bytes_of(&event), b"successor");
+    assert_eq!(*log.polls.borrow(), [7, 9]);
+    assert_eq!(*log.stops.borrow(), [None]);
+
+    let mut forwarded = HttpSourceHolder::new(ScriptedSource::new(&log, true, [Poll::Pending]));
+    assert!(
+        forwarded
+            .poll_body_event(&mut Context::from_waker(&waker), 7)
+            .is_pending()
+    );
+    assert_eq!(
+        Arc::strong_count(&wake),
+        3,
+        "a forwarded poll registers its task"
+    );
+    drop(forwarded);
+    assert_eq!(wake.wakes(), 1);
+}
+
+/// While anything else could reach the holder's state (a read future or
+/// another handle) or a forwarded poll is pending, an exclusive poll is the
+/// forwarded poll, with its guarantees.
+#[test]
+fn an_exclusive_poll_keeps_the_forwarded_poll_guarantees_otherwise() {
+    let log = Rc::new(Log::default());
+    let mut holder = HttpSourceHolder::new(ScriptedSource::new(
+        &log,
+        true,
+        [Poll::Pending, body(b"read", true)],
+    ));
+    let mut read = holder.read_body_event_unboxed(7);
+    assert!(poll(&mut read).is_pending());
+    let Poll::Ready(Err(error)) =
+        holder.poll_body_event_exclusive(&mut Context::from_waker(Waker::noop()), 9)
+    else {
+        panic!("a holder with an active read refuses");
+    };
+    assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+    assert_eq!(*log.polls.borrow(), [7], "the source is not polled for it");
+    assert!(matches!(poll(&mut read), Poll::Ready(Ok(_))));
+    drop(read);
+
+    let log = Rc::new(Log::default());
+    let mut holder = HttpSourceHolder::new(ScriptedSource::new(&log, true, [Poll::Pending]));
+    assert!(
+        holder
+            .poll_body_event(&mut Context::from_waker(Waker::noop()), 7)
+            .is_pending()
+    );
+    holder.set_source(ScriptedSource::new(
+        &log,
+        true,
+        [body(b"replacement", true)],
+    ));
+    let Poll::Ready(Err(error)) =
+        holder.poll_body_event_exclusive(&mut Context::from_waker(Waker::noop()), 9)
+    else {
+        panic!("the orphaned forwarded poll fails once");
+    };
+    assert_eq!(error.code(), HttpErrorCode::DROPPED);
+    let Poll::Ready(Ok(event)) =
+        holder.poll_body_event_exclusive(&mut Context::from_waker(Waker::noop()), 9)
+    else {
+        panic!("then the replacement serves");
+    };
+    assert_eq!(bytes_of(&event), b"replacement");
+
+    let wake = Arc::new(CountingWake::default());
+    let waker = Waker::from(Arc::clone(&wake));
+    let log = Rc::new(Log::default());
+    let mut holder = HttpSourceHolder::new(ScriptedSource::new(&log, true, [Poll::Pending]));
+    let probe = holder.readable_probe();
+    assert!(
+        holder
+            .poll_body_event_exclusive(&mut Context::from_waker(&waker), 7)
+            .is_pending()
+    );
+    assert_eq!(
+        Arc::strong_count(&wake),
+        3,
+        "with another handle to the state, the poll registers its task"
+    );
+    holder.clear(Some(HttpErrorCode::CANCEL));
+    assert_eq!(
+        wake.wakes(),
+        1,
+        "and is woken when the generation goes away"
+    );
+    assert!(!probe());
 }

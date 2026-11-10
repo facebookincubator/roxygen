@@ -24,14 +24,13 @@ use roxygen_core::hybrid_source::HttpHybridSource;
 use roxygen_core::ids::StreamId;
 use roxygen_core::ingress_completion::IngressCompletion;
 use roxygen_core::message::HttpMessage;
+use roxygen_core::source::HttpSource;
 use roxygen_core::source_holder::HolderHeaderRead;
 use roxygen_core::source_holder::HttpSourceHolder;
 use roxygen_core::stream_source::HttpStreamSourceOwner;
 use roxygen_runtime::panic::discard_panic;
 use roxygen_session::owned::OwnedApplication;
 use roxygen_session::owned::OwnedExchange;
-
-type BodyRead = Pin<Box<dyn Future<Output = Result<HttpBodyEvent, HttpError>> + 'static>>;
 
 /// As `UniplexSession`, a handler failure becomes an error response that closes the
 /// connection: `408` for a read timeout, `500` otherwise.
@@ -79,6 +78,14 @@ impl OwnedApplication for HandlerApplication {
             state: ExchangeState::AwaitingRequest,
         }
     }
+}
+
+/// A started response body read.
+enum BodyRead {
+    /// A polling source's read (`DIV-039`), polled through the exclusively owned
+    /// holder with the allowance it started with.
+    InPlace(u32),
+    Future(Pin<Box<dyn Future<Output = Result<HttpBodyEvent, HttpError>> + 'static>>),
 }
 
 enum ExchangeState {
@@ -233,9 +240,17 @@ impl OwnedExchange for HandlerExchange {
         // A pending read keeps the allowance it started with: while it waits the
         // driver serializes nothing more for this exchange, so its allowance can
         // only grow.
-        let read =
-            body_read.get_or_insert_with(|| Box::pin(response.read_body_event_unboxed(maximum)));
-        let result = std::task::ready!(read.as_mut().poll(context));
+        let read = body_read.get_or_insert_with(|| {
+            if response.polls_body_events() {
+                BodyRead::InPlace(maximum)
+            } else {
+                BodyRead::Future(Box::pin(response.read_body_event_unboxed(maximum)))
+            }
+        });
+        let result = std::task::ready!(match read {
+            BodyRead::InPlace(maximum) => response.poll_body_event_exclusive(context, *maximum),
+            BodyRead::Future(read) => read.as_mut().poll(context),
+        });
         *body_read = None;
         Poll::Ready(result)
     }
@@ -252,5 +267,134 @@ impl OwnedExchange for HandlerExchange {
 
     fn complete(mut self) {
         self.retire(None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::cell::RefCell;
+
+    use bytes::Bytes;
+    use roxygen_core::buf_queue::BufQueue;
+    use roxygen_core::handler::HttpHandler;
+    use roxygen_core::source::LocalSourceFuture;
+
+    use super::*;
+
+    const AVAILABLE: &[u8] = b"0123456789";
+
+    /// Answers each body read with one `Pending`, then at most `maximum` of
+    /// `AVAILABLE`, through `poll_body_event` when `polling`, else through the
+    /// read future, which keeps the `maximum` its read started with.
+    struct OnePendingBody {
+        polling: bool,
+        primed: Rc<Cell<bool>>,
+        maxima: Rc<RefCell<Vec<u32>>>,
+    }
+
+    fn poll_once_pending(
+        primed: &Cell<bool>,
+        context: &mut Context<'_>,
+        maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        if !primed.replace(false) {
+            primed.set(true);
+            context.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        let size = AVAILABLE.len().min(maximum as usize);
+        let body = BufQueue::from_bytes(Bytes::from_static(&AVAILABLE[..size]), size)
+            .expect("the body fits its queue");
+        Poll::Ready(Ok(HttpBodyEvent::body(body, true)))
+    }
+
+    impl HttpSource for OnePendingBody {
+        fn read_header_event(&mut self) -> LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
+            unreachable!("the exchange is already responding")
+        }
+
+        fn read_body_event(
+            &mut self,
+            maximum: u32,
+        ) -> LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
+            assert!(
+                !self.polling,
+                "a polling source is never read through a future"
+            );
+            self.maxima.borrow_mut().push(maximum);
+            let primed = Rc::clone(&self.primed);
+            Box::pin(std::future::poll_fn(move |context| {
+                poll_once_pending(&primed, context, maximum)
+            }))
+        }
+
+        fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {}
+
+        fn polls_body_events(&self) -> bool {
+            self.polling
+        }
+
+        fn poll_body_event(
+            &mut self,
+            context: &mut Context<'_>,
+            maximum: u32,
+        ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+            self.maxima.borrow_mut().push(maximum);
+            poll_once_pending(&self.primed, context, maximum)
+        }
+    }
+
+    struct NoHandler;
+
+    impl HttpHandler for NoHandler {
+        fn handle_request(
+            &self,
+            _context: HandlerSessionContext,
+            _request: HttpSourceHolder,
+        ) -> LocalHandlerFuture {
+            unreachable!("the exchange is already responding")
+        }
+    }
+
+    /// A body read pending when the driver's allowance grows still returns at
+    /// most the allowance it started with, polled in place or read through a
+    /// future.
+    #[test]
+    fn a_pending_body_read_keeps_the_allowance_it_started_with() {
+        for polling in [false, true] {
+            let maxima = Rc::new(RefCell::new(Vec::new()));
+            let source = OnePendingBody {
+                polling,
+                primed: Rc::new(Cell::new(false)),
+                maxima: Rc::clone(&maxima),
+            };
+            let mut exchange = HandlerExchange {
+                handler: Rc::new(NoHandler),
+                context: None,
+                state: ExchangeState::Responding {
+                    response: HttpSourceHolder::new(Box::new(source)),
+                    header_read: None,
+                    body_read: None,
+                },
+            };
+            let mut context = Context::from_waker(std::task::Waker::noop());
+            assert!(exchange.poll_body(&mut context, 3).is_pending());
+            let Poll::Ready(Ok(event)) = exchange.poll_body(&mut context, 8) else {
+                panic!("polling {polling}: the pending read completes");
+            };
+            assert_eq!(
+                event.as_body().expect("a body event").chain_length(),
+                3,
+                "polling {polling}: the read's starting allowance"
+            );
+            let expected: &[u32] = if polling { &[3, 3] } else { &[3] };
+            assert_eq!(*maxima.borrow(), expected, "polling {polling}");
+            let Poll::Ready(Err(error)) = exchange.poll_body(&mut context, 8) else {
+                panic!("polling {polling}: the consumed response fails the next read");
+            };
+            assert_eq!(error.code(), HttpErrorCode::DROPPED, "polling {polling}");
+            exchange.complete();
+        }
     }
 }
