@@ -3163,6 +3163,640 @@ mod stream_source {
             assert!(!reader.is_active());
         });
     }
+
+    /// A response source with recorded callbacks, split after its producer
+    /// enabled inline reads (`DIV-047`) unless `inline` is false.
+    fn inline_response(
+        receive_window: u32,
+        inline: bool,
+        deliver_ingress_before_abort: bool,
+    ) -> (
+        HttpResponseSourceOwner,
+        HttpResponseReader,
+        HttpStreamSourceProducer,
+        Rc<RefCell<CallbackLog>>,
+    ) {
+        let log = Rc::new(RefCell::new(CallbackLog::default()));
+        let source = HttpResponseSource::new(
+            StreamId::new(1),
+            Some(Box::new(RecordingCallback(Rc::clone(&log)))),
+            receive_window,
+            Host::tokio(),
+        )
+        .unwrap();
+        if deliver_ingress_before_abort {
+            source.deliver_ingress_before_abort();
+        }
+        let producer = source.producer();
+        if inline {
+            assert!(producer.enable_inline_reads());
+        }
+        let (owner, reader) = source.split();
+        (owner, reader, producer, log)
+    }
+
+    fn body_text(event: &HttpBodyEvent) -> Vec<u8> {
+        let body = event.as_body().expect("a body event");
+        body.coalesce(body.chain_length()).unwrap().to_vec()
+    }
+
+    #[test]
+    fn inline_reads_take_ready_events_without_waiting_or_suspending() {
+        run_paused(async {
+            let (mut owner, mut reader, producer, log) = inline_response(64, true, false);
+            assert!(reader.try_read_header(&owner).is_none());
+            assert!(!reader.is_active(), "an empty inline read admits nothing");
+
+            assert!(producer.headers(response(100, None), false));
+            assert!(producer.headers(response(200, Some(b"8")), false));
+            let head = reader.try_read_header(&owner).unwrap().unwrap();
+            assert_eq!(head.headers().response_status(), Some(100));
+            let head = reader.try_read_header(&owner).unwrap().unwrap();
+            assert_eq!(head.headers().response_status(), Some(200));
+            assert!(!head.eom());
+
+            for _ in 0..3 {
+                assert!(
+                    reader.try_read_body(&owner, 64).is_none(),
+                    "an empty inline body read returns nothing, not a suspend"
+                );
+                assert!(!reader.is_active());
+            }
+
+            // Two bodies coalesce into one queued event, split at the maximum.
+            assert_eq!(
+                producer.body(body(b"abcd"), 0, false),
+                FlowControlState::Open
+            );
+            assert_eq!(producer.body(body(b"ef"), 0, false), FlowControlState::Open);
+            let event = reader.try_read_body(&owner, 4).unwrap().unwrap();
+            assert_eq!(body_text(&event), b"abcd");
+            assert!(!event.eom());
+            let event = reader.try_read_body(&owner, 64).unwrap().unwrap();
+            assert_eq!(body_text(&event), b"ef");
+            assert!(!event.eom());
+            assert!(log.borrow().completions.is_empty());
+
+            assert_eq!(producer.body(body(b"gh"), 0, true), FlowControlState::Open);
+            let event = reader.try_read_body(&owner, 64).unwrap().unwrap();
+            assert_eq!(body_text(&event), b"gh");
+            assert!(event.eom());
+            assert_eq!(
+                log.borrow().completions,
+                [None],
+                "the EOM read completes the source"
+            );
+
+            owner.retire_terminal();
+            let Some(Err(error)) = reader.try_read_body(&owner, 64) else {
+                panic!("an inline read of a retired source must fail");
+            };
+            assert_eq!(error.code(), HttpErrorCode::DROPPED);
+            assert_eq!(
+                log.borrow().completions,
+                [None],
+                "the source completes once"
+            );
+        });
+    }
+
+    #[test]
+    fn an_empty_inline_read_registers_no_waker() {
+        run_paused(async {
+            let (owner, mut reader, producer, _log) = inline_response(64, true, false);
+            reader.set_suspend_free(true);
+            let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut context = Context::from_waker(&waker);
+            // A waiting read registers the counting waker, then retires, as a
+            // reader that switches to inline reads does.
+            reader.arm_header(&owner).unwrap();
+            assert!(reader.poll_header(&mut context).is_pending());
+            reader.retire_active_read();
+
+            for _ in 0..3 {
+                assert!(reader.try_read_header(&owner).is_none());
+            }
+            assert!(producer.headers(response(200, None), false));
+            assert_eq!(
+                wakes.0.load(Ordering::SeqCst),
+                0,
+                "a header after empty inline reads wakes nothing"
+            );
+            let head = reader.try_read_header(&owner).unwrap().unwrap();
+            assert_eq!(head.headers().response_status(), Some(200));
+
+            for _ in 0..3 {
+                assert!(reader.try_read_body(&owner, 64).is_none());
+            }
+            assert_eq!(
+                producer.body(body(b"token"), 0, false),
+                FlowControlState::Open
+            );
+            assert_eq!(
+                wakes.0.load(Ordering::SeqCst),
+                0,
+                "a body after empty inline reads wakes nothing"
+            );
+            let event = reader.try_read_body(&owner, 64).unwrap().unwrap();
+            assert_eq!(body_text(&event), b"token");
+        });
+    }
+
+    #[test]
+    fn inline_reads_report_the_ingress_error_a_waiting_read_reports() {
+        run_paused(async {
+            let mut outcomes = Vec::new();
+            for inline in [true, false] {
+                let (owner, mut reader, producer, log) = inline_response(64, true, false);
+                assert!(producer.headers(response(200, Some(b"2")), false));
+                let mut context = Context::from_waker(Waker::noop());
+                if inline {
+                    assert!(reader.try_read_header(&owner).unwrap().is_ok());
+                } else {
+                    reader.arm_header(&owner).unwrap();
+                    assert!(matches!(
+                        reader.poll_header(&mut context),
+                        Poll::Ready(Ok(_))
+                    ));
+                }
+                producer.body(body(b"abc"), 0, true);
+                let result = if inline {
+                    reader.try_read_body(&owner, 64).unwrap()
+                } else {
+                    reader.arm_body(&owner, 64).unwrap();
+                    let Poll::Ready(result) = reader.poll_body(&mut context) else {
+                        panic!("the waiting read must find the error");
+                    };
+                    result
+                };
+                let Err(error) = result else {
+                    panic!("a content-length mismatch must fail the read, inline={inline}");
+                };
+                outcomes.push((
+                    error.code(),
+                    error.message().to_vec(),
+                    log.borrow().completions.clone(),
+                ));
+            }
+            assert_eq!(
+                outcomes[0],
+                (
+                    HttpErrorCode::CONTENT_LENGTH_MISMATCH,
+                    b"Content-Length/body mismatch on ingress: expected= 2, actual= 3".to_vec(),
+                    vec![Some(HttpErrorCode::CONTENT_LENGTH_MISMATCH)],
+                )
+            );
+            assert_eq!(outcomes[0], outcomes[1]);
+        });
+    }
+
+    enum CreditStep {
+        Produce(&'static [u8]),
+        Eom,
+        Read(u32),
+    }
+
+    /// Reads a 200 response from an 8-byte window, inline or with suspend-free
+    /// waiting reads, producing as `steps` say. Returns each step's outcome
+    /// followed by the callback log.
+    fn credit_transcript(inline: bool, steps: &[CreditStep]) -> Vec<String> {
+        let (owner, mut reader, producer, log) = inline_response(8, inline, false);
+        reader.set_suspend_free(true);
+        assert!(producer.headers(response(200, None), false));
+        let mut context = Context::from_waker(Waker::noop());
+        if inline {
+            assert!(reader.try_read_header(&owner).unwrap().is_ok());
+        } else {
+            reader.arm_header(&owner).unwrap();
+            assert!(matches!(
+                reader.poll_header(&mut context),
+                Poll::Ready(Ok(_))
+            ));
+        }
+        let mut transcript = Vec::new();
+        let mut pending = false;
+        for step in steps {
+            let outcome = match step {
+                CreditStep::Produce(bytes) => {
+                    format!("{:?}", producer.body(body(bytes), 0, false))
+                }
+                CreditStep::Eom => format!("eom {}", producer.eom()),
+                CreditStep::Read(maximum) => {
+                    let result = if inline {
+                        reader.try_read_body(&owner, *maximum)
+                    } else {
+                        if !pending {
+                            reader.arm_body(&owner, *maximum).unwrap();
+                        }
+                        match reader.poll_body(&mut context) {
+                            Poll::Ready(result) => Some(result),
+                            Poll::Pending => None,
+                        }
+                    };
+                    pending = !inline && result.is_none();
+                    match result {
+                        None => "empty".to_owned(),
+                        Some(Ok(event)) => format!(
+                            "{:?} {:?} eom={}",
+                            event.event_type(),
+                            String::from_utf8(body_text(&event)).unwrap(),
+                            event.eom()
+                        ),
+                        Some(Err(error)) => format!("error {:?}", error.code()),
+                    }
+                }
+            };
+            let log = log.borrow();
+            transcript.push(format!(
+                "{outcome} | processed={:?} opened={:?} completions={:?}",
+                log.processed, log.opened, log.completions
+            ));
+        }
+        transcript
+    }
+
+    #[test]
+    fn inline_reads_keep_credit_and_completion_as_waiting_reads() {
+        run_paused(async {
+            let steps = [
+                CreditStep::Produce(b"abcdefgh"),
+                CreditStep::Read(3),
+                CreditStep::Read(3),
+                CreditStep::Read(3),
+                CreditStep::Read(3),
+                CreditStep::Produce(b"ijklmn"),
+                CreditStep::Read(3),
+                CreditStep::Eom,
+                CreditStep::Read(8),
+            ];
+            let inline = credit_transcript(true, &steps);
+            let id = StreamId::new(1);
+            // Every read reports its credit. The first opens the closed
+            // window, which owes no update until 4 bytes are read; the second
+            // acknowledges the 6 bytes read so far, and the read of "ijk" the
+            // 5 read since. The EOM read completes.
+            assert_eq!(
+                inline.last().unwrap(),
+                &format!(
+                    "Body \"lmn\" eom=true | processed={:?} opened={:?} completions=[None]",
+                    [(id, 3, 0), (id, 3, 6), (id, 2, 0), (id, 3, 5), (id, 3, 0)],
+                    [id]
+                )
+            );
+            assert_eq!(inline[4].split(" | ").next(), Some("empty"));
+            assert_eq!(inline, credit_transcript(false, &steps));
+        });
+    }
+
+    /// Reads a response whose head and body were queued before an ingress
+    /// abort, inline or with waiting reads, with `DIV-033` on or off.
+    fn kept_events_transcript(inline: bool, keep: bool) -> Vec<String> {
+        let (owner, mut reader, producer, log) = inline_response(64, true, keep);
+        reader.set_suspend_free(true);
+        assert!(producer.headers(response(200, None), false));
+        assert_eq!(
+            producer.body(body(b"first"), 0, false),
+            FlowControlState::Open
+        );
+        assert!(producer.abort(HttpErrorCode::TRANSPORT_EOF, b"transport EOF"));
+        let mut context = Context::from_waker(Waker::noop());
+        let mut transcript = Vec::new();
+        let header = if inline {
+            reader.try_read_header(&owner).unwrap()
+        } else {
+            reader.arm_header(&owner).unwrap();
+            let Poll::Ready(result) = reader.poll_header(&mut context) else {
+                panic!("the aborted source must not wait");
+            };
+            result
+        };
+        let header_read = header.is_ok();
+        transcript.push(match header {
+            Ok(head) => format!("head {:?}", head.headers().response_status()),
+            Err(error) => format!("error {:?}", error.code()),
+        });
+        transcript.push(format!("completions={:?}", log.borrow().completions));
+        if header_read {
+            for _ in 0..2 {
+                let result = if inline {
+                    reader.try_read_body(&owner, u32::MAX).unwrap()
+                } else {
+                    if !reader.is_active() {
+                        reader.arm_body(&owner, u32::MAX).unwrap();
+                    }
+                    let Poll::Ready(result) = reader.poll_body(&mut context) else {
+                        panic!("the aborted source must not wait");
+                    };
+                    result
+                };
+                transcript.push(match result {
+                    Ok(event) => format!(
+                        "body {:?} eom={}",
+                        String::from_utf8(body_text(&event)).unwrap(),
+                        event.eom()
+                    ),
+                    Err(error) => format!("error {:?}", error.code()),
+                });
+                transcript.push(format!("completions={:?}", log.borrow().completions));
+            }
+        }
+        transcript
+    }
+
+    #[test]
+    fn inline_reads_return_kept_events_then_the_abort_error() {
+        run_paused(async {
+            let eof = format!("error {:?}", HttpErrorCode::TRANSPORT_EOF);
+            let kept = [
+                "head Some(200)",
+                "completions=[]",
+                "body \"first\" eom=false",
+                "completions=[None]",
+                &eof,
+                "completions=[None]",
+            ];
+            assert_eq!(kept_events_transcript(true, true), kept);
+            assert_eq!(kept_events_transcript(false, true), kept);
+
+            let discarded = [eof.as_str(), "completions=[None]"];
+            assert_eq!(kept_events_transcript(true, false), discarded);
+            assert_eq!(kept_events_transcript(false, false), discarded);
+        });
+    }
+
+    #[test]
+    fn inline_reads_are_refused_unless_the_producer_enabled_them() {
+        run_paused(async {
+            let (owner, mut reader, producer, log) = inline_response(64, false, false);
+            assert!(producer.headers(response(200, None), false));
+            let Some(Err(error)) = reader.try_read_header(&owner) else {
+                panic!("an inline read of a source without inline reads must be refused");
+            };
+            assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+            assert!(!reader.is_active());
+
+            // The refusal changes nothing: a waiting read takes the head.
+            let mut context = Context::from_waker(Waker::noop());
+            reader.arm_header(&owner).unwrap();
+            assert!(matches!(
+                reader.poll_header(&mut context),
+                Poll::Ready(Ok(head)) if head.headers().response_status() == Some(200)
+            ));
+            assert!(matches!(
+                reader.try_read_body(&owner, 64),
+                Some(Err(error)) if error.code() == HttpErrorCode::INVALID_STATE_TRANSITION
+            ));
+            assert!(log.borrow().completions.is_empty());
+
+            // Control: the same head on a source with inline reads.
+            let (owner, mut reader, producer, _log) = inline_response(64, true, false);
+            assert!(producer.headers(response(200, None), false));
+            assert!(matches!(
+                reader.try_read_header(&owner),
+                Some(Ok(head)) if head.headers().response_status() == Some(200)
+            ));
+        });
+    }
+
+    #[test]
+    fn inline_reads_refuse_an_armed_reader() {
+        run_paused(async {
+            let refused = |result: Option<Result<HttpHeaderEvent, HttpError>>| matches!(result, Some(Err(error)) if error.code() == HttpErrorCode::INVALID_STATE_TRANSITION);
+            let mut context = Context::from_waker(Waker::noop());
+
+            // An armed read that was never polled.
+            let (owner, mut reader, producer, _log) = inline_response(64, true, false);
+            assert!(producer.headers(response(200, None), false));
+            reader.arm_header(&owner).unwrap();
+            assert!(refused(reader.try_read_header(&owner)));
+            assert!(reader.is_active(), "the refusal leaves the armed read");
+            assert!(matches!(
+                reader.poll_header(&mut context),
+                Poll::Ready(Ok(head)) if head.headers().response_status() == Some(200)
+            ));
+
+            // A pending read.
+            let (owner, mut reader, producer, _log) = inline_response(64, true, false);
+            reader.set_suspend_free(true);
+            reader.arm_header(&owner).unwrap();
+            assert!(reader.poll_header(&mut context).is_pending());
+            assert!(refused(reader.try_read_header(&owner)));
+            assert!(reader.is_active());
+            assert!(producer.headers(response(200, None), false));
+            assert!(matches!(
+                reader.poll_header(&mut context),
+                Poll::Ready(Ok(_))
+            ));
+
+            // A suspend-free reader armed between body events (`DIV-045`).
+            reader.arm_body(&owner, 64).unwrap();
+            assert_eq!(
+                producer.body(body(b"one"), 0, false),
+                FlowControlState::Open
+            );
+            assert!(matches!(reader.poll_body(&mut context), Poll::Ready(Ok(_))));
+            assert!(reader.is_active());
+            assert_eq!(
+                producer.body(body(b"two"), 0, false),
+                FlowControlState::Open
+            );
+            assert!(matches!(
+                reader.try_read_body(&owner, 64),
+                Some(Err(error)) if error.code() == HttpErrorCode::INVALID_STATE_TRANSITION
+            ));
+            assert!(reader.is_active());
+
+            // Control: once retired, the reader reads inline.
+            reader.retire_active_read();
+            let event = reader.try_read_body(&owner, 64).unwrap().unwrap();
+            assert_eq!(body_text(&event), b"two");
+        });
+    }
+
+    #[test]
+    fn inline_reads_are_refused_for_a_source_with_a_read_timeout() {
+        run_paused(async {
+            // A source with a read timeout.
+            let (owner, mut reader, producer, _log) = inline_response(64, false, false);
+            reader.set_suspend_free(true);
+            assert!(producer.set_read_timeout(Duration::from_secs(2)));
+            assert!(!producer.enable_inline_reads());
+            assert!(matches!(
+                reader.try_read_header(&owner),
+                Some(Err(error)) if error.code() == HttpErrorCode::INVALID_STATE_TRANSITION
+            ));
+            // The refusal changes nothing: a waiting read still times out.
+            reader.arm_header(&owner).unwrap();
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(reader.poll_header(&mut context).is_pending());
+            time::advance(Duration::from_secs(2)).await;
+            let Err(error) = std::future::poll_fn(|context| reader.poll_header(context)).await
+            else {
+                panic!("the read timeout must still apply");
+            };
+            assert_eq!(error.code(), HttpErrorCode::READ_TIMEOUT);
+
+            // A source with a deferred read timeout.
+            let (owner, mut reader, producer, _log) = inline_response(64, false, false);
+            assert!(
+                producer
+                    .defer_read_timeout(DeferredReadTimeout::DeferUpdates(Duration::from_secs(2)))
+            );
+            assert!(!producer.enable_inline_reads());
+            assert!(matches!(
+                reader.try_read_header(&owner),
+                Some(Err(error)) if error.code() == HttpErrorCode::INVALID_STATE_TRANSITION
+            ));
+            assert!(producer.arm_read_timeout(), "the deferred timeout stays");
+
+            // Control: a source without a read timeout.
+            let (_owner, _reader, producer, _log) = inline_response(64, false, false);
+            assert!(producer.enable_inline_reads());
+        });
+    }
+
+    #[test]
+    fn inline_reads_are_refused_while_a_read_is_pending() {
+        run_paused(async {
+            let (owner, mut reader, producer, _log) = inline_response(64, false, false);
+            reader.set_suspend_free(true);
+            reader.arm_header(&owner).unwrap();
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(reader.poll_header(&mut context).is_pending());
+            assert!(!producer.enable_inline_reads());
+            reader.retire_active_read();
+            assert!(matches!(
+                reader.try_read_header(&owner),
+                Some(Err(error)) if error.code() == HttpErrorCode::INVALID_STATE_TRANSITION
+            ));
+
+            // Control: with no read pending, the producer enables them.
+            assert!(producer.enable_inline_reads());
+            assert!(reader.try_read_header(&owner).is_none());
+        });
+    }
+
+    #[test]
+    fn a_nonzero_read_timeout_is_refused_after_inline_reads_are_enabled() {
+        run_paused(async {
+            let (owner, mut reader, producer, _log) = inline_response(64, true, false);
+            assert!(!producer.set_read_timeout(Duration::from_secs(2)));
+            for deferred in [
+                DeferredReadTimeout::DeferUpdates(Duration::from_secs(2)),
+                DeferredReadTimeout::ReplaceUpdates(Duration::from_secs(2)),
+                DeferredReadTimeout::CancelOnUpdate(Duration::from_secs(2)),
+            ] {
+                assert!(!producer.defer_read_timeout(deferred));
+            }
+            assert!(!producer.arm_read_timeout(), "nothing was deferred");
+            // Zero timeouts stay accepted.
+            assert!(producer.set_read_timeout(Duration::ZERO));
+            assert!(producer.defer_read_timeout(DeferredReadTimeout::DeferUpdates(Duration::ZERO)));
+            assert!(producer.arm_read_timeout());
+
+            // The refusals changed nothing: a waiting read does not time out.
+            reader.set_suspend_free(true);
+            reader.arm_header(&owner).unwrap();
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(reader.poll_header(&mut context).is_pending());
+            time::advance(Duration::from_secs(3)).await;
+            assert!(reader.poll_header(&mut context).is_pending());
+            assert!(producer.headers(response(200, None), false));
+            assert!(matches!(
+                reader.poll_header(&mut context),
+                Poll::Ready(Ok(_))
+            ));
+
+            // Control: a source without inline reads accepts a timeout.
+            let (_owner, _reader, producer, _log) = inline_response(64, false, false);
+            assert!(producer.set_read_timeout(Duration::from_secs(2)));
+        });
+    }
+
+    /// A callback whose first credit report panics.
+    struct PanicOnFirstCredit(Rc<Cell<bool>>);
+
+    impl HttpStreamSourceCallback for PanicOnFirstCredit {
+        fn bytes_processed(&mut self, _id: StreamId, _amount: usize, _to_acknowledge: usize) {
+            if !self.0.replace(true) {
+                panic!("first credit report");
+            }
+        }
+    }
+
+    #[test]
+    fn an_inline_read_that_unwinds_releases_its_admission() {
+        run_paused(async {
+            let reported = Rc::new(Cell::new(false));
+            let source = HttpResponseSource::new(
+                StreamId::new(1),
+                Some(Box::new(PanicOnFirstCredit(Rc::clone(&reported)))),
+                64,
+                Host::tokio(),
+            )
+            .unwrap();
+            let producer = source.producer();
+            assert!(producer.enable_inline_reads());
+            let (owner, mut reader) = source.split();
+            assert!(producer.headers(response(200, None), false));
+            assert!(reader.try_read_header(&owner).unwrap().is_ok());
+            assert_eq!(
+                producer.body(body(b"one"), 0, false),
+                FlowControlState::Open
+            );
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reader.try_read_body(&owner, 64)
+            }));
+            assert!(unwound.is_err(), "the credit callback panic propagates");
+            assert!(reported.get());
+
+            // The unwound read is not left admitted: the next one reads on.
+            assert_eq!(producer.body(body(b"two"), 0, true), FlowControlState::Open);
+            let event = reader.try_read_body(&owner, 64).unwrap().unwrap();
+            assert_eq!(body_text(&event), b"two");
+            assert!(event.eom());
+        });
+    }
+
+    #[test]
+    fn a_waiting_read_after_inline_reads_waits_and_is_woken() {
+        run_paused(async {
+            let (owner, mut reader, producer, log) = inline_response(64, true, false);
+            assert!(reader.try_read_header(&owner).is_none());
+            assert!(producer.headers(response(200, None), false));
+            assert!(reader.try_read_header(&owner).unwrap().is_ok());
+            assert!(reader.try_read_body(&owner, 64).is_none());
+            assert_eq!(
+                producer.body(body(b"one"), 0, false),
+                FlowControlState::Open
+            );
+            let event = reader.try_read_body(&owner, 64).unwrap().unwrap();
+            assert_eq!(body_text(&event), b"one");
+            assert!(reader.try_read_body(&owner, 64).is_none());
+
+            // The reader falls back to a suspend-free waiting read.
+            reader.set_suspend_free(true);
+            let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut context = Context::from_waker(&waker);
+            reader.arm_body(&owner, 64).unwrap();
+            assert!(reader.poll_body(&mut context).is_pending());
+            assert_eq!(producer.body(body(b"two"), 0, true), FlowControlState::Open);
+            assert_eq!(
+                wakes.0.load(Ordering::SeqCst),
+                1,
+                "the body wakes the read once"
+            );
+            let Poll::Ready(Ok(event)) = reader.poll_body(&mut context) else {
+                panic!("the woken read must return the body");
+            };
+            assert_eq!(body_text(&event), b"two");
+            assert!(event.eom());
+            assert!(!reader.is_active());
+            assert_eq!(log.borrow().completions, [None]);
+        });
+    }
 }
 
 mod stream_source_holder {

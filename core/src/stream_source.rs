@@ -296,6 +296,8 @@ struct StreamState {
     /// The largest growth hint of a body that left the queue, so coalescing
     /// grows a body container once instead of doubling it.
     body_segment_hint: u16,
+    /// The producer declared that the exclusive reader drives it (`DIV-047`).
+    inline_reads: bool,
 }
 
 struct StreamShared {
@@ -480,6 +482,12 @@ impl StreamShared {
         } else {
             self.store_read_timeout(timeout);
         }
+    }
+
+    /// Whether the producer refuses `timeout`: inline reads (`DIV-047`) have
+    /// no wait that could time out.
+    fn refuses_read_timeout(&self, timeout: Duration) -> bool {
+        !timeout.is_zero() && self.state.borrow().inline_reads
     }
 
     fn store_read_timeout(&self, timeout: Duration) {
@@ -952,11 +960,123 @@ impl HttpResponseReader {
         );
         finish_retirement_panic(first, unwinding);
     }
+
+    /// Roxygen-only (`DIV-047`): takes the next queued header event without
+    /// waiting, for a source whose producer enabled inline reads
+    /// ([`HttpStreamSourceProducer::enable_inline_reads`]).
+    ///
+    /// The read is validated and admitted as an armed read is, takes the event
+    /// as that read's first poll would, events an ingress abort kept
+    /// (`DIV-033`) included, and completes as it would, completing the source
+    /// when it can. `None` means nothing is queued: no read stays admitted, and
+    /// no wait or waker is registered, so the producer wakes nothing when it
+    /// queues the next event. The caller polls the producer before reading
+    /// again. A source without inline reads, an armed or pending read, and the
+    /// owner of another source refuse the read with `INVALID_STATE_TRANSITION`,
+    /// changing nothing; a released source fails it with `DROPPED`.
+    pub fn try_read_header(
+        &mut self,
+        owner: &HttpResponseSourceOwner,
+    ) -> Option<Result<HttpHeaderEvent, HttpError>> {
+        self.try_read(owner, ReadKind::Header, u32::MAX)
+            .map(|result| {
+                result.map(|event| match event {
+                    StreamReadOutput::Header(event) => event,
+                    StreamReadOutput::Body(_) => unreachable!("a header read returns headers"),
+                })
+            })
+    }
+
+    /// Roxygen-only (`DIV-047`): takes the next queued body event, of at most
+    /// `maximum` body bytes, without waiting, as
+    /// [`Self::try_read_header`] takes a header event, with an armed read's
+    /// splitting and flow-control credit. It never returns
+    /// `HttpBodyEvent::suspend`.
+    #[inline]
+    pub fn try_read_body(
+        &mut self,
+        owner: &HttpResponseSourceOwner,
+        maximum: u32,
+    ) -> Option<Result<HttpBodyEvent, HttpError>> {
+        self.try_read(owner, ReadKind::Body, maximum).map(|result| {
+            result.map(|event| match event {
+                StreamReadOutput::Body(event) => event,
+                StreamReadOutput::Header(_) => unreachable!("a body read returns body events"),
+            })
+        })
+    }
+
+    #[inline]
+    fn try_read(
+        &mut self,
+        owner: &HttpResponseSourceOwner,
+        kind: ReadKind,
+        maximum: u32,
+    ) -> Option<Result<StreamReadOutput, HttpError>> {
+        let Some(source) = owner.owner.source() else {
+            return Some(Err(source_not_readable()));
+        };
+        if self.is_active() || !self.matches(source) {
+            return Some(Err(inline_read_requires_an_idle_reader()));
+        }
+        let shared = &source.shared;
+        shared.assert_owner();
+        if !shared.state.borrow().inline_reads {
+            return Some(Err(inline_reads_not_enabled()));
+        }
+        self.body_started |= matches!(kind, ReadKind::Body);
+        if let Err(error) = validate_read(shared, kind, maximum) {
+            return Some(Err(error));
+        }
+        {
+            let mut state = shared.state.borrow_mut();
+            if state.active_read.is_some() || state.suspend_wait_active {
+                return Some(Err(read_already_active()));
+            }
+            state.active_read = Some(ReadActivity::Exclusive);
+        }
+        let mut admission = InlineReadAdmission {
+            shared,
+            admitted: true,
+        };
+        let result = take_ready_event(shared, kind, maximum);
+        admission.admitted = false;
+        let Some(result) = result else {
+            shared.state.borrow_mut().active_read = None;
+            return None;
+        };
+        let eom = result.as_ref().ok().is_some_and(|event| match event {
+            StreamReadOutput::Header(event) => event.eom(),
+            StreamReadOutput::Body(event) => event.eom(),
+        });
+        finish_exclusive_read(shared, eom);
+        Some(result)
+    }
 }
 
 impl Drop for HttpResponseReader {
     fn drop(&mut self) {
         self.retire_active_read();
+    }
+}
+
+/// Retires an inline read whose event take unwinds, as a panicking armed read
+/// is retired (`DIV-047`).
+struct InlineReadAdmission<'a> {
+    shared: &'a Rc<StreamShared>,
+    admitted: bool,
+}
+
+impl Drop for InlineReadAdmission<'_> {
+    fn drop(&mut self) {
+        if self.admitted {
+            let unwinding = std::thread::panicking();
+            let failure = catch_unwind(AssertUnwindSafe(|| {
+                finish_exclusive_read(self.shared, false)
+            }))
+            .err();
+            finish_retirement_panic(failure, unwinding);
+        }
     }
 }
 
@@ -1223,6 +1343,7 @@ impl HttpStreamSource {
                     can_suspend: true,
                     suspend_wait_active: false,
                     body_segment_hint: 0,
+                    inline_reads: false,
                 }),
                 callback: RefCell::new(CallbackSlot {
                     callback,
@@ -1802,11 +1923,43 @@ impl HttpStreamSourceProducer {
         stop_reading(&shared, error)
     }
 
+    /// Roxygen-only (`DIV-047`): declares that the source's exclusive reader
+    /// drives this producer, so that [`HttpResponseReader::try_read_header`]
+    /// and [`HttpResponseReader::try_read_body`] may take its events without
+    /// waiting. Afterwards the producer refuses a nonzero read timeout, which
+    /// a read that never waits could not honor: `set_read_timeout` and
+    /// `defer_read_timeout` with one return false and change nothing.
+    ///
+    /// Returns false, changing nothing, if the source has a read timeout or a
+    /// deferred one, if a read or a suspend's resume wait is in progress, or if
+    /// the source state has retired.
+    pub fn enable_inline_reads(&self) -> bool {
+        let Some(shared) = self.shared.upgrade() else {
+            return false;
+        };
+        shared.assert_owner();
+        if shared.has_read_timeout() || shared.deferred_read_timeout.get().is_some() {
+            return false;
+        }
+        let mut state = shared.state.borrow_mut();
+        if state.active_read.is_some() || state.suspend_wait_active {
+            return false;
+        }
+        state.inline_reads = true;
+        true
+    }
+
+    /// Sets the read timeout at once. Returns false, changing nothing, if the
+    /// source state has retired, or if the timeout is nonzero and inline reads
+    /// are enabled (`DIV-047`).
     pub fn set_read_timeout(&self, timeout: Duration) -> bool {
         let Some(shared) = self.shared.upgrade() else {
             return false;
         };
         shared.assert_owner();
+        if shared.refuses_read_timeout(timeout) {
+            return false;
+        }
         shared.set_read_timeout(timeout);
         true
     }
@@ -1814,12 +1967,17 @@ impl HttpStreamSourceProducer {
     /// Disables the current timeout until explicitly armed, using this update policy.
     ///
     /// Producer `set_read_timeout` remains immediate and bypasses this policy.
-    /// Returns false if the source state has retired.
+    /// Returns false if the source state has retired, or if the deferred
+    /// timeout is nonzero and inline reads are enabled (`DIV-047`); both change
+    /// nothing.
     pub fn defer_read_timeout(&self, timeout: DeferredReadTimeout) -> bool {
         let Some(shared) = self.shared.upgrade() else {
             return false;
         };
         shared.assert_owner();
+        if shared.refuses_read_timeout(timeout.duration()) {
+            return false;
+        }
         shared.deferred_read_timeout.set(Some(timeout));
         shared.set_read_timeout(Duration::ZERO);
         true
@@ -2642,6 +2800,24 @@ pub(crate) fn source_not_readable() -> HttpError {
 #[inline(never)]
 fn response_read_not_armed() -> HttpError {
     HttpError::with_message(HttpErrorCode::DROPPED, b"response read is not armed")
+}
+
+#[cold]
+#[inline(never)]
+fn inline_read_requires_an_idle_reader() -> HttpError {
+    HttpError::with_message(
+        HttpErrorCode::INVALID_STATE_TRANSITION,
+        b"inline response read requires an idle reader and its matching source owner",
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn inline_reads_not_enabled() -> HttpError {
+    HttpError::with_message(
+        HttpErrorCode::INVALID_STATE_TRANSITION,
+        b"inline response reads require a producer that enabled them",
+    )
 }
 
 #[cold]
