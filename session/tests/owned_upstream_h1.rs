@@ -1,6 +1,9 @@
 // Owned HTTP/1.1 upstream session tests. Each byte comparison runs a `UniplexSession` HTTP/1.1
 // client with the same request, the same zero-timeout `UniplexConfig` and the same origin bytes.
 
+use std::task::Context;
+use std::task::Waker;
+
 use roxygen_core::ids::StreamId;
 use roxygen_core::source::LocalSourceFuture;
 use roxygen_core::stream_source::FlowControlState;
@@ -18,6 +21,8 @@ use crate::owned_h1::Http1DriverConfig;
 use crate::owned_h1::OwnedH1Options;
 use crate::owned_h1::OwnedH1UpstreamReservation;
 use crate::owned_h1::OwnedH1UpstreamSession;
+use crate::owned_h1::codec_parses;
+use crate::owned_h1::driver_turns;
 
 const OK_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 /// `OK_RESPONSE` on a connection the origin will not keep open.
@@ -223,6 +228,15 @@ fn owned_exchange_wire(
     response: &'static [u8],
     response_body: &'static [u8],
 ) -> Vec<u8> {
+    owned_exchange_writes(request, response, response_body).concat()
+}
+
+/// As `owned_exchange_wire`; returns each write.
+fn owned_exchange_writes(
+    request: impl FnOnce() -> (HttpHeaderEvent, Vec<HttpBodyEvent>) + Send + 'static,
+    response: &'static [u8],
+    response_body: &'static [u8],
+) -> Vec<Vec<u8>> {
     run_on_host(move |context| {
         Box::pin(async move {
             let gate = Arc::new(tokio::sync::Notify::new());
@@ -245,7 +259,7 @@ fn owned_exchange_wire(
             });
             run.unwrap();
             assert_eq!(read.body, response_body);
-            state.borrow().writes.concat()
+            state.borrow().writes.clone()
         })
     })
 }
@@ -6363,4 +6377,400 @@ fn a_teardown_panic_on_a_read_error_during_a_request_write_resets_at_once() {
             "queued {queued}"
         );
     }
+}
+
+/// Bytes pushed by the test, which `PushedReadTransport` reads deliver as they arrive.
+#[derive(Default)]
+struct PushedReads {
+    chunks: RefCell<VecDeque<Vec<u8>>>,
+    waker: RefCell<Option<Waker>>,
+}
+
+impl PushedReads {
+    fn push(&self, bytes: &[u8]) {
+        self.chunks.borrow_mut().push_back(bytes.to_vec());
+        let waker = self.waker.borrow_mut().take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+/// Writes and closes through a [`ScriptedTransport`]; each read takes the next pushed bytes,
+/// waiting for them, and observes its cancellation when polled.
+struct PushedReadTransport {
+    inner: Rc<ScriptedTransport>,
+    reads: Rc<PushedReads>,
+}
+
+impl UniplexTransport for PushedReadTransport {
+    fn read(
+        &self,
+        _context: &WorkerContext,
+        _maximum: usize,
+        _allocation_size: usize,
+        _timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        let reads = Rc::clone(&self.reads);
+        Box::pin(std::future::poll_fn(move |context| {
+            if let Some(bytes) = reads.chunks.borrow_mut().pop_front() {
+                return Poll::Ready(Ok(UniplexRead::new(queue(&bytes), false)));
+            }
+            if cancellation.is_cancellation_requested() {
+                return Poll::Ready(Err(HttpError::with_message(
+                    HttpErrorCode::CORO_CANCELLED,
+                    b"pushed read cancelled",
+                )));
+            }
+            *reads.waker.borrow_mut() = Some(context.waker().clone());
+            Poll::Pending
+        }))
+    }
+
+    fn write(
+        &self,
+        context: &WorkerContext,
+        data: BufQueue,
+        flags: ByteEventWriteFlags,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        self.inner
+            .write(context, data, flags, timeout, cancellation)
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.shutdown_write(context)
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close_with_reset(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.inner.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.inner.register_byte_event(context, registration)
+    }
+}
+
+/// Sends a GET whose chunked response head the origin sends at once, then, for each of
+/// `chunks`, pushes it as one read, polls the driver, reads the chunk from the response source
+/// and polls the driver again. Returns the driver turns and codec parses each chunk took.
+fn streamed_chunk_turns(chunks: &'static [&'static [u8]]) -> Vec<(usize, usize)> {
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let (inner, _state) = ScriptedTransport::new([]);
+            let reads = Rc::new(PushedReads::default());
+            let transport = Rc::new(PushedReadTransport {
+                inner,
+                reads: Rc::clone(&reads),
+            });
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            let mut poll = Context::from_waker(Waker::noop());
+            let mut run = std::pin::pin!(session.run());
+            assert!(
+                run.as_mut().poll(&mut poll).is_pending(),
+                "the GET waits for its response"
+            );
+            let mut submission = std::pin::pin!(submission);
+            let Poll::Ready(response) = submission.as_mut().poll(&mut poll) else {
+                panic!("the GET is committed in the first poll");
+            };
+            let (_stream, mut source, _control) = response.unwrap().into_source_parts();
+            reads.push(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            let Poll::Ready(head) = source.read_header_event().as_mut().poll(&mut poll) else {
+                panic!("the response head is readable");
+            };
+            assert_eq!(head.unwrap().headers_mut().status_code().unwrap(), 200);
+            let mut turns = Vec::new();
+            for chunk in chunks {
+                let before = (driver_turns(), codec_parses());
+                let mut wire = format!("{:x}\r\n", chunk.len()).into_bytes();
+                wire.extend_from_slice(chunk);
+                wire.extend_from_slice(b"\r\n");
+                reads.push(&wire);
+                assert!(
+                    run.as_mut().poll(&mut poll).is_pending(),
+                    "the read is parsed"
+                );
+                let Poll::Ready(event) = source.read_body_event(u32::MAX).as_mut().poll(&mut poll)
+                else {
+                    panic!("the chunk is readable");
+                };
+                let event = event.unwrap();
+                let body = event.as_body().expect("a body event");
+                assert_eq!(body.coalesce(body.chain_length()).unwrap(), *chunk);
+                assert!(
+                    run.as_mut().poll(&mut poll).is_pending(),
+                    "the read chunk is acknowledged"
+                );
+                turns.push((driver_turns() - before.0, codec_parses() - before.1));
+            }
+            reads.push(b"0\r\n\r\n");
+            let (run, ()) = futures::join!(run, async {
+                let rest = read_response_body(&mut source).await;
+                assert!(rest.eom && rest.body.is_empty(), "{rest:?}");
+                drop(source);
+                close_once_idle(&handle).await;
+            });
+            run.unwrap();
+            turns
+        })
+    })
+}
+
+/// Reads `source`'s remaining body events, after its final head, to its end.
+async fn read_response_body(source: &mut HttpSourceHolder) -> ReadResponse {
+    let mut read = ReadResponse::default();
+    loop {
+        match source.read_body_event(u32::MAX).await {
+            Ok(event) => {
+                if let Some(bytes) = event.as_body() {
+                    read.body
+                        .extend_from_slice(&bytes.coalesce(bytes.chain_length()).unwrap());
+                }
+                if event.eom() {
+                    read.eom = true;
+                    return read;
+                }
+            }
+            Err(error) => {
+                read.error = Some(error.code());
+                return read;
+            }
+        }
+    }
+}
+
+/// Each chunk of a streamed response takes two driver turns and one parse: the turn whose read
+/// carries it parses it whole, and the turn that notes its consumption hands the parser nothing,
+/// as no input arrived since. No turn runs only to find nothing to do.
+#[test]
+fn a_streamed_response_chunk_takes_two_driver_turns_and_one_parse() {
+    let turns = streamed_chunk_turns(&[b"one", b"two", b"three"]);
+    assert_eq!(turns, [(2, 1); 3], "(driver turns, codec parses) per chunk");
+}
+
+/// The owned upstream driver writes each request in the same pieces as it did before its turns
+/// skipped phases with nothing to do (recorded from the driver at `48eb3af27ed4`).
+#[test]
+fn owned_upstream_h1_writes_in_the_recorded_pieces() {
+    let recorded: &[(&str, &[usize])] = &[
+        ("content-length", &[94]),
+        ("chunked", &[117]),
+        ("trailered", &[123]),
+        ("padded content-length", &[87]),
+        ("padded chunked", &[111]),
+        ("padding eom content-length", &[87]),
+        ("padding eom chunked", &[106]),
+        ("large", &[65519, 65519, 65519, 65519, 155]),
+        ("trace", &[88]),
+        ("get", &[56]),
+    ];
+    type Request = fn() -> (HttpHeaderEvent, Vec<HttpBodyEvent>);
+    let requests: [(&str, Request); 10] = [
+        ("content-length", || scripted_request(false)),
+        ("chunked", || scripted_request(true)),
+        ("trailered", trailered_request),
+        ("padded content-length", || padded_request(false)),
+        ("padded chunked", || padded_request(true)),
+        ("padding eom content-length", || padding_eom_request(false)),
+        ("padding eom chunked", || padding_eom_request(true)),
+        ("large", large_request),
+        ("trace", trace_request),
+        ("get", || (get_head(), Vec::new())),
+    ];
+    let actual: Vec<String> = requests
+        .into_iter()
+        .map(|(name, request)| {
+            let writes: Vec<usize> = owned_exchange_writes(request, OK_RESPONSE, b"ok")
+                .iter()
+                .map(Vec::len)
+                .collect();
+            format!("(\"{name}\", &{writes:?}),")
+        })
+        .collect();
+    let expected: Vec<String> = recorded
+        .iter()
+        .map(|(name, writes)| format!("(\"{name}\", &{writes:?}),"))
+        .collect();
+    assert_eq!(actual, expected, "write lengths:\n{}", actual.join("\n"));
+}
+
+/// A submission the driver refuses returns its slot, and the poll that refused it notes the
+/// connection idle before returning, as the quiescent turn it ends with always has: an owner
+/// that polls the driver only when woken sees the connection idle at once.
+#[test]
+fn a_refused_submission_leaves_the_connection_idle_in_that_poll() {
+    for case in ["refused upgrade", "cancelled token"] {
+        run_on_host(move |context| {
+            Box::pin(async move {
+                let (transport, state) = ScriptedTransport::new([]);
+                let (session, handle) =
+                    OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+                let mut poll = Context::from_waker(Waker::noop());
+                let mut run = std::pin::pin!(session.run());
+                assert!(run.as_mut().poll(&mut poll).is_pending(), "{case}");
+                assert!(handle.is_idle(), "{case}: a new connection is idle");
+                let reservation = handle.reserve_request().unwrap();
+                let token = CancellationSource::new();
+                let mut head = get_head();
+                if case == "refused upgrade" {
+                    head.headers_mut()
+                        .headers_mut()
+                        .set(HttpHeaderCode::Upgrade, b"websocket");
+                } else {
+                    token.request_cancellation();
+                }
+                let mut submission = std::pin::pin!(reservation.submit(
+                    head,
+                    HttpSourceHolder::empty(),
+                    token.token(),
+                ));
+                assert!(!handle.is_idle(), "{case}: the slot is taken");
+                assert!(run.as_mut().poll(&mut poll).is_pending(), "{case}");
+                assert!(
+                    handle.is_idle(),
+                    "{case}: the poll that returned the slot noted the connection idle"
+                );
+                assert!(
+                    matches!(submission.as_mut().poll(&mut poll), Poll::Ready(Err(_))),
+                    "{case}: the submission is refused"
+                );
+                assert!(handle.close_when_idle().unwrap());
+                run.await.unwrap();
+                assert!(state.borrow().writes.is_empty(), "{case}");
+            })
+        });
+    }
+}
+
+/// A request body of one-byte chunks, each ready at once; the `cancel_at`th read cancels the
+/// connection through `handle`.
+struct BurstUpload {
+    reads: usize,
+    cancel_at: usize,
+    handle: crate::owned_h1::OwnedH1UpstreamHandle,
+}
+
+impl HttpSource for BurstUpload {
+    fn read_header_event(&mut self) -> LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
+        unreachable!("an owned submission takes the head separately")
+    }
+
+    fn read_body_event(
+        &mut self,
+        _maximum: u32,
+    ) -> LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
+        self.reads += 1;
+        if self.reads == self.cancel_at {
+            self.handle.cancel();
+        }
+        Box::pin(std::future::ready(Ok(HttpBodyEvent::body(
+            queue(b"x"),
+            false,
+        ))))
+    }
+
+    fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {}
+}
+
+/// The write lengths of the owned upstream driver that, under a 64-byte write size and with
+/// writes that complete at once, sends a chunked POST whose body chunks are one byte each and
+/// ready at once, until the `cancel_at`th body read cancels the connection.
+fn upstream_burst_writes(cancel_at: usize) -> Vec<usize> {
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let (transport, state) = ScriptedTransport::new([]);
+            let mut options = upstream_options(context, transport);
+            options.io.maximum_write_size = 64;
+            let (session, handle) = OwnedH1UpstreamSession::new(options).unwrap();
+            let upload = HttpSourceHolder::new(Box::new(BurstUpload {
+                reads: 0,
+                cancel_at,
+                handle: handle.clone(),
+            }));
+            let submission = handle.reserve_request().unwrap().submit(
+                post_head(None, false),
+                upload,
+                CancellationToken::never(),
+            );
+            let (run, _response) = futures::join!(session.run(), submission);
+            assert_eq!(
+                run.map_err(|error| error.code()).err(),
+                Some(HttpErrorCode::CORO_CANCELLED)
+            );
+            state.borrow().writes.iter().map(Vec::len).collect()
+        })
+    })
+}
+
+/// A burst of ready request body events that runs past the turn budget, and a cancel that
+/// discards what is not yet written, write the same pieces as the upstream driver did before
+/// its turns skipped phases with nothing to do (recorded from the driver at `48eb3af27ed4`): a
+/// turn the driver no longer runs still counts against the budget, so the write the budget
+/// forces at its last turn holds the same bytes.
+#[test]
+fn a_cancelled_request_burst_past_the_turn_budget_writes_the_recorded_pieces() {
+    let recorded: &[(usize, &[usize])] = &[
+        (55, &[64, 51, 48, 48, 48, 48, 48, 42]),
+        (56, &[64, 51, 48, 48, 48, 48, 48, 42]),
+        (57, &[64, 51, 48, 48, 48, 48, 48, 42]),
+        (60, &[64, 51, 48, 48, 48, 48, 48, 42, 48]),
+        (61, &[64, 51, 48, 48, 48, 48, 48, 42, 48]),
+        (62, &[64, 51, 48, 48, 48, 48, 48, 42, 48]),
+        (
+            110,
+            &[64, 51, 48, 48, 48, 48, 48, 42, 48, 48, 48, 48, 48, 48, 24],
+        ),
+        (
+            118,
+            &[
+                64, 51, 48, 48, 48, 48, 48, 42, 48, 48, 48, 48, 48, 48, 24, 48,
+            ],
+        ),
+        (
+            119,
+            &[
+                64, 51, 48, 48, 48, 48, 48, 42, 48, 48, 48, 48, 48, 48, 24, 48,
+            ],
+        ),
+        (
+            120,
+            &[
+                64, 51, 48, 48, 48, 48, 48, 42, 48, 48, 48, 48, 48, 48, 24, 48, 48,
+            ],
+        ),
+    ];
+    let actual: Vec<String> = [55, 56, 57, 60, 61, 62, 110, 118, 119, 120]
+        .into_iter()
+        .map(|cancel_at| format!("({cancel_at}, &{:?}),", upstream_burst_writes(cancel_at)))
+        .collect();
+    let expected: Vec<String> = recorded
+        .iter()
+        .map(|(cancel_at, writes)| format!("({cancel_at}, &{writes:?}),"))
+        .collect();
+    assert_eq!(actual, expected, "write lengths:\n{}", actual.join("\n"));
 }

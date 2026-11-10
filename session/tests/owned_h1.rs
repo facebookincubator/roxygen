@@ -27,6 +27,8 @@ use crate::owned_h1::Http1UpgradePolicy;
 use crate::owned_h1::OwnedH1Handle;
 use crate::owned_h1::OwnedH1Options;
 use crate::owned_h1::OwnedH1Session;
+use crate::owned_h1::codec_parses;
+use crate::owned_h1::driver_turns;
 use crate::uniplex::UniplexWriteCompletion;
 use crate::uniplex::UniplexWriteQueue;
 
@@ -248,11 +250,11 @@ struct H1App {
     /// a transport-write byte event.
     instrument: bool,
     /// Once set, each exchange cancels the session through this handle from the named
-    /// callback: `new_exchange`, `request`, `poll_headers`, `poll_body`, `response_complete` or
-    /// (instrumented) `byte_event` or `headers_encoded`.
+    /// callback: `new_exchange`, `request`, `poll_headers`, `poll_body`, `response_complete`,
+    /// `complete` or (instrumented) `byte_event` or `headers_encoded`.
     cancel_in: CancelIn,
     /// Once set, each exchange drains the session through this handle from the named callback:
-    /// `request` or `poll_headers`.
+    /// `request`, `poll_headers` or `complete`.
     drain_in: CancelIn,
     /// The first exchange panics from this point of its retirement: `complete` or `drop`.
     panic_in: Option<&'static str>,
@@ -687,6 +689,8 @@ impl OwnedExchange for H1Exchange {
     fn complete(self) {
         note("complete", self.ordinal);
         self.probe.completed.set(self.probe.completed.get() + 1);
+        cancel_from(&self.cancel_in, "complete");
+        drain_from(&self.drain_in, "complete");
         if self.panic_in == Some("complete") {
             panic!("exchange panicked at retirement");
         }
@@ -863,6 +867,8 @@ impl HttpSource for StopProbe {
 
 struct Wire {
     output: Vec<u8>,
+    /// The length of each write, in order.
+    writes: Vec<usize>,
     close: CloseKind,
     error: Option<HttpErrorCode>,
 }
@@ -874,6 +880,7 @@ fn wire_of(
     let state = state.borrow();
     Wire {
         output: state.writes.concat(),
+        writes: state.writes.iter().map(Vec::len).collect(),
         close: state.close,
         error: result.err().map(|error| error.code()),
     }
@@ -2799,6 +2806,7 @@ impl UniplexTransport for FencedTransport {
 }
 
 const CLOSING_GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+const KEEP_ALIVE_GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n";
 
 #[test]
 fn response_retires_only_after_its_write_completes() {
@@ -4011,9 +4019,46 @@ fn corpus_run_with_io(
     http1: Http1DriverConfig,
     io: UniplexConfig,
 ) -> (CorpusRun, Vec<Vec<u8>>) {
+    let (wire, observed) = corpus_session(owned, vector, split, http1, io);
+    let run = CorpusRun {
+        output: without_dates(&wire.output),
+        close: wire.close,
+        error: wire.error,
+        requests: observed
+            .iter()
+            .map(|probe| {
+                (
+                    probe.method,
+                    probe.url.clone(),
+                    probe.fields.clone(),
+                    probe.request_eom,
+                    probe.request_body.clone(),
+                    probe.request_trailers.clone(),
+                    probe.request_finished,
+                    cause(probe),
+                )
+            })
+            .collect(),
+    };
+    let methods = observed
+        .iter()
+        .map(|probe| probe.request_method.clone())
+        .collect();
+    (run, methods)
+}
+
+/// Runs `vector` cut by `split` through one session, as `corpus_run_with_io` does; returns its
+/// wire and what each application observed.
+fn corpus_session(
+    owned: bool,
+    vector: &Vector,
+    split: Split,
+    http1: Http1DriverConfig,
+    io: UniplexConfig,
+) -> (Wire, Vec<Observed>) {
     let reads = split.reads(&vector.input);
     let responses = vector.responses.clone();
-    let (wire, observed) = run_on_host(move |context| {
+    run_on_host(move |context| {
         Box::pin(async move {
             let release = Arc::new(tokio::sync::Notify::new());
             let (transport, state) = ScriptedTransport::new(
@@ -4077,32 +4122,7 @@ fn corpus_run_with_io(
                 (wire_of(&state, result), observed)
             }
         })
-    });
-    let run = CorpusRun {
-        output: without_dates(&wire.output),
-        close: wire.close,
-        error: wire.error,
-        requests: observed
-            .iter()
-            .map(|probe| {
-                (
-                    probe.method,
-                    probe.url.clone(),
-                    probe.fields.clone(),
-                    probe.request_eom,
-                    probe.request_body.clone(),
-                    probe.request_trailers.clone(),
-                    probe.request_finished,
-                    cause(probe),
-                )
-            })
-            .collect(),
-    };
-    let methods = observed
-        .iter()
-        .map(|probe| probe.request_method.clone())
-        .collect();
-    (run, methods)
+    })
 }
 
 /// `h1_config` with `exact_method_tokens` (`DIV-040`).
@@ -5865,4 +5885,494 @@ fn a_staged_close_returns_a_failed_write_shutdown_without_waiting_for_the_peer()
     assert!(output.ends_with(TRAILERED_END), "{output:?}");
     assert_eq!(observed.len(), 1);
     assert_completed_once(&observed[0], "the stopped request");
+}
+
+/// A response body the test pushes one event at a time to a `PushedApp` exchange.
+#[derive(Default)]
+struct PushedBody {
+    events: RefCell<VecDeque<HttpBodyEvent>>,
+    waker: RefCell<Option<Waker>>,
+}
+
+impl PushedBody {
+    fn push(&self, event: HttpBodyEvent) {
+        self.events.borrow_mut().push_back(event);
+        let waker = self.waker.borrow_mut().take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+/// Answers each request at once with a chunked `200` head, then with the events pushed to
+/// `body`.
+struct PushedApp {
+    body: Rc<PushedBody>,
+}
+
+struct PushedExchange {
+    head: Option<HttpHeaderEvent>,
+    body: Rc<PushedBody>,
+}
+
+impl OwnedApplication for PushedApp {
+    type Exchange = PushedExchange;
+
+    fn new_exchange(&self, _stream: StreamId, _ingress: IngressCompletion) -> PushedExchange {
+        let mut message = HttpMessage::new();
+        message.set_status_code(200).unwrap();
+        message.set_http_version(1, 1);
+        message.headers_mut().set(HttpHeaderCode::Date, DATE);
+        PushedExchange {
+            head: Some(HttpHeaderEvent::new(message, false).unwrap()),
+            body: Rc::clone(&self.body),
+        }
+    }
+}
+
+impl OwnedExchange for PushedExchange {
+    fn request(&mut self, _head: Box<HttpMessage>, _body: HttpStreamSourceOwner, _eom: bool) {}
+
+    fn poll_headers(
+        &mut self,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        Poll::Ready(Ok(self
+            .head
+            .take()
+            .expect("the response head is polled once")))
+    }
+
+    fn poll_body(
+        &mut self,
+        context: &mut Context<'_>,
+        _maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        if let Some(event) = self.body.events.borrow_mut().pop_front() {
+            return Poll::Ready(Ok(event));
+        }
+        *self.body.waker.borrow_mut() = Some(context.waker().clone());
+        Poll::Pending
+    }
+
+    fn cancel(&mut self, _error: &HttpError, _peer_reset: bool) {}
+
+    fn response_complete(&mut self) {}
+
+    fn complete(self) {}
+}
+
+/// Serves a keep-alive GET whose chunked response head is written at once, then pushes each of
+/// `chunks` to its body and polls the driver once; returns the driver turns and codec parses
+/// each push took, and every write.
+fn pushed_body_turns(chunks: &'static [&'static [u8]]) -> (Vec<(usize, usize)>, Vec<Vec<u8>>) {
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let (transport, state) =
+                ScriptedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())]);
+            let body = Rc::new(PushedBody::default());
+            let application = PushedApp {
+                body: Rc::clone(&body),
+            };
+            let (session, handle) =
+                OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+            let mut run = std::pin::pin!(session.run());
+            let mut poll = Context::from_waker(Waker::noop());
+            assert!(
+                run.as_mut().poll(&mut poll).is_pending(),
+                "the response waits for its body"
+            );
+            assert_eq!(state.borrow().writes.len(), 1, "the head is written first");
+            let mut turns = Vec::new();
+            for chunk in chunks {
+                let before = (driver_turns(), codec_parses());
+                body.push(HttpBodyEvent::body(queue(chunk), false));
+                assert!(run.as_mut().poll(&mut poll).is_pending());
+                turns.push((driver_turns() - before.0, codec_parses() - before.1));
+            }
+            body.push(HttpBodyEvent::body(queue(b"end"), true));
+            assert!(handle.initiate_drain().unwrap());
+            run.await.unwrap();
+            let writes = state.borrow().writes.clone();
+            (turns, writes)
+        })
+    })
+}
+
+/// Each response body event pushed to a waiting exchange takes three driver turns: one
+/// serializes it, one finds the body pending again and, as no phase before the write has work
+/// left, starts the event's write, and one takes the write's completion. No turn runs only to
+/// find nothing to do, and the parser, paused behind the request, is handed nothing.
+#[test]
+fn a_pushed_response_body_event_takes_three_driver_turns() {
+    let (turns, writes) = pushed_body_turns(&[b"one", b"two", b"three"]);
+    assert_eq!(turns, [(3, 0); 3], "(driver turns, codec parses) per event");
+    assert!(
+        writes[0].starts_with(b"HTTP/1.1 200 \r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&writes[0])
+    );
+    assert_eq!(
+        writes[1..],
+        [
+            b"3\r\none\r\n".to_vec(),
+            b"3\r\ntwo\r\n".to_vec(),
+            b"5\r\nthree\r\n".to_vec(),
+            b"3\r\nend\r\n0\r\n\r\n".to_vec(),
+        ],
+        "each event is written alone, as it arrives"
+    );
+}
+
+/// A cancel or a drain that the retiring exchange's `complete` requests, when nothing else is
+/// left to do, ends the connection within the poll that retired the exchange: the driver
+/// observes it before returning, without waiting to be polled again.
+#[test]
+fn a_cancel_or_drain_from_complete_ends_the_connection_in_that_poll() {
+    for cancel in [true, false] {
+        let (first_poll_ready, wire) = run_on_host(move |context| {
+            Box::pin(async move {
+                let (transport, state) =
+                    ScriptedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())]);
+                let (application, _probes) = H1App::new(vec![Response::fixed(200, b"hello")]);
+                let slot = Rc::clone(if cancel {
+                    &application.cancel_in
+                } else {
+                    &application.drain_in
+                });
+                let (session, handle) =
+                    OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+                *slot.borrow_mut() = Some(("complete", handle));
+                let mut run = std::pin::pin!(session.run());
+                let first = run.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+                let ready = first.is_ready();
+                let result = match first {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => run.await,
+                };
+                slot.borrow_mut().take();
+                (ready, wire_of(&state, result))
+            })
+        });
+        let label = if cancel { "cancel" } else { "drain" };
+        assert!(
+            first_poll_ready,
+            "{label}: the connection ends in the poll that retired the exchange"
+        );
+        assert!(wire.output.ends_with(b"\r\n\r\nhello"), "{label}");
+        if cancel {
+            assert_eq!(wire.error, Some(HttpErrorCode::CORO_CANCELLED));
+            assert_eq!(wire.close, CloseKind::Reset);
+        } else {
+            assert_eq!(wire.error, None);
+            assert_eq!(wire.close, CloseKind::ShutdownWrite);
+        }
+    }
+}
+
+/// The write lengths of the owned driver serving a 16 KiB response, with or without a
+/// `Content-Length`, under a 16 KiB write size: its body is polled in pieces that fit beside
+/// the queued output.
+fn large_response_writes(content_length: bool) -> Vec<usize> {
+    let response = Response {
+        content_length,
+        ..Response::fixed(200, &patterned(16 << 10))
+    };
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let (transport, state) =
+                ScriptedTransport::new([ReadAction::Data(CLOSING_GET.to_vec())]);
+            let (application, _probes) = H1App::new(vec![response]);
+            let mut options = owned_options(context, transport);
+            options.io.buffer_limit = 16 << 10;
+            options.io.maximum_write_size = 16 << 10;
+            options.io.ingress_buffer_limit = 4 << 10;
+            options.io.maximum_read_size = 4 << 10;
+            options.io.read_allocation_size = 4 << 10;
+            let (session, _handle) = OwnedH1Session::new(application, options).unwrap();
+            let result = session.run().await;
+            wire_of(&state, result).writes
+        })
+    })
+}
+
+/// The write lengths of the owned driver serving three pipelined GETs through an unsaturated
+/// write queue, whose exchanges retire at serialization (`DIV-028`).
+fn unsaturated_pipelined_writes() -> Vec<usize> {
+    run_on_host(|context| {
+        Box::pin(async move {
+            let (transport, state, fence) =
+                FencedTransport::new([ReadAction::Data(pipelined_gets(3))], true);
+            fence.unsaturated.set(true);
+            fence.open.set(true);
+            let (application, _probes) = H1App::new(vec![Response::fixed(200, b"hello")]);
+            let (session, _handle) =
+                OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+            let result = session.run().await;
+            wire_of(&state, result).writes
+        })
+    })
+}
+
+/// The owned driver writes in the same pieces as it did before its turns skipped phases with
+/// nothing to do (recorded from the driver at `48eb3af27ed4`): a write starts no earlier than
+/// the turn in which no phase before it has work left, so egress is split as before. Covers
+/// every corpus vector and split, a body polled in pieces, retirement at serialization, and
+/// pushed body events.
+#[test]
+fn owned_h1_writes_in_the_recorded_pieces() {
+    let recorded_corpus: &[(&str, [&[usize]; 3])] = &[
+        (
+            "fragmented_chunked_request_with_trailer",
+            [&[99], &[99], &[99]],
+        ),
+        ("pipelined_requests", [&[99, 99], &[99, 99], &[99, 99]]),
+        ("malformed_header", [&[103], &[103], &[103]]),
+        ("consumer_shaped_post", [&[139], &[139], &[139]]),
+        ("event_stream_response", [&[139], &[139], &[139]]),
+        ("head", [&[97], &[97], &[97]]),
+        ("no_content", [&[97], &[97], &[97]]),
+        ("not_modified", [&[97], &[97], &[97]]),
+        ("http10", [&[94], &[94], &[94]]),
+        ("http10_keep_alive", [&[99], &[99], &[99]]),
+        ("connection_close", [&[94], &[94], &[94]]),
+        (
+            "two_pipelined_requests",
+            [&[101, 100], &[101, 100], &[97, 4, 100]],
+        ),
+        ("content_length_and_chunked", [&[103], &[103], &[103]]),
+        ("duplicate_content_length", [&[103], &[103], &[103]]),
+        ("obs_fold", [&[99], &[99], &[99]]),
+        ("absolute_form_with_host", [&[99], &[99], &[99]]),
+        ("connect", [&[73, 12], &[73, 12], &[73, 12]]),
+        ("websocket_upgrade", [&[166, 11], &[166, 11], &[166, 11]]),
+        ("expect_continue", [&[153], &[153], &[153]]),
+        ("chunked_with_trailers", [&[99], &[99], &[99]]),
+        ("head_at_the_limit", [&[94], &[94], &[92, 2]]),
+        ("head_over_the_limit", [&[103], &[103], &[103]]),
+        ("malformed_request_line", [&[103], &[103], &[103]]),
+    ];
+    let recorded_others: &[(&str, &[usize])] = &[
+        ("large response with Content-Length", &[16367, 113]),
+        ("large chunked response", &[16375, 129]),
+        ("unsaturated pipelined GETs", &[301]),
+        ("pushed body events", &[106, 8, 8, 10, 13]),
+    ];
+    let mut actual = Vec::new();
+    for vector in corpus() {
+        let writes = [Split::Whole, Split::Every7, Split::OneByte].map(|split| {
+            corpus_session(
+                true,
+                &vector,
+                split,
+                Http1DriverConfig::default(),
+                h1_config(),
+            )
+            .0
+            .writes
+        });
+        actual.push(format!("(\"{}\", {writes:?}),", vector.name));
+    }
+    let pushed = pushed_body_turns(&[b"one", b"two", b"three"])
+        .1
+        .iter()
+        .map(Vec::len)
+        .collect();
+    for (name, writes) in [
+        (
+            "large response with Content-Length",
+            large_response_writes(true),
+        ),
+        ("large chunked response", large_response_writes(false)),
+        ("unsaturated pipelined GETs", unsaturated_pipelined_writes()),
+        ("pushed body events", pushed),
+    ] {
+        actual.push(format!("(\"{name}\", &{writes:?}),"));
+    }
+    let expected: Vec<String> = recorded_corpus
+        .iter()
+        .map(|(name, writes)| format!("(\"{name}\", {writes:?}),"))
+        .chain(
+            recorded_others
+                .iter()
+                .map(|(name, writes)| format!("(\"{name}\", &{writes:?}),")),
+        )
+        .collect();
+    assert_eq!(actual, expected, "write lengths:\n{}", actual.join("\n"));
+}
+
+/// A response body of one-byte chunks, each ready when polled once `start` is called; the
+/// `cancel_at`th ready poll cancels the session through `handle`.
+struct BurstBody {
+    started: Cell<bool>,
+    polls: Cell<usize>,
+    cancel_at: usize,
+    handle: RefCell<Option<OwnedH1Handle>>,
+    waker: RefCell<Option<Waker>>,
+}
+
+impl BurstBody {
+    fn start(&self) {
+        self.started.set(true);
+        let waker = self.waker.borrow_mut().take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+/// Answers each request at once with a chunked `200` head, then with `body`.
+struct BurstApp {
+    body: Rc<BurstBody>,
+}
+
+struct BurstExchange {
+    head: Option<HttpHeaderEvent>,
+    body: Rc<BurstBody>,
+}
+
+impl OwnedApplication for BurstApp {
+    type Exchange = BurstExchange;
+
+    fn new_exchange(&self, _stream: StreamId, _ingress: IngressCompletion) -> BurstExchange {
+        let mut message = HttpMessage::new();
+        message.set_status_code(200).unwrap();
+        message.set_http_version(1, 1);
+        message.headers_mut().set(HttpHeaderCode::Date, DATE);
+        BurstExchange {
+            head: Some(HttpHeaderEvent::new(message, false).unwrap()),
+            body: Rc::clone(&self.body),
+        }
+    }
+}
+
+impl OwnedExchange for BurstExchange {
+    fn request(&mut self, _head: Box<HttpMessage>, _body: HttpStreamSourceOwner, _eom: bool) {}
+
+    fn poll_headers(
+        &mut self,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        Poll::Ready(Ok(self
+            .head
+            .take()
+            .expect("the response head is polled once")))
+    }
+
+    fn poll_body(
+        &mut self,
+        context: &mut Context<'_>,
+        _maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        if !self.body.started.get() {
+            *self.body.waker.borrow_mut() = Some(context.waker().clone());
+            return Poll::Pending;
+        }
+        let polls = self.body.polls.get() + 1;
+        self.body.polls.set(polls);
+        if polls == self.body.cancel_at {
+            self.body
+                .handle
+                .borrow()
+                .as_ref()
+                .expect("the handle is set before the body starts")
+                .cancel();
+        }
+        Poll::Ready(Ok(HttpBodyEvent::body(queue(b"x"), false)))
+    }
+
+    fn cancel(&mut self, _error: &HttpError, _peer_reset: bool) {}
+
+    fn response_complete(&mut self) {}
+
+    fn complete(self) {}
+}
+
+/// The write lengths of the owned driver that, under a 64-byte write size and with writes that
+/// complete at once, writes a chunked response head, then streams one-byte chunks, each ready
+/// at once, until the `cancel_at`th body poll cancels the connection.
+fn burst_writes(cancel_at: usize) -> Vec<usize> {
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let (transport, state) =
+                ScriptedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())]);
+            let body = Rc::new(BurstBody {
+                started: Cell::new(false),
+                polls: Cell::new(0),
+                cancel_at,
+                handle: RefCell::new(None),
+                waker: RefCell::new(None),
+            });
+            let application = BurstApp {
+                body: Rc::clone(&body),
+            };
+            let mut options = owned_options(context, transport);
+            options.io.maximum_write_size = 64;
+            let (session, handle) = OwnedH1Session::new(application, options).unwrap();
+            *body.handle.borrow_mut() = Some(handle);
+            let mut run = std::pin::pin!(session.run());
+            assert!(
+                run.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending(),
+                "the response waits for its body"
+            );
+            body.start();
+            let result = run.await;
+            body.handle.borrow_mut().take();
+            let wire = wire_of(&state, result);
+            assert_eq!(wire.error, Some(HttpErrorCode::CORO_CANCELLED));
+            wire.writes
+        })
+    })
+}
+
+/// A burst of ready response body events that runs past the turn budget, and a cancel that
+/// discards what is not yet written, write the same pieces as the driver did before its turns
+/// skipped phases with nothing to do (recorded from the driver at `48eb3af27ed4`): a turn the
+/// driver no longer runs still counts against the budget, so the write the budget forces at its
+/// last turn holds the same bytes.
+#[test]
+fn a_cancelled_body_burst_past_the_turn_budget_writes_the_recorded_pieces() {
+    let recorded: &[(usize, &[usize])] = &[
+        (55, &[64, 42, 48, 48, 48, 48, 48, 48, 24]),
+        (56, &[64, 42, 48, 48, 48, 48, 48, 48, 24]),
+        (57, &[64, 42, 48, 48, 48, 48, 48, 48, 24]),
+        (60, &[64, 42, 48, 48, 48, 48, 48, 48, 24]),
+        (61, &[64, 42, 48, 48, 48, 48, 48, 48, 24, 48]),
+        (62, &[64, 42, 48, 48, 48, 48, 48, 48, 24, 48]),
+        (
+            110,
+            &[
+                64, 42, 48, 48, 48, 48, 48, 48, 24, 48, 48, 48, 48, 48, 48, 24,
+            ],
+        ),
+        (
+            118,
+            &[
+                64, 42, 48, 48, 48, 48, 48, 48, 24, 48, 48, 48, 48, 48, 48, 24, 48,
+            ],
+        ),
+        (
+            119,
+            &[
+                64, 42, 48, 48, 48, 48, 48, 48, 24, 48, 48, 48, 48, 48, 48, 24, 48,
+            ],
+        ),
+        (
+            120,
+            &[
+                64, 42, 48, 48, 48, 48, 48, 48, 24, 48, 48, 48, 48, 48, 48, 24, 48,
+            ],
+        ),
+    ];
+    let actual: Vec<String> = [55, 56, 57, 60, 61, 62, 110, 118, 119, 120]
+        .into_iter()
+        .map(|cancel_at| format!("({cancel_at}, &{:?}),", burst_writes(cancel_at)))
+        .collect();
+    let expected: Vec<String> = recorded
+        .iter()
+        .map(|(cancel_at, writes)| format!("({cancel_at}, &{writes:?}),"))
+        .collect();
+    assert_eq!(actual, expected, "write lengths:\n{}", actual.join("\n"));
 }

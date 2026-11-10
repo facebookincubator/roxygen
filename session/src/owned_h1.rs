@@ -42,6 +42,7 @@
 use std::any::Any;
 use std::cell::Cell;
 use std::future::Future;
+use std::ops::Deref;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
 use std::panic::resume_unwind;
@@ -115,6 +116,30 @@ const TURN_BUDGET: usize = 64;
 /// The most chunked framing one response body event adds: a hex length of at most 8 digits
 /// and its CRLF, then the chunk's CRLF and the last chunk.
 const CHUNK_OVERHEAD: usize = 8 + b"\r\n".len() + b"\r\n0\r\n\r\n".len();
+
+#[cfg(test)]
+thread_local! {
+    static DRIVER_TURNS: Cell<usize> = const { Cell::new(0) };
+    static CODEC_PARSES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// How many turns the owned HTTP/1.1 drivers on this thread have run.
+#[cfg(test)]
+pub(crate) fn driver_turns() -> usize {
+    DRIVER_TURNS.with(Cell::get)
+}
+
+/// How many times the owned HTTP/1.1 drivers on this thread have handed their input to the
+/// codec (`on_ingress`).
+#[cfg(test)]
+pub(crate) fn codec_parses() -> usize {
+    CODEC_PARSES.with(Cell::get)
+}
+
+#[cfg(test)]
+fn count(counter: &'static std::thread::LocalKey<Cell<usize>>) {
+    counter.with(|count| count.set(count.get() + 1));
+}
 
 /// Inputs selected once, before starting an experimental HTTP/1.1 connection.
 pub struct OwnedH1Options {
@@ -447,6 +472,39 @@ fn stop_request_ingress(codec: &mut Http1xCodec, ingress_stopped: &mut bool) {
     codec.generate_immediate_goaway();
 }
 
+/// A connection's codec, and whether parsing could act on what it holds: set by new input and
+/// by every change to the codec outside a parse, and cleared by a parse that consumes all of
+/// its input. Until then, a parse of the same input with the same codec would do nothing: the
+/// codec defers a message's completion only while its parser is paused, and only these changes
+/// resume it.
+struct IngressCodec {
+    codec: Http1xCodec,
+    reparse: bool,
+}
+
+impl IngressCodec {
+    fn new(codec: Http1xCodec) -> Self {
+        Self {
+            codec,
+            reparse: true,
+        }
+    }
+
+    /// The codec, for a change outside a parse, after which a parse may act again.
+    fn get_mut(&mut self) -> &mut Http1xCodec {
+        self.reparse = true;
+        &mut self.codec
+    }
+}
+
+impl Deref for IngressCodec {
+    type Target = Http1xCodec;
+
+    fn deref(&self) -> &Http1xCodec {
+        &self.codec
+    }
+}
+
 /// A poll-driven HTTP/1.1 downstream connection with one exchange at a time.
 pub struct OwnedH1Session<A: OwnedApplication>(Driver<A>);
 
@@ -510,7 +568,7 @@ struct Driver<A: OwnedApplication> {
     application: A,
     control: Rc<Control>,
     config: UniplexConfig,
-    codec: Http1xCodec,
+    codec: IngressCodec,
     exchange: Option<Box<Exchange<A::Exchange>>>,
     ingress: BufQueue,
     egress: BufQueue,
@@ -823,7 +881,7 @@ impl<A: OwnedApplication> Driver<A> {
                 application,
                 control: Rc::clone(&control),
                 config: io,
-                codec,
+                codec: IngressCodec::new(codec),
                 exchange: None,
                 ingress: BufQueue::new(io.buffer_limit),
                 egress: BufQueue::new(io.buffer_limit),
@@ -880,6 +938,8 @@ impl<A: OwnedApplication> Driver<A> {
         }
         let mut turn = 0;
         while turn < TURN_BUDGET {
+            #[cfg(test)]
+            count(&DRIVER_TURNS);
             self.observe_cancel();
             self.observe_drain();
             let mut progress = false;
@@ -894,16 +954,7 @@ impl<A: OwnedApplication> Driver<A> {
                 self.observe_drain();
             }
             self.observe_stop();
-            // A busy codec may hold a completion it deferred while the parser was paused. As
-            // `UniplexSession`, an idle draining connection admits no further request.
-            if self.fatal.is_none()
-                && self.closing_error.is_none()
-                && !self.ingress_paused()
-                && !(self.draining && self.exchange.is_none())
-                && (!self.ingress.is_empty()
-                    || self.codec.is_busy()
-                    || (self.eof && !self.eof_processed))
-            {
+            if self.parse_due() {
                 match self.parse_input() {
                     Ok(parsed) => progress |= parsed,
                     Err(error) => self.abort(error),
@@ -931,14 +982,21 @@ impl<A: OwnedApplication> Driver<A> {
                 self.judge_eof();
                 progress = true;
             }
+            // The write waits while a phase before it can still add to it: one that acted this
+            // turn may act again. When none would, it starts in place of the next turn, which
+            // still counts against the budget that places the write it forces and the yield.
+            let write_waits = progress
+                && self.egress.chain_length() < self.config.maximum_write_size
+                && turn + 1 < TURN_BUDGET
+                && self.fatal.is_none();
             if !self.transport_reset
                 && !self.egress.is_empty()
                 && self.can_start_write()
-                && (!progress
-                    || self.egress.chain_length() >= self.config.maximum_write_size
-                    || turn + 1 >= TURN_BUDGET
-                    || self.fatal.is_some())
+                && (!write_waits || !self.phases_due_before_write())
             {
+                if write_waits {
+                    turn += 1;
+                }
                 // A write queue's capacity check may cancel; the abort discards the egress.
                 self.observe_cancel();
                 if !self.transport_reset
@@ -992,6 +1050,10 @@ impl<A: OwnedApplication> Driver<A> {
                 return Poll::Pending;
             }
             turn += 1;
+            // A next turn that would find nothing to do would return here.
+            if turn < TURN_BUDGET && !self.turn_due() {
+                return Poll::Pending;
+            }
         }
         self.budget_yield = Some(self.context.host().yield_to_io());
         // A yield that completes on its first poll arranged no wake.
@@ -999,6 +1061,70 @@ impl<A: OwnedApplication> Driver<A> {
             context.waker().wake_by_ref();
         }
         Poll::Pending
+    }
+
+    /// Whether a next turn would act. Each term is the condition under which a step of the
+    /// turn acts, or a wider one, and none runs transport or application code: a phase before
+    /// the write; the write; a closing error, a failure or a reset; or the idle close.
+    fn turn_due(&self) -> bool {
+        self.transport_reset
+            || self.fatal.is_some()
+            || self.closing_error.is_some()
+            || self.phases_due_before_write()
+            || if self.egress.is_empty() {
+                self.exchange.is_none() && (self.eof_processed || !self.codec.is_reusable())
+            } else {
+                // A queue's capacity check is transport code.
+                self.write_queue.is_some() || self.write.is_none()
+            }
+    }
+
+    /// Whether a phase before the write would act in a next turn: the cancel and drain checks,
+    /// the write completion, the read, the parse, a held read failure, the exchange, its
+    /// retirement or `DIV-053`'s EOF judgment. Each term is the condition under which that phase
+    /// acts, or a wider one, and none runs transport or application code.
+    fn phases_due_before_write(&self) -> bool {
+        (!self.transport_reset && cancel_requested(&self.control, &self.context))
+            || (self.control.drain.get() && !self.draining && self.fatal.is_none())
+            || self.write_wake.is_ready()
+            || self.read_wake.is_ready()
+            || (self.read.is_none() && self.read_capacity() != 0)
+            || self.parse_due()
+            || (self.read_error.is_some() && !self.holds_read_error())
+            || (self.fatal.is_none() && (self.stream_wake.is_ready() || self.retire_due()))
+            || self.eof_abort_due()
+    }
+
+    /// Whether the parse phase acts: the input or the codec changed since a parse consumed all
+    /// of its input, and there is something to parse. A busy codec may hold a completion it
+    /// deferred while the parser was paused. As `UniplexSession`, an idle draining connection
+    /// admits no further request.
+    fn parse_due(&self) -> bool {
+        self.codec.reparse
+            && self.fatal.is_none()
+            && self.closing_error.is_none()
+            && !self.ingress_paused()
+            && !(self.draining && self.exchange.is_none())
+            && (!self.ingress.is_empty()
+                || self.codec.is_busy()
+                // `DIV-053`: under the option the codec takes the EOF only once it is judged.
+                || (self.eof
+                    && !self.eof_processed
+                    && (self.eof_judged || !self.config.abort_exchanges_on_eof)))
+    }
+
+    /// Whether `retire_exchange` acts: it notes the request source's completion, or retires
+    /// the exchange.
+    fn retire_due(&self) -> bool {
+        self.exchange.as_ref().is_some_and(|exchange| {
+            if exchange.consumed {
+                exchange.response_complete
+                    && (exchange.retires_at_serialization
+                        || exchange.write_boundary <= self.summary.bytes_written)
+            } else {
+                exchange.signals.source_complete.get()
+            }
+        })
     }
 
     /// Run at each phase boundary: the transport's callbacks, like the application's, may
@@ -1023,7 +1149,7 @@ impl<A: OwnedApplication> Driver<A> {
             && !exchange.response_complete
             && exchange.signals.stopped()
         {
-            stop_request_ingress(&mut self.codec, &mut self.ingress_stopped);
+            stop_request_ingress(self.codec.get_mut(), &mut self.ingress_stopped);
         }
     }
 
@@ -1041,7 +1167,7 @@ impl<A: OwnedApplication> Driver<A> {
     #[cold]
     fn start_drain(&mut self) {
         self.draining = true;
-        if let Err(error) = drain_codec(&mut self.codec, &mut self.egress) {
+        if let Err(error) = drain_codec(self.codec.get_mut(), &mut self.egress) {
             self.abort(error);
         }
     }
@@ -1065,9 +1191,12 @@ impl<A: OwnedApplication> Driver<A> {
         let (consumed, mut egress_results) = if length == 0 && !self.codec.is_busy() {
             (0, Vec::new())
         } else {
-            let result = self
-                .codec
-                .on_ingress(&self.ingress, &mut callback, &mut self.egress);
+            #[cfg(test)]
+            count(&CODEC_PARSES);
+            let result =
+                self.codec
+                    .codec
+                    .on_ingress(&self.ingress, &mut callback, &mut self.egress);
             (result.consumed, result.egress_results)
         };
         // As `UniplexSession`, entering the upgrade is progress: the tunnel's bytes are parsed
@@ -1087,7 +1216,10 @@ impl<A: OwnedApplication> Driver<A> {
             && (consumed == length || consumed == 0);
         if finishing_eof {
             self.eof_processed = true;
-            let result = self.codec.on_ingress_eof(&mut callback, &mut self.egress);
+            let result = self
+                .codec
+                .codec
+                .on_ingress_eof(&mut callback, &mut self.egress);
             egress_results.extend(result.egress_results);
         }
         let failed = callback.failure.take();
@@ -1110,6 +1242,10 @@ impl<A: OwnedApplication> Driver<A> {
         {
             self.start_eof_watch();
         }
+        // The codec parses until its input runs out or its parser pauses or fails, and the
+        // EOF it can take is taken: a parse of what remains acts only after a change. The
+        // tunnel an upgrade entered is parsed next.
+        self.codec.reparse = !self.ingress.is_empty() || upgrade_completed;
         for result in egress_results {
             result?;
         }
@@ -1168,7 +1304,7 @@ impl<A: OwnedApplication> Driver<A> {
                 .is_none_or(|buffered| buffered < self.config.ingress_buffer_limit)
         {
             self.flow_pause = false;
-            self.codec.set_parser_paused(self.exchange_pause);
+            self.codec.get_mut().set_parser_paused(self.exchange_pause);
         }
         if !exchange.consumed && exchange.signals.source_complete.get() {
             exchange.consumed = true;
@@ -1181,7 +1317,7 @@ impl<A: OwnedApplication> Driver<A> {
                     return Err(error);
                 }
                 if !exchange.ingress_complete {
-                    stop_request_ingress(&mut self.codec, &mut self.ingress_stopped);
+                    stop_request_ingress(self.codec.get_mut(), &mut self.ingress_stopped);
                 }
             }
         }
@@ -1248,13 +1384,13 @@ impl<A: OwnedApplication> Driver<A> {
             // A drain requested from an exchange callback applies to this response.
             if self.control.drain.get() && !self.draining {
                 self.draining = true;
-                drain_codec(&mut self.codec, &mut self.egress)?;
+                drain_codec(self.codec.get_mut(), &mut self.egress)?;
             }
             // So does a stop the exchange's callbacks reported (`DIV-054`).
             if !exchange.ingress_complete && exchange.signals.stopped() {
-                stop_request_ingress(&mut self.codec, &mut self.ingress_stopped);
+                stop_request_ingress(self.codec.get_mut(), &mut self.ingress_stopped);
             }
-            let generated = self.codec.generate(
+            let generated = self.codec.get_mut().generate(
                 &mut self.egress,
                 EgressFrame::Headers {
                     stream,
@@ -1269,13 +1405,13 @@ impl<A: OwnedApplication> Driver<A> {
                 // As `UniplexSession`: the final head accepts or refuses the upgrade, and parsing
                 // resumes, into the tunnel or on to the request's end.
                 self.upgrade_pending = false;
-                if self.codec.resolve_downstream_upgrade(headers.headers()) == Some(false) {
+                let codec = self.codec.get_mut();
+                if codec.resolve_downstream_upgrade(headers.headers()) == Some(false) {
                     // As `UniplexSession`, a refused upgrade closes the connection after its
                     // request.
                     exchange.closing_request = true;
                 }
-                self.codec
-                    .set_parser_paused(self.exchange_pause || self.flow_pause);
+                codec.set_parser_paused(self.exchange_pause || self.flow_pause);
             }
             if let Some(size) = generated.header_size {
                 headers.on_headers_encoded(size);
@@ -1320,12 +1456,12 @@ impl<A: OwnedApplication> Driver<A> {
             // A stop reported with this event, which may be the response's last, or from its
             // byte events' cancellation (`DIV-054`).
             if !exchange.ingress_complete && exchange.signals.stopped() {
-                stop_request_ingress(&mut self.codec, &mut self.ingress_stopped);
+                stop_request_ingress(self.codec.get_mut(), &mut self.ingress_stopped);
             }
             let eom = event.eom();
             match event.into_kind() {
                 HttpBodyEventKind::Body(body) => {
-                    self.codec.generate(
+                    self.codec.get_mut().generate(
                         &mut self.egress,
                         EgressFrame::Body {
                             stream,
@@ -1337,7 +1473,7 @@ impl<A: OwnedApplication> Driver<A> {
                     )?;
                 }
                 HttpBodyEventKind::Trailers(trailers) => {
-                    self.codec.generate(
+                    self.codec.get_mut().generate(
                         &mut self.egress,
                         EgressFrame::Trailers {
                             stream,
@@ -1412,7 +1548,7 @@ impl<A: OwnedApplication> Driver<A> {
         if self.codec.is_reusable() || self.eof_abort_watched() {
             self.exchange_pause = false;
             self.flow_pause = false;
-            self.codec.set_parser_paused(false);
+            self.codec.get_mut().set_parser_paused(false);
         }
         true
     }
@@ -1435,17 +1571,8 @@ impl<A: OwnedApplication> Driver<A> {
 
     /// `None` when no read was outstanding to poll.
     fn poll_read_once(&mut self) -> Option<ReadPoll> {
-        if self.read.is_none()
-            && !self.eof
-            && self.read_error.is_none()
-            && self.fatal.is_none()
-            && self.closing_error.is_none()
-            && !self.cancellation.is_cancellation_requested()
-        {
-            let maximum = self
-                .config
-                .maximum_read_size
-                .min(self.ingress.remaining_capacity());
+        if self.read.is_none() {
+            let maximum = self.read_capacity();
             if maximum != 0 {
                 self.read = Some(self.transport.read(
                     &self.context,
@@ -1476,8 +1603,9 @@ impl<A: OwnedApplication> Driver<A> {
                 if read.is_eof() {
                     // As `UniplexSession`: a response generated after peer EOF closes.
                     self.eof = true;
-                    self.codec.generate_immediate_goaway();
+                    self.codec.get_mut().generate_immediate_goaway();
                 }
+                self.codec.reparse = true;
                 let mut data = read.into_data();
                 if self.eof_watch {
                     drop(data);
@@ -1495,6 +1623,22 @@ impl<A: OwnedApplication> Driver<A> {
             }
         }
         Some(ReadPoll::Data)
+    }
+
+    /// How much a new read may take: 0 while no read can start, as the connection read EOF or
+    /// a failure or is ending, or while the ingress buffer is full.
+    fn read_capacity(&self) -> usize {
+        if self.eof
+            || self.read_error.is_some()
+            || self.fatal.is_some()
+            || self.closing_error.is_some()
+            || self.cancellation.is_cancellation_requested()
+        {
+            return 0;
+        }
+        self.config
+            .maximum_read_size
+            .min(self.ingress.remaining_capacity())
     }
 
     fn writes_pending(&self) -> bool {
@@ -1641,6 +1785,8 @@ impl<A: OwnedApplication> Driver<A> {
             self.fail_read(failure(HttpErrorCode::TRANSPORT_EOF, b"transport EOF"));
         } else {
             self.eof_judged = true;
+            // The codec may now take the EOF.
+            self.codec.reparse = true;
         }
     }
 
@@ -1704,7 +1850,7 @@ impl<A: OwnedApplication> Driver<A> {
             .message_mut()
             .expect("a new error response retains its message");
         let stream = self.codec.last_incoming_stream_id();
-        self.codec.generate(
+        self.codec.get_mut().generate(
             &mut self.egress,
             EgressFrame::Headers {
                 stream,

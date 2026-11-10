@@ -844,6 +844,14 @@ struct Exchange {
 }
 
 impl Exchange {
+    /// Whether `cancel_error` selects a cause, without building it.
+    fn cancel_requested(&self) -> bool {
+        self.status.shared.cancelled()
+            || (!(self.request_complete && self.response_complete)
+                && (self.status.error.borrow().is_some()
+                    || self.status.cancellation.is_cancellation_requested()))
+    }
+
     /// What stops the exchange now: a connection cancel, or the request's selected cause
     /// while it still closes the connection (an HTTP/1.1 exchange cannot be reset alone before
     /// both messages end).
@@ -1142,7 +1150,7 @@ struct UpstreamDriver {
     transport: Rc<dyn UniplexTransport>,
     shared: Rc<Shared>,
     config: UniplexConfig,
-    codec: Http1xCodec,
+    codec: IngressCodec,
     exchange: Option<Box<Exchange>>,
     ingress: BufQueue,
     egress: BufQueue,
@@ -1354,7 +1362,7 @@ impl UpstreamDriver {
                 transport,
                 shared: Rc::clone(&shared),
                 config: io,
-                codec,
+                codec: IngressCodec::new(codec),
                 exchange: None,
                 ingress: BufQueue::new(io.buffer_limit),
                 egress: BufQueue::new(io.buffer_limit),
@@ -1405,6 +1413,8 @@ impl UpstreamDriver {
         }
         let mut turn = 0;
         while turn < TURN_BUDGET {
+            #[cfg(test)]
+            count(&DRIVER_TURNS);
             self.observe_cancel();
             let mut progress = false;
             if let Some(wrote) = self.poll_write() {
@@ -1425,14 +1435,7 @@ impl UpstreamDriver {
                     b"owned H1 upstream response without a request",
                 ));
             }
-            if self.fatal.is_none()
-                && self.exchange.is_some()
-                && !self.flow_pause
-                && !self.response_pause
-                && (!self.ingress.is_empty()
-                    || self.codec.is_busy()
-                    || (self.eof && !self.eof_processed))
-            {
+            if self.parse_due() {
                 match self.parse_input() {
                     Ok(parsed) => progress |= parsed,
                     Err(error) => self.abort(error),
@@ -1457,13 +1460,21 @@ impl UpstreamDriver {
                 progress = true;
                 self.observe_cancel();
             }
+            // The write waits while a phase before it can still add to it: one that acted this
+            // turn may act again. When none would, it starts in place of the next turn, which
+            // still counts against the budget that places the write it forces, the idleness it
+            // notes and the yield.
+            let write_waits = progress
+                && self.egress.chain_length() < self.config.maximum_write_size
+                && turn + 1 < TURN_BUDGET;
             if !self.transport_reset
                 && !self.egress.is_empty()
                 && self.can_start_write()
-                && (!progress
-                    || self.egress.chain_length() >= self.config.maximum_write_size
-                    || turn + 1 >= TURN_BUDGET)
+                && (!write_waits || !self.phases_due_before_write())
             {
+                if write_waits {
+                    turn += 1;
+                }
                 // A write queue's capacity check, like the capacity callbacks before it, may
                 // cancel the connection or the request; the abort discards the egress.
                 self.observe_cancel();
@@ -1515,22 +1526,18 @@ impl UpstreamDriver {
                 turn += 1;
                 continue;
             }
-            // As OwnedH2, idleness is recomputed on every quiescent turn, so a slot returned
-            // uncommitted leaves the connection idle again.
             if !progress || turn + 1 == TURN_BUDGET {
-                self.shared.idle.set(
-                    self.exchange.is_none()
-                        && self.shared.used.get() == 0
-                        && self.egress.is_empty()
-                        && !self.writes_pending()
-                        && self.fatal.is_none()
-                        && !self.transport_reset,
-                );
+                self.update_idle();
             }
             if !progress {
                 return Poll::Pending;
             }
             turn += 1;
+            // A next turn that would find nothing to do would note idleness and return here.
+            if turn < TURN_BUDGET && !self.turn_due() {
+                self.update_idle();
+                return Poll::Pending;
+            }
         }
         self.budget_yield = Some(self.context.host().yield_to_io());
         // A yield that completes on its first poll arranged no wake.
@@ -1538,6 +1545,91 @@ impl UpstreamDriver {
             context.waker().wake_by_ref();
         }
         Poll::Pending
+    }
+
+    /// As OwnedH2, idleness is recomputed on every quiescent turn, so a slot returned
+    /// uncommitted leaves the connection idle again.
+    fn update_idle(&self) {
+        self.shared.idle.set(
+            self.exchange.is_none()
+                && self.shared.used.get() == 0
+                && self.egress.is_empty()
+                && !self.writes_pending()
+                && self.fatal.is_none()
+                && !self.transport_reset,
+        );
+    }
+
+    /// Whether a next turn would act. Each term is the condition under which a step of the
+    /// turn acts, or a wider one, and none runs transport or application code: a phase before
+    /// the write; the write; a failure or a reset; or the idle close.
+    fn turn_due(&self) -> bool {
+        self.transport_reset
+            || self.fatal.is_some()
+            || self.phases_due_before_write()
+            || if self.egress.is_empty() {
+                // The idle check on the write queue is transport code.
+                self.exchange.is_none()
+                    && self.ingress.is_empty()
+                    && self.shared.closed.borrow().is_some()
+                    && self.shared.queued.borrow().is_none()
+            } else {
+                // A queue's capacity check is transport code.
+                self.write_queue.is_some() || self.write.is_none()
+            }
+    }
+
+    /// Whether a phase before the write would act in a next turn: the cancel check, the write
+    /// completion, the read, admission, the check for a response without a request, the
+    /// parse, a held read failure, the exchange or its settlement. Each term is the condition
+    /// under which that phase acts, or a wider one, and none runs transport or application
+    /// code.
+    fn phases_due_before_write(&self) -> bool {
+        (!self.transport_reset
+            && match &self.exchange {
+                Some(exchange) => exchange.cancel_requested(),
+                None => self.shared.cancelled(),
+            })
+            || self.write_wake.is_ready()
+            || self.read_wake.is_ready()
+            || (self.read.is_none() && self.read_capacity() != 0)
+            || (self.fatal.is_none()
+                && (self.admission_due() || (!self.ingress.is_empty() && self.exchange.is_none())))
+            || self.parse_due()
+            || (self.read_error.is_some() && !(self.flow_pause && self.codec.is_busy()))
+            || (self.fatal.is_none() && (self.stream_wake.is_ready() || self.settle_due()))
+    }
+
+    /// Whether `poll_admission` acts: EOF closes admission, or a queued submission can commit.
+    fn admission_due(&self) -> bool {
+        (self.eof && self.shared.closed.borrow().is_none())
+            || (self.exchange.is_none()
+                && self.ingress.is_empty()
+                && self.shared.queued.borrow().is_some())
+    }
+
+    /// Whether the parse phase acts: the input or the codec changed since a parse consumed all
+    /// of its input, and the live exchange's response has something to parse.
+    fn parse_due(&self) -> bool {
+        self.codec.reparse
+            && self.fatal.is_none()
+            && self.exchange.is_some()
+            && !self.flow_pause
+            && !self.response_pause
+            && (!self.ingress.is_empty()
+                || self.codec.is_busy()
+                || (self.eof && !self.eof_processed))
+    }
+
+    /// Whether `settle_exchange` acts: it releases the capacity of an exchange whose messages
+    /// ended, or retires one whose response is consumed and request written.
+    fn settle_due(&self) -> bool {
+        self.exchange.as_ref().is_some_and(|exchange| {
+            exchange.request_complete
+                && exchange.response_complete
+                && ((exchange.status.counted.get() && exchange.status.ingress_succeeded())
+                    || (exchange.consumed && exchange.write_boundary <= self.summary.bytes_written))
+        })
     }
 
     /// Run at each phase boundary: callbacks may cancel the session or the live request, and
@@ -1650,7 +1742,7 @@ impl UpstreamDriver {
             ));
         }
         let head_request = method == Some(HttpMethod::Head);
-        let id = self.codec.create_stream();
+        let id = self.codec.get_mut().create_stream();
         let signals = Rc::new(IngressSignals {
             source_complete: Cell::new(false),
             completed: Cell::new(None),
@@ -1676,7 +1768,7 @@ impl UpstreamDriver {
         }
         let producer = source.producer();
         let eom = headers.eom();
-        let generated = self.codec.generate(
+        let generated = self.codec.get_mut().generate(
             &mut self.egress,
             EgressFrame::Headers {
                 stream: id,
@@ -1749,7 +1841,7 @@ impl UpstreamDriver {
         }));
         self.flow_pause = false;
         self.response_pause = false;
-        self.codec.set_parser_paused(false);
+        self.codec.get_mut().set_parser_paused(false);
         status.acknowledge(id, source);
         self.stream_wake.mark();
         Ok(())
@@ -1770,9 +1862,12 @@ impl UpstreamDriver {
         let (consumed, mut egress_results) = if length == 0 && !self.codec.is_busy() {
             (0, Vec::new())
         } else {
-            let result = self
-                .codec
-                .on_ingress(&self.ingress, &mut callback, &mut self.egress);
+            #[cfg(test)]
+            count(&CODEC_PARSES);
+            let result =
+                self.codec
+                    .codec
+                    .on_ingress(&self.ingress, &mut callback, &mut self.egress);
             (result.consumed, result.egress_results)
         };
         // EOF ends a close-delimited response, or fails an unfinished one, once every byte
@@ -1785,7 +1880,10 @@ impl UpstreamDriver {
             && consumed == length;
         if finishing_eof {
             self.eof_processed = true;
-            let result = self.codec.on_ingress_eof(&mut callback, &mut self.egress);
+            let result = self
+                .codec
+                .codec
+                .on_ingress_eof(&mut callback, &mut self.egress);
             egress_results.extend(result.egress_results);
             // Before a response begins, the codec raises nothing at EOF, as `UniplexSession`
             // fails the request then.
@@ -1811,6 +1909,8 @@ impl UpstreamDriver {
         self.ingress
             .trim_start(consumed)
             .expect("codec consumption was range checked");
+        // As downstream: a parse of what remains acts only after a change.
+        self.codec.reparse = !self.ingress.is_empty();
         for result in egress_results {
             result?;
         }
@@ -1832,7 +1932,7 @@ impl UpstreamDriver {
                 .is_none_or(|buffered| buffered < self.config.ingress_buffer_limit)
         {
             self.flow_pause = false;
-            self.codec.set_parser_paused(self.response_pause);
+            self.codec.get_mut().set_parser_paused(self.response_pause);
         }
         // A cancel before both messages end closes the connection. After that, the buffered
         // response stays readable, as OwnedH2 leaves a finished stream.
@@ -1905,7 +2005,7 @@ impl UpstreamDriver {
                 exchange.resume = Some(resume);
             }
             HttpBodyEventKind::Trailers(trailers) => {
-                let generated = self.codec.generate(
+                let generated = self.codec.get_mut().generate(
                     &mut self.egress,
                     EgressFrame::Trailers {
                         stream: exchange.id,
@@ -1917,7 +2017,7 @@ impl UpstreamDriver {
                 // its message open, though the request is complete on the wire (DIV-029): the
                 // message ends here, writing nothing, so the connection can carry the next one.
                 if generated.bytes_written == 0 {
-                    self.codec.generate(
+                    self.codec.get_mut().generate(
                         &mut self.egress,
                         EgressFrame::EndOfMessage {
                             stream: exchange.id,
@@ -1927,7 +2027,7 @@ impl UpstreamDriver {
                 }
             }
             HttpBodyEventKind::Body(body) => {
-                self.codec.generate(
+                self.codec.get_mut().generate(
                     &mut self.egress,
                     EgressFrame::Body {
                         stream: exchange.id,
@@ -1939,7 +2039,7 @@ impl UpstreamDriver {
                 )?;
             }
             HttpBodyEventKind::Padding(length) => {
-                self.codec.generate(
+                self.codec.get_mut().generate(
                     &mut self.egress,
                     EgressFrame::Padding {
                         stream: exchange.id,
@@ -1949,7 +2049,7 @@ impl UpstreamDriver {
                 )?;
                 // Padding writes nothing in HTTP/1.1, so its EOM ends the message on its own.
                 if eom {
-                    self.codec.generate(
+                    self.codec.get_mut().generate(
                         &mut self.egress,
                         EgressFrame::EndOfMessage {
                             stream: exchange.id,
@@ -2045,18 +2145,25 @@ impl UpstreamDriver {
         Some(progress)
     }
 
-    fn poll_read_once(&mut self) -> Option<ReadPoll> {
-        if self.read.is_none()
-            && !self.eof
-            && self.read_error.is_none()
-            && self.failed_read.is_none()
-            && self.fatal.is_none()
-            && !self.cancellation.is_cancellation_requested()
+    /// How much a new read may take: 0 while no read can start, as the connection read EOF or
+    /// a failure or is ending, or while the ingress buffer is full.
+    fn read_capacity(&self) -> usize {
+        if self.eof
+            || self.read_error.is_some()
+            || self.failed_read.is_some()
+            || self.fatal.is_some()
+            || self.cancellation.is_cancellation_requested()
         {
-            let maximum = self
-                .config
-                .maximum_read_size
-                .min(self.ingress.remaining_capacity());
+            return 0;
+        }
+        self.config
+            .maximum_read_size
+            .min(self.ingress.remaining_capacity())
+    }
+
+    fn poll_read_once(&mut self) -> Option<ReadPoll> {
+        if self.read.is_none() {
+            let maximum = self.read_capacity();
             if maximum != 0 {
                 self.read = Some(self.transport.read(
                     &self.context,
@@ -2087,6 +2194,7 @@ impl UpstreamDriver {
                 if read.is_eof() {
                     self.eof = true;
                 }
+                self.codec.reparse = true;
                 let mut data = read.into_data();
                 if self.ingress.append(&mut data).is_err() {
                     self.abort(failure(
