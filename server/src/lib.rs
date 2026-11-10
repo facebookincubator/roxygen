@@ -30,6 +30,10 @@ mod attachment_tests;
 mod allocation_count;
 
 #[cfg(test)]
+#[path = "../tests/eof_abort.rs"]
+mod eof_abort_tests;
+
+#[cfg(test)]
 #[path = "../tests/http1_egress_batching.rs"]
 mod http1_egress_batching_tests;
 
