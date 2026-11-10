@@ -36,11 +36,38 @@ use super::Http1xCodec;
 use super::MAX_HEADER_BYTES;
 use super::ParseState;
 use super::chunk_delimiter_turns;
+use super::dyn_ingress_deliveries;
 use super::server_accepted_upgrade;
 
 static_assertions::assert_not_impl_any!(Http1xCodec: Clone, Send, Sync);
 
 const QUEUE_LIMIT: usize = 1024 * 1024;
+
+/// Which `Http1xCodec` ingress entry a test parses through.
+#[derive(Clone, Copy, Debug)]
+enum CallbackDispatch {
+    /// `HttpCodec::on_ingress`, with the callback as `dyn HttpCodecCallback`.
+    Dynamic,
+    /// `Http1xCodec::on_ingress_with_callback`, with the callback's own type.
+    Concrete,
+}
+
+impl CallbackDispatch {
+    const ALL: [Self; 2] = [Self::Dynamic, Self::Concrete];
+
+    fn ingress<C: HttpCodecCallback>(
+        self,
+        codec: &mut Http1xCodec,
+        input: &BufQueue,
+        callback: &mut C,
+        callback_egress: &mut BufQueue,
+    ) -> CodecIngressResult {
+        match self {
+            Self::Dynamic => HttpCodec::on_ingress(codec, input, callback, callback_egress),
+            Self::Concrete => codec.on_ingress_with_callback(input, callback, callback_egress),
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct Recorder {
@@ -230,35 +257,45 @@ fn test_simple_headers() {
 
 #[test]
 fn fragmented_ingress_body_shares_backing() {
-    let head = b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
-    let mut first_bytes = head.to_vec();
-    first_bytes.extend_from_slice(b"ab");
-    let first = Bytes::from(first_bytes);
-    let second = Bytes::from_static(b"cd");
-    let first_body_pointer = first.as_ptr().wrapping_add(head.len());
-    let second_body_pointer = second.as_ptr();
-    let mut input = BufQueue::new(first.len() + second.len());
-    input.push_bytes(first.clone()).expect("first segment fits");
-    input
-        .push_bytes(second.clone())
-        .expect("second segment fits");
-    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
-    let mut callback = SharedBodyCapture::default();
-    let mut callback_egress = BufQueue::new(QUEUE_LIMIT);
+    for dispatch in CallbackDispatch::ALL {
+        let head = b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
+        let mut first_bytes = head.to_vec();
+        first_bytes.extend_from_slice(b"ab");
+        let first = Bytes::from(first_bytes);
+        let second = Bytes::from_static(b"cd");
+        let first_body_pointer = first.as_ptr().wrapping_add(head.len());
+        let second_body_pointer = second.as_ptr();
+        let mut input = BufQueue::new(first.len() + second.len());
+        input.push_bytes(first.clone()).expect("first segment fits");
+        input
+            .push_bytes(second.clone())
+            .expect("second segment fits");
+        let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+        let mut callback = SharedBodyCapture::default();
+        let mut callback_egress = BufQueue::new(QUEUE_LIMIT);
 
-    let result = codec.on_ingress(&input, &mut callback, &mut callback_egress);
+        let result = dispatch.ingress(&mut codec, &input, &mut callback, &mut callback_egress);
 
-    assert_eq!(result.consumed, input.chain_length());
-    assert_eq!(callback.segments.len(), 2);
-    assert_eq!(callback.segments[0].as_ref(), b"ab");
-    assert_eq!(callback.segments[0].as_ptr(), first_body_pointer);
-    assert_eq!(callback.segments[1].as_ref(), b"cd");
-    assert_eq!(callback.segments[1].as_ptr(), second_body_pointer);
-    assert_eq!(input.segment_count(), 2);
-    assert_eq!(
-        input.front().expect("first input segment").as_ptr(),
-        first.as_ptr()
-    );
+        assert_eq!(result.consumed, input.chain_length());
+        assert_eq!(callback.segments.len(), 2);
+        assert_eq!(callback.segments[0].as_ref(), b"ab");
+        assert_eq!(
+            callback.segments[0].as_ptr(),
+            first_body_pointer,
+            "{dispatch:?}"
+        );
+        assert_eq!(callback.segments[1].as_ref(), b"cd");
+        assert_eq!(
+            callback.segments[1].as_ptr(),
+            second_body_pointer,
+            "{dispatch:?}"
+        );
+        assert_eq!(input.segment_count(), 2);
+        assert_eq!(
+            input.front().expect("first input segment").as_ptr(),
+            first.as_ptr()
+        );
+    }
 }
 
 #[test]
@@ -453,28 +490,115 @@ fn paused_body_defers_eof_until_resume() {
         }
     }
 
-    let input = b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\ndata";
-    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
-    let mut callback = PauseOnBody {
-        events: Vec::new(),
-        paused: false,
-    };
-    let mut egress = BufQueue::new(QUEUE_LIMIT);
-    let result = codec.on_ingress(&ingress_queue(input), &mut callback, &mut egress);
-    assert_eq!(result.consumed, input.len());
-    assert_eq!(callback.events, ["begin", "headers", "body"]);
+    for dispatch in CallbackDispatch::ALL {
+        let input = b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\ndata";
+        let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+        let mut callback = PauseOnBody {
+            events: Vec::new(),
+            paused: false,
+        };
+        let mut egress = BufQueue::new(QUEUE_LIMIT);
+        let result = dispatch.ingress(
+            &mut codec,
+            &ingress_queue(input),
+            &mut callback,
+            &mut egress,
+        );
+        assert_eq!(result.consumed, input.len());
+        assert_eq!(
+            callback.events,
+            ["begin", "headers", "body"],
+            "{dispatch:?}"
+        );
 
-    let _ = codec.on_ingress_eof(&mut callback, &mut egress);
-    assert_eq!(callback.events, ["begin", "headers", "body"]);
+        let _ = codec.on_ingress_eof(&mut callback, &mut egress);
+        assert_eq!(
+            callback.events,
+            ["begin", "headers", "body"],
+            "{dispatch:?}"
+        );
 
-    codec.set_parser_paused(false);
-    assert_eq!(
+        codec.set_parser_paused(false);
+        assert_eq!(
+            dispatch
+                .ingress(&mut codec, &BufQueue::new(0), &mut callback, &mut egress)
+                .consumed,
+            0
+        );
+        assert_eq!(
+            callback.events,
+            ["begin", "headers", "body", "complete"],
+            "{dispatch:?}"
+        );
+    }
+}
+
+#[test]
+fn concrete_ingress_delivers_every_callback_without_dyn_dispatch() {
+    let downstream = || Http1xCodec::new(TransportDirection::Downstream);
+    let upstream = || {
+        let mut codec = Http1xCodec::new(TransportDirection::Upstream);
+        send_trace_request(&mut codec);
         codec
-            .on_ingress(&BufQueue::new(0), &mut callback, &mut egress)
-            .consumed,
-        0
-    );
-    assert_eq!(callback.events, ["begin", "headers", "body", "complete"]);
+    };
+    let cases: [(&str, fn() -> Http1xCodec, &[u8], &[&str]); 3] = [
+        (
+            "request with a body",
+            downstream,
+            b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\ndata",
+            &["begin", "headers", "body", "complete"],
+        ),
+        (
+            "chunked response",
+            upstream,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+            &[
+                "begin",
+                "headers",
+                "chunk_header",
+                "body",
+                "chunk_complete",
+                "complete",
+            ],
+        ),
+        (
+            "invalid start line",
+            downstream,
+            b"G\x01T / HTTP/1.1\r\n\r\n",
+            &["begin", "error"],
+        ),
+    ];
+    for (name, codec, wire, events) in cases {
+        let mut egress = BufQueue::new(QUEUE_LIMIT);
+
+        let mut recorder = Recorder::default();
+        let before = dyn_ingress_deliveries();
+        let consumed = HttpCodec::on_ingress(
+            &mut codec(),
+            &ingress_queue(wire),
+            &mut recorder,
+            &mut egress,
+        )
+        .consumed;
+        assert_eq!(recorder.events, events, "{name}");
+        assert_eq!(
+            dyn_ingress_deliveries() - before,
+            events.len(),
+            "{name}: the trait entry delivers every callback through `dyn`"
+        );
+
+        let mut recorder = Recorder::default();
+        let before = dyn_ingress_deliveries();
+        let result =
+            codec().on_ingress_with_callback(&ingress_queue(wire), &mut recorder, &mut egress);
+        assert_eq!(result.consumed, consumed, "{name}");
+        assert_eq!(recorder.events, events, "{name}");
+        assert_eq!(
+            dyn_ingress_deliveries() - before,
+            0,
+            "{name}: the concrete entry delivers no callback through `dyn`"
+        );
+    }
 }
 
 #[test]
@@ -909,30 +1033,41 @@ impl HttpCodecCallback for BadPostCallback {
 #[test]
 fn test_bad_post_100() {
     let input = b"POST / HTTP/1.1\r\nExpect: 100-Continue\r\nContent-Length: 5\r\n\r\nabcdefghij";
-    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
-    let mut callback = BadPostCallback { events: Vec::new() };
-    let mut egress = BufQueue::new(QUEUE_LIMIT);
-    let result = codec.on_ingress(&ingress_queue(input), &mut callback, &mut egress);
-    assert_eq!(result.consumed, input.len() - 4);
-    assert_eq!(result.egress_results.len(), 3);
-    assert!(result.egress_results.iter().all(Result::is_ok));
-    assert_eq!(
-        callback.events,
-        [
-            "begin-1",
-            "headers-1/generate-100",
-            "body-1",
-            "complete-1",
-            "begin-2/generate-200",
-            "error-2/generate-400",
-        ]
-    );
-    assert!(codec.is_parser_paused());
-    let wire = queue_bytes(&egress);
-    let continue_at = find_bytes(&wire, b" 100 ").unwrap();
-    let ok_at = find_bytes(&wire, b" 200 ").unwrap();
-    let bad_at = find_bytes(&wire, b" 400 ").unwrap();
-    assert!(continue_at < ok_at && ok_at < bad_at);
+    for dispatch in CallbackDispatch::ALL {
+        let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+        let mut callback = BadPostCallback { events: Vec::new() };
+        let mut egress = BufQueue::new(QUEUE_LIMIT);
+        let result = dispatch.ingress(
+            &mut codec,
+            &ingress_queue(input),
+            &mut callback,
+            &mut egress,
+        );
+        assert_eq!(result.consumed, input.len() - 4, "{dispatch:?}");
+        assert_eq!(result.egress_results.len(), 3, "{dispatch:?}");
+        assert!(
+            result.egress_results.iter().all(Result::is_ok),
+            "{dispatch:?}"
+        );
+        assert_eq!(
+            callback.events,
+            [
+                "begin-1",
+                "headers-1/generate-100",
+                "body-1",
+                "complete-1",
+                "begin-2/generate-200",
+                "error-2/generate-400",
+            ],
+            "{dispatch:?}"
+        );
+        assert!(codec.is_parser_paused());
+        let wire = queue_bytes(&egress);
+        let continue_at = find_bytes(&wire, b" 100 ").unwrap();
+        let ok_at = find_bytes(&wire, b" 200 ").unwrap();
+        let bad_at = find_bytes(&wire, b" 400 ").unwrap();
+        assert!(continue_at < ok_at && ok_at < bad_at);
+    }
 }
 
 #[test]
@@ -1210,74 +1345,79 @@ fn chunk_callbacks_pause_before_the_next_phase() {
         }
     }
 
-    // The chunked body, CRLF and bare-LF terminated, and the consumed offset
-    // of each paused callback.
-    for (bytes, offsets) in [
-        (b"2\r\nab\r\n1\r\nc\r\n0\r\n\r\n".as_slice(), [3, 7, 10, 13]),
-        (b"2\r\nab\n1\r\nc\n0\r\n\r\n".as_slice(), [3, 6, 9, 11]),
-    ] {
-        for split in 0..=bytes.len() {
-            let wire = Bytes::copy_from_slice(bytes);
-            let expected_body_pointers = [
-                wire.as_ptr().wrapping_add(3),
-                wire.as_ptr().wrapping_add(4),
-                wire.as_ptr().wrapping_add(offsets[2]),
-            ];
-            let (mut codec, recorder) = chunk_size_codec(false, false);
-            let mut callback = PauseOnChunk(recorder, SharedBodyCapture::default());
-            let mut input = BufQueue::new(wire.len());
-            input.push_bytes(wire.slice(..split)).unwrap();
-            input.push_bytes(wire.slice(split..)).unwrap();
-            drop(wire);
-            let mut egress = BufQueue::new(QUEUE_LIMIT);
-            let mut consumed = 0;
-            for (offset, event) in offsets.into_iter().zip([
-                "chunk_header",
-                "chunk_complete",
-                "chunk_header",
-                "chunk_complete",
-            ]) {
-                codec.set_parser_paused(false);
-                let result = codec.on_ingress(&input, &mut callback, &mut egress);
-                consumed += result.consumed;
-                input.trim_start(result.consumed).unwrap();
-                assert_eq!(consumed, offset, "split={split}");
-                assert!(codec.is_parser_paused());
-                assert_eq!(callback.0.events.last(), Some(&event));
-                if event == "chunk_complete" {
-                    assert!(matches!(codec.state, ParseState::ChunkSize(line) if line.length == 0));
-                } else {
-                    assert!(matches!(codec.state, ParseState::ChunkBody(_)));
+    for dispatch in CallbackDispatch::ALL {
+        // The chunked body, CRLF and bare-LF terminated, and the consumed offset
+        // of each paused callback.
+        for (bytes, offsets) in [
+            (b"2\r\nab\r\n1\r\nc\r\n0\r\n\r\n".as_slice(), [3, 7, 10, 13]),
+            (b"2\r\nab\n1\r\nc\n0\r\n\r\n".as_slice(), [3, 6, 9, 11]),
+        ] {
+            for split in 0..=bytes.len() {
+                let wire = Bytes::copy_from_slice(bytes);
+                let expected_body_pointers = [
+                    wire.as_ptr().wrapping_add(3),
+                    wire.as_ptr().wrapping_add(4),
+                    wire.as_ptr().wrapping_add(offsets[2]),
+                ];
+                let (mut codec, recorder) = chunk_size_codec(false, false);
+                let mut callback = PauseOnChunk(recorder, SharedBodyCapture::default());
+                let mut input = BufQueue::new(wire.len());
+                input.push_bytes(wire.slice(..split)).unwrap();
+                input.push_bytes(wire.slice(split..)).unwrap();
+                drop(wire);
+                let mut egress = BufQueue::new(QUEUE_LIMIT);
+                let mut consumed = 0;
+                for (offset, event) in offsets.into_iter().zip([
+                    "chunk_header",
+                    "chunk_complete",
+                    "chunk_header",
+                    "chunk_complete",
+                ]) {
+                    codec.set_parser_paused(false);
+                    let result = dispatch.ingress(&mut codec, &input, &mut callback, &mut egress);
+                    consumed += result.consumed;
+                    input.trim_start(result.consumed).unwrap();
+                    assert_eq!(consumed, offset, "split={split} {dispatch:?}");
+                    assert!(codec.is_parser_paused());
+                    assert_eq!(callback.0.events.last(), Some(&event));
+                    if event == "chunk_complete" {
+                        assert!(
+                            matches!(codec.state, ParseState::ChunkSize(line) if line.length == 0)
+                        );
+                    } else {
+                        assert!(matches!(codec.state, ParseState::ChunkBody(_)));
+                    }
+                    let callbacks = callback.0.callback_count;
+                    assert_eq!(
+                        dispatch
+                            .ingress(&mut codec, &input, &mut callback, &mut egress)
+                            .consumed,
+                        0
+                    );
+                    assert_eq!(callback.0.callback_count, callbacks);
                 }
-                let callbacks = callback.0.callback_count;
-                assert_eq!(
-                    codec
-                        .on_ingress(&input, &mut callback, &mut egress)
-                        .consumed,
-                    0
-                );
-                assert_eq!(callback.0.callback_count, callbacks);
+                codec.set_parser_paused(false);
+                consumed += dispatch
+                    .ingress(&mut codec, &input, &mut callback, &mut egress)
+                    .consumed;
+                assert_eq!(consumed, bytes.len());
+                input.trim_start(input.chain_length()).unwrap();
+                drop(input);
+                drop(codec);
+                assert_eq!(callback.0.chunk_lengths, [2, 1]);
+                assert_eq!(callback.0.bodies, b"abc");
+                assert_eq!(callback.0.completions, [false]);
+                assert!(callback.0.errors.is_empty());
+                let mut captured = Vec::new();
+                let mut pointers = Vec::new();
+                for body in &callback.1.segments {
+                    captured.extend_from_slice(body);
+                    pointers
+                        .extend((0..body.len()).map(|offset| body.as_ptr().wrapping_add(offset)));
+                }
+                assert_eq!(captured, b"abc");
+                assert_eq!(pointers, expected_body_pointers, "{dispatch:?}");
             }
-            codec.set_parser_paused(false);
-            consumed += codec
-                .on_ingress(&input, &mut callback, &mut egress)
-                .consumed;
-            assert_eq!(consumed, bytes.len());
-            input.trim_start(input.chain_length()).unwrap();
-            drop(input);
-            drop(codec);
-            assert_eq!(callback.0.chunk_lengths, [2, 1]);
-            assert_eq!(callback.0.bodies, b"abc");
-            assert_eq!(callback.0.completions, [false]);
-            assert!(callback.0.errors.is_empty());
-            let mut captured = Vec::new();
-            let mut pointers = Vec::new();
-            for body in &callback.1.segments {
-                captured.extend_from_slice(body);
-                pointers.extend((0..body.len()).map(|offset| body.as_ptr().wrapping_add(offset)));
-            }
-            assert_eq!(captured, b"abc");
-            assert_eq!(pointers, expected_body_pointers);
         }
     }
 }
@@ -3974,6 +4114,7 @@ fn send_trace_request(codec: &mut Http1xCodec) {
 /// One `on_ingress` call over the queued reads. Returns whether a selected
 /// callback paused the parser.
 fn trace_ingress(
+    dispatch: CallbackDispatch,
     codec: &mut Http1xCodec,
     recorder: &mut TraceRecorder,
     ingress: &mut BufQueue,
@@ -3981,7 +4122,7 @@ fn trace_ingress(
     requests: &mut usize,
 ) -> bool {
     let mut egress = BufQueue::new(QUEUE_LIMIT);
-    let result = codec.on_ingress(ingress, recorder, &mut egress);
+    let result = dispatch.ingress(codec, ingress, recorder, &mut egress);
     ingress
         .trim_start(result.consumed)
         .expect("the codec consumes at most its input");
@@ -4024,6 +4165,16 @@ fn one_segment_read(range: Range<usize>) -> Vec<Range<usize>> {
 /// the next call; after the last read, paused calls resume on what remains,
 /// and after an upgrade one more call takes the bytes that follow it.
 fn run_trace(case: &TraceCase, wire: &Bytes, reads: &[Vec<Range<usize>>]) -> TraceOutcome {
+    run_trace_through(CallbackDispatch::Dynamic, case, wire, reads)
+}
+
+/// [`run_trace`] through either ingress entry.
+fn run_trace_through(
+    dispatch: CallbackDispatch,
+    case: &TraceCase,
+    wire: &Bytes,
+    reads: &[Vec<Range<usize>>],
+) -> TraceOutcome {
     let direction = if case.upstream {
         TransportDirection::Upstream
     } else {
@@ -4049,6 +4200,7 @@ fn run_trace(case: &TraceCase, wire: &Bytes, reads: &[Vec<Range<usize>>]) -> Tra
             codec.set_parser_paused(false);
         }
         callback_paused = trace_ingress(
+            dispatch,
             &mut codec,
             &mut recorder,
             &mut ingress,
@@ -4060,6 +4212,7 @@ fn run_trace(case: &TraceCase, wire: &Bytes, reads: &[Vec<Range<usize>>]) -> Tra
     while callback_paused && resumed < 4 * wire.len() + 4 {
         codec.set_parser_paused(false);
         callback_paused = trace_ingress(
+            dispatch,
             &mut codec,
             &mut recorder,
             &mut ingress,
@@ -4070,6 +4223,7 @@ fn run_trace(case: &TraceCase, wire: &Bytes, reads: &[Vec<Range<usize>>]) -> Tra
     }
     if recorder.upgraded && !ingress.is_empty() {
         trace_ingress(
+            dispatch,
             &mut codec,
             &mut recorder,
             &mut ingress,
@@ -4124,6 +4278,25 @@ fn for_every_delivery(case: &TraceCase, mut check: impl FnMut(&str, &TraceOutcom
             &format!("{}: {delivery}", case.name),
             &run_trace(case, &wire, &reads),
         );
+    }
+}
+
+/// Runs `case` at every delivery through both ingress entries, checks that
+/// they deliver the same callbacks and consume the same bytes, and passes
+/// each outcome to `check`.
+fn for_every_delivery_through_both_entries(
+    case: &TraceCase,
+    mut check: impl FnMut(&str, &TraceOutcome),
+) {
+    let wire = Bytes::from_static(case.wire);
+    for (delivery, reads) in deliveries(wire.len()) {
+        let context = format!("{}: {delivery}", case.name);
+        let [dynamic, concrete] =
+            CallbackDispatch::ALL.map(|dispatch| run_trace_through(dispatch, case, &wire, &reads));
+        assert_eq!(concrete.events, dynamic.events, "{context}");
+        assert_eq!(concrete.consumed, dynamic.consumed, "{context}");
+        check(&format!("{context}, Dynamic"), &dynamic);
+        check(&format!("{context}, Concrete"), &concrete);
     }
 }
 
@@ -4185,9 +4358,8 @@ fn assert_scan_error(outcome: &TraceOutcome, context: &str, message: &[u8], cons
 #[test]
 fn head_parse_trace_is_independent_of_segmentation() {
     for case in TRACE_CASES {
-        let expected = one_segment_trace(case).trace;
-        for_every_delivery(case, |context, outcome| {
-            assert_eq!(outcome.trace, expected, "{context}");
+        for_every_delivery_through_both_entries(case, |context, outcome| {
+            assert_eq!(outcome.trace, golden_trace(case.name), "{context}");
         });
     }
 }
@@ -4733,7 +4905,7 @@ fn eof_inside_a_head_fails_with_the_recorded_partial_message() {
 #[test]
 fn callback_pauses_stop_and_resume_at_the_recorded_offsets() {
     for case in PAUSE_CASES {
-        for_every_delivery(case, |context, outcome| {
+        for_every_delivery_through_both_entries(case, |context, outcome| {
             assert_eq!(outcome.trace, golden_trace(case.name), "{context}");
         });
     }
@@ -8745,7 +8917,7 @@ fn chunked_ingress_matches_the_recorded_traces_at_every_split() {
     }
     for case in CHUNKED_TRACE_CASES.iter() {
         let golden = chunked_golden_trace(case.name);
-        for_every_delivery(case, |context, outcome| {
+        for_every_delivery_through_both_entries(case, |context, outcome| {
             assert_eq!(outcome.trace, golden, "{context}");
         });
     }
@@ -8846,56 +9018,63 @@ impl HttpCodecCallback for ChunkCounter {
 fn chunk_headers_and_terminators_allocate_nothing_after_warm_up() {
     const CHUNKS: usize = 8;
     // Each framing ends one 5-byte chunk and begins the next.
-    let framings: [&[u8]; 3] = [b"\r\n5\r\n", b"\n5\n", b"\r\n5;name=value\r\n"];
-    for framing in framings {
-        for byte_by_byte in [false, true] {
-            let context = format!("{} byte_by_byte={byte_by_byte}", framing.escape_ascii());
-            let mut codec = Http1xCodec::new(TransportDirection::Downstream);
-            let mut counter = ChunkCounter::default();
-            let mut egress = BufQueue::new(QUEUE_LIMIT);
-            let mut ingress = |codec: &mut Http1xCodec, read: &BufQueue| {
-                codec.on_ingress(read, &mut counter, &mut egress).consumed
-            };
-            let warm_up = [CHUNKED_REQUEST_HEAD, b"5\r\nhello"].concat();
-            assert_eq!(ingress(&mut codec, &ingress_queue(&warm_up)), warm_up.len());
-            let framing_reads = if byte_by_byte {
-                framing.chunks(1).map(ingress_queue).collect::<Vec<_>>()
-            } else {
-                vec![ingress_queue(framing)]
-            };
-            let body = ingress_queue(b"hello");
-            let mut allocations = 0;
-            for _ in 0..CHUNKS {
-                let (consumed, counted) = count_allocations(|| {
-                    framing_reads
-                        .iter()
-                        .map(|read| ingress(&mut codec, read))
-                        .sum::<usize>()
-                });
-                assert_eq!(consumed, framing.len(), "{context}");
-                allocations += counted;
-                assert_eq!(ingress(&mut codec, &body), body.chain_length(), "{context}");
-            }
-            assert_eq!(
-                counter,
-                ChunkCounter {
-                    chunk_headers: CHUNKS + 1,
-                    chunk_bytes: 5 * (CHUNKS + 1),
-                    chunk_completions: CHUNKS,
-                    body_bytes: 5 * (CHUNKS + 1),
-                    errors: 0,
-                },
-                "{context}"
-            );
-            if std_allocations_observable() {
+    for dispatch in CallbackDispatch::ALL {
+        let framings: [&[u8]; 3] = [b"\r\n5\r\n", b"\n5\n", b"\r\n5;name=value\r\n"];
+        for framing in framings {
+            for byte_by_byte in [false, true] {
+                let context = format!(
+                    "{} byte_by_byte={byte_by_byte} {dispatch:?}",
+                    framing.escape_ascii()
+                );
+                let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+                let mut counter = ChunkCounter::default();
+                let mut egress = BufQueue::new(QUEUE_LIMIT);
+                let mut ingress = |codec: &mut Http1xCodec, read: &BufQueue| {
+                    dispatch
+                        .ingress(codec, read, &mut counter, &mut egress)
+                        .consumed
+                };
+                let warm_up = [CHUNKED_REQUEST_HEAD, b"5\r\nhello"].concat();
+                assert_eq!(ingress(&mut codec, &ingress_queue(&warm_up)), warm_up.len());
+                let framing_reads = if byte_by_byte {
+                    framing.chunks(1).map(ingress_queue).collect::<Vec<_>>()
+                } else {
+                    vec![ingress_queue(framing)]
+                };
+                let body = ingress_queue(b"hello");
+                let mut allocations = 0;
+                for _ in 0..CHUNKS {
+                    let (consumed, counted) = count_allocations(|| {
+                        framing_reads
+                            .iter()
+                            .map(|read| ingress(&mut codec, read))
+                            .sum::<usize>()
+                    });
+                    assert_eq!(consumed, framing.len(), "{context}");
+                    allocations += counted;
+                    assert_eq!(ingress(&mut codec, &body), body.chain_length(), "{context}");
+                }
                 assert_eq!(
-                    allocations, 0,
-                    "{context}: chunk terminators and chunk-size lines allocate nothing"
+                    counter,
+                    ChunkCounter {
+                        chunk_headers: CHUNKS + 1,
+                        chunk_bytes: 5 * (CHUNKS + 1),
+                        chunk_completions: CHUNKS,
+                        body_bytes: 5 * (CHUNKS + 1),
+                        errors: 0,
+                    },
+                    "{context}"
                 );
-            } else {
-                eprintln!(
-                    "{context}: allocation counts need a static std, as in @fbcode//mode/opt"
-                );
+                if std_allocations_observable() {
+                    assert_eq!(
+                        allocations, 0,
+                        "{context}: chunk terminators and chunk-size lines allocate nothing"
+                    );
+                } else {
+                    eprintln!(
+                        "{context}: allocation counts need a static std, as in @fbcode//mode/opt"
+                    );
+                }
             }
         }
     }
@@ -8979,34 +9158,36 @@ fn delivering_a_parsed_head_allocates_nothing() {
 
 #[test]
 fn parsing_and_delivering_a_head_allocates_as_before() {
-    let allocations = parsed_head_cases().map(|(name, mut codec, head)| {
-        let read = ingress_queue(head);
-        let mut delivered = HeadAddresses::default();
-        let mut egress = BufQueue::new(QUEUE_LIMIT);
-        let (consumed, allocations) = count_allocations(|| {
-            codec
-                .on_ingress(&read, &mut delivered, &mut egress)
-                .consumed
+    for dispatch in CallbackDispatch::ALL {
+        let allocations = parsed_head_cases().map(|(name, mut codec, head)| {
+            let read = ingress_queue(head);
+            let mut delivered = HeadAddresses::default();
+            let mut egress = BufQueue::new(QUEUE_LIMIT);
+            let (consumed, allocations) = count_allocations(|| {
+                dispatch
+                    .ingress(&mut codec, &read, &mut delivered, &mut egress)
+                    .consumed
+            });
+            assert_eq!(consumed, head.len(), "{name} {dispatch:?}");
+            assert_eq!(delivered.heads, 1, "{name} {dispatch:?}");
+            (name, allocations)
         });
-        assert_eq!(consumed, head.len(), "{name}");
-        assert_eq!(delivered.heads, 1, "{name}");
-        (name, allocations)
-    });
-    if !std_allocations_observable() {
-        eprintln!("allocation counts need a static std, as in @fbcode//mode/opt");
-        return;
+        if !std_allocations_observable() {
+            eprintln!("allocation counts need a static std, as in @fbcode//mode/opt");
+            continue;
+        }
+        // Each head: its header list's reservation and its message's box. The
+        // codec also keeps a copy of the first User-Agent.
+        assert_eq!(
+            allocations,
+            [
+                ("request with a body", 2),
+                ("bodiless request", 3),
+                ("chunked response", 2),
+            ],
+            "allocations to parse and deliver each head through {dispatch:?}"
+        );
     }
-    // Each head: its header list's reservation and its message's box. The
-    // codec also keeps a copy of the first User-Agent.
-    assert_eq!(
-        allocations,
-        [
-            ("request with a body", 2),
-            ("bodiless request", 3),
-            ("chunked response", 2),
-        ],
-        "allocations to parse and deliver each head"
-    );
 }
 
 /// Whether a `T` can own heap memory: a type without drop glue cannot.

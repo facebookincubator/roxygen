@@ -201,6 +201,18 @@ fn chunk_delimiter_turns() -> usize {
     CHUNK_DELIMITER_TURNS.with(Cell::get)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static DYN_INGRESS_DELIVERIES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Ingress callbacks delivered through `dyn HttpCodecCallback` on this thread,
+/// read by the count oracles.
+#[cfg(test)]
+fn dyn_ingress_deliveries() -> usize {
+    DYN_INGRESS_DELIVERIES.with(Cell::get)
+}
+
 /// The chunk size read so far, from the line's bytes before its first `;`
 /// with HTTP whitespace trimmed from both ends: nonempty hex digits whose value
 /// fits a `u64`, or invalid. A CR counts as whitespace, as the trim treats it;
@@ -807,17 +819,12 @@ impl Http1xCodec {
 
     fn dispatch(
         &mut self,
-        callback: &mut dyn HttpCodecCallback,
+        callback: &mut (impl IngressDelivery + ?Sized),
         callback_egress: &mut BufQueue,
         event: CodecEvent<'_>,
         result: &mut CodecIngressResult,
     ) {
-        result.append_callback_result(HttpCodec::dispatch_ingress_callback(
-            self,
-            callback,
-            callback_egress,
-            event,
-        ));
+        result.append_callback_result(callback.deliver(self, event, callback_egress));
     }
 
     fn dispatch_eof(
@@ -837,7 +844,7 @@ impl Http1xCodec {
 
     fn begin_message(
         &mut self,
-        callback: &mut dyn HttpCodecCallback,
+        callback: &mut (impl IngressDelivery + ?Sized),
         callback_egress: &mut BufQueue,
         result: &mut CodecIngressResult,
     ) {
@@ -865,7 +872,7 @@ impl Http1xCodec {
 
     fn begin_http_09_response(
         &mut self,
-        callback: &mut dyn HttpCodecCallback,
+        callback: &mut (impl IngressDelivery + ?Sized),
         callback_egress: &mut BufQueue,
         result: &mut CodecIngressResult,
     ) {
@@ -891,7 +898,7 @@ impl Http1xCodec {
 
     fn complete_message(
         &mut self,
-        callback: &mut dyn HttpCodecCallback,
+        callback: &mut (impl IngressDelivery + ?Sized),
         callback_egress: &mut BufQueue,
         result: &mut CodecIngressResult,
         upgraded: bool,
@@ -950,7 +957,7 @@ impl Http1xCodec {
         &mut self,
         kind: ParseErrorKind,
         message: &'static [u8],
-        callback: &mut dyn HttpCodecCallback,
+        callback: &mut (impl IngressDelivery + ?Sized),
         callback_egress: &mut BufQueue,
         result: &mut CodecIngressResult,
     ) {
@@ -1242,7 +1249,7 @@ impl Http1xCodec {
         mut buffered: Vec<u8>,
         input: &[u8],
         head_start: usize,
-        callback: &mut dyn HttpCodecCallback,
+        callback: &mut (impl IngressDelivery + ?Sized),
         callback_egress: &mut BufQueue,
         result: &mut CodecIngressResult,
     ) {
@@ -1681,7 +1688,7 @@ impl Http1xCodec {
     fn install_parsed_head(
         &mut self,
         parsed: ParsedHead,
-        callback: &mut dyn HttpCodecCallback,
+        callback: &mut (impl IngressDelivery + ?Sized),
         callback_egress: &mut BufQueue,
         result: &mut CodecIngressResult,
     ) {
@@ -1710,7 +1717,7 @@ impl Http1xCodec {
     fn emit_body(
         &mut self,
         body: Bytes,
-        callback: &mut dyn HttpCodecCallback,
+        callback: &mut (impl IngressDelivery + ?Sized),
         callback_egress: &mut BufQueue,
         result: &mut CodecIngressResult,
     ) {
@@ -2395,47 +2402,65 @@ macro_rules! format {
     }};
 }
 
-impl HttpCodec for Http1xCodec {
-    fn protocol(&self) -> CodecProtocol {
-        CodecProtocol::Http11
-    }
+/// Delivers one ingress callback and applies the controls it returns before
+/// parsing continues.
+trait IngressDelivery {
+    fn deliver(
+        &mut self,
+        codec: &mut Http1xCodec,
+        event: CodecEvent<'_>,
+        callback_egress: &mut BufQueue,
+    ) -> CodecCallbackResult;
+}
 
-    fn transport_direction(&self) -> TransportDirection {
-        self.direction
+/// A callback of a concrete type, called directly: the body of
+/// [`HttpCodec::dispatch_ingress_callback`]'s default, which `Http1xCodec` does
+/// not override.
+impl<C: HttpCodecCallback> IngressDelivery for C {
+    fn deliver(
+        &mut self,
+        codec: &mut Http1xCodec,
+        event: CodecEvent<'_>,
+        callback_egress: &mut BufQueue,
+    ) -> CodecCallbackResult {
+        let actions = self.on_ingress_event(event);
+        HttpCodec::apply_callback_actions(codec, actions, self, callback_egress)
     }
+}
 
-    fn capabilities(&self) -> CodecCapabilities {
-        CodecCapabilities::default()
+impl IngressDelivery for dyn HttpCodecCallback + '_ {
+    fn deliver(
+        &mut self,
+        codec: &mut Http1xCodec,
+        event: CodecEvent<'_>,
+        callback_egress: &mut BufQueue,
+    ) -> CodecCallbackResult {
+        #[cfg(test)]
+        DYN_INGRESS_DELIVERIES.with(|deliveries| count_work(deliveries, 1));
+        HttpCodec::dispatch_ingress_callback(codec, self, callback_egress, event)
     }
+}
 
-    fn create_stream(&mut self) -> StreamId {
-        if self.direction.is_downstream() {
-            self.ingress_stream = StreamId::new(self.ingress_stream.get().saturating_add(1));
-            self.ingress_stream
-        } else {
-            self.egress_stream = StreamId::new(self.egress_stream.get().saturating_add(1));
-            self.egress_stream
-        }
-    }
-
-    fn is_busy(&self) -> bool {
-        self.request_pending || self.response_pending
-    }
-
-    fn set_parser_paused(&mut self, paused: bool) {
-        if !self.parser_error {
-            self.parser_paused = paused;
-        }
-    }
-
-    fn is_parser_paused(&self) -> bool {
-        self.parser_paused
-    }
-
-    fn on_ingress(
+impl Http1xCodec {
+    /// [`HttpCodec::on_ingress`] for a callback of concrete type `C`.
+    ///
+    /// It parses with the same code, delivers the same callbacks in the same
+    /// order, applies each callback's controls before parsing continues, and
+    /// returns the same result. The parser calls `C` directly rather than
+    /// through `dyn HttpCodecCallback`.
+    pub fn on_ingress_with_callback<C: HttpCodecCallback>(
         &mut self,
         input: &BufQueue,
-        callback: &mut dyn HttpCodecCallback,
+        callback: &mut C,
+        callback_egress: &mut BufQueue,
+    ) -> CodecIngressResult {
+        self.parse_ingress(input, callback, callback_egress)
+    }
+
+    fn parse_ingress(
+        &mut self,
+        input: &BufQueue,
+        callback: &mut (impl IngressDelivery + ?Sized),
         callback_egress: &mut BufQueue,
     ) -> CodecIngressResult {
         let mut parse_segment = |input: &Bytes| {
@@ -2763,6 +2788,53 @@ impl HttpCodec for Http1xCodec {
             }
         }
         result
+    }
+}
+
+impl HttpCodec for Http1xCodec {
+    fn protocol(&self) -> CodecProtocol {
+        CodecProtocol::Http11
+    }
+
+    fn transport_direction(&self) -> TransportDirection {
+        self.direction
+    }
+
+    fn capabilities(&self) -> CodecCapabilities {
+        CodecCapabilities::default()
+    }
+
+    fn create_stream(&mut self) -> StreamId {
+        if self.direction.is_downstream() {
+            self.ingress_stream = StreamId::new(self.ingress_stream.get().saturating_add(1));
+            self.ingress_stream
+        } else {
+            self.egress_stream = StreamId::new(self.egress_stream.get().saturating_add(1));
+            self.egress_stream
+        }
+    }
+
+    fn is_busy(&self) -> bool {
+        self.request_pending || self.response_pending
+    }
+
+    fn set_parser_paused(&mut self, paused: bool) {
+        if !self.parser_error {
+            self.parser_paused = paused;
+        }
+    }
+
+    fn is_parser_paused(&self) -> bool {
+        self.parser_paused
+    }
+
+    fn on_ingress(
+        &mut self,
+        input: &BufQueue,
+        callback: &mut dyn HttpCodecCallback,
+        callback_egress: &mut BufQueue,
+    ) -> CodecIngressResult {
+        self.parse_ingress(input, callback, callback_egress)
     }
 
     fn on_ingress_eof(
