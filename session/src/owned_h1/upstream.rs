@@ -1485,11 +1485,9 @@ impl UpstreamDriver {
             let write_waits = progress
                 && self.egress.chain_length() < self.config.maximum_write_size
                 && turn + 1 < TURN_BUDGET;
-            if !self.transport_reset
-                && !self.egress.is_empty()
-                && self.can_start_write()
-                && (!write_waits || !self.phases_due_before_write())
-            {
+            let write_ready =
+                !self.transport_reset && !self.egress.is_empty() && self.can_start_write();
+            if write_ready && (!write_waits || !self.phases_due_before_write()) {
                 if write_waits {
                     turn += 1;
                 }
@@ -1551,8 +1549,10 @@ impl UpstreamDriver {
                 return Poll::Pending;
             }
             turn += 1;
-            // A next turn that would find nothing to do would note idleness and return here.
-            if turn < TURN_BUDGET && !self.turn_due() {
+            // A next turn that would find nothing to do would note idleness and return here. After
+            // a turn ready to write, the next is due: the phase that held the write back still is,
+            // or the write marked its signal, or a failure reset the connection.
+            if turn < TURN_BUDGET && !write_ready && !self.turn_due() {
                 self.update_idle();
                 return Poll::Pending;
             }
@@ -1597,25 +1597,30 @@ impl UpstreamDriver {
             }
     }
 
-    /// Whether a phase before the write would act in a next turn: the cancel check, the write
-    /// completion, the read, admission, the check for a response without a request, the
-    /// parse, a held read failure, the exchange or its settlement. Each term is the condition
-    /// under which that phase acts, or a wider one, and none runs transport or application
-    /// code.
+    /// Whether a phase before the write would act in a next turn: the write completion, the read,
+    /// the exchange, the cancel check, a read start, admission, the check for a response without
+    /// a request, the parse, a held read failure or the exchange's settlement. Each term is the
+    /// condition under which that phase acts, or a wider one, and none runs transport or
+    /// application code or changes anything, so their order sets only the cost: the signals,
+    /// which most often make a turn due, come first.
+    #[inline(always)]
     fn phases_due_before_write(&self) -> bool {
-        (!self.transport_reset
-            && match &self.exchange {
-                Some(exchange) => exchange.cancel_requested(),
-                None => self.shared.cancelled(),
-            })
-            || self.write_wake.is_ready()
+        #[cfg(test)]
+        count(&PHASE_CHECKS);
+        self.write_wake.is_ready()
             || self.read_wake.is_ready()
+            || (self.fatal.is_none() && self.stream_wake.is_ready())
+            || (!self.transport_reset
+                && match &self.exchange {
+                    Some(exchange) => exchange.cancel_requested(),
+                    None => self.shared.cancelled(),
+                })
             || (self.read.is_none() && self.read_capacity() != 0)
             || (self.fatal.is_none()
                 && (self.admission_due() || (!self.ingress.is_empty() && self.exchange.is_none())))
             || self.parse_due()
             || (self.read_error.is_some() && !(self.flow_pause && self.codec.is_busy()))
-            || (self.fatal.is_none() && (self.stream_wake.is_ready() || self.settle_due()))
+            || (self.fatal.is_none() && self.settle_due())
     }
 
     /// Whether `poll_admission` acts: EOF closes admission, or a queued submission can commit.
@@ -1641,6 +1646,7 @@ impl UpstreamDriver {
 
     /// Whether `settle_exchange` acts: it releases the capacity of an exchange whose messages
     /// ended, or retires one whose response is consumed and request written.
+    #[inline]
     fn settle_due(&self) -> bool {
         self.exchange.as_ref().is_some_and(|exchange| {
             exchange.request_complete
@@ -1652,6 +1658,7 @@ impl UpstreamDriver {
 
     /// Run at each phase boundary: callbacks may cancel the session or the live request, and
     /// the phases after them must not act for it.
+    #[inline(always)]
     fn observe_cancel(&mut self) {
         if self.transport_reset {
             return;

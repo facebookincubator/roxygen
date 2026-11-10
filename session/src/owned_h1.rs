@@ -138,8 +138,8 @@ pub(crate) fn codec_parses() -> usize {
     CODEC_PARSES.with(Cell::get)
 }
 
-/// How many times the owned HTTP/1.1 downstream drivers on this thread have checked whether a
-/// phase before the write would act (`phases_due_before_write`).
+/// How many times the owned HTTP/1.1 drivers on this thread have checked whether a phase before
+/// the write would act (`phases_due_before_write`).
 #[cfg(test)]
 pub(crate) fn phase_checks() -> usize {
     PHASE_CHECKS.with(Cell::get)

@@ -24,6 +24,7 @@ use crate::owned_h1::OwnedH1UpstreamSession;
 use crate::owned_h1::cancel_selections;
 use crate::owned_h1::codec_parses;
 use crate::owned_h1::driver_turns;
+use crate::owned_h1::phase_checks;
 
 const OK_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 /// `OK_RESPONSE` on a connection the origin will not keep open.
@@ -6704,6 +6705,257 @@ fn an_uncancelled_exchange_selects_no_cancel_cause() {
         ],
         "cancel cause selections per exchange"
     );
+}
+
+/// Submits the request `request` builds on a new connection and polls the driver once, which
+/// commits and writes it while the origin sends nothing; returns the driver turns and phase checks
+/// that poll took, and its writes. The origin then answers `OK_RESPONSE`.
+fn committed_request_turns(
+    request: fn() -> (HttpHeaderEvent, Vec<HttpBodyEvent>),
+) -> ((usize, usize), Vec<Vec<u8>>) {
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let (inner, state) = ScriptedTransport::new([]);
+            let reads = Rc::new(PushedReads::default());
+            let transport = Rc::new(PushedReadTransport {
+                inner,
+                reads: Rc::clone(&reads),
+            });
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let (head, body) = request();
+            let submission = handle.reserve_request().unwrap().submit(
+                head,
+                RequestSource::held(None, body),
+                CancellationToken::never(),
+            );
+            let mut poll = Context::from_waker(Waker::noop());
+            let mut run = std::pin::pin!(session.run());
+            let before = (driver_turns(), phase_checks());
+            assert!(
+                run.as_mut().poll(&mut poll).is_pending(),
+                "the request waits for its response"
+            );
+            let counts = (driver_turns() - before.0, phase_checks() - before.1);
+            let writes = state.borrow().writes.clone();
+            reads.push(OK_RESPONSE);
+            let (run, ()) = futures::join!(run, async {
+                let (_stream, mut source, _control) = submission.await.unwrap().into_source_parts();
+                assert_eq!(read_response(&mut source).await.body, b"ok");
+                drop(source);
+                close_once_idle(&handle).await;
+            });
+            run.unwrap();
+            (counts, writes)
+        })
+    })
+}
+
+/// The driver checks whether a phase before the write would act at most once per turn. A turn
+/// that could start a write either finds such a phase due, which holds the write back and is due
+/// in the next turn too, or starts the write, which marks the write's signal; either way its next
+/// turn is due without a second check. So the poll that commits and writes a request checks once
+/// in each turn: the write check of each turn that serializes, and the end of the turn that takes
+/// the write's completion.
+#[test]
+fn a_committed_request_checks_the_phases_once_per_turn() {
+    type Request = fn() -> (HttpHeaderEvent, Vec<HttpBodyEvent>);
+    let requests: [(&str, Request); 3] = [
+        ("get", || (get_head(), Vec::new())),
+        ("content-length", || scripted_request(false)),
+        ("chunked", || scripted_request(true)),
+    ];
+    let checks: Vec<(&str, (usize, usize))> = requests
+        .into_iter()
+        .map(|(name, request)| {
+            let (counts, writes) = committed_request_turns(request);
+            assert_eq!(writes.len(), 1, "{name}: the request is written at once");
+            (name, counts)
+        })
+        .collect();
+    assert_eq!(
+        checks,
+        [
+            ("get", (2, 2)),
+            ("content-length", (3, 3)),
+            ("chunked", (4, 4))
+        ],
+        "(driver turns, phase checks) of the committing poll"
+    );
+}
+
+/// A request body whose first read waits for `gate`, then yields once, waking its task; the reads
+/// after it are ready at once.
+struct ResumedUpload {
+    gate: Option<Arc<tokio::sync::Notify>>,
+    body: VecDeque<HttpBodyEvent>,
+}
+
+impl HttpSource for ResumedUpload {
+    fn read_header_event(&mut self) -> LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
+        unreachable!("an owned submission takes the head separately")
+    }
+
+    fn read_body_event(
+        &mut self,
+        _maximum: u32,
+    ) -> LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
+        let gate = self.gate.take();
+        let event = self.body.pop_front().ok_or_else(|| {
+            HttpError::with_message(HttpErrorCode::DROPPED, b"request body exhausted")
+        });
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.notified().await;
+                let mut yielded = false;
+                std::future::poll_fn(|context| {
+                    if std::mem::replace(&mut yielded, true) {
+                        Poll::Ready(())
+                    } else {
+                        context.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
+            event
+        })
+    }
+
+    fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {
+        self.body.clear();
+    }
+}
+
+/// A request body that becomes readable after its head is written, through a read that yields
+/// once, goes out whole and in one piece in the poll that resumed it: the read's wake makes the
+/// exchange due again within that poll, and each body event it serializes holds the write back
+/// until the body ends.
+#[test]
+fn a_resumed_request_body_is_written_in_one_piece() {
+    run_on_host(|context| {
+        Box::pin(async move {
+            let (inner, state) = ScriptedTransport::new([]);
+            let reads = Rc::new(PushedReads::default());
+            let transport = Rc::new(PushedReadTransport {
+                inner,
+                reads: Rc::clone(&reads),
+            });
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let upload = ResumedUpload {
+                gate: Some(Arc::clone(&gate)),
+                body: VecDeque::from([
+                    HttpBodyEvent::body(queue(b"hello "), false),
+                    HttpBodyEvent::body(queue(b"world"), true),
+                ]),
+            };
+            let submission = handle.reserve_request().unwrap().submit(
+                post_head(None, false),
+                HttpSourceHolder::new(Box::new(upload)),
+                CancellationToken::never(),
+            );
+            let mut poll = Context::from_waker(Waker::noop());
+            let mut run = std::pin::pin!(session.run());
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            assert_eq!(state.borrow().writes.len(), 1, "the head is written first");
+            gate.notify_one();
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            assert_eq!(
+                state.borrow().writes[1..],
+                [b"6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n".to_vec()],
+                "the body is written in one piece"
+            );
+            reads.push(OK_RESPONSE);
+            let (run, ()) = futures::join!(run, async {
+                let (_stream, mut source, _control) = submission.await.unwrap().into_source_parts();
+                assert_eq!(read_response(&mut source).await.body, b"ok");
+                drop(source);
+                close_once_idle(&handle).await;
+            });
+            run.unwrap();
+        })
+    });
+}
+
+/// A waker that cancels the worker.
+struct CancelWorkerOnWake(roxygen_runtime::worker::WorkerHandle);
+
+impl std::task::Wake for CancelWorkerOnWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        assert!(self.0.begin_shutdown());
+    }
+}
+
+/// A worker cancel from code that a parse runs, here the resume waker of a suspended body read,
+/// which the parse's last event wakes, ends the connection within the poll that parsed it: no
+/// phase after the parse observes cancels and no signal marks a worker cancel, so the end of the
+/// turn finds the cancel due and runs the turn that observes it.
+#[test]
+fn worker_cancel_from_a_body_read_wake_ends_the_connection_in_that_poll() {
+    run_on_host(|context| {
+        Box::pin(async move {
+            let (inner, state) = ScriptedTransport::new([]);
+            let reads = Rc::new(PushedReads::default());
+            let transport = Rc::new(PushedReadTransport {
+                inner,
+                reads: Rc::clone(&reads),
+            });
+            let worker = context.handle().clone();
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            let mut poll = Context::from_waker(Waker::noop());
+            let mut run = std::pin::pin!(session.run());
+            assert!(
+                run.as_mut().poll(&mut poll).is_pending(),
+                "the GET waits for its response"
+            );
+            let mut submission = std::pin::pin!(submission);
+            let Poll::Ready(response) = submission.as_mut().poll(&mut poll) else {
+                panic!("the GET is committed in the first poll");
+            };
+            let (_stream, mut source, _control) = response.unwrap().into_source_parts();
+            reads.push(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n");
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            let Poll::Ready(head) = source.read_header_event().as_mut().poll(&mut poll) else {
+                panic!("the response head is readable");
+            };
+            assert_eq!(head.unwrap().headers_mut().status_code().unwrap(), 200);
+            let Poll::Ready(Ok(event)) = source.read_body_event(u32::MAX).as_mut().poll(&mut poll)
+            else {
+                panic!("a read before the body suspends");
+            };
+            let HttpBodyEventKind::Suspend(mut resume) = event.into_kind() else {
+                panic!("no body has arrived");
+            };
+            let waker = Waker::from(Arc::new(CancelWorkerOnWake(worker)));
+            assert!(
+                resume
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            reads.push(b"one");
+            let Poll::Ready(run) = run.as_mut().poll(&mut poll) else {
+                panic!("the worker cancel ends the connection in the poll that parsed the body");
+            };
+            assert_eq!(
+                run.map_err(|error| error.code()).err(),
+                Some(HttpErrorCode::CORO_CANCELLED)
+            );
+            assert_eq!(state.borrow().close, CloseKind::Reset);
+        })
+    });
 }
 
 /// The owned upstream driver writes each request in the same pieces as it did before its turns
