@@ -4695,6 +4695,217 @@ mod hpack_codec {
         );
     }
 
+    /// One step of the encoder-memo sequence.
+    enum MemoStep {
+        /// A block through `encode_inputs_block` with this encoded-size maximum.
+        Inputs(Fields, usize),
+        /// A block through the owned-header `encode`, which leaves the encoder memo in place.
+        Owned(Fields),
+        /// An encoder table size change before the next block, as a peer's SETTINGS applies it.
+        TableSize(u32),
+        /// A new encoder installed through `encoder_mut`.
+        Replace,
+    }
+
+    /// The encoder-memo sequence for one codec with a 4,096-byte table, mostly the consumer-shaped
+    /// gRPC response whose `x-upstream-time` cycles through ten digits: warm-up blocks that insert
+    /// every digit, identical runs, churn runs long enough for the longest memo back-off, isolated
+    /// misses between identical runs, A/B alternation, table-mutating blocks, owned-path blocks,
+    /// blocks over the maximum (on a ready memo and while backing off), ineligible blocks, a table
+    /// shrink then grow (as two SETTINGS, then within one), and encoder replacement (while backing
+    /// off and while a memo is ready).
+    fn memo_steps() -> Vec<MemoStep> {
+        const MAXIMUM: usize = 16 << 10;
+        fn response(digit: u64) -> MemoStep {
+            MemoStep::Inputs(r2_shaped_response(digit), MAXIMUM)
+        }
+        fn run(steps: &mut Vec<MemoStep>, digit: u64, blocks: usize) {
+            steps.extend((0..blocks).map(|_| response(digit)));
+        }
+        fn churn(steps: &mut Vec<MemoStep>, blocks: u64) {
+            steps.extend((0..blocks).map(response));
+        }
+
+        let mut steps = Vec::new();
+        churn(&mut steps, 10);
+        run(&mut steps, 3, 6);
+        churn(&mut steps, 80);
+        run(&mut steps, 5, 40);
+        for digit in [6, 7, 6, 7] {
+            run(&mut steps, digit, 3);
+        }
+        steps.extend((0..40).map(|block| response(1 + block % 2)));
+        // Table-mutating blocks inside a churn: a new request id every fourth block and a new
+        // two-digit value every ninth.
+        for block in 0..36_u64 {
+            let mut fields = r2_shaped_response(block);
+            if block % 4 == 0 {
+                fields.push(("x-request-id".to_owned(), format!("{:016x}", mix(block))));
+            }
+            if block % 9 == 4 {
+                fields[4].1 = (10 + block).to_string();
+            }
+            steps.push(MemoStep::Inputs(fields, MAXIMUM));
+        }
+        for block in 0..30_u64 {
+            steps.push(if block % 7 == 3 {
+                MemoStep::Owned(r2_shaped_response(block))
+            } else {
+                response(block)
+            });
+        }
+        for block in 0..10 {
+            steps.push(if block == 4 {
+                MemoStep::Owned(r2_shaped_response(8))
+            } else {
+                response(8)
+            });
+        }
+        run(&mut steps, 4, 3);
+        steps.push(MemoStep::Inputs(r2_shaped_response(4), 1));
+        run(&mut steps, 4, 1);
+        churn(&mut steps, 6);
+        steps.push(MemoStep::Inputs(r2_shaped_response(9), 1));
+        churn(&mut steps, 10);
+        // Ineligible blocks: 33 fields, then more than 4,096 uncompressed bytes.
+        let mut wide = r2_shaped_response(2);
+        wide.extend((0..28).map(|field| (format!("x-pad-{field}"), "1".to_owned())));
+        let mut large = r2_shaped_response(2);
+        large.push(("x-pad-req".to_owned(), filler(5_000)));
+        for fields in [wide.clone(), wide, large.clone(), large] {
+            steps.push(MemoStep::Inputs(fields, MAXIMUM));
+        }
+        run(&mut steps, 2, 4);
+        run(&mut steps, 3, 4);
+        steps.push(MemoStep::TableSize(256));
+        run(&mut steps, 3, 1);
+        steps.push(MemoStep::TableSize(4096));
+        run(&mut steps, 3, 6);
+        churn(&mut steps, 20);
+        steps.push(MemoStep::TableSize(256));
+        steps.push(MemoStep::TableSize(4096));
+        run(&mut steps, 3, 6);
+        churn(&mut steps, 12);
+        steps.push(MemoStep::Replace);
+        churn(&mut steps, 40);
+        run(&mut steps, 7, 4);
+        steps.push(MemoStep::Replace);
+        run(&mut steps, 7, 4);
+        churn(&mut steps, 40);
+        steps
+    }
+
+    /// Runs `memo_steps` on one codec. Every block must equal the block a fresh copy of the
+    /// encoder (in a codec without a memo) makes: wire bytes or error, table state, egress
+    /// compression info, and compressed and uncompressed size. Returns, per block, the wire bytes
+    /// (or the error) with the table state, then the codec's `encoded_size` and every field of its
+    /// `compression_info`.
+    fn memo_stream() -> Vec<u8> {
+        fn encode(
+            codec: &mut HpackCodec,
+            step: &MemoStep,
+        ) -> Result<Vec<u8>, roxygen_core::buf_queue::BufQueueError> {
+            match step {
+                MemoStep::Inputs(fields, maximum) => {
+                    let inputs = InputBlock(
+                        fields
+                            .iter()
+                            .map(|(name, value)| {
+                                Header::new(HttpHeaderName::Name(name.as_bytes()), value.as_bytes())
+                            })
+                            .collect(),
+                    );
+                    codec
+                        .encode_inputs_block(&inputs, *maximum, 9)
+                        .map(|block| block.as_bytes().to_vec())
+                }
+                MemoStep::Owned(fields) => {
+                    let owned: Vec<HpackHeader> = fields
+                        .iter()
+                        .map(|(name, value)| HpackHeader::new(name, value))
+                        .collect();
+                    Ok(codec.encode(&owned))
+                }
+                MemoStep::TableSize(_) | MemoStep::Replace => unreachable!("not a block"),
+            }
+        }
+        fn table_state(codec: &HpackCodec) -> Vec<u8> {
+            let mut state = Vec::new();
+            append_encoder_state(&mut state, &[], codec.encoder().context().table());
+            state
+        }
+
+        let mut codec = HpackCodec::new();
+        let mut stream = Vec::new();
+        for (index, step) in memo_steps().iter().enumerate() {
+            match step {
+                MemoStep::TableSize(size) => {
+                    codec.set_encoder_header_table_size(*size);
+                    continue;
+                }
+                MemoStep::Replace => {
+                    *codec.encoder_mut() = HpackEncoder::new(true);
+                    continue;
+                }
+                MemoStep::Inputs(..) | MemoStep::Owned(_) => {}
+            }
+            let mut fresh = HpackCodec::new();
+            *fresh.encoder_mut() = codec.encoder().clone();
+            let actual = encode(&mut codec, step);
+            assert_eq!(
+                actual,
+                encode(&mut fresh, step),
+                "step {index}: the block a fresh copy of the encoder makes"
+            );
+            assert_eq!(table_state(&codec), table_state(&fresh), "step {index}");
+            assert_eq!(
+                codec.compression_info().egress,
+                fresh.compression_info().egress,
+                "step {index}"
+            );
+            if actual.is_ok() {
+                let (size, expected) = (codec.encoded_size(), fresh.encoded_size());
+                assert_eq!(
+                    (size.compressed, size.uncompressed),
+                    (expected.compressed, expected.uncompressed),
+                    "step {index}"
+                );
+            }
+            let wire = actual.unwrap_or_else(|error| error.to_string().into_bytes());
+            append_encoder_state(&mut stream, &wire, codec.encoder().context().table());
+            let size = codec.encoded_size();
+            let info = codec.compression_info();
+            for value in [size.compressed, size.compressed_block, size.uncompressed] {
+                stream.extend_from_slice(&value.to_le_bytes());
+            }
+            for part in [info.egress, info.ingress] {
+                for value in [
+                    part.header_table_size,
+                    part.bytes_stored,
+                    part.headers_stored,
+                    part.inserts,
+                    part.blocked_inserts,
+                    part.duplications,
+                    part.static_refs,
+                ] {
+                    stream.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        stream
+    }
+
+    #[test]
+    fn encoder_memo_sequence_is_unchanged() {
+        let stream = memo_stream();
+        assert_eq!(
+            (fnv1a64(&stream), stream.len()),
+            (0x8387_ef6b_0f53_633d, 234_833),
+            "the encoder-memo sequence's wire bytes, table states, encoded sizes and compression \
+             info, recorded at 167176432c6d"
+        );
+    }
+
     #[test]
     fn http1_sourced_mixed_case_names_encode_lowercase() {
         let mut headers = roxygen_core::headers::HttpHeaders::new();

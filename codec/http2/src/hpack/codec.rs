@@ -843,10 +843,19 @@ struct EncodedMemo {
     static_refs: u32,
 }
 
+/// The cap on the encoder memo's back-off exponent: after `m` consecutive misses, a miss idles the
+/// memo for `2^min(m, MEMO_BACKOFF_CAP) - 1` eligible blocks.
+const MEMO_BACKOFF_CAP: u8 = 5;
+
 struct EncoderMemo {
     epoch: u64,
     key: Vec<u8>,
     ready: Option<EncodedMemo>,
+    /// Consecutive misses since the key last matched.
+    misses: u8,
+    /// Eligible blocks still to encode without a match pass after a miss; the block that brings it
+    /// to 0 refills `key`.
+    idle: u8,
 }
 
 pub struct HpackCodec {
@@ -860,6 +869,10 @@ pub struct HpackCodec {
     block_storage: Vec<u8>,
     #[cfg(test)]
     encode_fields: usize,
+    #[cfg(test)]
+    memo_key_builds: usize,
+    #[cfg(test)]
+    memo_match_passes: usize,
 }
 
 impl HpackCodec {
@@ -874,6 +887,10 @@ impl HpackCodec {
             block_storage: Vec::new(),
             #[cfg(test)]
             encode_fields: 0,
+            #[cfg(test)]
+            memo_key_builds: 0,
+            #[cfg(test)]
+            memo_match_passes: 0,
         }
     }
 
@@ -941,9 +958,15 @@ impl HpackCodec {
             .encoder_memo
             .as_ref()
             .filter(|memo| Some(memo.epoch) == epoch);
+        let backing_off = memo.is_some_and(|memo| memo.idle != 0);
         // Only an armed memo for this epoch can hit, so only then does a matching pass precede the
-        // encode. Otherwise the encode pass alone counts the fields.
-        let (bound, matches) = if let Some(memo) = memo {
+        // encode. Otherwise (no memo, or one backing off after a miss) the encode pass alone counts
+        // the fields.
+        let (bound, matches) = if let Some(memo) = memo.filter(|memo| memo.idle == 0) {
+            #[cfg(test)]
+            {
+                self.memo_match_passes += 1;
+            }
             let mut key = memo.key.as_slice();
             let mut matches = true;
             let mut stats = InputStats::default();
@@ -1006,20 +1029,49 @@ impl HpackCodec {
             && encoded.as_bytes().len() <= MEMO_MAX_COMPRESSED
             && after_refs != u32::MAX
         {
-            if matches {
-                self.encoder_memo
-                    .as_mut()
-                    .expect("matching key requires a memo")
-                    .ready = Some(EncodedMemo {
-                    bytes: encoded.as_bytes().to_vec(),
-                    static_refs: after_refs - before_refs,
-                });
-            } else {
-                self.encoder_memo = Some(EncoderMemo {
-                    epoch,
-                    key: encode_field_key(headers, stats.uncompressed, stats.fields),
-                    ready: None,
-                });
+            match self
+                .encoder_memo
+                .as_mut()
+                .filter(|memo| memo.epoch == epoch)
+            {
+                Some(memo) if matches => {
+                    memo.misses = 0;
+                    memo.ready = Some(EncodedMemo {
+                        bytes: encoded.as_bytes().to_vec(),
+                        static_refs: after_refs - before_refs,
+                    });
+                }
+                Some(memo) => {
+                    if backing_off {
+                        memo.idle -= 1;
+                    } else {
+                        // A miss after `misses` consecutive misses idles the memo for
+                        // `2^min(misses, cap) - 1` blocks; an isolated miss idles none.
+                        memo.ready = None;
+                        memo.idle = (1 << memo.misses.min(MEMO_BACKOFF_CAP)) - 1;
+                        memo.misses = memo.misses.saturating_add(1);
+                    }
+                    if memo.idle == 0 {
+                        #[cfg(test)]
+                        {
+                            self.memo_key_builds += 1;
+                        }
+                        fill_field_key(&mut memo.key, headers, stats.uncompressed, stats.fields);
+                    }
+                }
+                None => {
+                    #[cfg(test)]
+                    {
+                        self.memo_key_builds += 1;
+                    }
+                    self.encoder_memo = Some(EncoderMemo {
+                        epoch,
+                        key: encode_field_key(headers, stats.uncompressed, stats.fields),
+                        ready: None,
+                        misses: 0,
+                        idle: 0,
+                    });
+                }
             }
         } else {
             self.encoder_memo = None;
@@ -1338,7 +1390,20 @@ fn match_field_key(key: &mut &[u8], header: &Header<'_>) -> bool {
 }
 
 fn encode_field_key(headers: &impl HeaderInputs, uncompressed: u32, fields: usize) -> Vec<u8> {
-    let mut key = Vec::with_capacity(uncompressed as usize + 3 * fields);
+    let mut key = Vec::new();
+    fill_field_key(&mut key, headers, uncompressed, fields);
+    key
+}
+
+/// Replaces `key`'s contents with the memo key of `headers`, reusing its capacity.
+fn fill_field_key(
+    key: &mut Vec<u8>,
+    headers: &impl HeaderInputs,
+    uncompressed: u32,
+    fields: usize,
+) {
+    key.clear();
+    key.reserve(uncompressed as usize + 3 * fields);
     headers.for_each(|header| {
         key.push(header.code.as_u8());
         key.extend_from_slice(
@@ -1354,7 +1419,6 @@ fn encode_field_key(headers: &impl HeaderInputs, uncompressed: u32, fields: usiz
         key.extend_from_slice(header.name);
         key.extend_from_slice(header.value);
     });
-    key
 }
 
 #[cfg(test)]
@@ -1593,5 +1657,116 @@ mod memo_tests {
         ]);
         codec.encode_inputs_block(&fields, 4096, 9).unwrap();
         assert!(codec.encoder_memo.is_none());
+    }
+
+    /// A consumer-shaped gRPC response of five fields whose `x-upstream-time` is `digit`.
+    fn grpc_response(digit: usize) -> Inputs {
+        Inputs(vec![
+            HpackHeader::new(":status", "200"),
+            HpackHeader::new("content-type", "application/grpc"),
+            HpackHeader::new("date", "Sun, 06 Nov 1994 08:49:37 GMT"),
+            HpackHeader::new("server", "proxy"),
+            HpackHeader::new("x-upstream-time", digit.to_string()),
+        ])
+    }
+
+    /// A codec whose table holds every `grpc_response`, so that none of them mutates it again.
+    fn indexed_digits() -> HpackCodec {
+        let mut codec = HpackCodec::new();
+        for digit in 0..10 {
+            codec
+                .encode_inputs_block(&grpc_response(digit), 4096, 9)
+                .unwrap();
+        }
+        codec
+    }
+
+    /// Encodes `fields`, checks the block against a fresh copy of the encoder, and returns whether
+    /// the block ran the encode loop (false: the memo replayed it).
+    fn encode_checked(codec: &mut HpackCodec, fields: &Inputs) -> bool {
+        let expected = codec
+            .encoder
+            .clone()
+            .encode_inputs(fields, 9, &mut InputStats::default());
+        let loops = codec.header_loop_counts().0;
+        let actual = codec.encode_inputs_block(fields, 4096, 9).unwrap();
+        assert_eq!(actual.as_bytes(), expected.as_bytes());
+        codec.header_loop_counts().0 != loops
+    }
+
+    #[test]
+    fn churning_indexed_value_backs_off_memo() {
+        // Every block differs from the one before and refers only to indexed fields, so the memo
+        // stays armed and every match pass misses. Block 1 finds no memo (the last warm-up block
+        // inserted) and builds the key. A miss after m consecutive misses idles 2^min(m, 5) - 1
+        // blocks, so match passes run on blocks 2, 3, 5, 9, 17 and 33 (the next on 65), and the key
+        // is built on block 1 and refilled on blocks 2, 4, 8, 16, 32 and 64, the block before each
+        // later pass (an isolated miss idles 0 blocks and refills at once): at most 7 key builds
+        // and 6 match passes. Without a back-off every block builds a key and blocks 2-64 run a
+        // match pass: 64 and 63.
+        let mut codec = indexed_digits();
+        let epoch = codec.encoder.context.mutation_epoch();
+        let before = (codec.memo_key_builds, codec.memo_match_passes);
+        for block in 0..64 {
+            assert!(
+                encode_checked(&mut codec, &grpc_response(block % 10)),
+                "block {block} differs from the one before, so it cannot hit"
+            );
+        }
+        assert_eq!(
+            codec.encoder.context.mutation_epoch(),
+            epoch,
+            "no block mutates the table"
+        );
+        let builds = codec.memo_key_builds - before.0;
+        let passes = codec.memo_match_passes - before.1;
+        assert!(
+            builds <= 7 && passes <= 6,
+            "64 churning blocks made {builds} key builds and {passes} match passes"
+        );
+    }
+
+    #[test]
+    fn memo_hits_resume_within_the_back_off_cap_after_churn() {
+        // The longest back-off idles 2^5 - 1 blocks. An identical run that starts on a miss idles
+        // 31 blocks, refills the key on its 32nd, records on its 33rd and replays on its 34th.
+        const LIMIT: usize = (1 << 5) + 2;
+        for burst in 0..=40 {
+            let mut codec = indexed_digits();
+            for block in 0..burst {
+                encode_checked(&mut codec, &grpc_response(block % 9));
+            }
+            let run = grpc_response(9);
+            let mut first_hit = None;
+            for position in 1..=LIMIT + 8 {
+                let encoded = encode_checked(&mut codec, &run);
+                match first_hit {
+                    None if !encoded => first_hit = Some(position),
+                    Some(hit) => assert!(
+                        !encoded,
+                        "burst {burst}: block {position} encodes after the hit on block {hit}"
+                    ),
+                    None => {}
+                }
+            }
+            assert!(
+                first_hit.is_some_and(|hit| hit <= LIMIT),
+                "burst {burst}: the identical run's first hit is {first_hit:?}, not within {LIMIT}"
+            );
+        }
+    }
+
+    #[test]
+    fn memo_hits_on_the_third_block_after_an_isolated_miss() {
+        // The first run builds the key, records and replays. Every later run follows a hit, so
+        // its first block is one isolated miss that refills the key; it records on its second
+        // block and replays from its third, as without a back-off.
+        let mut codec = indexed_digits();
+        for digit in [1, 2, 1, 3, 2] {
+            let encoded: Vec<bool> = (0..4)
+                .map(|_| encode_checked(&mut codec, &grpc_response(digit)))
+                .collect();
+            assert_eq!(encoded, [true, true, false, false], "run of {digit}");
+        }
     }
 }
