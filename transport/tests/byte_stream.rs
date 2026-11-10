@@ -3838,6 +3838,7 @@ mod byte_stream {
 
         use super::*;
         use crate::byte_stream::read_deadline_batons_for_test;
+        use crate::byte_stream::reader_wake_registrations_for_test;
 
         #[test]
         fn owned_reader_is_offered_only_untimed() {
@@ -4117,6 +4118,137 @@ mod byte_stream {
                     control.actions().len(),
                     1,
                     "a read that returns bytes cancels nothing"
+                );
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// A reader registers its cancellation wake once for all its reads: three reads that
+        /// each pend before their bytes arrive build one registration, where a registration per
+        /// read would build three.
+        #[test]
+        fn owned_reader_registers_its_cancellation_once() {
+            run_worker(|context| async move {
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                let cancel = CancellationSource::new();
+                let registrations = reader_wake_registrations_for_test();
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, cancel.token())
+                    .unwrap()
+                    .unwrap();
+                for chunk in [&b"one"[..], b"two", b"six"] {
+                    reader.start_read(1_024, 1_024).unwrap();
+                    assert!(
+                        reader
+                            .poll_read(&mut Context::from_waker(Waker::noop()))
+                            .is_pending()
+                    );
+                    control.feed(queue(&[chunk], chunk.len()), false);
+                    let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                    assert_eq!(flatten(read.data()), chunk);
+                }
+                assert_eq!(
+                    reader_wake_registrations_for_test(),
+                    registrations + 1,
+                    "the reader's reads share one cancellation wake registration",
+                );
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// A later read's cancellation wakes the waker that read registered, not the waker of
+        /// an earlier read, and fails that read.
+        #[test]
+        fn a_later_reader_read_cancellation_wakes_that_reads_waker() {
+            run_worker(|context| async move {
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                let cancel = CancellationSource::new();
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, cancel.token())
+                    .unwrap()
+                    .unwrap();
+                let earlier = Arc::new(WakeSignal::default());
+                let earlier_waker = Waker::from(Arc::clone(&earlier));
+                reader.start_read(1_024, 1_024).unwrap();
+                assert!(
+                    reader
+                        .poll_read(&mut Context::from_waker(&earlier_waker))
+                        .is_pending()
+                );
+                control.feed(queue(&[b"ok"], 2), false);
+                let Poll::Ready(Ok(read)) =
+                    reader.poll_read(&mut Context::from_waker(&earlier_waker))
+                else {
+                    panic!("the fed read completes");
+                };
+                assert_eq!(flatten(read.data()), b"ok");
+                earlier.take();
+
+                let later = Arc::new(WakeSignal::default());
+                let later_waker = Waker::from(Arc::clone(&later));
+                reader.start_read(1_024, 1_024).unwrap();
+                assert!(
+                    reader
+                        .poll_read(&mut Context::from_waker(&later_waker))
+                        .is_pending()
+                );
+                cancel.request_cancellation();
+                assert!(later.take(), "cancelling wakes the pending read's waker");
+                assert!(!earlier.take(), "the earlier read's waker is not woken");
+                let Poll::Ready(Err(error)) =
+                    reader.poll_read(&mut Context::from_waker(&later_waker))
+                else {
+                    panic!("the woken read observes its cancellation");
+                };
+                assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// `DIV-018`: because the registration outlives each read, a cancellation requested
+        /// while no read is started wakes the waker that the last pending read registered.
+        #[test]
+        fn a_cancellation_between_reader_reads_wakes_the_last_read_waker() {
+            run_worker(|context| async move {
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                let cancel = CancellationSource::new();
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, cancel.token())
+                    .unwrap()
+                    .unwrap();
+                let signal = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&signal));
+                reader.start_read(1_024, 1_024).unwrap();
+                assert!(
+                    reader
+                        .poll_read(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                control.feed(queue(&[b"ok"], 2), false);
+                let Poll::Ready(Ok(read)) = reader.poll_read(&mut Context::from_waker(&waker))
+                else {
+                    panic!("the fed read completes");
+                };
+                assert_eq!(flatten(read.data()), b"ok");
+                signal.take();
+                assert!(!transport.has_pending_read(&context).unwrap());
+
+                cancel.request_cancellation();
+                assert!(
+                    signal.take(),
+                    "the reader's registration wakes its last waker with no read started",
+                );
+                reader.start_read(1_024, 1_024).unwrap();
+                assert_eq!(
+                    poll_fn(|context| reader.poll_read(context))
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    HttpErrorCode::CORO_CANCELLED,
+                    "the next read is refused at entry",
                 );
                 transport.close(&context).unwrap();
             });

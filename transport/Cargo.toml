@@ -13,6 +13,7 @@ autotests = false
 name = "roxygen_transport"
 
 [dependencies]
+bytes = "1.12.1"
 ferroxygen_core = { path = "../core" }
 ferroxygen_runtime = { path = "../runtime" }
 libc = "0.2.186"

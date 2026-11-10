@@ -384,18 +384,40 @@ pub trait ByteStreamTransport: 'static {
 /// results, close and cancellation outcomes, and `DIV-016`/`DIV-017`/`DIV-018`
 /// behavior, except for timing: it has no deadline, its completion wakes no
 /// task, and over a Tokio-backed stream its I/O state lives in the backend, so
-/// it allocates no future. A cancellation wakes a pending read, as a timed
-/// read's wait does. Dropping the reader with a read started cancels that read,
-/// as dropping a read future does.
+/// it allocates no future. Over TCP its first poll fills the tailroom of a
+/// buffer that the transport keeps between reads (`DIV-018`), where a `read`
+/// starts a new buffer. A cancellation wakes a pending read, as a timed
+/// read's wait does. The reader registers that wake once for all its reads, so
+/// a cancellation requested while no read is started wakes the task that last
+/// polled a pending read (`DIV-018`). Dropping the reader with a read started
+/// cancels that read, as dropping a read future does.
 pub struct OwnedReader {
     io: Weak<dyn ByteStreamIo>,
     state: Rc<RefCell<TransportState>>,
     worker: WorkerHandle,
     limits: ByteStreamLimits,
     context: WorkerContext,
-    cancellation: CancellationToken,
+    cancellation: ReaderCancellation,
     /// The started read, until `poll_read` returns its result.
     read: Option<ReadStart>,
+}
+
+/// An [`OwnedReader`]'s cancellation: its token, and the one wake registration
+/// that all its reads update while they pend.
+struct ReaderCancellation {
+    token: CancellationToken,
+    listener: CancellationWakeRegistration,
+}
+
+impl ReaderCancellation {
+    fn new(token: CancellationToken) -> Self {
+        #[cfg(test)]
+        record_reader_wake_registration();
+        Self {
+            listener: token.wake_registration(),
+            token,
+        }
+    }
 }
 
 impl OwnedReader {
@@ -420,8 +442,9 @@ impl OwnedReader {
             &self.context,
             maximum,
             allocation_size,
-            ReadKind::Reader,
-            self.cancellation.clone(),
+            ReadKind::Reader {
+                cancellation: &self.cancellation.token,
+            },
         ));
         Ok(())
     }
@@ -439,7 +462,9 @@ impl OwnedReader {
             )));
         };
         let result = match read {
-            ReadStart::Started(operation) => ready!(Pin::new(operation).poll(context)),
+            ReadStart::Started(operation) => {
+                ready!(operation.poll_with(context, Some(&mut self.cancellation)))
+            }
             ReadStart::Finished(_) => {
                 let Some(ReadStart::Finished(result)) = self.read.take() else {
                     unreachable!("the started read finished at entry");
@@ -836,13 +861,9 @@ enum ReadDrive {
         deadline: TimedBaton,
         wait: Pin<Box<TimedWait>>,
     },
-    /// An [`OwnedReader`]'s read: no deadline. While it pends, `listener`
-    /// wakes it on cancellation, as a timed read's wait does.
-    Untimed {
-        io: ActiveReadIo,
-        cancellation: CancellationToken,
-        listener: Option<CancellationWakeRegistration>,
-    },
+    /// An [`OwnedReader`]'s read: no deadline. While it pends, its reader's
+    /// cancellation registration wakes it, as a timed read's wait does.
+    Untimed { io: ActiveReadIo },
 }
 
 /// The I/O of an [`OwnedReader`] read: `ByteStreamIo::read`'s boxed future,
@@ -899,12 +920,24 @@ std::thread_local! {
 #[cfg(test)]
 std::thread_local! {
     static READ_DEADLINE_BATONS: Cell<usize> = const { Cell::new(0) };
+    static READER_WAKE_REGISTRATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Read-direction deadline batons built on this thread.
 #[cfg(test)]
 pub(crate) fn read_deadline_batons_for_test() -> usize {
     READ_DEADLINE_BATONS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn record_reader_wake_registration() {
+    READER_WAKE_REGISTRATIONS.with(|count| count.set(count.get() + 1));
+}
+
+/// Cancellation wake registrations built for [`OwnedReader`] reads on this thread.
+#[cfg(test)]
+pub(crate) fn reader_wake_registrations_for_test() -> usize {
+    READER_WAKE_REGISTRATIONS.with(Cell::get)
 }
 
 /// Write progress cells built on this thread.
@@ -1057,14 +1090,7 @@ fn transition_close_resources(
                 retire_transport_value(deadline, &mut failure);
                 retire_transport_value(io_future, &mut failure);
             }
-            ReadDrive::Untimed {
-                io,
-                cancellation,
-                listener,
-            } => {
-                retire_transport_value((cancellation, listener), &mut failure);
-                retire_transport_value(io, &mut failure);
-            }
+            ReadDrive::Untimed { io } => retire_transport_value(io, &mut failure),
         }
         retire_transport_value(waker, &mut failure);
     }
@@ -1669,8 +1695,10 @@ impl OwnedByteStream {
             context,
             maximum,
             allocation_size,
-            ReadKind::Ordinary { timeout },
-            cancellation,
+            ReadKind::Ordinary {
+                timeout,
+                cancellation,
+            },
         ) {
             ReadStart::Started(operation) => Box::pin(operation),
             ReadStart::Finished(result) => Box::pin(std::future::ready(result)),
@@ -1794,13 +1822,25 @@ enum ReadStart {
 }
 
 /// How [`start_read_operation`] reads.
-#[derive(Clone, Copy)]
-enum ReadKind {
-    /// An ordinary read, timed by `timeout`.
-    Ordinary { timeout: Duration },
-    /// An [`OwnedReader`]'s read: untimed, and its I/O state kept by the
-    /// backend's [`PolledReader`] when it has one.
-    Reader,
+enum ReadKind<'a> {
+    /// An ordinary read, timed by `timeout` and observing `cancellation`.
+    Ordinary {
+        timeout: Duration,
+        cancellation: CancellationToken,
+    },
+    /// An [`OwnedReader`]'s read: untimed, its I/O state kept by the backend's
+    /// [`PolledReader`] when it has one, and observing the reader's
+    /// `cancellation`.
+    Reader { cancellation: &'a CancellationToken },
+}
+
+impl ReadKind<'_> {
+    fn cancellation(&self) -> &CancellationToken {
+        match self {
+            Self::Ordinary { cancellation, .. } => cancellation,
+            Self::Reader { cancellation } => cancellation,
+        }
+    }
 }
 
 /// Inlined into each caller, which then compiles for its own `kind`.
@@ -1810,13 +1850,12 @@ fn start_read_operation(
     context: &WorkerContext,
     maximum: usize,
     allocation_size: usize,
-    kind: ReadKind,
-    cancellation: CancellationToken,
+    kind: ReadKind<'_>,
 ) -> ReadStart {
     if let Err(error) = target.check_context(context) {
         return ReadStart::Finished(Err(error));
     }
-    if cancellation.is_cancellation_requested() {
+    if kind.cancellation().is_cancellation_requested() {
         return ReadStart::Finished(Err(cancelled_error(
             b"byte-stream read cancelled before entry",
         )));
@@ -1864,7 +1903,10 @@ fn start_read_operation(
         return ReadStart::Finished(Err(dropped_error()));
     };
     let drive = match kind {
-        ReadKind::Ordinary { timeout } => {
+        ReadKind::Ordinary {
+            timeout,
+            cancellation,
+        } => {
             let io_future = io.read(maximum, allocation_size);
             #[cfg(test)]
             READ_DEADLINE_BATONS.with(|count| count.set(count.get() + 1));
@@ -1876,7 +1918,7 @@ fn start_read_operation(
                 wait,
             }
         }
-        ReadKind::Reader => {
+        ReadKind::Reader { .. } => {
             let io = match io.polled_reader() {
                 Some(reader) => {
                     reader.start_read(maximum, allocation_size);
@@ -1884,11 +1926,7 @@ fn start_read_operation(
                 }
                 None => ActiveReadIo::Future(io.read(maximum, allocation_size)),
             };
-            ReadDrive::Untimed {
-                io,
-                cancellation,
-                listener: None,
-            }
+            ReadDrive::Untimed { io }
         }
     };
     target.state.borrow_mut().active_read = Some(ActiveRead {
@@ -2290,7 +2328,7 @@ impl ByteStreamTransport for OwnedByteStream {
             worker: self.worker.clone(),
             limits: self.limits,
             context: context.clone(),
-            cancellation,
+            cancellation: ReaderCancellation::new(cancellation),
             read: None,
         }))
     }
@@ -2383,7 +2421,21 @@ impl ReadOperation {
 impl Future for ReadOperation {
     type Output = Result<TransportRead, HttpError>;
 
-    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().poll_with(context, None)
+    }
+}
+
+impl ReadOperation {
+    /// Polls the read. An [`OwnedReader`]'s read observes `reader`'s
+    /// cancellation; an ordinary read passes none. Inlined into each caller,
+    /// which then compiles for its own kind of read.
+    #[inline(always)]
+    fn poll_with(
+        &mut self,
+        context: &mut Context<'_>,
+        reader: Option<&mut ReaderCancellation>,
+    ) -> Poll<Result<TransportRead, HttpError>> {
         self.state.borrow().assert_owner();
         if let Some(error) = self.close_error() {
             self.finish(None);
@@ -2436,18 +2488,14 @@ impl Future for ReadOperation {
                     let wait = wait.as_mut().poll(context);
                     ReadPoll::new(io, wait)
                 }
-                ReadDrive::Untimed {
-                    io,
-                    cancellation,
-                    listener,
-                } => {
+                ReadDrive::Untimed { io } => {
+                    let reader =
+                        reader.expect("an OwnedReader read polls with its reader's cancellation");
                     let io = io.poll(context);
                     let cancelled = if io.is_pending() {
-                        listener
-                            .get_or_insert_with(|| cancellation.wake_registration())
-                            .update_waker(context.waker())
+                        reader.listener.update_waker(context.waker())
                     } else {
-                        cancellation.is_cancellation_requested()
+                        reader.token.is_cancellation_requested()
                     };
                     let wait = if cancelled {
                         Poll::Ready(WaitStatus::Cancelled)

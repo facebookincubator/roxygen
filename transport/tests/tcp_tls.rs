@@ -8132,6 +8132,198 @@ mod tcp_tls {
         use crate::tcp::io_read_futures_for_test;
         use crate::tcp_tls_tests::tcp_tls::native_write_queue::with_accepted_tcp;
 
+        /// As `with_accepted_tcp`, with a peer that disables Nagle's algorithm and a clone of the
+        /// accepted socket through which the test sees how many bytes are queued.
+        fn with_observed_tcp<F, Fut>(limits: ByteStreamLimits, test: F)
+        where
+            F: FnOnce(WorkerContext, OwnedByteStream, TcpStream, std::net::TcpStream) -> Fut
+                + Send
+                + 'static,
+            Fut: Future<Output = ()> + 'static,
+        {
+            Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(LocalSet::new().run_until(async move {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let peer = TcpStream::connect(listener.local_addr().unwrap())
+                        .await
+                        .unwrap();
+                    peer.set_nodelay(true).unwrap();
+                    let (accepted, _) = listener.accept().await.unwrap();
+                    let accepted = accepted.into_std().unwrap();
+                    let observer = accepted.try_clone().unwrap();
+                    let (worker, driver) = WorkerDriver::new(8).unwrap();
+                    let call = worker
+                        .call_local(move |context| async move {
+                            let transport =
+                                TcpTransport::from_accepted(&context, accepted, limits).unwrap();
+                            test(context, transport, peer, observer).await;
+                        })
+                        .unwrap();
+                    let driver_task = tokio::task::spawn_local(driver);
+                    time::timeout(Duration::from_secs(10), call)
+                        .await
+                        .expect("the reader test is bounded")
+                        .unwrap();
+                    worker.begin_shutdown();
+                    driver_task.await.unwrap();
+                }));
+        }
+
+        /// `DIV-018`: once a reader read's bytes are released, the next read reclaims the same
+        /// buffer, so sequential reads make one first-buffer reservation, where a buffer per read
+        /// would make three.
+        #[test]
+        fn tcp_reader_reads_reuse_one_reclaimed_buffer() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                let reservations = tcp_first_reservations_for_test();
+                let mut start = None;
+                for chunk in [&b"one "[..], b"two ", b"six "] {
+                    peer.write_all(chunk).await.unwrap();
+                    reader.start_read(64, 64).unwrap();
+                    let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                    let front = read.data().front().unwrap().as_ptr() as usize;
+                    assert_eq!(
+                        *start.get_or_insert(front),
+                        front,
+                        "each read fills the reclaimed buffer from its start",
+                    );
+                    assert_eq!(read_bytes(read), chunk);
+                }
+                assert_eq!(
+                    tcp_first_reservations_for_test(),
+                    reservations + 1,
+                    "the reads reuse the reader's one buffer",
+                );
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// `DIV-018`, toward `IOBufQueue::preallocate`: while earlier reads' bytes are held, a
+        /// reader read fills the rest of their buffer as long as at least Proxygen's
+        /// `kMinReadSize` (1_460) bytes of it are left, and otherwise takes a new
+        /// `allocation_size` buffer. Each read's view reports its whole buffer as backing.
+        #[test]
+        fn tcp_reader_reads_fill_a_retained_buffers_tailroom() {
+            let limits = ByteStreamLimits::new(8_000, 1024, 8).unwrap();
+            with_observed_tcp(
+                limits,
+                |context, transport, mut peer, observer| async move {
+                    let mut reader = transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    let reservations = tcp_first_reservations_for_test();
+                    // 2_000 and 540 bytes leave 1_460 bytes of the 4_000-byte buffer, which the third
+                    // read still fills; its 100 bytes leave 1_360, so the fourth takes a new buffer.
+                    let mut held = Vec::new();
+                    for (seed, length) in (0u8..).zip([2_000, 540, 100, 100]) {
+                        let burst = pattern(length, seed);
+                        peer.write_all(&burst).await.unwrap();
+                        wait_until_queued(&observer, length).await;
+                        reader.start_read(8_000, 4_000).unwrap();
+                        let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                        assert_eq!(read.data().segment_count(), 1, "{length}");
+                        assert_eq!(
+                            read.data().backing_capacity_upper_bound(),
+                            Some(4_000),
+                            "a {length}-byte read's view pins its whole buffer",
+                        );
+                        assert!(read_bytes_ref(&read) == burst, "{length}");
+                        held.push(read);
+                    }
+                    let starts: Vec<usize> = held
+                        .iter()
+                        .map(|read| read.data().front().unwrap().as_ptr() as usize)
+                        .collect();
+                    assert_eq!(
+                        starts[1],
+                        starts[0] + 2_000,
+                        "the second read fills the held buffer's tailroom",
+                    );
+                    assert_eq!(
+                        starts[2],
+                        starts[0] + 2_540,
+                        "1_460 bytes of tailroom are still filled",
+                    );
+                    assert!(
+                        !(starts[0]..starts[0] + 4_000).contains(&starts[3]),
+                        "1_360 bytes of tailroom are not",
+                    );
+                    assert_eq!(tcp_first_reservations_for_test(), reservations + 2);
+                    transport.close(&context).unwrap();
+                },
+            );
+        }
+
+        /// A first offer of partial tailroom that the read fills continues the read, as a full
+        /// first buffer does (`DIV-017`), so one read still returns the whole burst.
+        #[test]
+        fn a_tcp_reader_read_that_fills_partial_tailroom_continues() {
+            let limits = ByteStreamLimits::new(8_000, 1024, 8).unwrap();
+            with_observed_tcp(
+                limits,
+                |context, transport, mut peer, observer| async move {
+                    let mut reader = transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    let first = pattern(2_000, 1);
+                    peer.write_all(&first).await.unwrap();
+                    wait_until_queued(&observer, first.len()).await;
+                    reader.start_read(8_000, 4_000).unwrap();
+                    let held = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                    assert!(read_bytes_ref(&held) == first);
+                    // `held` keeps the buffer, so 2_000 bytes of its tailroom are offered first.
+                    let burst = pattern(5_000, 2);
+                    peer.write_all(&burst).await.unwrap();
+                    wait_until_queued(&observer, burst.len()).await;
+                    reader.start_read(8_000, 4_000).unwrap();
+                    let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                    assert!(
+                        read_bytes_ref(&read) == burst,
+                        "one read returns the whole 5_000-byte burst",
+                    );
+                    drop(held);
+                    transport.close(&context).unwrap();
+                },
+            );
+        }
+
+        /// A reader read that finds no data reserves no buffer; the first bytes reserve one.
+        #[test]
+        fn a_pending_tcp_reader_read_reserves_nothing_before_data() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                let reservations = tcp_first_reservations_for_test();
+                reader.start_read(64, 64).unwrap();
+                assert!(
+                    reader
+                        .poll_read(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                assert_eq!(
+                    tcp_first_reservations_for_test(),
+                    reservations,
+                    "a reader read that finds no data reserves no buffer",
+                );
+                peer.write_all(b"data").await.unwrap();
+                let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                assert_eq!(read_bytes(read), b"data");
+                assert_eq!(tcp_first_reservations_for_test(), reservations + 1);
+                transport.close(&context).unwrap();
+            });
+        }
+
         #[test]
         fn tcp_reader_reads_build_no_io_read_future() {
             with_accepted_tcp(limits(), |context, transport, mut peer| async move {

@@ -24,6 +24,8 @@ use std::task::ready;
 use std::thread::ThreadId;
 use std::time::Duration;
 
+use bytes::Bytes;
+use bytes::BytesMut;
 use roxygen_core::buf_queue::BufQueue;
 use roxygen_core::error::HttpError;
 use roxygen_core::error::HttpErrorCode;
@@ -219,6 +221,14 @@ impl OwnedRead {
     /// Makes an exact-size copy of `bytes` the read's only buffer.
     pub(crate) fn copy_from_slice(&mut self, bytes: &[u8]) {
         self.tail = bytes.to_vec();
+    }
+
+    /// Makes `bytes`, a view of an allocation of `backing` bytes that a
+    /// reader's [`ReadRoom`] handed out, the read's first buffer.
+    fn push_first(&mut self, bytes: Bytes, backing: usize) -> io::Result<()> {
+        self.filled
+            .push_bytes_with_backing(bytes, backing)
+            .map_err(|_| io::Error::other("owned read exceeded its queue bound"))
     }
 
     /// Reserves the uninitialized first buffer that `poll_fill` then fills.
@@ -431,6 +441,144 @@ fn poll_tcp_first(
     polled
 }
 
+/// The least tailroom that a reader read's first offer reuses: Proxygen's
+/// `kMinReadSize`, which `HTTPUniplexTransportSession::readLoop` passes to
+/// `IOBufQueue::preallocate`.
+const MIN_READ_SIZE: usize = 1_460;
+
+/// The buffer whose tailroom the `OwnedReader` reads of a TCP stream reuse
+/// (`DIV-018`), as Proxygen's session `IOBufQueue` keeps its tail buffer
+/// between reads. A read hands out the bytes it filled as a view of the
+/// buffer, which keeps the rest; it holds no bytes between reads.
+#[derive(Default)]
+pub(crate) struct ReadRoom {
+    buffer: BytesMut,
+    /// The capacity of the allocation that `buffer` lies in.
+    backing: usize,
+}
+
+impl ReadRoom {
+    /// Readies the tailroom for a first offer of at most `capacity` bytes and
+    /// returns the offer. When the tailroom is short of `capacity`, the whole
+    /// buffer is reclaimed if no view of it is left; otherwise the tailroom is
+    /// offered while it holds at least `min(MIN_READ_SIZE, capacity)` bytes, as
+    /// `IOBufQueue::preallocate` offers it, and a new buffer of `capacity`
+    /// bytes replaces it when it holds less.
+    fn prepare(&mut self, capacity: usize) -> usize {
+        let tailroom = self.buffer.capacity();
+        if tailroom < capacity {
+            if self.buffer.try_reclaim(capacity) {
+                self.backing = self.buffer.capacity();
+            } else if tailroom < MIN_READ_SIZE.min(capacity) {
+                self.buffer = BytesMut::with_capacity(capacity);
+                self.backing = self.buffer.capacity();
+                #[cfg(test)]
+                record_tcp_first_reservation(self.buffer.as_ptr());
+            }
+        }
+        self.buffer.capacity().min(capacity)
+    }
+
+    /// Polls `stream` once into the first `offered` bytes of the tailroom.
+    fn poll_fill<S>(
+        &mut self,
+        stream: &mut S,
+        context: &mut Context<'_>,
+        offered: usize,
+    ) -> Poll<io::Result<usize>>
+    where
+        S: AsyncRead + Unpin + ?Sized,
+    {
+        let spare = &mut self.buffer.spare_capacity_mut()[..offered];
+        let start = spare.as_ptr().cast::<u8>();
+        let mut buffer = tokio::io::ReadBuf::uninit(spare);
+        ready!(Pin::new(stream).poll_read(context, &mut buffer))?;
+        let filled = buffer.filled();
+        if filled.as_ptr() != start || filled.len() > offered {
+            return Poll::Ready(Err(io::Error::other(
+                "AsyncRead replaced the read buffer it was given",
+            )));
+        }
+        let length = filled.len();
+        // SAFETY: `buffer` holds no bytes between reads, so its first `offered`
+        // spare bytes were offered. `filled` starts there and is no longer than
+        // that, so it is the original `ReadBuf`, whose filled prefix is
+        // initialized: safe code cannot rebuild a `ReadBuf` over this borrowed
+        // memory, and one over other memory fails the start check.
+        unsafe { self.buffer.set_len(length) };
+        Poll::Ready(Ok(length))
+    }
+
+    /// Hands out the filled bytes as a view of the buffer, with the capacity
+    /// of the allocation that the view keeps alive.
+    fn take_filled(&mut self) -> (Bytes, usize) {
+        (self.buffer.split().freeze(), self.backing)
+    }
+}
+
+/// `poll_tcp_first` for a reader read: the poll fills the reader's `room`,
+/// prepared only once Tokio reports the socket readable, and `Ready` carries
+/// the bytes read and the bytes offered.
+fn poll_tcp_first_into_room(
+    room: &mut ReadRoom,
+    read: &mut OwnedRead,
+    stream: &mut TcpStream,
+    context: &mut Context<'_>,
+    capacity: usize,
+) -> Poll<io::Result<(usize, usize)>> {
+    if !coop::has_budget_remaining() {
+        drop(ready!(coop::poll_proceed(context)));
+    }
+    ready!(
+        pin!(coop::unconstrained(poll_fn(|context| {
+            stream.poll_read_ready(context)
+        })))
+        .poll(context)
+    )?;
+    let offered = room.prepare(capacity);
+    let length = ready!(room.poll_fill(stream, context, offered))?;
+    if length != 0 {
+        let (bytes, backing) = room.take_filled();
+        read.push_first(bytes, backing)?;
+    }
+    Poll::Ready(Ok((length, offered)))
+}
+
+/// The read loop of `poll_gather` for a reader read over TCP, whose first poll
+/// fills the reader's `room` (`poll_tcp_first_into_room`). A first poll that
+/// fills what it offered, which can be less than `allocation_size`, continues
+/// the read.
+fn poll_gather_into_room(
+    stream: &mut TcpStream,
+    context: &mut Context<'_>,
+    maximum: usize,
+    allocation_size: usize,
+    read: &mut OwnedRead,
+    room: &mut ReadRoom,
+) -> Poll<io::Result<bool>> {
+    debug_assert!(read.is_empty(), "a pending reader read gathered nothing");
+    let (length, offered) = ready!(poll_tcp_first_into_room(
+        room,
+        read,
+        stream,
+        context,
+        allocation_size.min(maximum),
+    ))?;
+    match length {
+        0 => return Poll::Ready(Ok(true)),
+        length if length < offered || length == maximum => return Poll::Ready(Ok(false)),
+        _ => {}
+    }
+    poll_gather(
+        stream,
+        context,
+        maximum,
+        allocation_size,
+        read,
+        |_, _, _, _| unreachable!("the room's first poll gathered bytes"),
+    )
+}
+
 #[cfg(test)]
 std::thread_local! {
     static IO_WRITE_FUTURES: Cell<usize> = const { Cell::new(0) };
@@ -491,6 +639,19 @@ pub(crate) trait TokioByteStream: AsyncRead + AsyncWrite + Unpin + 'static {
             read,
             OwnedRead::poll_stage,
         )
+    }
+
+    /// `poll_read_owned` for an `OwnedReader` read, which may first fill the
+    /// reader's `room` (`DIV-018`). The default leaves `room` unused.
+    fn poll_read_reusing(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: usize,
+        allocation_size: usize,
+        read: &mut OwnedRead,
+        _room: &mut ReadRoom,
+    ) -> Poll<io::Result<bool>> {
+        self.poll_read_owned(context, maximum, allocation_size, read)
     }
 
     fn cancel_read(&mut self) {}
@@ -594,6 +755,19 @@ impl TokioByteStream for TcpStream {
         )
     }
 
+    /// Reads as `poll_read_owned` does, except that the first poll fills the
+    /// reader's `room`.
+    fn poll_read_reusing(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: usize,
+        allocation_size: usize,
+        read: &mut OwnedRead,
+        room: &mut ReadRoom,
+    ) -> Poll<io::Result<bool>> {
+        poll_gather_into_room(self, context, maximum, allocation_size, read, room)
+    }
+
     fn cancel_read(&mut self) {
         release_read_waker(self);
     }
@@ -695,6 +869,18 @@ impl TokioByteStream for AcceptedTcpStream {
     ) -> Poll<io::Result<bool>> {
         self.stream
             .poll_read_owned(context, maximum, allocation_size, read)
+    }
+
+    fn poll_read_reusing(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: usize,
+        allocation_size: usize,
+        read: &mut OwnedRead,
+        room: &mut ReadRoom,
+    ) -> Poll<io::Result<bool>> {
+        self.stream
+            .poll_read_reusing(context, maximum, allocation_size, read, room)
     }
 
     fn cancel_read(&mut self) {
@@ -855,6 +1041,18 @@ impl<S: TokioByteStream> TokioByteStream for ObservedStream<S> {
             .poll_read_owned(context, maximum, allocation_size, read)
     }
 
+    fn poll_read_reusing(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: usize,
+        allocation_size: usize,
+        read: &mut OwnedRead,
+        room: &mut ReadRoom,
+    ) -> Poll<io::Result<bool>> {
+        self.stream_mut()
+            .poll_read_reusing(context, maximum, allocation_size, read, room)
+    }
+
     fn cancel_read(&mut self) {
         self.stream_mut().cancel_read();
     }
@@ -936,8 +1134,9 @@ struct TokioIoShared<S> {
     non_abortive_close: Cell<bool>,
     /// An `OwnedWriteQueue` write's state while it is active (`QueuedWriter`).
     queued_write: RefCell<Option<IoWrite>>,
-    /// An `OwnedReader` read's state while it is active (`PolledReader`).
-    polled_read: RefCell<Option<IoRead>>,
+    /// An `OwnedReader` read's state while it is active, and the room that
+    /// those reads reuse (`PolledReader`).
+    polled_read: RefCell<PolledRead>,
 }
 
 // Drop order follows declaration order here and in `TokioIoShared`: the I/O
@@ -966,7 +1165,7 @@ impl<S> TokioByteStreamIo<S> {
                 close_wait_waker: RefCell::new(None),
                 non_abortive_close: Cell::new(false),
                 queued_write: RefCell::new(None),
-                polled_read: RefCell::new(None),
+                polled_read: RefCell::new(PolledRead::default()),
             }),
             close_drain,
         }
@@ -1459,8 +1658,8 @@ where
 }
 
 /// Polls the stream once to gather at most `maximum` bytes into `read`;
-/// `Ready` carries whether the stream reached EOF. Inlined into both read
-/// paths, which poll once per wake.
+/// `Ready` carries whether the stream reached EOF. Inlined into
+/// `TokioByteStreamIo::read`'s future, which polls once per wake.
 #[inline(always)]
 fn poll_stream_read<S>(
     shared: &TokioIoShared<S>,
@@ -1506,6 +1705,14 @@ where
     }
 }
 
+/// A [`PolledReader`]'s state: the active read, and the room that its reads
+/// reuse (`DIV-018`).
+#[derive(Default)]
+struct PolledRead {
+    read: Option<IoRead>,
+    room: ReadRoom,
+}
+
 /// One read's progress through [`poll_io_read`].
 struct IoRead {
     maximum: usize,
@@ -1526,11 +1733,13 @@ impl IoRead {
 
 /// Polls a `PolledReader` read with the steps of `ByteStreamIo::read`'s
 /// future: a read error deferred from the previous read, else at most
-/// `maximum` gathered bytes (`DIV-016`).
+/// `maximum` gathered bytes (`DIV-016`), the first of them in `room` when the
+/// stream reuses it.
 fn poll_io_read<S>(
     shared: &TokioIoShared<S>,
     context: &mut Context<'_>,
     io: &mut IoRead,
+    room: &mut ReadRoom,
 ) -> Poll<Result<TransportRead, HttpError>>
 where
     S: TokioByteStream,
@@ -1549,13 +1758,15 @@ where
             read.insert(OwnedRead::new(*maximum))
         }
     };
-    let ended = ready!(poll_stream_read(
-        shared,
-        context,
-        *maximum,
-        *allocation_size,
-        gathered
-    ));
+    let ended = ready!({
+        let mut stream = shared.stream.borrow_mut();
+        match stream.as_mut() {
+            Some(stream) => stream
+                .poll_read_reusing(context, *maximum, *allocation_size, gathered, room)
+                .map_err(read_io_error),
+            None => Poll::Ready(Err(dropped_error())),
+        }
+    });
     let read = read.take().expect("a polled read holds its gathered bytes");
     Poll::Ready(
         read_eof(shared, &read, ended)
@@ -1570,24 +1781,28 @@ where
     fn start_read(&self, maximum: usize, allocation_size: usize) {
         let replaced = self
             .polled_read
-            .replace(Some(IoRead::new(maximum, allocation_size)));
+            .borrow_mut()
+            .read
+            .replace(IoRead::new(maximum, allocation_size));
         assert!(replaced.is_none(), "a polled read ended before the next");
     }
 
     fn poll_read(&self, context: &mut Context<'_>) -> Poll<Result<TransportRead, HttpError>> {
         let polled = {
-            let mut read = self.polled_read.borrow_mut();
+            let mut polled = self.polled_read.borrow_mut();
+            let PolledRead { read, room } = &mut *polled;
             let read = read.as_mut().expect("a polled read is active");
-            poll_io_read(self, context, read)
+            poll_io_read(self, context, read, room)
         };
         if polled.is_ready() {
-            drop(self.polled_read.take());
+            self.retire_read();
         }
         polled
     }
 
     fn retire_read(&self) {
-        drop(self.polled_read.take());
+        let read = self.polled_read.borrow_mut().read.take();
+        drop(read);
     }
 }
 
