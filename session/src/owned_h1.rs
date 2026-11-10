@@ -1085,6 +1085,9 @@ impl<A: OwnedApplication> Driver<A> {
                 {
                     self.fail_with_response(error, peer, status)?;
                 }
+                // As `UniplexSession`'s `reset_h1_ingress_stream`: a peer EOF inside a request
+                // whose response has started resets once the serialized bytes are written.
+                _ if peer => self.fail_read(error),
                 _ => self.fail(error, peer),
             }
             return Ok(true);

@@ -1427,6 +1427,27 @@ fn assert_writes_the_response_then_resets(outcomes: &[(bool, usize, bool, Option
     );
 }
 
+/// The owned HTTP/1.1 driver, with the option off: a mid-upload EOF after the
+/// response started writes the serialized bytes before the reset, as
+/// `UniplexSession` does, so under `non_abortive_close` the whole response
+/// arrives.
+#[test]
+fn owned_http1_eof_mid_upload_with_an_early_response_writes_it_by_default() {
+    assert_writes_the_response_then_resets(&http1_eof_mid_upload_with_an_early_response_for(
+        true,
+        false,
+        &[false],
+    ));
+    let outcomes = http1_eof_mid_upload_with_an_early_response_for(true, true, &[false]);
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| *outcome
+                == (true, FINAL_BATCH, false, Some(HttpErrorCode::TRANSPORT_EOF))),
+        "the whole response, then EOF: {outcomes:?}"
+    );
+}
+
 /// With `non_abortive_close` (`DIV-038`), the close that follows a mid-upload EOF
 /// no longer discards the response's tail:
 /// the session writes the whole response, then the client reads all of it and
@@ -1451,8 +1472,19 @@ fn http1_eof_mid_upload_with_an_early_response(
     owned_http1: bool,
     non_abortive_close: bool,
 ) -> Vec<(bool, usize, bool, Option<HttpErrorCode>)> {
-    let outcomes: Vec<_> = [false, true]
-        .into_iter()
+    http1_eof_mid_upload_with_an_early_response_for(owned_http1, non_abortive_close, &[false, true])
+}
+
+/// As `http1_eof_mid_upload_with_an_early_response`, for the
+/// `abort_exchanges_on_eof` settings in `settings`.
+fn http1_eof_mid_upload_with_an_early_response_for(
+    owned_http1: bool,
+    non_abortive_close: bool,
+    settings: &'static [bool],
+) -> Vec<(bool, usize, bool, Option<HttpErrorCode>)> {
+    let outcomes: Vec<_> = settings
+        .iter()
+        .copied()
         .flat_map(|abort_exchanges_on_eof| {
             let (sender, receiver) = std::sync::mpsc::channel();
             on_worker(move |context| async move {
@@ -1490,7 +1522,11 @@ fn http1_eof_mid_upload_with_an_early_response(
             receiver.try_iter().collect::<Vec<_>>()
         })
         .collect();
-    assert_eq!(outcomes.len(), 4, "each setting ran on both executors");
+    assert_eq!(
+        outcomes.len(),
+        2 * settings.len(),
+        "each setting ran on both executors"
+    );
     outcomes
 }
 
