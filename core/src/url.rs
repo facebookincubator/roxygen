@@ -457,13 +457,17 @@ fn parse_fully_formed(url: &[u8], scheme_end: usize, strict: bool) -> Components
 }
 
 fn parse_non_fully_formed(url: &[u8], strict: bool) -> Components {
-    if url.is_empty() || !validate_url(url, strict) {
+    if url.is_empty() {
         return Components::default();
     }
-
-    let path_start = find_byte(url, b'/');
-    let query_start = find_byte(url, b'?');
-    let fragment_start = find_byte(url, b'#');
+    let Some(Delimiters {
+        path_start,
+        query_start,
+        fragment_start,
+    }) = scan_delimiters(url, strict)
+    else {
+        return Components::default();
+    };
     let path_end = earliest(query_start, fragment_start).unwrap_or(url.len());
     let authority_end = path_start.map_or(path_end, |path_start| path_start.min(path_end));
     let mut components = Components {
@@ -494,6 +498,73 @@ fn parse_non_fully_formed(url: &[u8], strict: bool) -> Components {
     }
     components.valid = true;
     components
+}
+
+/// `URL_BYTES` flag: `validate_url` rejects the byte in both modes.
+const URL_CONTROL: u8 = 1;
+/// `URL_BYTES` flag: `validate_url` rejects the byte in strict mode only.
+const URL_HIGH: u8 = 2;
+/// `URL_BYTES` flag: the byte is '/', '?' or '#'.
+const URL_DELIMITER: u8 = 4;
+
+/// Each byte's `validate_url` answers and whether it is a delimiter.
+const URL_BYTES: [u8; 256] = {
+    let mut table = [0; 256];
+    let mut index = 0;
+    while index < table.len() {
+        let byte = index as u8;
+        table[index] = if byte <= 0x20 || byte == 0x7f {
+            URL_CONTROL
+        } else if byte >= 0x80 {
+            URL_HIGH
+        } else if matches!(byte, b'/' | b'?' | b'#') {
+            URL_DELIMITER
+        } else {
+            0
+        };
+        index += 1;
+    }
+    table
+};
+
+const fn rejected_url_bytes(strict: bool) -> u8 {
+    if strict {
+        URL_CONTROL | URL_HIGH
+    } else {
+        URL_CONTROL
+    }
+}
+
+/// The first '/', '?' and '#' of a URL.
+struct Delimiters {
+    path_start: Option<usize>,
+    query_start: Option<usize>,
+    fragment_start: Option<usize>,
+}
+
+/// `validate_url` and the first '/', '?' and '#' in one pass: `None` when
+/// `validate_url` rejects `url`.
+fn scan_delimiters(url: &[u8], strict: bool) -> Option<Delimiters> {
+    count_visited(url.len());
+    let mut classes = 0;
+    let mut delimiters = Delimiters {
+        path_start: None,
+        query_start: None,
+        fragment_start: None,
+    };
+    for (index, byte) in url.iter().enumerate() {
+        let class = URL_BYTES[usize::from(*byte)];
+        classes |= class;
+        if class & URL_DELIMITER != 0 {
+            let first = match *byte {
+                b'/' => &mut delimiters.path_start,
+                b'?' => &mut delimiters.query_start,
+                _ => &mut delimiters.fragment_start,
+            };
+            first.get_or_insert(index);
+        }
+    }
+    (classes & rejected_url_bytes(strict) == 0).then_some(delimiters)
 }
 
 fn parse_authority(components: &mut Components) -> bool {
@@ -591,9 +662,14 @@ fn parse_port_prefix(port: &[u8]) -> (u16, bool) {
     (value, parsed_digit)
 }
 
+/// Rejects bytes at or below 0x20, 0x7f and, when `strict`, bytes above 0x7f.
+/// A reduction with no early exit, so it can be vectorized.
 fn validate_url(url: &[u8], strict: bool) -> bool {
-    url.iter()
-        .all(|byte| *byte > 0x20 && *byte != 0x7f && (!strict || *byte <= 0x7f))
+    count_visited(url.len());
+    let high = u8::from(strict) << 7;
+    url.iter().fold(0, |rejected, byte| {
+        rejected | u8::from(*byte <= 0x20) | u8::from(*byte == 0x7f) | (*byte & high)
+    }) == 0
 }
 
 fn is_user_info_char(byte: u8) -> bool {
@@ -698,9 +774,10 @@ fn create_url(
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    haystack.windows(needle.len()).position(|window| {
+        count_visited(1);
+        window == needle
+    })
 }
 
 fn find_byte(bytes: &[u8], needle: u8) -> Option<usize> {
@@ -710,7 +787,10 @@ fn find_byte(bytes: &[u8], needle: u8) -> Option<usize> {
 fn find_byte_from(bytes: &[u8], needle: u8, start: usize) -> Option<usize> {
     bytes[start..]
         .iter()
-        .position(|byte| *byte == needle)
+        .position(|byte| {
+            count_visited(1);
+            *byte == needle
+        })
         .map(|position| start + position)
 }
 
@@ -732,3 +812,412 @@ fn earliest(left: Option<usize>, right: Option<usize>) -> Option<usize> {
 #[cfg(test)]
 #[path = "../tests/url_dispatch.rs"]
 mod dispatch_tests;
+
+#[cfg(test)]
+thread_local! {
+    static BYTES_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts the bytes a URL scan examines (one per `find_bytes` window).
+#[cfg(test)]
+fn count_visited(bytes: usize) {
+    BYTES_VISITED.with(|visited| visited.set(visited.get() + bytes));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn count_visited(_bytes: usize) {}
+
+#[cfg(test)]
+fn take_bytes_visited() -> usize {
+    BYTES_VISITED.with(|visited| visited.replace(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `parse_components`, `parse_fully_formed`, `parse_non_fully_formed`
+    /// and `validate_url` as they were before the single-pass origin-form
+    /// scan, kept as the differential oracle.
+    mod oracle {
+        use super::super::*;
+
+        pub(super) fn parse_components(url: &[u8], strict: bool) -> Components {
+            if url == b"/" {
+                return Components {
+                    path: 0..1,
+                    valid: true,
+                    ..Components::default()
+                };
+            }
+
+            match find_bytes(url, b"://") {
+                Some(scheme_end)
+                    if scheme_end != 0
+                        && url[..scheme_end]
+                            .iter()
+                            .all(|byte| byte.is_ascii_alphabetic()) =>
+                {
+                    parse_fully_formed(url, scheme_end, strict)
+                }
+                _ => parse_non_fully_formed(url, strict),
+            }
+        }
+
+        fn parse_fully_formed(url: &[u8], scheme_end: usize, strict: bool) -> Components {
+            if !validate_url(url, strict) {
+                return Components::default();
+            }
+
+            let authority_start = scheme_end + 3;
+            let authority_end = find_any_from(url, authority_start, b"/?#").unwrap_or(url.len());
+            if authority_start == authority_end {
+                return Components::default();
+            }
+
+            let raw_authority = &url[authority_start..authority_end];
+            if url.get(authority_end) == Some(&b'#') {
+                return Components::default();
+            }
+            let Some((host, port)) = parse_full_authority(raw_authority) else {
+                return Components::default();
+            };
+            let mut components = Components {
+                scheme: url[..scheme_end].to_vec().into_boxed_slice(),
+                host: host.to_vec().into_boxed_slice(),
+                port,
+                ..Components::default()
+            };
+
+            let query_start = find_byte_from(url, b'?', authority_end);
+            let fragment_start = find_byte_from(url, b'#', authority_end);
+            let path_end = earliest(query_start, fragment_start).unwrap_or(url.len());
+            if authority_end < path_end && url[authority_end] == b'/' {
+                components.path = authority_end..path_end;
+                if !url[components.path.clone()]
+                    .iter()
+                    .all(|byte| is_full_url_char(*byte))
+                {
+                    return Components::default();
+                }
+            }
+            if let Some(query_start) = query_start {
+                if fragment_start.is_none_or(|fragment_start| query_start < fragment_start) {
+                    let query_end = fragment_start.unwrap_or(url.len());
+                    components.query = query_start + 1..query_end;
+                    if !url[components.query.clone()]
+                        .iter()
+                        .all(|byte| *byte == b'?' || is_full_url_char(*byte))
+                    {
+                        return Components::default();
+                    }
+                }
+            }
+            if let Some(fragment_start) = fragment_start {
+                let mut fragment_content_start = fragment_start + 1;
+                while url.get(fragment_content_start) == Some(&b'#') {
+                    fragment_content_start += 1;
+                }
+                components.fragment = fragment_content_start..url.len();
+                if !url[components.fragment.clone()]
+                    .iter()
+                    .all(|byte| matches!(*byte, b'?' | b'#') || is_full_url_char(*byte))
+                {
+                    return Components::default();
+                }
+            }
+            components.authority = join_host_and_port(&components.host, components.port);
+            components.valid = true;
+            components
+        }
+
+        fn parse_non_fully_formed(url: &[u8], strict: bool) -> Components {
+            if url.is_empty() || !validate_url(url, strict) {
+                return Components::default();
+            }
+
+            let path_start = find_byte(url, b'/');
+            let query_start = find_byte(url, b'?');
+            let fragment_start = find_byte(url, b'#');
+            let path_end = earliest(query_start, fragment_start).unwrap_or(url.len());
+            let authority_end = path_start.map_or(path_end, |path_start| path_start.min(path_end));
+            let mut components = Components {
+                authority: url[..authority_end].to_vec().into_boxed_slice(),
+                ..Components::default()
+            };
+
+            if let Some(path_start) = path_start
+                && path_start < path_end
+            {
+                components.path = path_start..path_end;
+            }
+
+            let query_end = fragment_start.unwrap_or(url.len());
+            if let Some(query_start) = query_start {
+                if query_start < query_end {
+                    components.query = query_start + 1..query_end;
+                } else if fragment_start.is_some_and(|fragment_start| fragment_start < query_start)
+                {
+                    return components;
+                }
+            }
+
+            if let Some(fragment_start) = fragment_start {
+                components.fragment = fragment_start + 1..url.len();
+            }
+            if !parse_authority(&mut components) {
+                return components;
+            }
+            components.valid = true;
+            components
+        }
+
+        pub(super) fn validate_url(url: &[u8], strict: bool) -> bool {
+            url.iter()
+                .all(|byte| *byte > 0x20 && *byte != 0x7f && (!strict || *byte <= 0x7f))
+        }
+    }
+
+    type Fields<'a> = (
+        &'a [u8],
+        &'a [u8],
+        &'a [u8],
+        Range<usize>,
+        Range<usize>,
+        Range<usize>,
+        u16,
+        bool,
+    );
+
+    fn fields(components: &Components) -> Fields<'_> {
+        (
+            &components.scheme,
+            &components.authority,
+            &components.host,
+            components.path.clone(),
+            components.query.clone(),
+            components.fragment.clone(),
+            components.port,
+            components.valid,
+        )
+    }
+
+    fn assert_matches_oracle(url: &[u8], strict: bool) {
+        assert_eq!(
+            fields(&parse_components(url, strict)),
+            fields(&oracle::parse_components(url, strict)),
+            "url={url:02x?} strict={strict}",
+        );
+        assert_eq!(
+            validate_url(url, strict),
+            oracle::validate_url(url, strict),
+            "url={url:02x?} strict={strict}",
+        );
+    }
+
+    /// Consumer-shaped origin-form request targets of 9, 34 and 120 bytes.
+    const ORIGIN_FORM_PATHS: [&[u8]; 3] = [
+        b"/svc/Ping",
+        b"/consumer.v1.Routing/ResolveRoutes",
+        b"/consumer/v2/items/0123456789abcdef/children?x-routing-key=c1-0123456789&shard=17&page=3&order=desc&fields=id,name#sect4",
+    ];
+
+    const EXHAUSTIVE_ALPHABET: [u8; 15] = [
+        b'/', b'?', b'#', b':', b'@', b'[', b']', b'.', b'%', b'a', b'Z', b'7', b' ', 0x7f, 0x80,
+    ];
+
+    #[test]
+    fn origin_form_paths_are_scanned_once() {
+        let mut scans = Vec::new();
+        for path in ORIGIN_FORM_PATHS {
+            for strict in [false, true] {
+                take_bytes_visited();
+                let components = parse_components(path, strict);
+                let visited = take_bytes_visited();
+                assert!(components.valid, "path={path:02x?}");
+                scans.push((path.len(), strict, visited));
+            }
+        }
+        assert!(
+            scans
+                .iter()
+                .all(|(length, _, visited)| *visited <= length + 8),
+            "(length, strict, bytes visited): {scans:?}",
+        );
+    }
+
+    #[test]
+    fn url_byte_classes_match_validate_url_and_the_delimiters() {
+        for byte in 0..=u8::MAX {
+            let class = URL_BYTES[usize::from(byte)];
+            for strict in [false, true] {
+                assert_eq!(
+                    class & rejected_url_bytes(strict) == 0,
+                    oracle::validate_url(&[byte], strict),
+                    "byte={byte:#04x} strict={strict}",
+                );
+            }
+            assert_eq!(
+                class & URL_DELIMITER != 0,
+                matches!(byte, b'/' | b'?' | b'#'),
+                "byte={byte:#04x}",
+            );
+        }
+    }
+
+    #[test]
+    fn components_match_the_oracle_on_named_cases() {
+        let named: [&[u8]; 28] = [
+            b"",
+            b"/",
+            b"//",
+            b"/a?b?c",
+            b"/a#b?c",
+            b"/a?b#c#d",
+            b"/?#",
+            b"/#?",
+            b"?a/b",
+            b"#a/b",
+            b"/a b",
+            b"/a\x7fb",
+            b"/a\x80b",
+            b"host:80/a?b#c",
+            b"[::1]:443/x",
+            b"a://b",
+            b"http://host/a?b?c#d#e",
+            b"http://u@h:8080/p?q#f",
+            b"https://[::1]:443/x?y",
+            b"http://h#f",
+            b"http:/h/p",
+            b"/http://h/p",
+            b"1http://h/p",
+            b"h://",
+            b"/p?q=http://h/x",
+            ORIGIN_FORM_PATHS[0],
+            ORIGIN_FORM_PATHS[1],
+            ORIGIN_FORM_PATHS[2],
+        ];
+        for url in named {
+            for strict in [false, true] {
+                assert_matches_oracle(url, strict);
+            }
+        }
+    }
+
+    #[test]
+    fn origin_form_components_match_the_oracle_for_every_byte_at_every_position() {
+        for path in ORIGIN_FORM_PATHS {
+            let mut url = path.to_vec();
+            for position in 0..path.len() {
+                for byte in 0..=u8::MAX {
+                    url[position] = byte;
+                    for strict in [false, true] {
+                        assert_matches_oracle(&url, strict);
+                    }
+                }
+                url[position] = path[position];
+            }
+        }
+    }
+
+    #[test]
+    fn components_match_the_oracle_exhaustively_up_to_five_bytes() {
+        let symbols = EXHAUSTIVE_ALPHABET.len();
+        let mut url = Vec::with_capacity(5);
+        for length in 0..=5_u32 {
+            for mut code in 0..symbols.pow(length) {
+                url.clear();
+                for _ in 0..length {
+                    url.push(EXHAUSTIVE_ALPHABET[code % symbols]);
+                    code /= symbols;
+                }
+                for strict in [false, true] {
+                    assert_matches_oracle(&url, strict);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn components_match_the_oracle_on_seeded_random_urls() {
+        const PREFIXES: [&[u8]; 8] = [
+            b"",
+            b"/",
+            b"//",
+            b"http://",
+            b"https://h:8080",
+            b"aZ://",
+            b"http://[::1]",
+            b"h:",
+        ];
+        const STRUCTURE: &[u8] = b"/?#:@[].%aZ7-_~=&!,;+$*'()hp:/";
+        const CLEAN: &[u8] = b"/.-_aZ7hpqx01/";
+        let mut state = 0x0A11_C0DE_5EED_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut url = Vec::with_capacity(160);
+        let mut valid = 0;
+        let mut fully_formed = 0;
+        for _ in 0..100_000 {
+            url.clear();
+            let prefix = PREFIXES[usize::try_from(next() % 8).expect("index fits")];
+            url.extend_from_slice(prefix);
+            let room = 160 - prefix.len() as u64;
+            let length = next() % (room + 1);
+            let clean = next() % 2 == 0;
+            let symbols = if clean { CLEAN } else { STRUCTURE };
+            for _ in 0..length {
+                let draw = next();
+                let byte = match draw % 64 {
+                    0 => draw.to_le_bytes()[1],
+                    1 if clean => b'?',
+                    2 if clean => b'#',
+                    _ => {
+                        symbols[usize::try_from((draw >> 8) % symbols.len() as u64)
+                            .expect("index fits")]
+                    }
+                };
+                url.push(byte);
+            }
+            for strict in [false, true] {
+                assert_matches_oracle(&url, strict);
+            }
+            let components = parse_components(&url, false);
+            valid += usize::from(components.valid);
+            fully_formed += usize::from(components.valid && !components.scheme.is_empty());
+        }
+        assert!(
+            valid >= 30_000 && fully_formed >= 10_000,
+            "{valid} valid and {fully_formed} fully formed of 100000",
+        );
+    }
+
+    #[test]
+    fn validate_url_matches_the_oracle_for_every_byte_at_every_position() {
+        for strict in [false, true] {
+            assert_eq!(validate_url(b"", strict), oracle::validate_url(b"", strict));
+        }
+        let mut url = Vec::with_capacity(160);
+        for length in 1..=160 {
+            for position in 0..length {
+                for byte in 0..=u8::MAX {
+                    url.clear();
+                    url.resize(length, b'a');
+                    url[position] = byte;
+                    for strict in [false, true] {
+                        assert_eq!(
+                            validate_url(&url, strict),
+                            oracle::validate_url(&url, strict),
+                            "byte={byte:#04x} at {position} of {length}, strict={strict}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

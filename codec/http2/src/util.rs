@@ -23,7 +23,11 @@ pub enum ControlEscapeMode {
 }
 
 pub fn validate_url(url: &[u8], strict: bool) -> bool {
-    if url.is_empty() || url.iter().any(|byte| matches!(*byte, 0..=0x20 | 0x7f)) {
+    // A reduction with no early exit, so it can be vectorized.
+    let rejected = url.iter().fold(0, |rejected, byte| {
+        rejected | u8::from(*byte <= 0x20) | u8::from(*byte == 0x7f)
+    });
+    if url.is_empty() || rejected != 0 {
         return false;
     }
     !strict || ParseUrl::parse_url(url, true).is_some()
@@ -329,6 +333,39 @@ const fn http_token(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `validate_url` as it was before the branch-free byte scan, kept as the
+    /// differential oracle.
+    fn oracle_validate_url(url: &[u8], strict: bool) -> bool {
+        if url.is_empty() || url.iter().any(|byte| matches!(*byte, 0..=0x20 | 0x7f)) {
+            return false;
+        }
+        !strict || ParseUrl::parse_url(url, true).is_some()
+    }
+
+    #[test]
+    fn validate_url_matches_the_oracle_for_every_byte_at_every_position() {
+        for strict in [false, true] {
+            assert_eq!(validate_url(b"", strict), oracle_validate_url(b"", strict));
+        }
+        let mut url = Vec::with_capacity(160);
+        for length in 1..=160 {
+            for position in 0..length {
+                for byte in 0..=u8::MAX {
+                    url.clear();
+                    url.resize(length, b'a');
+                    url[position] = byte;
+                    for strict in [false, true] {
+                        assert_eq!(
+                            validate_url(&url, strict),
+                            oracle_validate_url(&url, strict),
+                            "byte={byte:#04x} at {position} of {length}, strict={strict}",
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn name_table_matches_http_token() {
