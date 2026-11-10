@@ -101,6 +101,9 @@ struct Shared {
     /// driver from retiring it and returning the slot. From that completion on, the slot is
     /// returning, and admission counts it free (`DIV-029`).
     retiring: RefCell<Option<Rc<IngressSignals>>>,
+    /// Run whenever the slot turns returning
+    /// (`OwnedH1UpstreamHandle::set_returning_hook`).
+    returning_hook: RefCell<Option<Rc<dyn Fn()>>>,
     /// Requests committed on the connection (`DIV-035`).
     committed: Cell<u64>,
     closed: RefCell<Option<HttpError>>,
@@ -259,6 +262,13 @@ impl Shared {
                 capture(&mut panic, || observer.capacity_available());
             }
         }
+        // The slot is returning again, which nothing announces.
+        if self.available() == 0 && self.admits() != 0 {
+            let hook = self.returning_hook.borrow().clone();
+            if let Some(hook) = hook {
+                capture(&mut panic, || hook());
+            }
+        }
         capture(&mut panic, || self.wake.wake_by_ref());
         finish_panic(panic);
     }
@@ -342,6 +352,17 @@ impl OwnedH1UpstreamHandle {
                 && !shared.refuses()
                 && !shared.complete.get(),
         )
+    }
+
+    /// For a pool's selection index: `hook` runs whenever the slot turns
+    /// returning (`returning_capacity` reads 1 when it runs), which no observer callback
+    /// announces: inside the consumer's completion of a finished exchange, before the driver's
+    /// next turn, and at the release of a reservation taken on the returning slot. A connection
+    /// that closes first does not run it. It must not panic or act on the connection. Replaces
+    /// an earlier hook.
+    #[doc(hidden)]
+    pub fn set_returning_hook(&self, hook: Rc<dyn Fn()>) {
+        *self.0.returning_hook.borrow_mut() = Some(hook);
     }
 
     /// Installs the connection's one observer. Fails with `INVALID_STATE_TRANSITION` once an
@@ -2080,6 +2101,7 @@ impl UpstreamDriver {
             used: Cell::new(0),
             spent: Cell::new(false),
             retiring: RefCell::new(None),
+            returning_hook: RefCell::new(None),
             committed: Cell::new(0),
             closed: RefCell::new(None),
             observer: RefCell::new(None),
@@ -2550,6 +2572,7 @@ impl UpstreamDriver {
             drive: pull_through
                 .is_some()
                 .then(|| DriveLink(Rc::downgrade(&self.shared))),
+            returning: Cell::new(None),
         });
         let source = HttpResponseSource::new_shared(
             id,
@@ -2938,6 +2961,9 @@ impl UpstreamDriver {
                 && self.shared.retiring.borrow().is_none()
             {
                 *self.shared.retiring.borrow_mut() = Some(Rc::clone(&exchange.signals));
+                if let Some(hook) = self.shared.returning_hook.borrow().clone() {
+                    exchange.signals.returning.set(Some(hook));
+                }
             }
             return false;
         }
@@ -3235,7 +3261,9 @@ impl UpstreamDriver {
         }
         // Admission closes first, so the exchange's capacity release announces no capacity.
         capture(&mut self.panic, || self.shared.close(error.clone()));
-        self.shared.retiring.take();
+        if let Some(signals) = self.shared.retiring.take() {
+            signals.returning.take();
+        }
         if let Some(mut exchange) = self.exchange.take() {
             capture(&mut self.panic, || exchange.cancel(error));
             capture(&mut self.panic, || drop(exchange));

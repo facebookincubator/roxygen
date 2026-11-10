@@ -1347,6 +1347,159 @@ fn a_request_on_a_returning_slot_is_refused_unprocessed_when_the_connection_fail
     });
 }
 
+/// The returning hook a pool installs runs once, at the
+/// consumer's completion that makes the slot returning, with `returning_capacity` already 1, and
+/// never for an exchange whose slot does not turn returning there: a `Connection: close`
+/// response, a request still unwritten at that completion, or a connection cancelled first.
+#[test]
+fn the_returning_hook_runs_once_at_the_consumer_s_completion() {
+    // (case, first response, whether the request's write waits until its response is read,
+    // whether the connection is cancelled before the read, and the hook's runs once the request
+    // is committed, once its response is complete and unread, once it is read and dropped, and
+    // once the driver retired the exchange or the connection finished)
+    let cases: [(&str, &'static [u8], bool, bool, [usize; 4]); 4] = [
+        ("keep-alive", OK_RESPONSE, false, false, [0, 0, 1, 1]),
+        (
+            "connection close",
+            CLOSE_RESPONSE,
+            false,
+            false,
+            [0, 0, 0, 0],
+        ),
+        ("request unwritten", OK_RESPONSE, true, false, [0, 0, 0, 0]),
+        ("cancelled", OK_RESPONSE, false, true, [0, 0, 0, 0]),
+    ];
+    for (case, response, held_write, cancelled, expected) in cases {
+        let (observed, capacities) = run_on_host(move |context| {
+            Box::pin(async move {
+                let respond = Arc::new(tokio::sync::Notify::new());
+                let second = Arc::new(tokio::sync::Notify::new());
+                let (transport, state) =
+                    ScriptedTransport::new(reuse_reads(&respond, &second, response, false));
+                let write_gate = Rc::new(tokio::sync::Notify::new());
+                if held_write {
+                    state.borrow_mut().write_gate = Some((b"GET".to_vec(), Rc::clone(&write_gate)));
+                }
+                let (session, handle) =
+                    OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+                // `returning_capacity` in each run; the probe's handle is taken at the end.
+                let probe = Rc::new(RefCell::new(Some(handle.clone())));
+                let capacities = Rc::new(RefCell::new(Vec::new()));
+                handle.set_returning_hook(Rc::new({
+                    let (probe, capacities) = (Rc::clone(&probe), Rc::clone(&capacities));
+                    move || {
+                        let capacity = probe
+                            .borrow()
+                            .as_ref()
+                            .map(|handle| handle.returning_capacity());
+                        capacities.borrow_mut().push(capacity);
+                    }
+                }));
+                let submission = handle.reserve_request().unwrap().submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                let runs = || capacities.borrow().len();
+                let (run, observed) = futures::join!(session.run(), async {
+                    let response = submission.await.unwrap();
+                    let committed = runs();
+                    respond.notify_one();
+                    yield_until(|| response.control.capacity_released()).await;
+                    let unread = runs();
+                    let (_stream, mut source, _control) = response.into_source_parts();
+                    if cancelled {
+                        handle.cancel();
+                        yield_until(|| handle.is_finished()).await;
+                    } else {
+                        assert_eq!(read_response(&mut source).await.body, b"ok");
+                    }
+                    drop(source);
+                    let read = runs();
+                    write_gate.notify_one();
+                    yield_until(|| handle.is_idle() || handle.is_finished()).await;
+                    let retired = runs();
+                    if handle.is_idle() {
+                        assert!(handle.close_when_idle().unwrap());
+                    }
+                    [committed, unread, read, retired]
+                });
+                assert_eq!(run.is_err(), cancelled, "{case}: the run's outcome");
+                probe.take();
+                let capacities = capacities.take();
+                (observed, capacities)
+            })
+        });
+        assert_eq!(observed, expected, "{case}");
+        assert!(
+            capacities.iter().all(|capacity| *capacity == Some(1)),
+            "{case}: the slot is returning when the hook runs: {capacities:?}"
+        );
+    }
+}
+
+/// A reservation taken on a returning slot and dropped
+/// before the driver's next turn leaves the slot returning again, which announces no capacity
+/// (`DIV-029`), so the returning hook runs again, with `returning_capacity` 1.
+#[test]
+fn the_returning_hook_runs_again_when_a_reservation_on_the_returning_slot_is_dropped() {
+    let (runs, capacities) = run_on_host(|context| {
+        Box::pin(async move {
+            let respond = Arc::new(tokio::sync::Notify::new());
+            let second = Arc::new(tokio::sync::Notify::new());
+            let (transport, _state) =
+                ScriptedTransport::new(reuse_reads(&respond, &second, OK_RESPONSE, false));
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let probe = Rc::new(RefCell::new(Some(handle.clone())));
+            let capacities = Rc::new(RefCell::new(Vec::new()));
+            handle.set_returning_hook(Rc::new({
+                let (probe, capacities) = (Rc::clone(&probe), Rc::clone(&capacities));
+                move || {
+                    let capacity = probe
+                        .borrow()
+                        .as_ref()
+                        .map(|handle| handle.returning_capacity());
+                    capacities.borrow_mut().push(capacity);
+                }
+            }));
+            let submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            let runs = || capacities.borrow().len();
+            let (run, observed) = futures::join!(session.run(), async {
+                let (_stream, mut source, _control) = submission.await.unwrap().into_source_parts();
+                respond.notify_one();
+                assert_eq!(read_response(&mut source).await.body, b"ok");
+                drop(source);
+                let read = runs();
+                let reservation = handle
+                    .reserve_request()
+                    .expect("the consumed exchange's slot admits the next request");
+                let reserved = runs();
+                drop(reservation);
+                let dropped = runs();
+                yield_until(|| handle.is_idle()).await;
+                let retired = runs();
+                assert!(handle.close_when_idle().unwrap());
+                [read, reserved, dropped, retired]
+            });
+            run.unwrap();
+            probe.take();
+            let capacities = capacities.take();
+            (observed, capacities)
+        })
+    });
+    assert_eq!(
+        runs,
+        [1, 1, 2, 2],
+        "the hook's runs after the read, the reservation, its drop and the retirement"
+    );
+    assert_eq!(capacities, [Some(1), Some(1)]);
+}
+
 /// `DIV-029`: a reservation that takes a returning slot ends its returning capacity, since the
 /// driver's next turn then retires the exchange without announcing capacity; dropped before
 /// that turn, it leaves the slot returning again.

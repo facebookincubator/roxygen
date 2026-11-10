@@ -52,9 +52,10 @@ pub enum OwnedSessionSelection {
     FirstAvailable,
     /// The session with the fewest exchanges in flight: on HTTP/2 the fewest streams reserved
     /// or open, so idle sessions first; on HTTP/1.1, whose sessions take one exchange, an idle
-    /// session before one whose free slot its driver has not settled yet. Equally loaded
-    /// sessions are taken in `FirstAvailable`'s order: a busy one first, in the pool's order,
-    /// then an idle one in `PoolParams::reuse_order`.
+    /// session before one whose free slot its driver has not settled yet, and a session whose
+    /// slot is returning, which has none in flight, before an idle one (`DIV-046`). Equally
+    /// loaded sessions are taken in `FirstAvailable`'s order: a busy one first, in the pool's
+    /// order, then an idle one in `PoolParams::reuse_order`.
     LeastLoaded,
 }
 
@@ -86,10 +87,11 @@ impl PoolReservation for OwnedGetSessionResult {
 /// entry alone. A nonzero `idle_timeout` or `max_age` still reads the clock
 /// for the sessions' expiry, as `HttpSessionPool`'s step does. Only an
 /// acquisition that waits for a session or a dial continues in a boxed future.
-/// One that finds no session to take, below `max_connections`, waits for an
-/// HTTP/1.1 session whose driver returns its slot at its next turn, if no other
-/// acquisition waits for it, instead of starting a connection attempt; that
-/// session's next notification wakes it ahead of earlier waiters (`DIV-046`).
+/// While no acquisition waits, an HTTP/1.1 session whose slot is returning is
+/// taken at once (`DIV-046`). One that finds no session to take, below
+/// `max_connections`, waits for such a session, if no other acquisition waits
+/// for it, instead of starting a connection attempt; that session's next
+/// notification wakes it ahead of earlier waiters (`DIV-046`).
 /// Dropping it before it resolves abandons the acquisition, as dropping
 /// `HttpSessionPool`'s does, and leaves a returning session it waited for to
 /// the next acquisition.

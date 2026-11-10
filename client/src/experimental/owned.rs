@@ -54,12 +54,13 @@
 //! `admission_closed` callbacks, and the idleness a driver publishes at the end of a turn,
 //! which the session's run scope reports, feed the pool as a `ClientSession`'s lifecycle
 //! events do. Its acquisitions take a selected session on their first poll with no
-//! allocation and no clock read for their deadline ([`OwnedSessionAcquisition`]), and one
-//! that would dial waits instead for an HTTP/1.1 session whose driver returns its slot at
-//! its next turn. [`OwnedHttpSessionPool::set_session_selection`] opts into taking the
-//! least loaded of the sessions that can take an exchange (`DIV-048`). A reservation taken
-//! on a pooled session's handle reaches its pool as one the pool's acquisition made, and the
-//! admission the pool closes on a session it retires or drains refuses the handle's
+//! allocation and no clock read for their deadline ([`OwnedSessionAcquisition`]), an
+//! HTTP/1.1 session whose slot is returning included while no acquisition waits (`DIV-046`),
+//! and one that would dial waits instead for an HTTP/1.1 session whose driver returns its
+//! slot at its next turn. [`OwnedHttpSessionPool::set_session_selection`] opts into taking
+//! the least loaded of the sessions that can take an exchange (`DIV-048`). A reservation
+//! taken on a pooled session's handle reaches its pool as one the pool's acquisition made,
+//! and the admission the pool closes on a session it retires or drains refuses the handle's
 //! reservations, as a `ClientSession`'s draining flag does.
 
 use std::cell::Cell;
@@ -141,6 +142,7 @@ use crate::pool::PooledSession;
 use crate::pool::SessionSlot;
 use crate::pool::notify_session_event;
 use crate::pool::record_reservation;
+use crate::pool::record_returning;
 
 mod pool;
 
@@ -297,6 +299,24 @@ fn notify_pool(inner: &Rc<SessionInner>, event: PoolEvent) {
         wake_count,
         release_idle,
     );
+}
+
+/// Lists a pooled HTTP/1.1 session in its pool's selection index once its slot turned
+/// returning (`DIV-029`), which no pool event reports. A pool borrowed
+/// further up the stack has its index unsettled instead, so that its passes see the session.
+fn report_returning(inner: &Rc<SessionInner>) {
+    let Some(pool) = inner.pool.pool.borrow().as_ref().and_then(Weak::upgrade) else {
+        return;
+    };
+    let session = OwnedClientSession {
+        inner: Rc::clone(inner),
+    };
+    if session.is_draining() || !session.is_returning() {
+        return;
+    }
+    if !record_returning(&pool, &PooledSession::Owned(session)) {
+        inner.unsettle_pool();
+    }
 }
 
 #[derive(Clone)]
@@ -571,12 +591,9 @@ impl OwnedClientSession {
     }
 
     /// `available_capacity` without the worker admission check, which the
-    /// pool's acquisition step makes once for all of its sessions, and
-    /// without a returning HTTP/1.1 slot (`DIV-029`): the pool's selection
-    /// index hears of no slot that turns returning, so the pool takes such a
-    /// slot only once its driver retires the exchange (`DIV-046`).
+    /// pool's acquisition step makes once for all of its sessions.
     pub(crate) fn selectable_capacity(&self) -> u32 {
-        if self.session_admission_closed() || self.is_returning() {
+        if self.session_admission_closed() {
             0
         } else {
             self.inner.upstream.available_capacity()
@@ -620,10 +637,12 @@ impl OwnedClientSession {
     /// The exchanges in flight that a least-loaded pool compares (`DIV-048`): on HTTP/2 the
     /// streams its driver admitted, reserved or open; on HTTP/1.1, whose one slot is free
     /// whenever the session can take an exchange, `admitted_transactions`, so that an idle
-    /// session comes first.
+    /// session comes before one whose driver has not settled its free slot, except that a
+    /// returning session (`DIV-029`), whose exchange its consumer completed, has none, and so
+    /// comes first, as the busy one of equally loaded sessions (`DIV-046`).
     pub(crate) fn in_flight(&self) -> u32 {
         match &self.inner.upstream {
-            Upstream::Http1(_) => self.admitted_transactions(),
+            Upstream::Http1(_) => u32::from(!self.is_idle() && !self.is_returning()),
             Upstream::Http2(handle) => handle.admitted_streams(),
         }
     }
@@ -674,6 +693,14 @@ impl OwnedClientSession {
             Upstream::Http1(handle) => handle.set_observer(observer),
             Upstream::Http2(handle) => handle.set_observer(observer),
         };
+        if let Upstream::Http1(handle) = &self.inner.upstream {
+            let session = Rc::downgrade(&self.inner);
+            handle.set_returning_hook(Rc::new(move || {
+                if let Some(inner) = session.upgrade() {
+                    report_returning(&inner);
+                }
+            }));
+        }
     }
 
     pub(crate) fn is_bound_to_pool(&self) -> bool {

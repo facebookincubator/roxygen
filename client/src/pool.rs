@@ -582,6 +582,14 @@ impl PooledSession {
         }
     }
 
+    /// An owned HTTP/1.1 session whose slot is returning (`DIV-029`).
+    fn is_returning(&self) -> bool {
+        match self {
+            Self::Uniplex(_) => false,
+            Self::Owned(session) => session.is_returning(),
+        }
+    }
+
     fn available_transactions(&self) -> usize {
         match self {
             Self::Uniplex(session) => session.available_transactions(),
@@ -1091,11 +1099,12 @@ async fn retire_idle_sessions(
 ///
 /// The index is exact while every change to a session that the passes test reaches the pool
 /// as an event for that session: an owned HTTP/1.1 session becomes able to take an exchange
-/// again only when its driver returns its slot (`capacity_available`), becomes idle only in
-/// that callback or in the idleness its run reports, stops being idle only by a reservation,
-/// and stops admitting by `admission_closed`, by the pool closing it, or by a cancellation,
-/// which sets `unsettled`. A session that stops taking exchanges without an event (its
-/// worker cancelled) stays in its list until a step meets it and drops it.
+/// again only when its driver returns its slot (`capacity_available`) or its slot turns
+/// returning (`DIV-029`), which its returning hook reports (`record_returning`), becomes idle
+/// only in that callback or in the idleness its run reports, stops being idle only by a
+/// reservation, and stops admitting by `admission_closed`, by the pool closing it, or by a
+/// cancellation, which sets `unsettled`. A session that stops taking exchanges without an
+/// event (its worker cancelled) stays in its list until a step meets it and drops it.
 struct SessionIndex {
     /// Set while the index may not mirror the pool; `None` when the pool keeps no index.
     /// Shared with the pool's owned sessions, whose cancellation sets it.
@@ -1251,6 +1260,21 @@ impl PoolState {
         })
     }
 
+    /// Whether an acquisition may take a returning session: only while none waits and the pool
+    /// reuses sessions; otherwise its retirement wakes the first waiter, or drains it
+    /// (`DIV-046`).
+    fn selects_returning(&self) -> bool {
+        self.pooling_enabled && self.waiters.is_empty()
+    }
+
+    /// A busy session that an acquisition may take: it can take another exchange, and it is not
+    /// returning unless `returning` (`selects_returning`).
+    fn takes_busy(entry: &SessionEntry, returning: bool) -> bool {
+        !entry.session.is_idle()
+            && entry.session.supports_more_transactions()
+            && (returning || !entry.session.is_returning())
+    }
+
     /// Rebuilds the index after a release's passes, which left every stamp and the idle count
     /// as they compute them (S6.9): each session that can take an exchange joins its class
     /// list in the pool's order, each entry records whether it counted idle, and the floors are
@@ -1343,11 +1367,10 @@ impl PoolState {
                 Err(IndexMismatch) => {
                     self.unsettle_index();
                     self.count_scan();
+                    let returning = self.selects_returning();
                     return self
                         .sessions
-                        .find(|entry| {
-                            !entry.session.is_idle() && entry.session.supports_more_transactions()
-                        })
+                        .find(|entry| Self::takes_busy(entry, returning))
                         .or_else(|| self.select_idle_session(checkout_at, retired));
                 }
             }
@@ -1377,10 +1400,13 @@ impl PoolState {
     }
 
     fn indexed_busy_session(&mut self) -> Result<Option<SessionSlot>, IndexMismatch> {
+        let returning = self.selects_returning();
         let mut cursor = self.sessions.class_front(Class::Busy);
         while let Some(slot) = cursor {
             cursor = self.sessions.class_next(slot);
-            match Self::class_of(self.sessions.get(slot)) {
+            let entry = self.sessions.get(slot);
+            match Self::class_of(entry) {
+                Some(Class::Busy) if !returning && entry.session.is_returning() => {}
                 Some(Class::Busy) => return Ok(Some(slot)),
                 Some(Class::Idle) => return Err(IndexMismatch),
                 // It takes an exchange again only once its slot returns, which indexes it.
@@ -1399,13 +1425,16 @@ impl PoolState {
     fn indexed_least_loaded_busy_session(
         &mut self,
     ) -> Result<ControlFlow<SessionSlot, Option<SessionSlot>>, IndexMismatch> {
+        let returning = self.selects_returning();
         let mut least: Option<(u32, SessionSlot)> = None;
         let mut cursor = self.sessions.class_front(Class::Busy);
         while let Some(slot) = cursor {
             cursor = self.sessions.class_next(slot);
-            match Self::class_of(self.sessions.get(slot)) {
+            let entry = self.sessions.get(slot);
+            match Self::class_of(entry) {
+                Some(Class::Busy) if !returning && entry.session.is_returning() => {}
                 Some(Class::Busy) => {
-                    let load = self.sessions.get(slot).session.load();
+                    let load = entry.session.load();
                     if load == 0 {
                         return Ok(ControlFlow::Break(slot));
                     }
@@ -1468,15 +1497,17 @@ impl PoolState {
         if self.selection == OwnedSessionSelection::LeastLoaded {
             return self.least_loaded_entry();
         }
+        let returning = self.selects_returning();
         self.sessions
-            .find(|entry| !entry.session.is_idle() && entry.session.supports_more_transactions())
+            .find(|entry| Self::takes_busy(entry, returning))
             .or_else(|| match self.pool_params.reuse_order {
                 SessionReuseOrder::LeastRecentlyUsed => None,
                 SessionReuseOrder::MostRecentlyUsed => self.most_recently_idle_entry(),
             })
             .or_else(|| {
-                self.sessions
-                    .find(|entry| entry.session.supports_more_transactions())
+                self.sessions.find(|entry| {
+                    entry.session.supports_more_transactions() && !entry.session.is_returning()
+                })
             })
     }
 
@@ -1896,10 +1927,11 @@ impl PoolState {
     }
 
     /// The session an acquisition reuses when no busy session can take another
-    /// exchange, in reuse order. On an interval (`checkout_at`), as hyper-util's
-    /// checkout pops its idle list from the end: it retires expired candidates
-    /// into `retired`, closing their admission, until it finds one that is not,
-    /// and leaves older expired sessions to the sweep.
+    /// exchange, in reuse order, never a returning one (`DIV-046`). On an
+    /// interval (`checkout_at`), as hyper-util's checkout pops its idle list
+    /// from the end: it retires expired candidates into `retired`, closing
+    /// their admission, until it finds one that is not, and leaves older
+    /// expired sessions to the sweep.
     #[inline(never)]
     fn select_idle_session(
         &mut self,
@@ -1915,8 +1947,9 @@ impl PoolState {
             }
             .or_else(|| {
                 self.count_scan();
-                self.sessions
-                    .find(|entry| entry.session.supports_more_transactions())
+                self.sessions.find(|entry| {
+                    entry.session.supports_more_transactions() && !entry.session.is_returning()
+                })
             })?;
             if !checkout_at
                 .is_some_and(|now| self.sessions.get(slot).idle_expired(now, timeout, sweep))
@@ -1981,10 +2014,14 @@ impl PoolState {
     /// the pool's order, else an idle one in reuse order. An idle session has none in flight,
     /// so when no busy session is that lightly loaded, every candidate is idle.
     fn least_loaded_entry(&self) -> Option<SessionSlot> {
+        let returning = self.selects_returning();
         let (_, busy) = self
             .sessions
             .entries()
-            .filter(|(_, entry)| entry.session.supports_more_transactions())
+            .filter(|(_, entry)| {
+                entry.session.supports_more_transactions()
+                    && (returning || !entry.session.is_returning())
+            })
             .fold(None, |least, (slot, entry)| {
                 let load = entry.session.load();
                 let busy = (!entry.session.is_idle()).then_some(slot);
@@ -2213,6 +2250,25 @@ pub(crate) fn record_reservation(
     if let Some(claimer) = claimer {
         let _ = catch_callback(|| claimer.signal());
     }
+}
+
+/// Lists an owned HTTP/1.1 session whose slot turned returning (`DIV-029`), at its exchange's
+/// consumer's completion or at the release of a reservation taken on that slot, as a busy
+/// session that can take an exchange: as a returned slot's release
+/// would, the session moves to the back of the pool's order, where it joins the index's busy
+/// list, so that selection sees it before its driver retires the exchange. Returns false,
+/// changing nothing, when the pool is borrowed further up the stack.
+pub(crate) fn record_returning(pool: &Rc<RefCell<PoolState>>, session: &PooledSession) -> bool {
+    let Ok(mut state) = pool.try_borrow_mut() else {
+        return false;
+    };
+    if let Some(slot) = state.slot_of(session) {
+        state.sessions.move_to_back(slot);
+        state.index_session(slot, true);
+        #[cfg(debug_assertions)]
+        state.verify_index();
+    }
+    true
 }
 
 fn notify_idle_observer(pool: &Rc<RefCell<PoolState>>) {
@@ -3532,12 +3588,26 @@ async fn acquire_after_wait<Reservation: PoolReservation>(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// This thread's `wait_for_wakeup` calls: acquisition steps that waited.
+    static WAITS_FOR_WAKEUP: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Takes this thread's count of `wait_for_wakeup` calls, resetting it.
+#[cfg(test)]
+pub(crate) fn take_waits_for_wakeup_for_test() -> u64 {
+    WAITS_FOR_WAKEUP.replace(0)
+}
+
 async fn wait_for_wakeup(
     waiter: Rc<Waiter>,
     registration: WaiterRegistration,
     wait_timeout: Duration,
     cancellation: CancellationToken,
 ) -> Result<(), PoolError> {
+    #[cfg(test)]
+    WAITS_FOR_WAKEUP.set(WAITS_FOR_WAKEUP.get() + 1);
     let status = waiter.baton.timed_wait(wait_timeout, cancellation).await;
     drop(registration);
     if let Some(error) = waiter.error.borrow_mut().take() {
@@ -3836,11 +3906,10 @@ fn next_step(
             } else if pool.selection == OwnedSessionSelection::LeastLoaded {
                 pool.select_least_loaded(checkout_at, &mut idle_expired)
             } else {
+                let returning = pool.selects_returning();
                 pool.count_scan();
                 pool.sessions
-                    .find(|entry| {
-                        !entry.session.is_idle() && entry.session.supports_more_transactions()
-                    })
+                    .find(|entry| PoolState::takes_busy(entry, returning))
                     .or_else(|| pool.select_idle_session(checkout_at, &mut idle_expired))
             }
         };

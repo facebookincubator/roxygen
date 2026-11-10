@@ -437,6 +437,9 @@ struct IngressSignals {
     /// A pull-through exchange's connection, whose drive returns to its run when the source
     /// completes, before the wake that announces it (`DIV-047`).
     drive: Option<upstream::DriveLink>,
+    /// An upstream connection's returning hook, armed while the exchange
+    /// is published as retiring, which the source's completion runs.
+    returning: Cell<Option<Rc<dyn Fn()>>>,
 }
 
 impl IngressSignals {
@@ -464,6 +467,9 @@ impl HttpStreamSourceSharedCallback for IngressSignals {
         self.completed.set(Some(error.map_or(Ok(()), Err)));
         if let Some(drive) = &self.drive {
             drive.hand_back(id);
+        }
+        if let Some(returning) = self.returning.take() {
+            returning();
         }
         self.stream.wake_by_ref();
     }
@@ -830,6 +836,7 @@ impl<A: OwnedApplication> CodecInput<'_, A> {
             completed: Cell::new(None),
             stream: Arc::clone(self.stream_wake),
             drive: None,
+            returning: Cell::new(None),
         });
         let source = HttpIngressBody::new_shared(
             id,
