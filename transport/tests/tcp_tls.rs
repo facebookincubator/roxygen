@@ -68,7 +68,6 @@ mod tcp_tls {
     use tokio::io::Interest;
     use tokio::io::ReadBuf;
     use tokio::net::TcpListener;
-    #[cfg(target_os = "linux")]
     use tokio::net::TcpSocket;
     use tokio::net::TcpStream;
     use tokio::runtime::Builder;
@@ -7513,8 +7512,22 @@ mod tcp_tls {
         #[cfg(target_os = "linux")]
         use crate::tcp_zero_copy::send_iovec_arrays_for_test;
 
+        /// The send and receive buffer size both ends of a `with_accepted_tcp` connection pin.
+        /// Pinned buffers do not autotune, so what the connection holds while the peer does not
+        /// read stays far below `STALLING_WRITE` whatever the host's TCP buffer settings and
+        /// however much the connection has carried.
+        const PINNED_SOCKET_BUFFER: u32 = 64 << 10;
+
+        /// A TCP socket whose buffers are pinned to `PINNED_SOCKET_BUFFER`.
+        fn pinned_socket() -> TcpSocket {
+            let socket = TcpSocket::new_v4().unwrap();
+            socket.set_send_buffer_size(PINNED_SOCKET_BUFFER).unwrap();
+            socket.set_recv_buffer_size(PINNED_SOCKET_BUFFER).unwrap();
+            socket
+        }
+
         /// Runs `test` on a worker with an accepted TCP transport bounded by `limits` and the
-        /// connecting peer's Tokio stream.
+        /// connecting peer's Tokio stream, both with pinned socket buffers.
         pub(super) fn with_accepted_tcp<F, Fut>(limits: ByteStreamLimits, test: F)
         where
             F: FnOnce(WorkerContext, OwnedByteStream, TcpStream) -> Fut + Send + 'static,
@@ -7525,8 +7538,12 @@ mod tcp_tls {
                 .build()
                 .unwrap()
                 .block_on(LocalSet::new().run_until(async move {
-                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    let peer = TcpStream::connect(listener.local_addr().unwrap())
+                    let listener = pinned_socket();
+                    listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                    // Accepted sockets inherit the listener's buffers.
+                    let listener = listener.listen(1).unwrap();
+                    let peer = pinned_socket()
+                        .connect(listener.local_addr().unwrap())
                         .await
                         .unwrap();
                     let (accepted, _) = listener.accept().await.unwrap();
@@ -7615,7 +7632,7 @@ mod tcp_tls {
             });
         }
 
-        /// More bytes than loopback socket buffers hold while the peer does not read.
+        /// Many times what a `with_accepted_tcp` connection holds while the peer does not read.
         const STALLING_WRITE: usize = 16 << 20;
 
         /// Polls `writer` once.

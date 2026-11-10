@@ -7843,8 +7843,13 @@ fn a_cancelled_request_burst_past_the_turn_budget_writes_the_recorded_pieces() {
     assert_eq!(actual, expected, "write lengths:\n{}", actual.join("\n"));
 }
 
-/// More request body than loopback socket buffers hold while the origin does not read.
+/// Many times what the TCP connection holds while the origin does not read.
 const TCP_UPLOAD: usize = 16 << 20;
+
+/// The send and receive buffer size both ends of the TCP connection pin. Pinned buffers do not
+/// autotune, so what the connection holds while the origin does not read stays far below
+/// `TCP_UPLOAD` whatever the host's TCP buffer settings.
+const PINNED_SOCKET_BUFFER: u32 = 64 << 10;
 
 /// A patterned request body in events of at most 64 KiB, recording how many bytes the driver
 /// has pulled.
@@ -7890,6 +7895,10 @@ async fn sleep_until(mut ready: impl FnMut() -> bool) {
 /// idle connection cleanly.
 #[test]
 fn owned_h1_upstream_runs_sequential_exchanges_over_a_tcp_byte_stream() {
+    use roxygen_transport::tcp::TcpConnectOptions;
+    use roxygen_transport::tcp::TcpSocketOption;
+    use roxygen_transport::tcp::TcpSocketOptionPhase;
+    use roxygen_transport::tcp::TcpSocketOptionValue;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
 
@@ -7899,13 +7908,26 @@ fn owned_h1_upstream_runs_sequential_exchanges_over_a_tcp_byte_stream() {
         .build()
         .unwrap()
         .block_on(LocalSet::new().run_until(async {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = tokio::net::TcpSocket::new_v4().unwrap();
+            listener.set_send_buffer_size(PINNED_SOCKET_BUFFER).unwrap();
+            listener.set_recv_buffer_size(PINNED_SOCKET_BUFFER).unwrap();
+            listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            // Accepted sockets inherit the listener's buffers.
+            let listener = listener.listen(1).unwrap();
             let port = listener.local_addr().unwrap().port();
             let (worker, driver) = WorkerDriver::new(16).unwrap();
             let call = worker
                 .call_local(move |context| async move {
                     let accept = async { listener.accept().await.unwrap().0 };
-                    let connect = roxygen_transport::tcp::TcpTransport::connect(
+                    let pinned_buffers = [libc::SO_SNDBUF, libc::SO_RCVBUF]
+                        .map(|name| TcpSocketOption {
+                            level: libc::SOL_SOCKET,
+                            name,
+                            value: TcpSocketOptionValue::Integer(PINNED_SOCKET_BUFFER as i32),
+                            phase: TcpSocketOptionPhase::PreConnect,
+                        })
+                        .into();
+                    let connect = roxygen_transport::tcp::TcpTransport::connect_with_options(
                         &context,
                         roxygen_core::message::SocketAddress::new("127.0.0.1", port),
                         roxygen_transport::byte_stream::ByteStreamLimits::new(
@@ -7916,6 +7938,10 @@ fn owned_h1_upstream_runs_sequential_exchanges_over_a_tcp_byte_stream() {
                         .unwrap(),
                         Duration::from_secs(5),
                         CancellationToken::never(),
+                        TcpConnectOptions {
+                            socket_options: pinned_buffers,
+                            ..Default::default()
+                        },
                     );
                     let (mut origin, transport) = tokio::join!(accept, connect);
                     let transport: Rc<dyn UniplexTransport> = Rc::new(transport.unwrap());
