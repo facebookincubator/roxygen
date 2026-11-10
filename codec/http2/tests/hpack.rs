@@ -5059,8 +5059,9 @@ mod hpack_codec {
         let message = decode_literal_new_names();
         assert_eq!(
             HeaderName::take_name_buffers(),
-            2,
-            "each literal new name is decoded borrowed and lowercased into one buffer"
+            0,
+            "each literal new name is decoded borrowed and lowercased into the decoder's name \
+             buffer, which the decoder allocated when it was built, before the counters reset"
         );
         let headers: Vec<(&[u8], &[u8])> = message
             .headers()
@@ -5084,6 +5085,322 @@ mod hpack_codec {
             HeaderName::take_common_name_hashes(),
             2,
             "each literal new name is classified once, when its HeaderName is built"
+        );
+    }
+
+    /// A mixed-case token of `length` bytes: letters alternate case and every seventh byte is `-`.
+    fn mixed_case_name(length: usize, seed: usize) -> Vec<u8> {
+        (0..length)
+            .map(|at| {
+                if at % 7 == 6 {
+                    return b'-';
+                }
+                let letter = b'a' + u8::try_from((at * 5 + seed) % 26).unwrap();
+                if (at + seed).is_multiple_of(2) {
+                    letter.to_ascii_uppercase()
+                } else {
+                    letter
+                }
+            })
+            .collect()
+    }
+
+    /// One literal field with a new name, `first` being the representation's first byte: `0x00`
+    /// without indexing, `0x10` never indexed or `0x40` with incremental indexing. The name is
+    /// Huffman-coded when `huffman_name`; the value is raw.
+    fn literal_field(first: u8, name: &[u8], huffman_name: bool, value: &[u8]) -> Vec<u8> {
+        let mut field = vec![first];
+        let mut name_literal = HpackEncodeBuffer::new(huffman_name);
+        name_literal.encode_literal(name);
+        field.extend(name_literal.into_bytes());
+        let mut value_literal = HpackEncodeBuffer::new(false);
+        value_literal.encode_literal(value);
+        field.extend(value_literal.into_bytes());
+        field
+    }
+
+    /// Header blocks of literal fields with new names: names of 63, 64 and 65 bytes, mixed case,
+    /// raw and Huffman-coded, without indexing and never indexed; shorter names after longer ones;
+    /// common names, an empty name and non-ASCII bytes sent as literal names; and literals with
+    /// incremental indexing, references to the entries they add and a literal without indexing
+    /// that takes its name from the table, among literals with new names.
+    fn literal_name_blocks() -> Vec<Vec<u8>> {
+        let [n63, n64, n65] =
+            [(63, 1), (64, 2), (65, 3)].map(|(length, seed)| mixed_case_name(length, seed));
+        let mut name_reference = HpackEncodeBuffer::new(false);
+        name_reference.encode_integer_parts(62, LITERAL.code, LITERAL.prefix_length);
+        name_reference.encode_literal(b"by-index");
+        let name_reference = name_reference.into_bytes();
+        vec![
+            [
+                literal_field(0x00, &n64, false, b"v64"),
+                literal_field(0x00, b"X-A", false, b"short"),
+                literal_field(0x10, &n63, false, b"v63"),
+                literal_field(0x00, b"x-b", true, b""),
+            ]
+            .concat(),
+            [
+                literal_field(0x00, &n65, false, b"v65"),
+                literal_field(0x00, &n63, true, b"h63"),
+                literal_field(0x10, &n65, true, b"h65"),
+                literal_field(0x00, &n64, true, b"h64"),
+                literal_field(0x00, b"X-Tail", false, b"t"),
+            ]
+            .concat(),
+            [
+                literal_field(0x00, b"Content-Type", false, b"text/plain"),
+                literal_field(0x10, b"USER-AGENT", true, b"agent"),
+                literal_field(0x00, b"", false, b"empty"),
+                literal_field(0x00, b"X-\xc3\x89t\xc9", false, b"non-ascii"),
+                literal_field(0x00, b"x-request-id", false, b"rid"),
+            ]
+            .concat(),
+            [
+                literal_field(0x40, &n63, false, b"i63"),
+                literal_field(0x00, b"X-After-Index", false, b"a"),
+                vec![0xbe],
+                name_reference,
+                literal_field(0x40, b"X-Indexed", true, b"i"),
+                literal_field(0x00, &n64, false, b"after"),
+                vec![0xbe, 0xbf],
+            ]
+            .concat(),
+        ]
+    }
+
+    /// A response block: `:status: 200`, then four literal fields with new uncommon names, raw
+    /// and Huffman-coded, mixed case, without indexing and never indexed.
+    fn uncommon_literal_name_block() -> Vec<u8> {
+        [
+            vec![0x88],
+            literal_field(0x00, b"x-request-id", false, b"0123456789abcdef"),
+            literal_field(0x00, b"X-Mixed-Case", true, b"Value-Kept"),
+            literal_field(0x10, b"x-routing-key", false, b"shard-7"),
+            literal_field(0x00, b"X-Pad-Req", true, b"pad"),
+        ]
+        .concat()
+    }
+
+    /// Decodes `block` through the HTTP/2 header path, which does not clone names, and returns
+    /// the response's headers.
+    fn decode_response_headers(
+        decoder: &mut HpackDecoder,
+        block: &[u8],
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut info = crate::header_decode::HeaderDecodeInfo::new(false, false, true, true, false);
+        decoder
+            .decode_streaming(block, &mut info)
+            .expect("the block decodes");
+        let message = info.into_message().expect("the block is a valid response");
+        message
+            .headers()
+            .iter()
+            .map(|(_, name, value)| (name.to_vec(), value.to_vec()))
+            .collect()
+    }
+
+    const UNCOMMON_LITERAL_NAME_HEADERS: [(&[u8], &[u8]); 4] = [
+        (b"x-request-id", b"0123456789abcdef"),
+        (b"x-mixed-case", b"Value-Kept"),
+        (b"x-routing-key", b"shard-7"),
+        (b"x-pad-req", b"pad"),
+    ];
+
+    fn owned_headers(headers: &[(&[u8], &[u8])]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        headers
+            .iter()
+            .map(|(name, value)| (name.to_vec(), value.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn repeated_literal_names_reuse_the_decoder_name_buffer() {
+        let block = uncommon_literal_name_block();
+        let mut decoder = HpackDecoder::new();
+        assert!(StaticHeaderTable::get_header(8).is_some());
+        HeaderName::take_name_buffers();
+        let buffers: Vec<usize> = (0..2)
+            .map(|_| {
+                assert_eq!(
+                    decode_response_headers(&mut decoder, &block),
+                    owned_headers(&UNCOMMON_LITERAL_NAME_HEADERS),
+                    "decoded names are lowercase and values exact"
+                );
+                HeaderName::take_name_buffers()
+            })
+            .collect();
+        assert_eq!(
+            buffers,
+            [0, 0],
+            "literal names without indexing are lowercased into the decoder's one name buffer, \
+             so neither decode allocates a name"
+        );
+    }
+
+    /// The decoder allocates one 64-byte name buffer when it is built and keeps that allocation:
+    /// literal names without indexing borrow it and give it back, while literals with incremental
+    /// indexing (the table keeps their names), names over 64 bytes, common names and names taken
+    /// from the table never take it.
+    #[test]
+    fn name_buffer_keeps_its_allocation_across_decodes() {
+        HeaderName::take_name_buffers();
+        let mut decoder = HpackDecoder::new();
+        assert_eq!(
+            HeaderName::take_name_buffers(),
+            1,
+            "the decoder allocates its one name buffer when it is built"
+        );
+        let (pointer, capacity) = decoder.name_buffer_allocation();
+        assert_eq!(capacity, 64, "the name buffer holds 64 bytes");
+        let blocks = literal_name_blocks();
+        for (block, wire) in blocks
+            .iter()
+            .chain(&blocks)
+            .chain([&uncommon_literal_name_block()])
+            .enumerate()
+        {
+            decoder
+                .decode_streaming(wire, &mut DecodeEvents::default())
+                .expect("the block decodes");
+            assert_eq!(
+                decoder.name_buffer_allocation(),
+                (pointer, 64),
+                "block {block}: the decoder still holds its first name buffer"
+            );
+        }
+    }
+
+    /// Panics on every header.
+    struct PanicOnHeader;
+
+    impl StreamingCallback for PanicOnHeader {
+        fn on_header(&mut self, _name: &HeaderName, _value: &[u8]) {
+            panic!("header callback panic");
+        }
+
+        fn on_headers_complete(&mut self, _decoded_size: HttpHeaderSize, _acknowledge: bool) {}
+
+        fn on_decode_error(&mut self, _error: HpackError) {}
+    }
+
+    /// A callback that panics while it is given a literal name drops the decoder's name buffer
+    /// with that name. Later literal names each get their own allocation, as they would without
+    /// the buffer; the decoder does not grow a replacement buffer.
+    #[test]
+    fn name_buffer_lost_to_a_callback_panic_falls_back_to_allocating() {
+        let mut decoder = HpackDecoder::new();
+        let first = literal_field(0x00, b"x-request-id", false, b"lost");
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                decoder.decode_streaming(&first, &mut PanicOnHeader)
+            }))
+            .is_err()
+        );
+        assert!(StaticHeaderTable::get_header(8).is_some());
+        HeaderName::take_name_buffers();
+        assert_eq!(
+            decode_response_headers(&mut decoder, &uncommon_literal_name_block()),
+            owned_headers(&UNCOMMON_LITERAL_NAME_HEADERS),
+            "decoded names are lowercase and values exact"
+        );
+        assert_eq!(
+            HeaderName::take_name_buffers(),
+            4,
+            "each literal name is lowercased into its own allocation"
+        );
+        assert_eq!(
+            decoder.name_buffer_allocation().1,
+            0,
+            "the lost buffer is not replaced"
+        );
+    }
+
+    /// Streaming decode events with each header's name code ahead of its name and value.
+    #[derive(Default)]
+    struct CodedDecodeEvents(DecodeEvents);
+
+    impl StreamingCallback for CodedDecodeEvents {
+        fn on_header(&mut self, name: &HeaderName, value: &[u8]) {
+            self.0.0.push(name.code().as_u8());
+            self.0.header(name.as_bytes(), value);
+        }
+
+        fn on_headers_complete(&mut self, decoded_size: HttpHeaderSize, acknowledge: bool) {
+            self.0.on_headers_complete(decoded_size, acknowledge);
+        }
+
+        fn on_decode_error(&mut self, error: HpackError) {
+            self.0.on_decode_error(error);
+        }
+    }
+
+    /// The golden blocks, then the literal-name blocks twice, decoded in order by one streaming
+    /// and one collecting decoder per direction (the literal-name blocks by both directions):
+    /// each header's code, name and value, each block's result, and each decoder's final state.
+    /// Then every literal-name block decoded contiguously, split, from a cut queue and truncated
+    /// on one new connection.
+    #[test]
+    fn decoded_literal_names_digest_is_unchanged() {
+        let golden = golden_blocks();
+        let literal_names = literal_name_blocks();
+        let mut digest = StreamDigest::new();
+        let mut streaming = [HpackDecoder::new(), HpackDecoder::new()];
+        let mut collecting = [HpackDecoder::new(), HpackDecoder::new()];
+        let sequence = golden
+            .iter()
+            .enumerate()
+            .map(|(block, wire)| (block % 2, wire))
+            .chain(
+                literal_names
+                    .iter()
+                    .chain(&literal_names)
+                    .flat_map(|wire| [(0, wire), (1, wire)]),
+            );
+        for (direction, wire) in sequence {
+            let mut events = CodedDecodeEvents::default();
+            let result = streaming[direction].decode_streaming(wire, &mut events);
+            assert!(result.is_ok(), "every block decodes while streaming");
+            events.0.streaming_result(result);
+            digest.part(&events.0.0);
+            let decoded = collecting[direction]
+                .decode(wire)
+                .expect("every block decodes while collecting");
+            let mut events = DecodeEvents::default();
+            for header in &decoded.headers {
+                events.0.push(header.name.code().as_u8());
+                events.header(header.name.as_bytes(), &header.value);
+            }
+            events.size(b'r', decoded.size);
+            let consumed = u32::try_from(decoded.bytes_consumed).expect("consumed fits in u32");
+            events.0.extend_from_slice(&consumed.to_le_bytes());
+            digest.part(&events.0);
+        }
+        let mut states = DecodeEvents::default();
+        for decoder in streaming.iter().chain(&collecting) {
+            states.decoder_state(decoder);
+        }
+        digest.part(&states.0);
+        let mut reference = HpackDecoder::new();
+        for wire in &literal_names {
+            digest_block_decodes(&mut digest, &mut reference, DEFAULT_TABLE_SIZE, wire);
+        }
+        let name_lengths: Vec<usize> = HpackDecoder::new()
+            .decode(&literal_names[1])
+            .expect("the block decodes")
+            .headers
+            .iter()
+            .map(|header| header.name.len())
+            .collect();
+        assert_eq!(
+            name_lengths,
+            [65, 63, 65, 64, 6],
+            "the corpus sends names over, under and at 64 bytes"
+        );
+        assert_eq!(
+            (digest.hash, digest.length),
+            (0x3b59_51bf_3754_2cb7, 1_595_913),
+            "the golden and literal-name blocks' decoded codes, names, values, results and \
+             decoder states, recorded at df5729995574"
         );
     }
 

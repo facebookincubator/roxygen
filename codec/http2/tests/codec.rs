@@ -5258,6 +5258,114 @@ fn websocket_upgrade_state_commits_before_generated_callback() {
     assert!(callback.messages[0].is_ingress_websocket_upgrade());
 }
 
+/// With no WebSocket upgrade pending, no codec path looks a stream up in the upgrade set: an end
+/// of message, an upstream response and its trailers, an egress reset and an ingress reset.
+#[test]
+fn streams_without_a_pending_upgrade_never_probe_the_upgrade_set() {
+    let generate = |codec: &mut Http2Codec, frame: EgressFrame<'_>| {
+        let mut output = BufQueue::new(4096);
+        codec
+            .generate(&mut output, frame, &mut Trace::default())
+            .unwrap();
+        bytes(&output)
+    };
+    let request = request(b"/a");
+    let request_headers = |stream| EgressFrame::Headers {
+        stream,
+        message: &request,
+        end_stream: false,
+        extra_headers: None,
+    };
+    let mut codec = Http2Codec::new(TransportDirection::Upstream);
+    open(&mut codec, &mut Trace::default());
+    let first = codec.create_stream();
+    generate(&mut codec, request_headers(first));
+    Http2Codec::take_upgraded_stream_probes();
+    let mut probes = Vec::new();
+
+    generate(&mut codec, EgressFrame::EndOfMessage { stream: first });
+    probes.push(("end of message", Http2Codec::take_upgraded_stream_probes()));
+
+    let mut peer = Http2Codec::new(TransportDirection::Downstream);
+    let response_wire = generate(
+        &mut peer,
+        EgressFrame::Headers {
+            stream: first,
+            message: &response(200),
+            end_stream: false,
+            extra_headers: None,
+        },
+    );
+    let trailers_wire = generate(
+        &mut peer,
+        EgressFrame::Trailers {
+            stream: first,
+            trailers: &sample_trailers(),
+        },
+    );
+    for (step, wire, event) in [
+        ("response", response_wire, "headers"),
+        ("trailers", trailers_wire, "trailers"),
+    ] {
+        let mut capture = MessageCapture::default();
+        assert_eq!(
+            codec
+                .on_ingress(&queue(&wire), &mut capture, &mut BufQueue::new(1024))
+                .consumed,
+            wire.len()
+        );
+        assert!(capture.events.contains(&event), "{step} is delivered");
+        probes.push((step, Http2Codec::take_upgraded_stream_probes()));
+    }
+
+    let second = codec.create_stream();
+    generate(&mut codec, request_headers(second));
+    generate(
+        &mut codec,
+        EgressFrame::Reset {
+            stream: second,
+            code: H2ErrorCode::CANCEL,
+        },
+    );
+    probes.push(("egress reset", Http2Codec::take_upgraded_stream_probes()));
+
+    let third = codec.create_stream();
+    generate(&mut codec, request_headers(third));
+    let mut reset_wire = BufQueue::new(64);
+    frame::write_rst_stream(
+        &mut reset_wire,
+        u32::try_from(third.get()).unwrap(),
+        H2ErrorCode::CANCEL,
+    )
+    .unwrap();
+    let reset_wire = bytes(&reset_wire);
+    let mut trace = Trace::default();
+    assert_eq!(
+        codec
+            .on_ingress(&queue(&reset_wire), &mut trace, &mut BufQueue::new(1024))
+            .consumed,
+        reset_wire.len()
+    );
+    assert!(
+        trace
+            .events
+            .contains(&Seen::Abort(third.get(), H2ErrorCode::CANCEL))
+    );
+    probes.push(("ingress reset", Http2Codec::take_upgraded_stream_probes()));
+
+    assert_eq!(
+        probes,
+        [
+            ("end of message", 0),
+            ("response", 0),
+            ("trailers", 0),
+            ("egress reset", 0),
+            ("ingress reset", 0),
+        ],
+        "an empty upgrade set is never probed"
+    );
+}
+
 #[test]
 fn generated_ping_tokens_are_nonzero_and_fresh() {
     let mut codec = Http2Codec::new(TransportDirection::Upstream);

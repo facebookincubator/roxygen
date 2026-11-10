@@ -538,6 +538,9 @@ impl Default for HpackEncoder {
     }
 }
 
+/// The capacity of the decoder's name buffer.
+const NAME_BUFFER_CAPACITY: usize = 64;
+
 pub struct HpackDecoder {
     context: HpackContext,
     maximum_table_size: u32,
@@ -546,6 +549,9 @@ pub struct HpackDecoder {
     memo_reusable: bool,
     memo_fields: usize,
     scratch: [u8; LITERAL_SCRATCH],
+    /// Holds the lowercased name of the literal field without indexing being decoded, when it is
+    /// uncommon and at most `NAME_BUFFER_CAPACITY` bytes. Allocated once, never grown.
+    name_buffer: Vec<u8>,
     #[cfg(test)]
     decode_calls: usize,
     #[cfg(test)]
@@ -560,6 +566,8 @@ impl HpackDecoder {
     pub fn with_limits(table_size: u32, maximum_uncompressed: u64) -> Self {
         let mut context = HpackContext::new(table_size);
         context.table_mut().disable_names_index();
+        #[cfg(test)]
+        HeaderName::record_name_buffer();
         Self {
             context,
             maximum_table_size: table_size,
@@ -568,6 +576,7 @@ impl HpackDecoder {
             memo_reusable: false,
             memo_fields: 0,
             scratch: [0; LITERAL_SCRATCH],
+            name_buffer: Vec::with_capacity(NAME_BUFFER_CAPACITY),
             #[cfg(test)]
             decode_calls: 0,
             #[cfg(test)]
@@ -579,6 +588,12 @@ impl HpackDecoder {
     #[cfg(test)]
     pub(crate) fn take_field_start_reads(&mut self) -> usize {
         std::mem::take(&mut self.field_start_reads)
+    }
+
+    /// The name buffer's allocation: its data pointer and capacity.
+    #[cfg(test)]
+    pub(crate) fn name_buffer_allocation(&self) -> (*const u8, usize) {
+        (self.name_buffer.as_ptr(), self.name_buffer.capacity())
     }
 
     pub fn decode(&mut self, bytes: &[u8]) -> Result<DecodedHeaderBlock, HpackError> {
@@ -782,6 +797,7 @@ impl HpackDecoder {
             LITERAL.prefix_length
         };
         let mask = super::NBIT_MASKS[usize::from(prefix)];
+        let mut buffered = false;
         let name = if byte & mask != 0 {
             let index = u32::try_from(input.decode_integer(prefix)?)
                 .map_err(|_| HpackError::InvalidIndex)?;
@@ -796,12 +812,23 @@ impl HpackDecoder {
             if matches!(literal, Cow::Owned(_)) {
                 HeaderName::record_name_buffer();
             }
-            HeaderName::new(literal)
+            if !indexing
+                && literal.len() <= NAME_BUFFER_CAPACITY
+                && self.name_buffer.capacity() == NAME_BUFFER_CAPACITY
+            {
+                buffered = true;
+                HeaderName::new_in_buffer(&literal, &mut self.name_buffer)
+            } else {
+                HeaderName::new(literal)
+            }
         };
         let literal = input.decode_literal_with_scratch(&mut self.scratch)?;
         if !indexing {
             let size = HpackHeader::real_bytes_for(name.len(), literal.len());
             callback.on_header(&name, &literal);
+            if buffered && let Some(buffer) = name.into_name_buffer() {
+                self.name_buffer = buffer;
+            }
             return Ok(size);
         }
         let value: Box<[u8]> = match literal {

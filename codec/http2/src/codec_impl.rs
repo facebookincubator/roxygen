@@ -150,6 +150,7 @@ thread_local! {
     static MEMO_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The capacity the last uncached HEADERS decode reserved, 0 when none.
     static LAST_HEADER_PRESIZE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static UPGRADED_STREAM_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Returns and resets the number of fields `PreparedMessageHeaders::for_each` has visited on
@@ -839,7 +840,7 @@ impl Http2Codec {
             }
             FrameType::RST_STREAM => {
                 let code = frame::parse_rst_stream_cursor(payload, &header).map_err(frame_error)?;
-                self.upgraded_streams.remove(&header.stream);
+                self.remove_upgraded_stream(header.stream);
                 self.dispatch(
                     callback,
                     callback_egress,
@@ -1566,6 +1567,12 @@ impl Http2Codec {
         MEMO_COPIES.replace(0)
     }
 
+    /// Returns and resets how many stream lookups in the upgrade set this thread has made.
+    #[cfg(test)]
+    pub(crate) fn take_upgraded_stream_probes() -> usize {
+        UPGRADED_STREAM_PROBES.replace(0)
+    }
+
     /// Returns and resets `(temporary queue pushes, fallback boxes)` made while framing HEADERS and
     /// PUSH_PROMISE blocks on this thread.
     #[cfg(test)]
@@ -1619,13 +1626,24 @@ impl Http2Codec {
         true
     }
 
+    /// Forgets `stream`'s pending WebSocket upgrade and returns whether it had one. Most
+    /// connections never have an upgrade pending, so an empty set is not hashed into.
+    fn remove_upgraded_stream(&mut self, stream: u32) -> bool {
+        if self.upgraded_streams.is_empty() {
+            return false;
+        }
+        #[cfg(test)]
+        UPGRADED_STREAM_PROBES.set(UPGRADED_STREAM_PROBES.get() + 1);
+        self.upgraded_streams.remove(&stream)
+    }
+
     fn apply_header_completion_metadata(&mut self, message: &mut HttpMessage, stream: u32) {
         message.set_advanced_protocol_string(b"h2");
         let websocket_request = self.parallel.direction().is_downstream()
             && message.method().ok().flatten() == Some(HttpMethod::Connect)
             && message.upgrade_protocol() == Some(b"websocket".as_slice());
         let websocket_response = self.parallel.direction().is_upstream()
-            && self.upgraded_streams.remove(&stream)
+            && self.remove_upgraded_stream(stream)
             && message.status_code().ok() == Some(200);
         if websocket_request || websocket_response {
             message.set_ingress_websocket_upgrade();
@@ -1941,7 +1959,7 @@ impl Http2Codec {
             output.append(&mut staged).map_err(buffer_error)?;
             written
         };
-        self.upgraded_streams.remove(&stream);
+        self.remove_upgraded_stream(stream);
         Self::generated_frame(callback, stream, FrameType::DATA, written);
         Ok(GeneratedFrame {
             bytes_written: written,
@@ -2044,7 +2062,7 @@ impl Http2Codec {
         if self.pending_end_stream == Some(stream) {
             self.pending_end_stream = None;
         }
-        self.upgraded_streams.remove(&stream);
+        self.remove_upgraded_stream(stream);
         Self::generated_frame(callback, stream, FrameType::RST_STREAM, written);
         Ok(simple_generated(written))
     }

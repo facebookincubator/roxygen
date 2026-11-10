@@ -56,6 +56,33 @@ impl HeaderName {
         }
     }
 
+    /// Builds a name like `new`, but lowercases an uncommon name into `buffer`, cleared first,
+    /// instead of a new allocation. That leaves `buffer` empty until `into_name_buffer` gives it
+    /// back; a common name leaves `buffer` untouched.
+    pub(crate) fn new_in_buffer(name: &[u8], buffer: &mut Vec<u8>) -> Self {
+        #[cfg(test)]
+        Self::record_common_name_hash();
+        let code = HttpCommonHeaders::hash(name);
+        if code.as_u8() >= HttpHeaderCode::COMMON_OFFSET {
+            return Self::from_code(code);
+        }
+        let mut bytes = std::mem::take(buffer);
+        bytes.clear();
+        bytes.extend(name.iter().map(u8::to_ascii_lowercase));
+        Self {
+            bytes: Cow::Owned(bytes),
+            code: HttpHeaderCode::Other,
+        }
+    }
+
+    /// Gives back the buffer of a name built by `new_in_buffer`, or `None` for a common name.
+    pub(crate) fn into_name_buffer(self) -> Option<Vec<u8>> {
+        match self.bytes {
+            Cow::Owned(bytes) => Some(bytes),
+            Cow::Borrowed(_) => None,
+        }
+    }
+
     pub fn from_code(code: HttpHeaderCode) -> Self {
         assert!(
             code.as_u8() >= HttpHeaderCode::COMMON_OFFSET,
