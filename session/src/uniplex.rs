@@ -429,7 +429,8 @@ pub struct UniplexConfig {
     /// `HttpMethod::Post` (`Http1xCodec::set_exact_methods`,
     /// `Http2Codec::set_exact_methods`). Off, HTTP/1.1 accepts only the frozen method table
     /// and HTTP/2 canonicalizes the methods it recognizes without regard to case. Upstream
-    /// sessions ignore it; the owned drivers refuse it.
+    /// sessions ignore it. The owned downstream drivers (`OwnedH1Session`, `OwnedH2Session`)
+    /// apply it as a downstream session does; the owned upstream drivers refuse it.
     pub exact_method_tokens: bool,
     /// Roxygen-only, default off (`DIV-041`): an HTTP/2 session's codec stores every
     /// decoded field value exactly as decoded, surrounding spaces and tabs included, as h2

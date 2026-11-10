@@ -195,7 +195,7 @@ pub struct ServerSessionConfig {
     /// and only `POST` is `HttpMethod::Post`. Off, an HTTP/1.1 request whose method is not in
     /// the frozen method table gets 400, and HTTP/2 canonicalizes recognized methods without
     /// regard to case and uppercases extension methods. A method that is not a token is still
-    /// a malformed request. `owned_http1` and `owned_http2` refuse it.
+    /// a malformed request. `owned_http1` and `owned_http2` apply it.
     pub exact_method_tokens: bool,
     /// Roxygen-only, default off (`DIV-041`): an HTTP/2 connection hands the application
     /// each request field value exactly as decoded, surrounding spaces and tabs included,
@@ -273,9 +273,6 @@ impl ServerSessionConfig {
         if self.lifecycle_observer_factory.is_some() {
             return Err("owned_http1 does not support lifecycle_observer_factory");
         }
-        if self.exact_method_tokens {
-            return Err("owned_http1 does not support exact_method_tokens");
-        }
         if !self.stream_read_timeout.is_zero() {
             return Err("owned_http1 is untimed: stream_read_timeout must be zero");
         }
@@ -295,9 +292,6 @@ impl ServerSessionConfig {
         }
         if self.stats_factory.is_some() {
             return Err("owned_http2 does not support stats_factory");
-        }
-        if self.exact_method_tokens {
-            return Err("owned_http2 does not support exact_method_tokens");
         }
         if self.verbatim_http2_header_values {
             return Err("owned_http2 does not support verbatim_http2_header_values");

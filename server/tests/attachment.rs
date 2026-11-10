@@ -1861,10 +1861,6 @@ fn owned_http2_attachment_rejects_unsupported_configuration() {
                 stats.stats_factory = Some(Arc::new(|_: &ConnectionInfo| {
                     unreachable!("a refused configuration builds no recorder")
                 }));
-                let exact_methods = crate::acceptor::ServerSessionConfig {
-                    exact_method_tokens: true,
-                    ..untimed_owned(false, true)
-                };
                 let verbatim_values = crate::acceptor::ServerSessionConfig {
                     verbatim_http2_header_values: true,
                     ..untimed_owned(false, true)
@@ -1873,10 +1869,6 @@ fn owned_http2_attachment_rejects_unsupported_configuration() {
                     (
                         stats,
                         b"owned_http2 does not support stats_factory".as_slice(),
-                    ),
-                    (
-                        exact_methods,
-                        b"owned_http2 does not support exact_method_tokens".as_slice(),
                     ),
                     (
                         verbatim_values,

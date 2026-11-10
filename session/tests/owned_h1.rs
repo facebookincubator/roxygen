@@ -186,6 +186,8 @@ impl Drop for ResumeAfterWake {
 #[derive(Default)]
 struct H1Probe {
     method: RefCell<Option<HttpMethod>>,
+    /// The request method as sent (`HttpMessage::request_method`).
+    request_method: RefCell<Vec<u8>>,
     url: RefCell<Vec<u8>>,
     /// The request head's fields, in order.
     fields: RefCell<Vec<(Vec<u8>, Vec<u8>)>>,
@@ -325,6 +327,7 @@ fn drain_from(drain_in: &CancelIn, callback: &str) {
 #[derive(Clone, Debug)]
 struct Observed {
     method: Option<HttpMethod>,
+    request_method: Vec<u8>,
     url: Vec<u8>,
     fields: Vec<(Vec<u8>, Vec<u8>)>,
     request_error: Option<HttpErrorCode>,
@@ -346,6 +349,7 @@ impl H1Probe {
     fn observed(&self) -> Observed {
         Observed {
             method: *self.method.borrow(),
+            request_method: self.request_method.borrow().clone(),
             url: self.url.borrow().clone(),
             fields: self.fields.borrow().clone(),
             request_error: self.request_error.get(),
@@ -368,6 +372,7 @@ impl H1Probe {
 /// Records a request head as either application receives it.
 fn record_head(probe: &H1Probe, head: &mut HttpMessage, eom: bool) {
     *probe.method.borrow_mut() = head.method().unwrap();
+    *probe.request_method.borrow_mut() = head.request_method().unwrap().as_bytes().to_vec();
     *probe.url.borrow_mut() = head.url().unwrap().to_vec();
     *probe.fields.borrow_mut() = head
         .headers()
@@ -1911,7 +1916,7 @@ fn cancel_tears_down_cleanly() {
 #[test]
 fn owned_h1_rejects_unsupported_config() {
     type Change = fn(&mut UniplexConfig);
-    let cases: [(&str, Change, ByteEventCapability); 11] = [
+    let cases: [(&str, Change, ByteEventCapability); 10] = [
         (
             "read_timeout",
             |io| io.read_timeout = Duration::from_secs(1),
@@ -1940,11 +1945,6 @@ fn owned_h1_rejects_unsupported_config() {
         (
             "deliver_ingress_before_abort",
             |io| io.deliver_ingress_before_abort = true,
-            ByteEventCapability::Unsupported,
-        ),
-        (
-            "exact_method_tokens",
-            |io| io.exact_method_tokens = true,
             ByteEventCapability::Unsupported,
         ),
         (
@@ -3999,6 +3999,18 @@ fn corpus_run_configured(
     split: Split,
     http1: Http1DriverConfig,
 ) -> CorpusRun {
+    corpus_run_with_io(owned, vector, split, http1, h1_config()).0
+}
+
+/// As `corpus_run_configured`, with both sessions under the I/O configuration `io`; also
+/// returns each request's method as the application read it (`HttpMessage::request_method`).
+fn corpus_run_with_io(
+    owned: bool,
+    vector: &Vector,
+    split: Split,
+    http1: Http1DriverConfig,
+    io: UniplexConfig,
+) -> (CorpusRun, Vec<Vec<u8>>) {
     let reads = split.reads(&vector.input);
     let responses = vector.responses.clone();
     let (wire, observed) = run_on_host(move |context| {
@@ -4025,6 +4037,7 @@ fn corpus_run_configured(
                 let (application, probes) = H1App::new(responses);
                 let mut options = owned_options(context.clone(), transport);
                 options.http1 = http1;
+                options.io = io;
                 let (session, _handle) = OwnedH1Session::new(application, options).unwrap();
                 let run = async {
                     let result = session.run().await;
@@ -4046,7 +4059,7 @@ fn corpus_run_configured(
                     TransportDirection::Downstream,
                     transport,
                     Some(erased),
-                    h1_config(),
+                    io,
                 )
                 .unwrap();
                 let run = async {
@@ -4065,7 +4078,7 @@ fn corpus_run_configured(
             }
         })
     });
-    CorpusRun {
+    let run = CorpusRun {
         output: without_dates(&wire.output),
         close: wire.close,
         error: wire.error,
@@ -4084,6 +4097,140 @@ fn corpus_run_configured(
                 )
             })
             .collect(),
+    };
+    let methods = observed
+        .iter()
+        .map(|probe| probe.request_method.clone())
+        .collect();
+    (run, methods)
+}
+
+/// `h1_config` with `exact_method_tokens` (`DIV-040`).
+fn exact_methods_config() -> UniplexConfig {
+    UniplexConfig {
+        exact_method_tokens: true,
+        ..h1_config()
+    }
+}
+
+/// A vector of one bodiless request whose method is `method`, answered 200.
+fn method_vector(method: &[u8]) -> Vector {
+    Vector::new(
+        &String::from_utf8_lossy(method),
+        &[
+            method,
+            b" /generate HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n",
+        ]
+        .concat(),
+        vec![Response::fixed(200, b"ok")],
+    )
+}
+
+/// Under `exact_method_tokens` (`DIV-040`), the owned driver hands each token method to its
+/// exchange as sent: `post`, `Post` and `PURGE` as extension methods, and only `POST` as
+/// `HttpMethod::Post`. Whole, in 7-byte reads and one byte at a time, the run equals
+/// `UniplexSession`'s under the option.
+#[test]
+fn exact_method_tokens_reach_the_exchange_as_sent_as_uniplex() {
+    for method in [&b"POST"[..], b"post", b"Post", b"PURGE"] {
+        let vector = method_vector(method);
+        for split in [Split::Whole, Split::Every7, Split::OneByte] {
+            let label = format!("{} {split:?}", vector.name);
+            let run = |owned| {
+                corpus_run_with_io(
+                    owned,
+                    &vector,
+                    split,
+                    Http1DriverConfig::default(),
+                    exact_methods_config(),
+                )
+            };
+            let (owned, owned_methods) = run(true);
+            let (uniplex, uniplex_methods) = run(false);
+            assert_eq!(owned_methods, [method], "{label}: the method as sent");
+            assert_eq!(
+                owned.requests[0].0,
+                (method == b"POST").then_some(HttpMethod::Post),
+                "{label}: only the canonical spelling is recognized"
+            );
+            assert!(
+                owned.output.starts_with("HTTP/1.1 200 "),
+                "{label}: {}",
+                owned.output
+            );
+            assert_eq!(owned_methods, uniplex_methods, "{label}");
+            assert_eq!(owned, uniplex, "{label}");
+        }
+    }
+}
+
+/// Under `exact_method_tokens`, a request line whose method is not a token is still malformed:
+/// the owned driver writes the codec's 400 and resets, no exchange reads a request, and the run
+/// equals `UniplexSession`'s under the option.
+#[test]
+fn exact_method_tokens_still_reject_a_non_token_method_as_uniplex() {
+    for method in [&b"P@ST"[..], b"(GET)", b"PO\x7fST"] {
+        let vector = method_vector(method);
+        for split in [Split::Whole, Split::Every7, Split::OneByte] {
+            let label = format!("{} {split:?}", vector.name.escape_debug());
+            let run = |owned| {
+                corpus_run_with_io(
+                    owned,
+                    &vector,
+                    split,
+                    Http1DriverConfig::default(),
+                    exact_methods_config(),
+                )
+            };
+            let (owned, owned_methods) = run(true);
+            let (uniplex, uniplex_methods) = run(false);
+            assert!(
+                owned.output.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+                "{label}: {}",
+                owned.output
+            );
+            assert_eq!(owned.close, CloseKind::Reset, "{label}");
+            assert!(
+                owned_methods.iter().all(Vec::is_empty),
+                "{label}: no request reaches an exchange: {owned_methods:?}"
+            );
+            assert_eq!(owned_methods, uniplex_methods, "{label}");
+            assert_eq!(owned, uniplex, "{label}");
+        }
+    }
+}
+
+/// Without `exact_method_tokens`, the owned driver keeps the frozen method table, as
+/// `UniplexSession` does: `post`, `Post` and `PURGE` get the codec's 400.
+#[test]
+fn methods_outside_the_frozen_table_get_400_by_default_as_uniplex() {
+    for method in [&b"post"[..], b"Post", b"PURGE"] {
+        let vector = method_vector(method);
+        for split in [Split::Whole, Split::Every7, Split::OneByte] {
+            let label = format!("{} {split:?}", vector.name);
+            let run = |owned| {
+                corpus_run_with_io(
+                    owned,
+                    &vector,
+                    split,
+                    Http1DriverConfig::default(),
+                    h1_config(),
+                )
+            };
+            let (owned, owned_methods) = run(true);
+            let (uniplex, uniplex_methods) = run(false);
+            assert!(
+                owned.output.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+                "{label}: {}",
+                owned.output
+            );
+            assert!(
+                owned_methods.iter().all(Vec::is_empty),
+                "{label}: no request reaches an exchange: {owned_methods:?}"
+            );
+            assert_eq!(owned_methods, uniplex_methods, "{label}");
+            assert_eq!(owned, uniplex, "{label}");
+        }
     }
 }
 

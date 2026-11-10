@@ -305,15 +305,32 @@ async fn serve_methods(
     protocol: CodecProtocol,
     exact_method_tokens: bool,
 ) -> (Vec<String>, Vec<u16>) {
+    serve_methods_with(context, protocol, session(exact_method_tokens)).await
+}
+
+/// As `serve_methods`, with the session configuration `session`.
+async fn serve_methods_with(
+    context: WorkerContext,
+    protocol: CodecProtocol,
+    session: ServerSessionConfig,
+) -> (Vec<String>, Vec<u16>) {
     let (seen, statuses) = serve(
         &context,
         protocol,
-        session(exact_method_tokens),
+        session,
         &method_requests(protocol),
         METHODS.len(),
     )
     .await;
     (seen.into_iter().map(|seen| seen.method).collect(), statuses)
+}
+
+/// `session(exact_method_tokens)` with `owned_http1`.
+fn owned_session(exact_method_tokens: bool) -> ServerSessionConfig {
+    ServerSessionConfig {
+        owned_http1: true,
+        ..session(exact_method_tokens)
+    }
 }
 
 fn method_requests(protocol: CodecProtocol) -> Vec<Vec<u8>> {
@@ -481,16 +498,43 @@ fn h2c_request_methods_are_canonicalized_by_default() {
 }
 
 #[test]
-fn owned_http1_refuses_exact_method_tokens() {
-    let config = ServerSessionConfig {
-        owned_http1: true,
-        exact_method_tokens: true,
-        ..session(true)
-    };
-    assert_eq!(
-        config.check_owned_http1(),
-        Err("owned_http1 does not support exact_method_tokens")
-    );
+fn owned_http1_accepts_exact_method_tokens() {
+    assert_eq!(owned_session(true).check_owned_http1(), Ok(()));
+}
+
+#[test]
+fn exact_method_tokens_reach_the_application_byte_for_byte_over_owned_http1_when_enabled() {
+    on_worker(|context| async move {
+        let (methods, statuses) =
+            serve_methods_with(context, CodecProtocol::Http11, owned_session(true)).await;
+        assert_eq!(methods, ["POST", "post", "Post", "PURGE"]);
+        assert_eq!(statuses, [200, 200, 200, 200]);
+    });
+}
+
+#[test]
+fn owned_http1_requests_with_a_method_outside_the_frozen_table_get_400_by_default() {
+    on_worker(|context| async move {
+        let (methods, statuses) =
+            serve_methods_with(context, CodecProtocol::Http11, owned_session(false)).await;
+        assert_eq!(methods, ["POST"]);
+        assert_eq!(statuses, [200, 400, 400, 400]);
+    });
+}
+
+#[test]
+fn exact_method_tokens_still_refuse_a_method_that_is_not_a_token_over_owned_http1() {
+    on_worker(|context| async move {
+        RECORDED.with(|recorded| recorded.borrow_mut().clear());
+        let (_connection, mut client) =
+            connect_served(&context, CodecProtocol::Http11, owned_session(true)).await;
+        client
+            .write_all(&http1_request(b"P@ST"))
+            .await
+            .expect("request written");
+        assert_eq!(http1_status(&mut client).await, 400);
+        assert!(RECORDED.with(|recorded| recorded.borrow().is_empty()));
+    });
 }
 
 /// The frame types (and RST_STREAM error codes) the server sent on stream 1,

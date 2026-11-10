@@ -1410,11 +1410,218 @@ fn content_length_mismatch_cancels_once_with_the_typed_error() {
     });
 }
 
+/// Records each request's method as sent (`HttpMessage::request_method`) and answers it 200,
+/// with no body.
+struct MethodApplication(Rc<RefCell<Vec<String>>>);
+
+struct MethodExchange(Rc<RefCell<Vec<String>>>);
+
+impl OwnedH2Application for MethodApplication {
+    type Exchange = MethodExchange;
+
+    fn new_exchange(&self, _stream: StreamId, _ingress: IngressCompletion) -> MethodExchange {
+        MethodExchange(Rc::clone(&self.0))
+    }
+}
+
+/// A 200 head that ends the response.
+fn bodiless_ok() -> HttpHeaderEvent {
+    let mut response = HttpMessage::new();
+    response.set_status_code(200).unwrap();
+    response.set_http_version(1, 1);
+    HttpHeaderEvent::new(response, true).unwrap()
+}
+
+impl OwnedH2Exchange for MethodExchange {
+    fn request(&mut self, head: Box<HttpMessage>, _body: HttpStreamSourceOwner, _eom: bool) {
+        self.0
+            .borrow_mut()
+            .push(head.request_method().unwrap().to_owned());
+    }
+
+    fn poll_headers(
+        &mut self,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        Poll::Ready(Ok(bodiless_ok()))
+    }
+
+    fn poll_body(
+        &mut self,
+        _context: &mut Context<'_>,
+        _maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        unreachable!("the head ends the response")
+    }
+
+    fn cancel(&mut self, _error: &HttpError, _peer_reset: bool) {}
+
+    fn response_complete(&mut self) {}
+
+    fn complete(self) {}
+}
+
+/// `MethodApplication` as a `UniplexSession` handler.
+struct MethodHandler(Rc<RefCell<Vec<String>>>);
+
+impl HttpHandler for MethodHandler {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        mut request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        let seen = Rc::clone(&self.0);
+        Box::pin(async move {
+            let head = request.read_header_event().await?;
+            seen.borrow_mut()
+                .push(head.headers().request_method().unwrap().to_owned());
+            Ok(HttpSourceHolder::new(Box::new(
+                HttpFixedSource::make_fixed_response(200, None).expect("a 200 response"),
+            )))
+        })
+    }
+}
+
+/// The client preface, empty SETTINGS, and one bodiless request per method on streams 1, 3,
+/// 5, ..., each `:method` encoded as given.
+fn method_requests(methods: &[&[u8]]) -> Vec<u8> {
+    const END_HEADERS: u8 = 0x4;
+    let mut wire = CONNECTION_PREFACE.to_vec();
+    wire.extend_from_slice(&[0, 0, 0, FrameType::SETTINGS.as_u8(), 0, 0, 0, 0, 0]);
+    let mut encoder = HpackEncoder::new(false);
+    for (index, method) in methods.iter().enumerate() {
+        let stream = 1 + 2 * u32::try_from(index).unwrap();
+        let block = encoder.encode(&[
+            HpackHeader::new(":method", method),
+            HpackHeader::new(":scheme", "http"),
+            HpackHeader::new(":path", "/generate"),
+            HpackHeader::new(":authority", "example.com"),
+        ]);
+        wire.extend_from_slice(&u32::try_from(block.len()).unwrap().to_be_bytes()[1..]);
+        wire.extend_from_slice(&[FrameType::HEADERS.as_u8(), END_HEADERS | END_STREAM]);
+        wire.extend_from_slice(&stream.to_be_bytes());
+        wire.extend_from_slice(&block);
+    }
+    wire
+}
+
+/// What one method run produced: the methods the application read, as sent, in sorted order;
+/// each response head's status, by stream; the RST_STREAM and GOAWAY frames written; and the
+/// session's error. The order is normalized because the two sessions start and answer their
+/// streams in different orders.
+#[derive(Debug, PartialEq)]
+struct MethodRun {
+    methods: Vec<String>,
+    statuses: Vec<(StreamId, u16)>,
+    resets: Vec<(StreamId, H2ErrorCode)>,
+    goaways: Vec<(StreamId, H2ErrorCode)>,
+    error: Option<HttpErrorCode>,
+}
+
+/// Serves `methods` (`method_requests`), then peer EOF, with the owned driver (`owned`) or
+/// `UniplexSession`, both configured as `options` with `exact_method_tokens` set to `exact`.
+fn method_run(owned: bool, exact: bool, methods: &[&[u8]]) -> MethodRun {
+    let input = method_requests(methods);
+    let requests = methods.len();
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let (transport, state) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+            let mut config = options(context, transport);
+            config.io.exact_method_tokens = exact;
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let result = if owned {
+                let (session, _) =
+                    OwnedH2Session::new(MethodApplication(Rc::clone(&seen)), config).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), session.run()).await
+            } else {
+                let OwnedH2Options {
+                    context,
+                    transport,
+                    io,
+                    http2,
+                } = config;
+                let handler: Rc<dyn HttpHandler> = Rc::new(MethodHandler(Rc::clone(&seen)));
+                let (session, _) = UniplexSession::new_http2(
+                    context,
+                    TransportDirection::Downstream,
+                    transport,
+                    Some(handler),
+                    io,
+                    http2,
+                )
+                .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), session.run()).await
+            };
+            let error = result
+                .expect("the run ends")
+                .err()
+                .map(|error| error.code());
+            let mut decoded =
+                decode_server_frames_with_requests(&state.borrow().writes.concat(), requests);
+            decoded.header_statuses.sort_by_key(|(stream, _)| *stream);
+            let mut methods = seen.take();
+            methods.sort();
+            MethodRun {
+                methods,
+                statuses: decoded.header_statuses,
+                resets: decoded.resets,
+                goaways: decoded.goaways,
+                error,
+            }
+        })
+    })
+}
+
+/// Under `exact_method_tokens` (`DIV-040`), the owned driver hands each token `:method` to its
+/// exchange as sent: `post`, `Post` and `PURGE` as extension methods, kept byte for byte. The
+/// application reads what `UniplexSession` reads under the option, and every stream is
+/// answered as there.
+#[test]
+fn exact_method_tokens_reach_each_stream_as_sent_as_uniplex() {
+    const METHODS: [&[u8]; 4] = [b"POST", b"post", b"Post", b"PURGE"];
+    let owned = method_run(true, true, &METHODS);
+    assert_eq!(owned.methods, ["POST", "PURGE", "Post", "post"]);
+    assert_eq!(
+        owned.statuses,
+        [1, 3, 5, 7].map(|stream| (StreamId::new(stream), 200))
+    );
+    assert!(owned.resets.is_empty());
+    assert!(owned.goaways.is_empty());
+    assert_eq!(owned, method_run(false, true, &METHODS));
+}
+
+/// Under `exact_method_tokens`, a `:method` that is not a token, the empty one included, is
+/// still malformed: the owned driver answers the stream with the session's 400 and hands no
+/// request to its exchange, as `UniplexSession` does under the option.
+#[test]
+fn exact_method_tokens_still_make_a_non_token_method_malformed_as_uniplex() {
+    for method in [&b"P@ST"[..], b"(GET)", b"POST ", b"", b"PO\x7fST"] {
+        let label = String::from_utf8_lossy(method).escape_debug().to_string();
+        let owned = method_run(true, true, &[method]);
+        assert!(owned.methods.is_empty(), "{label}: {:?}", owned.methods);
+        assert_eq!(owned.statuses, [(StreamId::new(1), 400)], "{label}");
+        assert!(owned.resets.is_empty(), "{label}");
+        assert!(owned.goaways.is_empty(), "{label}");
+        assert_eq!(owned, method_run(false, true, &[method]), "{label}");
+    }
+}
+
+/// Without `exact_method_tokens`, the owned driver keeps the reference reading, as
+/// `UniplexSession` does: recognized methods are canonicalized without regard to case and
+/// extension methods are uppercased.
+#[test]
+fn request_methods_are_canonicalized_by_default_as_uniplex() {
+    const METHODS: [&[u8]; 4] = [b"POST", b"post", b"Post", b"purge"];
+    let owned = method_run(true, false, &METHODS);
+    assert_eq!(owned.methods, ["POST", "POST", "POST", "PURGE"]);
+    assert_eq!(owned, method_run(false, false, &METHODS));
+}
+
 #[test]
 fn unsupported_config_is_rejected_before_transport_or_application_work() {
     run_on_worker(|context| {
         Box::pin(async move {
-            for case in 0..7 {
+            for case in 0..6 {
                 let (transport, state) = FixtureTransport::new([]);
                 let mut config = options(context.clone(), transport);
                 match case {
@@ -1428,8 +1635,7 @@ fn unsupported_config_is_rejected_before_transport_or_application_work() {
                     2 => config.http2.stream_receive_window = 0,
                     3 => state.borrow_mut().capability = ByteEventCapability::TransportEvents,
                     4 => config.io.deliver_ingress_before_abort = true,
-                    5 => config.io.exact_method_tokens = true,
-                    6 => config.io.verbatim_http2_header_values = true,
+                    5 => config.io.verbatim_http2_header_values = true,
                     _ => unreachable!(),
                 }
                 let (application, probes) = Application::new(vec![]);

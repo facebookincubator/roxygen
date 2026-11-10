@@ -198,6 +198,25 @@ fn options(context: WorkerContext, transport: Rc<dyn UniplexTransport>) -> Owned
     }
 }
 
+/// `exact_method_tokens` (`DIV-040`) reads downstream request methods. The owned upstream
+/// driver refuses it, as the owned HTTP/1.1 upstream driver does, instead of ignoring it.
+#[test]
+fn owned_upstream_h2_refuses_exact_method_tokens() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (transport, state) = FixtureTransport::new([]);
+            let mut config = options(context, transport);
+            config.io.exact_method_tokens = true;
+            let error = match OwnedH2UpstreamSession::new(config) {
+                Err(error) => error,
+                Ok(_) => panic!("exact_method_tokens was silently accepted"),
+            };
+            assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+            assert!(state.borrow().writes.is_empty());
+        })
+    });
+}
+
 fn request_head(method: HttpMethod, eom: bool, length: Option<usize>) -> HttpHeaderEvent {
     let mut headers = committed_test_headers(b"/owned-upstream", eom);
     headers.headers_mut().set_method(method).unwrap();

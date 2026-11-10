@@ -14,15 +14,16 @@
 //! `ingress_buffer_limit` (parsing pauses while the unread request body is at it),
 //! `maximum_read_size`, `read_allocation_size` and `maximum_write_size` (each write, and
 //! each response body poll together with the output already queued and its chunk framing),
-//! and `abort_exchanges_on_eof` (`DIV-053`: a peer EOF, judged where `UniplexSession` would
-//! see it, fails the connection while the live exchange is open, as `UniplexSession`'s does).
+//! `abort_exchanges_on_eof` (`DIV-053`: a peer EOF, judged where `UniplexSession` would see
+//! it, fails the connection while the live exchange is open, as `UniplexSession`'s does), and
+//! `exact_method_tokens` (`DIV-040`, as `UniplexSession` applies it: the codec reads each
+//! request method as an exact token).
 //! It fails with `INVALID_STATE_TRANSITION` for anything else: a nonzero `read_timeout`,
 //! `stream_read_timeout` or `write_timeout` (the driver is untimed; the caller keeps timeout
 //! responsibility), `drain_request_body_on_drop` false, `wait_for_http1_response_on_drain`
-//! or `deliver_ingress_before_abort` or `exact_method_tokens` true, `maximum_write_size`
-//! above `buffer_limit` or too small to carry a chunk's framing beside one body byte, a
-//! transport with byte-event capability, or a context that is not the cancellation-free
-//! owner thread.
+//! or `deliver_ingress_before_abort` true, `maximum_write_size` above `buffer_limit` or too
+//! small to carry a chunk's framing beside one body byte, a transport with byte-event
+//! capability, or a context that is not the cancellation-free owner thread.
 //!
 //! Framing, close and upgrade follow `UniplexSession`'s port of the Proxygen HTTP/1.1 session
 //! ([`Http1UpgradePolicy::Proxygen`]): trailers are carried in both directions, the
@@ -781,7 +782,6 @@ impl<A: OwnedApplication> Driver<A> {
             || !io.drain_request_body_on_drop
             || io.wait_for_http1_response_on_drain
             || io.deliver_ingress_before_abort
-            || io.exact_method_tokens
             || transport.byte_event_capability(&context)? != ByteEventCapability::Unsupported
         {
             return Err(failure(
@@ -815,6 +815,7 @@ impl<A: OwnedApplication> Driver<A> {
         codec.set_downstream_upgrade_as_ordinary(
             http1.upgrade_policy == Http1UpgradePolicy::AsOrdinaryRequest,
         );
+        codec.set_exact_methods(io.exact_method_tokens);
         Ok((
             Self {
                 context,

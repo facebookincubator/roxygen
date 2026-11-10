@@ -1535,7 +1535,7 @@ where
             || (!UPSTREAM && !io.drain_request_body_on_drop)
             || (UPSTREAM && io.drain_request_body_on_drop)
             || (!UPSTREAM && io.deliver_ingress_before_abort)
-            || io.exact_method_tokens
+            || (UPSTREAM && io.exact_method_tokens)
             || io.verbatim_http2_header_values
             || http2.stats.is_some()
             || http2
@@ -1636,6 +1636,7 @@ where
         if let Some(strategy) = &http2.header_indexing_strategy {
             codec.set_header_indexing_strategy(Rc::clone(strategy));
         }
+        codec.set_exact_methods(io.exact_method_tokens && !UPSTREAM);
         codec.generate(
             &mut egress,
             EgressFrame::ConnectionPreface,
