@@ -68,7 +68,8 @@ impl HeaderName {
         }
         let mut bytes = std::mem::take(buffer);
         bytes.clear();
-        bytes.extend(name.iter().map(u8::to_ascii_lowercase));
+        bytes.extend_from_slice(name);
+        make_ascii_lowercase_wide(&mut bytes);
         Self {
             bytes: Cow::Owned(bytes),
             code: HttpHeaderCode::Other,
@@ -139,6 +140,30 @@ impl HeaderName {
     #[cfg(test)]
     pub(crate) fn take_common_name_hashes() -> usize {
         COMMON_NAME_HASHES.take()
+    }
+}
+
+/// Lowercases ASCII letters in place in fixed 16- and 8-byte steps, which compile to vector
+/// operations: whole 16-byte chunks, then one 16-byte window that ends at the last byte, or two
+/// 8-byte windows for 8 to 15 bytes. A window may overlap bytes already lowercased, which is
+/// harmless because lowercasing is idempotent. Shorter names take the byte loop.
+fn make_ascii_lowercase_wide(bytes: &mut [u8]) {
+    if bytes.len() >= 16 {
+        let (chunks, tail) = bytes.as_chunks_mut::<16>();
+        let ragged = !tail.is_empty();
+        chunks.as_flattened_mut().make_ascii_lowercase();
+        if ragged && let Some(last) = bytes.last_chunk_mut::<16>() {
+            last.make_ascii_lowercase();
+        }
+    } else if bytes.len() >= 8 {
+        if let Some(first) = bytes.first_chunk_mut::<8>() {
+            first.make_ascii_lowercase();
+        }
+        if let Some(last) = bytes.last_chunk_mut::<8>() {
+            last.make_ascii_lowercase();
+        }
+    } else {
+        bytes.make_ascii_lowercase();
     }
 }
 

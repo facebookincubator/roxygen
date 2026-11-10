@@ -5315,6 +5315,133 @@ mod hpack_codec {
         );
     }
 
+    /// Each decoded header's name code and name bytes; it does not clone names.
+    #[derive(Default)]
+    struct DecodedNames(Vec<(HttpHeaderCode, Vec<u8>)>);
+
+    impl StreamingCallback for DecodedNames {
+        fn on_header(&mut self, name: &HeaderName, _value: &[u8]) {
+            self.0.push((name.code(), name.as_bytes().to_vec()));
+        }
+
+        fn on_headers_complete(&mut self, _decoded_size: HttpHeaderSize, _acknowledge: bool) {}
+
+        fn on_decode_error(&mut self, _error: HpackError) {}
+    }
+
+    /// Literal names without indexing of every length the name buffer takes, 1 to 64 bytes: a
+    /// mixed-case name with every printable ASCII byte (0x20 to 0x7e) at its first, middle and last
+    /// position, and with each byte at a case-range edge (`@`, `A`, `Z`, `[`) at every position.
+    /// Each one is lowercased in the decoder's name buffer to exactly its ASCII lowercase, so an
+    /// error in a lowercasing loop's chunks, tail or case range cannot pass.
+    #[test]
+    fn buffered_literal_names_lowercase_every_length_and_byte() {
+        let mut decoder = HpackDecoder::new();
+        let allocation = decoder.name_buffer_allocation();
+        let mut checked = 0;
+        for length in 1..=64 {
+            let base = mixed_case_name(length, length);
+            let mut ends = vec![0, length / 2, length - 1];
+            ends.dedup();
+            let printable = ends
+                .into_iter()
+                .flat_map(|at| (0x20..=0x7e).map(move |byte| (at, byte)));
+            let case_edges = (0..length).flat_map(|at| b"@AZ[".map(|byte| (at, byte)));
+            let names: Vec<(usize, u8, Vec<u8>)> = printable
+                .chain(case_edges)
+                .map(|(at, byte)| {
+                    let mut name = base.clone();
+                    name[at] = byte;
+                    (at, byte, name)
+                })
+                .collect();
+            for chunk in names.chunks(64) {
+                let block: Vec<u8> = chunk
+                    .iter()
+                    .flat_map(|(_, _, name)| literal_field(0x00, name, false, b"v"))
+                    .collect();
+                HeaderName::take_name_buffers();
+                let mut decoded = DecodedNames::default();
+                decoder
+                    .decode_streaming(&block, &mut decoded)
+                    .expect("the block decodes");
+                assert_eq!(
+                    HeaderName::take_name_buffers(),
+                    0,
+                    "length {length}: every name is lowercased in the decoder's name buffer"
+                );
+                assert_eq!(
+                    decoded.0.len(),
+                    chunk.len(),
+                    "length {length}: every field decodes"
+                );
+                for ((at, byte, name), (code, lowercase)) in chunk.iter().zip(&decoded.0) {
+                    assert_eq!(
+                        (*code, String::from_utf8_lossy(lowercase)),
+                        (
+                            HttpHeaderCode::Other,
+                            String::from_utf8_lossy(&name.to_ascii_lowercase())
+                        ),
+                        "length {length}, byte {byte:#04x} at {at}: the name is uncommon and \
+                         decodes to its ASCII lowercase"
+                    );
+                    checked += 1;
+                }
+                assert_eq!(
+                    decoder.name_buffer_allocation(),
+                    allocation,
+                    "length {length}: the decoder still holds its first name buffer"
+                );
+            }
+        }
+        assert_eq!(
+            checked, 26_275,
+            "every length, end byte and case-edge byte is checked"
+        );
+    }
+
+    /// `HeaderName::new_in_buffer` lowercases names of every length from 1 to 320 bytes, past the
+    /// 64 bytes the decoder sends through its buffer: printable ASCII cycled through every
+    /// position, and a mixed-case name with each case-range edge byte (`@`, `A`, `Z`, `[`) at its
+    /// first, middle and last position.
+    #[test]
+    fn new_in_buffer_lowercases_names_of_every_length() {
+        let mut buffer = Vec::new();
+        let mut checked = 0;
+        for length in 1..=320 {
+            let cycled: Vec<u8> = (0..length)
+                .map(|at| 0x20 + u8::try_from((at * 7 + length) % 95).unwrap())
+                .collect();
+            let base = mixed_case_name(length, length);
+            let mut ends = vec![0, length / 2, length - 1];
+            ends.dedup();
+            let case_edges = ends.into_iter().flat_map(|at| {
+                let base = &base;
+                b"@AZ[".map(move |byte| {
+                    let mut name = base.clone();
+                    name[at] = byte;
+                    name
+                })
+            });
+            for name in std::iter::once(cycled).chain(case_edges) {
+                let header = HeaderName::new_in_buffer(&name, &mut buffer);
+                assert_eq!(
+                    (header.code(), String::from_utf8_lossy(header.as_bytes())),
+                    (
+                        HttpHeaderCode::Other,
+                        String::from_utf8_lossy(&name.to_ascii_lowercase())
+                    ),
+                    "length {length}: the name is uncommon and is its ASCII lowercase"
+                );
+                buffer = header
+                    .into_name_buffer()
+                    .expect("an uncommon name holds the buffer");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 4_148, "every length and edge byte is checked");
+    }
+
     /// Streaming decode events with each header's name code ahead of its name and value.
     #[derive(Default)]
     struct CodedDecodeEvents(DecodeEvents);
