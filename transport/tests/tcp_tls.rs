@@ -351,6 +351,51 @@ mod tcp_tls {
         fn prepare_reset(&self) {}
     }
 
+    /// A stream that offers the native write queue, whose first write panics and whose later
+    /// writes take every byte into `written`.
+    struct FirstWritePanicStream {
+        panicked: bool,
+        written: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl AsyncRead for FirstWritePanicStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for FirstWritePanicStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if !std::mem::replace(&mut self.panicked, true) {
+                panic!("the first write attempt panics");
+            }
+            self.written.borrow_mut().extend_from_slice(buffer);
+            Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl TokioByteStream for FirstWritePanicStream {
+        const WRITE_QUEUE: bool = true;
+
+        fn prepare_reset(&self) {}
+    }
+
     struct BackingProbeStream {
         read_payload: Box<[u8]>,
         read_offset: usize,
@@ -7462,7 +7507,9 @@ mod tcp_tls {
         use crate::byte_stream::write_deadline_batons_for_test;
         use crate::byte_stream::write_operations_for_test;
         use crate::byte_stream::write_progress_cells_for_test;
+        use crate::byte_stream::write_registrations_for_test;
         use crate::tcp::io_write_futures_for_test;
+        use crate::tcp_tls_tests::tcp_tls::owned_reader::with_observed_tcp;
         #[cfg(target_os = "linux")]
         use crate::tcp_zero_copy::send_iovec_arrays_for_test;
 
@@ -7800,13 +7847,23 @@ mod tcp_tls {
                     panic!("the reset's wake panics");
                 }
             }
-            with_accepted_tcp(limits(), |context, transport, _peer| async move {
+            let limits = ByteStreamLimits::new(64, STALLING_WRITE, 8).unwrap();
+            with_accepted_tcp(limits, |context, transport, peer| async move {
                 let cancellation = CancellationSource::new();
                 let mut writer = transport
-                    .write_queue(&context, 1024, Duration::ZERO, cancellation.token())
+                    .write_queue(
+                        &context,
+                        STALLING_WRITE,
+                        Duration::ZERO,
+                        cancellation.token(),
+                    )
                     .unwrap()
                     .unwrap();
-                writer.start_write(queue(&[b"lost"])).unwrap();
+                // A write larger than the socket buffers stays outstanding past its first attempt.
+                writer
+                    .start_write(queue(&[&pattern(STALLING_WRITE, 31)]))
+                    .unwrap();
+                stall_after_progress(&mut writer, &peer).await;
                 cancellation.request_cancellation();
                 let waker = Waker::from(Arc::new(PanickingWake));
                 let panic = catch_unwind(AssertUnwindSafe(|| {
@@ -7827,7 +7884,7 @@ mod tcp_tls {
                 let Poll::Ready(receipt) = polled else {
                     unreachable!("the receipt was delivered");
                 };
-                assert_eq!(receipt.requested_bytes, 4);
+                assert_eq!(receipt.requested_bytes, STALLING_WRITE);
                 assert_eq!(
                     receipt.result.unwrap_err().code(),
                     HttpErrorCode::TRANSPORT_WRITE_ERROR,
@@ -8318,6 +8375,346 @@ mod tcp_tls {
                 );
             });
         }
+
+        /// Lets the reactor observe a new socket's writability, as it has by the time a
+        /// connection that has read anything writes. Until then a send waits for readiness
+        /// without attempting the socket.
+        async fn observe_writability() {
+            tokio::task::yield_now().await;
+        }
+
+        /// Toward `folly::AsyncSocket::writeImpl`, which writes at once when no write is
+        /// pending: a submission to an idle queue goes out at entry when its first attempt
+        /// finishes it. Its capacity and saturation still wait for the next poll, which delivers
+        /// its receipt, as when that poll wrote it.
+        #[test]
+        fn a_submission_its_first_attempt_finishes_is_written_at_entry() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let mut writer = transport
+                    .write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                observe_writability().await;
+                writer.start_write(queue(&[b"thr", b"ough"])).unwrap();
+                let mut received = [0; 7];
+                time::timeout(Duration::from_secs(2), peer.read_exact(&mut received))
+                    .await
+                    .expect("the peer receives the submission before the queue is polled")
+                    .unwrap();
+                assert_eq!(&received, b"through");
+                assert!(
+                    !transport.has_pending_write(&context).unwrap(),
+                    "a write finished at entry leaves no transport write pending"
+                );
+                assert!(
+                    !writer.can_write(1) && writer.is_saturated() && !writer.is_idle(),
+                    "capacity returns at the poll that delivers the receipt"
+                );
+                let Poll::Ready(receipt) = poll_once(&mut writer).await else {
+                    panic!("the next poll delivers the finished write's receipt");
+                };
+                assert_eq!(receipt.requested_bytes, 7);
+                assert_eq!(receipt.result.unwrap().bytes_written, 7);
+                assert!(writer.can_write(1) && !writer.is_saturated() && writer.is_idle());
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// A write that its first attempt finishes is never registered with the transport as
+        /// an operation.
+        #[test]
+        fn writes_finished_at_entry_register_no_transport_write() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let mut writer = transport
+                    .write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                observe_writability().await;
+                let registrations = write_registrations_for_test();
+                for chunk in [&b"one "[..], b"two "] {
+                    writer.start_write(queue(&[chunk])).unwrap();
+                    let receipt = poll_fn(|context| writer.poll_complete(context)).await;
+                    assert_eq!(receipt.result.unwrap().bytes_written, 4);
+                }
+                assert_eq!(
+                    write_registrations_for_test(),
+                    registrations,
+                    "writes finished at entry register no transport write"
+                );
+                drop(writer);
+                // Control: the single-write API registers each write.
+                transport
+                    .write(
+                        &context,
+                        queue(&[b"six "]),
+                        Duration::ZERO,
+                        CancellationToken::never(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(write_registrations_for_test(), registrations + 1);
+                let mut received = [0; 12];
+                peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"one two six ");
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// A first attempt that the socket takes only part of leaves the rest of the write
+        /// outstanding, registered once, and the queue's polls finish it in order.
+        #[test]
+        fn a_partial_first_attempt_leaves_the_rest_outstanding() {
+            let limits = ByteStreamLimits::new(64, STALLING_WRITE, 8).unwrap();
+            with_accepted_tcp(limits, |context, transport, mut peer| async move {
+                let mut writer = transport
+                    .write_queue(
+                        &context,
+                        STALLING_WRITE,
+                        Duration::ZERO,
+                        CancellationToken::never(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                let registrations = write_registrations_for_test();
+                let payload = pattern(STALLING_WRITE, 23);
+                observe_writability().await;
+                writer.start_write(queue(&[&payload])).unwrap();
+                let mut byte = [0];
+                let peeked = time::timeout(Duration::from_secs(2), peer.peek(&mut byte))
+                    .await
+                    .expect("the first attempt sends what the socket takes before any poll")
+                    .unwrap();
+                assert_eq!(peeked, 1);
+                assert!(
+                    transport.has_pending_write(&context).unwrap(),
+                    "the rest of the write is outstanding"
+                );
+                assert!(writer.is_saturated() && !writer.can_write(1) && !writer.is_idle());
+                assert_eq!(
+                    write_registrations_for_test(),
+                    registrations + 1,
+                    "the unfinished write is registered once"
+                );
+                assert!(poll_once(&mut writer).await.is_pending());
+                let reader = async {
+                    let mut received = vec![0; STALLING_WRITE];
+                    peer.read_exact(&mut received).await.unwrap();
+                    received
+                };
+                let (receipt, received) =
+                    tokio::join!(poll_fn(|context| writer.poll_complete(context)), reader);
+                assert_eq!(receipt.requested_bytes, STALLING_WRITE);
+                assert_eq!(receipt.result.unwrap().bytes_written, STALLING_WRITE);
+                assert!(
+                    received == payload,
+                    "the peer receives the payload in order"
+                );
+                assert_eq!(write_registrations_for_test(), registrations + 1);
+                assert!(!writer.is_saturated() && writer.can_write(1) && writer.is_idle());
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// A first attempt that finds the socket full (`WouldBlock`) leaves the whole write
+        /// outstanding. The poll that pends registers the polling task's waker, so the
+        /// socket's writability wakes that task and the next poll finishes the write.
+        #[test]
+        fn a_first_attempt_that_would_block_leaves_the_write_to_the_queues_polls() {
+            with_observed_tcp(
+                limits(),
+                |context, transport, mut peer, mut observer| async move {
+                    let mut writer = transport
+                        .write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    // Fill the socket behind the transport once the reactor has seen it
+                    // writable, so that the first attempt's send would block.
+                    observe_writability().await;
+                    observer.set_nonblocking(true).unwrap();
+                    let filler = pattern(64 << 10, 29);
+                    let mut filled = 0;
+                    loop {
+                        match io::Write::write(&mut observer, &filler) {
+                            Ok(written) => filled += written,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(error) => panic!("filling the socket failed: {error}"),
+                        }
+                    }
+                    writer.start_write(queue(&[b"after"])).unwrap();
+                    assert!(
+                        transport.has_pending_write(&context).unwrap(),
+                        "a blocked first attempt leaves the write outstanding"
+                    );
+                    assert!(writer.is_saturated() && !writer.can_write(1));
+                    let wake = Arc::new(WakeSignal::default());
+                    let waker = Waker::from(Arc::clone(&wake));
+                    assert!(
+                        writer
+                            .poll_complete(&mut Context::from_waker(&waker))
+                            .is_pending()
+                    );
+                    let mut received = vec![0; filled];
+                    peer.read_exact(&mut received).await.unwrap();
+                    time::timeout(Duration::from_secs(5), wake.wait())
+                        .await
+                        .expect("the socket's writability wakes the task that polled the write");
+                    let receipt = poll_fn(|context| writer.poll_complete(context)).await;
+                    assert_eq!(receipt.requested_bytes, 5);
+                    assert_eq!(receipt.result.unwrap().bytes_written, 5);
+                    let mut after = [0; 5];
+                    peer.read_exact(&mut after).await.unwrap();
+                    assert_eq!(&after, b"after");
+                    assert!(writer.can_write(1) && writer.is_idle());
+                    transport.close(&context).unwrap();
+                },
+            );
+        }
+
+        /// A first attempt that fails delivers its failure receipt, with the bytes it wrote, at
+        /// the next poll, as a first poll's failure did; capacity waits for that poll.
+        #[test]
+        fn a_first_attempt_that_fails_delivers_its_receipt_at_the_next_poll() {
+            with_observed_tcp(limits(), |context, transport, peer, observer| async move {
+                let mut writer = transport
+                    .write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                #[expect(deprecated, reason = "Tokio's only linger-zero reset setter")]
+                let linger = peer.set_linger(Some(Duration::ZERO));
+                linger.unwrap();
+                drop(peer);
+                // The peer's reset has arrived once the socket reports it.
+                observer.set_nonblocking(true).unwrap();
+                while observer
+                    .peek(&mut [0])
+                    .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+                {
+                    time::sleep(Duration::from_millis(1)).await;
+                }
+                observe_writability().await;
+                writer.start_write(queue(&[b"lost"])).unwrap();
+                assert!(!writer.can_write(1) && writer.is_saturated() && !writer.is_idle());
+                let Poll::Ready(receipt) = poll_once(&mut writer).await else {
+                    panic!("the next poll delivers the failed write's receipt");
+                };
+                assert_eq!(receipt.requested_bytes, 4);
+                let error = receipt.result.unwrap_err();
+                assert_eq!(error.code(), HttpErrorCode::TRANSPORT_WRITE_ERROR);
+                assert_eq!(error.bytes_written(), 0);
+                assert!(writer.can_write(1) && writer.is_idle());
+                transport.close_with_reset(&context).unwrap();
+            });
+        }
+
+        /// The queue's cancellation applies to its outstanding write. A write that its first
+        /// attempt finished is no longer outstanding, so a later cancellation leaves its receipt
+        /// and refuses the next submission at entry, as for an idle queue.
+        #[test]
+        fn a_cancellation_after_a_write_finished_at_entry_refuses_the_next_submission() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let cancellation = CancellationSource::new();
+                let mut writer = transport
+                    .write_queue(&context, 1024, Duration::ZERO, cancellation.token())
+                    .unwrap()
+                    .unwrap();
+                observe_writability().await;
+                writer.start_write(queue(&[b"done"])).unwrap();
+                cancellation.request_cancellation();
+                let Poll::Ready(receipt) = poll_once(&mut writer).await else {
+                    panic!("the next poll delivers the finished write's receipt");
+                };
+                assert_eq!(receipt.result.unwrap().bytes_written, 4);
+                assert!(
+                    !writer.is_saturated(),
+                    "the transport stays open until a submission observes the cancellation"
+                );
+                writer.start_write(queue(&[b"late"])).unwrap();
+                let Poll::Ready(late) = poll_once(&mut writer).await else {
+                    panic!("a submission refused at entry has its receipt at once");
+                };
+                let error = late.result.unwrap_err();
+                assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+                assert_eq!(error.bytes_written(), 0);
+                assert!(writer.is_saturated(), "the refusal reset the transport");
+                let mut received = [0; 4];
+                peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"done");
+                let mut drained = Vec::new();
+                assert_eq!(
+                    peer.read_to_end(&mut drained).await.unwrap_err().kind(),
+                    io::ErrorKind::ConnectionReset,
+                );
+            });
+        }
+
+        /// A first attempt that panics leaves the write outstanding, as a first poll that
+        /// panicked did: the panic surfaces from `start_write`, the write stays registered and
+        /// holds the queue's capacity, and the next poll continues it.
+        #[test]
+        fn a_first_attempt_that_panics_leaves_the_write_outstanding() {
+            Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(LocalSet::new().run_until(async move {
+                    let (worker, driver) = WorkerDriver::new(8).unwrap();
+                    let call = worker
+                        .call_local(|context| async move {
+                            let written = Rc::new(RefCell::new(Vec::new()));
+                            let transport = owned_from_stream(
+                                &context,
+                                FirstWritePanicStream {
+                                    panicked: false,
+                                    written: Rc::clone(&written),
+                                },
+                                SocketAddress::new("127.0.0.1", 1000),
+                                SocketAddress::new("127.0.0.1", 2000),
+                                None,
+                                limits(),
+                            )
+                            .unwrap();
+                            let mut writer = transport
+                                .write_queue(
+                                    &context,
+                                    1024,
+                                    Duration::ZERO,
+                                    CancellationToken::never(),
+                                )
+                                .unwrap()
+                                .expect("the stream offers the native write queue");
+                            let panic = catch_unwind(AssertUnwindSafe(|| {
+                                writer.start_write(queue(&[b"data"]))
+                            }))
+                            .expect_err("the first attempt's panic surfaces from the submission");
+                            assert_eq!(
+                                panic.downcast_ref::<&str>(),
+                                Some(&"the first write attempt panics")
+                            );
+                            assert!(
+                                transport.has_pending_write(&context).unwrap(),
+                                "the panicked write stays registered"
+                            );
+                            assert!(
+                                !writer.can_write(1) && writer.is_saturated() && !writer.is_idle()
+                            );
+                            let Poll::Ready(receipt) =
+                                writer.poll_complete(&mut Context::from_waker(Waker::noop()))
+                            else {
+                                panic!("the next poll continues the write to its end");
+                            };
+                            assert_eq!(receipt.requested_bytes, 4);
+                            assert_eq!(receipt.result.unwrap().bytes_written, 4);
+                            assert_eq!(&*written.borrow(), b"data");
+                            assert!(writer.can_write(1) && writer.is_idle());
+                            transport.close_with_reset(&context).unwrap();
+                        })
+                        .unwrap();
+                    let driver_task = tokio::task::spawn_local(driver);
+                    call.await.unwrap();
+                    worker.begin_shutdown();
+                    driver_task.await.unwrap();
+                }));
+        }
     }
 
     mod owned_reader {
@@ -8327,7 +8724,7 @@ mod tcp_tls {
 
         /// As `with_accepted_tcp`, with a peer that disables Nagle's algorithm and a clone of the
         /// accepted socket through which the test sees how many bytes are queued.
-        fn with_observed_tcp<F, Fut>(limits: ByteStreamLimits, test: F)
+        pub(super) fn with_observed_tcp<F, Fut>(limits: ByteStreamLimits, test: F)
         where
             F: FnOnce(WorkerContext, OwnedByteStream, TcpStream, std::net::TcpStream) -> Fut
                 + Send

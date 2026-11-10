@@ -502,15 +502,20 @@ enum QueuedReceipt {
 /// Like Proxygen coro's uniplex write loop, which keeps one transport write
 /// outstanding while later egress gathers in its write buffer, the queue admits
 /// a submission only while no physical write is outstanding, and holds at most
-/// `WRITE_QUEUE_RECEIPTS` unconsumed receipts. A submitted write is registered
-/// with the transport at once, and its bytes are written as
-/// [`OwnedWriteQueue::poll_complete`] polls it, with the transport's
-/// single-write semantics except for timing: the write has no deadline and
-/// allocates nothing, and its completion wakes no task. A cancellation is
-/// observed at the next poll; one requested from another task wakes the task
-/// that last polled the outstanding write, as a reset of the transport does.
-/// Dropping the queue with a write outstanding resets the transport, as
-/// dropping a write future does.
+/// `WRITE_QUEUE_RECEIPTS` unconsumed receipts. As `folly::AsyncSocket::writeImpl`
+/// writes at once when no write is pending, a submission is attempted at
+/// entry, with no waker. A write that attempt finishes is never registered with
+/// the transport. One it leaves unfinished, because the socket took only part
+/// of it or would block, is registered with the transport, and the rest of its
+/// bytes are written as [`OwnedWriteQueue::poll_complete`] polls it, with the
+/// transport's single-write semantics except for timing: the write has no
+/// deadline and allocates nothing, and its completion wakes no task. Either
+/// way the submission holds the queue's capacity until a poll observes its
+/// completion. A cancellation is observed by the outstanding write at the next
+/// poll, or by the next submission at entry; one requested from another task
+/// wakes the task that last polled the outstanding write, as a reset of the
+/// transport does. Dropping the queue with a write outstanding resets the
+/// transport, as dropping a write future does.
 pub struct OwnedWriteQueue {
     worker: WorkerHandle,
     limits: ByteStreamLimits,
@@ -524,27 +529,37 @@ pub struct OwnedWriteQueue {
     /// The operation slot. Every write reuses it, with its transport handles
     /// and its progress cell, which counts each write's progress in turn.
     operation: WriteOperation,
-    /// Whether the slot holds the outstanding write: from its start until a
-    /// poll yields its result.
-    writing: bool,
+    held: Held,
     receipts: VecDeque<QueuedReceipt>,
+}
+
+/// What withholds an [`OwnedWriteQueue`]'s capacity, from a submission's start
+/// until a poll observes its completion.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Held {
+    Free,
+    /// The operation slot holds the outstanding write.
+    Writing,
+    /// The submission's first attempt finished it at entry; its receipt is done.
+    WrittenThrough,
 }
 
 impl OwnedWriteQueue {
     /// Reports capacity only, for a submission of any size up to the maximum.
     ///
-    /// The outstanding write progresses only while `poll_complete` is polled,
-    /// so capacity is withheld until it completes. That refusal is what arms
-    /// owned HTTP/2's writer for every write the queue holds
+    /// An outstanding write progresses only while `poll_complete` is polled,
+    /// so capacity is withheld until a poll observes the submission's
+    /// completion, as it is for a write finished at entry. That refusal is what
+    /// arms owned HTTP/2's writer for every write the queue holds
     /// (`UniplexWriteQueue::can_write`).
     pub fn can_write(&self, _bytes: usize) -> bool {
-        !self.writing && self.receipts.len() < WRITE_QUEUE_RECEIPTS
+        self.held == Held::Free && self.receipts.len() < WRITE_QUEUE_RECEIPTS
     }
 
     /// Submits `data`, which needs capacity and at most the maximum write
     /// size; an error is interface misuse and leaves no receipt. A submission
     /// the transport refuses at entry, or an empty one, gets its receipt at
-    /// once.
+    /// once, and returns its capacity at once.
     pub fn start_write(&mut self, data: BufQueue) -> Result<(), HttpError> {
         let requested_bytes = data.chain_length();
         if requested_bytes > self.maximum_write_size {
@@ -582,9 +597,17 @@ impl OwnedWriteQueue {
                 progress,
             } => {
                 self.operation.restart(operation, expected, progress);
-                self.writing = true;
+                self.held = Held::Writing;
                 self.receipts
                     .push_back(QueuedReceipt::Writing(requested_bytes));
+            }
+            WriteStart::WrittenThrough(result) => {
+                self.held = Held::WrittenThrough;
+                self.receipts
+                    .push_back(QueuedReceipt::Done(QueuedWriteCompletion {
+                        requested_bytes,
+                        result,
+                    }));
             }
             WriteStart::Finished(result) => {
                 self.receipts
@@ -592,6 +615,18 @@ impl OwnedWriteQueue {
                         requested_bytes,
                         result,
                     }));
+            }
+            WriteStart::Unwinding {
+                operation,
+                expected,
+                progress,
+                panic,
+            } => {
+                self.operation.restart(operation, expected, progress);
+                self.held = Held::Writing;
+                self.receipts
+                    .push_back(QueuedReceipt::Writing(requested_bytes));
+                resume_unwind(panic);
             }
         }
         Ok(())
@@ -601,10 +636,10 @@ impl OwnedWriteQueue {
     /// oldest receipt once its submission is complete. An idle queue registers
     /// nothing.
     pub fn poll_complete(&mut self, context: &mut Context<'_>) -> Poll<QueuedWriteCompletion> {
-        if self.writing {
-            match self.operation.poll_with(context, Some(&self.cancellation)) {
+        match self.held {
+            Held::Writing => match self.operation.poll_with(context, Some(&self.cancellation)) {
                 Poll::Ready(result) => {
-                    self.writing = false;
+                    self.held = Held::Free;
                     let receipt = self
                         .receipts
                         .back_mut()
@@ -622,7 +657,9 @@ impl OwnedWriteQueue {
                         context.waker().wake_by_ref();
                     }
                 }
-            }
+            },
+            Held::WrittenThrough => self.held = Held::Free,
+            Held::Free => {}
         }
         if !matches!(self.receipts.front(), Some(QueuedReceipt::Done(_))) {
             return Poll::Pending;
@@ -640,10 +677,11 @@ impl OwnedWriteQueue {
 
     /// Whether bytes submitted now would wait behind bytes the transport has
     /// not yet accepted: a physical write is outstanding, or the transport can
-    /// no longer write.
+    /// no longer write. A write finished at entry counts as outstanding until
+    /// a poll observes its completion, as it withholds capacity until then.
     pub fn is_saturated(&self) -> bool {
         let state = self.operation.state.borrow();
-        self.writing || state.write_shutdown || state.close_state != CloseState::Open
+        self.held != Held::Free || state.write_shutdown || state.close_state != CloseState::Open
     }
 }
 
@@ -922,6 +960,7 @@ std::thread_local! {
 std::thread_local! {
     static WRITE_PROGRESS_CELLS: Cell<usize> = const { Cell::new(0) };
     static WRITE_OPERATIONS: Cell<usize> = const { Cell::new(0) };
+    static WRITE_REGISTRATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -957,6 +996,12 @@ pub(crate) fn write_progress_cells_for_test() -> usize {
 #[cfg(test)]
 pub(crate) fn write_operations_for_test() -> usize {
     WRITE_OPERATIONS.with(Cell::get)
+}
+
+/// Writes registered with their transport (`TransportState::active_write`) on this thread.
+#[cfg(test)]
+pub(crate) fn write_registrations_for_test() -> usize {
+    WRITE_REGISTRATIONS.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -1757,6 +1802,9 @@ impl OwnedByteStream {
                 progress,
             )),
             WriteStart::Finished(result) => Box::pin(std::future::ready(result)),
+            WriteStart::WrittenThrough(_) | WriteStart::Unwinding { .. } => {
+                unreachable!("only a queued write writes through")
+            }
         }
     }
 
@@ -1977,7 +2025,18 @@ enum WriteStart {
         expected: usize,
         progress: WriteProgress,
     },
+    /// An [`OwnedWriteQueue`] write that its first attempt finished at entry
+    /// ([`write_through`]).
+    WrittenThrough(Result<WriteInfo, TransportWriteError>),
     Finished(Result<WriteInfo, TransportWriteError>),
+    /// As `Started`, for an [`OwnedWriteQueue`] write whose first attempt
+    /// panicked: the caller holds the write as outstanding, then resumes `panic`.
+    Unwinding {
+        operation: u64,
+        expected: usize,
+        progress: WriteProgress,
+        panic: TransportPanic,
+    },
 }
 
 fn assert_transport_owner(state: &RefCell<TransportState>, worker: &WorkerHandle) {
@@ -2090,6 +2149,12 @@ fn start_write_operation(
                 0,
             )));
         }
+        if let WriteKind::Queued { progress, .. } = kind
+            && target.byte_event_capability == ByteEventCapability::Unsupported
+        {
+            drop(state);
+            return write_through(&target, data, length, progress);
+        }
         let operation = state.next_operation();
         for pending in &mut state.registrations {
             if pending.write_operation.is_none() {
@@ -2135,6 +2200,8 @@ fn start_write_operation(
         }
         None => ActiveIo::Future(io.write(data, progress.clone(), flags, byte_events.clone())),
     };
+    #[cfg(test)]
+    WRITE_REGISTRATIONS.with(|count| count.set(count.get() + 1));
     target.state.borrow_mut().active_write = Some(ActiveWrite {
         operation,
         io,
@@ -2147,6 +2214,100 @@ fn start_write_operation(
         operation,
         expected: length,
         progress,
+    }
+}
+
+/// Writes an [`OwnedWriteQueue`] submission of `length` bytes through, as
+/// `folly::AsyncSocket::writeImpl` writes at once when no write is pending: one
+/// attempt at entry, polled with no waker. A write the attempt finishes is never
+/// registered with the transport. One it leaves unfinished, because the socket
+/// took only part of it or would block, or whose attempt panics, is registered as
+/// [`start_write_operation`] registers a queued write, and the queue's next poll
+/// continues it with the poller's waker. The transport offers no byte events, so
+/// no registration waits for this write.
+fn write_through(
+    target: &WriteTarget<'_>,
+    data: BufQueue,
+    length: usize,
+    progress: &WriteProgress,
+) -> WriteStart {
+    let Some(io) = target.io.upgrade() else {
+        return WriteStart::Finished(Err(TransportWriteError::new(dropped_error(), 0)));
+    };
+    io.prepare_write_timeout(Duration::ZERO);
+    let progress = progress.restart(length);
+    let flags = ByteEventWriteFlags::default();
+    let Some(writer) = io.queued_writer() else {
+        let io = ActiveIo::Future(io.write(data, progress.clone(), flags, None));
+        return WriteStart::Started {
+            operation: register_queued_write(target, io, &progress),
+            expected: length,
+            progress,
+        };
+    };
+    writer.start_write(data, progress.clone(), flags, None);
+    let attempt = catch_unwind(AssertUnwindSafe(|| {
+        writer.poll_write(&mut Context::from_waker(Waker::noop()))
+    }));
+    match attempt {
+        Ok(Poll::Ready(result)) => {
+            let written = progress.get();
+            WriteStart::WrittenThrough(
+                finished_write(result, written, length)
+                    .map_err(|error| TransportWriteError::new(error, written)),
+            )
+        }
+        Ok(Poll::Pending) => WriteStart::Started {
+            operation: register_queued_write(target, ActiveIo::Queued(QueuedIo(writer)), &progress),
+            expected: length,
+            progress,
+        },
+        Err(panic) => WriteStart::Unwinding {
+            operation: register_queued_write(target, ActiveIo::Queued(QueuedIo(writer)), &progress),
+            expected: length,
+            progress,
+            panic,
+        },
+    }
+}
+
+/// Registers an unfinished [`write_through`] write with its transport.
+fn register_queued_write(target: &WriteTarget<'_>, io: ActiveIo, progress: &WriteProgress) -> u64 {
+    let mut state = target.state.borrow_mut();
+    debug_assert!(
+        state.registrations.is_empty(),
+        "a transport without byte events holds no registration"
+    );
+    let operation = state.next_operation();
+    #[cfg(test)]
+    WRITE_REGISTRATIONS.with(|count| count.set(count.get() + 1));
+    state.active_write = Some(ActiveWrite {
+        operation,
+        io,
+        byte_events: None,
+        _progress: progress.clone(),
+        wait: WriteWait::Untimed,
+        waker: None,
+    });
+    operation
+}
+
+/// A finished backend write's result: all `expected` bytes written, the
+/// backend's error, or a partial write's error.
+#[inline(always)]
+fn finished_write(
+    result: Result<(), HttpError>,
+    written: usize,
+    expected: usize,
+) -> Result<WriteInfo, HttpError> {
+    match result {
+        Ok(()) if written == expected => Ok(WriteInfo {
+            bytes_written: written,
+        }),
+        Ok(()) => Err(write_error(
+            b"byte-stream adapter completed a partial write",
+        )),
+        Err(error) => Err(error),
     }
 }
 
@@ -2354,7 +2515,7 @@ impl ByteStreamTransport for OwnedByteStream {
                 Rc::clone(&self.state),
                 WriteProgress::new(0),
             ),
-            writing: false,
+            held: Held::Free,
             receipts: VecDeque::with_capacity(WRITE_QUEUE_RECEIPTS),
         }))
     }
@@ -2867,17 +3028,10 @@ impl WriteOperation {
             WritePoll::Io(result) => result,
         };
         let written = self.progress.get();
-        match result {
-            Ok(()) if written == self.expected => {
+        match finished_write(result, written, self.expected) {
+            Ok(info) => {
                 self.finish(None, None);
-                Poll::Ready(Ok(WriteInfo {
-                    bytes_written: written,
-                }))
-            }
-            Ok(()) => {
-                let error = write_error(b"byte-stream adapter completed a partial write");
-                self.finish(None, Some(&error));
-                Poll::Ready(Err(TransportWriteError::new(error, written)))
+                Poll::Ready(Ok(info))
             }
             Err(error) => {
                 self.finish(None, Some(&error));
