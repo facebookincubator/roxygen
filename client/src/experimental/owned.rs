@@ -320,9 +320,7 @@ impl Upstream {
         }
     }
 
-    /// Slots the driver returns at its next turn. The owned HTTP/2 driver
-    /// releases a stream's slot when it parses the response's end, so none
-    /// waits for its consumer there.
+    /// HTTP/1.1 only (`DIV-029`); an HTTP/2 stream's capacity returns at once.
     fn returning_capacity(&self) -> u32 {
         match self {
             Self::Http1(handle) => handle.returning_capacity(),
@@ -433,8 +431,9 @@ impl OwnedClientSession {
 
     /// Requests the connection can admit now: 0 once the attachment is
     /// cancelled, the worker stops accepting work or the session's pool closes
-    /// its admission; otherwise on HTTP/1.1 1 while its one slot is free and
-    /// admission is open, and on HTTP/2 the lower of its own and its peer's
+    /// its admission; otherwise on HTTP/1.1 1 while its one slot is free or
+    /// returning (`DIV-029`) and admission is open, and on HTTP/2 the lower of
+    /// its own and its peer's
     /// `MAX_CONCURRENT_STREAMS`, less the reserved and active streams.
     pub fn available_capacity(&self) -> u32 {
         if self.admission_closed() {
@@ -564,10 +563,20 @@ impl OwnedClientSession {
         !self.is_draining() && self.inner.pool.reserved.get() && self.is_idle()
     }
 
+    /// An HTTP/1.1 session whose slot is returning: its exchange's consumer
+    /// completed it, and the driver's next turn retires it
+    /// (`OwnedH1UpstreamHandle::returning_capacity`, `DIV-029`).
+    pub(crate) fn is_returning(&self) -> bool {
+        self.inner.upstream.returning_capacity() != 0
+    }
+
     /// `available_capacity` without the worker admission check, which the
-    /// pool's acquisition step makes once for all of its sessions.
+    /// pool's acquisition step makes once for all of its sessions, and
+    /// without a returning HTTP/1.1 slot (`DIV-029`): the pool's selection
+    /// index hears of no slot that turns returning, so the pool takes such a
+    /// slot only once its driver retires the exchange (`DIV-046`).
     pub(crate) fn selectable_capacity(&self) -> u32 {
-        if self.session_admission_closed() {
+        if self.session_admission_closed() || self.is_returning() {
             0
         } else {
             self.inner.upstream.available_capacity()

@@ -1086,6 +1086,316 @@ fn a_finished_exchange_s_slot_is_returning_until_the_driver_retires_it() {
     }
 }
 
+/// N8.4w (`DIV-029`): once its consumer completes it, a finished exchange's slot admits the next
+/// request at once, before the driver's turn that the completion woke retires the exchange: its
+/// request written and its response read to its end, on a connection its codec leaves reusable.
+/// `returning_capacity` reports that window. A `Connection: close` response's connection never
+/// admits again, and an unwritten request keeps the slot until the driver writes it and retires
+/// the exchange.
+#[test]
+fn a_consumed_exchange_s_slot_admits_the_next_request_before_the_driver_retires_it() {
+    // (case, first response, whether the request's write waits until its response is read,
+    // `available_capacity` and `returning_capacity` once the request is committed, once its
+    // response is complete and unread, once it is read and before the driver's next turn, and
+    // once the driver retired the exchange)
+    type Observed = [(u32, u32); 4];
+    let cases: [(&str, &'static [u8], bool, Observed); 3] = [
+        (
+            "keep-alive",
+            OK_RESPONSE,
+            false,
+            [(0, 0), (0, 0), (1, 1), (1, 0)],
+        ),
+        (
+            "connection close",
+            CLOSE_RESPONSE,
+            false,
+            [(0, 0), (0, 0), (0, 0), (0, 0)],
+        ),
+        (
+            "request unwritten",
+            OK_RESPONSE,
+            true,
+            [(0, 0), (0, 0), (0, 0), (1, 0)],
+        ),
+    ];
+    for (case, response, held_write, expected) in cases {
+        let observed = run_on_host(move |context| {
+            Box::pin(async move {
+                let respond = Arc::new(tokio::sync::Notify::new());
+                let second = Arc::new(tokio::sync::Notify::new());
+                let (transport, state) =
+                    ScriptedTransport::new(reuse_reads(&respond, &second, response, false));
+                let write_gate = Rc::new(tokio::sync::Notify::new());
+                if held_write {
+                    state.borrow_mut().write_gate = Some((b"GET".to_vec(), Rc::clone(&write_gate)));
+                }
+                let (session, handle) =
+                    OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+                let submission = handle.reserve_request().unwrap().submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                let observe = || (handle.available_capacity(), handle.returning_capacity());
+                let (run, observed) = futures::join!(session.run(), async {
+                    let response = submission.await.unwrap();
+                    let committed = observe();
+                    respond.notify_one();
+                    yield_until(|| response.control.capacity_released()).await;
+                    let unread = observe();
+                    let (_stream, mut source, _control) = response.into_source_parts();
+                    assert_eq!(read_response(&mut source).await.body, b"ok");
+                    drop(source);
+                    // No yield since the read: the driver has not run.
+                    let read = observe();
+                    write_gate.notify_one();
+                    yield_until(|| handle.is_idle() || handle.is_finished()).await;
+                    let retired = observe();
+                    if handle.is_idle() {
+                        assert!(handle.close_when_idle().unwrap());
+                    }
+                    [committed, unread, read, retired]
+                });
+                run.unwrap();
+                observed
+            })
+        });
+        assert_eq!(observed, expected, "{case}");
+    }
+}
+
+/// N8.4w (`DIV-029`): a request reserved and submitted on a consumed exchange's slot, before
+/// the driver's next turn, is committed by that turn once it retires the exchange, and written
+/// in the same poll; the retirement announces no capacity, since the slot is taken, and the
+/// second exchange's retirement announces it as usual.
+#[test]
+fn a_request_reserved_on_a_consumed_exchange_s_slot_is_committed_once_the_exchange_retires() {
+    run_on_host(|context| {
+        Box::pin(async move {
+            let respond = Arc::new(tokio::sync::Notify::new());
+            let second = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) =
+                ScriptedTransport::new(reuse_reads(&respond, &second, OK_RESPONSE, false));
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let log = Rc::new(AdmissionLog::default());
+            handle.set_observer(log.clone()).unwrap();
+            let submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            let (run, (bodies, writes_when_reserved, log_when_committed)) =
+                futures::join!(session.run(), async {
+                    let (_stream, mut source, _control) =
+                        submission.await.unwrap().into_source_parts();
+                    respond.notify_one();
+                    let first = read_response(&mut source).await.body;
+                    drop(source);
+                    // No yield since the read: the driver has not retired the exchange.
+                    let writes = state.borrow().writes.len();
+                    let next = handle
+                        .reserve_request()
+                        .expect("the consumed exchange's slot admits the next request")
+                        .submit(
+                            get_head(),
+                            HttpSourceHolder::empty(),
+                            CancellationToken::never(),
+                        );
+                    let (_stream, mut source, _control) = next.await.unwrap().into_source_parts();
+                    let committed = log.0.borrow().clone();
+                    second.notify_one();
+                    let second = read_response(&mut source).await.body;
+                    drop(source);
+                    yield_until(|| handle.is_idle()).await;
+                    assert!(handle.close_when_idle().unwrap());
+                    ([first, second], writes, committed)
+                });
+            run.unwrap();
+            assert_eq!(bodies, [b"ok".to_vec(), b"ok".to_vec()]);
+            assert_eq!(
+                writes_when_reserved, 1,
+                "only the first request was written"
+            );
+            assert_eq!(state.borrow().writes.concat(), GET_WIRE.repeat(2));
+            assert_eq!(
+                log_when_committed,
+                ["capacity_released(1)"],
+                "the retirement of a slot already taken announces nothing"
+            );
+            assert_eq!(
+                *log.0.borrow(),
+                [
+                    "capacity_released(1)",
+                    "capacity_released(2)",
+                    "capacity_available",
+                    "admission_closed",
+                ]
+            );
+            assert_eq!(state.borrow().close, CloseKind::ShutdownWrite);
+        })
+    });
+}
+
+/// N8.4w (`DIV-029`): a reservation taken on a consumed exchange's slot and dropped before the
+/// driver's next turn announces nothing, and the retirement then announces the free slot once.
+#[test]
+fn a_reservation_dropped_on_a_returning_slot_leaves_one_announcement_to_the_retirement() {
+    run_on_host(|context| {
+        Box::pin(async move {
+            let respond = Arc::new(tokio::sync::Notify::new());
+            let second = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) =
+                ScriptedTransport::new(reuse_reads(&respond, &second, OK_RESPONSE, false));
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let log = Rc::new(AdmissionLog::default());
+            handle.set_observer(log.clone()).unwrap();
+            let submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            let (run, (reserved, dropped, log_when_dropped)) =
+                futures::join!(session.run(), async {
+                    let (_stream, mut source, _control) =
+                        submission.await.unwrap().into_source_parts();
+                    respond.notify_one();
+                    assert_eq!(read_response(&mut source).await.body, b"ok");
+                    drop(source);
+                    let reservation = handle
+                        .reserve_request()
+                        .expect("the consumed exchange's slot admits the next request");
+                    let reserved = handle.available_capacity();
+                    drop(reservation);
+                    let dropped = handle.available_capacity();
+                    let logged = log.0.borrow().clone();
+                    yield_until(|| handle.is_idle()).await;
+                    assert!(handle.close_when_idle().unwrap());
+                    (reserved, dropped, logged)
+                });
+            run.unwrap();
+            assert_eq!((reserved, dropped), (0, 1));
+            assert_eq!(log_when_dropped, ["capacity_released(1)"]);
+            assert_eq!(
+                *log.0.borrow(),
+                [
+                    "capacity_released(1)",
+                    "capacity_available",
+                    "admission_closed"
+                ]
+            );
+            assert_eq!(state.borrow().close, CloseKind::ShutdownWrite);
+        })
+    });
+}
+
+/// N8.4w (`DIV-029`, `DIV-035`): a request admitted on a returning slot is refused unprocessed,
+/// unwritten, when the connection fails before the driver commits it, as one submitted from
+/// `capacity_available` is: here, response bytes behind the finished response.
+#[test]
+fn a_request_on_a_returning_slot_is_refused_unprocessed_when_the_connection_fails_first() {
+    run_on_host(|context| {
+        Box::pin(async move {
+            let respond = Arc::new(tokio::sync::Notify::new());
+            let mut response = OK_RESPONSE.to_vec();
+            response.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+            let (transport, state) =
+                ScriptedTransport::new([ReadAction::WaitData(Arc::clone(&respond), response)]);
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            let (run, (error, unprocessed)) = futures::join!(session.run(), async {
+                let (_stream, mut source, _control) = submission.await.unwrap().into_source_parts();
+                respond.notify_one();
+                assert_eq!(read_response(&mut source).await.body, b"ok");
+                drop(source);
+                let mut next = Box::pin(
+                    handle
+                        .reserve_request()
+                        .expect("the consumed exchange's slot admits the next request")
+                        .submit(
+                            get_head(),
+                            HttpSourceHolder::empty(),
+                            CancellationToken::never(),
+                        ),
+                );
+                let error = next.as_mut().await.err().map(|error| error.code());
+                (error, next.request_unprocessed())
+            });
+            assert_eq!(
+                run.expect_err("bytes behind the response fail the connection")
+                    .code(),
+                HttpErrorCode::PROTOCOL_ERROR
+            );
+            assert_eq!(
+                (error, unprocessed),
+                (Some(HttpErrorCode::PROTOCOL_ERROR), true)
+            );
+            assert_eq!(
+                state.borrow().writes.concat(),
+                GET_WIRE,
+                "the second is unwritten"
+            );
+            assert_eq!(state.borrow().close, CloseKind::Reset);
+        })
+    });
+}
+
+/// `DIV-029`: a reservation that takes a returning slot ends its returning capacity, since the
+/// driver's next turn then retires the exchange without announcing capacity; dropped before
+/// that turn, it leaves the slot returning again.
+#[test]
+fn a_reservation_on_a_returning_slot_ends_its_returning_capacity_until_it_is_dropped() {
+    let observed = run_on_host(|context| {
+        Box::pin(async move {
+            let respond = Arc::new(tokio::sync::Notify::new());
+            let second = Arc::new(tokio::sync::Notify::new());
+            let (transport, _state) =
+                ScriptedTransport::new(reuse_reads(&respond, &second, OK_RESPONSE, false));
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            let observe = || (handle.available_capacity(), handle.returning_capacity());
+            let (run, observed) = futures::join!(session.run(), async {
+                let (_stream, mut source, _control) = submission.await.unwrap().into_source_parts();
+                respond.notify_one();
+                assert_eq!(read_response(&mut source).await.body, b"ok");
+                drop(source);
+                // No yield since the read: the driver has not retired the exchange.
+                let read = observe();
+                let reservation = handle
+                    .reserve_request()
+                    .expect("the consumed exchange's slot admits the next request");
+                let reserved = observe();
+                drop(reservation);
+                let dropped = observe();
+                yield_until(|| handle.is_idle()).await;
+                let retired = observe();
+                assert!(handle.close_when_idle().unwrap());
+                [read, reserved, dropped, retired]
+            });
+            run.unwrap();
+            observed
+        })
+    });
+    assert_eq!(
+        observed,
+        [(1, 1), (0, 0), (1, 1), (1, 0)],
+        "(available_capacity, returning_capacity) after the read, the reservation, its drop and \
+         the retirement"
+    );
+}
+
 #[test]
 fn close_when_idle_closes_an_idle_connection() {
     run_on_host(|context| {
@@ -9839,6 +10149,59 @@ mod n8 {
                     .settle_run()
                     .expect("the idle connection closes")
                     .unwrap();
+            })
+        });
+    }
+
+    /// N8.4w (`DIV-047`, `DIV-029`): the source's completion at the EOM read admits the next
+    /// request at once, before the run retires the exchange; one poll of the run then retires
+    /// the exchange, commits the pull-through request submitted meanwhile and writes it.
+    #[test]
+    fn n8_the_eom_read_admits_the_next_request_before_the_run_retires_the_exchange() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                fixture.origin.send(b"0\r\n\r\n");
+                let Poll::Ready(event) = fixture.body(&mut response, u32::MAX) else {
+                    panic!("the EOM is taken in the read that parses it");
+                };
+                assert!(event.unwrap().eom());
+                assert_eq!(
+                    (
+                        fixture.handle.available_capacity(),
+                        fixture.handle.returning_capacity()
+                    ),
+                    (1, 1),
+                    "the completed source's slot admits before the run polls"
+                );
+                drop(response);
+                let writes = fixture.state.borrow().writes.len();
+                let mut submission = fixture
+                    .handle
+                    .reserve_request()
+                    .unwrap()
+                    .submit_pull_through(
+                        get_head(),
+                        HttpSourceHolder::empty(),
+                        CancellationToken::never(),
+                    );
+                assert!(fixture.poll_run().is_pending());
+                assert_eq!(
+                    fixture.state.borrow().writes.len(),
+                    writes + 1,
+                    "one run poll retires the exchange, then commits and writes the next request"
+                );
+                let Poll::Ready(next) =
+                    Pin::new(&mut submission).poll(&mut Context::from_waker(Waker::noop()))
+                else {
+                    panic!("the next request is committed");
+                };
+                let mut next = Response::PullThrough(next.unwrap());
+                fixture.origin.send(CHUNKED_HEAD);
+                let mut head = fixture.next_header(&mut next);
+                assert_eq!(head.headers_mut().status_code().unwrap(), 200);
+                fixture.finish(&mut next).unwrap();
             })
         });
     }

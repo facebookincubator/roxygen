@@ -38,6 +38,12 @@
 //! already readable, or a failed read, closes admission first; a request that admission refuses
 //! reports `OwnedRequestProgressExt::request_unprocessed` (`DIV-035`).
 //!
+//! A slot is returning (`OwnedH1UpstreamHandle::returning_capacity`, `DIV-029`) from the moment
+//! its reader's completion is all that keeps the driver from retiring a finished exchange on a
+//! reusable connection: the connection admits the next request at once, which the driver
+//! commits once its next turn has retired the exchange, and that retirement announces no
+//! capacity once the slot is taken.
+//!
 //! Pull-through exchanges (`DIV-047`, experimental): under
 //! [`OwnedH1UpstreamSession::run_pull_through`], the body of a
 //! [`OwnedH1UpstreamReservation::submit_pull_through`] exchange holds the driver's drive from its
@@ -91,11 +97,12 @@ struct Shared {
     used: Cell<u32>,
     /// A committed exchange holds the slot until it retires.
     spent: Cell<bool>,
+    /// The live exchange's response signals once only its consumer's completion keeps the
+    /// driver from retiring it and returning the slot. From that completion on, the slot is
+    /// returning, and admission counts it free (`DIV-029`).
+    retiring: RefCell<Option<Rc<IngressSignals>>>,
     /// Requests committed on the connection (`DIV-035`).
     committed: Cell<u64>,
-    /// The live exchange's response signals once only its consumer's completion and the
-    /// driver's retirement keep its slot (`OwnedH1UpstreamHandle::returning_capacity`).
-    retiring: RefCell<Option<Rc<IngressSignals>>>,
     closed: RefCell<Option<HttpError>>,
     observer: RefCell<Option<Rc<dyn OwnedUpstreamObserver>>>,
     queued: RefCell<Option<Submission>>,
@@ -196,12 +203,35 @@ impl Shared {
         self.cancel.get() || self.context.is_cancelled()
     }
 
+    /// The live exchange's consumer completed it once only that completion kept the driver from
+    /// retiring it and returning the slot (`DIV-029`).
+    #[inline]
+    fn returning(&self) -> bool {
+        self.retiring
+            .borrow()
+            .as_ref()
+            .is_some_and(|signals| signals.source_complete.get())
+    }
+
+    /// The connection takes no request: admission closed, or a cancel.
+    #[inline]
+    fn refuses(&self) -> bool {
+        self.cancel.get() || self.closed.borrow().is_some() || self.context.is_cancelled()
+    }
+
+    /// 1 while the slot is free and admission is open. Capacity announcements follow it, so a
+    /// returning slot is announced when the driver retires its exchange.
     fn available(&self) -> u32 {
-        if self.spent.get()
-            || self.cancel.get()
-            || self.closed.borrow().is_some()
-            || self.context.is_cancelled()
-        {
+        if self.spent.get() || self.refuses() {
+            0
+        } else {
+            1 - self.used.get()
+        }
+    }
+
+    /// `available`, counting a returning slot free: what a reservation may take (`DIV-029`).
+    fn admits(&self) -> u32 {
+        if (self.spent.get() && !self.returning()) || self.refuses() {
             0
         } else {
             1 - self.used.get()
@@ -287,30 +317,29 @@ fn finish_panic(panic: Option<PanicPayload>) {
 pub struct OwnedH1UpstreamHandle(Rc<Shared>);
 
 impl OwnedH1UpstreamHandle {
-    /// 1 while the connection's slot is free and admission is open, otherwise 0.
+    /// 1 while the connection's slot is free or returning (`returning_capacity`) and admission
+    /// is open, otherwise 0.
     pub fn available_capacity(&self) -> u32 {
         if self.0.complete.get() {
             0
         } else {
-            self.0.available()
+            self.0.admits()
         }
     }
 
-    /// 1 while the connection's slot is held only by an exchange whose request is written and
-    /// whose response is complete and read to its end (its source completed), on a connection
-    /// that `Http1xCodec` left reusable after that response: unless the connection fails first,
-    /// the driver's next turn, which the source's completion woke, retires the exchange and
-    /// returns the slot (`capacity_available`). Otherwise 0.
+    /// Roxygen-only (`DIV-029`): 1 while the slot is held only by an exchange whose request is
+    /// written and whose response is complete and read to its end (its source completed), on a
+    /// connection that `Http1xCodec` left reusable after that response, with admission open
+    /// and no reservation taken on the slot. The slot admits the next request meanwhile: the
+    /// driver's next turn, which the source's completion woke, retires the exchange, then
+    /// commits a request submitted on the slot, unless the connection fails first. Otherwise 0:
+    /// once a reservation takes the slot, the retirement announces no capacity.
     pub fn returning_capacity(&self) -> u32 {
         let shared = &self.0;
         u32::from(
-            shared
-                .retiring
-                .borrow()
-                .as_ref()
-                .is_some_and(|signals| signals.source_complete.get())
-                && shared.closed.borrow().is_none()
-                && !shared.cancelled()
+            shared.returning()
+                && shared.used.get() == 0
+                && !shared.refuses()
                 && !shared.complete.get(),
         )
     }
@@ -366,8 +395,8 @@ impl OwnedH1UpstreamHandle {
         Ok(changed)
     }
 
-    /// Takes the connection's one slot. Fails with `REFUSED_STREAM` while the slot is taken or
-    /// admission is closed.
+    /// Takes the connection's one slot, free or returning. Fails with `REFUSED_STREAM` while the
+    /// slot is taken or admission is closed.
     pub fn reserve_request(&self) -> Result<OwnedH1UpstreamReservation, HttpError> {
         if self.available_capacity() == 0 {
             return Err(failure(
@@ -2050,8 +2079,8 @@ impl UpstreamDriver {
             idle: Cell::new(true),
             used: Cell::new(0),
             spent: Cell::new(false),
-            committed: Cell::new(0),
             retiring: RefCell::new(None),
+            committed: Cell::new(0),
             closed: RefCell::new(None),
             observer: RefCell::new(None),
             queued: RefCell::new(None),
@@ -2878,30 +2907,32 @@ impl UpstreamDriver {
 
     /// Releases capacity once the request is serialized and the response produced, and
     /// retires the exchange once its response is consumed and its request written: a reusable
-    /// connection then returns its slot, and any other closes admission.
+    /// connection then returns its slot, and any other closes admission. Until the consumption,
+    /// once it is all the retirement of a reusable connection's exchange waits for, the exchange
+    /// is published as retiring (`Shared::retiring`).
     fn settle_exchange(&mut self) -> bool {
         let Some(exchange) = self.exchange.as_mut() else {
             return false;
         };
-        if exchange.request_complete
+        let produced = exchange.request_complete
             && exchange.response_complete
-            && exchange.status.ingress_succeeded()
-        {
+            && exchange.status.ingress_succeeded();
+        if produced {
             // The response is fully produced: a held drive returns to the run before the
             // release's wake, which then reaches only the run (`DIV-047`).
             self.shared.hand_back(exchange.id);
             exchange.status.release();
         }
+        let written = exchange.write_boundary <= self.summary.bytes_written;
         if !(exchange.request_complete
             && exchange.response_complete
             && exchange.consumed
-            && exchange.write_boundary <= self.summary.bytes_written)
+            && written)
         {
-            // Only the consumer's completion is left: the turn it wakes returns the slot.
-            if exchange.request_complete
-                && exchange.response_complete
-                && exchange.status.ingress_succeeded()
-                && exchange.write_boundary <= self.summary.bytes_written
+            // Only the consumer's completion is left: from it on, the slot admits the next
+            // request, which the turn it wakes commits after retiring this one (`DIV-029`).
+            if produced
+                && written
                 && self.codec.is_reusable()
                 && !self.codec.is_busy()
                 && self.shared.retiring.borrow().is_none()

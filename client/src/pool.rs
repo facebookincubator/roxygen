@@ -2182,7 +2182,10 @@ pub(crate) fn notify_session_event(
 /// `ClientSession`'s `TransactionAttached` reaches `notify_session_event`, on
 /// the session's entry alone (`DIV-046`): no longer idle, and moved to the back
 /// when `enqueue_back`. Every other session's state is unchanged: each idle
-/// transition was reported when it happened.
+/// transition was reported when it happened. A reservation that takes the
+/// returning slot an acquisition waits for (a reservation on the session's
+/// handle) wakes that acquisition, which steps again: the slot's retirement
+/// announces no capacity once it is taken (`DIV-029`).
 pub(crate) fn record_reservation(
     pool: &Rc<RefCell<PoolState>>,
     session: &PooledSession,
@@ -2205,6 +2208,11 @@ pub(crate) fn record_reservation(
     state.index_session(slot, enqueue_back);
     #[cfg(debug_assertions)]
     state.verify_index();
+    let claimer = state.take_claimer(Some(session));
+    drop(state);
+    if let Some(claimer) = claimer {
+        let _ = catch_callback(|| claimer.signal());
+    }
 }
 
 fn notify_idle_observer(pool: &Rc<RefCell<PoolState>>) {

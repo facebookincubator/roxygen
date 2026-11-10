@@ -3953,3 +3953,159 @@ fn the_router_s_session_parameters_are_accepted_with_pull_through() {
         "two pull-through exchanges reuse one connection"
     );
 }
+
+/// N8.4w (`DIV-046`): while an acquisition waits, the session a back-to-back
+/// acquisition's previous exchange is returning goes to the waiter, not to
+/// that acquisition: the retirement's `capacity_available` wakes the first
+/// waiter, as before. Two streams of five exchanges each share one
+/// connection and alternate, the second taking the session after the
+/// first's first exchange.
+#[test]
+fn a_waiting_acquisition_takes_a_returning_session_before_its_consumer_acquires_again() {
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let order = run_on_worker(move |context| async move {
+        let pool = pool(&context, address, CodecProtocol::Http11, 1);
+        let order = RefCell::new(Vec::new());
+        let first = acquire(&pool).await;
+        order.borrow_mut().push(0);
+        let stream = |id: usize, first: Option<OwnedClientReservation>| {
+            let (pool, order) = (&pool, &order);
+            async move {
+                let mut reservation = first;
+                for exchanged in 1..=5 {
+                    let held = match reservation.take() {
+                        Some(held) => held,
+                        None => {
+                            let next = acquire(pool).await.reservation;
+                            order.borrow_mut().push(id);
+                            next
+                        }
+                    };
+                    assert_eq!(exchange(held, "/").await, b"ok");
+                    if exchanged == 5 {
+                        break;
+                    }
+                }
+            }
+        };
+        futures::join!(stream(1, None), stream(0, Some(first.reservation)));
+        order.into_inner()
+    });
+    assert_eq!(
+        (order, origin.accepted()),
+        (vec![0, 1, 0, 1, 0, 1, 0, 1, 0, 1], 1),
+        "each stream's next acquisition waits behind the other's, which takes the session first"
+    );
+}
+
+/// N8.4w (`DIV-046`): with reuse disabled, a back-to-back acquisition does
+/// not take the session its previous exchange is returning, which the release
+/// drains: it dials anew.
+#[test]
+fn max_connections_zero_never_reuses_a_returning_session() {
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let (replaced, body) = run_on_worker(move |context| async move {
+        let pool = pool(&context, address, CodecProtocol::Http11, 0);
+        let first = acquire(&pool).await;
+        assert_eq!(exchange(first.reservation, "/").await, b"ok");
+        let second = acquire(&pool).await;
+        let replaced = local(&first.session) != local(&second.session);
+        (replaced, exchange(second.reservation, "/").await)
+    });
+    assert_eq!(
+        (replaced, body, origin.accepted()),
+        (true, b"ok".to_vec(), 2),
+        "the next exchange dials anew"
+    );
+}
+
+/// `DIV-046`, `DIV-029`: an acquisition waits for a returning HTTP/1.1 session while another
+/// waits for its dial; a reservation then taken on that session's handle takes the slot, whose
+/// retirement announces no capacity, so it wakes the waiting acquisition, which dials. Under
+/// either selection, with this module's pool parameters and with the router's.
+#[test]
+fn a_reservation_on_a_claimed_returning_session_wakes_the_acquisition_waiting_for_it() {
+    let cases = [
+        OwnedSessionSelection::FirstAvailable,
+        OwnedSessionSelection::LeastLoaded,
+    ]
+    .into_iter()
+    .flat_map(|selection| [false, true].map(|router| (selection, router)));
+    let observed: Vec<_> = cases
+        .map(|(selection, router)| {
+            let origin = Origin::start(CodecProtocol::Http11);
+            let address = origin.address;
+            let (attempts, served) = run_on_worker(move |context| async move {
+                let (params, session) = if router {
+                    router_http1()
+                } else {
+                    (params(4), untimed())
+                };
+                let pool = pool_with(&context, address, CodecProtocol::Http11, params, session);
+                pool.set_session_selection(selection)
+                    .expect("an open pool takes a selection");
+                let one = acquire(&pool).await;
+                let two = acquire(&pool).await;
+                let first = submit(one.reservation, "/").await;
+                let second = submit(two.reservation, "/").await;
+                until(|| first.request.capacity_released() && second.request.capacity_released())
+                    .await;
+                let attempts = pool.connection_attempts_for_test();
+                let mut earlier =
+                    pin!(pool.get_session_with_reservation(CancellationToken::never()));
+                assert!(
+                    poll_once(earlier.as_mut()).await.is_pending(),
+                    "no slot is free"
+                );
+                // Read from the buffer, with no yield: the second session's slot is returning.
+                assert_eq!(read_body(second).await, b"ok");
+                let mut waiting =
+                    pin!(pool.get_session_with_reservation(CancellationToken::never()));
+                assert!(poll_once(waiting.as_mut()).await.is_pending());
+                let claimed = pool.connection_attempts_for_test() - attempts;
+                let held = two
+                    .session
+                    .reserve_request()
+                    .expect("a returning slot admits a reservation");
+                // An acquisition that no wake reaches resolves only when its wait times out or
+                // the held reservation is released, which comes after both bounds.
+                let bound = TIMEOUT / 4;
+                let earlier = tokio::time::timeout(bound, earlier)
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                let waiting = tokio::time::timeout(bound, waiting)
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                let mut served = Vec::new();
+                for acquired in [earlier, waiting] {
+                    let Some(acquired) = acquired else {
+                        served.push(false);
+                        continue;
+                    };
+                    served.push(local(&acquired.session) != local(&two.session));
+                    assert_eq!(exchange(acquired.reservation, "/").await, b"ok");
+                }
+                drop(held);
+                assert_eq!(read_body(first).await, b"ok");
+                (
+                    [claimed, pool.connection_attempts_for_test() - attempts],
+                    served,
+                )
+            });
+            (selection, router, attempts, served, origin.accepted())
+        })
+        .collect();
+    let expected: Vec<_> = observed
+        .iter()
+        .map(|&(selection, router, ..)| (selection, router, [1, 2], vec![true, true], 4))
+        .collect();
+    assert_eq!(
+        observed, expected,
+        "(selection, router parameters, attempts once the second acquisition waits and in all, \
+         each served on a connection other than the returning session's, connections)"
+    );
+}
