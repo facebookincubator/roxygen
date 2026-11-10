@@ -13,7 +13,6 @@ use std::future::Future;
 use std::hash::BuildHasher;
 use std::hash::RandomState;
 use std::ops::Deref;
-use std::ops::DerefMut;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
 use std::panic::resume_unwind;
@@ -1024,29 +1023,176 @@ impl Failure {
 
 /// Live streams by id. Peers choose stream ids, so each session draws its own seed. Iteration
 /// follows the hash, so every site whose order is observable visits the streams sorted by id.
-struct StreamTable<E, const UPSTREAM: bool>(
-    HashMap<StreamId, Box<Stream<E, UPSTREAM>>, SeedableRandomState>,
-)
+/// A stream is reached mutably only through the methods below, which tell the flow index which
+/// streams may have changed.
+struct StreamTable<E, const UPSTREAM: bool>
 where
-    E: ExchangeStorage<UPSTREAM>;
+    E: ExchangeStorage<UPSTREAM>,
+{
+    map: HashMap<StreamId, Box<Stream<E, UPSTREAM>>, SeedableRandomState>,
+    /// The flow-blocked streams, under a nonzero `write_timeout`.
+    flow: Option<Box<FlowIndex>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Full refreshes of a flow index on this thread, for tests.
+    pub(crate) static FLOW_FULL_REFRESHES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The streams the `flow` slot can wait for, kept per stream instead of found by a pass over
+/// every stream at each idle check. `Stream::send_blocked` and `Stream::awaits_credit` read only
+/// the stream's own plain fields, which change only through a `&mut Stream`; the table hands one
+/// out only after recording its id in `touched`, and `StreamTable::refresh_flow` evaluates both
+/// predicates again for exactly those streams.
+#[derive(Default)]
+struct FlowIndex {
+    /// Streams reached mutably since the last refresh; may repeat.
+    touched: Vec<StreamId>,
+    /// Every stream may have changed: `iter_mut`, or `touched` outgrew the table.
+    all: bool,
+    /// The streams whose `send_blocked` holds, sorted by id.
+    send_blocked: Vec<StreamId>,
+    /// The streams whose `awaits_credit` holds, sorted by id.
+    awaits_credit: Vec<StreamId>,
+}
+
+impl FlowIndex {
+    #[inline(always)]
+    fn touch(&mut self, id: StreamId, live: usize) {
+        if self.all || self.touched.last() == Some(&id) {
+            return;
+        }
+        if self.touched.len() > 2 * live + 32 {
+            self.touch_all();
+        } else {
+            self.touched.push(id);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn touch_all(&mut self) {
+        self.all = true;
+        self.touched.clear();
+    }
+
+    fn set_member(set: &mut Vec<StreamId>, id: StreamId, member: bool) {
+        match (set.binary_search(&id), member) {
+            (Err(at), true) => set.insert(at, id),
+            (Ok(at), false) => {
+                set.remove(at);
+            }
+            _ => {}
+        }
+    }
+}
 
 impl<E, const UPSTREAM: bool> StreamTable<E, UPSTREAM>
 where
     E: ExchangeStorage<UPSTREAM>,
 {
-    fn with_hasher(state: SeedableRandomState) -> Self {
-        Self(HashMap::with_hasher(state))
+    fn with_hasher(state: SeedableRandomState, flow_index: bool) -> Self {
+        Self {
+            map: HashMap::with_hasher(state),
+            flow: flow_index.then(Box::default),
+        }
+    }
+
+    #[inline(always)]
+    fn touch(&mut self, id: StreamId) {
+        if let Some(flow) = &mut self.flow {
+            flow.touch(id, self.map.len());
+        }
+    }
+
+    #[inline(always)]
+    fn get_mut(&mut self, id: &StreamId) -> Option<&mut Box<Stream<E, UPSTREAM>>> {
+        self.touch(*id);
+        self.map.get_mut(id)
+    }
+
+    #[inline(always)]
+    fn entry(&mut self, id: StreamId) -> Entry<'_, StreamId, Box<Stream<E, UPSTREAM>>> {
+        self.touch(id);
+        self.map.entry(id)
+    }
+
+    #[inline(always)]
+    fn remove(&mut self, id: &StreamId) -> Option<Box<Stream<E, UPSTREAM>>> {
+        self.touch(*id);
+        self.map.remove(id)
+    }
+
+    #[inline(always)]
+    fn insert(
+        &mut self,
+        id: StreamId,
+        stream: Box<Stream<E, UPSTREAM>>,
+    ) -> Option<Box<Stream<E, UPSTREAM>>> {
+        self.touch(id);
+        self.map.insert(id, stream)
+    }
+
+    fn iter_mut(
+        &mut self,
+    ) -> std::collections::hash_map::IterMut<'_, StreamId, Box<Stream<E, UPSTREAM>>> {
+        if let Some(flow) = &mut self.flow {
+            flow.touch_all();
+        }
+        self.map.iter_mut()
+    }
+
+    /// Brings the flow index up to date with every stream reached mutably since the last
+    /// refresh, and returns it; `None` without one. Many records relative to the table, such as
+    /// one read of WINDOW_UPDATE frames that unblocks every blocked stream, take one full pass
+    /// instead of a sorted-set shift per stream.
+    fn refresh_flow(&mut self) -> Option<&FlowIndex> {
+        let Self { map, flow } = self;
+        let flow = flow.as_deref_mut()?;
+        if flow.touched.len() > 64 && 4 * flow.touched.len() > map.len() {
+            flow.all = true;
+        }
+        if flow.all {
+            #[cfg(test)]
+            FLOW_FULL_REFRESHES.with(|count| count.set(count.get() + 1));
+            flow.all = false;
+            flow.touched.clear();
+            flow.send_blocked.clear();
+            flow.awaits_credit.clear();
+            for (id, stream) in map.iter() {
+                if stream.send_blocked() {
+                    flow.send_blocked.push(*id);
+                }
+                if stream.awaits_credit() {
+                    flow.awaits_credit.push(*id);
+                }
+            }
+            flow.send_blocked.sort_unstable();
+            flow.awaits_credit.sort_unstable();
+        } else {
+            for index in 0..flow.touched.len() {
+                let id = flow.touched[index];
+                let (blocked, credit) = map.get(&id).map_or((false, false), |stream| {
+                    (stream.send_blocked(), stream.awaits_credit())
+                });
+                FlowIndex::set_member(&mut flow.send_blocked, id, blocked);
+                FlowIndex::set_member(&mut flow.awaits_credit, id, credit);
+            }
+            flow.touched.clear();
+        }
+        Some(flow)
     }
 
     fn ids_in_order(&self) -> Vec<StreamId> {
-        let mut ids: Vec<_> = self.0.keys().copied().collect();
+        let mut ids: Vec<_> = self.map.keys().copied().collect();
         ids.sort_unstable();
         ids
     }
 
     fn drop_in_order(&mut self) {
         for id in self.ids_in_order() {
-            drop(self.0.remove(&id));
+            drop(self.map.remove(&id));
         }
     }
 }
@@ -1071,12 +1217,13 @@ where
             }
         }
 
-        if !self.0.is_empty() {
+        if !self.map.is_empty() {
             Rest(self).0.drop_in_order();
         }
     }
 }
 
+/// Read access only: mutable access goes through the tracked methods above.
 impl<E, const UPSTREAM: bool> Deref for StreamTable<E, UPSTREAM>
 where
     E: ExchangeStorage<UPSTREAM>,
@@ -1084,16 +1231,7 @@ where
     type Target = HashMap<StreamId, Box<Stream<E, UPSTREAM>>, SeedableRandomState>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<E, const UPSTREAM: bool> DerefMut for StreamTable<E, UPSTREAM>
-where
-    E: ExchangeStorage<UPSTREAM>,
-{
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &self.map
     }
 }
 
@@ -1530,7 +1668,8 @@ where
             self.streams.is_empty(),
             "the seed is fixed before any stream opens"
         );
-        self.streams = StreamTable::with_hasher(fixed_stream_hash_state(seed));
+        let flow_index = self.streams.flow.is_some();
+        self.streams = StreamTable::with_hasher(fixed_stream_hash_state(seed), flow_index);
         self
     }
 
@@ -1717,7 +1856,7 @@ where
                         rate_limits,
                     },
                 },
-                streams: StreamTable::with_hasher(stream_hash_state()),
+                streams: StreamTable::with_hasher(stream_hash_state(), !io.write_timeout.is_zero()),
                 ingress: BufQueue::new(io.buffer_limit),
                 egress,
                 read,
@@ -2413,12 +2552,25 @@ where
 
     /// Uniplex's `h2_blocked_streams`: with the connection out of send credit, the streams whose
     /// next body needs credit, else the streams out of stream credit, sorted by id. Returns
-    /// whether the connection is out of credit.
-    fn flow_blocked_streams(&self, blocked: &mut Vec<StreamId>) -> bool {
+    /// whether the connection is out of credit. Reads the flow index, which costs the streams
+    /// reached mutably since the last check plus the blocked streams, not a pass over every
+    /// stream.
+    fn flow_blocked_streams(&mut self, blocked: &mut Vec<StreamId>) -> bool {
         let connection = self.connection.codec.available_send() == 0;
         blocked.clear();
-        blocked.extend(
-            self.streams
+        let flow = self
+            .streams
+            .refresh_flow()
+            .expect("a nonzero write timeout keeps a flow index");
+        blocked.extend_from_slice(if connection {
+            &flow.awaits_credit
+        } else {
+            &flow.send_blocked
+        });
+        #[cfg(debug_assertions)]
+        {
+            let mut walked: Vec<StreamId> = self
+                .streams
                 .iter()
                 .filter(|(_, stream)| {
                     if connection {
@@ -2427,9 +2579,14 @@ where
                         stream.send_blocked()
                     }
                 })
-                .map(|(id, _)| *id),
-        );
-        blocked.sort_unstable();
+                .map(|(id, _)| *id)
+                .collect();
+            walked.sort_unstable();
+            debug_assert_eq!(
+                *blocked, walked,
+                "the flow index matches a pass over the streams"
+            );
+        }
         connection
     }
 

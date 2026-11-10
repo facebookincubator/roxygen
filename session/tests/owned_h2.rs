@@ -15695,6 +15695,376 @@ fn uniplex_buffer_timeout_is_a_flow_control_timeout_on_the_owned_driver() {
     assert_eq!(uniplex.error, None);
 }
 
+/// `streams` GETs whose responses each need `extra` bytes beyond the 65,535-byte stream window,
+/// with the connection window widened so only the stream windows block.
+fn st6b_stream_blocked_gets(streams: usize) -> (Http2Codec, Vec<u8>) {
+    let (mut peer, mut input) = ready_owner_requests(streams);
+    input.extend(eligibility_frame(
+        &mut peer,
+        EgressFrame::WindowUpdate {
+            stream: StreamId::UNSPECIFIED,
+            amount: i32::MAX as u32 - 65_535,
+        },
+    ));
+    (peer, input)
+}
+
+/// A SETTINGS change of the initial window adjusts every stream's window at once (the table's
+/// `iter_mut`, which refreshes the whole flow index). Streams that the change unblocks by one
+/// byte and that then block again keep the flow slot, restamped at the change: they are reset a
+/// full write timeout after it, not a millisecond earlier.
+#[test]
+fn flow_index_follows_an_initial_window_change_to_every_stream() {
+    const STREAMS: usize = 4;
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (mut peer, input) = st6b_stream_blocked_gets(STREAMS);
+            let grow = eligibility_frame(
+                &mut peer,
+                EgressFrame::Settings {
+                    settings: &[CodecSetting {
+                        identifier: SettingsId::InitialWindowSize.as_u16(),
+                        value: 65_536,
+                    }],
+                },
+            );
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (session, handle, state, _probes) = write_timed_session(
+                context,
+                [
+                    FixtureRead::Data(input),
+                    FixtureRead::WaitData(Arc::clone(&gate), grow),
+                ],
+                vec![Reply::Body(65_535 + 2); STREAMS],
+                WRITE,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                complete_credit_wait(|| {
+                    written_frames(&state, STREAMS).body_bytes == 65_535 * STREAMS
+                })
+                .await;
+                settle_turns(32).await;
+                host.advance(WRITE / 2);
+                let refreshes = crate::owned_h2::FLOW_FULL_REFRESHES.with(Cell::get);
+                gate.notify_one();
+                complete_credit_wait(|| {
+                    written_frames(&state, STREAMS).body_bytes == 65_536 * STREAMS
+                })
+                .await;
+                settle_turns(32).await;
+                assert!(
+                    crate::owned_h2::FLOW_FULL_REFRESHES.with(Cell::get) > refreshes,
+                    "the flow index was refreshed in full"
+                );
+                host.advance(WRITE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert!(
+                    written_frames(&state, STREAMS).resets.is_empty(),
+                    "the window change restamps the flow slot"
+                );
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                let frames = written_frames(&state, STREAMS);
+                assert_eq!(
+                    frames.resets,
+                    (0..STREAMS as u64)
+                        .map(|index| (
+                            StreamId::new(2 * index + 1),
+                            H2ErrorCode::FLOW_CONTROL_ERROR
+                        ))
+                        .collect::<Vec<_>>()
+                );
+                assert!(handle.initiate_drain().unwrap());
+            });
+            run.expect("the drained connection closes cleanly");
+        })
+    });
+}
+
+/// More stream accesses between two idle checks than the flow index tracks one by one (here,
+/// interleaved WINDOW_UPDATEs in one read) fall back to a full refresh, which still finds every
+/// stream that blocks again; they are reset a full write timeout after the read.
+#[test]
+fn flow_index_overflow_refreshes_every_stream() {
+    const STREAMS: usize = 8;
+    const ROUNDS: u32 = 10;
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (mut peer, input) = st6b_stream_blocked_gets(STREAMS);
+            let mut updates = Vec::new();
+            for _ in 0..ROUNDS {
+                for index in 0..STREAMS as u64 {
+                    updates.extend(eligibility_frame(
+                        &mut peer,
+                        EgressFrame::WindowUpdate {
+                            stream: StreamId::new(2 * index + 1),
+                            amount: 1,
+                        },
+                    ));
+                }
+            }
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (session, handle, state, _probes) = write_timed_session(
+                context,
+                [
+                    FixtureRead::Data(input),
+                    FixtureRead::WaitData(Arc::clone(&gate), updates),
+                ],
+                vec![Reply::Body(65_535 + 100); STREAMS],
+                WRITE,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                complete_credit_wait(|| {
+                    written_frames(&state, STREAMS).body_bytes == 65_535 * STREAMS
+                })
+                .await;
+                settle_turns(32).await;
+                host.advance(WRITE / 2);
+                let refreshes = crate::owned_h2::FLOW_FULL_REFRESHES.with(Cell::get);
+                gate.notify_one();
+                complete_credit_wait(|| {
+                    written_frames(&state, STREAMS).body_bytes
+                        == (65_535 + ROUNDS as usize) * STREAMS
+                })
+                .await;
+                settle_turns(32).await;
+                assert!(
+                    crate::owned_h2::FLOW_FULL_REFRESHES.with(Cell::get) > refreshes,
+                    "the flow index was refreshed in full"
+                );
+                host.advance(WRITE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert!(
+                    written_frames(&state, STREAMS).resets.is_empty(),
+                    "the read restamps the flow slot"
+                );
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    written_frames(&state, STREAMS).resets,
+                    (0..STREAMS as u64)
+                        .map(|index| (
+                            StreamId::new(2 * index + 1),
+                            H2ErrorCode::FLOW_CONTROL_ERROR
+                        ))
+                        .collect::<Vec<_>>()
+                );
+                assert!(handle.initiate_drain().unwrap());
+            });
+            run.expect("the drained connection closes cleanly");
+        })
+    });
+}
+
+/// A SETTINGS change to an initial window that the open streams have already used up blocks
+/// every one of them on its own window, though none has a body waiting and none is polled or
+/// serialized again (the window change reaches them only through the stream table's `iter_mut`):
+/// each is reset with FLOW_CONTROL_ERROR a full write timeout after the change.
+#[test]
+fn initial_window_shrink_blocks_idle_open_streams_at_the_flow_timeout() {
+    const STREAMS: usize = 4;
+    const BODY: usize = 1_000;
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (mut peer, input) = st6b_stream_blocked_gets(STREAMS);
+            let shrink = eligibility_frame(
+                &mut peer,
+                EgressFrame::Settings {
+                    settings: &[CodecSetting {
+                        identifier: SettingsId::InitialWindowSize.as_u16(),
+                        value: BODY as u64,
+                    }],
+                },
+            );
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let terminal = Arc::new(tokio::sync::Notify::new());
+            let (fixture, state) = FixtureTransport::new([
+                FixtureRead::Data(input),
+                FixtureRead::WaitData(Arc::clone(&gate), shrink),
+            ]);
+            let (mut application, _probes) = Application::new(vec![Reply::Body(BODY); STREAMS]);
+            application.empty_terminal = Some(Arc::clone(&terminal));
+            let mut config = options(context, Rc::new(UntimedReads(fixture)));
+            config.io.write_timeout = WRITE;
+            let (session, handle) = OwnedH2Session::new(application, config).expect("owned H2");
+            let (run, ()) = futures::join!(session.run(), async {
+                complete_credit_wait(|| {
+                    written_frames(&state, STREAMS).body_bytes == BODY * STREAMS
+                })
+                .await;
+                settle_turns(32).await;
+                host.advance(WRITE * 2);
+                settle_turns(32).await;
+                assert!(
+                    written_frames(&state, STREAMS).resets.is_empty(),
+                    "open streams with send credit are not flow-blocked"
+                );
+                gate.notify_one();
+                settle_turns(32).await;
+                host.advance(WRITE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert!(
+                    written_frames(&state, STREAMS).resets.is_empty(),
+                    "the flow-control timeout came early"
+                );
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    written_frames(&state, STREAMS).resets,
+                    (0..STREAMS as u64)
+                        .map(|index| (
+                            StreamId::new(2 * index + 1),
+                            H2ErrorCode::FLOW_CONTROL_ERROR
+                        ))
+                        .collect::<Vec<_>>()
+                );
+                assert!(handle.initiate_drain().unwrap());
+            });
+            run.expect("the drained connection closes cleanly");
+        })
+    });
+}
+
+/// A connection WINDOW_UPDATE whose credit the stream's own window cuts short exhausts that
+/// window in a serialization that polls no owner, since body stays pending: the stream turns
+/// from connection-blocked to blocked on its own window, and the flow-control timeout resets it
+/// with FLOW_CONTROL_ERROR a full write timeout after the update, not a millisecond earlier.
+#[test]
+fn connection_credit_cut_short_by_the_stream_window_arms_the_stream_flow_timeout() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (mut peer, mut input) = ready_owner_requests(1);
+            input.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::new(1),
+                    amount: 50,
+                },
+            ));
+            let credit = eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::UNSPECIFIED,
+                    amount: 1_000,
+                },
+            );
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (session, handle, state, _probes) = write_timed_session(
+                context,
+                [
+                    FixtureRead::Data(input),
+                    FixtureRead::WaitData(Arc::clone(&gate), credit),
+                ],
+                vec![Reply::Body(65_535 + 100)],
+                WRITE,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                complete_credit_wait(|| written_frames(&state, 1).body_bytes == 65_535).await;
+                settle_turns(32).await;
+                host.advance(WRITE / 2);
+                gate.notify_one();
+                complete_credit_wait(|| written_frames(&state, 1).body_bytes == 65_535 + 50).await;
+                settle_turns(32).await;
+                host.advance(WRITE - Duration::from_millis(1));
+                settle_turns(32).await;
+                let frames = written_frames(&state, 1);
+                assert!(
+                    frames.resets.is_empty(),
+                    "the flow-control timeout came early"
+                );
+                assert!(
+                    frames.goaways.is_empty(),
+                    "the connection is no longer blocked"
+                );
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                let frames = written_frames(&state, 1);
+                assert_eq!(
+                    frames.resets,
+                    [(StreamId::new(1), H2ErrorCode::FLOW_CONTROL_ERROR)]
+                );
+                assert!(frames.goaways.is_empty());
+                assert!(handle.initiate_drain().unwrap());
+            });
+            run.expect("the drained connection closes cleanly");
+        })
+    });
+}
+
+/// A mass unblock: one read of WINDOW_UPDATE frames, in ascending stream order, unblocks every
+/// idle stream that a SETTINGS change blocked on its own window. The next idle check refreshes
+/// the flow index in one full pass instead of taking the streams out of its sets one by one, and
+/// finds what a pass over the streams finds: nothing blocked, so no stream is reset.
+#[test]
+fn flow_index_refreshes_in_full_after_a_mass_unblock() {
+    const STREAMS: usize = 100;
+    const BODY: usize = 1_000;
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (mut peer, input) = st6b_stream_blocked_gets(STREAMS);
+            let shrink = eligibility_frame(
+                &mut peer,
+                EgressFrame::Settings {
+                    settings: &[CodecSetting {
+                        identifier: SettingsId::InitialWindowSize.as_u16(),
+                        value: BODY as u64,
+                    }],
+                },
+            );
+            let mut unblock = Vec::new();
+            for index in 0..STREAMS as u64 {
+                unblock.extend(eligibility_frame(
+                    &mut peer,
+                    EgressFrame::WindowUpdate {
+                        stream: StreamId::new(2 * index + 1),
+                        amount: 1,
+                    },
+                ));
+            }
+            let shrink_gate = Arc::new(tokio::sync::Notify::new());
+            let unblock_gate = Arc::new(tokio::sync::Notify::new());
+            let terminal = Arc::new(tokio::sync::Notify::new());
+            let (fixture, state) = FixtureTransport::new([
+                FixtureRead::Data(input),
+                FixtureRead::WaitData(Arc::clone(&shrink_gate), shrink),
+                FixtureRead::WaitData(Arc::clone(&unblock_gate), unblock),
+            ]);
+            let (mut application, _probes) = Application::new(vec![Reply::Body(BODY); STREAMS]);
+            application.empty_terminal = Some(Arc::clone(&terminal));
+            let mut config = options(context, Rc::new(UntimedReads(fixture)));
+            config.io.write_timeout = WRITE;
+            let (session, handle) = OwnedH2Session::new(application, config).expect("owned H2");
+            let (run, ()) = futures::join!(session.run(), async {
+                complete_credit_wait(|| {
+                    written_frames(&state, STREAMS).body_bytes == BODY * STREAMS
+                })
+                .await;
+                settle_turns(32).await;
+                shrink_gate.notify_one();
+                settle_turns(32).await;
+                let refreshes = crate::owned_h2::FLOW_FULL_REFRESHES.with(Cell::get);
+                unblock_gate.notify_one();
+                settle_turns(32).await;
+                assert_eq!(
+                    crate::owned_h2::FLOW_FULL_REFRESHES.with(Cell::get) - refreshes,
+                    1,
+                    "the check after the unblock refreshes the flow index in one full pass"
+                );
+                host.advance(WRITE * 2);
+                settle_turns(32).await;
+                assert!(
+                    written_frames(&state, STREAMS).resets.is_empty(),
+                    "no stream is blocked after the unblock"
+                );
+                terminal.notify_waiters();
+                settle_turns(32).await;
+                assert!(handle.initiate_drain().unwrap());
+            });
+            run.expect("the drained connection closes cleanly");
+        })
+    });
+}
+
 /// A hundred streams that block one after another hold one wheel slot for the connection's
 /// flow-control timeout: each arrival restamps it later, which is a store, not a relink, the
 /// wheel re-slots it about once per timeout period, and its one fire resets every blocked stream.
