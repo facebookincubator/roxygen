@@ -2129,6 +2129,7 @@ impl UpstreamDriver {
 
     /// Polls the driver, isolating a callback panic: the panic is retained, the connection
     /// aborts, and the driver is woken to finish its cleanup.
+    #[inline(always)]
     fn poll_isolated(
         &mut self,
         context: &mut Context<'_>,

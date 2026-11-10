@@ -649,6 +649,7 @@ pub trait HttpCodec {
     /// Codec implementations normally call
     /// [`HttpCodec::dispatch_ingress_callback`] rather than invoking this
     /// method directly.
+    #[inline]
     fn apply_callback_actions(
         &mut self,
         actions: CodecCallbackActions,

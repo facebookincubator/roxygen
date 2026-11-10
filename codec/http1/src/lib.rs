@@ -2457,6 +2457,7 @@ impl Http1xCodec {
         self.parse_ingress(input, callback, callback_egress)
     }
 
+    #[inline]
     fn parse_ingress(
         &mut self,
         input: &BufQueue,
