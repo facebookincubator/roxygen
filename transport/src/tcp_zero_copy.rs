@@ -14,6 +14,8 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::io;
 #[cfg(target_os = "linux")]
+use std::mem::MaybeUninit;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::rc::Weak;
@@ -30,6 +32,12 @@ use roxygen_runtime::worker::WorkerCleanupRegistration;
 use roxygen_runtime::worker::WorkerContext;
 
 const IOV_MAX: usize = 1024;
+/// Iovecs that one `sendmsg` passes from the stack, as
+/// `folly::AsyncSocket::writeChain` keeps up to `kSmallIoVecSize` (64) iovecs
+/// in a stack array; a write of more segments builds a heap array, as Folly's
+/// does.
+#[cfg(target_os = "linux")]
+const INLINE_IOVECS: usize = 64;
 const COMPLETION_BATCH: usize = 64;
 const LOAN_BUDGET: usize = 64 * 1024 * 1024;
 
@@ -1070,6 +1078,22 @@ struct Completion {
     copied: bool,
 }
 
+#[cfg(all(test, target_os = "linux"))]
+std::thread_local! {
+    static SEND_IOVEC_ARRAYS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn record_send_iovec_array() {
+    SEND_IOVEC_ARRAYS.with(|count| count.set(count.get() + 1));
+}
+
+/// Heap iovec arrays that `send_queue` built on this thread.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn send_iovec_arrays_for_test() -> usize {
+    SEND_IOVEC_ARRAYS.with(Cell::get)
+}
+
 #[cfg(target_os = "linux")]
 fn send_queue(
     stream: &tokio::net::TcpStream,
@@ -1078,27 +1102,39 @@ fn send_queue(
 ) -> io::Result<usize> {
     use std::os::fd::AsRawFd;
 
-    let mut vectors = data
-        .segments()
-        .take(IOV_MAX)
-        .map(|segment| libc::iovec {
+    let count = data.segment_count().min(IOV_MAX);
+    let mut inline = [MaybeUninit::<libc::iovec>::uninit(); INLINE_IOVECS];
+    let mut spilled = Vec::<libc::iovec>::new();
+    let vectors = if count <= INLINE_IOVECS {
+        &mut inline[..count]
+    } else {
+        #[cfg(test)]
+        record_send_iovec_array();
+        spilled.reserve_exact(count);
+        &mut spilled.spare_capacity_mut()[..count]
+    };
+    let mut filled = 0;
+    for (vector, segment) in vectors.iter_mut().zip(data.segments()) {
+        vector.write(libc::iovec {
             iov_base: segment.as_ptr().cast_mut().cast(),
             iov_len: segment.len(),
-        })
-        .collect::<Vec<_>>();
+        });
+        filled += 1;
+    }
     // SAFETY: all-zero is a valid `msghdr`; every pointer field is either null
     // or replaced below with storage that remains borrowed for the syscall.
     let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
-    message.msg_iov = vectors.as_mut_ptr();
-    message.msg_iovlen = vectors.len();
+    message.msg_iov = vectors.as_mut_ptr().cast::<libc::iovec>();
+    message.msg_iovlen = filled;
     let flags =
         libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL | if zero_copy { libc::MSG_ZEROCOPY } else { 0 };
-    // SAFETY: `stream` owns the live descriptor. Each iovec points into an
-    // immutable `BufQueue` segment retained by the caller for this syscall. For
-    // `MSG_ZEROCOPY`, `ZeroCopyState::prepare` has additionally installed a
-    // shared clone before this call; success retains exactly the accepted
-    // prefix until `CompletionControl` validates its kernel cookie, while every
-    // failure path removes the unsubmitted reservation.
+    // SAFETY: `stream` owns the live descriptor. `msg_iov` names the `filled`
+    // iovecs written above, whose storage outlives this syscall. Each points
+    // into an immutable `BufQueue` segment retained by the caller for this
+    // syscall. For `MSG_ZEROCOPY`, `ZeroCopyState::prepare` has additionally
+    // installed a shared clone before this call; success retains exactly the
+    // accepted prefix until `CompletionControl` validates its kernel cookie,
+    // while every failure path removes the unsubmitted reservation.
     let result = unsafe { libc::sendmsg(stream.as_raw_fd(), &message, flags) };
     if result < 0 {
         Err(io::Error::last_os_error())
@@ -1453,6 +1489,90 @@ mod tests {
                 controller.poll_write_with(&data, false, || Poll::Ready(Ok(())), |_| Ok(5)),
                 Poll::Ready(Ok(5))
             ));
+        }
+    }
+
+    /// `send_queue`'s iovec arrays, over a real loopback socket.
+    #[cfg(target_os = "linux")]
+    mod send_iovecs {
+        use super::*;
+
+        /// A connected loopback pair: the Tokio writer and its blocking peer.
+        async fn loopback() -> (tokio::net::TcpStream, std::net::TcpStream) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (peer, _) = listener.accept().unwrap();
+            (stream, peer)
+        }
+
+        /// `count` segments of 8 bytes each; segment `index` holds bytes of `index % 251`.
+        fn eight_byte_segments(count: usize) -> BufQueue {
+            let mut data = BufQueue::new(count * 8);
+            for index in 0..count {
+                data.push_copy(&[(index % 251) as u8; 8]).unwrap();
+            }
+            data
+        }
+
+        /// Writes `data` with one `poll_write` of a plain controller, as an owned TCP write does,
+        /// and returns the bytes that one `sendmsg` accepted.
+        fn send_once(stream: &tokio::net::TcpStream, data: &BufQueue) -> usize {
+            let mut controller = TcpZeroCopy::new();
+            let mut context = Context::from_waker(Waker::noop());
+            match controller.poll_write(stream, &mut context, data, false) {
+                Poll::Ready(Ok(written)) => written,
+                outcome => panic!("a fresh loopback socket accepts the send: {outcome:?}"),
+            }
+        }
+
+        fn receive_exactly(peer: &mut std::net::TcpStream, length: usize) -> Vec<u8> {
+            let mut received = vec![0; length];
+            peer.read_exact(&mut received).unwrap();
+            received
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_send_of_up_to_64_segments_builds_no_heap_iovec_array() {
+            let (stream, mut peer) = loopback().await;
+            for count in [1, 3, 64] {
+                let data = eight_byte_segments(count);
+                let arrays = send_iovec_arrays_for_test();
+                assert_eq!(send_once(&stream, &data), count * 8, "{count} segments");
+                assert_eq!(
+                    send_iovec_arrays_for_test(),
+                    arrays,
+                    "a send of {count} segments keeps its iovecs on the stack"
+                );
+                let expected = (0..count)
+                    .flat_map(|index| [(index % 251) as u8; 8])
+                    .collect::<Vec<_>>();
+                assert_eq!(receive_exactly(&mut peer, count * 8), expected);
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_send_of_more_than_64_segments_spills_and_sends_at_most_iov_max() {
+            let (stream, mut peer) = loopback().await;
+            for (count, sent) in [(65, 65), (1_100, IOV_MAX)] {
+                let data = eight_byte_segments(count);
+                let arrays = send_iovec_arrays_for_test();
+                assert_eq!(
+                    send_once(&stream, &data),
+                    sent * 8,
+                    "one sendmsg passes the first {sent} of {count} segments"
+                );
+                assert_eq!(
+                    send_iovec_arrays_for_test(),
+                    arrays + 1,
+                    "a send of {count} segments builds one heap iovec array"
+                );
+                let expected = (0..sent)
+                    .flat_map(|index| [(index % 251) as u8; 8])
+                    .collect::<Vec<_>>();
+                assert_eq!(receive_exactly(&mut peer, sent * 8), expected);
+            }
         }
     }
 

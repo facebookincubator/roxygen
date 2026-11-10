@@ -512,8 +512,6 @@ enum QueuedReceipt {
 /// Dropping the queue with a write outstanding resets the transport, as
 /// dropping a write future does.
 pub struct OwnedWriteQueue {
-    io: Weak<dyn ByteStreamIo>,
-    state: Rc<RefCell<TransportState>>,
     worker: WorkerHandle,
     limits: ByteStreamLimits,
     byte_event_capability: ByteEventCapability,
@@ -523,9 +521,12 @@ pub struct OwnedWriteQueue {
     /// Wakes the task that last polled the outstanding write when another task
     /// requests cancellation; it installs no listener until a write pends.
     cancellation_wake: CancellationWakeRegistration,
-    /// Counts each write's progress in turn.
-    progress: WriteProgress,
-    operation: Option<WriteOperation>,
+    /// The operation slot. Every write reuses it, with its transport handles
+    /// and its progress cell, which counts each write's progress in turn.
+    operation: WriteOperation,
+    /// Whether the slot holds the outstanding write: from its start until a
+    /// poll yields its result.
+    writing: bool,
     receipts: VecDeque<QueuedReceipt>,
 }
 
@@ -537,7 +538,7 @@ impl OwnedWriteQueue {
     /// owned HTTP/2's writer for every write the queue holds
     /// (`UniplexWriteQueue::can_write`).
     pub fn can_write(&self, _bytes: usize) -> bool {
-        self.operation.is_none() && self.receipts.len() < WRITE_QUEUE_RECEIPTS
+        !self.writing && self.receipts.len() < WRITE_QUEUE_RECEIPTS
     }
 
     /// Submits `data`, which needs capacity and at most the maximum write
@@ -559,8 +560,8 @@ impl OwnedWriteQueue {
             ));
         }
         let target = WriteTarget {
-            io: &self.io,
-            state: &self.state,
+            io: &self.operation.io,
+            state: &self.operation.state,
             worker: &self.worker,
             limits: self.limits,
             byte_event_capability: self.byte_event_capability,
@@ -571,12 +572,17 @@ impl OwnedWriteQueue {
             data,
             ByteEventWriteFlags::default(),
             WriteKind::Queued {
-                progress: &self.progress,
+                progress: &self.operation.progress,
+                cancellation: &self.cancellation,
             },
-            self.cancellation.clone(),
         ) {
-            WriteStart::Started(operation) => {
-                self.operation = Some(operation);
+            WriteStart::Started {
+                operation,
+                expected,
+                progress,
+            } => {
+                self.operation.restart(operation, expected, progress);
+                self.writing = true;
                 self.receipts
                     .push_back(QueuedReceipt::Writing(requested_bytes));
             }
@@ -595,10 +601,10 @@ impl OwnedWriteQueue {
     /// oldest receipt once its submission is complete. An idle queue registers
     /// nothing.
     pub fn poll_complete(&mut self, context: &mut Context<'_>) -> Poll<QueuedWriteCompletion> {
-        if let Some(operation) = self.operation.as_mut() {
-            match Pin::new(operation).poll(context) {
+        if self.writing {
+            match self.operation.poll_with(context, Some(&self.cancellation)) {
                 Poll::Ready(result) => {
-                    self.operation = None;
+                    self.writing = false;
                     let receipt = self
                         .receipts
                         .back_mut()
@@ -636,8 +642,8 @@ impl OwnedWriteQueue {
     /// not yet accepted: a physical write is outstanding, or the transport can
     /// no longer write.
     pub fn is_saturated(&self) -> bool {
-        let state = self.state.borrow();
-        self.operation.is_some() || state.write_shutdown || state.close_state != CloseState::Open
+        let state = self.operation.state.borrow();
+        self.writing || state.write_shutdown || state.close_state != CloseState::Open
     }
 }
 
@@ -915,6 +921,7 @@ std::thread_local! {
 #[cfg(test)]
 std::thread_local! {
     static WRITE_PROGRESS_CELLS: Cell<usize> = const { Cell::new(0) };
+    static WRITE_OPERATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -944,6 +951,12 @@ pub(crate) fn reader_wake_registrations_for_test() -> usize {
 #[cfg(test)]
 pub(crate) fn write_progress_cells_for_test() -> usize {
     WRITE_PROGRESS_CELLS.with(Cell::get)
+}
+
+/// `WriteOperation`s built on this thread.
+#[cfg(test)]
+pub(crate) fn write_operations_for_test() -> usize {
+    WRITE_OPERATIONS.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -1260,9 +1273,9 @@ enum WriteWait {
     /// An unarmed write that `WriteOperation::finish` retires, waking its task
     /// at the point where an armed write's `TimedBaton::drop` wakes it.
     Retired { _wake: CompletionWake },
-    /// An [`OwnedWriteQueue`]'s write: no deadline, and cancellation is observed
-    /// when the write is polled, which wakes no task.
-    Untimed { cancellation: CancellationToken },
+    /// An [`OwnedWriteQueue`]'s write: no deadline, and the queue's
+    /// cancellation is observed when the write is polled, which wakes no task.
+    Untimed,
 }
 
 struct CompletionWake(Option<Waker>);
@@ -1727,10 +1740,22 @@ impl OwnedByteStream {
             context,
             data,
             flags,
-            WriteKind::Ordinary { timeout },
-            cancellation,
+            WriteKind::Ordinary {
+                timeout,
+                cancellation,
+            },
         ) {
-            WriteStart::Started(operation) => Box::pin(operation),
+            WriteStart::Started {
+                operation,
+                expected,
+                progress,
+            } => Box::pin(WriteOperation::new(
+                self.io.clone(),
+                Rc::clone(&self.state),
+                operation,
+                expected,
+                progress,
+            )),
             WriteStart::Finished(result) => Box::pin(std::future::ready(result)),
         }
     }
@@ -1945,7 +1970,13 @@ fn start_read_operation(
 
 /// A write that [`start_write_operation`] began, or the result it ended with at entry.
 enum WriteStart {
-    Started(WriteOperation),
+    /// The transport's write `operation` of `expected` bytes, and the progress
+    /// handle of the [`WriteOperation`] that the caller builds or restarts.
+    Started {
+        operation: u64,
+        expected: usize,
+        progress: WriteProgress,
+    },
     Finished(Result<WriteInfo, TransportWriteError>),
 }
 
@@ -1983,12 +2014,27 @@ fn check_transport_identity(
 }
 
 /// How [`start_write_operation`] writes.
-#[derive(Clone, Copy)]
 enum WriteKind<'a> {
-    /// An ordinary write, timed by `timeout`.
-    Ordinary { timeout: Duration },
-    /// An [`OwnedWriteQueue`]'s write: untimed, counting its progress in the queue's cell.
-    Queued { progress: &'a WriteProgress },
+    /// An ordinary write, timed by `timeout` and observing `cancellation`.
+    Ordinary {
+        timeout: Duration,
+        cancellation: CancellationToken,
+    },
+    /// An [`OwnedWriteQueue`]'s write: untimed, counting its progress in the
+    /// queue's cell and observing the queue's `cancellation`.
+    Queued {
+        progress: &'a WriteProgress,
+        cancellation: &'a CancellationToken,
+    },
+}
+
+impl WriteKind<'_> {
+    fn cancellation(&self) -> &CancellationToken {
+        match self {
+            Self::Ordinary { cancellation, .. } => cancellation,
+            Self::Queued { cancellation, .. } => cancellation,
+        }
+    }
 }
 
 fn start_write_operation(
@@ -1997,7 +2043,6 @@ fn start_write_operation(
     data: BufQueue,
     flags: ByteEventWriteFlags,
     kind: WriteKind<'_>,
-    cancellation: CancellationToken,
 ) -> WriteStart {
     if let Err(error) = target.check_context(context) {
         return WriteStart::Finished(Err(TransportWriteError::new(error, 0)));
@@ -2010,7 +2055,7 @@ fn start_write_operation(
             0,
         )));
     }
-    if cancellation.is_cancellation_requested() {
+    if kind.cancellation().is_cancellation_requested() {
         let _ = target.transition_close(CloseState::Reset, Some(context));
         return WriteStart::Finished(Err(TransportWriteError::new(
             cancelled_error(b"byte-stream write cancelled before entry"),
@@ -2058,8 +2103,11 @@ fn start_write_operation(
     let Some(io) = target.io.upgrade() else {
         return WriteStart::Finished(Err(TransportWriteError::new(dropped_error(), 0)));
     };
-    let (progress, wait) = match kind {
-        WriteKind::Ordinary { timeout } => {
+    let (progress, wait, queued_writer) = match kind {
+        WriteKind::Ordinary {
+            timeout,
+            cancellation,
+        } => {
             io.prepare_write_timeout(timeout);
             (
                 WriteProgress::new(length),
@@ -2068,19 +2116,17 @@ fn start_write_operation(
                     cancellation,
                     started: None,
                 },
+                None,
             )
         }
-        WriteKind::Queued { progress } => {
+        WriteKind::Queued { progress, .. } => {
             io.prepare_write_timeout(Duration::ZERO);
             (
                 progress.restart(length),
-                WriteWait::Untimed { cancellation },
+                WriteWait::Untimed,
+                io.queued_writer(),
             )
         }
-    };
-    let queued_writer = match kind {
-        WriteKind::Ordinary { .. } => None,
-        WriteKind::Queued { .. } => io.queued_writer(),
     };
     let io = match queued_writer {
         Some(writer) => {
@@ -2097,13 +2143,11 @@ fn start_write_operation(
         wait,
         waker: None,
     });
-    WriteStart::Started(WriteOperation::new(
-        target.io.clone(),
-        Rc::clone(target.state),
+    WriteStart::Started {
         operation,
-        length,
+        expected: length,
         progress,
-    ))
+    }
 }
 
 impl ByteStreamTransport for OwnedByteStream {
@@ -2298,8 +2342,6 @@ impl ByteStreamTransport for OwnedByteStream {
             return Ok(None);
         }
         Ok(Some(OwnedWriteQueue {
-            io: self.io.clone(),
-            state: Rc::clone(&self.state),
             worker: self.worker.clone(),
             limits: self.limits,
             byte_event_capability: self.byte_event_capability,
@@ -2307,8 +2349,12 @@ impl ByteStreamTransport for OwnedByteStream {
             maximum_write_size,
             cancellation_wake: cancellation.wake_registration(),
             cancellation,
-            progress: WriteProgress::new(0),
-            operation: None,
+            operation: WriteOperation::idle(
+                self.io.clone(),
+                Rc::clone(&self.state),
+                WriteProgress::new(0),
+            ),
+            writing: false,
             receipts: VecDeque::with_capacity(WRITE_QUEUE_RECEIPTS),
         }))
     }
@@ -2565,6 +2611,8 @@ impl WriteOperation {
         expected: usize,
         progress: WriteProgress,
     ) -> Self {
+        #[cfg(test)]
+        WRITE_OPERATIONS.with(|count| count.set(count.get() + 1));
         Self {
             io,
             state,
@@ -2573,6 +2621,26 @@ impl WriteOperation {
             progress,
             complete: false,
         }
+    }
+
+    /// An [`OwnedWriteQueue`]'s operation slot, complete until its first write.
+    fn idle(
+        io: Weak<dyn ByteStreamIo>,
+        state: Rc<RefCell<TransportState>>,
+        progress: WriteProgress,
+    ) -> Self {
+        let mut slot = Self::new(io, state, 0, 0, progress);
+        slot.complete = true;
+        slot
+    }
+
+    /// Reuses a complete slot for the transport's write `operation`.
+    fn restart(&mut self, operation: u64, expected: usize, progress: WriteProgress) {
+        debug_assert!(self.complete, "only a complete write's slot is reused");
+        self.operation = operation;
+        self.expected = expected;
+        self.progress = progress;
+        self.complete = false;
     }
 
     fn finish(
@@ -2673,7 +2741,21 @@ impl WriteOperation {
 impl Future for WriteOperation {
     type Output = Result<WriteInfo, TransportWriteError>;
 
-    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().poll_with(context, None)
+    }
+}
+
+impl WriteOperation {
+    /// Polls the write. An [`OwnedWriteQueue`]'s write observes the queue's
+    /// `cancellation`; an ordinary write passes none. Inlined into each caller,
+    /// which then compiles for its own kind of write.
+    #[inline(always)]
+    fn poll_with(
+        &mut self,
+        context: &mut Context<'_>,
+        queue_cancellation: Option<&CancellationToken>,
+    ) -> Poll<Result<WriteInfo, TransportWriteError>> {
         self.state.borrow().assert_owner();
         if let Some(error) = self.close_error() {
             let written = self.finish(None, None);
@@ -2750,7 +2832,9 @@ impl Future for WriteOperation {
                         }
                     }
                 },
-                WriteWait::Untimed { cancellation } => {
+                WriteWait::Untimed => {
+                    let cancellation =
+                        queue_cancellation.expect("an untimed write is polled by its queue");
                     if cancellation.is_cancellation_requested() {
                         WritePoll::Cancelled
                     } else {
