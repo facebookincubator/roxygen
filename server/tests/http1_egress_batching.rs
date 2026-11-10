@@ -765,7 +765,10 @@ impl HttpSource for FedResponse {
 /// Makes the response source of a fed token response from its head and feed.
 pub(crate) type FedSource = fn(HttpHeaderEvent, Rc<RefCell<Feed>>) -> Box<dyn HttpSource>;
 
-fn fed_response(header: HttpHeaderEvent, feed: Rc<RefCell<Feed>>) -> Box<dyn HttpSource> {
+pub(crate) fn fed_response(
+    header: HttpHeaderEvent,
+    feed: Rc<RefCell<Feed>>,
+) -> Box<dyn HttpSource> {
     Box::new(FedResponse {
         header: Some(header),
         feed,

@@ -35,6 +35,10 @@ pub mod url;
 mod body_event_queue_tests;
 
 #[cfg(test)]
+#[path = "../tests/polled_body_reads.rs"]
+mod polled_body_reads_tests;
+
+#[cfg(test)]
 #[path = "../tests/flow_control.rs"]
 mod flow_control_tests;
 

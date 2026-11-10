@@ -356,6 +356,39 @@ impl HttpSource for ExchangeSource {
             .expect("live source")
             .set_read_timeout(timeout);
     }
+
+    /// A holder asks this before any read guard exists, so a panic in the
+    /// application's answer marks the cleanup unconfirmed here.
+    fn polls_body_events(&self) -> bool {
+        let polls = catch_unwind(AssertUnwindSafe(|| {
+            self.inner
+                .as_ref()
+                .is_some_and(HttpSource::polls_body_events)
+        }));
+        polls.unwrap_or_else(|payload| {
+            self.tracker.fail();
+            resume_unwind(payload)
+        })
+    }
+
+    /// Needs no per-read guard: unlike a read future, a poll leaves no foreign
+    /// state behind, and the source itself holds `retirement`.
+    fn poll_body_event(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        let polled = catch_unwind(AssertUnwindSafe(|| {
+            self.inner
+                .as_mut()
+                .expect("live source")
+                .poll_body_event(context, maximum)
+        }));
+        polled.unwrap_or_else(|payload| {
+            self.tracker.fail();
+            resume_unwind(payload)
+        })
+    }
 }
 
 impl Drop for ExchangeSource {

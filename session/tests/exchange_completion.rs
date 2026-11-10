@@ -1803,6 +1803,158 @@ fn exchange_completion_panic_payloads_cannot_abandon_retirement() {
     });
 }
 
+/// A source that serves body reads only through `poll_body_event` (`DIV-039`):
+/// `Pending` once, then the end of the body, or a panic on every poll.
+struct PollingSource {
+    polls: Rc<Cell<usize>>,
+    panic_poll: bool,
+}
+
+impl HttpSource for PollingSource {
+    fn read_header_event(&mut self) -> LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn read_body_event(
+        &mut self,
+        _maximum: u32,
+    ) -> LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
+        panic!("a polling source is never read through a future");
+    }
+
+    fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {}
+
+    fn polls_body_events(&self) -> bool {
+        true
+    }
+
+    fn poll_body_event(
+        &mut self,
+        _context: &mut Context<'_>,
+        _maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        self.polls.set(self.polls.get() + 1);
+        if self.panic_poll {
+            std::panic::panic_any(PanickingPayload);
+        }
+        if self.polls.get() == 1 {
+            return Poll::Pending;
+        }
+        Poll::Ready(Ok(HttpBodyEvent::body(BufQueue::new(0), true)))
+    }
+}
+
+#[test]
+fn exchange_source_polls_a_polling_source_in_place() {
+    run_local(async {
+        let owner = ExchangeOwner::new(Rc::new(|| {}), false);
+        let tracker = owner.tracker();
+        let receipt = owner.completion();
+        tracker.mark_detached();
+        let polls = Rc::new(Cell::new(0));
+        let mut source = tracker.source(HttpSourceHolder::new(Box::new(PollingSource {
+            polls: Rc::clone(&polls),
+            panic_poll: false,
+        })));
+        assert!(
+            source.polls_body_events(),
+            "the exchange wrapper reports its source's polling"
+        );
+        let mut read = source.read_body_event_unboxed(7);
+        assert!(poll_once(Pin::new(&mut read)).is_pending());
+        pending(&receipt);
+        let Poll::Ready(Ok(event)) = poll_once(Pin::new(&mut read)) else {
+            panic!("the second poll ends the body");
+        };
+        assert!(event.eom());
+        assert_eq!(polls.get(), 2);
+        drop(read);
+        drop(source);
+        assert!(owner.ready());
+        owner.publish();
+        assert_eq!(completed(&receipt).await, Ok(()));
+    });
+}
+
+#[test]
+fn exchange_source_polled_read_panic_preserves_exchange_failure() {
+    run_local(async {
+        let owner = ExchangeOwner::new(Rc::new(|| {}), false);
+        let tracker = owner.tracker();
+        let receipt = owner.completion();
+        tracker.mark_detached();
+        let polls = Rc::new(Cell::new(0));
+        let mut source = tracker.source(HttpSourceHolder::new(Box::new(PollingSource {
+            polls: Rc::clone(&polls),
+            panic_poll: true,
+        })));
+        let mut read = source.read_body_event_unboxed(7);
+        let panic = catch_unwind(AssertUnwindSafe(|| poll_once(Pin::new(&mut read))))
+            .err()
+            .expect("the polled read panics");
+        assert!(panic.is::<PanickingPayload>());
+        roxygen_runtime::panic::discard_panic(panic);
+        assert_eq!(polls.get(), 1);
+        drop(read);
+        drop(source);
+        assert!(owner.ready());
+        owner.publish();
+        assert_eq!(
+            completed(&receipt).await,
+            Err(ExchangeCompletionError::CleanupUnconfirmed)
+        );
+    });
+}
+
+/// A source whose `polls_body_events` capability query panics.
+struct PanickingCapabilitySource;
+
+impl HttpSource for PanickingCapabilitySource {
+    fn read_header_event(&mut self) -> LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn read_body_event(
+        &mut self,
+        _maximum: u32,
+    ) -> LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {}
+
+    fn polls_body_events(&self) -> bool {
+        std::panic::panic_any(PanickingPayload)
+    }
+}
+
+/// The holder asks the capability when a body read starts, before any read
+/// guard exists; a panic there must still make the exchange's cleanup
+/// unconfirmed after a caller catches it and tears down normally.
+#[test]
+fn exchange_source_polls_body_events_panic_preserves_exchange_failure() {
+    run_local(async {
+        let owner = ExchangeOwner::new(Rc::new(|| {}), false);
+        let tracker = owner.tracker();
+        let receipt = owner.completion();
+        tracker.mark_detached();
+        let mut source = tracker.source(HttpSourceHolder::new(Box::new(PanickingCapabilitySource)));
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            drop(source.read_body_event_unboxed(7));
+        }))
+        .expect_err("the body read's capability query panics");
+        assert!(panic.is::<PanickingPayload>());
+        roxygen_runtime::panic::discard_panic(panic);
+        drop(source);
+        assert!(owner.ready());
+        owner.publish();
+        assert_eq!(
+            completed(&receipt).await,
+            Err(ExchangeCompletionError::CleanupUnconfirmed)
+        );
+    });
+}
+
 #[test]
 fn exchange_completion_cancellation_matrix() {
     run_local(async {

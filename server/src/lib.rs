@@ -42,6 +42,14 @@ mod http1_egress_batching_tests;
 mod non_abortive_close_tests;
 
 #[cfg(test)]
+#[path = "../tests/polled_response_body.rs"]
+mod polled_response_body_tests;
+
+#[cfg(test)]
+#[path = "../tests/router_ingress.rs"]
+mod router_ingress_tests;
+
+#[cfg(test)]
 #[path = "../tests/native_readiness.rs"]
 mod native_readiness_tests;
 
