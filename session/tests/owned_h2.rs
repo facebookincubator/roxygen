@@ -17759,3 +17759,347 @@ fn zero_stream_read_timeout_takes_no_slot_sleep_or_clock_read() {
         })
     });
 }
+
+/// Response bodies of the TCP exchanges. The first fits any socket buffer. The second is written
+/// as one physical write, which the shrunken loopback buffers cannot hold while the client does
+/// not read.
+const TCP_SMALL_BODY: usize = 64;
+const TCP_LARGE_BODY: usize = 2 << 20;
+/// `SO_SNDBUF` of the session's socket and `SO_RCVBUF` of the client's.
+const TCP_SOCKET_BUFFER: u32 = 64 << 10;
+/// The session's write and egress bound, so that one write carries the whole large response.
+const TCP_WRITE_LIMIT: usize = 4 << 20;
+
+/// The length of the whole frames at the start of `wire`.
+fn whole_frames_length(wire: &[u8]) -> usize {
+    let mut length = 0;
+    while wire.len() - length >= FRAME_HEADER_SIZE {
+        let payload = u32::from_be_bytes([0, wire[length], wire[length + 1], wire[length + 2]]);
+        let end = length + FRAME_HEADER_SIZE + payload as usize;
+        if end > wire.len() {
+            break;
+        }
+        length = end;
+    }
+    length
+}
+
+/// Whether a written frame ends `stream`.
+fn stream_ended(wire: &WireTranscript, stream: u32) -> bool {
+    wire.frames.iter().any(|frame| {
+        frame.stream == stream
+            && (frame.frame_type == FrameType::DATA.as_u8()
+                || frame.frame_type == FrameType::HEADERS.as_u8())
+            && frame.flags & END_STREAM != 0
+    })
+}
+
+/// Reads from `client` into `received` until its whole frames satisfy `done`, for at most
+/// `TRANSCRIPT_WAIT`.
+async fn read_frames_until(
+    client: &mut tokio::net::TcpStream,
+    received: &mut Vec<u8>,
+    done: impl Fn(&WireTranscript) -> bool,
+    awaited: &str,
+) {
+    use tokio::io::AsyncReadExt;
+
+    let mut buffer = vec![0; 64 << 10];
+    tokio::time::timeout(TRANSCRIPT_WAIT, async {
+        while !done(&WireTranscript::new(
+            WireDirection::Written,
+            &received[..whole_frames_length(received)],
+        )) {
+            let read = client.read(&mut buffer).await.unwrap();
+            assert_ne!(
+                read, 0,
+                "the session closed the connection before {awaited}"
+            );
+            received.extend_from_slice(&buffer[..read]);
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the client never received {awaited}"));
+}
+
+/// Owned HTTP/2 over a real TCP `OwnedByteStream`, which offers the native write queue. Two
+/// exchanges run on one connection, with a PING between them.
+///
+/// - Each response's END_STREAM waits for a gate that the client releases. The first exchange
+///   then retires as its END_STREAM is serialized, so no stream is open when the write carrying
+///   it starts, and nothing else polls the session. The queue progresses only while the driver
+///   polls it, and only the queue's refusal of more capacity arms the driver's writer for that
+///   write.
+/// - The second response goes out as one physical write that pends while the client does not
+///   read. That exchange retires as its END_STREAM is serialized (`DIV-028`): its `complete()`
+///   runs while the write carrying its response is still outstanding.
+#[test]
+fn owned_h2_serves_sequential_exchanges_over_a_tcp_byte_stream() {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    let (received, retired_before_read) = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(LocalSet::new().run_until(async {
+            let listener = tokio::net::TcpSocket::new_v4().unwrap();
+            listener.set_send_buffer_size(TCP_SOCKET_BUFFER).unwrap();
+            listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let listener = listener.listen(1).unwrap();
+            let client = tokio::net::TcpSocket::new_v4().unwrap();
+            client.set_recv_buffer_size(TCP_SOCKET_BUFFER).unwrap();
+            let (client, accepted) = tokio::join!(
+                client.connect(listener.local_addr().unwrap()),
+                listener.accept()
+            );
+            let mut client = client.unwrap();
+            let accepted = accepted.unwrap().0.into_std().unwrap();
+            let (worker, driver) = WorkerDriver::new(16).unwrap();
+            let call = worker
+                .call_local(move |context| async move {
+                    let transport: Rc<dyn UniplexTransport> = Rc::new(
+                        roxygen_transport::tcp::TcpTransport::from_accepted(
+                            &context,
+                            accepted,
+                            roxygen_transport::byte_stream::ByteStreamLimits::new(
+                                64 << 10,
+                                TCP_WRITE_LIMIT,
+                                8,
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                    assert!(
+                        transport
+                            .try_write_queue(
+                                &context,
+                                TCP_WRITE_LIMIT,
+                                Duration::ZERO,
+                                CancellationToken::never()
+                            )
+                            .unwrap()
+                            .is_some(),
+                        "the TCP transport offers its native write queue"
+                    );
+                    let (mut application, probes) = Application::new(vec![
+                        Reply::Body(TCP_SMALL_BODY),
+                        Reply::Body(TCP_LARGE_BODY),
+                    ]);
+                    let terminal = Arc::new(tokio::sync::Notify::new());
+                    application.response_date = Some(TRANSCRIPT_DATE);
+                    application.body_chunk = 64 << 10;
+                    application.empty_terminal = Some(Arc::clone(&terminal));
+                    let mut config = options(context, transport);
+                    config.io.buffer_limit = TCP_WRITE_LIMIT;
+                    config.io.maximum_write_size = TCP_WRITE_LIMIT;
+                    let (session, _handle) = OwnedH2Session::new(application, config).unwrap();
+                    // The session and the client run in their own tasks, so that only the
+                    // session's own wakes poll it.
+                    let client_probes = Rc::clone(&probes);
+                    let client_task = tokio::task::spawn_local(async move {
+                        let probes = client_probes;
+                        let mut peer = Http2Codec::new(TransportDirection::Upstream);
+                        let mut first =
+                            eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+                        first.extend(transcript_settings(&mut peer));
+                        // INITIAL_WINDOW_SIZE 2^31 - 1, and the connection window to match, so
+                        // that flow control never holds the large response.
+                        first.extend(raw_frame(
+                            FrameType::SETTINGS,
+                            0,
+                            0,
+                            &[0, 4, 0x7f, 0xff, 0xff, 0xff],
+                        ));
+                        first.extend(raw_frame(
+                            FrameType::WINDOW_UPDATE,
+                            0,
+                            0,
+                            &(0x7fff_ffff_u32 - 65_535).to_be_bytes(),
+                        ));
+                        first.extend(retirement_get(&mut peer));
+                        client.write_all(&first).await.unwrap();
+                        let mut received = Vec::new();
+                        read_frames_until(
+                            &mut client,
+                            &mut received,
+                            |wire| {
+                                wire.frames
+                                    .iter()
+                                    .filter(|frame| {
+                                        frame.stream == 1
+                                            && frame.frame_type == FrameType::DATA.as_u8()
+                                    })
+                                    .map(|frame| frame.length as usize)
+                                    .sum::<usize>()
+                                    == TCP_SMALL_BODY
+                            },
+                            "the first response's body",
+                        )
+                        .await;
+                        terminal.notify_one();
+                        read_frames_until(
+                            &mut client,
+                            &mut received,
+                            |wire| stream_ended(wire, 1),
+                            "the first response's END_STREAM, released after its body",
+                        )
+                        .await;
+                        tokio::time::timeout(TRANSCRIPT_WAIT, async {
+                            while probes.borrow()[0].completed.get() == 0 {
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
+                        })
+                        .await
+                        .expect("the first exchange retires once its response is written");
+                        let mut ping = raw_frame(FrameType::SETTINGS, ACK, 0, &[]);
+                        ping.extend(raw_frame(
+                            FrameType::PING,
+                            0,
+                            0,
+                            &TRANSCRIPT_PING.to_be_bytes(),
+                        ));
+                        client.write_all(&ping).await.unwrap();
+                        read_frames_until(
+                            &mut client,
+                            &mut received,
+                            |wire| wire.count(FrameType::PING, ACK) == 1,
+                            "the ACK of a PING sent while no stream is open",
+                        )
+                        .await;
+                        terminal.notify_one();
+                        client.write_all(&retirement_get(&mut peer)).await.unwrap();
+                        let read_before_retirement = received.len();
+                        let retired_before_read = tokio::time::timeout(TRANSCRIPT_WAIT, async {
+                            while probes
+                                .borrow()
+                                .get(1)
+                                .is_none_or(|probe| probe.completed.get() == 0)
+                            {
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
+                        })
+                        .await
+                        .is_ok()
+                            && received.len() == read_before_retirement;
+                        read_frames_until(
+                            &mut client,
+                            &mut received,
+                            |wire| stream_ended(wire, 3),
+                            "the second response",
+                        )
+                        .await;
+                        client
+                            .write_all(&eligibility_frame(
+                                &mut peer,
+                                EgressFrame::Goaway {
+                                    last_stream: StreamId::new(0),
+                                    code: H2ErrorCode::NO_ERROR,
+                                    debug_data: None,
+                                },
+                            ))
+                            .await
+                            .unwrap();
+                        client.shutdown().await.unwrap();
+                        client.read_to_end(&mut received).await.unwrap();
+                        (received, retired_before_read)
+                    });
+                    let session_task = tokio::task::spawn_local(session.run());
+                    let (run, client) = match select(session_task, client_task).await {
+                        Either::Left((run, client)) => (run, client.await),
+                        Either::Right((Err(failure), _)) => resume_unwind(failure.into_panic()),
+                        Either::Right((client, run)) => (run.await, client),
+                    };
+                    run.unwrap_or_else(|failure| resume_unwind(failure.into_panic()))
+                        .expect("the session finishes cleanly after the client's GOAWAY and EOF");
+                    let (received, retired_before_read) =
+                        client.unwrap_or_else(|failure| resume_unwind(failure.into_panic()));
+                    for (ordinal, probe) in probes.borrow().iter().enumerate() {
+                        assert_eq!(
+                            (
+                                probe.requested.get(),
+                                probe.response_complete.get(),
+                                probe.completed.get()
+                            ),
+                            (1, 1, 1),
+                            "exchange {ordinal}"
+                        );
+                        assert!(probe.cancelled.borrow().is_empty(), "exchange {ordinal}");
+                    }
+                    (received, retired_before_read)
+                })
+                .unwrap();
+            let driver_task = tokio::task::spawn_local(driver);
+            let result = tokio::time::timeout(Duration::from_secs(30), call)
+                .await
+                .expect("the TCP exchanges finish")
+                .unwrap();
+            worker.begin_shutdown();
+            driver_task.await.unwrap();
+            result
+        }));
+    assert!(
+        retired_before_read,
+        "the second exchange retires at its END_STREAM's serialization, while its response's \
+         write is outstanding and before the client reads any of it"
+    );
+    let frames = raw_frames(&received);
+    let large_data: Vec<&RawFrame> = frames
+        .iter()
+        .filter(|frame| frame.stream == 3 && frame.frame_type == FrameType::DATA.as_u8())
+        .collect();
+    assert_eq!(
+        large_data
+            .iter()
+            .map(|frame| frame.payload.len())
+            .sum::<usize>(),
+        TCP_LARGE_BODY
+    );
+    assert!(
+        large_data
+            .iter()
+            .all(|frame| frame.payload.iter().all(|byte| *byte == b'r')),
+        "the large response body arrives intact"
+    );
+    let ends: Vec<bool> = large_data
+        .iter()
+        .map(|frame| frame.flags & END_STREAM != 0)
+        .collect();
+    assert_eq!(
+        ends.iter().position(|end| *end),
+        Some(ends.len() - 1),
+        "only the last DATA frame ends the large response"
+    );
+    let transcript: Vec<(u8, u8, u32, usize)> = frames
+        .iter()
+        .filter(|frame| !(frame.stream == 3 && frame.frame_type == FrameType::DATA.as_u8()))
+        .map(|frame| {
+            (
+                frame.frame_type,
+                frame.flags,
+                frame.stream,
+                frame.payload.len(),
+            )
+        })
+        .collect();
+    // The large response's DATA frames are checked above. Each response ends with an empty DATA
+    // frame, which its released gate produced.
+    let settings = FrameType::SETTINGS.as_u8();
+    assert_eq!(
+        transcript,
+        [
+            (settings, 0, 0, 18),
+            (settings, ACK, 0, 0),
+            (settings, ACK, 0, 0),
+            (FrameType::HEADERS.as_u8(), END_HEADERS, 1, 30),
+            (FrameType::DATA.as_u8(), 0, 1, TCP_SMALL_BODY),
+            (FrameType::DATA.as_u8(), END_STREAM, 1, 0),
+            (FrameType::PING.as_u8(), ACK, 0, 8),
+            (FrameType::HEADERS.as_u8(), END_HEADERS, 3, 10),
+            (FrameType::GOAWAY.as_u8(), 0, 0, 8),
+        ],
+        "SETTINGS, an ACK of each client SETTINGS, the first response, the PING's ACK, the second \
+         response, then the final GOAWAY"
+    );
+}

@@ -338,3 +338,75 @@ fn tcp_byte_stream_offers_its_reader_through_uniplex() {
             driver_task.await.unwrap();
         }));
 }
+
+/// A native TCP byte stream offers its write queue through `UniplexTransport`, and the queue
+/// answers `is_saturated`, so the owned drivers' `DIV-028` rule applies on TCP.
+#[test]
+fn tcp_byte_stream_offers_its_write_queue_through_uniplex() {
+    use tokio::io::AsyncReadExt;
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(tokio::task::LocalSet::new().run_until(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (worker, driver) = roxygen_runtime::driver::WorkerDriver::new(8).unwrap();
+            let call = worker
+                .call_local(move |context| async move {
+                    let accept = async { listener.accept().await.unwrap().0 };
+                    let connect = roxygen_transport::tcp::TcpTransport::connect(
+                        &context,
+                        SocketAddress::new("127.0.0.1", port),
+                        roxygen_transport::byte_stream::ByteStreamLimits::new(1024, 1024, 8)
+                            .unwrap(),
+                        Duration::from_secs(5),
+                        CancellationToken::never(),
+                    );
+                    let (mut peer, transport) = tokio::join!(accept, connect);
+                    let transport: Rc<dyn UniplexTransport> = Rc::new(transport.unwrap());
+                    assert!(
+                        transport
+                            .try_write_queue(
+                                &context,
+                                1024,
+                                Duration::from_secs(5),
+                                CancellationToken::never(),
+                            )
+                            .unwrap()
+                            .is_none(),
+                        "a write timeout keeps the single-write API"
+                    );
+                    let mut writer = transport
+                        .try_write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .expect("an untimed TCP transport offers its native write queue");
+                    assert!(
+                        !writer.is_saturated(),
+                        "an idle native queue answers unsaturated"
+                    );
+                    assert!(writer.can_write(2));
+                    writer.start_write(queue(b"ok")).unwrap();
+                    assert!(writer.is_saturated(), "its write is outstanding");
+                    let completion =
+                        std::future::poll_fn(|context| writer.poll_complete(context)).await;
+                    assert_eq!(completion.requested_bytes, 2);
+                    assert_eq!(completion.result.unwrap().bytes_written, 2);
+                    assert!(writer.is_idle());
+                    assert!(!writer.is_saturated());
+                    let mut received = [0; 2];
+                    peer.read_exact(&mut received).await.unwrap();
+                    assert_eq!(&received, b"ok");
+                    transport.close(&context).unwrap();
+                })
+                .unwrap();
+            let driver_task = tokio::task::spawn_local(driver);
+            tokio::time::timeout(Duration::from_secs(10), call)
+                .await
+                .expect("the queue test is bounded")
+                .unwrap();
+            worker.begin_shutdown();
+            driver_task.await.unwrap();
+        }));
+}

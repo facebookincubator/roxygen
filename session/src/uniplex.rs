@@ -248,8 +248,8 @@ pub trait UniplexWriteQueue: 'static {
     }
 }
 
-/// The native TCP byte stream's queue (`ByteStreamTransport::write_queue`). It keeps the
-/// default `is_saturated`, so the owned drivers keep their write fence on TCP (`DIV-028`).
+/// The native TCP byte stream's queue (`ByteStreamTransport::write_queue`), which answers
+/// `is_saturated` (`DIV-028`, `DIV-029`).
 impl UniplexWriteQueue for OwnedWriteQueue {
     fn can_write(&self, bytes: usize) -> bool {
         OwnedWriteQueue::can_write(self, bytes)
@@ -268,6 +268,10 @@ impl UniplexWriteQueue for OwnedWriteQueue {
 
     fn is_idle(&self) -> bool {
         OwnedWriteQueue::is_idle(self)
+    }
+
+    fn is_saturated(&self) -> bool {
+        OwnedWriteQueue::is_saturated(self)
     }
 }
 

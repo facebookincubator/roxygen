@@ -7319,3 +7319,178 @@ fn a_cancelled_body_burst_past_the_turn_budget_writes_the_recorded_pieces() {
         .collect();
     assert_eq!(actual, expected, "write lengths:\n{}", actual.join("\n"));
 }
+
+/// The response body of the TCP early-retirement tests, sent as one physical write that the
+/// shrunken loopback buffers cannot hold while the client does not read.
+const TCP_BODY: usize = 2 << 20;
+/// `SO_SNDBUF` of the session's socket and `SO_RCVBUF` of the client's.
+const TCP_SOCKET_BUFFER: u32 = 64 << 10;
+/// The session's write and buffer bound, so that one write carries the whole response.
+const TCP_WRITE_LIMIT: usize = 4 << 20;
+
+/// What the client and the owned HTTP/1.1 session saw in `h1_retirement_over_tcp`.
+struct TcpRetirement {
+    /// The exchange's `complete()` ran before the client read anything.
+    retired_before_read: bool,
+    run: Result<(), HttpErrorCode>,
+    /// (`response_complete`, `complete`) counts and the cancels of the exchange.
+    exchange: (usize, usize, Vec<(HttpErrorCode, bool)>),
+    received: Vec<u8>,
+}
+
+/// Serves one GET with owned HTTP/1.1 over an accepted plaintext TCP `OwnedByteStream`, whose
+/// native write queue answers `is_saturated`, with a `TCP_BODY`-byte response. The client reads
+/// nothing until the exchange's `complete()` has run, or for 5 seconds. Then it reads the whole
+/// response and ends the connection, or, when `reset_after_complete`, resets it.
+fn h1_retirement_over_tcp(reset_after_complete: bool) -> TcpRetirement {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(tokio::task::LocalSet::new().run_until(async move {
+            let listener = tokio::net::TcpSocket::new_v4().unwrap();
+            listener.set_send_buffer_size(TCP_SOCKET_BUFFER).unwrap();
+            listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let listener = listener.listen(1).unwrap();
+            let client = tokio::net::TcpSocket::new_v4().unwrap();
+            client.set_recv_buffer_size(TCP_SOCKET_BUFFER).unwrap();
+            let (client, accepted) = tokio::join!(
+                client.connect(listener.local_addr().unwrap()),
+                listener.accept()
+            );
+            let mut client = client.unwrap();
+            let accepted = accepted.unwrap().0.into_std().unwrap();
+            let (worker, driver) = roxygen_runtime::driver::WorkerDriver::new(16).unwrap();
+            let call = worker
+                .call_local(move |context| async move {
+                    let transport: Rc<dyn UniplexTransport> = Rc::new(
+                        roxygen_transport::tcp::TcpTransport::from_accepted(
+                            &context,
+                            accepted,
+                            roxygen_transport::byte_stream::ByteStreamLimits::new(
+                                64 << 10,
+                                TCP_WRITE_LIMIT,
+                                8,
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                    let (application, probes) =
+                        H1App::new(vec![Response::fixed(200, &vec![b'r'; TCP_BODY])]);
+                    let mut options = owned_options(context, transport);
+                    options.io.buffer_limit = TCP_WRITE_LIMIT;
+                    options.io.maximum_write_size = TCP_WRITE_LIMIT;
+                    let (session, _handle) = OwnedH1Session::new(application, options).unwrap();
+                    let client_probes = Rc::clone(&probes);
+                    let client_task = tokio::task::spawn_local(async move {
+                        client
+                            .write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+                            .await
+                            .unwrap();
+                        let retired_before_read =
+                            tokio::time::timeout(Duration::from_secs(5), async {
+                                while client_probes
+                                    .borrow()
+                                    .first()
+                                    .is_none_or(|probe| probe.completed.get() == 0)
+                                {
+                                    tokio::time::sleep(Duration::from_millis(1)).await;
+                                }
+                            })
+                            .await
+                            .is_ok();
+                        let mut received = Vec::new();
+                        if reset_after_complete {
+                            client.set_zero_linger().unwrap();
+                            drop(client);
+                            return (retired_before_read, received);
+                        }
+                        let mut buffer = vec![0; 64 << 10];
+                        while received
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .is_none_or(|head| received.len() < head + 4 + TCP_BODY)
+                        {
+                            let read = client.read(&mut buffer).await.unwrap();
+                            assert_ne!(read, 0, "the session closed before its response ended");
+                            received.extend_from_slice(&buffer[..read]);
+                        }
+                        client.shutdown().await.unwrap();
+                        client.read_to_end(&mut received).await.unwrap();
+                        (retired_before_read, received)
+                    });
+                    let (run, client) =
+                        tokio::join!(tokio::task::spawn_local(session.run()), client_task);
+                    let run = run
+                        .unwrap_or_else(|failure| std::panic::resume_unwind(failure.into_panic()));
+                    let (retired_before_read, received) = client
+                        .unwrap_or_else(|failure| std::panic::resume_unwind(failure.into_panic()));
+                    let probe = Rc::clone(&probes.borrow()[0]);
+                    TcpRetirement {
+                        retired_before_read,
+                        run: run.map(drop).map_err(|error| error.code()),
+                        exchange: (
+                            probe.response_complete.get(),
+                            probe.completed.get(),
+                            probe.cancelled.borrow().clone(),
+                        ),
+                        received,
+                    }
+                })
+                .unwrap();
+            let driver_task = tokio::task::spawn_local(driver);
+            let result = tokio::time::timeout(Duration::from_secs(30), call)
+                .await
+                .expect("the TCP exchange finishes")
+                .unwrap();
+            worker.begin_shutdown();
+            driver_task.await.unwrap();
+            result
+        }))
+}
+
+/// On plaintext TCP the native write queue answers `is_saturated`, so the `DIV-028` rule
+/// applies: a response's exchange retires once its end is serialized and handed to the
+/// saturated queue, and its `complete()` runs before the client reads any of the one write
+/// that carries it.
+#[test]
+fn owned_h1_retires_a_response_at_serialization_over_tcp() {
+    let outcome = h1_retirement_over_tcp(false);
+    assert!(
+        outcome.retired_before_read,
+        "the exchange retires at its response's serialization, before the client reads"
+    );
+    assert_eq!(outcome.run, Ok(()));
+    assert_eq!(outcome.exchange, (1, 1, Vec::new()));
+    let head = outcome
+        .received
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("a response head")
+        + 4;
+    assert!(
+        outcome.received.starts_with(b"HTTP/1.1 200 "),
+        "{:?}",
+        String::from_utf8_lossy(&outcome.received[..head])
+    );
+    assert_eq!(outcome.received.len(), head + TCP_BODY);
+    assert!(outcome.received[head..].iter().all(|byte| *byte == b'r'));
+}
+
+/// A write failure after an early retirement on TCP fails the connection, and does not reach the
+/// retired exchange: the client resets after `complete()`, the run fails, and the exchange sees
+/// no `cancel`.
+#[test]
+fn a_write_failure_after_an_early_retirement_over_tcp_fails_only_the_connection() {
+    let outcome = h1_retirement_over_tcp(true);
+    assert!(
+        outcome.retired_before_read,
+        "the exchange retires at its response's serialization, before the client reads"
+    );
+    assert!(outcome.run.is_err(), "the reset fails the connection");
+    assert_eq!(outcome.exchange, (1, 1, Vec::new()));
+}
