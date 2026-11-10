@@ -1800,6 +1800,12 @@ where
         polled
     }
 
+    fn cancel_read(&self, cancel: &mut dyn FnMut()) {
+        let read = self.polled_read.borrow_mut().read.take();
+        cancel();
+        drop(read);
+    }
+
     fn retire_read(&self) {
         let read = self.polled_read.borrow_mut().read.take();
         drop(read);

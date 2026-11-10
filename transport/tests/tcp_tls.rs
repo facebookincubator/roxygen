@@ -8718,6 +8718,9 @@ mod tcp_tls {
     }
 
     mod owned_reader {
+        use std::task::RawWaker;
+        use std::task::RawWakerVTable;
+
         use super::*;
         use crate::byte_stream::read_operations_for_test;
         use crate::byte_stream::read_queue_rebuilds_for_test;
@@ -9112,6 +9115,162 @@ mod tcp_tls {
                 }
                 transport.close(&context).unwrap();
             });
+        }
+
+        /// `DIV-018`: dropping a reader whose read pends ends only that read. The transport keeps
+        /// the reader's buffer, so the next reader's read reclaims it instead of reserving one.
+        #[test]
+        fn dropping_a_pending_tcp_reader_read_keeps_the_readers_buffer() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                peer.write_all(b"one ").await.unwrap();
+                reader.start_read(64, 64).unwrap();
+                let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                let start = read.data().front().unwrap().as_ptr() as usize;
+                assert_eq!(read_bytes(read), b"one ");
+                let reservations = tcp_first_reservations_for_test();
+                reader.start_read(64, 64).unwrap();
+                assert!(
+                    reader
+                        .poll_read(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                drop(reader);
+
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                peer.write_all(b"two ").await.unwrap();
+                reader.start_read(64, 64).unwrap();
+                let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                assert_eq!(
+                    read.data().front().unwrap().as_ptr() as usize,
+                    start,
+                    "the next read fills the kept buffer from its start",
+                );
+                assert_eq!(read_bytes(read), b"two ");
+                assert_eq!(
+                    tcp_first_reservations_for_test(),
+                    reservations,
+                    "the cancelled read's reader buffer outlives it",
+                );
+                transport.close(&context).unwrap();
+            });
+        }
+
+        type ReaderWakerDropHook = RefCell<Option<Box<dyn FnOnce()>>>;
+
+        thread_local! {
+            static ON_READER_WAKER_DROP: ReaderWakerDropHook = const { RefCell::new(None) };
+        }
+
+        const READER_WAKER: RawWakerVTable = RawWakerVTable::new(
+            clone_reader_waker,
+            wake_reader_waker,
+            wake_reader_waker,
+            drop_reader_waker,
+        );
+
+        fn clone_reader_waker(_data: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &READER_WAKER)
+        }
+
+        fn wake_reader_waker(_data: *const ()) {}
+
+        /// Runs this thread's `ON_READER_WAKER_DROP` hook, once, at the first drop of a
+        /// `reader_waker` clone.
+        fn drop_reader_waker(_data: *const ()) {
+            let hook = ON_READER_WAKER_DROP.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+
+        fn reader_waker() -> Waker {
+            // SAFETY: the vtable ignores its null data pointer and owns no data. Each callback
+            // accesses only the invoking thread's hook, so the waker is valid on any thread.
+            unsafe { Waker::from_raw(clone_reader_waker(std::ptr::null())) }
+        }
+
+        /// Parks a first reader's read under `reader_waker`, whose release while the dropped
+        /// reader cancels that read starts a second reader's read on the same transport, then
+        /// panics if `panic_after_start`. The replacement read survives the old read's cleanup
+        /// and reads the next bytes.
+        fn replacement_during_reader_drop(panic_after_start: bool) {
+            with_accepted_tcp(limits(), move |context, transport, mut peer| async move {
+                let mut first = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                let second = Rc::new(RefCell::new(
+                    transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap(),
+                ));
+                let started = Rc::new(Cell::new(false));
+                first.start_read(64, 64).unwrap();
+                let waker = reader_waker();
+                {
+                    let mut reading = std::pin::pin!(coop::unconstrained(poll_fn(|context| {
+                        first.poll_read(context)
+                    })));
+                    assert!(
+                        reading
+                            .as_mut()
+                            .poll(&mut Context::from_waker(&waker))
+                            .is_pending()
+                    );
+                }
+                ON_READER_WAKER_DROP.with(|slot| {
+                    let second = Rc::clone(&second);
+                    let started = Rc::clone(&started);
+                    assert!(
+                        slot.replace(Some(Box::new(move || {
+                            second.borrow_mut().start_read(64, 64).unwrap();
+                            started.set(true);
+                            assert!(!panic_after_start, "replacement admitted before panic");
+                        })))
+                        .is_none()
+                    );
+                });
+                let result = catch_unwind(AssertUnwindSafe(|| drop(first)));
+                assert!(
+                    started.get(),
+                    "socket waker release admitted the replacement"
+                );
+                if panic_after_start {
+                    let panic = result.expect_err("the cancellation callback panics");
+                    assert_eq!(
+                        panic.downcast_ref::<&'static str>(),
+                        Some(&"replacement admitted before panic")
+                    );
+                } else {
+                    result.expect("dropping the first reader preserves its replacement");
+                }
+                assert!(transport.has_pending_read(&context).unwrap());
+                peer.write_all(b"replacement").await.unwrap();
+                let read = poll_fn(|context| second.borrow_mut().poll_read(context))
+                    .await
+                    .unwrap();
+                assert_eq!(read_bytes(read), b"replacement");
+                assert!(!transport.has_pending_read(&context).unwrap());
+                transport.close(&context).unwrap();
+            });
+        }
+
+        #[test]
+        fn dropping_a_tcp_reader_can_admit_a_replacement_read() {
+            replacement_during_reader_drop(false);
+        }
+
+        #[test]
+        fn tcp_reader_cancellation_panic_preserves_a_replacement_read() {
+            replacement_during_reader_drop(true);
         }
 
         /// `DIV-016` through a reader: the bytes queued before a TCP reset come first although

@@ -947,6 +947,24 @@ impl ActiveReadIo {
             Self::Polled(polled) => polled.0.poll_read(context),
         }
     }
+
+    /// Ends the read with `cancel`, which releases the socket waker. A polled
+    /// read's backend detaches the read's state and the read's guard drops
+    /// before `cancel` runs, so `cancel` can admit a replacement read that the
+    /// old read's cleanup does not retire.
+    fn cancel(self, cancel: &mut dyn FnMut()) {
+        match self {
+            Self::Future(_future) => cancel(),
+            Self::Polled(polled) => {
+                let reader = Rc::clone(&polled.0);
+                let mut guard = Some(polled);
+                reader.cancel_read(&mut || {
+                    drop(guard.take());
+                    cancel();
+                });
+            }
+        }
+    }
 }
 
 /// A read that a [`PolledReader`] holds. Dropping it ends the read, as
@@ -968,6 +986,11 @@ pub(crate) trait PolledReader {
 
     /// `Ready` ends the read.
     fn poll_read(&self, context: &mut Context<'_>) -> Poll<Result<TransportRead, HttpError>>;
+
+    /// Detaches the unfinished read's state, then calls `cancel` once, keeping
+    /// that state until `cancel` returns or unwinds. `cancel` can start a
+    /// replacement read.
+    fn cancel_read(&self, cancel: &mut dyn FnMut());
 
     /// Ends an unfinished read, as dropping `ByteStreamIo::read`'s future does.
     fn retire_read(&self);
@@ -2672,15 +2695,43 @@ impl ReadOperation {
                 None
             }
         };
-        if active.is_some() {
-            if let Some(code) = cancel {
-                if let Some(io) = self.io.upgrade() {
-                    io.cancel_read(code);
-                }
+        if let Some(active) = active {
+            match cancel {
+                Some(code) => Self::cancel_active(&self.io, active, code),
+                None => drop(active),
             }
-            drop(active);
         }
         self.complete = true;
+    }
+
+    /// Ends `active` with `code`. The backend's cancellation releases the
+    /// socket waker, whose drop can start a replacement read, so an
+    /// [`OwnedReader`] read's state is detached and its guard dropped first;
+    /// its buffers and its waker drop after the cancellation returns or
+    /// unwinds. Cold and out of line, so that the `finish(None)` that ends
+    /// each completed read carries none of this.
+    #[cold]
+    #[inline(never)]
+    fn cancel_active(io: &Weak<dyn ByteStreamIo>, active: ActiveRead, code: HttpErrorCode) {
+        let Some(io) = io.upgrade() else {
+            drop(active);
+            return;
+        };
+        let ActiveRead { drive, waker, .. } = active;
+        let mut io = Some(io);
+        let mut cancel_io = || {
+            io.take()
+                .expect("a read's cancellation runs once")
+                .cancel_read(code);
+        };
+        match drive {
+            ReadDrive::Untimed { io: active_io } => active_io.cancel(&mut cancel_io),
+            timed @ ReadDrive::Timed { .. } => {
+                cancel_io();
+                drop(timed);
+            }
+        }
+        drop(waker);
     }
 
     fn close_error(close_state: CloseState) -> Option<HttpError> {
