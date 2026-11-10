@@ -13,14 +13,16 @@
 //! body window and the bound on unparsed input and on unwritten output),
 //! `ingress_buffer_limit` (parsing pauses while the unread request body is at it),
 //! `maximum_read_size`, `read_allocation_size` and `maximum_write_size` (each write, and
-//! each response body poll together with the output already queued and its chunk framing).
+//! each response body poll together with the output already queued and its chunk framing),
+//! and `abort_exchanges_on_eof` (`DIV-053`: a peer EOF, judged where `UniplexSession` would
+//! see it, fails the connection while the live exchange is open, as `UniplexSession`'s does).
 //! It fails with `INVALID_STATE_TRANSITION` for anything else: a nonzero `read_timeout`,
 //! `stream_read_timeout` or `write_timeout` (the driver is untimed; the caller keeps timeout
 //! responsibility), `drain_request_body_on_drop` false, `wait_for_http1_response_on_drain`
-//! or `abort_exchanges_on_eof` or `deliver_ingress_before_abort` or `exact_method_tokens`
-//! true, `maximum_write_size` above `buffer_limit` or too small to carry a chunk's framing
-//! beside one body byte, a transport with byte-event capability, or a context that is not
-//! the cancellation-free owner thread.
+//! or `deliver_ingress_before_abort` or `exact_method_tokens` true, `maximum_write_size`
+//! above `buffer_limit` or too small to carry a chunk's framing beside one body byte, a
+//! transport with byte-event capability, or a context that is not the cancellation-free
+//! owner thread.
 //!
 //! Framing, close and upgrade follow `UniplexSession`'s port of the Proxygen HTTP/1.1 session
 //! ([`Http1UpgradePolicy::Proxygen`]): trailers are carried in both directions, the
@@ -321,6 +323,11 @@ struct Exchange<E: OwnedExchange> {
     body_events: bool,
     /// An upgrade or CONNECT request, which parsing hands over at its final response head.
     upgrade: bool,
+    /// The request closes the connection: it does not keep it alive, or the driver refused
+    /// its upgrade (`DIV-053`'s EOF watch).
+    closing_request: bool,
+    /// The upgrade completed: the exchange carries an established tunnel.
+    tunnel: bool,
     ingress_complete: bool,
     consumed: bool,
     response_headers: bool,
@@ -521,6 +528,11 @@ struct Driver<A: OwnedApplication> {
     draining: bool,
     eof: bool,
     eof_processed: bool,
+    /// `DIV-053`: the peer EOF was judged and did not abort; the codec may then see it.
+    eof_judged: bool,
+    /// `DIV-053`: reads behind a complete request that closes the connection are discarded
+    /// unparsed, so its EOF is seen.
+    eof_watch: bool,
     /// A failed read, applied once what was read before it is handled (`holds_read_error`).
     read_error: Option<HttpError>,
     exchange_pause: bool,
@@ -613,6 +625,8 @@ impl<A: OwnedApplication> CodecInput<'_, A> {
             started: false,
             body_events: false,
             upgrade: false,
+            closing_request: false,
+            tunnel: false,
             ingress_complete: false,
             consumed: false,
             response_headers: false,
@@ -660,6 +674,7 @@ impl<A: OwnedApplication> HttpCodecCallback for CodecInput<'_, A> {
                 // as one, unless it parses them as ordinary requests (`DIV-030`).
                 let upgrade = message.is_ingress_websocket_upgrade() || message.is_upgraded();
                 exchange.upgrade = upgrade;
+                exchange.closing_request = !message.wants_keepalive();
                 exchange.head = Some(message);
                 self.stream_wake.mark();
                 if upgrade {
@@ -693,6 +708,9 @@ impl<A: OwnedApplication> HttpCodecCallback for CodecInput<'_, A> {
             // An accepted upgrade: the bytes that follow are the request's body, through EOF.
             CodecEvent::MessageComplete { upgraded: true, .. } => {
                 self.upgrade_completed = true;
+                if let Some(exchange) = self.exchange.as_mut() {
+                    exchange.tunnel = true;
+                }
             }
             CodecEvent::MessageComplete { .. } => {
                 self.complete_request(&mut actions);
@@ -762,7 +780,6 @@ impl<A: OwnedApplication> Driver<A> {
             || !io.write_timeout.is_zero()
             || !io.drain_request_body_on_drop
             || io.wait_for_http1_response_on_drain
-            || io.abort_exchanges_on_eof
             || io.deliver_ingress_before_abort
             || io.exact_method_tokens
             || transport.byte_event_capability(&context)? != ByteEventCapability::Unsupported
@@ -824,6 +841,8 @@ impl<A: OwnedApplication> Driver<A> {
                 draining: false,
                 eof: false,
                 eof_processed: false,
+                eof_judged: false,
+                eof_watch: false,
                 read_error: None,
                 exchange_pause: false,
                 flow_pause: false,
@@ -889,6 +908,9 @@ impl<A: OwnedApplication> Driver<A> {
                     Err(error) => self.abort(error),
                 }
             }
+            // Input the parse step left paused, as behind a retiring exchange or an upgrade, is
+            // parsed before a peer EOF is judged (`DIV-053`).
+            let paused = self.ingress_paused();
             if !self.holds_read_error()
                 && let Some(error) = self.read_error.take()
             {
@@ -902,6 +924,10 @@ impl<A: OwnedApplication> Driver<A> {
                 }
             }
             if self.fatal.is_none() && self.retire_exchange() {
+                progress = true;
+            }
+            if self.eof_abort_due() && !(paused && !self.ingress_paused()) {
+                self.judge_eof();
                 progress = true;
             }
             if !self.transport_reset
@@ -948,6 +974,7 @@ impl<A: OwnedApplication> Driver<A> {
                 && self.egress.is_empty()
                 && !self.writes_pending()
                 && (self.eof_processed || !self.codec.is_reusable())
+                && !self.eof_abort_watched()
             {
                 if let Some(closed) = self.close_idle() {
                     return Poll::Ready(closed);
@@ -1047,8 +1074,11 @@ impl<A: OwnedApplication> Driver<A> {
         let upgrade_completed = callback.upgrade_completed;
         // The codec ignores EOF while its parser is paused, so EOF waits behind every pause:
         // an upgrade's until the final response head resolves it.
+        // `DIV-053`: under the option the codec sees the EOF only once it is judged, so a
+        // mid-request EOF cannot fail the request first.
         let finishing_eof = self.eof
             && !self.eof_processed
+            && (self.eof_judged || !self.config.abort_exchanges_on_eof)
             && !upgrade_completed
             && !*callback.upgrade_pending
             && !*callback.exchange_pause
@@ -1070,6 +1100,15 @@ impl<A: OwnedApplication> Driver<A> {
         self.ingress
             .trim_start(consumed)
             .expect("codec consumption was range checked");
+        if self.config.abort_exchanges_on_eof
+            && !self.eof_watch
+            && self
+                .exchange
+                .as_ref()
+                .is_some_and(|exchange| exchange.ingress_complete && exchange.closing_request)
+        {
+            self.start_eof_watch();
+        }
         for result in egress_results {
             result?;
         }
@@ -1170,6 +1209,11 @@ impl<A: OwnedApplication> Driver<A> {
                 return Ok(());
             }
         }
+        // `DIV-053`: an EOF already read is judged before another response event is serialized,
+        // as `UniplexSession`'s `handle_eof` runs in its read loop before its egress task. The
+        // application is still polled; what it returns is not serialized: the exchange is open,
+        // so the judgment aborts it.
+        let eof_due = self.eof_abort_due() && self.exchange_open();
         let exchange = self
             .exchange
             .as_mut()
@@ -1187,6 +1231,11 @@ impl<A: OwnedApplication> Driver<A> {
                 return Ok(());
             };
             check_cancel(&self.control, &self.context)?;
+            if eof_due {
+                drop(headers);
+                self.judge_eof();
+                return Ok(());
+            }
             let mut headers: HttpHeaderEvent = headers?;
             let registrations = headers.take_byte_event_registrations();
             exchange.registered_byte_events |= !registrations.is_empty();
@@ -1219,7 +1268,11 @@ impl<A: OwnedApplication> Driver<A> {
                 // As `UniplexSession`: the final head accepts or refuses the upgrade, and parsing
                 // resumes, into the tunnel or on to the request's end.
                 self.upgrade_pending = false;
-                self.codec.resolve_downstream_upgrade(headers.headers());
+                if self.codec.resolve_downstream_upgrade(headers.headers()) == Some(false) {
+                    // As `UniplexSession`, a refused upgrade closes the connection after its
+                    // request.
+                    exchange.closing_request = true;
+                }
                 self.codec
                     .set_parser_paused(self.exchange_pause || self.flow_pause);
             }
@@ -1254,6 +1307,11 @@ impl<A: OwnedApplication> Driver<A> {
                 return Ok(());
             };
             check_cancel(&self.control, &self.context)?;
+            if eof_due {
+                drop(event);
+                self.judge_eof();
+                return Ok(());
+            }
             let mut event = event?;
             let registrations = event.take_byte_event_registrations();
             exchange.registered_byte_events |= !registrations.is_empty();
@@ -1347,8 +1405,10 @@ impl<A: OwnedApplication> Driver<A> {
             ));
             return true;
         }
-        // A closing connection admits no read-ahead request; the idle check closes it.
-        if self.codec.is_reusable() {
+        // A closing connection admits no read-ahead request; the idle check closes it. Under
+        // `DIV-053` a request read before a peer EOF that is not yet judged is parsed, as
+        // `UniplexSession` parses what it read before it sees the EOF.
+        if self.codec.is_reusable() || self.eof_abort_watched() {
             self.exchange_pause = false;
             self.flow_pause = false;
             self.codec.set_parser_paused(false);
@@ -1418,7 +1478,9 @@ impl<A: OwnedApplication> Driver<A> {
                     self.codec.generate_immediate_goaway();
                 }
                 let mut data = read.into_data();
-                if self.ingress.append(&mut data).is_err() {
+                if self.eof_watch {
+                    drop(data);
+                } else if self.ingress.append(&mut data).is_err() {
                     self.abort(failure(
                         HttpErrorCode::TRANSPORT_READ_ERROR,
                         b"transport read exceeded requested ingress capacity",
@@ -1537,6 +1599,56 @@ impl<A: OwnedApplication> Driver<A> {
             self.abort(error);
         }
         Some(progress)
+    }
+
+    /// `DIV-053`: a peer EOF was read and is not yet judged, with the option on.
+    #[inline]
+    fn eof_abort_watched(&self) -> bool {
+        self.eof
+            && self.config.abort_exchanges_on_eof
+            && !self.eof_judged
+            && self.fatal.is_none()
+            && self.closing_error.is_none()
+    }
+
+    /// `DIV-053`: the peer EOF is judged now. As a failed read, it waits for what was read
+    /// before it (`holds_read_error`), where `UniplexSession` would see it.
+    #[inline]
+    fn eof_abort_due(&self) -> bool {
+        self.eof_abort_watched() && !self.holds_read_error()
+    }
+
+    /// `DIV-053`: whether the live exchange is open in `UniplexSession`'s sense: its request
+    /// head arrived, it carries no established tunnel, and its response's end is not yet
+    /// serialized (`UniplexSession` detaches a stream once that end is serialized).
+    #[inline]
+    fn exchange_open(&self) -> bool {
+        self.exchange.as_ref().is_some_and(|exchange| {
+            (exchange.started || exchange.head.is_some())
+                && !exchange.tunnel
+                && !exchange.response_complete
+        })
+    }
+
+    /// `DIV-053`: fails the connection for the peer's EOF while the live exchange is open, as
+    /// `UniplexSession`'s `fail_connection` does: the exchange is cancelled at once, as the
+    /// peer's, and the transport resets once the bytes already serialized are written
+    /// (`fail_read`). Otherwise the EOF takes the default path.
+    #[cold]
+    fn judge_eof(&mut self) {
+        if self.exchange_open() {
+            self.fail_read(failure(HttpErrorCode::TRANSPORT_EOF, b"transport EOF"));
+        } else {
+            self.eof_judged = true;
+        }
+    }
+
+    /// `DIV-053`: as `UniplexSession`'s EOF watch, the input read behind a complete request
+    /// that closes the connection is discarded, and so are later reads.
+    #[cold]
+    fn start_eof_watch(&mut self) {
+        self.eof_watch = true;
+        self.ingress.trim_start_at_most(usize::MAX);
     }
 
     /// `None` while the outstanding read has yet to observe cancellation, or while a staged

@@ -175,7 +175,7 @@ pub struct ServerSessionConfig {
     /// default ends only incomplete requests and keeps serving one whose request completed, so
     /// a half-closed client still gets its response. The EOF is seen only while reads run, so
     /// an ingress pause (flow control, pipelining) defers it. HTTP/2 connections are
-    /// unchanged, and `owned_http1` refuses the option.
+    /// unchanged, and `owned_http1` applies it by the same rules.
     pub abort_exchanges_on_eof: bool,
     /// Roxygen-only, default off (`DIV-038`): a connection the session resets (an
     /// HTTP/1.1 stream reset, such as a response body error, after writing what it
@@ -272,9 +272,6 @@ impl ServerSessionConfig {
         }
         if self.lifecycle_observer_factory.is_some() {
             return Err("owned_http1 does not support lifecycle_observer_factory");
-        }
-        if self.abort_exchanges_on_eof {
-            return Err("owned_http1 does not support abort_exchanges_on_eof");
         }
         if self.exact_method_tokens {
             return Err("owned_http1 does not support exact_method_tokens");

@@ -1911,7 +1911,7 @@ fn cancel_tears_down_cleanly() {
 #[test]
 fn owned_h1_rejects_unsupported_config() {
     type Change = fn(&mut UniplexConfig);
-    let cases: [(&str, Change, ByteEventCapability); 12] = [
+    let cases: [(&str, Change, ByteEventCapability); 11] = [
         (
             "read_timeout",
             |io| io.read_timeout = Duration::from_secs(1),
@@ -1935,11 +1935,6 @@ fn owned_h1_rejects_unsupported_config() {
         (
             "wait_for_http1_response_on_drain",
             |io| io.wait_for_http1_response_on_drain = true,
-            ByteEventCapability::Unsupported,
-        ),
-        (
-            "abort_exchanges_on_eof",
-            |io| io.abort_exchanges_on_eof = true,
             ByteEventCapability::Unsupported,
         ),
         (
@@ -4266,6 +4261,150 @@ fn owned_h1_corpus_upgrade_vectors_parse_as_ordinary_requests() {
 /// response and shuts down its write side; the owned driver answers it keep-alive, then writes
 /// the codec's 400 and resets. The requests either application sees and the session error are
 /// the same. A malformed head that is complete before EOF gives the same wire in both.
+/// `DIV-053`: serves `request` then a peer EOF, in two reads, with `abort_exchanges_on_eof`
+/// set to `abort`, on the owned driver and on `UniplexSession`.
+fn eof_abort_runs(
+    abort: bool,
+    request: &[u8],
+    response: Response,
+) -> ((Wire, Vec<Observed>), (Wire, Vec<Observed>)) {
+    let io = UniplexConfig {
+        abort_exchanges_on_eof: abort,
+        ..h1_config()
+    };
+    let reads = || vec![ReadAction::Data(request.to_vec()), ReadAction::Eof];
+    (
+        configured_wire(true, reads(), response.clone(), io),
+        configured_wire(false, reads(), response, io),
+    )
+}
+
+/// `DIV-053`: the owned driver judges a peer EOF as `UniplexSession` does. Each script gives
+/// the same wire, close and error under both sessions; where the EOF aborts an exchange, the
+/// owned application sees it cancelled once, as the peer's.
+#[test]
+fn eof_abort_matches_uniplex() {
+    let mut connect = CONNECT_HEAD.to_vec();
+    connect.extend_from_slice(&[b'x'; 100]);
+    let mut websocket = WEBSOCKET_HEAD.to_vec();
+    websocket.extend_from_slice(&[b'x'; 100]);
+    let upload = b"POST /u HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nabc".to_vec();
+    let refused = Response {
+        tunnel: true,
+        ..Response::fixed(400, b"no")
+    };
+    // (label, option on, request, response, whether the EOF aborts the exchange)
+    let cases = [
+        // By default the codec answers the cut-short upload with 400, then resets; with the
+        // option the open exchange is aborted first, with no response.
+        (
+            "mid-upload, off",
+            false,
+            upload.clone(),
+            Response::fixed(200, b"hello"),
+            false,
+        ),
+        (
+            "mid-upload",
+            true,
+            upload,
+            Response::fixed(200, b"hello"),
+            true,
+        ),
+        // An EOF that ends an accepted tunnel's ingress is no abort: the tunnel's answer follows.
+        (
+            "CONNECT tunnel",
+            true,
+            connect,
+            Response::tunnel(200, &[b'y'; 100], false),
+            false,
+        ),
+        (
+            "WebSocket tunnel",
+            true,
+            websocket,
+            Response::tunnel(200, &[b'y'; 100], true),
+            false,
+        ),
+        // A refused upgrade's response head is serialized before the EOF is judged, behind the
+        // pending upgrade; its body is not, so the abort writes the head, then resets.
+        (
+            "refused upgrade",
+            true,
+            WEBSOCKET_HEAD.to_vec(),
+            refused,
+            true,
+        ),
+        // The request reaches the application, whose ready response is not written.
+        (
+            "request and EOF",
+            true,
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec(),
+            Response::fixed(200, b"hello"),
+            true,
+        ),
+    ];
+    for (label, abort, request, response, aborted) in cases {
+        let ((owned, owned_probes), (uniplex, _)) = eof_abort_runs(abort, &request, response);
+        assert_eq!(
+            without_dates(&owned.output),
+            without_dates(&uniplex.output),
+            "{label}: the wire"
+        );
+        assert_eq!(owned.close, uniplex.close, "{label}: the close");
+        assert_eq!(owned.error, uniplex.error, "{label}: the error");
+        if aborted {
+            assert_eq!(
+                (owned.close, owned.error),
+                (CloseKind::Reset, Some(HttpErrorCode::TRANSPORT_EOF)),
+                "{label}"
+            );
+            assert_eq!(
+                owned_probes.last().map(|probe| probe.cancelled.clone()),
+                Some(vec![(HttpErrorCode::TRANSPORT_EOF, true)]),
+                "{label}: the exchange is cancelled once, as the peer's"
+            );
+        }
+    }
+}
+
+/// `DIV-053`: two pipelined requests, then a peer EOF. The EOF waits behind the second
+/// request, so the first is answered and the second aborted, as by `UniplexSession`. The owned
+/// driver reads the EOF while the first exchange is live, so that response already says
+/// `Connection: close`, with the option off as on (`UniplexSession` reads it later).
+#[test]
+fn eof_behind_a_pipelined_request_answers_the_first_and_aborts_the_second_as_uniplex() {
+    let get = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+    let ((owned, owned_probes), (uniplex, uniplex_probes)) = eof_abort_runs(
+        true,
+        &[get.as_slice(), get].concat(),
+        Response::fixed(200, b"hello"),
+    );
+    let answered = |wire: &Wire| {
+        let text = String::from_utf8_lossy(&wire.output).into_owned();
+        (
+            text.matches("HTTP/1.1 200").count(),
+            text.ends_with("\r\n\r\nhello"),
+        )
+    };
+    assert_eq!(answered(&owned), (1, true));
+    assert_eq!(answered(&owned), answered(&uniplex));
+    assert_eq!(
+        (owned.close, owned.error),
+        (CloseKind::Reset, Some(HttpErrorCode::TRANSPORT_EOF))
+    );
+    assert_eq!((owned.close, owned.error), (uniplex.close, uniplex.error));
+    assert_eq!((owned_probes.len(), uniplex_probes.len()), (2, 2));
+    assert_eq!(
+        owned_probes
+            .iter()
+            .map(|probe| probe.cancelled.clone())
+            .collect::<Vec<_>>(),
+        [vec![], vec![(HttpErrorCode::TRANSPORT_EOF, true)]],
+        "only the second exchange is cancelled, as the peer's"
+    );
+}
+
 #[test]
 fn eof_inside_a_head_behind_a_request_differs_from_uniplex() {
     const OK: &str =
@@ -5262,6 +5401,33 @@ fn a_stopped_upload_is_read_to_peer_eof_after_the_write_side_shuts_down() {
         1,
         "nothing read after the stop is parsed as a request"
     );
+    assert_completed_once(&run.observed[0], "the stopped request");
+}
+
+/// `DIV-054` with `DIV-053`: under `abort_exchanges_on_eof`, the staged close after a
+/// stopped upload's response is unchanged: the peer's EOF read during it is no abort, and the
+/// run ends at that EOF with no error.
+#[test]
+fn staged_close_under_eof_abort_reads_to_peer_eof() {
+    let go = Arc::new(tokio::sync::Notify::new());
+    let run = staged_close_run(
+        vec![
+            ReadAction::Data(OPEN_UPLOAD.to_vec()),
+            ReadAction::WaitDataOrCancellation(Arc::clone(&go), [UPLOAD_END, NEXT_GET].concat()),
+            ReadAction::Eof,
+        ],
+        None,
+        None,
+        go,
+        |io| io.abort_exchanges_on_eof = true,
+    );
+    let output = String::from_utf8_lossy(&run.wire.output);
+    assert_eq!(run.wire.error, None, "{output:?}");
+    assert!(run.reading_after_shutdown, "{output:?}");
+    assert_eq!(run.unread, 0, "the peer's EOF is read before the run ends");
+    assert_eq!(run.wire.close, CloseKind::ShutdownWrite);
+    assert_eq!(output.matches("HTTP/1.1 200 ").count(), 1, "{output:?}");
+    assert!(output.ends_with(TRAILERED_END), "{output:?}");
     assert_completed_once(&run.observed[0], "the stopped request");
 }
 

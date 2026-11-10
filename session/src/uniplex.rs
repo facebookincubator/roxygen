@@ -396,7 +396,9 @@ pub struct UniplexConfig {
     pub wait_for_http1_response_on_drain: bool,
     /// Fail a downstream HTTP/1.1 connection, as a reset does, when the peer's EOF
     /// arrives while a transaction other than an established tunnel is open, reading past
-    /// a request that closes the connection to see it (`DIV-053`).
+    /// a request that closes the connection to see it (`DIV-053`). The owned HTTP/1.1
+    /// downstream driver applies it by the same rules; the owned upstream drivers refuse it,
+    /// and owned HTTP/2 ignores it.
     pub abort_exchanges_on_eof: bool,
     /// Roxygen-only, default off (`DIV-033`): when a stream's ingress is aborted (a
     /// peer reset, a transport EOF or read error, a connection error), the head and
