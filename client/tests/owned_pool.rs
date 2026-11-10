@@ -11,6 +11,7 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::convert::Infallible;
 use std::future::Future;
+use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::num::NonZeroUsize;
@@ -3685,4 +3686,270 @@ fn least_loaded_selection_takes_a_session_not_yet_idle_rather_than_dial() {
             );
         }
     }
+}
+
+/// An owned HTTP/1.1 pool to `address`, whose sessions take pull-through
+/// exchanges, with `params` and `session`'s parameters.
+fn pull_through_pool(
+    context: &WorkerContext,
+    address: SocketAddr,
+    params: PoolParams,
+    session: SessionParams,
+) -> OwnedHttpSessionPool {
+    OwnedHttpSessionPool::new(
+        context.clone(),
+        socket_address(address),
+        params,
+        plaintext(CodecProtocol::Http11),
+        session,
+    )
+    .expect("the pool accepts its parameters")
+}
+
+/// Sends `path` on `reservation` as a pull-through request and returns the
+/// 200 response's whole body, read through its pull-through body.
+async fn pull_through_exchange(reservation: OwnedClientReservation, path: &str) -> Vec<u8> {
+    let (head, body) = request(path).await;
+    let mut response = reservation
+        .submit_pull_through(head, body, CancellationToken::never())
+        .await
+        .expect("request is committed");
+    let head = poll_fn(|context| response.body.poll_header(context))
+        .await
+        .expect("response head");
+    assert_eq!(head.headers().response_status(), Some(200));
+    let mut body = Vec::new();
+    let mut eom = head.eom();
+    while !eom {
+        let event = poll_fn(|context| response.body.poll_body(context, u32::MAX))
+            .await
+            .expect("response body");
+        if let Some(data) = event.as_body() {
+            data.segments()
+                .for_each(|segment| body.extend_from_slice(segment));
+        }
+        eom = event.eom();
+    }
+    body
+}
+
+/// Runs one pull-through exchange on the pool's next session and returns that
+/// session once it is idle.
+async fn pull_through_one_exchange(pool: &OwnedHttpSessionPool) -> OwnedClientSession {
+    let OwnedGetSessionResult {
+        reservation,
+        session,
+    } = acquire(pool).await;
+    assert_eq!(pull_through_exchange(reservation, "/").await, b"ok");
+    settle(&session).await;
+    session
+}
+
+/// As `two_idle_sessions`, through pull-through exchanges.
+async fn two_pull_through_idle_sessions(
+    pool: &OwnedHttpSessionPool,
+) -> (OwnedClientSession, OwnedClientSession) {
+    let first = acquire(pool).await;
+    let second = acquire(pool).await;
+    assert_ne!(
+        local(&first.session),
+        local(&second.session),
+        "a reserved session makes the pool open another"
+    );
+    assert_eq!(pull_through_exchange(first.reservation, "/").await, b"ok");
+    settle(&first.session).await;
+    assert_eq!(pull_through_exchange(second.reservation, "/").await, b"ok");
+    settle(&second.session).await;
+    (first.session, second.session)
+}
+
+/// `DIV-032`'s idle retirement and most-recently-used order hold on
+/// pull-through sessions: the run, to which the drive returns when the
+/// response is produced, retires the exchange and publishes idleness, which
+/// the session's run scope reports to the pool, as for any owned session.
+/// The scenarios of `idle_session_is_retired_and_replaced` (both sweeps),
+/// `most_recently_used_reuse_picks_the_session_released_last` and
+/// `most_recently_used_reuse_lets_the_cold_session_retire`, through
+/// pull-through exchanges.
+#[test]
+fn pull_through_sessions_are_reported_idle_and_retired() {
+    for idle_sweep in [IdleSweep::AtExpiry, IdleSweep::Interval] {
+        let origin = Origin::start(CodecProtocol::Http11);
+        let address = origin.address;
+        let (sessions, closed, replaced, body) = run_on_worker(move |context| async move {
+            let pool = pull_through_pool(
+                &context,
+                address,
+                idle_params(1, SessionReuseOrder::LeastRecentlyUsed, IDLE, idle_sweep),
+                untimed(),
+            );
+            let first = pull_through_one_exchange(&pool).await;
+            tokio::time::sleep(IDLE * 4).await;
+            let sessions = pool.session_count();
+            let closed = tokio::time::timeout(Duration::from_secs(1), first.wait_closed()).await;
+            let OwnedGetSessionResult {
+                reservation,
+                session: second,
+            } = acquire(&pool).await;
+            (
+                sessions,
+                matches!(closed, Ok(Ok(_))),
+                local(&first) != local(&second),
+                pull_through_exchange(reservation, "/").await,
+            )
+        });
+        assert_eq!(
+            (sessions, closed, replaced, body),
+            (0, true, true, b"ok".to_vec()),
+            "{idle_sweep:?}: the idle pull-through session is retired without an acquisition, \
+             closes, and the next request opens a new connection"
+        );
+    }
+
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let picks = run_on_worker(move |context| async move {
+        let pool = pull_through_pool(
+            &context,
+            address,
+            idle_params(
+                2,
+                SessionReuseOrder::MostRecentlyUsed,
+                IDLE,
+                IdleSweep::AtExpiry,
+            ),
+            untimed(),
+        );
+        let (older, newer) = two_pull_through_idle_sessions(&pool).await;
+        // Released in the other order, the older session is then the most recent.
+        let first = acquire(&pool).await;
+        let second = acquire(&pool).await;
+        let picks = [
+            local(&first.session) == local(&newer),
+            local(&second.session) == local(&older),
+        ];
+        assert_eq!(pull_through_exchange(first.reservation, "/").await, b"ok");
+        settle(&first.session).await;
+        assert_eq!(pull_through_exchange(second.reservation, "/").await, b"ok");
+        settle(&second.session).await;
+        let last = local(&pull_through_one_exchange(&pool).await) == local(&older);
+        [picks[0], picks[1], last]
+    });
+    assert_eq!(
+        picks,
+        [true, true, true],
+        "the most recently released pull-through session is reused first"
+    );
+
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let (hot_served, cold_retired, hot_kept, sessions) = run_on_worker(move |context| async move {
+        let pool = pull_through_pool(
+            &context,
+            address,
+            idle_params(
+                2,
+                SessionReuseOrder::MostRecentlyUsed,
+                IDLE,
+                IdleSweep::AtExpiry,
+            ),
+            untimed(),
+        );
+        let (cold, hot) = two_pull_through_idle_sessions(&pool).await;
+        let mut hot_served = true;
+        for _ in 0..12 {
+            hot_served &= local(&pull_through_one_exchange(&pool).await) == local(&hot);
+            tokio::time::sleep(IDLE / 3).await;
+        }
+        (
+            hot_served,
+            cold.is_draining(),
+            !hot.is_draining(),
+            pool.session_count(),
+        )
+    });
+    assert_eq!(
+        (hot_served, cold_retired, hot_kept, sessions),
+        (true, true, true, 1),
+        "the most recently used idle pull-through session serves, and the unused one idles out"
+    );
+}
+
+/// A waiter takes the session a pull-through exchange released: the drive
+/// returns to the run at the response's end, and the run returns the slot,
+/// whose `capacity_available` wakes the waiter, which reuses the session.
+#[test]
+fn a_waiter_takes_the_session_a_pull_through_exchange_released() {
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let (pending, first_body, same, body) = run_on_worker(move |context| async move {
+        let pool = pull_through_pool(&context, address, params(1), untimed());
+        let first = acquire(&pool).await;
+        let second = pool.get_session_with_reservation(CancellationToken::never());
+        tokio::pin!(second);
+        let pending = tokio::select! {
+            _ = &mut second => false,
+            () = tokio::time::sleep(Duration::from_millis(100)) => true,
+        };
+        let first_body = pull_through_exchange(first.reservation, "/slow").await;
+        let second = second.await.expect("the waiter is served");
+        let same = local(&first.session) == local(&second.session);
+        (
+            pending,
+            first_body,
+            same,
+            pull_through_exchange(second.reservation, "/").await,
+        )
+    });
+    assert_eq!(
+        (pending, first_body, same, body, origin.accepted()),
+        (true, b"chunk".repeat(SLOW_CHUNKS), true, b"ok".to_vec(), 1),
+        "the waiter waits for, then reuses, the session the pull-through exchange released"
+    );
+}
+
+/// The router's HTTP/1.1 parameters (prod_inference `RoxygenClientParams`):
+/// hyper-util's legacy pool (MRU reuse, interval sweeps, no connection
+/// limit, one connection attempt) and session timers off with every
+/// hyper-parity option on.
+fn router_http1() -> (PoolParams, SessionParams) {
+    (
+        PoolParams {
+            max_connections: u32::MAX,
+            max_connection_attempts: 1,
+            enable_tls_session_caching: false,
+            connect_timeout: Duration::from_secs(1),
+            max_age: Duration::ZERO,
+            max_waiters: u16::MAX,
+            idle_timeout: Duration::from_secs(90),
+            reuse_order: SessionReuseOrder::MostRecentlyUsed,
+            idle_sweep: IdleSweep::Interval,
+        },
+        SessionParams {
+            deliver_ingress_before_abort: true,
+            unframed_bodiless_http1_requests: true,
+            non_abortive_close: true,
+            ..untimed()
+        },
+    )
+}
+
+/// An owned pool accepts the router's HTTP/1.1 parameters and serves
+/// pull-through exchanges on one reused connection.
+#[test]
+fn the_router_s_session_parameters_are_accepted_with_pull_through() {
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let (same, sessions) = run_on_worker(move |context| async move {
+        let (params, session) = router_http1();
+        let pool = pull_through_pool(&context, address, params, session);
+        let first = pull_through_one_exchange(&pool).await;
+        let second = pull_through_one_exchange(&pool).await;
+        (local(&first) == local(&second), pool.session_count())
+    });
+    assert_eq!(
+        (same, sessions, origin.accepted()),
+        (true, 1, 1),
+        "two pull-through exchanges reuse one connection"
+    );
 }

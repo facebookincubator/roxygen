@@ -5,6 +5,7 @@
 use std::cell::Cell;
 use std::convert::Infallible;
 use std::future::Future;
+use std::future::poll_fn;
 use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Write;
@@ -69,14 +70,20 @@ use crate::connector::ClientTransportOptions;
 use crate::connector::ConnectionParams;
 use crate::connector::HttpConnector;
 use crate::connector::SessionParams;
+use crate::experimental::owned::OwnedClientPullThroughBody;
 use crate::experimental::owned::OwnedClientReservation;
 use crate::experimental::owned::OwnedClientSession;
+use crate::experimental::owned::OwnedHttpSessionPool;
+use crate::pool::PoolParams;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const UPLOAD: usize = 128 * 1024;
 const LARGE: usize = 300_000;
 const ENABLE_PUSH: u16 = 2;
 const MAX_CONCURRENT_STREAMS: u16 = 3;
+/// `/slow` streams `SLOW_CHUNKS` chunks of `chunk` this far apart.
+const CHUNK_GAP: Duration = Duration::from_millis(40);
+const SLOW_CHUNKS: usize = 10;
 
 fn wait<Work: Future>(work: Work) -> Work::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -212,6 +219,19 @@ async fn respond(
         }
         "/empty" => response.status(204).body(full(Bytes::new())),
         "/large" => response.status(200).body(full(large_body())),
+        "/slow" => {
+            let chunks = futures::stream::unfold(0, |sent| async move {
+                if sent == SLOW_CHUNKS {
+                    return None;
+                }
+                tokio::time::sleep(CHUNK_GAP).await;
+                Some((
+                    Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"chunk"))),
+                    sent + 1,
+                ))
+            });
+            response.status(200).body(StreamBody::new(chunks).boxed())
+        }
         "/hang" => return std::future::pending().await,
         _ => response.status(404).body(full(Bytes::new())),
     };
@@ -297,6 +317,7 @@ enum Exchange {
     Head,
     Large,
     Hang,
+    Slow,
 }
 
 impl Exchange {
@@ -320,6 +341,7 @@ impl Exchange {
             Self::Head => (HttpMethod::Head, "/fixed", None),
             Self::Large => (HttpMethod::Get, "/large", None),
             Self::Hang => (HttpMethod::Get, "/hang", None),
+            Self::Slow => (HttpMethod::Get, "/slow", None),
         };
         let body = body.map(|bytes: Vec<u8>| {
             BufQueue::copy_from_slice(&bytes, bytes.len()).expect("bounded upload")
@@ -353,6 +375,32 @@ struct Received {
     sequence: u64,
 }
 
+impl Received {
+    /// Records a response head's status and headers, without the origin's
+    /// `Date`.
+    fn head(&mut self, head: &HttpHeaderEvent) {
+        self.status = head.headers().response_status();
+        head.headers().headers().for_each(|name, value| {
+            if !name.eq_ignore_ascii_case(b"date") {
+                self.headers.push((name.to_vec(), value.to_vec()));
+            }
+        });
+    }
+
+    /// Records a body event's bytes and trailers.
+    fn body_event(&mut self, event: &HttpBodyEvent) {
+        if let Some(bytes) = event.as_body() {
+            self.body
+                .extend_from_slice(&bytes.coalesce(bytes.chain_length()).expect("bounded body"));
+        }
+        if let HttpBodyEventKind::Trailers(trailers) = event.kind() {
+            trailers.for_each(|name, value| {
+                self.trailers.push((name.to_vec(), value.to_vec()));
+            });
+        }
+    }
+}
+
 async fn read(source: &mut HttpSourceHolder) -> Received {
     let mut received = Received::default();
     let head = match source.read_header_event().await {
@@ -362,26 +410,12 @@ async fn read(source: &mut HttpSourceHolder) -> Received {
             return received;
         }
     };
-    received.status = head.headers().response_status();
-    head.headers().headers().for_each(|name, value| {
-        if !name.eq_ignore_ascii_case(b"date") {
-            received.headers.push((name.to_vec(), value.to_vec()));
-        }
-    });
+    received.head(&head);
     let mut eom = head.eom();
     while !eom {
         match source.read_body_event(u32::MAX).await {
             Ok(event) => {
-                if let Some(bytes) = event.as_body() {
-                    received.body.extend_from_slice(
-                        &bytes.coalesce(bytes.chain_length()).expect("bounded body"),
-                    );
-                }
-                if let HttpBodyEventKind::Trailers(trailers) = event.kind() {
-                    trailers.for_each(|name, value| {
-                        received.trailers.push((name.to_vec(), value.to_vec()));
-                    });
-                }
+                received.body_event(&event);
                 eom = event.eom();
             }
             Err(error) => {
@@ -2139,5 +2173,578 @@ fn an_attachment_cancellation_during_the_run_s_final_poll_fails_wait_closed() {
     assert_eq!(
         observed,
         (Some(200), false, true, Some(HttpErrorCode::CORO_CANCELLED))
+    );
+}
+
+/// On HTTP/2, which has no pull-through exchanges, a pull-through submission
+/// is refused with `INVALID_STATE_TRANSITION` before it reaches the driver,
+/// and reports no `request_unprocessed`, so a stale-connection retry would not
+/// repeat it. The session then serves a plain exchange as its first committed
+/// request: (the refusal's code, the refused submission's progress, the next
+/// exchange's status and sequence number).
+#[test]
+fn submit_pull_through_is_refused_on_http2() {
+    let origin = Origin::start(CodecProtocol::Http2);
+    let address = origin.address;
+    let observed = run_on_worker(move |context| async move {
+        let session = connect_owned(&context, address, CodecProtocol::Http2, untimed()).await;
+        let (head, body) = Exchange::Fixed.request().await;
+        let mut submission = reserve_owned(&session).await.submit_pull_through(
+            head,
+            body,
+            CancellationToken::never(),
+        );
+        let refused = (&mut submission).await.err().map(|error| error.code());
+        let progress = (
+            submission.request_unprocessed(),
+            submission.sequence_number(),
+        );
+        let next = exchange(&session, Exchange::Fixed).await;
+        close(&session).await;
+        (refused, progress, next.status, next.sequence)
+    });
+    assert_eq!(
+        observed,
+        (
+            Some(HttpErrorCode::INVALID_STATE_TRANSITION),
+            (false, None),
+            Some(200),
+            0
+        )
+    );
+}
+
+/// Every owned HTTP/1.1 session is rooted with `run_pull_through`, so each
+/// exchange selects how its response is read, with no session option: a
+/// pull-through exchange, then a plain one, then another pull-through one, on
+/// one connection (`DIV-047`): (status, body length, sequence number) each.
+#[test]
+fn every_owned_http1_session_takes_pull_through_and_plain_exchanges() {
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let observed = run_on_worker(move |context| async move {
+        let session = connect_owned(&context, address, CodecProtocol::Http11, untimed()).await;
+        let mut observed = Vec::new();
+        for pull_through in [true, false, true] {
+            if pull_through {
+                let (head, body) = Exchange::Fixed.request().await;
+                let mut response = reserve_owned(&session)
+                    .await
+                    .submit_pull_through(head, body, CancellationToken::never())
+                    .await
+                    .expect("a pull-through request is committed");
+                let received = read_pull_through(&mut response.body).await;
+                observed.push((received.status, received.body.len(), response.sequence));
+            } else {
+                let received = exchange(&session, Exchange::Fixed).await;
+                observed.push((received.status, received.body.len(), received.sequence));
+            }
+        }
+        close(&session).await;
+        observed
+    });
+    let fixed = observed[1].1;
+    assert_eq!(
+        observed,
+        [
+            (Some(200), fixed, 0),
+            (Some(200), fixed, 1),
+            (Some(200), fixed, 2)
+        ]
+    );
+}
+
+/// Connects an owned HTTP/1.1 session, which takes pull-through exchanges.
+async fn connect_pull_through(context: &WorkerContext, address: SocketAddr) -> OwnedClientSession {
+    connect_owned(context, address, CodecProtocol::Http11, untimed()).await
+}
+
+/// Reads a pull-through response through its body, as `read` reads a source.
+async fn read_pull_through(body: &mut OwnedClientPullThroughBody) -> Received {
+    let head = match poll_fn(|context| body.poll_header(context)).await {
+        Ok(head) => head,
+        Err(error) => {
+            return Received {
+                error: Some(error.code()),
+                ..Received::default()
+            };
+        }
+    };
+    if head.eom() {
+        let mut received = Received::default();
+        received.head(&head);
+        return received;
+    }
+    let mut received = read_pull_through_body(body).await;
+    received.head(&head);
+    received
+}
+
+/// Reads a pull-through response's remaining body events to its end or error.
+async fn read_pull_through_body(body: &mut OwnedClientPullThroughBody) -> Received {
+    let mut received = Received::default();
+    loop {
+        match poll_fn(|context| body.poll_body(context, u32::MAX)).await {
+            Ok(event) => {
+                received.body_event(&event);
+                if event.eom() {
+                    return received;
+                }
+            }
+            Err(error) => {
+                received.error = Some(error.code());
+                return received;
+            }
+        }
+    }
+}
+
+/// One pull-through exchange on `session`, read to its end through its body.
+async fn pull_through_exchange(session: &OwnedClientSession, exchange: Exchange) -> Received {
+    let (head, body) = exchange.request().await;
+    let mut response = reserve_owned(session)
+        .await
+        .submit_pull_through(head, body, CancellationToken::never())
+        .await
+        .expect("request is committed");
+    let mut received = read_pull_through(&mut response.body).await;
+    received.sequence = response.sequence;
+    received
+}
+
+/// A pull-through session's responses, read through their bodies, equal an
+/// owned session's for the differential table's exchanges on one HTTP/1.1
+/// connection: a fixed body, a 128 KiB upload echoed (the body takes the drive
+/// only once the upload is written), a streamed body with trailers, a 204,
+/// HEAD and a 300 000-byte body.
+#[test]
+fn pull_through_responses_equal_owned_responses_over_http1() {
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let (owned, pulled) = run_on_worker(move |context| async move {
+        let owned = through_owned_session(&context, address, CodecProtocol::Http11).await;
+        let session = connect_pull_through(&context, address).await;
+        let mut pulled = Vec::new();
+        for entry in Exchange::TABLE {
+            pulled.push(pull_through_exchange(&session, entry).await);
+        }
+        close(&session).await;
+        (owned, pulled)
+    });
+    assert_eq!(pulled, owned);
+    assert_eq!(
+        pulled
+            .iter()
+            .map(|received| (
+                received.status,
+                received.body.len(),
+                received.trailers.len(),
+                received.error,
+                received.sequence,
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (Some(200), 10, 0, None, 0),
+            (Some(201), UPLOAD, 0, None, 1),
+            (Some(200), 11, 1, None, 2),
+            (Some(204), 0, 0, None, 3),
+            (Some(200), 0, 0, None, 4),
+            (Some(200), LARGE, 0, None, 5),
+        ],
+        "every exchange of the table is served through its pull-through body"
+    );
+}
+
+/// Reads a slow response's head and its body events through `body` until one
+/// carries bytes: (the head's status, that event's bytes, empty if the
+/// response ended first).
+async fn pull_through_head_and_first_chunk(
+    body: &mut OwnedClientPullThroughBody,
+) -> (Option<u16>, Vec<u8>) {
+    let head = poll_fn(|context| body.poll_header(context))
+        .await
+        .expect("response head");
+    let mut received = Received::default();
+    received.head(&head);
+    let mut eom = head.eom();
+    while !eom && received.body.is_empty() {
+        let event = poll_fn(|context| body.poll_body(context, u32::MAX))
+            .await
+            .expect("response body");
+        received.body_event(&event);
+        eom = event.eom();
+    }
+    (received.status, received.body)
+}
+
+/// What `wait_closed` reports, within 2 s, once the consumer of a slow
+/// response retires after its first chunk: on a pull-through session by
+/// stopping its body, which stays alive until then, and on an owned session by
+/// dropping its response's source: (the status, whether a chunk was read
+/// first, whether the run reset its transport or its error's code).
+fn closed_after_retiring_a_slow_response(
+    pull_through: bool,
+) -> (Option<u16>, bool, Result<bool, HttpErrorCode>) {
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    run_on_worker(move |context| async move {
+        let (head, body) = Exchange::Slow.request().await;
+        let within = |session: &OwnedClientSession| {
+            tokio::time::timeout(Duration::from_secs(2), session.wait_closed())
+        };
+        if pull_through {
+            let session = connect_pull_through(&context, address).await;
+            let mut response = reserve_owned(&session)
+                .await
+                .submit_pull_through(head, body, CancellationToken::never())
+                .await
+                .expect("request is committed");
+            let (status, chunk) = pull_through_head_and_first_chunk(&mut response.body).await;
+            let chunk = !chunk.is_empty();
+            response.body.stop(None);
+            let closed = within(&session)
+                .await
+                .expect("the connection closes while its stopped body lives");
+            drop(response);
+            (
+                status,
+                chunk,
+                closed
+                    .map(|summary| summary.reset)
+                    .map_err(|error| error.code()),
+            )
+        } else {
+            let session = connect_owned(&context, address, CodecProtocol::Http11, untimed()).await;
+            let response = reserve_owned(&session)
+                .await
+                .submit(head, body, CancellationToken::never())
+                .await
+                .expect("request is committed");
+            let mut source = response.source.into_source_owner().into_source_holder();
+            let head = source.read_header_event().await.expect("response head");
+            let mut observed = (head.headers().response_status(), false);
+            let mut eom = head.eom();
+            while !eom && !observed.1 {
+                let event = source
+                    .read_body_event(u32::MAX)
+                    .await
+                    .expect("response body");
+                observed.1 = event.as_body().is_some();
+                eom = event.eom();
+            }
+            drop(source);
+            let closed = within(&session).await.expect("the connection closes");
+            (
+                observed.0,
+                observed.1,
+                closed
+                    .map(|summary| summary.reset)
+                    .map_err(|error| error.code()),
+            )
+        }
+    })
+}
+
+/// Stopping a pull-through body mid-response closes its connection as
+/// dropping an owned response's source does, while the body still lives: the
+/// stop retires the read, clears the source and returns the drive to the run.
+#[test]
+fn a_stopped_pull_through_body_closes_its_connection_as_a_dropped_owned_source_does() {
+    let pulled = closed_after_retiring_a_slow_response(true);
+    assert_eq!(pulled, closed_after_retiring_a_slow_response(false));
+    assert_eq!((pulled.0, pulled.1), (Some(200), true));
+}
+
+/// An attachment cancellation while a pull-through body holds the drive and is
+/// not being read cancels the session: the scope's stop check cancels the
+/// connection, which takes the drive back, so the run fails the exchange and
+/// completes, and `wait_closed` fails `CORO_CANCELLED` before the body is read
+/// again; the body's next read returns that error: (the status, whether a
+/// chunk was read first, `wait_closed` within 2 s, the next read's error,
+/// `is_finished`).
+#[test]
+fn pull_through_attachment_cancellation_while_held_cancels_the_session() {
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let observed = run_on_worker(move |context| async move {
+        let attachment = CancellationSource::new();
+        let session = attach_to_origin(
+            &context,
+            address,
+            CodecProtocol::Http11,
+            untimed(),
+            attachment.token(),
+        )
+        .await;
+        let (head, body) = Exchange::Slow.request().await;
+        let mut response = reserve_owned(&session)
+            .await
+            .submit_pull_through(head, body, CancellationToken::never())
+            .await
+            .expect("request is committed");
+        let (status, chunk) = pull_through_head_and_first_chunk(&mut response.body).await;
+        let chunk = !chunk.is_empty();
+        attachment.request_cancellation();
+        let closed = tokio::time::timeout(Duration::from_secs(2), session.wait_closed())
+            .await
+            .map(|closed| closed.err().map(|error| error.code()));
+        let next = poll_fn(|context| response.body.poll_body(context, u32::MAX))
+            .await
+            .err()
+            .map(|error| error.code());
+        (status, chunk, closed, next, session.is_finished())
+    });
+    assert_eq!(
+        observed,
+        (
+            Some(200),
+            true,
+            Ok(Some(HttpErrorCode::CORO_CANCELLED)),
+            Some(HttpErrorCode::CORO_CANCELLED),
+            true
+        )
+    );
+}
+
+/// Worker quiescence while a pull-through body holds the drive closes the
+/// session's admission at once and drains it without taking the drive back:
+/// the body reads the rest of its response, then the session closes and the
+/// worker quiesces without forcing: (the status, the whole body, the read's
+/// error, the reservation's error after quiescence began, whether
+/// `wait_closed` resolved `Ok`, `is_finished`).
+#[test]
+fn pull_through_worker_quiescence_while_held_drains_after_the_exchange() {
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let observed = run_on_quiescing_worker(move |context, runtime| async move {
+        let session = connect_pull_through(&context, address).await;
+        let (head, body) = Exchange::Slow.request().await;
+        let mut response = reserve_owned(&session)
+            .await
+            .submit_pull_through(head, body, CancellationToken::never())
+            .await
+            .expect("request is committed");
+        let (status, mut body) = pull_through_head_and_first_chunk(&mut response.body).await;
+        assert!(!body.is_empty(), "the body holds the drive mid-response");
+        drop(runtime.quiesce(TIMEOUT));
+        assert!(!context.handle().is_accepting(), "quiescence has begun");
+        let reserved = session.reserve_request().err().map(|error| error.code());
+        let mut rest = read_pull_through_body(&mut response.body).await;
+        body.append(&mut rest.body);
+        let closed = session.wait_closed().await.is_ok();
+        (
+            status,
+            body,
+            rest.error,
+            reserved,
+            closed,
+            session.is_finished(),
+        )
+    });
+    assert_eq!(
+        observed,
+        (
+            Some(200),
+            b"chunk".repeat(SLOW_CHUNKS),
+            None,
+            Some(HttpErrorCode::DROPPED),
+            true,
+            true
+        )
+    );
+}
+
+/// A loopback origin whose first connection answers its request with a
+/// `Content-Length: 100` head and 10 body bytes, then, when the client sends
+/// on the returned sender, closes the connection and acknowledges on the
+/// returned receiver. With `replace`, it then serves an `ok` response on a
+/// second connection, which it reads until the client closes it.
+fn eof_mid_response_origin(
+    replace: bool,
+) -> (
+    SocketAddr,
+    mpsc::Sender<()>,
+    mpsc::Receiver<()>,
+    std::thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("origin binds");
+    let address = listener.local_addr().expect("origin address");
+    let (close, closing) = mpsc::channel();
+    let (closed, closures) = mpsc::channel();
+    let origin = std::thread::spawn(move || {
+        let (mut first, _) = listener.accept().expect("origin accepts");
+        read_head(&mut first).expect("request head");
+        first
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n0123456789")
+            .expect("origin answers in part");
+        closing.recv().expect("the client asks for the close");
+        drop(first);
+        closed.send(()).expect("the client waits");
+        if replace {
+            let (mut second, _) = listener.accept().expect("origin accepts the replacement");
+            read_head(&mut second).expect("replacement request head");
+            second
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .expect("origin answers");
+            let mut rest = Vec::new();
+            let _ = second.read_to_end(&mut rest);
+        }
+    });
+    (address, close, closures, origin)
+}
+
+/// Pool parameters with one connection, a 1 s connect timeout and no maximum
+/// age.
+fn one_connection() -> PoolParams {
+    PoolParams {
+        max_connections: 1,
+        connect_timeout: Duration::from_secs(1),
+        max_age: Duration::ZERO,
+        ..PoolParams::default()
+    }
+}
+
+/// While a pull-through body holds the drive and is not read, an upstream EOF
+/// inside its response is not applied, so its pool still counts the session
+/// open; the body's next read applies it, and the driver's `admission_closed`,
+/// which runs inside that read, reaches the pool there: the session is
+/// draining when the read returns, and the waiter it wakes dials a
+/// replacement and is served on it. An owned session's run, the control,
+/// applies the EOF at once. (PT: the status, the first chunk, draining before
+/// the read, the waiter pending before it, the read's error, draining after
+/// it, the replacement's response and whether it is another connection.)
+#[test]
+fn n8_admission_closed_during_an_inline_drive_reaches_the_pool() {
+    let (address, close, closures, origin) = eof_mid_response_origin(true);
+    let pulled = run_on_worker(move |context| async move {
+        let pool = OwnedHttpSessionPool::new(
+            context.clone(),
+            socket_address(address),
+            one_connection(),
+            plaintext(CodecProtocol::Http11),
+            untimed(),
+        )
+        .expect("the pool accepts its parameters");
+        let first = pool
+            .get_session_with_reservation(CancellationToken::never())
+            .await
+            .expect("first acquisition");
+        let waiter = pool.get_session_with_reservation(CancellationToken::never());
+        tokio::pin!(waiter);
+        let waiting = tokio::select! {
+            _ = &mut waiter => false,
+            () = tokio::time::sleep(Duration::from_millis(20)) => true,
+        };
+        assert!(waiting, "the only session is reserved");
+        let (head, body) = Exchange::Fixed.request().await;
+        let mut response = first
+            .reservation
+            .submit_pull_through(head, body, CancellationToken::never())
+            .await
+            .expect("request is committed");
+        let (status, chunk) = pull_through_head_and_first_chunk(&mut response.body).await;
+        close.send(()).expect("the origin waits");
+        received(&closures).await;
+        // Time for a run that polls its own driver to apply the EOF.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let draining_before = first.session.is_draining();
+        let early = tokio::select! {
+            served = &mut waiter => Some(served),
+            () = tokio::time::sleep(Duration::from_millis(10)) => None,
+        };
+        let pending_before = early.is_none();
+        let error = poll_fn(|context| response.body.poll_body(context, u32::MAX))
+            .await
+            .err()
+            .map(|error| error.code());
+        let draining_after = first.session.is_draining();
+        let second = match early {
+            Some(served) => served,
+            None => waiter.await,
+        }
+        .expect("the waiter is served");
+        let replaced = second.session.connection_context().local_endpoint()
+            != first.session.connection_context().local_endpoint();
+        let (head, body) = Exchange::Fixed.request().await;
+        let mut replacement = second
+            .reservation
+            .submit_pull_through(head, body, CancellationToken::never())
+            .await
+            .expect("request is committed");
+        let served = read_pull_through(&mut replacement.body).await;
+        (
+            status,
+            chunk,
+            draining_before,
+            pending_before,
+            error,
+            draining_after,
+            (served.status, served.body, replaced),
+        )
+    });
+    origin.join().expect("origin ends");
+
+    let (address, close, closures, origin) = eof_mid_response_origin(false);
+    let owned = run_on_worker(move |context| async move {
+        let pool = OwnedHttpSessionPool::new(
+            context.clone(),
+            socket_address(address),
+            one_connection(),
+            plaintext(CodecProtocol::Http11),
+            untimed(),
+        )
+        .expect("the pool accepts its parameters");
+        let first = pool
+            .get_session_with_reservation(CancellationToken::never())
+            .await
+            .expect("first acquisition");
+        let (head, body) = Exchange::Fixed.request().await;
+        let response = first
+            .reservation
+            .submit(head, body, CancellationToken::never())
+            .await
+            .expect("request is committed");
+        let mut source = response.source.into_source_owner().into_source_holder();
+        let head = source.read_header_event().await.expect("response head");
+        let mut chunk = Received::default();
+        chunk.head(&head);
+        while chunk.body.is_empty() {
+            let event = source
+                .read_body_event(u32::MAX)
+                .await
+                .expect("response body");
+            chunk.body_event(&event);
+        }
+        close.send(()).expect("the origin waits");
+        received(&closures).await;
+        until(|| first.session.is_draining()).await;
+        let error = loop {
+            match source.read_body_event(u32::MAX).await {
+                Ok(event) => chunk.body_event(&event),
+                Err(error) => break Some(error.code()),
+            }
+        };
+        (chunk.status, chunk.body, error)
+    });
+    origin.join().expect("origin ends");
+
+    let error = owned.2;
+    assert!(error.is_some(), "the EOF fails the owned response");
+    assert_eq!(
+        owned,
+        (Some(200), b"0123456789".to_vec(), error),
+        "the control's run applied the EOF without a read"
+    );
+    assert_eq!(
+        pulled,
+        (
+            Some(200),
+            b"0123456789".to_vec(),
+            false,
+            true,
+            error,
+            true,
+            (Some(200), b"ok".to_vec(), true)
+        )
     );
 }

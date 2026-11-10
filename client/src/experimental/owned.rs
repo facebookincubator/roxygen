@@ -40,6 +40,15 @@
 //! peer or its worker's quiescence closes it, where dropping the last `ClientSession`
 //! drains it (`DIV-020`): a drain would refuse a submission the driver has not committed yet.
 //!
+//! An HTTP/1.1 session's driver is rooted with `OwnedH1UpstreamSession::run_pull_through`
+//! (`DIV-047`) in its run scope, whose stop check, quiescence drain and idle report are
+//! unchanged. Each exchange selects how its response is read:
+//! [`OwnedClientReservation::submit`] as on any session, or
+//! [`OwnedClientReservation::submit_pull_through`], which resolves to an
+//! [`OwnedClientPullThroughBody`] whose reads drive the connection once the request is
+//! written. On HTTP/2 a pull-through submission is refused with `INVALID_STATE_TRANSITION`
+//! before it reaches the driver, and is not reported unprocessed.
+//!
 //! [`OwnedHttpSessionPool`] pools owned sessions to one address with `HttpSessionPool`'s
 //! scheduler and `PoolParams`, which it shares: the drivers' `capacity_available` and
 //! `admission_closed` callbacks, and the idleness a driver publishes at the end of a turn,
@@ -75,6 +84,7 @@ use roxygen_core::connection::ConnectionContext;
 use roxygen_core::connection::TransportSecurity;
 use roxygen_core::error::HttpError;
 use roxygen_core::error::HttpErrorCode;
+use roxygen_core::events::HttpBodyEvent;
 use roxygen_core::events::HttpHeaderEvent;
 use roxygen_core::http::CodecProtocol;
 use roxygen_core::ingress_completion::IngressCompletion;
@@ -93,6 +103,8 @@ use roxygen_session::owned::OwnedUpstreamObserver;
 use roxygen_session::owned_h1::Http1DriverConfig;
 use roxygen_session::owned_h1::OwnedH1ExclusiveSubmission;
 use roxygen_session::owned_h1::OwnedH1Options;
+use roxygen_session::owned_h1::OwnedH1PullThroughBody;
+use roxygen_session::owned_h1::OwnedH1PullThroughSubmission;
 use roxygen_session::owned_h1::OwnedH1UpstreamHandle;
 use roxygen_session::owned_h1::OwnedH1UpstreamRequest;
 use roxygen_session::owned_h1::OwnedH1UpstreamReservation;
@@ -831,8 +843,8 @@ fn start(
                 session: Rc::downgrade(&inner),
                 ..scope
             };
-            let registration =
-                context.register_scope(scope.run(inner.upstream.clone(), session.run()));
+            let registration = context
+                .register_scope(scope.run(inner.upstream.clone(), session.run_pull_through()));
             (inner, registration)
         }
         DriverConfig::Http2(io, http2) => {
@@ -1027,6 +1039,27 @@ impl OwnedClientReservation {
             }
         })
     }
+
+    /// Roxygen-only (`DIV-047`): as [`submit`](Self::submit), but the response's
+    /// [`OwnedClientPullThroughBody`] drives the HTTP/1.1 connection from inside its reads
+    /// (`OwnedH1UpstreamReservation::submit_pull_through`). On HTTP/2 the request is refused
+    /// with `INVALID_STATE_TRANSITION` at once, and the refusal does not report
+    /// `request_unprocessed`.
+    pub fn submit_pull_through(
+        self,
+        headers: HttpHeaderEvent,
+        source: impl Into<HttpBodySource>,
+        cancellation: CancellationToken,
+    ) -> OwnedClientPullThroughSubmission {
+        OwnedClientPullThroughSubmission(match self.0 {
+            Reservation::Http1(reservation) => PullThroughSubmission::Http1(
+                reservation.submit_pull_through(headers, source, cancellation),
+            ),
+            Reservation::Http2(_) => PullThroughSubmission::Refused(Some(refusal(
+                "owned HTTP/2 client sessions have no pull-through exchanges",
+            ))),
+        })
+    }
 }
 
 /// A submitted request: a future of its response. Dropping it before it
@@ -1108,6 +1141,109 @@ impl OwnedClientResponse {
             request,
             sequence,
         }
+    }
+}
+
+/// A submitted pull-through request (`DIV-047`): a future of its response, which resolves at
+/// the driver's commitment. Dropping it before it resolves cancels the request, as dropping an
+/// [`OwnedClientSubmission`] does.
+pub struct OwnedClientPullThroughSubmission(PullThroughSubmission);
+
+enum PullThroughSubmission {
+    Http1(OwnedH1PullThroughSubmission),
+    /// Refused before it reached a driver: HTTP/2 has no pull-through exchanges.
+    Refused(Option<HttpError>),
+}
+
+impl OwnedClientPullThroughSubmission {
+    /// Selects `error` for the request; selected before the response is
+    /// claimed, it fails the submission.
+    pub fn cancel(&self, error: HttpError) {
+        if let PullThroughSubmission::Http1(submission) = &self.0 {
+            submission.cancel(error);
+        }
+    }
+}
+
+impl OwnedRequestProgressExt for OwnedClientPullThroughSubmission {
+    fn request_unprocessed(&self) -> bool {
+        match &self.0 {
+            PullThroughSubmission::Http1(submission) => submission.request_unprocessed(),
+            PullThroughSubmission::Refused(_) => false,
+        }
+    }
+
+    fn sequence_number(&self) -> Option<u64> {
+        match &self.0 {
+            PullThroughSubmission::Http1(submission) => submission.sequence_number(),
+            PullThroughSubmission::Refused(_) => None,
+        }
+    }
+}
+
+impl Future for OwnedClientPullThroughSubmission {
+    type Output = Result<OwnedClientPullThroughResponse, HttpError>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut self.get_mut().0 {
+            PullThroughSubmission::Http1(submission) => {
+                Pin::new(submission).poll(context).map(|response| {
+                    response.map(|response| {
+                        let request = OwnedClientRequest(Request::Http1(response.control));
+                        let sequence = request.sequence_number().expect(
+                            "should be fixed when the driver commits the request, before its response",
+                        );
+                        OwnedClientPullThroughResponse {
+                            body: OwnedClientPullThroughBody(response.body),
+                            request,
+                            sequence,
+                        }
+                    })
+                })
+            }
+            PullThroughSubmission::Refused(error) => Poll::Ready(Err(error
+                .take()
+                .expect("an owned pull-through submission was polled after it resolved"))),
+        }
+    }
+}
+
+/// A claimed pull-through response (`DIV-047`): its body, its request's control, and how many
+/// requests its connection committed before it.
+pub struct OwnedClientPullThroughResponse {
+    pub body: OwnedClientPullThroughBody,
+    pub request: OwnedClientRequest,
+    pub sequence: u64,
+}
+
+/// A pull-through exchange's response body (`DIV-047`), `OwnedH1PullThroughBody`'s client
+/// handle.
+pub struct OwnedClientPullThroughBody(OwnedH1PullThroughBody);
+
+impl OwnedClientPullThroughBody {
+    /// Reads the next response head, 1xx heads included, as the response's reader does.
+    pub fn poll_header(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        self.0.poll_header(context)
+    }
+
+    /// Reads the next body event, of at most `maximum` body bytes. It never returns
+    /// `HttpBodyEvent::suspend`.
+    #[inline]
+    pub fn poll_body(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        self.0.poll_body(context, maximum)
+    }
+
+    /// Stops the response, as dropping the body does: its read retires before its source is
+    /// cleared with `error`, and its connection's drive returns to the session's run.
+    pub fn stop(&mut self, error: Option<HttpErrorCode>) {
+        self.0.stop(error);
     }
 }
 

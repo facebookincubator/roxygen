@@ -12,6 +12,12 @@
 //!   protocol-neutral upstream session that frozen Proxygen's
 //!   `HTTPCoroConnector` does not have, and refuse the session parameters
 //!   they cannot honor instead of ignoring them.
+//! - `DIV-047`: [`owned::OwnedClientReservation::submit_pull_through`],
+//!   HTTP/1.1 owned exchanges whose response bodies drive their connection
+//!   from inside their reads
+//!   (`roxygen_session::owned_h1::OwnedH1UpstreamSession::run_pull_through`).
+//!   They prototype a consumer-driven read that frozen Proxygen's coro
+//!   session does not have.
 
 pub mod owned;
 
