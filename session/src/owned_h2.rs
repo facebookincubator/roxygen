@@ -1535,6 +1535,7 @@ where
             || (!UPSTREAM && !io.drain_request_body_on_drop)
             || (UPSTREAM && io.drain_request_body_on_drop)
             || (!UPSTREAM && io.deliver_ingress_before_abort)
+            || io.exact_method_tokens
             || http2.stats.is_some()
             || http2
                 .ping_probes

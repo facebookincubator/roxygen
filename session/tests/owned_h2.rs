@@ -1414,7 +1414,7 @@ fn content_length_mismatch_cancels_once_with_the_typed_error() {
 fn unsupported_config_is_rejected_before_transport_or_application_work() {
     run_on_worker(|context| {
         Box::pin(async move {
-            for case in 0..5 {
+            for case in 0..6 {
                 let (transport, state) = FixtureTransport::new([]);
                 let mut config = options(context.clone(), transport);
                 match case {
@@ -1428,6 +1428,7 @@ fn unsupported_config_is_rejected_before_transport_or_application_work() {
                     2 => config.http2.stream_receive_window = 0,
                     3 => state.borrow_mut().capability = ByteEventCapability::TransportEvents,
                     4 => config.io.deliver_ingress_before_abort = true,
+                    5 => config.io.exact_method_tokens = true,
                     _ => unreachable!(),
                 }
                 let (application, probes) = Application::new(vec![]);

@@ -420,6 +420,15 @@ pub struct UniplexConfig {
     /// its unflushed buffer and the I/O, instead of draining that output to a peer that
     /// may have stopped reading. HTTP/2 sessions and the owned drivers ignore it.
     pub non_abortive_close: bool,
+    /// Roxygen-only, default off (`DIV-040`): a downstream session's codec reads each
+    /// request's method as RFC 9110 section 9.1 defines methods, and as hyper reads them:
+    /// any token, case-sensitive and kept byte for byte, so `post`, `Post` and `PURGE` are
+    /// extension methods the application reads as sent and only `POST` is
+    /// `HttpMethod::Post` (`Http1xCodec::set_exact_methods`,
+    /// `Http2Codec::set_exact_methods`). Off, HTTP/1.1 accepts only the frozen method table
+    /// and HTTP/2 canonicalizes the methods it recognizes without regard to case. Upstream
+    /// sessions ignore it; the owned drivers refuse it.
+    pub exact_method_tokens: bool,
 }
 
 impl Default for UniplexConfig {
@@ -439,6 +448,7 @@ impl Default for UniplexConfig {
             deliver_ingress_before_abort: false,
             unframed_bodiless_http1_requests: false,
             non_abortive_close: false,
+            exact_method_tokens: false,
         }
     }
 }
@@ -3886,6 +3896,7 @@ impl UniplexSession {
             if let Some(strategy) = &http2.header_indexing_strategy {
                 codec.set_header_indexing_strategy(Rc::clone(strategy));
             }
+            codec.set_exact_methods(config.exact_method_tokens && direction.is_downstream());
             let mut callback = NoopCodecCallback;
             codec.generate(&mut egress, EgressFrame::ConnectionPreface, &mut callback)?;
             codec.generate_configured_settings(&mut egress, &mut callback)?;
@@ -3905,6 +3916,7 @@ impl UniplexSession {
         } else {
             let mut codec = Http1xCodec::new(direction);
             codec.set_unframed_bodiless_requests(config.unframed_bodiless_http1_requests);
+            codec.set_exact_methods(config.exact_method_tokens && direction.is_downstream());
             (DriverCodec::Http1(codec), None)
         };
         let http2_state = http2_config.clone().map(|config| {

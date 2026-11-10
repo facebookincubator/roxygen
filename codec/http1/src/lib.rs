@@ -32,6 +32,7 @@ use roxygen_core::http::HttpHeaderSize;
 use roxygen_core::http::HttpMethod;
 use roxygen_core::http::Method;
 use roxygen_core::http::TransportDirection;
+use roxygen_core::http::is_tchar;
 use roxygen_core::ids::StreamId;
 use roxygen_core::message::HttpMessage;
 use roxygen_core::rfc2616;
@@ -355,11 +356,13 @@ static METHOD_BYTE_MASKS: [[u32; 27]; INITIAL_PREFIX_LIMIT - 1] = {
 
 /// `valid_initial_prefix` of a head that grows one byte at a time, with each
 /// byte read once. Downstream it keeps the frozen methods that the method token
-/// still prefixes and whether a delimiter has ended the token; upstream, which
-/// byte of `HTTP/` comes next. A prefix that fails stays failed: every longer
-/// head holds the same mismatch.
+/// still prefixes (with exact methods, that every byte so far is a `tchar`) and
+/// whether a delimiter has ended the token; upstream, which byte of `HTTP/`
+/// comes next. A prefix that fails stays failed: every longer head holds the
+/// same mismatch.
 struct PrefixMatch {
     upstream: bool,
+    exact_methods: bool,
     length: usize,
     candidates: u32,
     delimited: bool,
@@ -367,9 +370,10 @@ struct PrefixMatch {
 }
 
 impl PrefixMatch {
-    fn new(upstream: bool) -> Self {
+    fn new(upstream: bool, exact_methods: bool) -> Self {
         Self {
             upstream,
+            exact_methods,
             length: 0,
             candidates: ALL_FROZEN_HTTP_METHODS,
             delimited: false,
@@ -404,6 +408,8 @@ impl PrefixMatch {
         } else if !self.delimited {
             if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
                 self.delimited = true;
+            } else if self.exact_methods {
+                self.valid = is_tchar(byte);
             } else {
                 #[cfg(test)]
                 count_helper_work(|work| &work.prefix_method_steps, 1);
@@ -560,6 +566,9 @@ pub struct Http1xCodec {
     downstream_upgrade_as_ordinary: bool,
     /// Roxygen-only (`DIV-036`): a request head that ends its message gets no body framing.
     unframed_bodiless_requests: bool,
+    /// Roxygen-only (`DIV-040`): a downstream request's method is any RFC 9110 token,
+    /// kept byte for byte, instead of one of `FROZEN_HTTP_METHODS`.
+    exact_methods: bool,
     /// The last request stream parsed under `downstream_upgrade_as_ordinary`, or unspecified.
     last_ordinary_request: StreamId,
     upstream_upgrade_as_ordinary: bool,
@@ -645,6 +654,7 @@ impl Http1xCodec {
             strict_validation,
             downstream_upgrade_as_ordinary: false,
             unframed_bodiless_requests: false,
+            exact_methods: false,
             last_ordinary_request: StreamId::UNSPECIFIED,
             upstream_upgrade_as_ordinary: false,
             ordinary_request_sent: false,
@@ -723,6 +733,17 @@ impl Http1xCodec {
     /// Off by default. It has no effect on a downstream codec.
     pub fn set_unframed_bodiless_requests(&mut self, enabled: bool) {
         self.unframed_bodiless_requests = enabled;
+    }
+
+    /// Roxygen-only (`DIV-040`): a downstream request's method is read as RFC 9110 section 9.1
+    /// defines methods, and as hyper (`httparse` and `http::Method::from_bytes`) reads them:
+    /// any token, case-sensitive and kept byte for byte (`Method::from_exact_token`), so
+    /// `post`, `Post` and `PURGE` are extension methods and only `POST` is `HttpMethod::Post`,
+    /// instead of only the reference codec's frozen method table, matched byte for byte.
+    /// A request line whose method is not a token is still a 400 parse error. Off by
+    /// default. It has no effect on an upstream codec.
+    pub fn set_exact_methods(&mut self, enabled: bool) {
+        self.exact_methods = enabled;
     }
 
     /// Releases upstream egress ownership as soon as the request completes.
@@ -999,6 +1020,7 @@ impl Http1xCodec {
         if self.direction.is_upstream() {
             return;
         }
+        let exact_methods = self.exact_methods;
         let Some(message) = self.current_message.as_mut() else {
             return;
         };
@@ -1023,7 +1045,7 @@ impl Http1xCodec {
                 None => return,
             },
         };
-        if words.next().is_some() || !is_frozen_http_method(method) {
+        if words.next().is_some() || !accepts_method(exact_methods, method) {
             return;
         }
         let parsed =
@@ -1031,9 +1053,11 @@ impl Http1xCodec {
         if !parsed.valid() {
             return;
         }
-        let _ = message.set_method(Method::from_name(
-            String::from_utf8_lossy(method).into_owned(),
-        ));
+        let method = match Method::from_exact_token(method).filter(|_| exact_methods) {
+            Some(method) => method,
+            None => Method::from_name(String::from_utf8_lossy(method).into_owned()),
+        };
+        let _ = message.set_method(method);
         let _ = message.set_url(url, self.strict_validation);
         message.set_http_version(version.0, version.1);
     }
@@ -1055,6 +1079,9 @@ impl Http1xCodec {
             (token_end + 1).min(head.len()),
         );
         let token = &head[..token_end];
+        if self.exact_methods {
+            return token.iter().copied().all(is_tchar);
+        }
         FROZEN_HTTP_METHODS
             .iter()
             .any(|method| method.starts_with(token))
@@ -1114,7 +1141,7 @@ impl Http1xCodec {
         // start-line prefix check. Bytes past it are not scanned.
         let mut prefix_stop = None;
         if base + from < prefix_limit {
-            let mut prefix = PrefixMatch::new(self.direction.is_upstream());
+            let mut prefix = PrefixMatch::new(self.direction.is_upstream(), self.exact_methods);
             for byte in buffered {
                 push_prefix(&mut prefix, byte);
             }
@@ -1327,16 +1354,23 @@ impl Http1xCodec {
                     b"invalid HTTP request version".as_slice(),
                 ))?,
             };
-            if words.next().is_some() || !is_frozen_http_method(method) {
+            if words.next().is_some() || !accepts_method(self.exact_methods, method) {
                 self.current_message = Some(message);
                 return Err((ParseErrorKind::Header, b"invalid HTTP request line"));
             }
-            let method = match HttpMethod::from_bytes(method) {
-                Some(method) => Method::from(method),
-                None => {
-                    #[cfg(test)]
-                    count_work(&self.head_work.method_copies, 1);
-                    Method::from_name(String::from_utf8_lossy(method).into_owned())
+            let method = if self.exact_methods {
+                Method::from_exact_token(method).ok_or((
+                    ParseErrorKind::Header,
+                    b"invalid HTTP request method".as_slice(),
+                ))?
+            } else {
+                match HttpMethod::from_bytes(method) {
+                    Some(method) => Method::from(method),
+                    None => {
+                        #[cfg(test)]
+                        count_work(&self.head_work.method_copies, 1);
+                        Method::from_name(String::from_utf8_lossy(method).into_owned())
+                    }
                 }
             };
             message.set_method(method).map_err(|_| {
@@ -3020,6 +3054,16 @@ pub fn server_accepted_upgrade(client: &[u8], server: &[u8]) -> bool {
 
 fn is_frozen_http_method(method: &[u8]) -> bool {
     FROZEN_HTTP_METHODS.contains(&method)
+}
+
+/// Whether a downstream request line may carry `method`: with `exact_methods`
+/// any token, otherwise a frozen method.
+fn accepts_method(exact_methods: bool, method: &[u8]) -> bool {
+    if exact_methods {
+        !method.is_empty() && method.iter().copied().all(is_tchar)
+    } else {
+        is_frozen_http_method(method)
+    }
 }
 
 fn parse_version(value: &[u8]) -> Option<(u8, u8)> {

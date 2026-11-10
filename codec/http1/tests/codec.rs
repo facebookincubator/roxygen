@@ -296,6 +296,86 @@ fn frozen_method_table_accepts_fragmented_extension_methods() {
     assert_eq!(callback.events, ["begin", "error"]);
 }
 
+fn exact_method_codec() -> Http1xCodec {
+    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+    codec.set_exact_methods(true);
+    codec
+}
+
+/// Parses `wire` with exact methods, whole and then one byte at a time, and
+/// returns each parse's recorder.
+fn parse_exact_whole_and_bytewise(wire: &[u8]) -> [Recorder; 2] {
+    let mut whole = Recorder::default();
+    parse(&mut exact_method_codec(), &mut whole, wire);
+    let mut bytewise = Recorder::default();
+    let mut codec = exact_method_codec();
+    let mut egress = BufQueue::new(QUEUE_LIMIT);
+    for byte in wire.chunks(1) {
+        let _ = codec.on_ingress(&ingress_queue(byte), &mut bytewise, &mut egress);
+    }
+    [whole, bytewise]
+}
+
+#[test]
+fn exact_methods_keep_every_request_method_token_byte_for_byte_when_enabled() {
+    for (method, recognized) in [
+        (b"POST".as_slice(), Some(HttpMethod::Post)),
+        (b"post", None),
+        (b"Post", None),
+        (b"PURGE", None),
+        (b"purge", None),
+        (b"M-SEARCH", None),
+        (b"FOO_BAR.1~", None),
+        (b"head", None),
+        // Longer than the longest frozen method, which bounds the early start-line check.
+        (b"A-VERY-LONG-EXTENSION-METHOD", None),
+    ] {
+        let mut wire = method.to_vec();
+        wire.extend_from_slice(b" /generate HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        for callback in parse_exact_whole_and_bytewise(&wire) {
+            assert_eq!(
+                callback.events,
+                ["begin", "headers", "complete"],
+                "{method:?}"
+            );
+            let mut message = callback.messages[0].clone();
+            assert_eq!(message.method_string().unwrap().as_bytes(), method);
+            assert_eq!(message.method().unwrap(), recognized, "{method:?}");
+            assert_eq!(message.request_url(), Some(b"/generate".as_slice()));
+        }
+    }
+}
+
+#[test]
+fn exact_methods_reject_a_method_that_is_not_a_token_when_enabled() {
+    for wire in [
+        b"P@ST / HTTP/1.1\r\n\r\n".as_slice(),
+        b"(GET) / HTTP/1.1\r\n\r\n",
+        b"A-VERY-LONG-EXTENSION-METHOD{ / HTTP/1.1\r\n\r\n",
+        b"POST\x7f / HTTP/1.1\r\n\r\n",
+    ] {
+        for callback in parse_exact_whole_and_bytewise(wire) {
+            assert_eq!(callback.events, ["begin", "error"], "{wire:?}");
+            assert_eq!(callback.errors[0].0, ProxygenError::PARSE_HEADER);
+            assert_eq!(callback.errors[0].1, Some(400));
+        }
+    }
+}
+
+#[test]
+fn methods_outside_the_frozen_table_are_rejected_by_default() {
+    for wire in [
+        b"post / HTTP/1.1\r\n\r\n".as_slice(),
+        b"Post / HTTP/1.1\r\n\r\n",
+        b"PURGE / HTTP/1.1\r\n\r\n",
+    ] {
+        let callback = assert_header_error(wire, false);
+        assert_eq!(callback.events, ["begin", "error"], "{wire:?}");
+    }
+    let mut message = assert_simple_request(b"POST / HTTP/1.1\r\n\r\n");
+    assert_eq!(message.method().unwrap(), Some(HttpMethod::Post));
+}
+
 #[test]
 fn test_simple_headers_queue() {
     let wire = b"GET /one HTTP/1.1\nHost: one\n\nGET /two HTTP/1.1\nHost: two\n\n";

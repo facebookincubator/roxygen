@@ -112,6 +112,29 @@ impl Method {
         }
     }
 
+    /// Roxygen-only (`DIV-040`): the method that the request-line or `:method` token `token`
+    /// names when methods are case-sensitive (RFC 9110 section 9.1), as
+    /// `http::Method::from_bytes` reads it: exactly a recognized method's canonical spelling
+    /// is that method, and any other token is an extension method spelled byte for byte, so
+    /// `post` and `Post` are extension methods distinct from `POST`. `None` unless `token` is
+    /// an RFC 9110 `token` (one or more `tchar`).
+    pub fn from_exact_token(token: &[u8]) -> Option<Self> {
+        if token.is_empty() || !token.iter().copied().all(is_tchar) {
+            return None;
+        }
+        if let Some(method) = HttpMethod::ALL
+            .iter()
+            .copied()
+            .find(|method| method.as_bytes() == token)
+        {
+            return Some(Self::from(method));
+        }
+        let name = std::str::from_utf8(token).ok()?;
+        Some(Self {
+            name: MethodName::Extension(name.into()),
+        })
+    }
+
     pub const fn recognized(&self) -> Option<HttpMethod> {
         match &self.name {
             MethodName::Known(method) => Some(*method),
@@ -163,6 +186,30 @@ impl fmt::Display for Method {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
+}
+
+/// Whether `byte` is an RFC 9110 `tchar`: a digit, a letter, or one of ``!#$%&'*+-.^_`|~``.
+pub const fn is_tchar(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+            | b'0'..=b'9'
+            | b'a'..=b'z'
+            | b'A'..=b'Z'
+    )
 }
 
 /// Wire protocol selected for an HTTP codec.

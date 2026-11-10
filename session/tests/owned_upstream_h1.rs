@@ -1299,7 +1299,7 @@ fn submit_exclusive_and_source_parts_match_h2_contracts() {
 #[test]
 fn owned_h1_upstream_rejects_unsupported_config() {
     type Change = fn(&mut OwnedH1Options);
-    let cases: [(&str, Change, ByteEventCapability); 11] = [
+    let cases: [(&str, Change, ByteEventCapability); 12] = [
         (
             "read_timeout",
             |options| options.io.read_timeout = Duration::from_secs(1),
@@ -1328,6 +1328,11 @@ fn owned_h1_upstream_rejects_unsupported_config() {
         (
             "abort_exchanges_on_eof",
             |options| options.io.abort_exchanges_on_eof = true,
+            ByteEventCapability::Unsupported,
+        ),
+        (
+            "exact_method_tokens",
+            |options| options.io.exact_method_tokens = true,
             ByteEventCapability::Unsupported,
         ),
         (

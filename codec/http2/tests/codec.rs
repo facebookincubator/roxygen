@@ -1589,6 +1589,108 @@ fn bad_headers() {
     assert_request_field_error(fields);
 }
 
+/// Decodes the request `fields` on stream 1 and then again on stream 3 (the
+/// second block may come from the decoder memo) with a codec `configure` set
+/// up, and returns what the callback saw.
+fn decode_twice_with(
+    fields: &[HpackHeader],
+    configure: impl FnOnce(&mut Http2Codec),
+) -> MessageCapture {
+    let mut codec = Http2Codec::new(TransportDirection::Downstream);
+    configure(&mut codec);
+    open(&mut codec, &mut Trace::default());
+    let mut callback = MessageCapture::default();
+    let mut encoder = HpackCodec::new();
+    for stream in [1, 3] {
+        let mut wire = BufQueue::new(64 * 1024);
+        frame::write_headers(
+            &mut wire,
+            queue(&encoder.encode(fields)),
+            stream,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        let wire = bytes(&wire);
+        assert_eq!(
+            codec
+                .on_ingress(&queue(&wire), &mut callback, &mut BufQueue::new(1024))
+                .consumed,
+            wire.len()
+        );
+    }
+    callback
+}
+
+fn request_with_method(method: &[u8]) -> Vec<HpackHeader> {
+    let mut fields = request_fields(b"/generate");
+    fields[0] = HpackHeader::new(b":method", method);
+    fields
+}
+
+#[test]
+fn exact_methods_keep_the_method_pseudo_header_byte_for_byte_when_enabled() {
+    for (method, recognized) in [
+        (b"POST".as_slice(), Some(HttpMethod::Post)),
+        (b"post", None),
+        (b"Post", None),
+        (b"PURGE", None),
+        (b"purge", None),
+        (b"M-SEARCH", None),
+        (b"FOO_BAR.1~", None),
+    ] {
+        let capture = decode_twice_with(&request_with_method(method), |codec| {
+            codec.set_exact_methods(true);
+        });
+        assert_eq!(
+            capture.events,
+            [
+                "begin", "headers", "complete", "begin", "headers", "complete"
+            ],
+            "{method:?}"
+        );
+        for mut message in capture.messages {
+            assert_eq!(message.method_string().unwrap().as_bytes(), method);
+            assert_eq!(message.method().unwrap(), recognized, "{method:?}");
+        }
+    }
+}
+
+#[test]
+fn exact_methods_reject_a_method_that_is_not_a_token_when_enabled() {
+    for method in [b"".as_slice(), b"P@ST", b"POST ", b"(GET)", b"GE\x7fT"] {
+        let capture = decode_twice_with(&request_with_method(method), |codec| {
+            codec.set_exact_methods(true);
+        });
+        assert!(capture.messages.is_empty(), "{method:?}");
+        assert_eq!(
+            capture
+                .error
+                .map(|(_, _, status, new_stream)| (status, new_stream)),
+            Some((Some(400), true)),
+            "{method:?}"
+        );
+    }
+}
+
+#[test]
+fn request_methods_are_canonicalized_by_default() {
+    for (method, canonical, recognized) in [
+        (b"POST".as_slice(), "POST", Some(HttpMethod::Post)),
+        (b"post", "POST", Some(HttpMethod::Post)),
+        (b"Post", "POST", Some(HttpMethod::Post)),
+        (b"purge", "PURGE", None),
+    ] {
+        let capture = decode_twice_with(&request_with_method(method), |_| {});
+        assert_eq!(capture.messages.len(), 2, "{method:?}");
+        for mut message in capture.messages {
+            assert_eq!(message.method_string().unwrap(), canonical);
+            assert_eq!(message.method().unwrap(), recognized);
+        }
+    }
+}
+
 #[test]
 fn header_decode_retains_owned_message_and_public_result_type() {
     use super::header_decode::HeaderDecodeInfo;

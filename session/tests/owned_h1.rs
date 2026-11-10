@@ -1911,7 +1911,7 @@ fn cancel_tears_down_cleanly() {
 #[test]
 fn owned_h1_rejects_unsupported_config() {
     type Change = fn(&mut UniplexConfig);
-    let cases: [(&str, Change, ByteEventCapability); 11] = [
+    let cases: [(&str, Change, ByteEventCapability); 12] = [
         (
             "read_timeout",
             |io| io.read_timeout = Duration::from_secs(1),
@@ -1945,6 +1945,11 @@ fn owned_h1_rejects_unsupported_config() {
         (
             "deliver_ingress_before_abort",
             |io| io.deliver_ingress_before_abort = true,
+            ByteEventCapability::Unsupported,
+        ),
+        (
+            "exact_method_tokens",
+            |io| io.exact_method_tokens = true,
             ByteEventCapability::Unsupported,
         ),
         (

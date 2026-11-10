@@ -188,6 +188,15 @@ pub struct ServerSessionConfig {
     /// Everything else about the reset is unchanged. Plaintext only: `HttpServer` refuses
     /// it with TLS credentials, and `serve_transport` for a transport declared TLS.
     pub non_abortive_close: bool,
+    /// Roxygen-only, default off (`DIV-040`): each request's method reaches the application
+    /// as RFC 9110 section 9.1 defines methods and as hyper's server reads them, on HTTP/1.1
+    /// and HTTP/2 alike: any token, case-sensitive and kept byte for byte, so `post`, `Post`
+    /// and `PURGE` are extension methods that `HttpMessage::request_method` returns as sent
+    /// and only `POST` is `HttpMethod::Post`. Off, an HTTP/1.1 request whose method is not in
+    /// the frozen method table gets 400, and HTTP/2 canonicalizes recognized methods without
+    /// regard to case and uppercases extension methods. A method that is not a token is still
+    /// a malformed request. `owned_http1` and `owned_http2` refuse it.
+    pub exact_method_tokens: bool,
     #[cfg(test)]
     pub(crate) accepted_socket_profile: Option<Arc<AcceptedSocketProfile>>,
 }
@@ -231,6 +240,7 @@ impl Default for ServerSessionConfig {
             owned_http2: false,
             abort_exchanges_on_eof: false,
             non_abortive_close: false,
+            exact_method_tokens: false,
             #[cfg(test)]
             accepted_socket_profile: None,
         }
@@ -254,6 +264,9 @@ impl ServerSessionConfig {
         if self.abort_exchanges_on_eof {
             return Err("owned_http1 does not support abort_exchanges_on_eof");
         }
+        if self.exact_method_tokens {
+            return Err("owned_http1 does not support exact_method_tokens");
+        }
         if !self.stream_read_timeout.is_zero() {
             return Err("owned_http1 is untimed: stream_read_timeout must be zero");
         }
@@ -273,6 +286,9 @@ impl ServerSessionConfig {
         }
         if self.stats_factory.is_some() {
             return Err("owned_http2 does not support stats_factory");
+        }
+        if self.exact_method_tokens {
+            return Err("owned_http2 does not support exact_method_tokens");
         }
         Ok(())
     }
@@ -677,6 +693,7 @@ pub(crate) fn attach_session(
         deliver_ingress_before_abort: false,
         unframed_bodiless_http1_requests: false,
         non_abortive_close: config.session.non_abortive_close,
+        exact_method_tokens: config.session.exact_method_tokens,
     };
     if let Some(limits) = transport_limits {
         uniplex.maximum_read_size = uniplex.maximum_read_size.min(limits.maximum_read_size());

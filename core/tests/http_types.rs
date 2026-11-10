@@ -104,6 +104,48 @@ fn method_constructors_preserve_value_and_hash_consistency() {
 }
 
 #[test]
+fn exact_method_tokens_are_case_sensitive_and_kept_byte_for_byte() {
+    for (token, expected, recognized) in [
+        ("POST", "POST", Some(HttpMethod::Post)),
+        ("GET", "GET", Some(HttpMethod::Get)),
+        ("UNSUB", "UNSUB", Some(HttpMethod::Unsub)),
+        ("post", "post", None),
+        ("Post", "Post", None),
+        ("pOsT", "pOsT", None),
+        ("PURGE", "PURGE", None),
+        ("purge", "purge", None),
+        ("M-SEARCH", "M-SEARCH", None),
+        ("!#$%&'*+-.^_`|~09azAZ", "!#$%&'*+-.^_`|~09azAZ", None),
+    ] {
+        let method = Method::from_exact_token(token.as_bytes()).expect("a token");
+        assert_eq!(method.as_str(), expected);
+        assert_eq!(method.recognized(), recognized);
+    }
+    assert_ne!(
+        Method::from_exact_token(b"post"),
+        Some(Method::from(HttpMethod::Post))
+    );
+    assert_eq!(
+        Method::from_exact_token(b"POST"),
+        Some(Method::from(HttpMethod::Post))
+    );
+    for invalid in [
+        b"".as_slice(),
+        b"PO ST",
+        b"POST\t",
+        b"GET\0",
+        b"(GET)",
+        b"GE/T",
+        b"GET\"",
+        b"GET,",
+        b"M\xc3\xa9THOD",
+        b"\x7f",
+    ] {
+        assert_eq!(Method::from_exact_token(invalid), None, "{invalid:?}");
+    }
+}
+
+#[test]
 fn header_size_fields_default_to_zero_and_remain_independent() {
     assert_eq!(
         HttpHeaderSize::default(),

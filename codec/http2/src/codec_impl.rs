@@ -49,6 +49,7 @@ use crate::frame::FrameHeader;
 use crate::frame::FrameType;
 use crate::frame::SegmentCursor;
 use crate::frame::Setting;
+use crate::header_decode::FieldDecodeOptions;
 use crate::header_decode::HeaderDecodeInfo;
 use crate::hpack::CompressionInfo;
 use crate::hpack::DecodeMemoState;
@@ -251,6 +252,7 @@ struct DecoderMemo {
     request: bool,
     validate: bool,
     strict: bool,
+    options: FieldDecodeOptions,
     /// The length and seeded hash of the last eligible block. Only a block that matches them is
     /// copied, so a block seen once costs no allocation.
     len: usize,
@@ -276,6 +278,7 @@ pub struct Http2Codec {
     add_date_to_response: bool,
     validate_headers: bool,
     strict_validation: bool,
+    field_options: FieldDecodeOptions,
     reuse_payload_headroom: bool,
     compact_data: bool,
     data_headers: DataHeaderArena,
@@ -321,6 +324,7 @@ impl Http2Codec {
             add_date_to_response: true,
             validate_headers: true,
             strict_validation: false,
+            field_options: FieldDecodeOptions::default(),
             reuse_payload_headroom: true,
             compact_data: false,
             data_headers: DataHeaderArena::default(),
@@ -382,6 +386,18 @@ impl Http2Codec {
     pub fn set_strict_validation(&mut self, enabled: bool) {
         self.decoder_memo = None;
         self.strict_validation = enabled;
+    }
+
+    /// Roxygen-only (`DIV-040`): a request's `:method` is read as RFC 9110 section 9.1 defines
+    /// methods, and as h2 (`http::Method::from_bytes`) reads them: any token, case-sensitive and
+    /// kept byte for byte (`Method::from_exact_token`), so `post` and `Post` are extension
+    /// methods and only `POST` is `HttpMethod::Post`, instead of the reference decoder's run of
+    /// letters and `-`, whose recognized methods match without regard to case and whose
+    /// extension methods are uppercased. A `:method` that is not a token, the empty one
+    /// included, makes the request malformed. Off by default.
+    pub fn set_exact_methods(&mut self, enabled: bool) {
+        self.decoder_memo = None;
+        self.field_options.exact_methods = enabled;
     }
 
     pub fn set_header_indexing_strategy(
@@ -1183,7 +1199,8 @@ impl Http2Codec {
                 self.validate_headers,
                 self.strict_validation,
                 false,
-            );
+            )
+            .with_options(self.field_options);
             let head = !trailers && matches!(block.kind, HeaderBlockKind::Headers { .. });
             let mut presizing = PresizingDecode {
                 decode: &mut decode,
@@ -1457,6 +1474,7 @@ impl Http2Codec {
             || memo.request != request
             || memo.validate != self.validate_headers
             || memo.strict != self.strict_validation
+            || memo.options != self.field_options
             || memo.wire != bytes
         {
             return None;
@@ -1494,13 +1512,18 @@ impl Http2Codec {
             return;
         };
         let hash = self.memo_fingerprint_hash(bytes);
-        let (validate, strict) = (self.validate_headers, self.strict_validation);
+        let (validate, strict, options) = (
+            self.validate_headers,
+            self.strict_validation,
+            self.field_options,
+        );
         match &mut self.decoder_memo {
             Some(memo)
                 if memo.token == token
                     && memo.request == request
                     && memo.validate == validate
                     && memo.strict == strict
+                    && memo.options == options
                     && memo.len == bytes.len()
                     && memo.hash == hash =>
             {
@@ -1522,6 +1545,7 @@ impl Http2Codec {
                 memo.request = request;
                 memo.validate = validate;
                 memo.strict = strict;
+                memo.options = options;
                 memo.len = bytes.len();
                 memo.hash = hash;
                 memo.wire.clear();
@@ -1533,6 +1557,7 @@ impl Http2Codec {
                     request,
                     validate,
                     strict,
+                    options,
                     len: bytes.len(),
                     hash,
                     wire: Vec::new(),

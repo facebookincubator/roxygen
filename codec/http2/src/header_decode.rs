@@ -4,6 +4,7 @@ use roxygen_codec::ProxygenError;
 use roxygen_core::headers::HttpHeaderCode;
 use roxygen_core::http::HttpHeaderSize;
 use roxygen_core::http::HttpMethod;
+use roxygen_core::http::Method;
 use roxygen_core::message::HttpMessage;
 
 use crate::hpack::DecodedHeaderBlock;
@@ -17,6 +18,15 @@ use crate::util::validate_header_value;
 use crate::util::validate_method;
 use crate::util::validate_scheme;
 use crate::util::validate_url;
+
+/// Roxygen-only options for decoding a field section, all off by default.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FieldDecodeOptions {
+    /// `DIV-040`: a request's `:method` is any RFC 9110 token, case-sensitive and kept byte
+    /// for byte (`Method::from_exact_token`), as `http::Method::from_bytes` reads it, instead
+    /// of a run of letters and `-` whose recognized methods match without regard to case.
+    pub exact_methods: bool,
+}
 
 /// Request pseudo-header state and validation.
 #[derive(Debug, Default)]
@@ -36,8 +46,28 @@ impl HttpRequestVerifier {
     }
 
     pub fn set_method(&mut self, message: &mut HttpMessage, method: &[u8]) -> bool {
+        self.set_method_with(message, method, FieldDecodeOptions::default())
+    }
+
+    /// `set_method`, reading the method as `options` say.
+    pub fn set_method_with(
+        &mut self,
+        message: &mut HttpMessage,
+        method: &[u8],
+        options: FieldDecodeOptions,
+    ) -> bool {
         if self.has_method {
             return self.fail("Duplicate method", false);
+        }
+        if options.exact_methods {
+            let Some(exact) = Method::from_exact_token(method) else {
+                return self.fail(
+                    format!("Invalid method: {}", String::from_utf8_lossy(method)),
+                    true,
+                );
+            };
+            self.has_method = true;
+            return message.set_method(exact).is_ok();
         }
         if !validate_method(method) {
             return self.fail(
@@ -193,6 +223,7 @@ pub struct HeaderDecodeInfo {
     pub proxygen_error: Option<ProxygenError>,
     pub decode_error: Option<HpackError>,
     verifier: HttpRequestVerifier,
+    options: FieldDecodeOptions,
     is_request: bool,
     request_trailers: bool,
     validate: bool,
@@ -218,6 +249,7 @@ impl HeaderDecodeInfo {
             proxygen_error: None,
             decode_error: None,
             verifier: HttpRequestVerifier::default(),
+            options: FieldDecodeOptions::default(),
             is_request,
             request_trailers,
             validate,
@@ -227,6 +259,13 @@ impl HeaderDecodeInfo {
             regular_header_seen: false,
             pseudo_header_seen: false,
         }
+    }
+
+    /// Decodes with `options` instead of the defaults.
+    #[must_use]
+    pub const fn with_options(mut self, options: FieldDecodeOptions) -> Self {
+        self.options = options;
+        self
     }
 
     pub fn decode(mut self, decoded: DecodedHeaderBlock) -> Result<HttpMessage, Box<Self>> {
@@ -269,7 +308,8 @@ impl HeaderDecodeInfo {
             return if self.is_request {
                 let ok = match code {
                     HttpHeaderCode::ColonMethod => {
-                        self.verifier.set_method(&mut self.message, value)
+                        self.verifier
+                            .set_method_with(&mut self.message, value, self.options)
                     }
                     HttpHeaderCode::ColonScheme => {
                         self.verifier.set_scheme(&mut self.message, value)

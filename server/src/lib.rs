@@ -50,6 +50,10 @@ mod polled_response_body_tests;
 mod router_ingress_tests;
 
 #[cfg(test)]
+#[path = "../tests/request_fields.rs"]
+mod request_fields_tests;
+
+#[cfg(test)]
 #[path = "../tests/native_readiness.rs"]
 mod native_readiness_tests;
 
