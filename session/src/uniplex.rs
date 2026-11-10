@@ -10013,7 +10013,13 @@ fn handle_codec_failure(
             if let Some(status) = status {
                 state.borrow_mut().reset_after_error_response = Some(failure.stream);
                 match catch_unwind(AssertUnwindSafe(|| {
-                    schedule_error_response(state, failure.stream, status, failure.error.clone())
+                    schedule_error_response(
+                        state,
+                        write_wake,
+                        failure.stream,
+                        status,
+                        failure.error.clone(),
+                    )
                 })) {
                     Ok(result) => scheduled = result,
                     Err(payload) => first_panic = Some(payload),
@@ -10079,7 +10085,7 @@ fn handle_codec_failure(
                     return;
                 }
             }
-            schedule_error_response(state, failure.stream, status, failure.error);
+            schedule_error_response(state, write_wake, failure.stream, status, failure.error);
         }
         CodecFailureDisposition::Ignore => {}
         CodecFailureDisposition::Reset {
@@ -10249,6 +10255,7 @@ fn reset_h1_ingress_stream(
 
 fn schedule_error_response(
     state: &Rc<RefCell<DriverState>>,
+    write_wake: &tokio::sync::Notify,
     stream: StreamId,
     status: u16,
     error: HttpError,
@@ -10280,8 +10287,18 @@ fn schedule_error_response(
         .set_error_response_status(stream, status)
         .is_ok();
     let mut replacement = None;
+    let mut pending_response = None;
+    let mut install_failure = None;
     let mut errors = Vec::new();
-    if !scheduled {
+    if scheduled {
+        match core
+            .core_mut()
+            .install_error_response_after_source_complete(stream)
+        {
+            Ok(update) => pending_response = update,
+            Err(install_error) => install_failure = Some(install_error),
+        }
+    } else {
         if core.core_mut().protocol() == CodecProtocol::Http11
             && !core
                 .core_mut()
@@ -10330,6 +10347,13 @@ fn schedule_error_response(
     if let Some(transfer) = replacement {
         driver.enqueue_transfer(stream, transfer, None);
     }
+    if let Some(update) = pending_response {
+        let drain_trigger = apply_stream_update_locked(&mut driver, update);
+        debug_assert!(
+            drain_trigger.is_none(),
+            "the stream's ingress is already marked complete"
+        );
+    }
     for error in errors {
         driver.record_error(error);
     }
@@ -10338,6 +10362,11 @@ fn schedule_error_response(
     }
     drop(driver);
     capture_panic(&mut first_panic, || flush_lifecycle_events(state));
+    if let Some(install_error) = install_failure {
+        capture_panic(&mut first_panic, || {
+            fail_connection(state, write_wake, install_error, true);
+        });
+    }
     resume_first_panic(first_panic);
     true
 }

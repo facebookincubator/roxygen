@@ -1754,6 +1754,172 @@ fn peer_eof(
     })
 }
 
+const PARTIAL_LENGTH_POST: &[u8] =
+    b"POST / HTTP/1.1\r\nHost: example\r\nContent-Length: 10\r\n\r\nabc";
+const PARTIAL_CHUNKED_POST: &[u8] =
+    b"POST / HTTP/1.1\r\nHost: example\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n";
+
+/// The ingress failures for which the codec fails a partial request with a 400: the
+/// peer's EOF (`None`) inside a body, and a malformed chunk-size line.
+const PRE_FINAL_INGRESS_FAILURES: [(&str, &[u8], Option<&[u8]>, HttpErrorCode); 3] = [
+    (
+        "Content-Length body, EOF",
+        PARTIAL_LENGTH_POST,
+        None,
+        HttpErrorCode::TRANSPORT_EOF,
+    ),
+    (
+        "chunked body, EOF",
+        PARTIAL_CHUNKED_POST,
+        None,
+        HttpErrorCode::TRANSPORT_EOF,
+    ),
+    (
+        "chunked body, malformed chunk",
+        PARTIAL_CHUNKED_POST,
+        Some(b"zz\r\n"),
+        HttpErrorCode::BODY_PARSE_ERROR,
+    ),
+];
+
+/// What a handler does with its request after reading the head.
+#[derive(Clone, Copy, Debug)]
+enum RequestStop {
+    /// Parks holding the request unread.
+    Hold,
+    /// Stops the request with `NO_ERROR` and parks.
+    StopNoError,
+    /// Drops the request unread, which stops it with `NO_ERROR` (no
+    /// `drain_request_body_on_drop`), and parks.
+    Drop,
+    /// Drops the request unread and returns a response whose head is never ready, like a
+    /// forwarded response still waiting on its upstream.
+    DropThenPendingHead,
+}
+
+struct RequestStopHandler {
+    stop: RequestStop,
+    started: Rc<tokio::sync::Notify>,
+}
+
+impl HttpHandler for RequestStopHandler {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        mut request_source: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        let stop = self.stop;
+        let started = Rc::clone(&self.started);
+        Box::pin(async move {
+            request_source.read_header_event().await?;
+            let held = match stop {
+                RequestStop::Hold => Some(request_source),
+                RequestStop::StopNoError => {
+                    request_source.stop_reading(Some(HttpErrorCode::NO_ERROR));
+                    Some(request_source)
+                }
+                RequestStop::Drop => {
+                    drop(request_source);
+                    None
+                }
+                RequestStop::DropThenPendingHead => {
+                    drop(request_source);
+                    started.notify_one();
+                    return Ok(HttpSourceHolder::new(Box::new(PendingHeaderSource)));
+                }
+            };
+            started.notify_one();
+            let _held = held;
+            std::future::pending().await
+        })
+    }
+}
+
+/// Sends the incomplete `request`, lets the handler apply `stop` after the head, then
+/// delivers the peer's EOF (`more` is `None`) or the bytes `more`. The clock is paused, so
+/// it advances only while every task is idle: a session still running an hour later has
+/// nothing left that can end it, and the result is `None`.
+fn request_stop_then_ingress_failure(
+    request: &'static [u8],
+    stop: RequestStop,
+    more: Option<&'static [u8]>,
+) -> Option<Outcome> {
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            tokio::time::pause();
+            let ready = Arc::new(tokio::sync::Notify::new());
+            let failure = match more {
+                None => ReadAction::WaitEof(Arc::clone(&ready)),
+                Some(bytes) => ReadAction::WaitData(Arc::clone(&ready), bytes.to_vec()),
+            };
+            let (transport, state) =
+                ScriptedTransport::new([ReadAction::Data(request.to_vec()), failure]);
+            let started = Rc::new(tokio::sync::Notify::new());
+            let handler: HttpHandlerRef = Rc::new(RequestStopHandler {
+                stop,
+                started: Rc::clone(&started),
+            });
+            let erased: Rc<dyn UniplexTransport> = transport;
+            let (session, _handle) = UniplexSession::new(
+                context,
+                TransportDirection::Downstream,
+                erased,
+                Some(handler),
+                UniplexConfig::default(),
+            )
+            .unwrap();
+            let mut run = tokio::task::spawn_local(session.run());
+            tokio::time::timeout(Duration::from_secs(1), started.notified())
+                .await
+                .expect("handler parked after the request head");
+            ready.notify_one();
+            let Ok(result) = tokio::time::timeout(Duration::from_secs(3600), &mut run).await else {
+                run.abort();
+                return None;
+            };
+            let result = result.expect("session task completed");
+            let state = state.borrow();
+            Some(Outcome {
+                output: state.writes.concat(),
+                close: state.close,
+                bodies: 0,
+                error: result.err().map(|error| error.code()),
+            })
+        })
+    })
+}
+
+/// Asserts that every pre-final ingress failure after the handler applied `stop` gets the
+/// codec's 400 and a reset, listing each failure that did not.
+fn assert_ingress_failures_after_request_stop_send_400_and_reset(stop: RequestStop) {
+    let mismatches = PRE_FINAL_INGRESS_FAILURES
+        .into_iter()
+        .filter_map(|(failure, request, more, error)| {
+            let Some(outcome) = request_stop_then_ingress_failure(request, stop, more) else {
+                return Some(format!(
+                    "{failure}: the session is still running an hour after the ingress failure"
+                ));
+            };
+            let sent_400_then_reset = outcome.output.starts_with(b"HTTP/1.1 400 ")
+                && outcome.close == CloseKind::Reset
+                && outcome.error == Some(error);
+            (!sent_400_then_reset).then(|| {
+                format!(
+                    "{failure}: expected a 400, a reset and {error:?}; got {:?}, {:?}, {:?}",
+                    String::from_utf8_lossy(&outcome.output),
+                    outcome.close,
+                    outcome.error,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        mismatches.is_empty(),
+        "{stop:?}:\n{}",
+        mismatches.join("\n")
+    );
+}
+
 fn simple_get(mode: HandlerMode) -> Outcome {
     downstream(
         vec![
@@ -8739,6 +8905,28 @@ mod h1 {
         ] {
             h1_ingress_failure_network(case);
         }
+    }
+
+    #[test]
+    fn pre_final_ingress_failure_of_a_held_request_sends_400_and_resets() {
+        assert_ingress_failures_after_request_stop_send_400_and_reset(RequestStop::Hold);
+    }
+
+    #[test]
+    fn pre_final_ingress_failure_after_a_no_error_request_stop_sends_400_and_resets() {
+        assert_ingress_failures_after_request_stop_send_400_and_reset(RequestStop::StopNoError);
+    }
+
+    #[test]
+    fn pre_final_ingress_failure_after_dropping_the_request_sends_400_and_resets() {
+        assert_ingress_failures_after_request_stop_send_400_and_reset(RequestStop::Drop);
+    }
+
+    #[test]
+    fn pre_final_ingress_failure_after_dropping_the_request_replaces_a_pending_response() {
+        assert_ingress_failures_after_request_stop_send_400_and_reset(
+            RequestStop::DropThenPendingHead,
+        );
     }
 
     #[test]

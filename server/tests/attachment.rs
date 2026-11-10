@@ -2438,6 +2438,66 @@ fn a_served_connection_updates_its_cancellation_listeners_once() {
     }
 }
 
+/// A served HTTP/1.1 connection whose handler dropped its request unread, which stops
+/// the request with `NO_ERROR`, still answers a malformed chunk with the codec's 400 and
+/// ends.
+#[test]
+fn a_malformed_chunk_after_a_dropped_request_sends_400_and_ends_the_connection() {
+    on_worker(|context, _runtime| async move {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        let (io, mut peer) = tokio::io::duplex(4096);
+        let transport = adopt_local(
+            &context,
+            EstablishedIo::new(
+                io,
+                TransportEndpoint::Unknown,
+                TransportEndpoint::Unknown,
+                None,
+            ),
+            limits(),
+        )
+        .expect("I/O adopted");
+        let invoked = Rc::new(std::cell::Cell::new(false));
+        let connection = serve_transport(
+            &context,
+            transport,
+            Rc::new(PendingHandler(Rc::clone(&invoked))),
+            ServeTransportOptions::new(CodecProtocol::Http11, TransportSecurity::Plaintext),
+        )
+        .expect("connection attaches");
+        peer.write_all(
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n",
+        )
+        .await
+        .expect("partial request written");
+        while !invoked.get() {
+            tokio::task::yield_now().await;
+        }
+        // Lets the session apply the dropped request's completion before the chunk arrives.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        peer.write_all(b"zz\r\n")
+            .await
+            .expect("malformed chunk written");
+        let error = tokio::time::timeout(Duration::from_secs(5), connection.wait_closed())
+            .await
+            .expect("the malformed chunk ends the connection")
+            .expect_err("the codec failure fails the session");
+        assert_eq!(error.code(), HttpErrorCode::BODY_PARSE_ERROR);
+        let mut response = Vec::new();
+        peer.read_to_end(&mut response)
+            .await
+            .expect("response read");
+        assert!(
+            response.starts_with(b"HTTP/1.1 400 "),
+            "{:?}",
+            String::from_utf8_lossy(&response)
+        );
+    });
+}
+
 /// External cancellation wins over local cancellation when both are
 /// requested before the run's first poll.
 #[test]

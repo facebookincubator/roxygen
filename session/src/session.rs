@@ -2072,6 +2072,42 @@ impl SessionCore {
         Ok(())
     }
 
+    /// Installs the error response that `set_error_response_status` left pending
+    /// if the request source has already completed: `apply_source_completion`
+    /// installs it otherwise, and a completed source does not complete again.
+    pub(crate) fn install_error_response_after_source_complete(
+        &mut self,
+        id: StreamId,
+    ) -> Result<Option<StreamUpdate>, HttpError> {
+        if !self.stream(id)?.stream_source_complete() {
+            return Ok(None);
+        }
+        self.install_pending_error_response(id)
+    }
+
+    fn install_pending_error_response(
+        &mut self,
+        id: StreamId,
+    ) -> Result<Option<StreamUpdate>, HttpError> {
+        if !self.direction.is_downstream()
+            || !self.stream(id)?.can_send_headers()
+            || self.stream(id)?.error_response_status().is_none()
+        {
+            return Ok(None);
+        }
+        self.cancel_handler(id);
+        let state = self.stream_mut(id)?;
+        let status = state
+            .take_error_response_status()
+            .expect("the pending error response status was checked");
+        let replacement = error_response(status, b"")?;
+        let transfer = state.install_egress_source(replacement, true, None)?;
+        state.mark_handler_error_response();
+        let mut update = StreamUpdate::new(id, StreamAction::SendErrorResponse(status), false);
+        update.replacement = Some(transfer);
+        Ok(Some(update))
+    }
+
     #[cfg(test)]
     pub(crate) fn set_error_response_status_without_handler_cancel_for_test(
         &mut self,
@@ -2409,20 +2445,7 @@ impl SessionCore {
             let detached = self.detach_if_complete(id);
             return Ok(StreamUpdate::new(id, StreamAction::None, detached));
         }
-        if self.direction.is_downstream()
-            && self.stream(id)?.can_send_headers()
-            && self.stream(id)?.error_response_status().is_some()
-        {
-            self.cancel_handler(id);
-            let state = self.stream_mut(id)?;
-            let status = state
-                .take_error_response_status()
-                .expect("the pending error response status was checked");
-            let replacement = error_response(status, b"")?;
-            let transfer = state.install_egress_source(replacement, true, None)?;
-            state.mark_handler_error_response();
-            let mut update = StreamUpdate::new(id, StreamAction::SendErrorResponse(status), false);
-            update.replacement = Some(transfer);
+        if let Some(update) = self.install_pending_error_response(id)? {
             return Ok(update);
         }
         let action = if let Some(error_code) = error_code {
