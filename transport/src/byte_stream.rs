@@ -528,9 +528,10 @@ enum QueuedReceipt {
 /// `WRITE_QUEUE_RECEIPTS` unconsumed receipts. As `folly::AsyncSocket::writeImpl`
 /// writes at once when no write is pending, a submission is attempted at
 /// entry, with no waker. A write that attempt finishes is never registered with
-/// the transport. One it leaves unfinished, because the socket took only part
-/// of it or would block, is registered with the transport, and the rest of its
-/// bytes are written as [`OwnedWriteQueue::poll_complete`] polls it, with the
+/// the transport, nor held by its backend. One it leaves unfinished, because
+/// the socket took only part of it or would block, is registered with the
+/// transport, and the rest of its bytes are written as
+/// [`OwnedWriteQueue::poll_complete`] polls it, with the
 /// transport's single-write semantics except for timing: the write has no
 /// deadline and allocates nothing, and its completion wakes no task. Either
 /// way the submission holds the queue's capacity until a poll observes its
@@ -1350,11 +1351,29 @@ pub(crate) trait QueuedWriter {
         byte_events: Option<ByteEventWriteState>,
     );
 
+    /// Attempts a write of `data` without byte events once, with the effects
+    /// of `start_write` followed by one `poll_write` with `Waker::noop()`,
+    /// except that the backend never holds a write that the attempt finishes.
+    fn write_through(&self, data: BufQueue, progress: &WriteProgress) -> WriteThrough;
+
     /// `Ready` ends the write.
     fn poll_write(&self, context: &mut Context<'_>) -> Poll<Result<(), HttpError>>;
 
     /// Ends an unfinished write, as dropping `ByteStreamIo::write`'s future does.
     fn retire_write(&self);
+}
+
+/// How a [`QueuedWriter::write_through`] attempt ended.
+pub(crate) enum WriteThrough {
+    /// The attempt finished the write with this result.
+    Finished(Result<(), HttpError>),
+    /// The attempt left the write unfinished, and the backend holds it as
+    /// after `start_write` and a pending `poll_write`.
+    Held,
+    /// The attempt panicked, and the caller resumes `panic`. The backend holds
+    /// the write as for `Held`, unless the panic came as the finished write
+    /// ended, which leaves it as a `poll_write` that panicked there does.
+    Panicked(TransportPanic),
 }
 
 /// A write's deadline, built once a backend poll leaves the write pending, as
@@ -2375,9 +2394,10 @@ fn start_write_operation(
 
 /// Writes an [`OwnedWriteQueue`] submission of `length` bytes through, as
 /// `folly::AsyncSocket::writeImpl` writes at once when no write is pending: one
-/// attempt at entry, polled with no waker. A write the attempt finishes is never
-/// registered with the transport. One it leaves unfinished, because the socket
-/// took only part of it or would block, or whose attempt panics, is registered as
+/// attempt at entry, polled with no waker ([`QueuedWriter::write_through`]). A
+/// write the attempt finishes is neither registered with the transport nor held
+/// by its backend. One it leaves unfinished, because the socket took only part
+/// of it or would block, or whose attempt panics, is registered as
 /// [`start_write_operation`] registers a queued write, and the queue's next poll
 /// continues it with the poller's waker. The transport offers no byte events, so
 /// no registration waits for this write.
@@ -2390,11 +2410,15 @@ fn write_through(
     let Some(io) = target.io.upgrade() else {
         return WriteStart::Finished(Err(TransportWriteError::new(dropped_error(), 0)));
     };
-    io.prepare_write_timeout(Duration::ZERO);
     let progress = progress.restart(length);
-    let flags = ByteEventWriteFlags::default();
     let Some(writer) = io.queued_writer() else {
-        let active_io = ActiveIo::Future(io.write(data, progress.clone(), flags, None));
+        io.prepare_write_timeout(Duration::ZERO);
+        let active_io = ActiveIo::Future(io.write(
+            data,
+            progress.clone(),
+            ByteEventWriteFlags::default(),
+            None,
+        ));
         let operation = register_queued_write(target, active_io, &progress);
         release_write_backend_owner(io, target.state, operation);
         return WriteStart::Started {
@@ -2403,19 +2427,15 @@ fn write_through(
             progress,
         };
     };
-    writer.start_write(data, progress.clone(), flags, None);
-    let attempt = catch_unwind(AssertUnwindSafe(|| {
-        writer.poll_write(&mut Context::from_waker(Waker::noop()))
-    }));
-    match attempt {
-        Ok(Poll::Ready(result)) => {
+    match writer.write_through(data, &progress) {
+        WriteThrough::Finished(result) => {
             let written = progress.get();
             WriteStart::WrittenThrough(
                 finished_write(result, written, length)
                     .map_err(|error| TransportWriteError::new(error, written)),
             )
         }
-        Ok(Poll::Pending) => {
+        WriteThrough::Held => {
             let operation =
                 register_queued_write(target, ActiveIo::Queued(QueuedIo(writer)), &progress);
             release_write_backend_owner(io, target.state, operation);
@@ -2425,7 +2445,7 @@ fn write_through(
                 progress,
             }
         }
-        Err(panic) => {
+        WriteThrough::Panicked(panic) => {
             let operation =
                 register_queued_write(target, ActiveIo::Queued(QueuedIo(writer)), &progress);
             release_write_backend_owner(io, target.state, operation);

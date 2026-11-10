@@ -62,6 +62,7 @@ use crate::byte_stream::TransportPanic;
 use crate::byte_stream::TransportRead;
 use crate::byte_stream::TransportRetirement;
 use crate::byte_stream::WriteProgress;
+use crate::byte_stream::WriteThrough;
 use crate::byte_stream::finish_transport_panic;
 #[cfg(test)]
 use crate::byte_stream::record_close_path_error;
@@ -583,6 +584,13 @@ fn poll_gather_into_room(
 std::thread_local! {
     static IO_WRITE_FUTURES: Cell<usize> = const { Cell::new(0) };
     static IO_READ_FUTURES: Cell<usize> = const { Cell::new(0) };
+    static HELD_QUEUED_WRITES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// `OwnedWriteQueue` writes whose state a backend held on this thread.
+#[cfg(test)]
+pub(crate) fn held_queued_writes_for_test() -> usize {
+    HELD_QUEUED_WRITES.with(Cell::get)
 }
 
 /// Boxed `ByteStreamIo::read` futures built on this thread.
@@ -1824,10 +1832,50 @@ where
         byte_events: Option<ByteEventWriteState>,
     ) {
         assert!(!self.write_active.replace(true));
-        let replaced =
-            self.queued_write
-                .replace(Some(IoWrite::new(data, progress, flags, byte_events)));
-        assert!(replaced.is_none(), "a queued write ended before the next");
+        self.hold_queued_write(IoWrite::new(data, progress, flags, byte_events));
+    }
+
+    /// Polls a write state of its own with `poll_io_write`, as the active
+    /// write, and holds it only when the attempt leaves it unfinished or
+    /// panics before it ends. An attempt that finishes the write ends it as
+    /// `poll_write` does, within the attempt.
+    fn write_through(&self, data: BufQueue, progress: &WriteProgress) -> WriteThrough {
+        if let Some(stream) = self.stream.borrow_mut().as_mut() {
+            stream.prepare_write_timeout(Duration::ZERO);
+        }
+        assert!(!self.write_active.replace(true));
+        let mut write = Some(IoWrite::new(
+            data,
+            progress.clone(),
+            ByteEventWriteFlags::default(),
+            None,
+        ));
+        let attempt = catch_unwind(AssertUnwindSafe(|| {
+            let polled = poll_io_write(
+                self,
+                &mut Context::from_waker(Waker::noop()),
+                write.as_mut().expect("the attempt's write has not ended"),
+            );
+            if polled.is_ready() {
+                let ended = write.take();
+                end_write(self);
+                drop(ended);
+            }
+            polled
+        }));
+        match attempt {
+            Ok(Poll::Ready(result)) => WriteThrough::Finished(result),
+            Ok(Poll::Pending) => {
+                self.hold_queued_write(write.expect("a pending attempt's write has not ended"));
+                WriteThrough::Held
+            }
+            Err(panic) => {
+                if let Some(write) = write {
+                    self.hold_queued_write(write);
+                }
+                WriteThrough::Panicked(panic)
+            }
+        }
     }
 
     fn poll_write(&self, context: &mut Context<'_>) -> Poll<Result<(), HttpError>> {
@@ -1853,6 +1901,15 @@ impl<S> TokioIoShared<S>
 where
     S: TokioByteStream,
 {
+    /// Holds `write`, the active write, as the queued write that `poll_write`
+    /// continues.
+    fn hold_queued_write(&self, write: IoWrite) {
+        #[cfg(test)]
+        HELD_QUEUED_WRITES.with(|count| count.set(count.get() + 1));
+        let replaced = self.queued_write.replace(Some(write));
+        assert!(replaced.is_none(), "a queued write ended before the next");
+    }
+
     /// Ends the queued write as an ordinary write's future does: its
     /// `WriteActiveGuard` drops first, then its state.
     fn end_queued_write(&self) {

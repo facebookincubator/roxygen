@@ -7500,6 +7500,7 @@ mod tcp_tls {
     }
 
     mod native_write_queue {
+        use bytes::Bytes;
         use roxygen_runtime::worker::WorkerContext;
 
         use super::*;
@@ -7507,6 +7508,7 @@ mod tcp_tls {
         use crate::byte_stream::write_operations_for_test;
         use crate::byte_stream::write_progress_cells_for_test;
         use crate::byte_stream::write_registrations_for_test;
+        use crate::tcp::held_queued_writes_for_test;
         use crate::tcp::io_write_futures_for_test;
         use crate::tcp_tls_tests::tcp_tls::owned_reader::with_observed_tcp;
         #[cfg(target_os = "linux")]
@@ -8731,6 +8733,532 @@ mod tcp_tls {
                     worker.begin_shutdown();
                     driver_task.await.unwrap();
                 }));
+        }
+
+        /// A write that its first attempt finishes is never held as backend write state, the
+        /// record that an unfinished write keeps for the queue's polls to continue.
+        #[test]
+        fn writes_finished_at_entry_hold_no_backend_write_state() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let mut writer = transport
+                    .write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                observe_writability().await;
+                let held = held_queued_writes_for_test();
+                for chunk in [&b"one "[..], b"two "] {
+                    writer.start_write(queue(&[chunk])).unwrap();
+                    let receipt = poll_fn(|context| writer.poll_complete(context)).await;
+                    assert_eq!(receipt.result.unwrap().bytes_written, 4);
+                }
+                assert_eq!(
+                    held_queued_writes_for_test(),
+                    held,
+                    "writes finished at entry hold no backend write state"
+                );
+                let mut received = [0; 8];
+                peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"one two ");
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// A first attempt that leaves the write unfinished holds its backend state once, and
+        /// the queue's polls continue that state to the write's end.
+        #[test]
+        fn an_unfinished_first_attempt_holds_its_backend_write_state_once() {
+            let limits = ByteStreamLimits::new(64, STALLING_WRITE, 8).unwrap();
+            with_accepted_tcp(limits, |context, transport, mut peer| async move {
+                let mut writer = transport
+                    .write_queue(
+                        &context,
+                        STALLING_WRITE,
+                        Duration::ZERO,
+                        CancellationToken::never(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                let held = held_queued_writes_for_test();
+                let payload = pattern(STALLING_WRITE, 31);
+                observe_writability().await;
+                writer.start_write(queue(&[&payload])).unwrap();
+                assert!(transport.has_pending_write(&context).unwrap());
+                assert_eq!(
+                    held_queued_writes_for_test(),
+                    held + 1,
+                    "the unfinished write's state is held once"
+                );
+                assert!(poll_once(&mut writer).await.is_pending());
+                let reader = async {
+                    let mut received = vec![0; STALLING_WRITE];
+                    peer.read_exact(&mut received).await.unwrap();
+                    received
+                };
+                let (receipt, received) =
+                    tokio::join!(poll_fn(|context| writer.poll_complete(context)), reader);
+                assert_eq!(receipt.result.unwrap().bytes_written, STALLING_WRITE);
+                assert!(
+                    received == payload,
+                    "the peer receives the payload in order"
+                );
+                assert_eq!(
+                    held_queued_writes_for_test(),
+                    held + 1,
+                    "the queue's polls continue the held state"
+                );
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// A write that its first attempt finished is not outstanding, so shutting the write
+        /// side before the queue is polled half-closes at once, after the write's bytes.
+        #[test]
+        fn a_shutdown_after_a_write_finished_at_entry_half_closes_after_its_bytes() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let mut writer = transport
+                    .write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                observe_writability().await;
+                writer.start_write(queue(&[b"last"])).unwrap();
+                assert!(!transport.has_pending_write(&context).unwrap());
+                transport.shutdown_write(&context).unwrap();
+                let mut received = Vec::new();
+                time::timeout(Duration::from_secs(2), peer.read_to_end(&mut received))
+                    .await
+                    .expect("the half-close follows the bytes without a poll of the queue")
+                    .unwrap();
+                assert_eq!(received, b"last");
+                let Poll::Ready(receipt) = poll_once(&mut writer).await else {
+                    panic!("the next poll delivers the finished write's receipt");
+                };
+                assert_eq!(receipt.result.unwrap().bytes_written, 4);
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// With zero-copy enabled, a submission that its first attempt finishes is still sent
+        /// with `MSG_ZEROCOPY`: its bytes stay retained until the kernel's completion.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_zero_copy_submission_finished_at_entry_retains_its_bytes_until_completion() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let mut writer = transport
+                    .write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                // Before the completion pump exists, which the yield would run first.
+                observe_writability().await;
+                assert!(
+                    transport.enable_zero_copy(&context, 1).unwrap(),
+                    "loopback TCP supports MSG_ZEROCOPY"
+                );
+                writer.start_write(queue(&[b"zero"])).unwrap();
+                assert!(!transport.has_pending_write(&context).unwrap());
+                assert_eq!(
+                    transport.zero_copy_pending_for_test(&context).unwrap(),
+                    1,
+                    "the zero-copy send retains its bytes until the kernel completes it"
+                );
+                let receipt = poll_fn(|context| writer.poll_complete(context)).await;
+                assert_eq!(receipt.result.unwrap().bytes_written, 4);
+                let mut received = [0; 4];
+                peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"zero");
+                time::timeout(Duration::from_secs(2), async {
+                    while transport.zero_copy_pending_for_test(&context).unwrap() != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the completion pump releases the submitted bytes");
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// A stream that offers the native write queue, takes every byte it is given, and
+        /// records the write timeouts it is prepared with.
+        struct TimeoutProbeStream {
+            timeouts: Rc<RefCell<Vec<Duration>>>,
+            written: Rc<RefCell<Vec<u8>>>,
+        }
+
+        impl AsyncRead for TimeoutProbeStream {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+                _buffer: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        impl AsyncWrite for TimeoutProbeStream {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+                buffer: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.written.borrow_mut().extend_from_slice(buffer);
+                Poll::Ready(Ok(buffer.len()))
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl TokioByteStream for TimeoutProbeStream {
+            const WRITE_QUEUE: bool = true;
+
+            fn prepare_reset(&self) {}
+
+            fn prepare_write_timeout(&mut self, timeout: Duration) {
+                self.timeouts.borrow_mut().push(timeout);
+            }
+        }
+
+        /// Each submission prepares the stream with the queue's zero write timeout before its
+        /// first attempt, as the single-write API prepares each write with its own.
+        #[test]
+        fn each_queued_submission_prepares_a_zero_write_timeout() {
+            Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(LocalSet::new().run_until(async move {
+                    let (worker, driver) = WorkerDriver::new(8).unwrap();
+                    let call = worker
+                        .call_local(|context| async move {
+                            let timeouts = Rc::new(RefCell::new(Vec::new()));
+                            let written = Rc::new(RefCell::new(Vec::new()));
+                            let transport = owned_from_stream(
+                                &context,
+                                TimeoutProbeStream {
+                                    timeouts: Rc::clone(&timeouts),
+                                    written: Rc::clone(&written),
+                                },
+                                SocketAddress::new("127.0.0.1", 1000),
+                                SocketAddress::new("127.0.0.1", 2000),
+                                None,
+                                limits(),
+                            )
+                            .unwrap();
+                            let mut writer = transport
+                                .write_queue(
+                                    &context,
+                                    1024,
+                                    Duration::ZERO,
+                                    CancellationToken::never(),
+                                )
+                                .unwrap()
+                                .expect("the stream offers the native write queue");
+                            for chunk in [&b"one"[..], b"two"] {
+                                writer.start_write(queue(&[chunk])).unwrap();
+                                assert_eq!(
+                                    timeouts.borrow().last(),
+                                    Some(&Duration::ZERO),
+                                    "the submission prepared its write timeout at entry"
+                                );
+                                let receipt =
+                                    poll_fn(|context| writer.poll_complete(context)).await;
+                                assert_eq!(receipt.result.unwrap().bytes_written, 3);
+                            }
+                            assert_eq!(*timeouts.borrow(), [Duration::ZERO, Duration::ZERO]);
+                            assert_eq!(&*written.borrow(), b"onetwo");
+                            // Control: the single-write API prepares its own timeout.
+                            transport
+                                .write(
+                                    &context,
+                                    queue(&[b"six"]),
+                                    Duration::from_secs(5),
+                                    CancellationToken::never(),
+                                )
+                                .await
+                                .unwrap();
+                            assert_eq!(
+                                *timeouts.borrow(),
+                                [Duration::ZERO, Duration::ZERO, Duration::from_secs(5)]
+                            );
+                            transport.close_with_reset(&context).unwrap();
+                        })
+                        .unwrap();
+                    let driver_task = tokio::task::spawn_local(driver);
+                    call.await.unwrap();
+                    worker.begin_shutdown();
+                    driver_task.await.unwrap();
+                }));
+        }
+
+        /// A stream that offers the native write queue. Each of its first `writes` writes takes
+        /// the whole buffer it is given into `written`, and every later write fails. It counts
+        /// its shutdowns and resets.
+        struct ScriptedWriteStream {
+            writes: usize,
+            observed: ScriptedWrites,
+        }
+
+        /// What a test observes of its [`ScriptedWriteStream`].
+        #[derive(Clone, Default)]
+        struct ScriptedWrites {
+            written: Rc<RefCell<Vec<u8>>>,
+            shutdowns: Rc<Cell<usize>>,
+            resets: Rc<Cell<usize>>,
+        }
+
+        impl AsyncRead for ScriptedWriteStream {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+                _buffer: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        impl AsyncWrite for ScriptedWriteStream {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+                buffer: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                if self.writes == 0 {
+                    return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+                }
+                self.writes -= 1;
+                self.observed.written.borrow_mut().extend_from_slice(buffer);
+                Poll::Ready(Ok(buffer.len()))
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                let shutdowns = &self.observed.shutdowns;
+                shutdowns.set(shutdowns.get() + 1);
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl TokioByteStream for ScriptedWriteStream {
+            const WRITE_QUEUE: bool = true;
+
+            fn prepare_reset(&self) {
+                let resets = &self.observed.resets;
+                resets.set(resets.get() + 1);
+            }
+        }
+
+        /// Runs `test` on a worker with a transport over a [`ScriptedWriteStream`] whose first
+        /// `writes` writes succeed.
+        fn with_scripted_stream<F, Fut>(writes: usize, test: F)
+        where
+            F: FnOnce(WorkerContext, OwnedByteStream, ScriptedWrites) -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + 'static,
+        {
+            Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(LocalSet::new().run_until(async move {
+                    let (worker, driver) = WorkerDriver::new(8).unwrap();
+                    let call = worker
+                        .call_local(move |context| async move {
+                            let observed = ScriptedWrites::default();
+                            let transport = owned_from_stream(
+                                &context,
+                                ScriptedWriteStream {
+                                    writes,
+                                    observed: observed.clone(),
+                                },
+                                SocketAddress::new("127.0.0.1", 1000),
+                                SocketAddress::new("127.0.0.1", 2000),
+                                None,
+                                limits(),
+                            )
+                            .unwrap();
+                            test(context, transport, observed).await;
+                        })
+                        .unwrap();
+                    let driver_task = tokio::task::spawn_local(driver);
+                    call.await.unwrap();
+                    worker.begin_shutdown();
+                    driver_task.await.unwrap();
+                }));
+        }
+
+        std::thread_local! {
+            /// What the next [`HookedOwner`] to drop on this thread runs.
+            static OWNER_DROP_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+                const { RefCell::new(None) };
+        }
+
+        /// The owner of a `Bytes` segment, which runs this thread's `OWNER_DROP_HOOK` as it
+        /// drops.
+        struct HookedOwner(&'static [u8]);
+
+        impl AsRef<[u8]> for HookedOwner {
+            fn as_ref(&self) -> &[u8] {
+                self.0
+            }
+        }
+
+        impl Drop for HookedOwner {
+            fn drop(&mut self) {
+                let hook = OWNER_DROP_HOOK.with(|hook| hook.borrow_mut().take());
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+        }
+
+        fn set_owner_drop_hook(hook: impl FnOnce() + 'static) {
+            OWNER_DROP_HOOK.with(|slot| slot.replace(Some(Box::new(hook))));
+        }
+
+        /// A submission of `hooked`, in a segment that a [`HookedOwner`] owns, then `rest` in a
+        /// segment of its own.
+        fn hooked_submission(hooked: &'static [u8], rest: &[u8]) -> BufQueue {
+            let mut data = BufQueue::new(hooked.len() + rest.len());
+            data.push_bytes(Bytes::from_owner(HookedOwner(hooked)))
+                .unwrap();
+            if !rest.is_empty() {
+                data.push_bytes(Bytes::copy_from_slice(rest)).unwrap();
+            }
+            data
+        }
+
+        /// A submission made while a first attempt writes, here from the drop of the owner of a
+        /// segment the attempt wrote, is refused as while the backend holds a write, so no
+        /// other write lands inside the attempt's bytes.
+        #[test]
+        fn a_submission_during_a_first_attempt_is_refused() {
+            with_scripted_stream(usize::MAX, |context, transport, observed| async move {
+                let mut writer = transport
+                    .write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                let mut nested = transport
+                    .write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                let refused = Rc::new(Cell::new(None));
+                let hook_refused = Rc::clone(&refused);
+                set_owner_drop_hook(move || {
+                    let submitted =
+                        catch_unwind(AssertUnwindSafe(|| nested.start_write(queue(&[b"nested"]))));
+                    hook_refused.set(Some(submitted.is_err()));
+                });
+                writer
+                    .start_write(hooked_submission(b"head", b"tail"))
+                    .unwrap();
+                assert_eq!(
+                    &*observed.written.borrow(),
+                    b"headtail",
+                    "no other write lands inside the attempt's bytes"
+                );
+                assert_eq!(
+                    refused.get(),
+                    Some(true),
+                    "the submission during the attempt is refused"
+                );
+                let Poll::Ready(receipt) =
+                    writer.poll_complete(&mut Context::from_waker(Waker::noop()))
+                else {
+                    panic!("the next poll delivers the finished write's receipt");
+                };
+                assert_eq!(receipt.result.unwrap().bytes_written, 8);
+                transport.close_with_reset(&context).unwrap();
+            });
+        }
+
+        /// A first attempt that fails, and whose unwritten bytes' owner panics as it drops,
+        /// leaves the write outstanding as a first poll whose cleanup panicked did: the panic
+        /// surfaces from `start_write`, the write stays registered, and dropping the queue
+        /// resets the transport.
+        #[test]
+        fn a_panic_dropping_a_failed_first_attempts_bytes_leaves_the_write_outstanding() {
+            with_scripted_stream(0, |context, transport, observed| async move {
+                let mut writer = transport
+                    .write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                set_owner_drop_hook(|| panic!("the unwritten bytes' owner panics"));
+                let panic = catch_unwind(AssertUnwindSafe(|| {
+                    writer.start_write(hooked_submission(b"lost", b""))
+                }))
+                .expect_err("the owner's panic surfaces from the submission");
+                assert_eq!(
+                    panic.downcast_ref::<&str>(),
+                    Some(&"the unwritten bytes' owner panics")
+                );
+                assert!(
+                    transport.has_pending_write(&context).unwrap(),
+                    "the write whose cleanup panicked stays registered"
+                );
+                assert!(!writer.can_write(1) && writer.is_saturated() && !writer.is_idle());
+                assert_eq!(observed.resets.get(), 0);
+                drop(writer);
+                assert_eq!(
+                    observed.resets.get(),
+                    1,
+                    "dropping the queue with its write outstanding resets the transport"
+                );
+                assert!(observed.written.borrow().is_empty());
+            });
+        }
+
+        /// A shutdown requested while a first attempt writes, here from the drop of the owner of
+        /// a segment the attempt wrote, is attempted as the write ends when the attempt then
+        /// fails, as for a write the backend holds.
+        #[test]
+        fn a_shutdown_during_a_failed_first_attempt_is_attempted_as_the_write_ends() {
+            with_scripted_stream(1, |context, transport, observed| async move {
+                let transport = Rc::new(transport);
+                let mut writer = transport
+                    .write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                let hook_transport = Rc::clone(&transport);
+                let hook_context = context.clone();
+                set_owner_drop_hook(move || {
+                    hook_transport.shutdown_write(&hook_context).unwrap();
+                });
+                writer
+                    .start_write(hooked_submission(b"head", b"tail"))
+                    .unwrap();
+                assert_eq!(&*observed.written.borrow(), b"head");
+                assert_eq!(
+                    observed.shutdowns.get(),
+                    1,
+                    "the shutdown is attempted as the failed write ends, before the submission returns"
+                );
+                let Poll::Ready(receipt) =
+                    writer.poll_complete(&mut Context::from_waker(Waker::noop()))
+                else {
+                    panic!("the next poll delivers the failed write's receipt");
+                };
+                assert_eq!(receipt.result.unwrap_err().bytes_written(), 4);
+                drop(writer);
+                transport.close_with_reset(&context).unwrap();
+            });
         }
     }
 

@@ -4277,6 +4277,15 @@ mod byte_stream {
                 self.armed.set(true);
             }
 
+            fn write_through(
+                &self,
+                data: BufQueue,
+                progress: &WriteProgress,
+            ) -> crate::byte_stream::WriteThrough {
+                self.start_write(data, progress.clone(), ByteEventWriteFlags::default(), None);
+                crate::byte_stream::WriteThrough::Held
+            }
+
             fn poll_write(&self, _context: &mut Context<'_>) -> Poll<Result<(), HttpError>> {
                 Poll::Pending
             }
