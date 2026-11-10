@@ -12,6 +12,8 @@ mod byte_stream {
     use std::sync::atomic::Ordering;
     use std::task::Context;
     use std::task::Poll;
+    use std::task::RawWaker;
+    use std::task::RawWakerVTable;
     use std::task::Wake;
     use std::task::Waker;
     use std::thread::ThreadId;
@@ -244,6 +246,76 @@ mod byte_stream {
 
         fn wake_by_ref(self: &Arc<Self>) {
             self.record();
+        }
+    }
+
+    /// Counts the clones and wakes of the wakers made by [`WakerCounts::waker`]. Each waker
+    /// holds a strong count, and all of them share the counter's address as their data, so
+    /// `Waker::will_wake` holds between them and not with another counter's wakers.
+    #[derive(Default)]
+    struct WakerCounts {
+        clones: AtomicUsize,
+        wakes: AtomicUsize,
+    }
+
+    static COUNTED_WAKER: RawWakerVTable = RawWakerVTable::new(
+        clone_counted_waker,
+        wake_counted_waker,
+        wake_counted_waker_by_ref,
+        drop_counted_waker,
+    );
+
+    fn clone_counted_waker(data: *const ()) -> RawWaker {
+        // SAFETY: every counted waker's `data` is `Arc::into_raw` of a `WakerCounts` and owns
+        // one of its strong counts (`WakerCounts::waker`, and this clone's increment), so the
+        // allocation is live while the cloned waker is.
+        let counts = unsafe {
+            Arc::increment_strong_count(data.cast::<WakerCounts>());
+            &*data.cast::<WakerCounts>()
+        };
+        counts.clones.fetch_add(1, Ordering::Relaxed);
+        RawWaker::new(data, &COUNTED_WAKER)
+    }
+
+    fn wake_counted_waker(data: *const ()) {
+        wake_counted_waker_by_ref(data);
+        drop_counted_waker(data);
+    }
+
+    fn wake_counted_waker_by_ref(data: *const ()) {
+        // SAFETY: the woken waker owns a strong count of the `WakerCounts` at `data`, as in
+        // `clone_counted_waker`, so the allocation is live.
+        let counts = unsafe { &*data.cast::<WakerCounts>() };
+        counts.wakes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn drop_counted_waker(data: *const ()) {
+        // SAFETY: `data` is `Arc::into_raw` of a `WakerCounts`, and the dropped (or consumed)
+        // waker owns the strong count released here, which nothing else releases.
+        unsafe { Arc::decrement_strong_count(data.cast::<WakerCounts>()) };
+    }
+
+    impl WakerCounts {
+        fn waker(self: &Arc<Self>) -> Waker {
+            let data = Arc::into_raw(Arc::clone(self)).cast::<()>();
+            // SAFETY: `data` owns the strong count `into_raw` leaked, and `COUNTED_WAKER`'s
+            // functions keep `RawWakerVTable`'s contract for such a `data`: a clone takes its
+            // own count, a drop or a consuming wake releases the waker's, and a wake by
+            // reference only reads the counter. `WakerCounts` is `Send + Sync`.
+            unsafe { Waker::from_raw(RawWaker::new(data, &COUNTED_WAKER)) }
+        }
+
+        fn clones(&self) -> usize {
+            self.clones.load(Ordering::Relaxed)
+        }
+
+        fn wakes(&self) -> usize {
+            self.wakes.load(Ordering::Relaxed)
+        }
+
+        /// The wakers made from this counter that are alive.
+        fn live(self: &Arc<Self>) -> usize {
+            Arc::strong_count(self) - 1
         }
     }
 
@@ -3982,6 +4054,49 @@ mod byte_stream {
         }
     }
 
+    /// A pending read polled again with the waker it holds keeps that clone: three polls with
+    /// one waker clone it once for the transport's read, once for the deadline's wait, and once
+    /// per pending poll in the fake backend, which keeps each pending poll's waker. The read's
+    /// never-cancellable token clones none.
+    #[test]
+    fn a_read_polled_again_with_its_waker_clones_it_once() {
+        run_worker(|context| async move {
+            let (transport, control) = transport(&context, ByteEventCapability::Unsupported, None);
+            let counts = Arc::new(WakerCounts::default());
+            let waker = counts.waker();
+            let mut read = transport.read(
+                &context,
+                1_024,
+                1_024,
+                Duration::ZERO,
+                CancellationToken::never(),
+            );
+            for _ in 0..3 {
+                assert!(poll_once_with_waker(read.as_mut(), &waker).is_pending());
+            }
+            assert_eq!(
+                counts.clones(),
+                1 + 1 + 3,
+                "the read and its wait each clone the waker once; the backend clones it per poll",
+            );
+            control.feed(queue(&[b"ok"], 2), false);
+            assert_eq!(counts.wakes(), 1, "the bytes wake the read");
+            let Poll::Ready(Ok(result)) = poll_once_with_waker(read.as_mut(), &waker) else {
+                panic!("the fed read completes");
+            };
+            assert_eq!(flatten(result.data()), b"ok");
+            assert_eq!(
+                (counts.clones(), counts.wakes()),
+                (6, 2),
+                "the completing poll clones the waker only for the deadline, which wakes its \
+                 wait's waker as it drops",
+            );
+            drop(read);
+            assert_eq!(counts.live(), 1, "the completed read keeps no waker");
+            transport.close(&context).unwrap();
+        });
+    }
+
     mod owned_reader {
         use std::future::poll_fn;
 
@@ -4026,13 +4141,27 @@ mod byte_stream {
                     transport.has_pending_read(&context).unwrap(),
                     "a started read is registered with the transport",
                 );
-                assert!(
-                    reader
-                        .poll_read(&mut Context::from_waker(Waker::noop()))
-                        .is_pending()
-                );
+                let signal = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&signal));
+                for _ in 0..2 {
+                    assert!(
+                        reader
+                            .poll_read(&mut Context::from_waker(&waker))
+                            .is_pending()
+                    );
+                }
                 control.feed(queue(&[b"ab"], 2), true);
-                let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                assert!(signal.take(), "the pending read is woken by its bytes");
+                let Poll::Ready(Ok(read)) = reader.poll_read(&mut Context::from_waker(&waker))
+                else {
+                    panic!("the buffered bytes complete the read");
+                };
+                drop(waker);
+                assert_eq!(
+                    Arc::strong_count(&signal),
+                    1,
+                    "completion releases the read's captured wakers"
+                );
                 assert_eq!(flatten(read.data()), b"ab");
                 assert!(
                     !read.is_eof(),
@@ -4254,14 +4383,29 @@ mod byte_stream {
                     .unwrap()
                     .unwrap();
                 reader.start_read(2, 2).unwrap();
-                assert!(
-                    reader
-                        .poll_read(&mut Context::from_waker(Waker::noop()))
-                        .is_pending()
-                );
+                let signal = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&signal));
+                for _ in 0..2 {
+                    assert!(
+                        reader
+                            .poll_read(&mut Context::from_waker(&waker))
+                            .is_pending()
+                    );
+                }
                 control.feed(queue(&[b"ok"], 2), false);
                 partial.request_cancellation();
-                let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                let Poll::Ready(Ok(read)) = reader.poll_read(&mut Context::from_waker(&waker))
+                else {
+                    panic!("ready bytes win over the later cancellation");
+                };
+                drop(reader);
+                drop(waker);
+                assert_eq!(
+                    Arc::strong_count(&signal),
+                    1,
+                    "completion releases the read's waker, and dropping the reader its \
+                     cancellation registration's",
+                );
                 assert_eq!(flatten(read.data()), b"ok", "bytes that arrived first win");
                 assert_eq!(
                     control.actions().len(),
@@ -4417,21 +4561,32 @@ mod byte_stream {
                         .unwrap()
                         .unwrap();
                     reader.start_read(1_024, 1_024).unwrap();
+                    let first = Arc::new(WakeSignal::default());
+                    let first_waker = Waker::from(Arc::clone(&first));
                     let signal = Arc::new(WakeSignal::default());
                     let waker = Waker::from(Arc::clone(&signal));
-                    assert!(
-                        reader
-                            .poll_read(&mut Context::from_waker(&waker))
-                            .is_pending()
+                    for current in [&first_waker, &first_waker, &waker] {
+                        assert!(
+                            reader
+                                .poll_read(&mut Context::from_waker(current))
+                                .is_pending()
+                        );
+                    }
+                    drop(first_waker);
+                    assert_eq!(
+                        Arc::strong_count(&first),
+                        1,
+                        "a changed poll target releases the previous waker"
                     );
                     if graceful {
                         transport.close(&context).unwrap();
                     } else {
                         transport.close_with_reset(&context).unwrap();
                     }
+                    assert!(!first.take(), "closing does not wake the previous target");
                     assert!(
                         signal.take(),
-                        "closing the transport wakes the pending read"
+                        "closing the transport wakes the current read target"
                     );
                     let Poll::Ready(result) = reader.poll_read(&mut Context::from_waker(&waker))
                     else {
@@ -4463,7 +4618,60 @@ mod byte_stream {
                         );
                     }
                     assert!(!transport.has_pending_read(&context).unwrap());
+                    drop(waker);
+                    assert_eq!(
+                        Arc::strong_count(&signal),
+                        1,
+                        "close releases the read's captured wakers"
+                    );
                 }
+            });
+        }
+
+        /// Dropping the transport ends a pending reader read with `DROPPED`, wakes it, and
+        /// cancels the backend read, as for the read API.
+        #[test]
+        fn dropping_the_transport_ends_a_pending_reader_read() {
+            run_worker(|context| async move {
+                let owner = std::thread::current().id();
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                reader.start_read(1_024, 1_024).unwrap();
+                let signal = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&signal));
+                assert!(
+                    reader
+                        .poll_read(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                drop(transport);
+                assert!(
+                    signal.take(),
+                    "dropping the transport wakes the pending read"
+                );
+                let Poll::Ready(Err(error)) = reader.poll_read(&mut Context::from_waker(&waker))
+                else {
+                    panic!("the woken read observes the dropped transport");
+                };
+                assert_eq!(error.code(), HttpErrorCode::DROPPED);
+                assert_eq!(
+                    control.actions(),
+                    vec![
+                        IoAction::CancelRead(HttpErrorCode::DROPPED, owner),
+                        IoAction::Close(owner),
+                        IoAction::Drop(owner),
+                    ],
+                );
+                drop(waker);
+                assert_eq!(
+                    Arc::strong_count(&signal),
+                    1,
+                    "the dropped transport releases the read's captured wakers"
+                );
             });
         }
 
@@ -4480,12 +4688,22 @@ mod byte_stream {
                     .unwrap()
                     .unwrap();
                 reader.start_read(1_024, 1_024).unwrap();
-                assert!(
-                    reader
-                        .poll_read(&mut Context::from_waker(Waker::noop()))
-                        .is_pending()
-                );
+                let signal = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&signal));
+                for _ in 0..2 {
+                    assert!(
+                        reader
+                            .poll_read(&mut Context::from_waker(&waker))
+                            .is_pending()
+                    );
+                }
                 drop(reader);
+                drop(waker);
+                assert_eq!(
+                    Arc::strong_count(&signal),
+                    1,
+                    "dropping the reader releases its captured wakers"
+                );
                 assert!(
                     !transport.has_pending_read(&context).unwrap(),
                     "the dropped reader's read is unregistered",
@@ -4613,6 +4831,47 @@ mod byte_stream {
                 control.feed(queue(&[b"next"], 4), false);
                 let read = pending.await.unwrap();
                 assert_eq!(flatten(read.data()), b"next");
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// A pending reader read polled again with the waker it holds keeps that clone: three
+        /// polls with one waker clone it once for the read and once per pending poll in the
+        /// fake backend, which keeps each pending poll's waker. The reader's never-cancellable
+        /// token clones none.
+        #[test]
+        fn a_reader_read_polled_again_with_its_waker_clones_it_once() {
+            run_worker(|context| async move {
+                let (transport, control) =
+                    transport(&context, ByteEventCapability::Unsupported, None);
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                let counts = Arc::new(WakerCounts::default());
+                let waker = counts.waker();
+                reader.start_read(1_024, 1_024).unwrap();
+                for _ in 0..3 {
+                    assert!(
+                        reader
+                            .poll_read(&mut Context::from_waker(&waker))
+                            .is_pending()
+                    );
+                }
+                assert_eq!(
+                    counts.clones(),
+                    1 + 3,
+                    "the read clones the waker once; the backend clones it per poll",
+                );
+                control.feed(queue(&[b"ok"], 2), false);
+                assert_eq!(counts.wakes(), 1, "the bytes wake the read");
+                let Poll::Ready(Ok(read)) = reader.poll_read(&mut Context::from_waker(&waker))
+                else {
+                    panic!("the fed read completes");
+                };
+                assert_eq!(flatten(read.data()), b"ok");
+                assert_eq!(counts.clones(), 4, "the completing poll clones nothing");
+                assert_eq!(counts.live(), 1, "the completed read keeps no waker");
                 transport.close(&context).unwrap();
             });
         }

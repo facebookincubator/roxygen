@@ -2683,8 +2683,8 @@ impl ReadOperation {
         self.complete = true;
     }
 
-    fn close_error(&self) -> Option<HttpError> {
-        match self.state.borrow().close_state {
+    fn close_error(close_state: CloseState) -> Option<HttpError> {
+        match close_state {
             CloseState::Open => None,
             CloseState::Graceful => None,
             CloseState::Reset => Some(read_error(b"byte-stream was reset")),
@@ -2711,12 +2711,16 @@ impl ReadOperation {
         context: &mut Context<'_>,
         reader: Option<&mut ReaderCancellation>,
     ) -> Poll<Result<TransportRead, HttpError>> {
-        self.state.borrow().assert_owner();
-        if let Some(error) = self.close_error() {
+        let close_state = {
+            let state = self.state.borrow();
+            state.assert_owner();
+            state.close_state
+        };
+        if let Some(error) = Self::close_error(close_state) {
             self.finish(None);
             return Poll::Ready(Err(error));
         }
-        if self.state.borrow().close_state == CloseState::Graceful {
+        if close_state == CloseState::Graceful {
             self.finish(None);
             return Poll::Ready(Ok(TransportRead::eof()));
         }
@@ -2751,7 +2755,13 @@ impl ReadOperation {
                 .as_mut()
                 .filter(|active| active.operation == self.operation)
                 .expect("an open read operation remains registered with its transport");
-            active.waker = Some(context.waker().clone());
+            if active
+                .waker
+                .as_ref()
+                .is_none_or(|stored| !stored.will_wake(context.waker()))
+            {
+                active.waker = Some(context.waker().clone());
+            }
             match &mut active.drive {
                 ReadDrive::Timed { deadline, .. } if deadline.status() == WaitStatus::TimedOut => {
                     ReadPoll::TimedOut
