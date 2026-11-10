@@ -105,6 +105,9 @@ mod upstream;
 
 pub use upstream::OwnedH1ExclusiveResponse;
 pub use upstream::OwnedH1ExclusiveSubmission;
+pub use upstream::OwnedH1PullThroughBody;
+pub use upstream::OwnedH1PullThroughResponse;
+pub use upstream::OwnedH1PullThroughSubmission;
 pub use upstream::OwnedH1UpstreamHandle;
 pub use upstream::OwnedH1UpstreamRequest;
 pub use upstream::OwnedH1UpstreamReservation;
@@ -223,14 +226,20 @@ pub enum Http1UpgradePolicy {
     AsOrdinaryRequest,
 }
 
-/// The session owner's waker, shared by every wake source of one connection.
+/// The session owner's waker, shared by every wake source of one connection, and its wake
+/// record: each wake sets it, and the owned HTTP/1.1 upstream driver clears it as each of its
+/// polls begins, so a pull-through body can tell whether one of the driver's wake sources fired
+/// since the driver's last poll (`DIV-047`).
 #[derive(Default)]
-struct TaskWaker(Mutex<Option<Waker>>);
+struct TaskWaker {
+    waker: Mutex<Option<Waker>>,
+    woken: AtomicBool,
+}
 
 impl TaskWaker {
     fn register(&self, waker: &Waker) {
         let replaced = {
-            let mut slot = self.0.lock();
+            let mut slot = self.waker.lock();
             if slot
                 .as_ref()
                 .is_some_and(|current| current.will_wake(waker))
@@ -243,10 +252,29 @@ impl TaskWaker {
     }
 
     fn wake(&self) {
-        let waker = self.0.lock().clone();
+        self.woken.store(true, Ordering::Release);
+        let waker = self.waker.lock().clone();
         if let Some(waker) = waker {
             waker.wake();
         }
+    }
+
+    /// Clears the wake record as a poll begins. The swap acquires the store of a wake it
+    /// overwrites, so the poll sees the signal that wake marked first.
+    #[inline]
+    fn clear_wake_record(&self) {
+        self.woken.swap(false, Ordering::AcqRel);
+    }
+
+    /// Whether a wake happened since the last poll began (`DIV-047`).
+    #[inline]
+    fn woken(&self) -> bool {
+        self.woken.load(Ordering::Acquire)
+    }
+
+    /// Records a wake without waking (`DIV-047`'s revocation).
+    fn note_wake(&self) {
+        self.woken.store(true, Ordering::Release);
     }
 }
 
@@ -326,6 +354,9 @@ struct IngressSignals {
     source_complete: Cell<bool>,
     completed: Cell<Option<Result<(), HttpError>>>,
     stream: Arc<Signal>,
+    /// A pull-through exchange's connection, whose drive returns to its run when the source
+    /// completes, before the wake that announces it (`DIV-047`).
+    drive: Option<upstream::DriveLink>,
 }
 
 impl IngressSignals {
@@ -348,9 +379,12 @@ impl HttpStreamSourceSharedCallback for IngressSignals {
         self.stream.wake_by_ref();
     }
 
-    fn source_complete(&self, _id: StreamId, error: Option<HttpError>) {
+    fn source_complete(&self, id: StreamId, error: Option<HttpError>) {
         self.source_complete.set(true);
         self.completed.set(Some(error.map_or(Ok(()), Err)));
+        if let Some(drive) = &self.drive {
+            drive.hand_back(id);
+        }
         self.stream.wake_by_ref();
     }
 }
@@ -706,6 +740,7 @@ impl<A: OwnedApplication> CodecInput<'_, A> {
             source_complete: Cell::new(false),
             completed: Cell::new(None),
             stream: Arc::clone(self.stream_wake),
+            drive: None,
         });
         let source = HttpIngressBody::new_shared(
             id,

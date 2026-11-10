@@ -8181,3 +8181,2820 @@ fn owned_h1_upstream_runs_sequential_exchanges_over_a_tcp_byte_stream() {
         );
     }
 }
+
+/// N8 (`DIV-047`): pull-through exchanges, whose response body drives its connection's driver
+/// from inside its reads.
+mod n8 {
+    use roxygen_core::stream_source::HttpResponseReader;
+    use roxygen_core::stream_source::HttpResponseSource;
+    use roxygen_core::stream_source::HttpResponseSourceOwner;
+    use roxygen_runtime::host::LocalHost;
+
+    use super::*;
+    use crate::owned_h1::OwnedH1PullThroughBody;
+
+    /// One response's reads: a pull-through body's, or a suspend-free exclusive reader's
+    /// (`DIV-045`), as a consumer of a plain owned submission reads.
+    pub(super) trait Reads {
+        fn poll_header(
+            &mut self,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<HttpHeaderEvent, HttpError>>;
+
+        fn poll_body(
+            &mut self,
+            context: &mut Context<'_>,
+            maximum: u32,
+        ) -> Poll<Result<HttpBodyEvent, HttpError>>;
+    }
+
+    impl Reads for OwnedH1PullThroughBody {
+        fn poll_header(
+            &mut self,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+            OwnedH1PullThroughBody::poll_header(self, context)
+        }
+
+        fn poll_body(
+            &mut self,
+            context: &mut Context<'_>,
+            maximum: u32,
+        ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+            OwnedH1PullThroughBody::poll_body(self, context, maximum)
+        }
+    }
+
+    /// A suspend-free exclusive reader of a plain submission's response.
+    pub(super) struct Waiting {
+        reader: HttpResponseReader,
+        owner: HttpResponseSourceOwner,
+    }
+
+    impl Waiting {
+        pub(super) fn new(source: HttpResponseSource) -> Self {
+            let (owner, mut reader) = source.split();
+            reader.set_suspend_free(true);
+            Self { reader, owner }
+        }
+    }
+
+    impl Reads for Waiting {
+        fn poll_header(
+            &mut self,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+            if !self.reader.is_active()
+                && let Err(error) = self.reader.arm_header(&self.owner)
+            {
+                return Poll::Ready(Err(error));
+            }
+            self.reader.poll_header(context)
+        }
+
+        fn poll_body(
+            &mut self,
+            context: &mut Context<'_>,
+            maximum: u32,
+        ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+            if !self.reader.is_active()
+                && let Err(error) = self.reader.arm_body(&self.owner, maximum)
+            {
+                return Poll::Ready(Err(error));
+            }
+            self.reader.poll_body(context)
+        }
+    }
+
+    /// Reads a response to its end, `maximum` body bytes at a time; a slow reader yields to the
+    /// host before each body read.
+    pub(super) async fn read_all(reads: &mut impl Reads, maximum: u32, slow: bool) -> ReadResponse {
+        let mut read = ReadResponse::default();
+        loop {
+            match poll_fn(|context| reads.poll_header(context)).await {
+                Ok(mut head) => {
+                    read.statuses
+                        .push(head.headers_mut().status_code().unwrap());
+                    if head.eom() {
+                        read.eom = true;
+                        return read;
+                    }
+                    if head.is_final().unwrap() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    read.error = Some(error.code());
+                    return read;
+                }
+            }
+        }
+        loop {
+            if slow {
+                tokio::task::yield_now().await;
+            }
+            match poll_fn(|context| reads.poll_body(context, maximum)).await {
+                Ok(event) => {
+                    if let Some(bytes) = event.as_body() {
+                        let length = bytes.chain_length();
+                        read.body
+                            .extend_from_slice(&bytes.coalesce(length).unwrap());
+                    }
+                    if let HttpBodyEventKind::Trailers(trailers) = event.kind() {
+                        read.trailers.extend(
+                            trailers
+                                .iter()
+                                .map(|(_, name, value)| (name.to_vec(), value.to_vec())),
+                        );
+                    }
+                    if event.eom() {
+                        read.eom = true;
+                        return read;
+                    }
+                }
+                Err(error) => {
+                    read.error = Some(error.code());
+                    return read;
+                }
+            }
+        }
+    }
+
+    /// How an exchange runs: a plain submission under `run`, read with a suspend-free reader;
+    /// a pull-through submission under `run_pull_through`, read through its body; or a plain
+    /// submission under `run_pull_through`.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(super) enum Mode {
+        Run,
+        PullThrough,
+        PlainOnPullThrough,
+    }
+
+    /// The gates a case's origin waits on: `response` opens once the request is committed,
+    /// `after` once the reader has read the response and dropped its reads.
+    pub(super) struct Gates {
+        pub(super) response: Arc<tokio::sync::Notify>,
+        pub(super) after: Arc<tokio::sync::Notify>,
+    }
+
+    /// One response-reading exchange of the differential matrix.
+    #[derive(Clone, Copy)]
+    pub(super) struct Case {
+        pub(super) name: &'static str,
+        pub(super) request: fn() -> (HttpHeaderEvent, Vec<HttpBodyEvent>),
+        pub(super) reads: fn(&Gates) -> Vec<ReadAction>,
+        pub(super) configure: fn(&mut UniplexConfig),
+        pub(super) maximum: u32,
+        /// The request body is "hello", released once the reader has read the response.
+        pub(super) gated_upload: bool,
+        pub(super) slow: bool,
+        /// The connection observer callback that cancels the connection.
+        pub(super) cancel_from: Option<&'static str>,
+    }
+
+    impl Case {
+        /// A GET whose origin answers with `reads`.
+        pub(super) fn get(name: &'static str, reads: fn(&Gates) -> Vec<ReadAction>) -> Self {
+            Self {
+                name,
+                request: || (get_head(), Vec::new()),
+                reads,
+                configure: |_| {},
+                maximum: u32::MAX,
+                gated_upload: false,
+                slow: false,
+                cancel_from: None,
+            }
+        }
+    }
+
+    /// The origin answers with `response` once the request is committed, then sends EOF.
+    pub(super) fn answer(gates: &Gates, response: &[u8]) -> Vec<ReadAction> {
+        vec![
+            ReadAction::WaitData(Arc::clone(&gates.response), response.to_vec()),
+            ReadAction::Eof,
+        ]
+    }
+
+    /// What one exchange showed: what the reader read, `run`'s error code, the bytes written
+    /// and how the connection closed.
+    #[derive(Debug, PartialEq)]
+    pub(super) struct Outcome {
+        pub(super) read: ReadResponse,
+        pub(super) run: Option<HttpErrorCode>,
+        pub(super) wire: Vec<u8>,
+        pub(super) close: CloseKind,
+    }
+
+    /// Waits until the connection finished, or closes it once it is idle.
+    pub(super) async fn finish(handle: &crate::owned_h1::OwnedH1UpstreamHandle) {
+        yield_until(|| handle.is_finished() || handle.is_idle()).await;
+        if !handle.is_finished() {
+            handle.close_when_idle().unwrap();
+        }
+    }
+
+    pub(super) fn exchange_outcome(mode: Mode, case: Case) -> Outcome {
+        run_on_host(move |context| {
+            Box::pin(async move {
+                let gates = Gates {
+                    response: Arc::new(tokio::sync::Notify::new()),
+                    after: Arc::new(tokio::sync::Notify::new()),
+                };
+                let upload_gate = Arc::new(tokio::sync::Notify::new());
+                let (transport, state) = ScriptedTransport::new((case.reads)(&gates));
+                let mut options = upstream_options(context, transport);
+                (case.configure)(&mut options.io);
+                let (session, handle) = OwnedH1UpstreamSession::new(options).unwrap();
+                let observer = case.cancel_from.map(|callback| {
+                    let observer = Rc::new(CancelFromObserver {
+                        handle: RefCell::new(Some(handle.clone())),
+                        callback,
+                    });
+                    handle.set_observer(observer.clone()).unwrap();
+                    observer
+                });
+                let (head, body) = (case.request)();
+                let upload = if case.gated_upload {
+                    GatedUpload::held(&upload_gate, None)
+                } else {
+                    RequestSource::held(None, body)
+                };
+                let reservation = handle.reserve_request().unwrap();
+                let run: Pin<
+                    Box<dyn Future<Output = Result<crate::uniplex::UniplexRunSummary, HttpError>>>,
+                > = if mode == Mode::Run {
+                    Box::pin(session.run())
+                } else {
+                    Box::pin(session.run_pull_through())
+                };
+                let (run, read) = futures::join!(run, async {
+                    let read = if mode == Mode::PullThrough {
+                        let mut response = reservation
+                            .submit_pull_through(head, upload, CancellationToken::never())
+                            .await
+                            .unwrap();
+                        gates.response.notify_one();
+                        read_all(&mut response.body, case.maximum, case.slow).await
+                    } else {
+                        let response = reservation
+                            .submit_exclusive(head, upload, CancellationToken::never())
+                            .await
+                            .unwrap();
+                        gates.response.notify_one();
+                        let mut reads = Waiting::new(response.source);
+                        read_all(&mut reads, case.maximum, case.slow).await
+                    };
+                    upload_gate.notify_one();
+                    gates.after.notify_one();
+                    finish(&handle).await;
+                    read
+                });
+                if let Some(observer) = observer {
+                    observer.handle.take();
+                }
+                let state = state.borrow();
+                Outcome {
+                    read,
+                    run: run.err().map(|error| error.code()),
+                    wire: state.writes.concat(),
+                    close: state.close,
+                }
+            })
+        })
+    }
+
+    /// Runs `case` under `run` and as a pull-through exchange, and compares what each showed.
+    fn assert_pull_through_matches_run(case: Case) -> Outcome {
+        let run = exchange_outcome(Mode::Run, case);
+        let pull_through = exchange_outcome(Mode::PullThrough, case);
+        assert_eq!(pull_through, run, "{}", case.name);
+        pull_through
+    }
+
+    #[test]
+    fn n8_differential_content_length() {
+        let outcome = assert_pull_through_matches_run(Case::get("content-length", |gates| {
+            answer(gates, OK_RESPONSE)
+        }));
+        assert_eq!(
+            (outcome.read.body.as_slice(), outcome.read.eom),
+            (b"ok".as_slice(), true)
+        );
+    }
+
+    #[test]
+    fn n8_differential_chunked_with_trailers() {
+        let outcome = assert_pull_through_matches_run(Case::get("chunked", |gates| {
+            answer(
+                gates,
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n3\r\n!!!\r\n0\r\nx-checksum: abc\r\n\r\n",
+            )
+        }));
+        assert_eq!(outcome.read.body, b"ok!!!");
+        assert_eq!(
+            outcome.read.trailers,
+            [(b"x-checksum".to_vec(), b"abc".to_vec())]
+        );
+    }
+
+    #[test]
+    fn n8_differential_close_delimited() {
+        let outcome = assert_pull_through_matches_run(Case::get("close-delimited", |gates| {
+            answer(gates, b"HTTP/1.1 200 OK\r\n\r\nok")
+        }));
+        assert_eq!(
+            (outcome.read.body.as_slice(), outcome.read.eom),
+            (b"ok".as_slice(), true)
+        );
+    }
+
+    #[test]
+    fn n8_differential_eof_inside_a_response() {
+        let outcome = assert_pull_through_matches_run(Case::get("eof inside", |gates| {
+            answer(gates, b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nok")
+        }));
+        assert!(outcome.read.error.is_some(), "{outcome:?}");
+    }
+
+    #[test]
+    fn n8_differential_informational_heads() {
+        let outcome = assert_pull_through_matches_run(Case::get("informational", |gates| {
+            answer(
+                gates,
+                b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            )
+        }));
+        assert_eq!(outcome.read.statuses, [100, 103, 200]);
+    }
+
+    #[test]
+    fn n8_differential_bodiless_responses() {
+        let mut head = Case::get("HEAD", |gates| {
+            answer(gates, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+        });
+        head.request = || {
+            let mut head = get_head();
+            head.headers_mut().set_method(HttpMethod::Head).unwrap();
+            (head, Vec::new())
+        };
+        for case in [
+            head,
+            Case::get("204", |gates| {
+                answer(gates, b"HTTP/1.1 204 No Content\r\n\r\n")
+            }),
+            Case::get("304", |gates| {
+                answer(
+                    gates,
+                    b"HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n",
+                )
+            }),
+        ] {
+            let outcome = assert_pull_through_matches_run(case);
+            assert!(
+                outcome.read.body.is_empty() && outcome.read.eom,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn n8_differential_connection_close() {
+        for case in [
+            Case::get("Connection: close", |gates| answer(gates, CLOSE_RESPONSE)),
+            Case::get("HTTP/1.0", |gates| {
+                answer(gates, b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            }),
+        ] {
+            let outcome = assert_pull_through_matches_run(case);
+            assert_eq!(outcome.read.body, b"ok", "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn n8_differential_bytes_behind_a_response() {
+        let outcome = assert_pull_through_matches_run(Case::get("bytes behind", |gates| {
+            answer(
+                gates,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokHTTP/1.1 200 OK\r\n",
+            )
+        }));
+        assert_eq!(outcome.run, Some(HttpErrorCode::PROTOCOL_ERROR));
+    }
+
+    /// A 256 KiB response in 16 KiB reads, the first released once the request is committed.
+    pub(super) fn large_response_reads(gates: &Gates) -> Vec<ReadAction> {
+        let body = patterned(256 << 10);
+        let mut response =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        response.extend_from_slice(&body);
+        let mut chunks = response.chunks(16 << 10).map(<[u8]>::to_vec);
+        let first = chunks.next().unwrap();
+        std::iter::once(ReadAction::WaitData(Arc::clone(&gates.response), first))
+            .chain(chunks.map(ReadAction::Data))
+            .chain([ReadAction::Eof])
+            .collect()
+    }
+
+    #[test]
+    fn n8_differential_large_body_with_a_flow_pause() {
+        let mut case = Case::get("flow pause", large_response_reads);
+        case.configure = |config| config.ingress_buffer_limit = 16 << 10;
+        case.maximum = 4 << 10;
+        case.slow = true;
+        let outcome = assert_pull_through_matches_run(case);
+        assert!(outcome.read.body == patterned(256 << 10) && outcome.read.eom);
+    }
+
+    #[test]
+    fn n8_differential_early_response_with_an_unfinished_upload() {
+        let case = Case {
+            request: || (post_head(Some(5), false), Vec::new()),
+            gated_upload: true,
+            // The origin answers at once, before the request body, and keeps the connection.
+            ..Case::get("early response", |gates| {
+                vec![ReadAction::WaitData(
+                    Arc::clone(&gates.response),
+                    OK_RESPONSE.to_vec(),
+                )]
+            })
+        };
+        let outcome = assert_pull_through_matches_run(case);
+        assert!(outcome.wire.ends_with(b"hello"), "{outcome:?}");
+    }
+
+    #[test]
+    fn n8_differential_large_upload() {
+        let case = Case {
+            request: large_request,
+            ..Case::get("large upload", |gates| answer(gates, OK_RESPONSE))
+        };
+        let outcome = assert_pull_through_matches_run(case);
+        assert!(outcome.wire.ends_with(&patterned(256 << 10)));
+    }
+
+    /// As `cancel_from_a_settle_callback_fails_the_connection`'s origin: the response, then an
+    /// empty read that completes once the reader is done, in the turn that retires the exchange.
+    fn settle_reads<const CLOSE: bool>(gates: &Gates) -> Vec<ReadAction> {
+        let response = if CLOSE { CLOSE_RESPONSE } else { OK_RESPONSE };
+        vec![
+            ReadAction::WaitData(Arc::clone(&gates.response), response.to_vec()),
+            ReadAction::WaitDataOrCancellation(Arc::clone(&gates.after), Vec::new()),
+        ]
+    }
+
+    #[test]
+    fn n8_differential_cancel_from_a_settle_callback() {
+        for (callback, response) in [
+            ("capacity_released", OK_RESPONSE),
+            ("capacity_available", OK_RESPONSE),
+            ("admission_closed", CLOSE_RESPONSE),
+        ] {
+            let mut case = Case::get(callback, settle_reads::<false>);
+            if response == CLOSE_RESPONSE {
+                case.reads = settle_reads::<true>;
+            }
+            case.cancel_from = Some(callback);
+            let outcome = assert_pull_through_matches_run(case);
+            assert_eq!(
+                outcome.run,
+                Some(HttpErrorCode::CORO_CANCELLED),
+                "{callback}"
+            );
+        }
+    }
+
+    #[test]
+    fn n8_differential_read_error_after_a_flow_pause() {
+        let mut case = Case::get("read error", |gates| {
+            let body = patterned(24 << 10);
+            let mut first =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+            first.extend_from_slice(&body[..12 << 10]);
+            vec![
+                ReadAction::WaitData(Arc::clone(&gates.response), first),
+                ReadAction::Data(body[12 << 10..].to_vec()),
+                ReadAction::Error(HttpErrorCode::TRANSPORT_READ_ERROR),
+            ]
+        });
+        case.configure = |config| config.ingress_buffer_limit = 16 << 10;
+        case.maximum = 4 << 10;
+        case.slow = true;
+        let outcome = assert_pull_through_matches_run(case);
+        assert!(outcome.read.body == patterned(24 << 10) && outcome.read.eom);
+        assert_eq!(outcome.run, Some(HttpErrorCode::TRANSPORT_READ_ERROR));
+    }
+
+    /// Two exchanges on one keep-alive connection, each plain or pull-through; under `run`
+    /// when neither is pull-through and `pull_through_session` is false. Returns what each
+    /// reader read, `run`'s error code, the bytes written and how the connection closed.
+    fn reuse_outcome(
+        pull_through_session: bool,
+        kinds: [bool; 2],
+    ) -> (Vec<ReadResponse>, Option<HttpErrorCode>, Vec<u8>, CloseKind) {
+        run_on_host(move |context| {
+            Box::pin(async move {
+                let first_gate = Arc::new(tokio::sync::Notify::new());
+                let second_gate = Arc::new(tokio::sync::Notify::new());
+                let (transport, state) = ScriptedTransport::new([
+                    ReadAction::WaitData(Arc::clone(&first_gate), OK_RESPONSE.to_vec()),
+                    ReadAction::WaitData(
+                        Arc::clone(&second_gate),
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo".to_vec(),
+                    ),
+                ]);
+                let (session, handle) =
+                    OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+                let run: Pin<
+                    Box<dyn Future<Output = Result<crate::uniplex::UniplexRunSummary, HttpError>>>,
+                > = if pull_through_session {
+                    Box::pin(session.run_pull_through())
+                } else {
+                    Box::pin(session.run())
+                };
+                let (run, reads) = futures::join!(run, async {
+                    let mut reads = Vec::new();
+                    for (pull_through, gate) in kinds.into_iter().zip([&first_gate, &second_gate]) {
+                        yield_until(|| handle.available_capacity() == 1).await;
+                        let reservation = handle.reserve_request().unwrap();
+                        let read = if pull_through {
+                            let mut response = reservation
+                                .submit_pull_through(
+                                    get_head(),
+                                    HttpSourceHolder::empty(),
+                                    CancellationToken::never(),
+                                )
+                                .await
+                                .unwrap();
+                            gate.notify_one();
+                            read_all(&mut response.body, u32::MAX, false).await
+                        } else {
+                            let response = reservation
+                                .submit_exclusive(
+                                    get_head(),
+                                    HttpSourceHolder::empty(),
+                                    CancellationToken::never(),
+                                )
+                                .await
+                                .unwrap();
+                            gate.notify_one();
+                            read_all(&mut Waiting::new(response.source), u32::MAX, false).await
+                        };
+                        reads.push(read);
+                    }
+                    close_once_idle(&handle).await;
+                    reads
+                });
+                let state = state.borrow();
+                (
+                    reads,
+                    run.err().map(|error| error.code()),
+                    state.writes.concat(),
+                    state.close,
+                )
+            })
+        })
+    }
+
+    #[test]
+    fn n8_differential_keep_alive_reuse() {
+        let run = reuse_outcome(false, [false, false]);
+        assert_eq!(run.0[1].body, b"two");
+        for kinds in [[true, true], [true, false], [false, true]] {
+            assert_eq!(reuse_outcome(true, kinds), run, "{kinds:?}");
+        }
+    }
+
+    /// Every case of the differential matrix.
+    fn matrix() -> Vec<Case> {
+        let mut head = Case::get("HEAD", |gates| {
+            answer(gates, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+        });
+        head.request = || {
+            let mut head = get_head();
+            head.headers_mut().set_method(HttpMethod::Head).unwrap();
+            (head, Vec::new())
+        };
+        let mut flow = Case::get("flow pause", large_response_reads);
+        flow.configure = |config| config.ingress_buffer_limit = 16 << 10;
+        flow.maximum = 4 << 10;
+        flow.slow = true;
+        vec![
+            Case::get("content-length", |gates| answer(gates, OK_RESPONSE)),
+            Case::get("chunked", |gates| {
+                answer(
+                    gates,
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nx-checksum: abc\r\n\r\n",
+                )
+            }),
+            Case::get("close-delimited", |gates| {
+                answer(gates, b"HTTP/1.1 200 OK\r\n\r\nok")
+            }),
+            Case::get("eof inside", |gates| {
+                answer(gates, b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nok")
+            }),
+            head,
+            Case::get("204", |gates| {
+                answer(gates, b"HTTP/1.1 204 No Content\r\n\r\n")
+            }),
+            Case::get("Connection: close", |gates| answer(gates, CLOSE_RESPONSE)),
+            Case::get("bytes behind", |gates| {
+                answer(
+                    gates,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokHTTP/1.1 200 OK\r\n",
+                )
+            }),
+            flow,
+            Case {
+                request: large_request,
+                ..Case::get("large upload", |gates| answer(gates, OK_RESPONSE))
+            },
+        ]
+    }
+
+    #[test]
+    fn n8_plain_submissions_on_a_pull_through_session_behave_as_run() {
+        for case in matrix() {
+            assert_eq!(
+                exchange_outcome(Mode::PlainOnPullThrough, case),
+                exchange_outcome(Mode::Run, case),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn n8_submit_pull_through_is_refused_on_a_session_run_with_run() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let (transport, state) = ScriptedTransport::new([]);
+                let (session, handle) =
+                    OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+                let mut submission = handle.reserve_request().unwrap().submit_pull_through(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                // First polled before the session's run is chosen: it waits for commitment.
+                assert!(poll_once(Pin::new(&mut submission)).is_pending());
+                let (run, refused) = futures::join!(session.run(), async {
+                    let refused = (&mut submission).await.err();
+                    close_once_idle(&handle).await;
+                    refused
+                });
+                let refused = refused.expect("a pull-through submission is refused under run");
+                assert_eq!(refused.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+                assert!(
+                    !submission.request_unprocessed(),
+                    "the refusal is not a stale connection's: a retry would repeat it"
+                );
+                assert!(
+                    state.borrow().writes.is_empty(),
+                    "no byte of the refused request is written"
+                );
+                run.unwrap();
+            })
+        });
+    }
+
+    /// A waker that counts its wakes and wakes nothing.
+    #[derive(Default)]
+    pub(super) struct Count(AtomicUsize);
+
+    impl Count {
+        pub(super) fn get(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// One read an [`Origin`] delivers.
+    pub(super) enum Pushed {
+        Bytes(Vec<u8>),
+        Eof,
+        Error(HttpErrorCode),
+    }
+
+    /// The origin side of a [`PtTransport`]: the test pushes reads, and each transport read
+    /// takes the next one once its future is polled.
+    #[derive(Default)]
+    pub(super) struct Origin {
+        reads: RefCell<VecDeque<Pushed>>,
+        waker: RefCell<Option<Waker>>,
+        /// `UniplexTransport::read` calls.
+        pub(super) starts: Cell<usize>,
+        /// Reads that delivered bytes, EOF or a failure.
+        pub(super) delivered: Cell<usize>,
+        /// Runs in the next `UniplexTransport::read` call, inside whatever polls the driver.
+        pub(super) on_read_start: RefCell<Option<Box<dyn FnOnce()>>>,
+        /// Runs in the next `UniplexTransport::close_with_reset` call, after the reset.
+        pub(super) on_reset: RefCell<Option<Box<dyn FnOnce()>>>,
+        pub(super) dropped: Cell<bool>,
+    }
+
+    impl Origin {
+        pub(super) fn push(&self, read: Pushed) {
+            self.reads.borrow_mut().push_back(read);
+            let waker = self.waker.borrow_mut().take();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+
+        pub(super) fn send(&self, bytes: &[u8]) {
+            self.push(Pushed::Bytes(bytes.to_vec()));
+        }
+    }
+
+    /// Writes and closes through a [`ScriptedTransport`]; reads come from an [`Origin`].
+    pub(super) struct PtTransport {
+        inner: Rc<ScriptedTransport>,
+        origin: Rc<Origin>,
+    }
+
+    impl Drop for PtTransport {
+        fn drop(&mut self) {
+            self.origin.dropped.set(true);
+        }
+    }
+
+    impl UniplexTransport for PtTransport {
+        fn read(
+            &self,
+            _context: &WorkerContext,
+            _maximum: usize,
+            _allocation_size: usize,
+            _timeout: Duration,
+            cancellation: CancellationToken,
+        ) -> LocalTransportFuture<Result<crate::uniplex::UniplexRead, HttpError>> {
+            self.origin.starts.set(self.origin.starts.get() + 1);
+            let hook = self.origin.on_read_start.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            let origin = Rc::clone(&self.origin);
+            Box::pin(poll_fn(move |context| {
+                let read = origin.reads.borrow_mut().pop_front();
+                if let Some(read) = read {
+                    origin.delivered.set(origin.delivered.get() + 1);
+                    return Poll::Ready(match read {
+                        Pushed::Bytes(bytes) => {
+                            Ok(crate::uniplex::UniplexRead::new(queue(&bytes), false))
+                        }
+                        Pushed::Eof => Ok(crate::uniplex::UniplexRead::new(BufQueue::new(0), true)),
+                        Pushed::Error(code) => {
+                            Err(HttpError::with_message(code, b"pushed read failure"))
+                        }
+                    });
+                }
+                if cancellation.is_cancellation_requested() {
+                    return Poll::Ready(Err(HttpError::with_message(
+                        HttpErrorCode::CORO_CANCELLED,
+                        b"pushed read cancelled",
+                    )));
+                }
+                *origin.waker.borrow_mut() = Some(context.waker().clone());
+                Poll::Pending
+            }))
+        }
+
+        fn write(
+            &self,
+            context: &WorkerContext,
+            data: BufQueue,
+            flags: ByteEventWriteFlags,
+            timeout: Duration,
+            cancellation: CancellationToken,
+        ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+            self.inner
+                .write(context, data, flags, timeout, cancellation)
+        }
+
+        fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+            self.inner.shutdown_write(context)
+        }
+
+        fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+            self.inner.close(context)
+        }
+
+        fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+            let reset = self.inner.close_with_reset(context);
+            let hook = self.origin.on_reset.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            reset
+        }
+
+        fn byte_event_capability(
+            &self,
+            context: &WorkerContext,
+        ) -> Result<ByteEventCapability, HttpError> {
+            self.inner.byte_event_capability(context)
+        }
+
+        fn register_byte_event(
+            &self,
+            context: &WorkerContext,
+            registration: HttpByteEventRegistration,
+        ) -> Result<(), ByteEventRegistrationError> {
+            self.inner.register_byte_event(context, registration)
+        }
+    }
+
+    /// A response as a test reads it: through a pull-through body, or a plain exclusive
+    /// response's suspend-free reader.
+    pub(super) enum Response {
+        PullThrough(crate::owned_h1::OwnedH1PullThroughResponse),
+        Plain(Waiting, crate::owned_h1::OwnedH1UpstreamRequest),
+    }
+
+    impl Response {
+        pub(super) fn body(&mut self) -> &mut OwnedH1PullThroughBody {
+            match self {
+                Self::PullThrough(response) => &mut response.body,
+                Self::Plain(..) => panic!("a plain response has no pull-through body"),
+            }
+        }
+
+        pub(super) fn control(&self) -> &crate::owned_h1::OwnedH1UpstreamRequest {
+            match self {
+                Self::PullThrough(response) => &response.control,
+                Self::Plain(_, control) => control,
+            }
+        }
+    }
+
+    impl Reads for Response {
+        fn poll_header(
+            &mut self,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+            match self {
+                Self::PullThrough(response) => response.body.poll_header(context),
+                Self::Plain(reads, _) => reads.poll_header(context),
+            }
+        }
+
+        fn poll_body(
+            &mut self,
+            context: &mut Context<'_>,
+            maximum: u32,
+        ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+            match self {
+                Self::PullThrough(response) => response.body.poll_body(context, maximum),
+                Self::Plain(reads, _) => reads.poll_body(context, maximum),
+            }
+        }
+    }
+
+    pub(super) const CHUNKED_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+    /// `bytes` as one chunk of a chunked body.
+    pub(super) fn chunk(bytes: &[u8]) -> Vec<u8> {
+        let mut wire = format!("{:x}\r\n", bytes.len()).into_bytes();
+        wire.extend_from_slice(bytes);
+        wire.extend_from_slice(b"\r\n");
+        wire
+    }
+
+    pub(super) fn body_bytes(event: &HttpBodyEvent) -> Vec<u8> {
+        event.as_body().map_or_else(Vec::new, |bytes| {
+            bytes.coalesce(bytes.chain_length()).unwrap().to_vec()
+        })
+    }
+
+    pub(super) type RunResult = Result<crate::uniplex::UniplexRunSummary, HttpError>;
+
+    /// One owned upstream connection over an [`Origin`], under `run` (`Mode::Run`) or
+    /// `run_pull_through`, whose run future and response reads the test polls by hand: the run
+    /// with `run_waker`, as its root would, the reads with `holder_waker`, as a downstream
+    /// exchange would. Both wakers count their wakes and wake nothing.
+    pub(super) struct Fixture {
+        pub(super) mode: Mode,
+        pub(super) origin: Rc<Origin>,
+        pub(super) state: Rc<RefCell<TransportState>>,
+        pub(super) handle: crate::owned_h1::OwnedH1UpstreamHandle,
+        run: Pin<Box<dyn Future<Output = RunResult>>>,
+        pub(super) run_wake: Arc<Count>,
+        run_waker: Waker,
+        /// `run_wake`'s count when the run was last polled.
+        run_seen: usize,
+        /// How many times the test polled the run.
+        pub(super) run_polls: usize,
+        pub(super) holder_wake: Arc<Count>,
+        pub(super) holder_waker: Waker,
+    }
+
+    impl Fixture {
+        pub(super) fn new(
+            context: WorkerContext,
+            mode: Mode,
+            configure: impl FnOnce(&mut UniplexConfig),
+        ) -> Self {
+            let (inner, state) = ScriptedTransport::new([]);
+            let origin = Rc::new(Origin::default());
+            let transport = Rc::new(PtTransport {
+                inner,
+                origin: Rc::clone(&origin),
+            });
+            let mut options = upstream_options(context, transport);
+            configure(&mut options.io);
+            let (session, handle) = OwnedH1UpstreamSession::new(options).unwrap();
+            let run: Pin<Box<dyn Future<Output = RunResult>>> = if mode == Mode::Run {
+                Box::pin(session.run())
+            } else {
+                Box::pin(session.run_pull_through())
+            };
+            let run_wake = Arc::new(Count::default());
+            let holder_wake = Arc::new(Count::default());
+            Self {
+                mode,
+                origin,
+                state,
+                handle,
+                run,
+                run_waker: Waker::from(Arc::clone(&run_wake)),
+                run_wake,
+                run_seen: 0,
+                run_polls: 0,
+                holder_waker: Waker::from(Arc::clone(&holder_wake)),
+                holder_wake,
+            }
+        }
+
+        pub(super) fn poll_run(&mut self) -> Poll<RunResult> {
+            self.run_seen = self.run_wake.get();
+            self.run_polls += 1;
+            self.run
+                .as_mut()
+                .poll(&mut Context::from_waker(&self.run_waker))
+        }
+
+        /// Whether the run's waker was woken since its last poll.
+        pub(super) fn run_woken(&self) -> bool {
+            self.run_wake.get() != self.run_seen
+        }
+
+        /// Drops the run future, as a forced teardown of its scope would.
+        pub(super) fn drop_run(&mut self) {
+            self.run = Box::pin(std::future::pending());
+        }
+
+        /// Polls the run each time its waker was woken since its last poll, as its root
+        /// would. Returns its result if it completes.
+        pub(super) fn settle_run(&mut self) -> Option<RunResult> {
+            for _ in 0..100 {
+                if self.run_wake.get() == self.run_seen {
+                    return None;
+                }
+                if let Poll::Ready(result) = self.poll_run() {
+                    return Some(result);
+                }
+            }
+            panic!("the run woke itself 100 times");
+        }
+
+        /// Submits a request, a pull-through one unless under `run`, then polls the run, which
+        /// commits it and writes what it can.
+        pub(super) fn submit(
+            &mut self,
+            head: HttpHeaderEvent,
+            upload: HttpSourceHolder,
+            token: CancellationToken,
+        ) -> Response {
+            let reservation = self.handle.reserve_request().unwrap();
+            let mut noop = Context::from_waker(Waker::noop());
+            if self.mode == Mode::Run {
+                let mut submission = reservation.submit_exclusive(head, upload, token);
+                assert!(self.poll_run().is_pending());
+                assert!(self.settle_run().is_none());
+                let Poll::Ready(response) = Pin::new(&mut submission).poll(&mut noop) else {
+                    panic!("the request is committed");
+                };
+                let response = response.unwrap();
+                Response::Plain(Waiting::new(response.source), response.control)
+            } else {
+                let mut submission = reservation.submit_pull_through(head, upload, token);
+                assert!(self.poll_run().is_pending());
+                assert!(self.settle_run().is_none());
+                let Poll::Ready(response) = Pin::new(&mut submission).poll(&mut noop) else {
+                    panic!("the request is committed");
+                };
+                Response::PullThrough(response.unwrap())
+            }
+        }
+
+        pub(super) fn header(
+            &self,
+            response: &mut impl Reads,
+        ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+            response.poll_header(&mut Context::from_waker(&self.holder_waker))
+        }
+
+        pub(super) fn body(
+            &self,
+            response: &mut impl Reads,
+            maximum: u32,
+        ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+            response.poll_body(&mut Context::from_waker(&self.holder_waker), maximum)
+        }
+
+        /// Reads the next header: a read that waits lets the run settle, then reads again.
+        pub(super) fn next_header(&mut self, response: &mut Response) -> HttpHeaderEvent {
+            for _ in 0..4 {
+                if let Poll::Ready(head) = self.header(response) {
+                    return head.unwrap();
+                }
+                self.settle_run();
+            }
+            panic!("no head arrived");
+        }
+
+        /// Reads the next body event, as `next_header` reads a head.
+        pub(super) fn next_event(
+            &mut self,
+            response: &mut Response,
+            maximum: u32,
+        ) -> Result<HttpBodyEvent, HttpError> {
+            for _ in 0..4 {
+                if let Poll::Ready(event) = self.body(response, maximum) {
+                    return event;
+                }
+                self.settle_run();
+            }
+            panic!("no body event arrived");
+        }
+
+        /// Submits a pull-through GET and reads its chunked response head through the body,
+        /// which takes the drive.
+        pub(super) fn held(&mut self) -> Response {
+            assert_eq!(self.mode, Mode::PullThrough);
+            let mut response = self.submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            self.origin.send(CHUNKED_HEAD);
+            let Poll::Ready(head) = self.header(&mut response) else {
+                panic!("the head is taken in the read that takes the drive");
+            };
+            assert_eq!(head.unwrap().headers_mut().status_code().unwrap(), 200);
+            assert!(
+                response.body().holds_the_drive(),
+                "the body holds the drive"
+            );
+            response
+        }
+
+        /// Ends the chunked response, reads it to its end, then closes the idle connection.
+        pub(super) fn finish(&mut self, response: &mut Response) -> RunResult {
+            self.origin.send(b"0\r\n\r\n");
+            while !self.next_event(response, u32::MAX).unwrap().eom() {}
+            assert!(self.settle_run().is_none());
+            assert!(self.handle.is_idle(), "the exchange retired");
+            assert!(self.handle.close_when_idle().unwrap());
+            self.settle_run().expect("the idle connection closes")
+        }
+    }
+
+    #[test]
+    fn n8_each_event_is_taken_in_the_read_that_parses_it() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                for piece in [b"one".as_slice(), b"two", b"three"] {
+                    let holder = fixture.holder_wake.get();
+                    let run = fixture.run_wake.get();
+                    fixture.origin.send(&chunk(piece));
+                    assert_eq!(
+                        (
+                            fixture.holder_wake.get() - holder,
+                            fixture.run_wake.get() - run
+                        ),
+                        (1, 0),
+                        "the read wakes the holder, not the run"
+                    );
+                    let Poll::Ready(event) = fixture.body(&mut response, u32::MAX) else {
+                        panic!("the chunk is taken in the read that parses it");
+                    };
+                    assert_eq!(body_bytes(&event.unwrap()), piece);
+                    assert!(
+                        fixture.body(&mut response, u32::MAX).is_pending(),
+                        "the re-read finds nothing"
+                    );
+                }
+                fixture.finish(&mut response).unwrap();
+            })
+        });
+    }
+
+    #[test]
+    fn n8_run_future_does_not_poll_a_held_driver() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                let turns = driver_turns();
+                assert!(fixture.poll_run().is_pending());
+                fixture.origin.send(&chunk(b"one"));
+                assert!(fixture.poll_run().is_pending());
+                assert_eq!(driver_turns(), turns, "the run future polls no held driver");
+                let Poll::Ready(event) = fixture.body(&mut response, u32::MAX) else {
+                    panic!("the holder's read drives");
+                };
+                assert_eq!(body_bytes(&event.unwrap()), b"one");
+                fixture.finish(&mut response).unwrap();
+            })
+        });
+    }
+
+    #[test]
+    fn n8_the_run_is_polled_only_after_a_wake() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                let turns = driver_turns();
+                assert!(fixture.body(&mut response, u32::MAX).is_pending());
+                assert!(fixture.body(&mut response, u32::MAX).is_pending());
+                assert_eq!(driver_turns(), turns, "a quiescent wait needs no poll");
+                fixture.origin.send(&chunk(b"one"));
+                assert!(
+                    fixture.body(&mut response, u32::MAX).is_ready(),
+                    "a wake delivered to the holder makes its next read poll"
+                );
+                assert!(driver_turns() > turns);
+                let turns = driver_turns();
+                let other = Arc::new(Count::default());
+                let other_waker = Waker::from(Arc::clone(&other));
+                assert!(
+                    response
+                        .poll_body(&mut Context::from_waker(&other_waker), u32::MAX)
+                        .is_pending()
+                );
+                assert!(driver_turns() > turns, "another waker always polls");
+                fixture.origin.send(&chunk(b"two"));
+                assert_eq!(other.get(), 1, "the driver's wakes reach the new waker");
+                let Poll::Ready(event) =
+                    response.poll_body(&mut Context::from_waker(&other_waker), u32::MAX)
+                else {
+                    panic!("the new waker's read drives");
+                };
+                assert_eq!(body_bytes(&event.unwrap()), b"two");
+                fixture.finish(&mut response).unwrap();
+            })
+        });
+    }
+
+    #[test]
+    fn n8_acquisition_retires_a_pending_waiting_read() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let upload = Arc::new(tokio::sync::Notify::new());
+                let mut response = fixture.submit(
+                    post_head(Some(5), false),
+                    GatedUpload::held(&upload, None),
+                    CancellationToken::never(),
+                );
+                // The request body is not written: the head read waits, registered with the
+                // source.
+                assert!(fixture.header(&mut response).is_pending());
+                assert!(!response.body().holds_the_drive());
+                upload.notify_one();
+                assert!(fixture.settle_run().is_none());
+                assert!(
+                    fixture.state.borrow().writes.concat().ends_with(b"hello"),
+                    "the run wrote the request body"
+                );
+                fixture.origin.send(CHUNKED_HEAD);
+                let Poll::Ready(head) = fixture.header(&mut response) else {
+                    panic!("the acquiring read drives");
+                };
+                let mut head =
+                    head.expect("the try read succeeds: the pending waiting read was retired");
+                assert_eq!(head.headers_mut().status_code().unwrap(), 200);
+                assert!(response.body().holds_the_drive());
+                fixture.origin.send(&chunk(b"one"));
+                let Poll::Ready(event) = fixture.body(&mut response, u32::MAX) else {
+                    panic!("the chunk is taken");
+                };
+                assert_eq!(body_bytes(&event.unwrap()), b"one");
+                fixture.finish(&mut response).unwrap();
+            })
+        });
+    }
+
+    #[test]
+    fn n8_a_read_nested_in_the_run_s_drive_waits_without_taking_the_drive() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let response = Rc::new(RefCell::new(fixture.submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                )));
+                let (nested, holder_waker) = (Rc::clone(&response), fixture.holder_waker.clone());
+                let nested_read = Rc::new(Cell::new(None));
+                let read = Rc::clone(&nested_read);
+                // A read start inside the run's drive reads the body, after the request is
+                // written and before its head is complete.
+                *fixture.origin.on_read_start.borrow_mut() = Some(Box::new(move || {
+                    let mut response = nested.borrow_mut();
+                    let poll = response.poll_header(&mut Context::from_waker(&holder_waker));
+                    read.set(Some((poll.is_pending(), response.body().holds_the_drive())));
+                }));
+                fixture.origin.send(b"HTTP/1.1 200 OK\r\n");
+                assert!(fixture.settle_run().is_none());
+                let Some((pending, held)) = nested_read.get() else {
+                    panic!("the run's drive started a read after the partial head");
+                };
+                assert!(pending, "the head is incomplete");
+                let holder = fixture.holder_wake.get();
+                fixture.origin.send(b"Transfer-Encoding: chunked\r\n\r\n");
+                assert!(fixture.settle_run().is_none());
+                assert_eq!(
+                    fixture.holder_wake.get() - holder,
+                    1,
+                    "the run produces the head, which wakes the nested read's waker"
+                );
+                assert!(
+                    !held,
+                    "the nested read waited without taking the drive the run was polling"
+                );
+                let mut response = response.borrow_mut();
+                let Poll::Ready(head) = fixture.header(&mut *response) else {
+                    panic!("the woken read takes the head");
+                };
+                assert_eq!(head.unwrap().headers_mut().status_code().unwrap(), 200);
+                assert!(
+                    response.body().holds_the_drive(),
+                    "a read outside the run's drive takes the drive"
+                );
+                fixture.finish(&mut response).unwrap();
+            })
+        });
+    }
+
+    #[test]
+    fn n8_an_unfinished_upload_keeps_the_run_driving_until_the_request_is_written() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let upload = Arc::new(tokio::sync::Notify::new());
+                let mut response = fixture.submit(
+                    post_head(Some(5), false),
+                    GatedUpload::held(&upload, None),
+                    CancellationToken::never(),
+                );
+                // The origin answers before the request body is sent.
+                fixture
+                    .origin
+                    .send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                assert!(
+                    fixture.header(&mut response).is_pending(),
+                    "the read waits, and the run reads the response"
+                );
+                assert!(fixture.settle_run().is_none());
+                let Poll::Ready(head) = fixture.header(&mut response) else {
+                    panic!("the run's parse woke the waiting read");
+                };
+                assert_eq!(head.unwrap().headers_mut().status_code().unwrap(), 200);
+                assert!(
+                    !response.body().holds_the_drive(),
+                    "until the request is written, the run keeps the drive"
+                );
+                // The holder reads nothing more until the request is sent: the run writes it.
+                upload.notify_one();
+                assert!(fixture.settle_run().is_none());
+                assert!(fixture.state.borrow().writes.concat().ends_with(b"hello"));
+                let mut body = Vec::new();
+                loop {
+                    let event = fixture.next_event(&mut response, u32::MAX).unwrap();
+                    body.extend(body_bytes(&event));
+                    if event.eom() {
+                        break;
+                    }
+                }
+                assert_eq!(body, b"ok");
+                assert!(fixture.settle_run().is_none());
+                assert_eq!(fixture.handle.available_capacity(), 1, "the slot returns");
+                drop(response);
+                assert!(fixture.handle.close_when_idle().unwrap());
+                fixture
+                    .settle_run()
+                    .expect("the idle connection closes")
+                    .unwrap();
+            })
+        });
+    }
+
+    #[test]
+    fn n8_a_fatal_abort_while_held_and_unread_completes_the_run() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |config| {
+                    config.deliver_ingress_before_abort = true;
+                });
+                let mut response = fixture.held();
+                fixture.origin.send(&chunk(b"abcdef"));
+                let Poll::Ready(event) = fixture.body(&mut response, 2) else {
+                    panic!("the chunk is taken in part");
+                };
+                assert_eq!(body_bytes(&event.unwrap()), b"ab");
+                *fixture.origin.on_read_start.borrow_mut() =
+                    Some(Box::new(|| panic!("read start panicked")));
+                fixture.origin.send(&chunk(b"ghi"));
+                // The read that drives reads the chunk, then the next read start panics: the
+                // connection fails and keeps the queued events (`DIV-033`).
+                let read = catch_unwind(AssertUnwindSafe(|| fixture.body(&mut response, 2)));
+                let Ok(Poll::Ready(event)) = read else {
+                    panic!("the holder's read neither panics nor waits");
+                };
+                assert_eq!(body_bytes(&event.unwrap()), b"cd", "a kept event");
+                // The holder stalls. The run finishes on its own wakes and resumes the panic.
+                let run = catch_unwind(AssertUnwindSafe(|| fixture.settle_run()));
+                let panic = run.expect_err("the run resumes the callback panic");
+                assert_eq!(panic_text(panic), "read start panicked");
+                assert!(fixture.handle.is_finished());
+                assert_eq!(fixture.state.borrow().close, CloseKind::Reset);
+                let event = fixture.next_event(&mut response, 2).unwrap();
+                assert_eq!(body_bytes(&event), b"ef");
+                let error = fixture.next_event(&mut response, 2).err();
+                assert_eq!(
+                    error.map(|error| error.code()),
+                    Some(HttpErrorCode::INTERNAL_ERROR)
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn n8_an_inline_completion_leaves_the_driver_to_the_run() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                fixture.origin.push(Pushed::Eof);
+                // The read that drives parses an EOF inside the response: the connection fails,
+                // and its run completes in that drive.
+                let Poll::Ready(read) = fixture.body(&mut response, u32::MAX) else {
+                    panic!("the EOF is applied in the read");
+                };
+                assert_eq!(
+                    read.err().map(|error| error.code()),
+                    Some(HttpErrorCode::TRANSPORT_EOF)
+                );
+                assert!(
+                    !fixture.handle.is_finished(),
+                    "only the run future marks the run finished"
+                );
+                assert!(
+                    !fixture.origin.dropped.get(),
+                    "the driver, which owns the transport, is left to the run future"
+                );
+                let run = fixture
+                    .settle_run()
+                    .expect("the run future takes the completion on its wake");
+                assert_eq!(run.unwrap_err().code(), HttpErrorCode::TRANSPORT_EOF);
+                assert!(fixture.handle.is_finished());
+                assert!(
+                    fixture.origin.dropped.get(),
+                    "the run future dropped the driver"
+                );
+            })
+        });
+    }
+
+    /// What a reader saw of a response whose origin sends a chunk and EOF while it does not
+    /// read: its events after that point, `run`'s error code, and whether admission closed
+    /// before it read again.
+    fn eof_while_unread(mode: Mode, deliver: bool) -> (Vec<String>, Option<HttpErrorCode>, bool) {
+        run_on_host(move |context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, mode, |config| {
+                    config.deliver_ingress_before_abort = deliver;
+                });
+                let log = Rc::new(AdmissionLog::default());
+                fixture.handle.set_observer(log.clone()).unwrap();
+                let mut response = fixture.submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                fixture.origin.send(CHUNKED_HEAD);
+                fixture.next_header(&mut response);
+                fixture.origin.send(&chunk(b"one"));
+                let event = fixture.next_event(&mut response, u32::MAX).unwrap();
+                assert_eq!(body_bytes(&event), b"one");
+                // The reader stops reading; the origin sends a chunk, then EOF.
+                fixture.origin.send(&chunk(b"two"));
+                fixture.origin.push(Pushed::Eof);
+                let mut run = fixture.settle_run();
+                let closed_before_read =
+                    log.0.borrow().iter().any(|note| note == "admission_closed");
+                let mut events = Vec::new();
+                loop {
+                    match fixture.next_event(&mut response, u32::MAX) {
+                        Ok(event) => {
+                            events.push(String::from_utf8(body_bytes(&event)).unwrap());
+                            if event.eom() {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            events.push(format!("error {:?}", error.code()));
+                            break;
+                        }
+                    }
+                }
+                run = run.or_else(|| fixture.settle_run());
+                let run = run.expect("the run completes");
+                (
+                    events,
+                    run.err().map(|error| error.code()),
+                    closed_before_read,
+                )
+            })
+        })
+    }
+
+    #[test]
+    fn n8_eof_while_held_and_unread_is_applied_at_the_next_read() {
+        for deliver in [false, true] {
+            let (run_events, run_error, run_closed) = eof_while_unread(Mode::Run, deliver);
+            let (events, error, closed) = eof_while_unread(Mode::PullThrough, deliver);
+            assert!(run_closed, "under run, the EOF is applied at once");
+            assert!(
+                !closed,
+                "while held and unread, the EOF waits for the holder's next read"
+            );
+            assert_eq!(
+                (events, error),
+                (run_events, run_error),
+                "the reader then gets run's events and error (deliver_ingress_before_abort: {deliver})"
+            );
+        }
+    }
+
+    /// How many transport reads completed while a reader that read the head and a first
+    /// chunk read nothing and its origin sent three more chunks.
+    fn reads_while_unread(mode: Mode) -> usize {
+        run_on_host(move |context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, mode, |_| {});
+                let mut response = fixture.submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                fixture.origin.send(CHUNKED_HEAD);
+                fixture.next_header(&mut response);
+                fixture.origin.send(&chunk(b"one"));
+                fixture.next_event(&mut response, u32::MAX).unwrap();
+                let delivered = fixture.origin.delivered.get();
+                for piece in [b"two".as_slice(), b"three", b"four"] {
+                    fixture.origin.send(&chunk(piece));
+                    assert!(fixture.settle_run().is_none());
+                }
+                let unread = fixture.origin.delivered.get() - delivered;
+                let mut body = Vec::new();
+                loop {
+                    let event = fixture.next_event(&mut response, u32::MAX).unwrap();
+                    body.extend(body_bytes(&event));
+                    if body.len() == b"twothreefour".len() {
+                        break;
+                    }
+                }
+                assert_eq!(body, b"twothreefour");
+                fixture.origin.send(b"0\r\n\r\n");
+                while !fixture.next_event(&mut response, u32::MAX).unwrap().eom() {}
+                assert!(fixture.settle_run().is_none());
+                assert!(fixture.handle.close_when_idle().unwrap());
+                fixture
+                    .settle_run()
+                    .expect("the idle connection closes")
+                    .unwrap();
+                unread
+            })
+        })
+    }
+
+    #[test]
+    fn n8_an_unread_body_stops_the_upstream_reading() {
+        assert_eq!(
+            reads_while_unread(Mode::Run),
+            3,
+            "under run, the connection reads whether or not its reader does"
+        );
+        assert!(
+            reads_while_unread(Mode::PullThrough) <= 1,
+            "while held and unread, at most one transport read completes"
+        );
+    }
+
+    #[test]
+    fn n8_the_eom_read_wakes_only_the_run() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                fixture.origin.send(&chunk(b"one"));
+                let Poll::Ready(event) = fixture.body(&mut response, u32::MAX) else {
+                    panic!("the chunk is taken");
+                };
+                assert_eq!(body_bytes(&event.unwrap()), b"one");
+                fixture.origin.send(b"0\r\n\r\n");
+                let holder = fixture.holder_wake.get();
+                let run = fixture.run_wake.get();
+                let Poll::Ready(event) = fixture.body(&mut response, u32::MAX) else {
+                    panic!("the EOM is taken in the read that parses it");
+                };
+                assert!(event.unwrap().eom());
+                assert_eq!(
+                    fixture.holder_wake.get(),
+                    holder,
+                    "neither the release in the drive that parses EOM nor the source's completion \
+                     wakes the holder"
+                );
+                assert!(fixture.run_wake.get() > run, "they wake the run");
+                assert!(!response.body().holds_the_drive());
+                let polls = fixture.run_polls;
+                assert!(fixture.settle_run().is_none());
+                assert_eq!(
+                    fixture.run_polls - polls,
+                    1,
+                    "one run poll retires the exchange"
+                );
+                assert_eq!(
+                    fixture.handle.available_capacity(),
+                    1,
+                    "and returns the slot"
+                );
+                assert!(fixture.handle.close_when_idle().unwrap());
+                fixture
+                    .settle_run()
+                    .expect("the idle connection closes")
+                    .unwrap();
+            })
+        });
+    }
+
+    #[test]
+    fn n8_a_source_completion_while_held_wakes_only_the_run() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                fixture.origin.send(&chunk(b"one"));
+                let Poll::Ready(event) = fixture.body(&mut response, u32::MAX) else {
+                    panic!("the chunk is taken");
+                };
+                assert_eq!(body_bytes(&event.unwrap()), b"one");
+                let holder = fixture.holder_wake.get();
+                let run = fixture.run_wake.get();
+                response.body().stop(None);
+                assert_eq!(
+                    fixture.holder_wake.get(),
+                    holder,
+                    "the drive returns before the source's completion wakes the driver"
+                );
+                assert!(fixture.run_wake.get() > run);
+                let closed = fixture
+                    .settle_run()
+                    .expect("the run closes the connection whose response was not read to its end");
+                assert!(closed.is_err());
+                assert_eq!(fixture.state.borrow().close, CloseKind::Reset);
+            })
+        });
+    }
+
+    #[test]
+    fn n8_a_body_read_after_its_response_ended_does_not_take_the_drive() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let upload = Arc::new(tokio::sync::Notify::new());
+                let mut response = fixture.submit(
+                    post_head(Some(5), false),
+                    GatedUpload::held(&upload, None),
+                    CancellationToken::never(),
+                );
+                // An early response, all of it parsed by the run before the upload ends.
+                fixture
+                    .origin
+                    .send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                let mut head = fixture.next_header(&mut response);
+                assert_eq!(head.headers_mut().status_code().unwrap(), 200);
+                upload.notify_one();
+                assert!(fixture.settle_run().is_none());
+                assert!(fixture.state.borrow().writes.concat().ends_with(b"hello"));
+                let turns = driver_turns();
+                let Poll::Ready(event) = fixture.body(&mut response, 1) else {
+                    panic!("a queued byte is taken");
+                };
+                assert_eq!(body_bytes(&event.unwrap()), b"o");
+                assert_eq!(
+                    driver_turns(),
+                    turns,
+                    "after its response's end, a read does not drive the connection"
+                );
+                assert!(
+                    !response.body().holds_the_drive(),
+                    "after its response's end, a read does not take the drive"
+                );
+                let mut rest = Vec::new();
+                loop {
+                    let event = fixture.next_event(&mut response, 1).unwrap();
+                    rest.extend(body_bytes(&event));
+                    if event.eom() {
+                        break;
+                    }
+                }
+                assert_eq!(rest, b"k");
+                assert!(fixture.settle_run().is_none());
+                assert_eq!(
+                    fixture.handle.available_capacity(),
+                    1,
+                    "the exchange retires and the slot returns while the body lives"
+                );
+                drop(response);
+                assert!(fixture.handle.close_when_idle().unwrap());
+                fixture
+                    .settle_run()
+                    .expect("the idle connection closes")
+                    .unwrap();
+            })
+        });
+    }
+
+    #[test]
+    fn n8_eof_after_the_response_end_is_applied_at_once() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let log = Rc::new(AdmissionLog::default());
+                fixture.handle.set_observer(log.clone()).unwrap();
+                let mut response = fixture.held();
+                fixture
+                    .origin
+                    .send(&[chunk(b"abc"), b"0\r\n\r\n".to_vec()].concat());
+                let Poll::Ready(event) = fixture.body(&mut response, 1) else {
+                    panic!("the drive parses the response's end");
+                };
+                assert_eq!(body_bytes(&event.unwrap()), b"a");
+                assert!(
+                    !response.body().holds_the_drive(),
+                    "the drive returned at the release"
+                );
+                fixture.origin.push(Pushed::Eof);
+                assert!(fixture.settle_run().is_none());
+                assert!(
+                    log.0.borrow().iter().any(|note| note == "admission_closed"),
+                    "the run applies the EOF at once, with the response's events unread"
+                );
+                let mut rest = Vec::new();
+                loop {
+                    let event = fixture.next_event(&mut response, 1).unwrap();
+                    rest.extend(body_bytes(&event));
+                    if event.eom() {
+                        break;
+                    }
+                }
+                assert_eq!(rest, b"bc");
+                fixture
+                    .settle_run()
+                    .expect("the connection closes once the exchange retires")
+                    .unwrap();
+            })
+        });
+    }
+
+    #[test]
+    fn n8_a_producer_abort_completes_the_source_at_once_and_returns_the_drive() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                // A malformed chunk size fails the response in the drive that parses it.
+                fixture.origin.send(b"zz\r\n");
+                let holder = fixture.holder_wake.get();
+                let Poll::Ready(read) = fixture.body(&mut response, u32::MAX) else {
+                    panic!("the failure is read in the read that parses it");
+                };
+                let read = read.err().map(|error| error.code());
+                assert!(read.is_some());
+                assert_eq!(
+                    fixture.holder_wake.get(),
+                    holder,
+                    "the drive wakes only the run"
+                );
+                assert!(
+                    !response.body().holds_the_drive(),
+                    "the abort completed the source at once, which returned the drive"
+                );
+                let run = fixture.settle_run().expect("the run completes on its wake");
+                assert_eq!(run.err().map(|error| error.code()), read);
+            })
+        });
+    }
+
+    #[test]
+    fn n8_an_immediately_ready_budget_yield_is_not_lost() {
+        run_on_host_with(|host, context| {
+            Box::pin(async move {
+                host.set_yield_mode(crate::external_host_tests::YieldMode::Immediate);
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                // More immediately ready reads than one poll's turn budget: the drive yields,
+                // and the yield is ready on its first poll.
+                for _ in 0..100 {
+                    fixture.origin.send(&chunk(b"a"));
+                }
+                let mut body = Vec::new();
+                let mut seen = fixture.holder_wake.get();
+                // As a downstream task, the holder reads again only after a wake.
+                for _ in 0..1000 {
+                    match fixture.body(&mut response, u32::MAX) {
+                        Poll::Ready(event) => {
+                            body.extend(body_bytes(&event.unwrap()));
+                            if body.len() == 100 {
+                                break;
+                            }
+                        }
+                        Poll::Pending => {
+                            let wakes = fixture.holder_wake.get();
+                            assert!(
+                                wakes > seen,
+                                "the holder waits with no wake to come: {} of 100 bytes read",
+                                body.len()
+                            );
+                            seen = wakes;
+                        }
+                    }
+                }
+                assert_eq!(body, vec![b'a'; 100]);
+                fixture.finish(&mut response).unwrap();
+            })
+        });
+    }
+
+    #[test]
+    fn n8_a_connection_cancel_while_held_and_unread_is_applied_by_the_run() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                fixture.origin.send(&chunk(b"one"));
+                assert!(fixture.body(&mut response, u32::MAX).is_ready());
+                // The holder stops reading, as a downstream whose client takes nothing.
+                let holder = fixture.holder_wake.get();
+                fixture.handle.cancel();
+                let run = fixture
+                    .settle_run()
+                    .expect("the run applies the cancel without the holder");
+                assert_eq!(
+                    run.err().map(|error| error.code()),
+                    Some(HttpErrorCode::CORO_CANCELLED)
+                );
+                assert_eq!(fixture.state.borrow().close, CloseKind::Reset);
+                assert!(
+                    fixture.holder_wake.get() > holder,
+                    "the holder is woken to read the outcome"
+                );
+                let Poll::Ready(read) = fixture.body(&mut response, u32::MAX) else {
+                    panic!("the holder's next read returns the outcome");
+                };
+                assert_eq!(
+                    read.err().map(|error| error.code()),
+                    Some(HttpErrorCode::CORO_CANCELLED)
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn n8_a_third_party_request_cancel_while_held_is_applied_by_the_run() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                fixture.origin.send(&chunk(b"one"));
+                assert!(fixture.body(&mut response, u32::MAX).is_ready());
+                response.control().cancel(HttpError::with_message(
+                    HttpErrorCode::CANCEL,
+                    b"route timeout",
+                ));
+                let run = fixture
+                    .settle_run()
+                    .expect("the run applies the request's cancel without the holder");
+                assert_eq!(
+                    run.err().map(|error| error.code()),
+                    Some(HttpErrorCode::CANCEL)
+                );
+                assert_eq!(fixture.state.borrow().close, CloseKind::Reset);
+                let Poll::Ready(read) = fixture.body(&mut response, u32::MAX) else {
+                    panic!("the holder's next read returns the outcome");
+                };
+                assert_eq!(
+                    read.err().map(|error| error.code()),
+                    Some(HttpErrorCode::CANCEL)
+                );
+            })
+        });
+    }
+
+    /// The run's last poll ends at a budget yield that completes only at the host's I/O phase,
+    /// as an event-loop host's does. A connection or request cancel then lands, and the body
+    /// reads before the run runs. The run applies the cancel without the holder's reads.
+    fn cancel_before_acquisition_with_a_pending_yield(request_cancel: bool, code: HttpErrorCode) {
+        run_on_host_with(move |host, context| {
+            Box::pin(async move {
+                host.set_yield_mode(crate::external_host_tests::YieldMode::Deferred);
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                fixture.origin.send(CHUNKED_HEAD);
+                // More ready reads than one poll's turn budget.
+                for _ in 0..100 {
+                    fixture.origin.send(&chunk(b"a"));
+                }
+                let yields = host.yields();
+                assert!(fixture.settle_run().is_none());
+                assert!(
+                    host.yields() > yields,
+                    "the run's poll ends at a pending budget yield"
+                );
+                if request_cancel {
+                    response.control().cancel(HttpError::with_message(
+                        HttpErrorCode::CANCEL,
+                        b"route timeout",
+                    ));
+                } else {
+                    fixture.handle.cancel();
+                }
+                let _ = fixture.header(&mut response);
+                let held = response.body().holds_the_drive();
+                let mut run = fixture.settle_run();
+                if run.is_none() {
+                    // The host idles, and its I/O phase completes the yield.
+                    LocalHost::sleep_until(&*host, LocalHost::now(&*host) + Duration::from_secs(1))
+                        .await;
+                    run = fixture.settle_run();
+                }
+                let run = run.unwrap_or_else(|| {
+                    panic!(
+                        "the run applies the cancel without the holder's reads (the read took the drive: {held})"
+                    )
+                });
+                assert_eq!(run.err().map(|error| error.code()), Some(code));
+                assert_eq!(fixture.state.borrow().close, CloseKind::Reset);
+                let outcome = (0..200)
+                    .find_map(|_| match fixture.body(&mut response, u32::MAX) {
+                        Poll::Ready(Ok(_)) => None,
+                        Poll::Ready(Err(error)) => Some(error.code()),
+                        Poll::Pending => panic!("the holder's reads return the outcome"),
+                    })
+                    .expect("the holder's reads end with the outcome");
+                assert_eq!(outcome, code);
+            })
+        });
+    }
+
+    #[test]
+    fn n8_a_connection_cancel_before_acquisition_with_a_pending_yield_is_applied_by_the_run() {
+        cancel_before_acquisition_with_a_pending_yield(false, HttpErrorCode::CORO_CANCELLED);
+    }
+
+    #[test]
+    fn n8_a_request_cancel_before_acquisition_with_a_pending_yield_is_applied_by_the_run() {
+        cancel_before_acquisition_with_a_pending_yield(true, HttpErrorCode::CANCEL);
+    }
+
+    #[test]
+    fn n8_a_token_cancel_while_held_and_unread_is_applied_by_the_run() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let token = CancellationSource::new();
+                let mut response =
+                    fixture.submit(get_head(), HttpSourceHolder::empty(), token.token());
+                fixture.origin.send(CHUNKED_HEAD);
+                let Poll::Ready(head) = fixture.header(&mut response) else {
+                    panic!("the head is taken in the read that takes the drive");
+                };
+                assert_eq!(head.unwrap().headers_mut().status_code().unwrap(), 200);
+                assert!(response.body().holds_the_drive());
+                fixture.origin.send(&chunk(b"one"));
+                assert!(fixture.body(&mut response, u32::MAX).is_ready());
+                // Cancelled from another thread while the holder does not read.
+                std::thread::scope(|scope| {
+                    scope.spawn(|| assert!(token.request_cancellation()));
+                });
+                let run = fixture
+                    .settle_run()
+                    .expect("the run applies the token's cancel without the holder");
+                assert_eq!(
+                    run.err().map(|error| error.code()),
+                    Some(HttpErrorCode::CORO_CANCELLED)
+                );
+                assert_eq!(fixture.state.borrow().close, CloseKind::Reset);
+                let Poll::Ready(read) = fixture.body(&mut response, u32::MAX) else {
+                    panic!("the holder's next read returns the outcome");
+                };
+                assert_eq!(
+                    read.err().map(|error| error.code()),
+                    Some(HttpErrorCode::CORO_CANCELLED)
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn n8_a_cancel_from_an_inline_callback_revokes_without_borrowing_the_driver() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                let handle = fixture.handle.clone();
+                *fixture.origin.on_read_start.borrow_mut() =
+                    Some(Box::new(move || handle.cancel()));
+                fixture.origin.send(&chunk(b"one"));
+                let holder = fixture.holder_wake.get();
+                // The drive reads the chunk, and the next read start cancels the connection.
+                let read = catch_unwind(AssertUnwindSafe(|| fixture.body(&mut response, u32::MAX)));
+                let Ok(Poll::Ready(read)) = read else {
+                    panic!("the holder's read neither panics nor waits");
+                };
+                assert_eq!(
+                    read.err().map(|error| error.code()),
+                    Some(HttpErrorCode::CORO_CANCELLED),
+                    "the drive applied the cancel at its next phase boundary"
+                );
+                assert_eq!(
+                    fixture.holder_wake.get(),
+                    holder,
+                    "a revocation inside the holder's drive does not wake the holder"
+                );
+                let run = fixture
+                    .settle_run()
+                    .expect("the run completes on its wakes");
+                assert_eq!(
+                    run.err().map(|error| error.code()),
+                    Some(HttpErrorCode::CORO_CANCELLED),
+                    "with the cancel: the revocation borrowed no driver"
+                );
+                assert_eq!(fixture.state.borrow().close, CloseKind::Reset);
+            })
+        });
+    }
+
+    #[test]
+    fn n8_worker_cancellation_while_held_completes_the_run_on_its_scope() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let worker = context.handle().clone();
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                fixture.origin.send(&chunk(b"one"));
+                assert!(fixture.body(&mut response, u32::MAX).is_ready());
+                assert!(worker.begin_shutdown());
+                // The root polls the run at worker cancellation.
+                let run = match fixture.poll_run() {
+                    Poll::Ready(run) => run,
+                    Poll::Pending => fixture
+                        .settle_run()
+                        .expect("the run completes on its scope, without the holder"),
+                };
+                assert_eq!(
+                    run.err().map(|error| error.code()),
+                    Some(HttpErrorCode::CORO_CANCELLED)
+                );
+                assert_eq!(fixture.state.borrow().close, CloseKind::Reset);
+                let Poll::Ready(read) = fixture.body(&mut response, u32::MAX) else {
+                    panic!("the holder's next read returns the outcome");
+                };
+                assert!(read.is_err());
+            })
+        });
+    }
+
+    #[test]
+    fn n8_dropping_the_run_while_held_revokes_and_aborts() {
+        let (inspected_tx, inspected_rx) = std::sync::mpsc::channel();
+        let completion = forced_teardown_of_scope(move |context| {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = ScriptedTransport::new([ReadAction::WaitData(
+                Arc::clone(&gate),
+                CHUNKED_HEAD.to_vec(),
+            )]);
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let submission = handle.reserve_request().unwrap().submit_pull_through(
+                get_head(),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            let slot: Rc<RefCell<Option<OwnedH1PullThroughBody>>> = Rc::new(RefCell::new(None));
+            let held = Rc::new(Cell::new(false));
+            let (body, held_at_teardown) = (Rc::clone(&slot), Rc::clone(&held));
+            after_forced_teardown(move || {
+                let mut body = body.borrow_mut().take().expect("the body outlives the run");
+                let holds = body.holds_the_drive();
+                let Poll::Ready(read) = body.poll_header(&mut Context::from_waker(Waker::noop()))
+                else {
+                    panic!("the abort is read at once");
+                };
+                inspected_tx
+                    .send((
+                        held_at_teardown.get(),
+                        holds,
+                        read.err().map(|error| error.code()),
+                        state.borrow().close,
+                    ))
+                    .unwrap();
+            });
+            Box::pin(async move {
+                let _ = futures::join!(session.run_pull_through(), async move {
+                    let response = submission.await.unwrap();
+                    gate.notify_one();
+                    *slot.borrow_mut() = Some(response.body);
+                    // The head read takes the drive, then waits for the head.
+                    let _ = poll_fn(|context| {
+                        let mut body = slot.borrow_mut();
+                        let body = body.as_mut().expect("the body is stored");
+                        let poll = body.poll_header(context);
+                        held.set(body.holds_the_drive());
+                        poll
+                    })
+                    .await;
+                    std::future::pending::<()>().await;
+                    drop(handle);
+                });
+            })
+        });
+        assert_eq!(
+            completion,
+            Err(ManagedWorkerError::TeardownDeadlineExceeded),
+            "the forced destruction of the unjoined run is a clean overrun"
+        );
+        let (held, holds, read, close) = inspected_rx.recv().unwrap();
+        assert!(held, "the body held the drive when the run was dropped");
+        assert!(!holds, "dropping the run took the drive back");
+        assert_eq!(
+            read,
+            Some(HttpErrorCode::CORO_CANCELLED),
+            "the body reads the abort"
+        );
+        assert_eq!(
+            close,
+            CloseKind::Reset,
+            "the abandoned driver reset its transport"
+        );
+    }
+
+    #[test]
+    fn n8_dropping_the_run_with_a_stashed_completion_neither_aborts_nor_asserts() {
+        for panics in [false, true] {
+            let dropped = run_on_host(move |context| {
+                Box::pin(async move {
+                    let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                    let mut response = fixture.held();
+                    if panics {
+                        *fixture.origin.on_reset.borrow_mut() =
+                            Some(Box::new(|| panic!("reset panicked")));
+                    }
+                    // An EOF inside the response completes the run in the holder's drive.
+                    fixture.origin.push(Pushed::Eof);
+                    assert!(fixture.body(&mut response, u32::MAX).is_ready());
+                    assert!(!fixture.handle.is_finished());
+                    let dropped = catch_unwind(AssertUnwindSafe(|| fixture.drop_run()))
+                        .err()
+                        .map(panic_text);
+                    assert!(
+                        fixture.handle.is_finished(),
+                        "the drop marked the run finished"
+                    );
+                    assert!(fixture.origin.dropped.get(), "and dropped the driver");
+                    assert_eq!(fixture.state.borrow().close, CloseKind::Reset);
+                    dropped
+                })
+            });
+            if panics {
+                assert_eq!(
+                    dropped.as_deref(),
+                    Some("reset panicked"),
+                    "the drop resumes the stashed panic"
+                );
+            } else {
+                assert_eq!(dropped, None, "the drop neither aborts nor asserts");
+            }
+        }
+    }
+
+    /// A response observer whose deadline never fires.
+    struct NoDeadline;
+
+    impl crate::owned::OwnedResponseObserver for NoDeadline {
+        fn poll_deadline(&mut self, _context: &mut Context<'_>) -> Poll<HttpError> {
+            Poll::Pending
+        }
+
+        fn response_complete(self: Box<Self>, _completed: Result<std::time::Instant, HttpError>) {}
+    }
+
+    #[test]
+    fn n8_response_observation_is_refused_on_a_pull_through_exchange() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                let refused = response
+                    .control()
+                    .observe_response(Box::new(NoDeadline))
+                    .err()
+                    .map(|error| error.code());
+                assert_eq!(
+                    refused,
+                    Some(HttpErrorCode::INVALID_STATE_TRANSITION),
+                    "its deadline would be processed only on the holder's reads"
+                );
+                fixture.finish(&mut response).unwrap();
+            })
+        });
+    }
+
+    #[test]
+    fn n8_a_second_pull_through_exchange_is_refused() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                let refused = fixture
+                    .handle
+                    .reserve_request()
+                    .err()
+                    .map(|error| error.code());
+                assert_eq!(
+                    refused,
+                    Some(HttpErrorCode::REFUSED_STREAM),
+                    "capacity one: no second exchange while one holds the drive"
+                );
+                fixture.finish(&mut response).unwrap();
+            })
+        });
+    }
+
+    #[test]
+    fn n8_a_drain_while_held_finishes_the_exchange_then_closes() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                assert!(fixture.handle.close_when_idle().unwrap());
+                assert!(
+                    response.body().holds_the_drive(),
+                    "a drain does not take the drive back"
+                );
+                fixture
+                    .origin
+                    .send(&[chunk(b"one"), b"0\r\n\r\n".to_vec()].concat());
+                let mut body = Vec::new();
+                loop {
+                    let event = fixture.next_event(&mut response, u32::MAX).unwrap();
+                    body.extend(body_bytes(&event));
+                    if event.eom() {
+                        break;
+                    }
+                }
+                assert_eq!(body, b"one");
+                fixture
+                    .settle_run()
+                    .expect("the drained connection closes once the exchange retires")
+                    .unwrap();
+                assert_eq!(fixture.state.borrow().close, CloseKind::ShutdownWrite);
+            })
+        });
+    }
+
+    /// What one read after a stall saw: the transport reads completed by then, and the size of
+    /// its event. The origin sends a 256 KiB body in 4 KiB reads while the reader reads nothing.
+    fn first_read_after_a_stall(mode: Mode) -> (usize, usize) {
+        run_on_host(move |context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, mode, |config| {
+                    config.ingress_buffer_limit = 16 << 10;
+                });
+                let mut response = fixture.submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                let body = patterned(256 << 10);
+                fixture.origin.send(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes(),
+                );
+                fixture.next_header(&mut response);
+                for piece in body.chunks(4 << 10) {
+                    fixture.origin.send(piece);
+                }
+                fixture.settle_run();
+                let first = body_bytes(&fixture.next_event(&mut response, u32::MAX).unwrap());
+                let delivered = fixture.origin.delivered.get();
+                let mut read = first.clone();
+                loop {
+                    let event = fixture.next_event(&mut response, u32::MAX).unwrap();
+                    read.extend(body_bytes(&event));
+                    if event.eom() {
+                        break;
+                    }
+                }
+                assert!(read == body, "the body arrives intact");
+                assert!(fixture.settle_run().is_none());
+                assert!(fixture.handle.close_when_idle().unwrap());
+                fixture
+                    .settle_run()
+                    .expect("the idle connection closes")
+                    .unwrap();
+                (delivered, first.len())
+            })
+        })
+    }
+
+    #[test]
+    fn n8_one_holder_read_buffers_at_most_the_ingress_limit() {
+        let run = first_read_after_a_stall(Mode::Run);
+        let pull_through = first_read_after_a_stall(Mode::PullThrough);
+        assert_eq!(
+            pull_through, run,
+            "one read after a stall reads and buffers what run reads and buffers"
+        );
+        assert!(
+            pull_through.1 <= 16 << 10,
+            "the source holds at most the ingress limit"
+        );
+    }
+
+    #[test]
+    fn n8_a_slow_reader_gets_the_whole_body_after_flow_pauses() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |config| {
+                    config.ingress_buffer_limit = 16 << 10;
+                });
+                let mut response = fixture.submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                let body = patterned(256 << 10);
+                fixture.origin.send(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes(),
+                );
+                fixture.next_header(&mut response);
+                for piece in body.chunks(16 << 10) {
+                    fixture.origin.send(piece);
+                }
+                // The holder reads 4 KiB at a time, and again only after a wake: the resume
+                // credit wakes it once parsing may resume.
+                let mut read = Vec::new();
+                let mut seen = fixture.holder_wake.get();
+                for _ in 0..10_000 {
+                    match fixture.body(&mut response, 4 << 10) {
+                        Poll::Ready(event) => {
+                            let event = event.unwrap();
+                            read.extend(body_bytes(&event));
+                            if event.eom() {
+                                break;
+                            }
+                        }
+                        Poll::Pending => {
+                            let wakes = fixture.holder_wake.get();
+                            assert!(
+                                wakes > seen,
+                                "the holder waits with no wake to come: {} bytes read",
+                                read.len()
+                            );
+                            seen = wakes;
+                        }
+                    }
+                }
+                assert!(read == body, "the whole body arrives: {} bytes", read.len());
+                assert!(fixture.settle_run().is_none());
+                assert!(fixture.handle.close_when_idle().unwrap());
+                fixture
+                    .settle_run()
+                    .expect("the idle connection closes")
+                    .unwrap();
+            })
+        });
+    }
+
+    /// Whether an EOF that arrives once the connection is idle, after an exchange, closes
+    /// admission and ends the run at once, and the run's error code.
+    fn eof_while_idle(mode: Mode) -> (bool, Option<Option<HttpErrorCode>>) {
+        run_on_host(move |context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, mode, |_| {});
+                let log = Rc::new(AdmissionLog::default());
+                fixture.handle.set_observer(log.clone()).unwrap();
+                let mut response = fixture.submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                fixture.origin.send(OK_RESPONSE);
+                fixture.next_header(&mut response);
+                while !fixture.next_event(&mut response, u32::MAX).unwrap().eom() {}
+                assert!(fixture.settle_run().is_none());
+                assert!(fixture.handle.is_idle());
+                fixture.origin.push(Pushed::Eof);
+                let run = fixture.settle_run();
+                (
+                    log.0.borrow().iter().any(|note| note == "admission_closed"),
+                    run.map(|run| run.err().map(|error| error.code())),
+                )
+            })
+        })
+    }
+
+    #[test]
+    fn n8_eof_while_idle_is_applied_at_once() {
+        let pull_through = eof_while_idle(Mode::PullThrough);
+        assert_eq!(pull_through, eof_while_idle(Mode::Run));
+        assert!(pull_through.0, "admission closes at once");
+        assert!(pull_through.1.is_some(), "and the run ends at once");
+    }
+
+    /// What a reader read of a response whose connection fails with a read error after a chunk,
+    /// with `deliver_ingress_before_abort` (`DIV-033`), and `run`'s error code.
+    fn reset_mid_response(mode: Mode) -> (Vec<String>, Option<HttpErrorCode>) {
+        run_on_host(move |context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, mode, |config| {
+                    config.deliver_ingress_before_abort = true;
+                });
+                let mut response = fixture.submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                fixture.origin.send(CHUNKED_HEAD);
+                fixture.next_header(&mut response);
+                fixture.origin.send(&chunk(b"one"));
+                fixture
+                    .origin
+                    .push(Pushed::Error(HttpErrorCode::TRANSPORT_READ_ERROR));
+                let mut run = fixture.settle_run();
+                let mut events = Vec::new();
+                loop {
+                    match fixture.next_event(&mut response, u32::MAX) {
+                        Ok(event) => events.push(String::from_utf8(body_bytes(&event)).unwrap()),
+                        Err(error) => {
+                            events.push(format!("error {:?}", error.code()));
+                            break;
+                        }
+                    }
+                }
+                run = run.or_else(|| fixture.settle_run());
+                (
+                    events,
+                    run.expect("the run completes")
+                        .err()
+                        .map(|error| error.code()),
+                )
+            })
+        })
+    }
+
+    #[test]
+    fn n8_an_upstream_reset_mid_response_delivers_kept_events_then_the_error() {
+        let pull_through = reset_mid_response(Mode::PullThrough);
+        assert_eq!(pull_through, reset_mid_response(Mode::Run));
+        assert_eq!(
+            pull_through.0,
+            [
+                "one".to_owned(),
+                format!("error {:?}", HttpErrorCode::TRANSPORT_READ_ERROR)
+            ]
+        );
+    }
+
+    /// Where a reader drops its response: with a body read pending, or between body events.
+    #[derive(Clone, Copy, Debug)]
+    enum DropPoint {
+        Pending,
+        Armed,
+    }
+
+    /// `run`'s error code and the close kind of a connection whose response's reader drops it
+    /// mid-body at `point`. With `gated`, the request body is never released, so a pull-through
+    /// body reads with waiting reads, as a plain response's reader does; otherwise it holds the
+    /// drive.
+    fn dropped_mid_response(
+        mode: Mode,
+        gated: bool,
+        point: DropPoint,
+    ) -> (Option<HttpErrorCode>, CloseKind) {
+        run_on_host(move |context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, mode, |_| {});
+                let upload = Arc::new(tokio::sync::Notify::new());
+                let mut response = if gated {
+                    fixture.submit(
+                        post_head(Some(5), false),
+                        GatedUpload::held(&upload, None),
+                        CancellationToken::never(),
+                    )
+                } else {
+                    fixture.submit(
+                        get_head(),
+                        HttpSourceHolder::empty(),
+                        CancellationToken::never(),
+                    )
+                };
+                fixture.origin.send(CHUNKED_HEAD);
+                fixture.next_header(&mut response);
+                fixture.origin.send(&chunk(b"one"));
+                assert_eq!(
+                    body_bytes(&fixture.next_event(&mut response, u32::MAX).unwrap()),
+                    b"one"
+                );
+                if let DropPoint::Pending = point {
+                    assert!(fixture.body(&mut response, u32::MAX).is_pending());
+                }
+                if mode == Mode::PullThrough {
+                    assert_eq!(response.body().holds_the_drive(), !gated);
+                }
+                drop(response);
+                let run = fixture.settle_run().expect("the run closes the connection");
+                (
+                    run.err().map(|error| error.code()),
+                    fixture.state.borrow().close,
+                )
+            })
+        })
+    }
+
+    #[test]
+    fn n8_dropping_the_body_mid_response_closes_the_connection_as_run_does() {
+        for gated in [false, true] {
+            for point in [DropPoint::Pending, DropPoint::Armed] {
+                let run = dropped_mid_response(Mode::Run, gated, point);
+                assert!(run.0.is_some(), "{point:?}: the connection fails");
+                assert_eq!(
+                    dropped_mid_response(Mode::PullThrough, gated, point),
+                    run,
+                    "gated {gated}, {point:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn n8_dropping_the_body_from_an_inline_callback_does_not_poll_the_run() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut a = Fixture::new(context.clone(), Mode::PullThrough, |_| {});
+                let mut b = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut a_response = a.held();
+                let b_response = Rc::new(RefCell::new(Some(b.held())));
+                let dropped = Rc::clone(&b_response);
+                // A callback inside A's drive drops B's held body.
+                *a.origin.on_read_start.borrow_mut() =
+                    Some(Box::new(move || drop(dropped.borrow_mut().take())));
+                a.origin.send(&chunk(b"one"));
+                let b_run = b.run_wake.get();
+                let Poll::Ready(event) = a.body(&mut a_response, u32::MAX) else {
+                    panic!("A's read drives");
+                };
+                assert_eq!(body_bytes(&event.unwrap()), b"one");
+                assert!(
+                    b_response.borrow().is_none(),
+                    "B's body dropped inside A's drive"
+                );
+                assert_eq!(
+                    b.state.borrow().close,
+                    CloseKind::Open,
+                    "B's driver was not polled: its connection is not yet closed"
+                );
+                assert!(b.run_wake.get() > b_run, "B's run is woken instead");
+                let b_closed = b
+                    .settle_run()
+                    .expect("B's run closes its connection on its wake");
+                assert!(b_closed.is_err());
+                assert_eq!(b.state.borrow().close, CloseKind::Reset);
+                a.finish(&mut a_response).unwrap();
+            })
+        });
+    }
+
+    #[test]
+    fn n8_a_body_dropped_while_unwinding_does_not_poll_the_run() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                fixture.origin.send(&chunk(b"one"));
+                assert!(fixture.body(&mut response, u32::MAX).is_ready());
+                let run = fixture.run_wake.get();
+                let unwound = catch_unwind(AssertUnwindSafe(move || {
+                    let _response = response;
+                    panic!("unwinding");
+                }));
+                assert_eq!(
+                    panic_text(unwound.unwrap_err()),
+                    "unwinding",
+                    "the body's drop neither panics again nor aborts"
+                );
+                assert_eq!(
+                    fixture.state.borrow().close,
+                    CloseKind::Open,
+                    "the run was not polled during the unwind"
+                );
+                assert!(fixture.run_wake.get() > run, "the run is woken");
+                let closed = fixture.settle_run().expect("the run closes the connection");
+                assert!(closed.is_err());
+                assert_eq!(fixture.state.borrow().close, CloseKind::Reset);
+            })
+        });
+    }
+
+    /// Records the runtime context each `capacity_released` callback runs under.
+    #[derive(Default)]
+    struct ContextProbe(RefCell<Vec<Option<roxygen_runtime::context::RuntimeContext>>>);
+
+    impl crate::owned::OwnedUpstreamObserver for ContextProbe {
+        fn capacity_released(&self, _stream: StreamId) {
+            self.0
+                .borrow_mut()
+                .push(roxygen_runtime::context::RuntimeContext::current());
+        }
+    }
+
+    #[test]
+    fn n8_inline_drives_run_under_the_holder_s_runtime_context() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let probe = Rc::new(ContextProbe::default());
+                fixture.handle.set_observer(probe.clone()).unwrap();
+                let mut response = fixture.held();
+                fixture
+                    .origin
+                    .send(&[chunk(b"one"), b"0\r\n\r\n".to_vec()].concat());
+                let holder = roxygen_runtime::context::RuntimeContext::new();
+                let read = {
+                    let _entered = holder.enter();
+                    fixture.body(&mut response, u32::MAX)
+                };
+                let Poll::Ready(event) = read else {
+                    panic!("the drive parses the response's end");
+                };
+                assert_eq!(
+                    probe.0.borrow().as_slice(),
+                    [Some(holder)],
+                    "the release in the holder's drive runs under the holder's context"
+                );
+                let mut eom = event.unwrap().eom();
+                while !eom {
+                    eom = fixture.next_event(&mut response, u32::MAX).unwrap().eom();
+                }
+                assert!(fixture.settle_run().is_none());
+                assert!(fixture.handle.close_when_idle().unwrap());
+                fixture
+                    .settle_run()
+                    .expect("the idle connection closes")
+                    .unwrap();
+            })
+        });
+    }
+
+    #[test]
+    fn n8_a_callback_panic_in_an_inline_drive_is_resumed_by_the_run() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                *fixture.origin.on_read_start.borrow_mut() =
+                    Some(Box::new(|| panic!("read start panicked")));
+                fixture.origin.send(&chunk(b"one"));
+                let read = catch_unwind(AssertUnwindSafe(|| fixture.body(&mut response, u32::MAX)));
+                let Ok(Poll::Ready(read)) = read else {
+                    panic!("the holder's read neither panics nor waits");
+                };
+                assert_eq!(
+                    read.err().map(|error| error.code()),
+                    Some(HttpErrorCode::INTERNAL_ERROR),
+                    "the holder reads the connection's error"
+                );
+                let run = catch_unwind(AssertUnwindSafe(|| fixture.settle_run()));
+                assert_eq!(
+                    panic_text(run.expect_err("the run resumes the panic")),
+                    "read start panicked"
+                );
+                assert!(fixture.handle.is_finished());
+                assert_eq!(fixture.state.borrow().close, CloseKind::Reset);
+            })
+        });
+    }
+
+    /// A downstream exchange that forwards one upstream response, a fresh head and then each
+    /// body event, as a proxy's exchange does.
+    struct Forward(Rc<RefCell<Option<Response>>>);
+
+    impl crate::owned::OwnedExchange for Forward {
+        fn request(
+            &mut self,
+            _head: Box<roxygen_core::message::HttpMessage>,
+            _body: roxygen_core::stream_source::HttpStreamSourceOwner,
+            _eom: bool,
+        ) {
+        }
+
+        fn poll_headers(
+            &mut self,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+            let mut upstream = self.0.borrow_mut();
+            let response = upstream.as_mut().expect("the upstream response is live");
+            match response.poll_header(context) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Ready(Ok(_)) => {
+                    let mut message = roxygen_core::message::HttpMessage::new();
+                    message.set_status_code(200).unwrap();
+                    message.set_http_version(1, 1);
+                    Poll::Ready(Ok(HttpHeaderEvent::new(message, false).unwrap()))
+                }
+            }
+        }
+
+        fn poll_body(
+            &mut self,
+            context: &mut Context<'_>,
+            maximum: u32,
+        ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+            let mut upstream = self.0.borrow_mut();
+            upstream
+                .as_mut()
+                .expect("the upstream response is live")
+                .poll_body(context, maximum)
+        }
+
+        fn cancel(&mut self, _error: &HttpError, _peer_reset: bool) {
+            let upstream = self.0.borrow_mut().take();
+            drop(upstream);
+        }
+
+        fn response_complete(&mut self) {}
+
+        fn complete(self) {}
+    }
+
+    struct ForwardApp(Rc<RefCell<Option<Response>>>);
+
+    impl crate::owned::OwnedApplication for ForwardApp {
+        type Exchange = Forward;
+
+        fn new_exchange(
+            &self,
+            _stream: StreamId,
+            _ingress: roxygen_core::ingress_completion::IngressCompletion,
+        ) -> Forward {
+            Forward(Rc::clone(&self.0))
+        }
+    }
+
+    /// The downstream wire, the downstream run's and the upstream run's error codes, and the
+    /// upstream's close kind, when a callback the upstream runs while it parses a chunk
+    /// cancels the downstream connection that forwards the response.
+    fn downstream_cancel_outcome(
+        mode: Mode,
+    ) -> (
+        Vec<u8>,
+        Option<HttpErrorCode>,
+        Option<HttpErrorCode>,
+        CloseKind,
+    ) {
+        run_on_host(move |context| {
+            Box::pin(async move {
+                let mut upstream = Fixture::new(context.clone(), mode, |_| {});
+                let response = upstream.submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                let slot = Rc::new(RefCell::new(Some(response)));
+                let (down_transport, down_state) = ScriptedTransport::new([ReadAction::Data(
+                    b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec(),
+                )]);
+                let options = OwnedH1Options {
+                    context,
+                    transport: down_transport,
+                    io: UniplexConfig {
+                        drain_request_body_on_drop: true,
+                        ..upstream_config()
+                    },
+                    http1: Http1DriverConfig::default(),
+                };
+                let (session, down_handle) =
+                    crate::owned_h1::OwnedH1Session::new(ForwardApp(Rc::clone(&slot)), options)
+                        .unwrap();
+                let mut downstream: Pin<Box<dyn Future<Output = RunResult>>> =
+                    Box::pin(session.run());
+                let down_wake = Arc::new(Count::default());
+                let down_waker = Waker::from(Arc::clone(&down_wake));
+                let mut down_seen = usize::MAX;
+                let mut down_done = None;
+                let mut up_done = None;
+                // Polls each run that was woken since its last poll, until neither was.
+                let mut pump = |upstream: &mut Fixture,
+                                down_done: &mut Option<RunResult>,
+                                up_done: &mut Option<RunResult>| {
+                    for _ in 0..100 {
+                        let mut polled = false;
+                        if up_done.is_none() && upstream.run_woken() {
+                            polled = true;
+                            *up_done = upstream.settle_run();
+                        }
+                        if down_done.is_none() && down_wake.get() != down_seen {
+                            polled = true;
+                            down_seen = down_wake.get();
+                            if let Poll::Ready(result) = downstream
+                                .as_mut()
+                                .poll(&mut Context::from_waker(&down_waker))
+                            {
+                                *down_done = Some(result);
+                            }
+                        }
+                        if !polled {
+                            return;
+                        }
+                    }
+                    panic!("the runs kept waking each other");
+                };
+                upstream.origin.send(CHUNKED_HEAD);
+                pump(&mut upstream, &mut down_done, &mut up_done);
+                upstream.origin.send(&chunk(b"zero"));
+                pump(&mut upstream, &mut down_done, &mut up_done);
+                assert!(
+                    down_state
+                        .borrow()
+                        .writes
+                        .concat()
+                        .windows(4)
+                        .any(|window| window == b"zero"),
+                    "the first chunk is forwarded"
+                );
+                let handle = down_handle.clone();
+                *upstream.origin.on_read_start.borrow_mut() =
+                    Some(Box::new(move || handle.cancel()));
+                upstream.origin.send(&chunk(b"one"));
+                pump(&mut upstream, &mut down_done, &mut up_done);
+                let down = down_done.expect("the downstream run ends");
+                let up = up_done.expect("the upstream run ends");
+                let wire = down_state.borrow().writes.concat();
+                (
+                    wire,
+                    down.err().map(|error| error.code()),
+                    up.err().map(|error| error.code()),
+                    upstream.state.borrow().close,
+                )
+            })
+        })
+    }
+
+    #[test]
+    fn n8_a_downstream_cancel_from_an_inline_callback_serializes_nothing_more() {
+        let run = downstream_cancel_outcome(Mode::Run);
+        let pull_through = downstream_cancel_outcome(Mode::PullThrough);
+        assert!(
+            !run.0.windows(3).any(|window| window == b"one"),
+            "under run, the cancelled downstream forwards nothing after the cancel"
+        );
+        assert_eq!(
+            pull_through, run,
+            "the event taken in the drive is dropped unserialized: the wire and both outcomes \
+             are run's"
+        );
+    }
+}

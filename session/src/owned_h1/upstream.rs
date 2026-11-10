@@ -37,9 +37,26 @@
 //! `UniplexSession`'s client. Each turn reads before it commits a queued request, so a peer EOF
 //! already readable, or a failed read, closes admission first; a request that admission refuses
 //! reports `OwnedRequestProgressExt::request_unprocessed` (`DIV-035`).
+//!
+//! Pull-through exchanges (`DIV-047`, experimental): under
+//! [`OwnedH1UpstreamSession::run_pull_through`], the body of a
+//! [`OwnedH1UpstreamReservation::submit_pull_through`] exchange holds the driver's drive from its
+//! first read after the request is written until the response is fully produced or its source
+//! completes, and polls the driver inline from its reads; the run's future does not poll it
+//! meanwhile. A body polls the driver only when the wake record of the driver's task waker shows
+//! that one of the driver's wake sources fired since its last poll. So every input of the driver
+//! must wake that task waker (through a `Signal` or `task.wake()`, which set the record), be
+//! covered by a term of the body's check (a pending budget yield), or reach the run's future,
+//! which takes the drive back (the held request's cancellation token, worker cancellation): an
+//! input that does none of these is lost while a body holds the drive. Timers added to this
+//! driver must wake its task waker, and must take a held drive back before pull-through accepts
+//! them. Taking the drive back (hand-back and revocation) touches only `Shared`'s drive state,
+//! the task waker and wakers, never the driver, so it is safe from a callback inside an inline
+//! drive.
 
 use std::cell::OnceCell;
 use std::cell::RefCell;
+use std::rc::Weak;
 
 use roxygen_core::body_event_queue::HttpBodySource;
 use roxygen_core::body_event_queue::HttpBodyTransfer;
@@ -50,7 +67,9 @@ use roxygen_core::headers::HttpHeaderCode;
 use roxygen_core::http::HttpMethod;
 use roxygen_core::ingress_completion::IngressCompletion;
 use roxygen_core::source_holder::HttpSourceHolder;
+use roxygen_core::stream_source::HttpResponseReader;
 use roxygen_core::stream_source::HttpResponseSource;
+use roxygen_core::stream_source::HttpResponseSourceOwner;
 use roxygen_core::stream_source::HttpStreamSourceOwner;
 use roxygen_runtime::cancellation::CancellationToken;
 use roxygen_runtime::cancellation::CancellationWakeRegistration;
@@ -80,9 +99,97 @@ struct Shared {
     closed: RefCell<Option<HttpError>>,
     observer: RefCell<Option<Rc<dyn OwnedUpstreamObserver>>>,
     queued: RefCell<Option<Submission>>,
+    /// Who polls the driver of a session run with `run_pull_through` (`DIV-047`).
+    drive: Drive,
+}
+
+/// Who polls a pull-through connection's driver (`DIV-047`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DriveState {
+    /// The run future, on each of its polls.
+    #[default]
+    Idle,
+    /// Only the body of this exchange, from inside its reads.
+    Held(StreamId),
+    /// The run future: a cancel input or a connection failure took the drive from this
+    /// exchange's body.
+    Revoked(StreamId),
+}
+
+/// A pull-through connection's drive state. It lives in `Shared`, so hand-back and revocation
+/// reach it without borrowing the driver (`DIV-047`).
+#[derive(Default)]
+struct Drive {
+    state: Cell<DriveState>,
+    /// The run future's last waker.
+    run_waker: RefCell<Option<Waker>>,
+    /// The holder's last waker.
+    holder_waker: RefCell<Option<Waker>>,
+    /// Set while a holder's read polls the driver.
+    driving: Cell<bool>,
+    /// The pull-through exchange whose request bytes are all written.
+    written: Cell<Option<StreamId>>,
+    /// A budget yield was pending when the holder's last drive returned.
+    yield_pending: Cell<bool>,
+    /// The held exchange's cancellation token, when it can be cancelled, registered with the
+    /// run future's waker: a cancel from any thread wakes the run future, which revokes.
+    token: RefCell<Option<CancellationWakeRegistration>>,
 }
 
 impl Shared {
+    /// Re-registers the driver's task waker to the run future's waker, which it returns.
+    fn register_run_waker(&self) -> Option<Waker> {
+        let waker = self.drive.run_waker.borrow().clone();
+        if let Some(waker) = &waker {
+            self.wake.task.register(waker);
+        }
+        waker
+    }
+
+    /// Returns `stream`'s held or revoked drive to the run, before the wake that announces it:
+    /// the driver's task waker is the run future's again. Borrows no driver (`DIV-047`).
+    /// Returns whether the drive changed hands.
+    fn hand_back(&self, stream: StreamId) -> bool {
+        let (DriveState::Held(held) | DriveState::Revoked(held)) = self.drive.state.get() else {
+            return false;
+        };
+        if held != stream {
+            return false;
+        }
+        self.drive.state.set(DriveState::Idle);
+        self.register_run_waker();
+        drop(self.drive.token.take());
+        true
+    }
+
+    /// Takes a held drive, `stream`'s or any, back to the run future, which applies what
+    /// revoked it: every cancel input and connection failure revokes. Borrows no driver, so it
+    /// is safe from a callback inside an inline drive, whose holder it does not wake: that
+    /// read continues after its drive (`DIV-047`).
+    fn revoke(&self, stream: Option<StreamId>) {
+        let DriveState::Held(held) = self.drive.state.get() else {
+            return;
+        };
+        if stream.is_some_and(|stream| stream != held) {
+            return;
+        }
+        self.drive.state.set(DriveState::Revoked(held));
+        let run = self.register_run_waker();
+        self.wake.task.note_wake();
+        drop(self.drive.token.take());
+        let holder = if self.drive.driving.get() {
+            None
+        } else {
+            self.drive.holder_waker.borrow().clone()
+        };
+        if let Some(run) = run {
+            run.wake();
+        }
+        if let Some(holder) = holder {
+            holder.wake();
+        }
+    }
+
     /// The connection is cancelled, by its handle or its worker.
     #[inline]
     fn cancelled(&self) -> bool {
@@ -241,6 +348,7 @@ impl OwnedH1UpstreamHandle {
     pub fn cancel(&self) {
         self.0.cancel.set(true);
         self.0.idle.set(false);
+        self.0.revoke(None);
         self.0.wake.wake_by_ref();
     }
 
@@ -301,6 +409,28 @@ impl OwnedH1UpstreamReservation {
         OwnedH1ExclusiveSubmission(self.submit(headers, source, cancellation))
     }
 
+    /// Roxygen-only (`DIV-047`): submits a request whose response body may drive this
+    /// connection from inside its reads, with `submit_exclusive`'s commitment semantics. Its
+    /// connection must run with [`OwnedH1UpstreamSession::run_pull_through`]: under `run`, the
+    /// driver refuses it at commit with `INVALID_STATE_TRANSITION`, before any byte is written,
+    /// and the refusal does not report `request_unprocessed`. A `cancellation` token that can be
+    /// cancelled is honored while the body holds the drive: its cancel wakes the run's future,
+    /// which takes the drive back and applies it. The request refuses `observe_response`.
+    pub fn submit_pull_through(
+        self,
+        headers: HttpHeaderEvent,
+        source: impl Into<HttpBodySource>,
+        cancellation: CancellationToken,
+    ) -> OwnedH1PullThroughSubmission {
+        OwnedH1PullThroughSubmission(self.submit_impl(
+            headers,
+            source,
+            cancellation,
+            ResponseWait::Commitment,
+            true,
+        ))
+    }
+
     /// Submits a request and waits for its first published response head, preserving the
     /// fresh response read capability, as
     /// `OwnedH2UpstreamReservation::submit_with_response_interest`. Codec commitment alone does
@@ -328,6 +458,7 @@ impl OwnedH1UpstreamReservation {
             source,
             cancellation,
             ResponseWait::FirstHead(producer_completion),
+            false,
         ))
     }
 
@@ -339,7 +470,13 @@ impl OwnedH1UpstreamReservation {
         source: impl Into<HttpBodySource>,
         cancellation: CancellationToken,
     ) -> OwnedH1UpstreamSubmission {
-        self.submit_impl(headers, source, cancellation, ResponseWait::Commitment)
+        self.submit_impl(
+            headers,
+            source,
+            cancellation,
+            ResponseWait::Commitment,
+            false,
+        )
     }
 
     fn submit_impl(
@@ -348,6 +485,7 @@ impl OwnedH1UpstreamReservation {
         source: impl Into<HttpBodySource>,
         cancellation: CancellationToken,
         wait: ResponseWait,
+        pull_through: bool,
     ) -> OwnedH1UpstreamSubmission {
         let (response_interest, producer) = match wait {
             ResponseWait::Commitment => (false, None),
@@ -375,6 +513,8 @@ impl OwnedH1UpstreamReservation {
             waiter: RefCell::new(None),
             unprocessed: Cell::new(false),
             sequence: Cell::new(None),
+            link: Cell::new(None),
+            pull_through,
         });
         let cancellation_wake = status.cancellation.can_be_cancelled().then(|| {
             let mut registration = status.cancellation.wake_registration();
@@ -568,11 +708,20 @@ impl OwnedH1UpstreamRequest {
     }
 
     /// Attaches one response observer, or immediately delivers an already-published result.
-    /// Callbacks run outside request-state borrows. Repeated attachment is rejected.
+    /// Callbacks run outside request-state borrows. Repeated attachment is rejected, and so is
+    /// observation of a pull-through exchange (`DIV-047`).
     pub fn observe_response(
         &self,
         observer: Box<dyn OwnedResponseObserver>,
     ) -> Result<(), HttpError> {
+        // A pull-through exchange's deadline would be processed only on its body's reads
+        // (`DIV-047`).
+        if self.0.pull_through {
+            return Err(failure(
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"response observation is refused on a pull-through exchange",
+            ));
+        }
         if self.0.response_observation_attached.get() {
             return Err(failure(
                 HttpErrorCode::INVALID_STATE_TRANSITION,
@@ -633,6 +782,335 @@ impl OwnedRequestProgressExt for OwnedH1UpstreamRequest {
     }
 }
 
+/// A pull-through submission (`DIV-047`): an acknowledgment of the driver's request commitment,
+/// as [`OwnedH1ExclusiveSubmission`] for an ordinary submission. Dropping it before it resolves
+/// cancels the request as dropping that submission does.
+pub struct OwnedH1PullThroughSubmission(OwnedH1UpstreamSubmission);
+
+impl OwnedH1PullThroughSubmission {
+    /// Retains the first explicit cause through the ordinary submission owner.
+    pub fn cancel(&self, error: HttpError) {
+        self.0.cancel(error);
+    }
+}
+
+impl Future for OwnedH1PullThroughSubmission {
+    type Output = Result<OwnedH1PullThroughResponse, HttpError>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.poll_response(context).map(|result| {
+            result.map(|response| {
+                let status = Rc::clone(&response.control.0);
+                let link = status
+                    .link
+                    .take()
+                    .expect("a committed pull-through exchange is linked");
+                OwnedH1PullThroughResponse {
+                    stream: response.stream,
+                    body: OwnedH1PullThroughBody::new(
+                        response.stream,
+                        response.source,
+                        link,
+                        status,
+                    ),
+                    control: response.control,
+                }
+            })
+        })
+    }
+}
+
+impl OwnedRequestProgressExt for OwnedH1PullThroughSubmission {
+    fn request_unprocessed(&self) -> bool {
+        self.0.request_unprocessed()
+    }
+
+    fn sequence_number(&self) -> Option<u64> {
+        self.0.sequence_number()
+    }
+}
+
+/// A pull-through exchange's response (`DIV-047`): its body and the request's capacity
+/// observation.
+pub struct OwnedH1PullThroughResponse {
+    pub stream: StreamId,
+    pub body: OwnedH1PullThroughBody,
+    pub control: OwnedH1UpstreamRequest,
+}
+
+/// What a pull-through exchange's body reads through: its connection's run and its response
+/// source's signals (`DIV-047`).
+struct PullThroughLink {
+    run: Rc<PullThrough>,
+    signals: Rc<IngressSignals>,
+}
+
+/// A pull-through exchange's response source's link to its connection's drive (`DIV-047`).
+pub(super) struct DriveLink(Weak<Shared>);
+
+impl DriveLink {
+    /// Returns `stream`'s drive to the run as its source completes.
+    pub(super) fn hand_back(&self, stream: StreamId) {
+        if let Some(shared) = self.0.upgrade() {
+            shared.hand_back(stream);
+        }
+    }
+}
+
+/// The waiting read a pull-through body's reader has armed or pending.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WaitingRead {
+    Header,
+    Body(u32),
+}
+
+/// A pull-through exchange's response body (`DIV-047`): it owns the response's exclusive reader
+/// and its source owner, declared and retired in that order.
+///
+/// Once the request's bytes are written, the first read of a live exchange whose response is
+/// still being produced takes the connection's drive, retiring any pending or armed read, unless
+/// it is nested in a callback of the run's future's poll or the connection or the request is
+/// already cancelled, where it waits as below. While it holds the drive, each read polls the
+/// driver, with its waker, if one of the driver's wake sources fired since the driver's last
+/// poll, a budget yield is pending or the waker changed, then takes the ready event without
+/// waiting; a read that finds none leaves its waker with the driver. The drive returns to the
+/// run's future when the response is fully produced or the source completes, and a cancel input
+/// or a connection failure revokes it. Before the drive is taken, after it returns and after a
+/// revocation, reads take a ready event or wait for one with a suspend-free read (`DIV-045`). No
+/// read returns `HttpBodyEvent::suspend`.
+pub struct OwnedH1PullThroughBody {
+    reader: HttpResponseReader,
+    owner: HttpResponseSourceOwner,
+    run: Rc<PullThrough>,
+    signals: Rc<IngressSignals>,
+    status: Rc<RequestStatus>,
+    stream: StreamId,
+    /// The waker of the holder's last drive.
+    holder: Option<Waker>,
+    waiting: Option<WaitingRead>,
+}
+
+impl OwnedH1PullThroughBody {
+    fn new(
+        stream: StreamId,
+        source: HttpResponseSource,
+        link: PullThroughLink,
+        status: Rc<RequestStatus>,
+    ) -> Self {
+        let (owner, mut reader) = source.split();
+        reader.set_suspend_free(true);
+        Self {
+            reader,
+            owner,
+            run: link.run,
+            signals: link.signals,
+            status,
+            stream,
+            holder: None,
+            waiting: None,
+        }
+    }
+
+    /// Reads the next response head, 1xx heads included, as the response's reader does.
+    pub fn poll_header(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        if self.holds() || self.acquire() {
+            self.drive_if_woken(context);
+            if let Some(result) = self.reader.try_read_header(&self.owner) {
+                return Poll::Ready(result);
+            }
+            if self.holds() {
+                return Poll::Pending;
+            }
+        }
+        self.wait_header(context)
+    }
+
+    /// Reads the next body event, of at most `maximum` body bytes. It never returns
+    /// `HttpBodyEvent::suspend`.
+    #[inline]
+    pub fn poll_body(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        if self.holds() || self.acquire() {
+            self.drive_if_woken(context);
+            if let Some(result) = self.reader.try_read_body(&self.owner, maximum) {
+                return Poll::Ready(result);
+            }
+            // While the body holds the drive, its waker is the driver's (I4).
+            if self.holds() {
+                return Poll::Pending;
+            }
+        }
+        self.wait_body(context, maximum)
+    }
+
+    /// Stops the response: the reader's read retires before the source is cleared with `error`,
+    /// as the reader and owner of a plain exclusive response are retired, then the drive
+    /// returns to the run, if the source's completion did not already return it.
+    pub fn stop(&mut self, error: Option<HttpErrorCode>) {
+        self.reader.retire_active_read();
+        self.waiting = None;
+        self.owner.clear(error);
+        let shared = &self.run.shared;
+        if shared.hand_back(self.stream) {
+            shared.wake.wake_by_ref();
+        }
+    }
+
+    /// Whether this body holds its connection's drive.
+    #[cfg(test)]
+    pub(crate) fn holds_the_drive(&self) -> bool {
+        self.holds()
+    }
+
+    #[inline]
+    fn holds(&self) -> bool {
+        self.run.shared.drive.state.get() == DriveState::Held(self.stream)
+    }
+
+    /// Takes the drive once this exchange is live, its request written, its response still
+    /// being produced (so the release that returns the drive has not run) and its source
+    /// incomplete: the reader's pending or armed read retires, and the next drive is
+    /// unconditional. A read nested in a callback of the run future's poll does not take it:
+    /// it could not drive, and the driver's wakes would reach only the run future. Nor does a
+    /// read after a connection cancel or a request's error: that cancel's revocation found the
+    /// drive idle, so the run future must apply it.
+    fn acquire(&mut self) -> bool {
+        let drive = &self.run.shared.drive;
+        if drive.state.get() != DriveState::Idle
+            || !self.status.live.get()
+            || drive.written.get() != Some(self.stream)
+            || self.signals.source_complete.get()
+            || self
+                .status
+                .ingress
+                .borrow()
+                .as_ref()
+                .is_none_or(|ingress| ingress.snapshot().is_some())
+            || self.run.driver.try_borrow().is_err()
+            || self.run.shared.cancelled()
+            || self.status.error.get().is_some()
+        {
+            return false;
+        }
+        // A cancellable token is registered with the run future's waker before it is checked,
+        // so a cancel from another thread is not missed.
+        let cancellation = &self.status.cancellation;
+        let token = cancellation.can_be_cancelled().then(|| {
+            let mut registration = cancellation.wake_registration();
+            if let Some(run) = drive.run_waker.borrow().as_ref() {
+                registration.update_waker(run);
+            }
+            registration
+        });
+        if cancellation.is_cancellation_requested() {
+            return false;
+        }
+        self.reader.retire_active_read();
+        self.waiting = None;
+        drop(drive.token.replace(token));
+        drive.state.set(DriveState::Held(self.stream));
+        self.holder = None;
+        true
+    }
+
+    /// Polls the driver if one of its wake sources fired since its last poll, a budget yield
+    /// is pending, or the holder's waker changed.
+    #[inline]
+    fn drive_if_woken(&mut self, context: &mut Context<'_>) {
+        if !self.run.task.woken()
+            && !self.run.shared.drive.yield_pending.get()
+            && self
+                .holder
+                .as_ref()
+                .is_some_and(|holder| holder.will_wake(context.waker()))
+        {
+            return;
+        }
+        if !self
+            .holder
+            .as_ref()
+            .is_some_and(|holder| holder.will_wake(context.waker()))
+        {
+            self.holder = Some(context.waker().clone());
+            let previous = self
+                .run
+                .shared
+                .drive
+                .holder_waker
+                .replace(Some(context.waker().clone()));
+            drop(previous);
+        }
+        self.run.drive(context);
+    }
+
+    /// Whether the reader holds the waiting read `read`; another armed or pending read retires.
+    fn holds_waiting(&mut self, read: WaitingRead) -> bool {
+        if !self.reader.is_active() {
+            return false;
+        }
+        if self.waiting == Some(read) {
+            return true;
+        }
+        self.reader.retire_active_read();
+        false
+    }
+
+    /// Reads without the drive: a ready event first, else a suspend-free waiting read
+    /// (`DIV-045`) that the producer wakes.
+    fn wait_header(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        if !self.holds_waiting(WaitingRead::Header) {
+            if let Some(result) = self.reader.try_read_header(&self.owner) {
+                return Poll::Ready(result);
+            }
+            if let Err(error) = self.reader.arm_header(&self.owner) {
+                return Poll::Ready(Err(error));
+            }
+            self.waiting = Some(WaitingRead::Header);
+        }
+        let poll = self.reader.poll_header(context);
+        if !self.reader.is_active() {
+            self.waiting = None;
+        }
+        poll
+    }
+
+    fn wait_body(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        if !self.holds_waiting(WaitingRead::Body(maximum)) {
+            if let Some(result) = self.reader.try_read_body(&self.owner, maximum) {
+                return Poll::Ready(result);
+            }
+            if let Err(error) = self.reader.arm_body(&self.owner, maximum) {
+                return Poll::Ready(Err(error));
+            }
+            self.waiting = Some(WaitingRead::Body(maximum));
+        }
+        let poll = self.reader.poll_body(context);
+        if !self.reader.is_active() {
+            self.waiting = None;
+        }
+        poll
+    }
+}
+
+impl Drop for OwnedH1PullThroughBody {
+    fn drop(&mut self) {
+        self.stop(None);
+    }
+}
+
 struct RequestStatus {
     shared: Rc<Shared>,
     stream: Cell<Option<StreamId>>,
@@ -657,6 +1135,10 @@ struct RequestStatus {
     unprocessed: Cell<bool>,
     /// The connection's earlier commits, fixed at commit or at that refusal (`DIV-035`).
     sequence: Cell<Option<u64>>,
+    /// A committed pull-through exchange's link, until its submission resolves (`DIV-047`).
+    link: Cell<Option<PullThroughLink>>,
+    /// Submitted with `submit_pull_through` (`DIV-047`).
+    pull_through: bool,
 }
 
 impl RequestStatus {
@@ -681,6 +1163,9 @@ impl RequestStatus {
 
     fn cancel(&self, error: HttpError) {
         drop(self.error.set(error));
+        if let Some(stream) = self.stream.get() {
+            self.shared.revoke(Some(stream));
+        }
         self.shared.wake.wake_by_ref();
     }
 
@@ -1112,6 +1597,15 @@ fn request_length_mismatch() -> HttpError {
 
 #[cold]
 #[inline(never)]
+fn pull_through_requires_its_run() -> HttpError {
+    failure(
+        HttpErrorCode::INVALID_STATE_TRANSITION,
+        b"owned H1 pull-through submission requires a session run with run_pull_through",
+    )
+}
+
+#[cold]
+#[inline(never)]
 fn resume_cancelled() -> HttpError {
     failure(
         HttpErrorCode::CORO_CANCELLED,
@@ -1132,6 +1626,170 @@ impl OwnedH1UpstreamSession {
     pub fn run(self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
         UpstreamRun(Some(self.0))
     }
+
+    /// Roxygen-only (`DIV-047`): [`Self::run`] for a connection whose
+    /// [`OwnedH1UpstreamReservation::submit_pull_through`] exchanges may hold its drive. It is
+    /// rooted as `run` is, and is `run` while no pull-through exchange holds the drive; plain
+    /// submissions behave as under `run`. While a body holds the drive, this future does not
+    /// poll the driver; a cancel input, a connection failure or this future's drop takes the
+    /// drive back, after which it polls the driver at once. A run that completes, or a callback
+    /// panic the driver retains, inside a body's read is left to this future, which marks the
+    /// run finished, drops the driver and returns the result or resumes the panic.
+    ///
+    /// Worker cancellation is not one of the driver's wake sources, as under `run`. Its root
+    /// must therefore poll this future at worker quiescence, and poll or drop it at worker
+    /// cancellation, as `RunScope` does: a held drive is otherwise taken back only at the
+    /// body's next read.
+    pub fn run_pull_through(self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
+        let mut driver = self.0;
+        let shared = Rc::clone(&driver.shared);
+        let task = Arc::clone(&driver.task);
+        PullThroughRun(Rc::new_cyclic(|run| {
+            driver.pull_through = Weak::clone(run);
+            PullThrough {
+                shared,
+                task,
+                driver: RefCell::new(Some(driver)),
+                outcome: RefCell::new(None),
+            }
+        }))
+    }
+}
+
+/// A pull-through connection's driver, and the outcome an inline poll reached, which only the
+/// run future takes (`DIV-047`).
+struct PullThrough {
+    shared: Rc<Shared>,
+    task: Arc<TaskWaker>,
+    driver: RefCell<Option<UpstreamDriver>>,
+    outcome: RefCell<Option<RunOutcome>>,
+}
+
+/// A run's result and its retained callback panic.
+struct RunOutcome {
+    result: Result<UniplexRunSummary, HttpError>,
+    panic: Option<PanicPayload>,
+}
+
+impl PullThrough {
+    /// Polls the driver from the holder's read, with its context; a read nested in a callback
+    /// of that poll skips. A completion is stashed for the run future, which it wakes: only the
+    /// run future marks the run finished and drops the driver.
+    fn drive(&self, context: &mut Context<'_>) {
+        let Ok(mut cell) = self.driver.try_borrow_mut() else {
+            return;
+        };
+        let Some(driver) = cell.as_mut() else {
+            return;
+        };
+        let drive = &self.shared.drive;
+        drive.driving.set(true);
+        let poll = driver.poll_isolated(context);
+        drive.driving.set(false);
+        drive.yield_pending.set(driver.budget_yield.is_some());
+        let Poll::Ready(result) = poll else {
+            return;
+        };
+        let panic = driver.panic.take();
+        drop(cell);
+        *self.outcome.borrow_mut() = Some(RunOutcome { result, panic });
+        let run = drive.run_waker.borrow().clone();
+        if let Some(run) = run {
+            run.wake();
+        }
+    }
+}
+
+/// The future `run_pull_through` returns: it polls the driver unless a body holds the drive,
+/// and joins and drops it.
+struct PullThroughRun(Rc<PullThrough>);
+
+impl Future for PullThroughRun {
+    type Output = Result<UniplexRunSummary, HttpError>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let run = &self.0;
+        let drive = &run.shared.drive;
+        let previous = {
+            let mut waker = drive.run_waker.borrow_mut();
+            if waker
+                .as_ref()
+                .is_some_and(|waker| waker.will_wake(context.waker()))
+            {
+                None
+            } else {
+                waker.replace(context.waker().clone())
+            }
+        };
+        drop(previous);
+        let outcome = run.outcome.borrow_mut().take();
+        if let Some(RunOutcome { result, panic }) = outcome {
+            let mut driver = run
+                .driver
+                .borrow_mut()
+                .take()
+                .expect("a stashed completion leaves its driver to the run");
+            driver.panic = panic;
+            return finish_run(driver, result);
+        }
+        // While a body holds the drive, the run future revokes for the inputs that reach it
+        // instead of the holder: the held exchange's token and worker cancellation.
+        if let DriveState::Held(_) = drive.state.get() {
+            let token_cancelled = drive
+                .token
+                .borrow_mut()
+                .as_mut()
+                .is_some_and(|token| token.update_waker(context.waker()));
+            if !token_cancelled && !run.shared.context.is_cancelled() {
+                return Poll::Pending;
+            }
+            run.shared.revoke(None);
+        }
+        let mut cell = run.driver.borrow_mut();
+        let driver = cell
+            .as_mut()
+            .expect("owned H1 upstream runner polled after completion");
+        let Poll::Ready(result) = driver.poll_isolated(context) else {
+            return Poll::Pending;
+        };
+        let driver = cell
+            .take()
+            .expect("owned H1 upstream runner completes once");
+        drop(cell);
+        finish_run(driver, result)
+    }
+}
+
+impl Drop for PullThroughRun {
+    fn drop(&mut self) {
+        let run = &self.0;
+        run.shared.revoke(None);
+        let outcome = run.outcome.borrow_mut().take();
+        let driver = run.driver.borrow_mut().take();
+        let Some(outcome) = outcome else {
+            // As `run`'s future drops its driver: an unfinished one aborts.
+            drop(driver);
+            return;
+        };
+        // A stashed completion proves the cleanup joined: the driver drops as a finished
+        // run's does, and its panic resumes unless this drop is already unwinding.
+        run.shared.complete.set(true);
+        drop(driver);
+        finish_panic(outcome.panic);
+    }
+}
+
+/// Marks a run whose driver completed finished, then resumes a retained panic or returns its
+/// result; the driver drops after that.
+fn finish_run(
+    mut driver: UpstreamDriver,
+    result: Result<UniplexRunSummary, HttpError>,
+) -> Poll<Result<UniplexRunSummary, HttpError>> {
+    driver.shared.complete.set(true);
+    if let Some(panic) = driver.panic.take() {
+        resume_unwind(panic);
+    }
+    Poll::Ready(result)
 }
 
 /// Drives an [`UpstreamDriver`] to completion, isolating callback panics in every poll.
@@ -1146,30 +1804,14 @@ impl Future for UpstreamRun {
             .0
             .as_mut()
             .expect("owned H1 upstream runner polled after completion");
-        driver.started = true;
-        match catch_unwind(AssertUnwindSafe(|| driver.poll(context))) {
-            Ok(Poll::Pending) => Poll::Pending,
-            Ok(Poll::Ready(result)) => {
-                let mut driver = this
-                    .0
-                    .take()
-                    .expect("owned H1 upstream runner completes once");
-                driver.shared.complete.set(true);
-                if let Some(panic) = driver.panic.take() {
-                    resume_unwind(panic);
-                }
-                Poll::Ready(result)
-            }
-            Err(panic) => {
-                driver.retain_panic(panic);
-                driver.abort(failure(
-                    HttpErrorCode::INTERNAL_ERROR,
-                    b"owned H1 upstream callback panicked",
-                ));
-                context.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
+        let Poll::Ready(result) = driver.poll_isolated(context) else {
+            return Poll::Pending;
+        };
+        let driver = this
+            .0
+            .take()
+            .expect("owned H1 upstream runner completes once");
+        finish_run(driver, result)
     }
 }
 
@@ -1217,6 +1859,8 @@ struct UpstreamDriver {
     /// `Http1UpgradePolicy::AsOrdinaryRequest`: CONNECT and `Upgrade` requests are sent as
     /// ordinary requests (`DIV-031`).
     ordinary_upgrades: bool,
+    /// The run of a session run with `run_pull_through` (`DIV-047`).
+    pull_through: Weak<PullThrough>,
 }
 
 /// The codec callback: borrows what one response `on_ingress_with_callback` call may change.
@@ -1411,6 +2055,7 @@ impl UpstreamDriver {
             closed: RefCell::new(None),
             observer: RefCell::new(None),
             queued: RefCell::new(None),
+            drive: Drive::default(),
         });
         let cancellation = CancellationSource::new();
         let write_cancellation = CancellationSource::new();
@@ -1468,6 +2113,7 @@ impl UpstreamDriver {
                 budget_yield: None,
                 started: false,
                 ordinary_upgrades,
+                pull_through: Weak::new(),
             },
             OwnedH1UpstreamHandle(shared),
         ))
@@ -1481,8 +2127,31 @@ impl UpstreamDriver {
         }
     }
 
+    /// Polls the driver, isolating a callback panic: the panic is retained, the connection
+    /// aborts, and the driver is woken to finish its cleanup.
+    fn poll_isolated(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<UniplexRunSummary, HttpError>> {
+        self.started = true;
+        match catch_unwind(AssertUnwindSafe(|| self.poll(context))) {
+            Ok(poll) => poll,
+            Err(panic) => {
+                self.retain_panic(panic);
+                self.abort(failure(
+                    HttpErrorCode::INTERNAL_ERROR,
+                    b"owned H1 upstream callback panicked",
+                ));
+                // Through the task waker, as every wake of the driver goes (`DIV-047`).
+                self.task.wake();
+                Poll::Pending
+            }
+        }
+    }
+
     fn poll(&mut self, context: &mut Context<'_>) -> Poll<Result<UniplexRunSummary, HttpError>> {
         self.task.register(context.waker());
+        self.task.clear_wake_record();
         if self.budget_yield.is_some() && self.poll_budget_yield(context).is_pending() {
             return Poll::Pending;
         }
@@ -1615,9 +2284,10 @@ impl UpstreamDriver {
             }
         }
         self.budget_yield = Some(self.context.host().yield_to_io());
-        // A yield that completes on its first poll arranged no wake.
+        // A yield that completes on its first poll arranged no wake. The driver wakes itself
+        // through its task waker, which records the wake (`DIV-047`).
         if self.poll_budget_yield(context).is_ready() {
-            context.waker().wake_by_ref();
+            self.task.wake();
         }
         Poll::Pending
     }
@@ -1778,6 +2448,24 @@ impl UpstreamDriver {
         if let Some(error) = submission.status.selected_error() {
             return Err(error);
         }
+        // A pull-through exchange's body may hold the drive only of a session run with
+        // `run_pull_through` (`DIV-047`); under `run` it is refused before any byte is written.
+        let pull_through = if submission.status.pull_through {
+            // Defensive: with capacity one, no exchange holds the drive at a commit.
+            if self.shared.drive.state.get() != DriveState::Idle {
+                return Err(failure(
+                    HttpErrorCode::INVALID_STATE_TRANSITION,
+                    b"owned H1 pull-through submission while another holds the drive",
+                ));
+            }
+            Some(
+                self.pull_through
+                    .upgrade()
+                    .ok_or_else(pull_through_requires_its_run)?,
+            )
+        } else {
+            None
+        };
         let headers = submission
             .headers
             .as_mut()
@@ -1829,6 +2517,9 @@ impl UpstreamDriver {
             source_complete: Cell::new(false),
             completed: Cell::new(None),
             stream: Arc::clone(&self.stream_wake),
+            drive: pull_through
+                .is_some()
+                .then(|| DriveLink(Rc::downgrade(&self.shared))),
         });
         let source = HttpResponseSource::new_shared(
             id,
@@ -1849,6 +2540,12 @@ impl UpstreamDriver {
             source.deliver_ingress_before_abort();
         }
         let producer = source.producer();
+        if pull_through.is_some() && !producer.enable_inline_reads() {
+            return Err(failure(
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"owned H1 pull-through response source refused inline reads",
+            ));
+        }
         let eom = headers.eom();
         let generated = self.codec.get_mut().generate(
             &mut self.egress,
@@ -1924,6 +2621,10 @@ impl UpstreamDriver {
         self.flow_pause = false;
         self.response_pause = false;
         self.codec.get_mut().set_parser_paused(false);
+        if let Some(run) = pull_through {
+            let signals = Rc::clone(&self.exchange.as_ref().expect("just committed").signals);
+            status.link.set(Some(PullThroughLink { run, signals }));
+        }
         status.acknowledge(id, source);
         self.stream_wake.mark();
         Ok(())
@@ -2156,8 +2857,22 @@ impl UpstreamDriver {
                 .summary
                 .bytes_scheduled
                 .saturating_add(self.egress.chain_length() as u64);
+            self.note_request_written();
         }
         Ok(())
+    }
+
+    /// Notes that a pull-through exchange's request bytes are all written, after which its body
+    /// may take the drive (`DIV-047`).
+    #[inline]
+    fn note_request_written(&self) {
+        if let Some(exchange) = &self.exchange
+            && exchange.status.pull_through
+            && exchange.request_complete
+            && exchange.write_boundary <= self.summary.bytes_written
+        {
+            self.shared.drive.written.set(Some(exchange.id));
+        }
     }
 
     /// Releases capacity once the request is serialized and the response produced, and
@@ -2171,6 +2886,9 @@ impl UpstreamDriver {
             && exchange.response_complete
             && exchange.status.ingress_succeeded()
         {
+            // The response is fully produced: a held drive returns to the run before the
+            // release's wake, which then reaches only the run (`DIV-047`).
+            self.shared.hand_back(exchange.id);
             exchange.status.release();
         }
         if !(exchange.request_complete
@@ -2396,6 +3114,9 @@ impl UpstreamDriver {
         if let Some(error) = failed {
             self.abort(error);
         }
+        if progress {
+            self.note_request_written();
+        }
         Some(progress)
     }
 
@@ -2466,6 +3187,12 @@ impl UpstreamDriver {
     /// Closes admission with `error`, then cancels and drops the live exchange with it.
     #[cold]
     fn close_and_cancel(&mut self, error: &HttpError) {
+        // A held drive returns to the run future first: the polls the run still needs must not
+        // wait for the holder's reads, and the wakes below reach only the run (`DIV-047`).
+        if let Some(exchange) = &self.exchange {
+            let stream = exchange.id;
+            capture(&mut self.panic, || self.shared.revoke(Some(stream)));
+        }
         // Admission closes first, so the exchange's capacity release announces no capacity.
         capture(&mut self.panic, || self.shared.close(error.clone()));
         self.shared.retiring.take();
