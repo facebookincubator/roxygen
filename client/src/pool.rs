@@ -2042,7 +2042,30 @@ impl PoolState {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// This thread's passes over a pool batch: waiters to signal, or retired
+    /// sessions to drain.
+    static BATCH_PASSES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Takes this thread's count of passes over a pool batch, resetting it.
+#[cfg(test)]
+pub(crate) fn take_batch_passes_for_test() -> u64 {
+    BATCH_PASSES.replace(0)
+}
+
+#[cfg(test)]
+fn count_batch_pass() {
+    BATCH_PASSES.set(BATCH_PASSES.get() + 1);
+}
+
 fn signal_waiters(waiters: Vec<Rc<Waiter>>) {
+    if waiters.is_empty() {
+        return;
+    }
+    #[cfg(test)]
+    count_batch_pass();
     waiters.into_iter().for_each(|waiter| {
         let _ = catch_callback(|| waiter.signal());
     });
@@ -2056,6 +2079,11 @@ fn cancel_waiters(waiters: Vec<Rc<Waiter>>, error: PoolError) {
 }
 
 fn drain_sessions(sessions: Vec<PooledSession>) {
+    if sessions.is_empty() {
+        return;
+    }
+    #[cfg(test)]
+    count_batch_pass();
     sessions.into_iter().for_each(|session| {
         let _ = catch_callback(|| session.initiate_drain());
     });
@@ -2083,6 +2111,11 @@ impl RetiredSessions {
 
     /// Drains every session, in order, then resumes the first panic a drain raised.
     fn drain_propagating_panics(mut self) {
+        if self.0.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        count_batch_pass();
         let mut first_panic = None;
         std::mem::take(&mut self.0).into_iter().for_each(|session| {
             if let Err(payload) = catch_unwind(AssertUnwindSafe(|| session.initiate_drain())) {
@@ -2101,6 +2134,9 @@ impl RetiredSessions {
 
 impl Drop for RetiredSessions {
     fn drop(&mut self) {
+        if self.0.is_empty() {
+            return;
+        }
         drain_sessions(std::mem::take(&mut self.0));
     }
 }

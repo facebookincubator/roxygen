@@ -84,6 +84,7 @@ use crate::pool::IdleSweep;
 use crate::pool::PoolError;
 use crate::pool::PoolParams;
 use crate::pool::SessionReuseOrder;
+use crate::pool::take_batch_passes_for_test;
 use crate::pool::take_waits_for_wakeup_for_test;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -4545,4 +4546,166 @@ fn a_reservation_on_a_claimed_returning_session_wakes_the_acquisition_waiting_fo
         "(selection, router parameters, attempts once the second acquisition waits and in all, \
          each served on a connection other than the returning session's, connections)"
     );
+}
+
+/// Sends `/` on `reservation`, as a pull-through request when
+/// `pull_through`, and returns the 200 response's whole body.
+async fn exchange_root(reservation: OwnedClientReservation, pull_through: bool) -> Vec<u8> {
+    if pull_through {
+        pull_through_exchange(reservation, "/").await
+    } else {
+        exchange(reservation, "/").await
+    }
+}
+
+/// Runs `streams` streams of `BACK_TO_BACK_REQUESTS` back-to-back exchanges
+/// each on sessions the pool already opened, through pull-through exchanges
+/// when `pull_through`, and returns this thread's pool batch passes from the
+/// streams' first acquisitions to their last exchanges' retirements. Before
+/// that, `streams` reservations held at once open the sessions, and each
+/// exchanges once; then every session settles.
+async fn batch_passes_back_to_back(
+    pool: &OwnedHttpSessionPool,
+    streams: usize,
+    pull_through: bool,
+) -> u64 {
+    let warm: Vec<_> = futures::stream::iter((0..streams).map(|_| acquire(pool)))
+        .buffer_unordered(streams)
+        .collect()
+        .await;
+    let opened: Vec<OwnedClientSession> = futures::stream::iter(warm)
+        .then(|acquired| async move {
+            assert_eq!(
+                exchange_root(acquired.reservation, pull_through).await,
+                b"ok"
+            );
+            acquired.session
+        })
+        .collect()
+        .await;
+    for session in &opened {
+        settle(session).await;
+    }
+    take_batch_passes_for_test();
+    let last: Vec<OwnedClientSession> = futures::stream::iter((0..streams).map(|_| async move {
+        let mut last = None;
+        for _ in 0..BACK_TO_BACK_REQUESTS {
+            let acquired = acquire(pool).await;
+            assert_eq!(
+                exchange_root(acquired.reservation, pull_through).await,
+                b"ok"
+            );
+            last = Some(acquired.session);
+        }
+        last.expect("a stream exchanges at least once")
+    }))
+    .buffer_unordered(streams)
+    .collect()
+    .await;
+    for session in &last {
+        settle(session).await;
+    }
+    take_batch_passes_for_test()
+}
+
+/// CL-L3: back-to-back exchanges on open sessions wake no waiter and retire
+/// no session, so they make no pass over a batch of waiters to signal or of
+/// sessions to drain, which is empty: not at their acquisitions' steps, nor
+/// at their sessions' events. Owned pools over both protocols at K = 1 and 8,
+/// on HTTP/1.1 with this module's pool parameters and the router's and
+/// through plain and pull-through exchanges, and an `HttpSessionPool`.
+#[test]
+fn back_to_back_exchanges_make_no_pass_over_an_empty_pool_batch() {
+    let cases = [1, 8].into_iter().flat_map(|streams| {
+        [false, true]
+            .into_iter()
+            .flat_map(move |router| {
+                [false, true]
+                    .into_iter()
+                    .map(move |pull_through| (CodecProtocol::Http11, streams, router, pull_through))
+            })
+            .chain([(CodecProtocol::Http2, streams, false, false)])
+    });
+    let mut observed: Vec<_> = cases
+        .map(|(protocol, streams, router, pull_through)| {
+            let origin = Origin::start(protocol);
+            let address = origin.address;
+            let passes = run_on_worker(move |context| async move {
+                let (params, session) = if router {
+                    router_http1()
+                } else {
+                    (
+                        params(u32::try_from(streams).expect("a small stream count")),
+                        untimed(),
+                    )
+                };
+                let pool = pool_with(&context, address, protocol, params, session);
+                batch_passes_back_to_back(&pool, streams, pull_through).await
+            });
+            (
+                format!(
+                    "{protocol:?}, K = {streams}, router parameters: {router}, pull-through: \
+                     {pull_through}"
+                ),
+                passes,
+            )
+        })
+        .collect();
+
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let passes = run_on_worker(move |context| async move {
+        let pool = HttpSessionPool::new(
+            context,
+            socket_address(address),
+            params(1),
+            plaintext(CodecProtocol::Http11),
+            untimed(),
+        );
+        uniplex_one_exchange(&pool).await;
+        take_batch_passes_for_test();
+        for _ in 0..BACK_TO_BACK_REQUESTS {
+            uniplex_one_exchange(&pool).await;
+        }
+        take_batch_passes_for_test()
+    });
+    observed.push(("HttpSessionPool, K = 1".to_owned(), passes));
+    let expected: Vec<_> = observed.iter().map(|(case, _)| (case.clone(), 0)).collect();
+    assert_eq!(observed, expected, "no pass over an empty batch");
+}
+
+/// CL-L3: a waiter batch that is not empty is still signalled, in one pass.
+/// With one connection of one stream held, a second acquisition waits;
+/// releasing the held reservation wakes it, and nothing else in its
+/// acquisition has a waiter to signal or a session to drain.
+#[test]
+fn a_released_session_wakes_its_waiter_in_one_pool_batch_pass() {
+    for protocol in PROTOCOLS {
+        let origin = Origin::start(protocol);
+        let address = origin.address;
+        let (pending, passes, same) = run_on_worker(move |context| async move {
+            let pool = pool_with(&context, address, protocol, params(1), one_stream(protocol));
+            let first = acquire(&pool).await;
+            let second = pool.get_session_with_reservation(CancellationToken::never());
+            tokio::pin!(second);
+            let pending = tokio::select! {
+                _ = &mut second => false,
+                () = tokio::time::sleep(Duration::from_millis(100)) => true,
+            };
+            take_batch_passes_for_test();
+            drop(first.reservation);
+            let second = second.await.expect("the waiter is served");
+            let passes = take_batch_passes_for_test();
+            (
+                pending,
+                passes,
+                local(&first.session) == local(&second.session),
+            )
+        });
+        assert_eq!(
+            (pending, passes, same),
+            (true, 1, true),
+            "{protocol:?}: one pass signals the one waiter, which takes the released session"
+        );
+    }
 }

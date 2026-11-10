@@ -86,6 +86,7 @@ use crate::pool::IdleSessionObserver;
 use crate::pool::PoolError;
 use crate::pool::PoolObserver;
 use crate::pool::PoolParams;
+use crate::pool::take_batch_passes_for_test;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -4211,6 +4212,57 @@ fn attached_pool_expiration_retires_before_acquisition_error() {
             assert!(!pool.full());
             assert_eq!(pool.task_count_for_test(), 0);
             assert_eq!(fixture.calls.get(), 1);
+        });
+    }
+}
+
+/// CL-L3: a retired-session batch that is not empty is still drained, in one
+/// pass. An acquisition that retires the pool's only session, aged out, and
+/// then fails drains that session; its step has no waiter to signal.
+#[test]
+fn an_acquisition_drains_the_session_it_retires_in_one_pool_batch_pass() {
+    for timed_out in [false, true] {
+        run_case(move |context, _runtime| async move {
+            let fixture = Fixture::default();
+            let mut options = params(1);
+            options.max_waiters = 0;
+            let pool = HttpSessionPool::try_with_attached_factory(
+                context,
+                options,
+                TransportSecurity::Plaintext,
+                fixture.factory(CodecProtocol::Http11),
+            )
+            .unwrap();
+            pool.set_idle_session_observer(Some(Rc::new(IdleNotice(Rc::clone(&fixture.idle)))))
+                .unwrap();
+            let session = exchange(
+                pool.get_session_with_reservation(CancellationToken::never())
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            fixture.idle(&session).await;
+            pool.expire_sessions_for_test();
+            take_batch_passes_for_test();
+            let result = if timed_out {
+                pool.acquisition_step_for_test(Instant::now() - TIMEOUT - TIMEOUT)
+            } else {
+                pool.get_session_with_reservation(CancellationToken::never())
+                    .await
+                    .map(|_| ())
+            };
+            let passes = take_batch_passes_for_test();
+            assert!(matches!(
+                (timed_out, result),
+                (false, Err(PoolError::MaxWaiters)) | (true, Err(PoolError::Timeout))
+            ));
+            assert_eq!(
+                (passes, session.is_draining()),
+                (1, true),
+                "one pass drains the one retired session"
+            );
+            pool.drain_and_join().await.unwrap();
+            assert!(session.is_finished());
         });
     }
 }
