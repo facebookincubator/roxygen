@@ -1833,6 +1833,347 @@ fn request_methods_are_canonicalized_by_default_as_uniplex() {
     assert_eq!(owned, method_run(false, false, &METHODS));
 }
 
+/// Never answers, and records each exchange dropped while its response is owed.
+struct HeldApplication(Rc<Cell<usize>>);
+
+struct HeldExchange(Rc<Cell<usize>>);
+
+impl OwnedH2Application for HeldApplication {
+    type Exchange = HeldExchange;
+
+    fn new_exchange(&self, _stream: StreamId, _ingress: IngressCompletion) -> HeldExchange {
+        HeldExchange(Rc::clone(&self.0))
+    }
+}
+
+impl OwnedH2Exchange for HeldExchange {
+    fn request(&mut self, _head: Box<HttpMessage>, _body: HttpStreamSourceOwner, _eom: bool) {}
+
+    fn poll_headers(
+        &mut self,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        Poll::Pending
+    }
+
+    fn poll_body(
+        &mut self,
+        _context: &mut Context<'_>,
+        _maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        unreachable!("no head is produced")
+    }
+
+    fn cancel(&mut self, _error: &HttpError, _peer_reset: bool) {}
+
+    fn response_complete(&mut self) {}
+
+    fn complete(self) {}
+}
+
+impl Drop for HeldExchange {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
+/// `HeldApplication` as a `UniplexSession` handler.
+struct HeldStreamHandler(Rc<Cell<usize>>);
+
+struct AbandonProbe(Rc<Cell<usize>>);
+
+impl Drop for AbandonProbe {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
+impl HttpHandler for HeldStreamHandler {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        let probe = AbandonProbe(Rc::clone(&self.0));
+        Box::pin(async move {
+            let _held = (probe, request);
+            std::future::pending::<Result<HttpSourceHolder, HttpError>>().await
+        })
+    }
+}
+
+/// One frame of an EOF-abort script.
+fn eof_frame(frame_type: FrameType, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let mut frame = u32::try_from(payload.len()).unwrap().to_be_bytes()[1..].to_vec();
+    frame.extend_from_slice(&[frame_type.as_u8(), flags]);
+    frame.extend_from_slice(&stream.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// The client preface and empty SETTINGS, then `frames`.
+fn eof_script(frames: &[Vec<u8>]) -> Vec<u8> {
+    let mut wire = CONNECTION_PREFACE.to_vec();
+    wire.extend(eof_frame(FrameType::SETTINGS, 0, 0, &[]));
+    wire.extend(frames.concat());
+    wire
+}
+
+/// A request head on `stream`: a GET that ends the stream, or a POST whose body
+/// follows. Without `end_headers` the header block is left unfinished.
+fn eof_request(stream: u32, get: bool, end_headers: bool) -> Vec<u8> {
+    const END_HEADERS: u8 = 0x4;
+    let block = HpackEncoder::new(false).encode(&[
+        HpackHeader::new(":method", if get { "GET" } else { "POST" }),
+        HpackHeader::new(":scheme", "http"),
+        HpackHeader::new(":path", "/generate"),
+        HpackHeader::new(":authority", "example.com"),
+    ]);
+    let flags = if get { END_STREAM } else { 0 } | if end_headers { END_HEADERS } else { 0 };
+    eof_frame(FrameType::HEADERS, flags, stream, &block)
+}
+
+fn eof_reset(stream: u32) -> Vec<u8> {
+    eof_frame(
+        FrameType::RST_STREAM,
+        0,
+        stream,
+        &H2ErrorCode::CANCEL.as_u32().to_be_bytes(),
+    )
+}
+
+/// What one held-request EOF run produced: the exchanges or handlers dropped while
+/// their responses were owed; each response head's status, by stream; the RST_STREAM
+/// and GOAWAY frames written; and the session's error.
+#[derive(Debug, PartialEq)]
+struct EofRun {
+    abandoned: usize,
+    statuses: Vec<(StreamId, u16)>,
+    resets: Vec<(StreamId, H2ErrorCode)>,
+    goaways: Vec<(StreamId, H2ErrorCode)>,
+    error: Option<HttpErrorCode>,
+}
+
+/// Serves `input`, read with EOF, with the owned driver (`owned`) or `UniplexSession`,
+/// both configured as `options` with `abort_streams_on_eof`, then `configure`, and
+/// applications that hold every response.
+fn eof_run(owned: bool, input: &[u8], configure: fn(&mut OwnedH2Options)) -> EofRun {
+    let input = input.to_vec();
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let (transport, state) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+            let mut config = options(context, transport);
+            config.http2.abort_streams_on_eof = true;
+            configure(&mut config);
+            let abandoned = Rc::new(Cell::new(0));
+            let result = if owned {
+                let (session, _) =
+                    OwnedH2Session::new(HeldApplication(Rc::clone(&abandoned)), config).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), session.run()).await
+            } else {
+                let OwnedH2Options {
+                    context,
+                    transport,
+                    io,
+                    http2,
+                } = config;
+                let handler: Rc<dyn HttpHandler> =
+                    Rc::new(HeldStreamHandler(Rc::clone(&abandoned)));
+                let (session, _) = UniplexSession::new_http2(
+                    context,
+                    TransportDirection::Downstream,
+                    transport,
+                    Some(handler),
+                    io,
+                    http2,
+                )
+                .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), session.run()).await
+            };
+            let error = result
+                .expect("the run ends")
+                .err()
+                .map(|error| error.code());
+            let decoded = decode_server_frames_with_requests(&state.borrow().writes.concat(), 3);
+            EofRun {
+                abandoned: abandoned.get(),
+                statuses: decoded.header_statuses,
+                resets: decoded.resets,
+                goaways: decoded.goaways,
+                error,
+            }
+        })
+    })
+}
+
+/// Under `abort_streams_on_eof` (`DIV-055`), the owned driver judges an EOF read with
+/// the bytes before it as `UniplexSession` does, each case read in one segment: held
+/// requests are aborted with one GOAWAY(INTERNAL_ERROR) and no response, a request
+/// whose head or body is incomplete is open, a stream the peer reset is not open even
+/// before the owned driver applies the reset, and a flood breach parsed with the EOF
+/// keeps its own error.
+#[test]
+fn http2_eof_abort_matches_uniplex() {
+    fn unlimited(_config: &mut OwnedH2Options) {}
+    fn one_reset(config: &mut OwnedH2Options) {
+        config.http2.rate_limits.resets = RateLimitConfig::new(1, Duration::from_secs(10), 0);
+    }
+    let aborted = |abandoned, last| EofRun {
+        abandoned,
+        statuses: Vec::new(),
+        resets: Vec::new(),
+        goaways: vec![(StreamId::new(last), H2ErrorCode::INTERNAL_ERROR)],
+        error: Some(HttpErrorCode::TRANSPORT_EOF),
+    };
+    let cases: [(&str, Vec<u8>, fn(&mut OwnedH2Options), EofRun); 6] = [
+        (
+            "two held GETs",
+            eof_script(&[eof_request(1, true, true), eof_request(3, true, true)]),
+            unlimited,
+            aborted(2, 3),
+        ),
+        (
+            "a POST whose body is incomplete",
+            eof_script(&[
+                eof_request(1, false, true),
+                eof_frame(FrameType::DATA, 0, 1, b"abc"),
+            ]),
+            unlimited,
+            aborted(1, 1),
+        ),
+        (
+            "a HEADERS block without END_HEADERS",
+            eof_script(&[eof_request(1, true, false)]),
+            unlimited,
+            aborted(0, 1),
+        ),
+        (
+            "a held GET the peer reset",
+            eof_script(&[eof_request(1, true, true), eof_reset(1)]),
+            unlimited,
+            EofRun {
+                abandoned: 1,
+                statuses: Vec::new(),
+                resets: Vec::new(),
+                goaways: Vec::new(),
+                error: None,
+            },
+        ),
+        (
+            "a held GET beside one the peer reset",
+            eof_script(&[
+                eof_request(1, true, true),
+                eof_request(3, true, true),
+                eof_reset(3),
+            ]),
+            unlimited,
+            aborted(2, 3),
+        ),
+        (
+            "a reset flood beside a held GET",
+            eof_script(&[
+                eof_request(1, true, true),
+                eof_request(3, true, true),
+                eof_request(5, true, true),
+                eof_reset(3),
+                eof_reset(5),
+            ]),
+            one_reset,
+            EofRun {
+                abandoned: 3,
+                statuses: Vec::new(),
+                resets: Vec::new(),
+                goaways: vec![(StreamId::new(5), H2ErrorCode::CANCEL)],
+                error: Some(HttpErrorCode::CANCEL),
+            },
+        ),
+    ];
+    for (label, input, configure, expected) in cases {
+        let owned = eof_run(true, &input, configure);
+        assert_eq!(owned, expected, "{label}");
+        assert_eq!(eof_run(false, &input, configure), owned, "{label}");
+    }
+}
+
+/// `UniplexSession` under `abort_streams_on_eof` (`DIV-055`): a REFUSED_STREAM that finds no
+/// room in the egress buffer behind a held write records its error without failing the
+/// connection, and the peer's EOF still aborts the held stream.
+#[test]
+fn uniplex_eof_aborts_a_held_stream_after_a_refusal_found_no_room() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let eof = Arc::new(tokio::sync::Notify::new());
+            let write_gate = Arc::new(tokio::sync::Notify::new());
+            // Behind the held first write, the SETTINGS ACK (9 bytes) and 14 PING replies (17
+            // bytes each) leave 9 of the 256 bytes, too few for the 13-byte RST_STREAM.
+            let pings = eof_frame(FrameType::PING, 0, 0, &[0; 8]).repeat(14);
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(eof_script(&[eof_request(1, true, true)])),
+                FixtureRead::Data(pings),
+                FixtureRead::Data(eof_request(3, true, true)),
+                FixtureRead::WaitDataEof(Arc::clone(&eof), Vec::new()),
+            ]);
+            state.borrow_mut().write_gate = Some(Arc::clone(&write_gate));
+            let OwnedH2Options {
+                context,
+                transport,
+                mut io,
+                mut http2,
+            } = options(context, transport);
+            io.buffer_limit = 256;
+            io.ingress_buffer_limit = 256;
+            io.maximum_read_size = 256;
+            io.read_allocation_size = 256;
+            http2.settings.push(CodecSetting {
+                identifier: SettingsId::MaxConcurrentStreams.as_u16(),
+                value: 1,
+            });
+            http2.abort_streams_on_eof = true;
+            let abandoned = Rc::new(Cell::new(0));
+            let handler: Rc<dyn HttpHandler> = Rc::new(HeldStreamHandler(Rc::clone(&abandoned)));
+            let (session, _) = UniplexSession::new_http2(
+                context,
+                TransportDirection::Downstream,
+                transport,
+                Some(handler),
+                io,
+                http2,
+            )
+            .unwrap();
+            let script = async {
+                wait_until(|| {
+                    state.borrow().reads.is_empty() && state.borrow().write_gate_pending.is_some()
+                })
+                .await;
+                assert_eq!(abandoned.get(), 0, "stream 1 is held until the EOF");
+                eof.notify_one();
+                for _ in 0..256 {
+                    tokio::task::yield_now().await;
+                }
+                write_gate.notify_one();
+            };
+            let (run, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(session.run(), script)
+            })
+            .await
+            .expect("the EOF ends the run");
+            let decoded = decode_server_frames_with_requests(&state.borrow().writes.concat(), 3);
+            assert_eq!(decoded.ping_replies.len(), 14);
+            assert!(
+                decoded.resets.is_empty(),
+                "stream 3's REFUSED_STREAM found no room"
+            );
+            assert_eq!(abandoned.get(), 1, "the EOF aborts held stream 1");
+            assert_eq!(state.borrow().close, FixtureClose::Reset);
+            assert_eq!(
+                run.err().map(|error| error.code()),
+                Some(HttpErrorCode::PROTOCOL_ERROR),
+                "the session keeps the error the refusal recorded"
+            );
+        })
+    });
+}
+
 #[test]
 fn unsupported_config_is_rejected_before_transport_or_application_work() {
     run_on_worker(|context| {
@@ -9540,6 +9881,262 @@ async fn ordered_owner_failure(
         written_transcript(&state),
         run.map(drop).map_err(|error| error.code()),
     )
+}
+
+/// As `ordered_owner_failure` with `eof`, on a session with
+/// `Http2SessionConfig::abort_streams_on_eof`.
+async fn ordered_owner_eof_abort(
+    context: WorkerContext,
+    order: Rc<StreamOrderProbe>,
+    reads: Vec<u8>,
+) -> (WireTranscript, Result<(), HttpErrorCode>) {
+    let (transport, state) = FixtureTransport::new([FixtureRead::DataEof(reads)]);
+    let (mut application, probes) = Application::new(vec![Reply::Body(0); ORDER_STREAMS.len()]);
+    application.hold_headers = true;
+    application.stream_order = Some(order);
+    assert_seed_reorders(&ORDER_STREAMS);
+    let mut config = options(context, transport);
+    config.http2.abort_streams_on_eof = true;
+    let (session, _handle) = OwnedH2Session::new(application, config).unwrap();
+    let session = session.with_stream_seed(ORDER_SEED);
+    let run = tokio::time::timeout(Duration::from_secs(10), session.run())
+        .await
+        .expect("the EOF retires every owner");
+    drop(probes);
+    (
+        written_transcript(&state),
+        run.map(drop).map_err(|error| error.code()),
+    )
+}
+
+/// With `abort_streams_on_eof` (`DIV-055`), an EOF read with requests whose owners
+/// hold their responses fails the connection with `TRANSPORT_EOF`: complete GETs and
+/// incomplete POSTs alike are cancelled in id order, with no 500 for the incomplete
+/// ones, and one GOAWAY carries INTERNAL_ERROR.
+#[test]
+fn eof_abort_cancels_open_streams_in_id_order_without_500s_when_enabled() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let order = Rc::new(StreamOrderProbe::default());
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut requests = order_requests(&mut peer, &[], 1, true);
+            for complete in [false, true, false, true] {
+                requests.extend(order_followups(&mut peer, 1, complete));
+            }
+            let (written, run) =
+                ordered_owner_eof_abort(context, Rc::clone(&order), requests).await;
+            assert_eq!(run, Err(HttpErrorCode::TRANSPORT_EOF));
+            assert_eq!(order.cancelled.borrow().as_slice(), &ORDER_STREAMS);
+            assert_eq!(
+                written.count(FrameType::HEADERS, 0),
+                0,
+                "no response head is written"
+            );
+            assert_eq!(written.count(FrameType::GOAWAY, 0), 1);
+        })
+    });
+}
+
+/// With `abort_streams_on_eof`, a stream whose response's END_STREAM is serialized is
+/// not open, even while the write that carries it is held: an EOF read then takes the
+/// default path, and both responses are written whole.
+#[test]
+fn eof_after_every_response_end_is_serialized_closes_cleanly_when_enabled() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let eof = Arc::new(tokio::sync::Notify::new());
+            let write_gate = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(peer_two_requests_bytes()),
+                FixtureRead::WaitDataEof(Arc::clone(&eof), Vec::new()),
+            ]);
+            state.borrow_mut().write_gate = Some(Arc::clone(&write_gate));
+            let (application, probes) = Application::new(vec![Reply::Body(TRANSCRIPT_BODY); 2]);
+            let mut config = options(context, transport);
+            config.http2.abort_streams_on_eof = true;
+            let (session, _handle) = OwnedH2Session::new(application, config).unwrap();
+            let script = async {
+                complete_credit_wait(|| {
+                    let probes = probes.borrow();
+                    probes.len() == 2
+                        && probes
+                            .iter()
+                            .all(|probe| probe.response_complete.get() == 1)
+                        && state.borrow().write_gate_pending.is_some()
+                })
+                .await;
+                eof.notify_one();
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                write_gate.notify_one();
+            };
+            let (run, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(session.run(), script)
+            })
+            .await
+            .expect("the session ends at EOF");
+            assert_eq!(
+                run.map(drop).map_err(|error| error.code()),
+                Ok(()),
+                "the EOF closes the connection cleanly"
+            );
+            let written = written_transcript(&state);
+            assert_eq!(written.count(FrameType::HEADERS, 0), 2);
+            assert_eq!(written.count(FrameType::DATA, END_STREAM), 2);
+            assert!(
+                probes
+                    .borrow()
+                    .iter()
+                    .all(|probe| probe.cancelled.borrow().is_empty())
+            );
+        })
+    });
+}
+
+/// With `abort_streams_on_eof`, a request block begun above the final GOAWAY's last stream
+/// is not open: the codec drops its events when it ends. Its EOF, while the write carrying
+/// stream 1's whole response is held, then closes the connection cleanly.
+#[test]
+fn eof_inside_a_request_head_above_the_final_goaway_closes_cleanly_when_enabled() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let eof = Arc::new(tokio::sync::Notify::new());
+            let write_gate = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(eof_script(&[eof_request(1, true, true)])),
+                FixtureRead::WaitDataEof(Arc::clone(&eof), eof_request(3, true, false)),
+            ]);
+            state.borrow_mut().write_gate = Some(Arc::clone(&write_gate));
+            let (application, probes) = Application::new(vec![Reply::Body(TRANSCRIPT_BODY)]);
+            let mut config = options(context, transport);
+            config.http2.abort_streams_on_eof = true;
+            let (session, handle) = OwnedH2Session::new(application, config).unwrap();
+            let script = async {
+                complete_credit_wait(|| {
+                    probes
+                        .borrow()
+                        .first()
+                        .is_some_and(|probe| probe.response_complete.get() == 1)
+                        && state.borrow().write_gate_pending.is_some()
+                })
+                .await;
+                assert!(handle.initiate_drain().unwrap());
+                for _ in 0..256 {
+                    tokio::task::yield_now().await;
+                }
+                eof.notify_one();
+                for _ in 0..256 {
+                    tokio::task::yield_now().await;
+                }
+                write_gate.notify_one();
+            };
+            let (run, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(session.run(), script)
+            })
+            .await
+            .expect("the session ends at EOF");
+            assert_eq!(
+                run.map(drop).map_err(|error| error.code()),
+                Ok(()),
+                "the EOF closes the connection cleanly"
+            );
+            let decoded = decode_server_frames_with_requests(&state.borrow().writes.concat(), 3);
+            assert_eq!(
+                decoded.goaways,
+                [
+                    (StreamId::new(0x7fff_ffff), H2ErrorCode::NO_ERROR),
+                    (StreamId::new(1), H2ErrorCode::NO_ERROR)
+                ],
+                "the final GOAWAY precedes stream 3's block"
+            );
+            assert_eq!(
+                written_transcript(&state).count(FrameType::DATA, END_STREAM),
+                1
+            );
+            assert!(probes.borrow()[0].cancelled.borrow().is_empty());
+            assert_ne!(state.borrow().close, FixtureClose::Reset);
+        })
+    });
+}
+
+/// Serialized output is kept only best-effort (`DIV-055`). The owned driver serializes into
+/// its egress buffer while a write is held, so an endless response can fill the buffer and
+/// leave no room for the abort's GOAWAY. The driver then aborts at once: the exchange is
+/// cancelled, the transport is reset while the write is still held, and nothing serialized
+/// after that write is written. (`UniplexSession` serializes only between writes, and
+/// ignores a GOAWAY that does not fit.)
+#[test]
+fn eof_abort_without_room_for_its_goaway_resets_at_once() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let eof = Arc::new(tokio::sync::Notify::new());
+            let write_gate = Arc::new(tokio::sync::Notify::new());
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(order_requests(&mut peer, &[], 1, true)),
+                FixtureRead::WaitDataEof(Arc::clone(&eof), Vec::new()),
+            ]);
+            state.borrow_mut().write_gate = Some(Arc::clone(&write_gate));
+            let (application, probes) = Application::new(vec![Reply::Body(1 << 20)]);
+            let mut config = options(context, transport);
+            config.io.buffer_limit = 1 << 15;
+            config.io.ingress_buffer_limit = 1 << 14;
+            config.io.maximum_write_size = 1 << 15;
+            config.io.maximum_read_size = 1 << 14;
+            config.io.read_allocation_size = 4096;
+            config.http2.abort_streams_on_eof = true;
+            let (session, _handle) = OwnedH2Session::new(application, config).unwrap();
+            let script = async {
+                let mut before = 0;
+                loop {
+                    for _ in 0..64 {
+                        tokio::task::yield_now().await;
+                    }
+                    let now = probes
+                        .borrow()
+                        .first()
+                        .map_or(0, |probe| probe.produced_bytes.get());
+                    if now != 0 && now == before && state.borrow().write_gate_pending.is_some() {
+                        break;
+                    }
+                    before = now;
+                }
+                eof.notify_one();
+                for _ in 0..256 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    state.borrow().writes.is_empty(),
+                    "the first write is still held"
+                );
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Reset,
+                    "the transport is reset before the held write completes"
+                );
+                write_gate.notify_one();
+            };
+            let (run, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(session.run(), script)
+            })
+            .await
+            .expect("the run ends once the held write completes");
+            assert_eq!(
+                run.err().map(|error| error.code()),
+                Some(HttpErrorCode::TRANSPORT_EOF)
+            );
+            assert_eq!(
+                probes.borrow()[0].cancelled.borrow().as_slice(),
+                &[(HttpErrorCode::TRANSPORT_EOF, false)]
+            );
+            assert_eq!(
+                state.borrow().writes.len(),
+                1,
+                "only the held write is written"
+            );
+        })
+    });
 }
 
 #[test]

@@ -1,7 +1,8 @@
 //! The router prototype's ingress combination: `serve_transport` with
-//! `abort_exchanges_on_eof` (`DIV-053`), `non_abortive_close` (`DIV-038`),
-//! `exact_method_tokens` (`DIV-040`) and `verbatim_http2_header_values`
-//! (`DIV-041`), serving a response source that polls its body events in place
+//! `abort_exchanges_on_eof` (`DIV-053`), `abort_http2_streams_on_eof`
+//! (`DIV-055`), `non_abortive_close` (`DIV-038`), `exact_method_tokens`
+//! (`DIV-040`) and `verbatim_http2_header_values` (`DIV-041`), serving a
+//! response source that polls its body events in place
 //! (`DIV-039`) under a head whose values the handler inserts with
 //! `HttpHeaders::add_verbatim`, over HTTP/1.1 and h2c on loopback TCP, on a
 //! `RuntimeOwner` worker and a `HostedWorker`.
@@ -185,6 +186,7 @@ fn router_session() -> ServerSessionConfig {
         connection_idle_timeout: Duration::ZERO,
         write_timeout: Duration::ZERO,
         abort_exchanges_on_eof: true,
+        abort_http2_streams_on_eof: true,
         non_abortive_close: true,
         exact_method_tokens: true,
         verbatim_http2_header_values: true,
@@ -198,13 +200,22 @@ async fn serve_router_connection(
     script: &Rc<Script>,
     protocol: CodecProtocol,
 ) -> (ServerConnection, TcpStream) {
+    serve_router_connection_with(context, script, protocol, router_session()).await
+}
+
+/// Serves one loopback connection with `session`.
+async fn serve_router_connection_with(
+    context: &WorkerContext,
+    script: &Rc<Script>,
+    protocol: CodecProtocol,
+    session: ServerSessionConfig,
+) -> (ServerConnection, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let (client, accepted) = tokio::join!(
         TcpStream::connect(listener.local_addr().expect("listener address")),
         listener.accept()
     );
     let (accepted, _) = accepted.expect("connection accepted");
-    let session = router_session();
     let transport = TcpTransport::from_accepted(
         context,
         accepted.into_std().expect("standard stream"),
@@ -538,17 +549,75 @@ fn has_stream_1_headers(wire: &[u8]) -> bool {
         .any(|frame| frame.stream == 1 && frame.kind == 0x1)
 }
 
-/// A client that half-closes an h2c connection mid-stream: `DIV-053` leaves
-/// HTTP/2 unchanged (hyper's h2 server aborts the stream here), so the stream
-/// and its polling source stay open, the rest of the response reaches the
-/// client, and the connection then closes cleanly; `read_body_event` is never
-/// used.
+/// A client that half-closes an h2c connection mid-stream: a transport EOF
+/// aborts every open stream (`DIV-055`), as hyper's h2 server does, so the
+/// polling source chain is stopped and dropped within a bound and the
+/// connection ends with EOF (`non_abortive_close`), the stream never ended;
+/// `read_body_event` is never used.
 #[test]
-fn router_ingress_h2c_half_close_mid_stream_keeps_the_stream_and_its_polling_source() {
+fn router_ingress_h2c_eof_mid_stream_drops_the_polling_source_and_ends_with_eof() {
     on_worker(move |context| async move {
         let script = Rc::new(Script::default());
         let (connection, mut client) =
             serve_router_connection(&context, &script, CodecProtocol::Http2).await;
+        client
+            .write_all(&h2c_request())
+            .await
+            .expect("request written");
+        let mut wire = Vec::new();
+        within(
+            "the response head",
+            read_h2_until(&mut client, &mut wire, has_stream_1_headers),
+        )
+        .await;
+        script.push_body(b"first");
+        within(
+            "the first event",
+            read_h2_until(&mut client, &mut wire, |wire| {
+                stream_1_body(wire).0 == b"first"
+            }),
+        )
+        .await;
+
+        client.shutdown().await.expect("client half-closes");
+        within("the source is dropped", async {
+            while !script.dropped.get() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        let reset = within(
+            "the connection ends",
+            read_until_closed(&mut client, &mut wire),
+        )
+        .await;
+        assert!(!reset, "the client sees EOF, not a reset");
+        assert_eq!(
+            stream_1_body(&wire),
+            (b"first".to_vec(), false),
+            "nothing follows the written event and the stream never ends"
+        );
+        assert!(script.stopped.get(), "the source was stopped");
+        assert_eq!(script.reads.get(), 0, "read_body_event is never called");
+        let _ = within("the session closes", connection.wait_closed()).await;
+    });
+}
+
+/// Without `abort_http2_streams_on_eof`, a client that half-closes an h2c
+/// connection mid-stream keeps the stream: `abort_exchanges_on_eof` alone
+/// leaves HTTP/2 unchanged (`DIV-053`), so the stream and its polling source
+/// stay open, the rest of the response reaches the client, and the connection
+/// then closes cleanly; `read_body_event` is never used.
+#[test]
+fn router_ingress_h2c_half_close_mid_stream_keeps_the_stream_without_abort_http2_streams_on_eof() {
+    on_worker(move |context| async move {
+        let script = Rc::new(Script::default());
+        let session = ServerSessionConfig {
+            abort_http2_streams_on_eof: false,
+            ..router_session()
+        };
+        let (connection, mut client) =
+            serve_router_connection_with(&context, &script, CodecProtocol::Http2, session).await;
         client
             .write_all(&h2c_request())
             .await

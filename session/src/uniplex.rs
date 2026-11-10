@@ -537,7 +537,8 @@ pub struct UniplexConfig {
     /// arrives while a transaction other than an established tunnel is open, reading past
     /// a request that closes the connection to see it (`DIV-053`). The owned HTTP/1.1
     /// downstream driver applies it by the same rules; the owned upstream drivers refuse it,
-    /// and owned HTTP/2 ignores it.
+    /// and owned HTTP/2 ignores it. HTTP/2 sessions use
+    /// `Http2SessionConfig::abort_streams_on_eof` (`DIV-055`).
     pub abort_exchanges_on_eof: bool,
     /// Roxygen-only, default off (`DIV-033`): when a stream's ingress is aborted (a
     /// peer reset, a transport EOF or read error, a connection error), the head and
@@ -1297,6 +1298,13 @@ impl HttpCodec for DriverCodec {
         match self {
             Self::Http1(codec) => codec.is_busy(),
             Self::Http2(codec) => codec.is_busy(),
+        }
+    }
+
+    fn has_partial_request_head(&self) -> bool {
+        match self {
+            Self::Http1(codec) => codec.has_partial_request_head(),
+            Self::Http2(codec) => codec.has_partial_request_head(),
         }
     }
 
@@ -10107,16 +10115,34 @@ fn handle_eof(
         .iter()
         .filter_map(|(stream, meta)| (!meta.complete && !meta.discard).then_some(*stream))
         .collect();
-    // An upgraded tunnel's EOF is a half-close: its egress may still finish.
     let abort_exchanges = downstream && {
         let state = state.borrow();
         let core = state.core();
-        state.abort_exchanges_on_eof
-            && state.codec.protocol() == CodecProtocol::Http11
-            && core.stream_ids().into_iter().any(|stream| {
-                core.stream_if_present(stream)
-                    .is_some_and(|stream| !stream.is_upgraded())
-            })
+        match state.codec.protocol() {
+            // An upgraded tunnel's EOF is a half-close: its egress may still finish.
+            CodecProtocol::Http11 => {
+                state.abort_exchanges_on_eof
+                    && core.stream_ids().into_iter().any(|stream| {
+                        core.stream_if_present(stream)
+                            .is_some_and(|stream| !stream.is_upgraded())
+                    })
+            }
+            // `DIV-055`: a request head still arriving, or a stream whose response
+            // END_STREAM is unserialized, tunnels included.
+            CodecProtocol::Http2 => {
+                core.connection_error().is_none()
+                    && state
+                        .http2
+                        .as_ref()
+                        .is_some_and(|http2| http2.config.abort_streams_on_eof)
+                    && (state.codec.has_partial_request_head()
+                        || core.stream_ids().into_iter().any(|stream| {
+                            core.stream_if_present(stream)
+                                .is_some_and(|stream| !stream.egress_complete())
+                        }))
+            }
+            _ => false,
+        }
     };
     // An unserialized HTTP/1.1 request can get no response after peer EOF.
     let upstream_request_unstarted = upstream && !upstream_response_pending && {

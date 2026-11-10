@@ -2455,6 +2455,21 @@ impl HttpCodec for Http2Codec {
         StreamId::new(u64::from(self.parallel.last_incoming_stream_id()))
     }
 
+    fn has_partial_request_head(&self) -> bool {
+        self.header_block.as_ref().is_some_and(|block| {
+            !block.rejected
+                && matches!(
+                    block.kind,
+                    HeaderBlockKind::Headers {
+                        stream,
+                        request: true,
+                        trailers: false,
+                        ..
+                    } if self.parallel.stream_allowed(stream)
+                )
+        })
+    }
+
     fn generate(
         &mut self,
         output: &mut BufQueue,

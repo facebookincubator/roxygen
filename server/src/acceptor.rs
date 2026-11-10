@@ -166,7 +166,8 @@ pub struct ServerSessionConfig {
     /// recorded in `DIV-051`: among them, events arrive at the end of each driver poll, and
     /// a stream detaches when it retires. The driver requires the configured
     /// stream receive window to equal the advertised `INITIAL_WINDOW_SIZE`; the acceptor
-    /// aligns the two (see `owned_http2_session_config`).
+    /// aligns the two (see `owned_http2_session_config`). It honors
+    /// `abort_http2_streams_on_eof` (`DIV-055`).
     pub owned_http2: bool,
     /// Experimental, default off (`DIV-053`): when a downstream HTTP/1.1 peer's EOF arrives
     /// while a transaction other than an established tunnel is open, fail the connection as a
@@ -175,8 +176,20 @@ pub struct ServerSessionConfig {
     /// default ends only incomplete requests and keeps serving one whose request completed, so
     /// a half-closed client still gets its response. The EOF is seen only while reads run, so
     /// an ingress pause (flow control, pipelining) defers it. HTTP/2 connections are
-    /// unchanged, and `owned_http1` applies it by the same rules.
+    /// unchanged by it (`abort_http2_streams_on_eof`, `DIV-055`, is their counterpart), and
+    /// `owned_http1` applies it by the same rules.
     pub abort_exchanges_on_eof: bool,
+    /// Experimental, default off (`DIV-055`): when a downstream HTTP/2 peer's EOF arrives
+    /// while a stream is open (its response's END_STREAM not yet serialized, or its request
+    /// head still arriving), fail the connection with `TRANSPORT_EOF`, as a transport read
+    /// error does: every stream's handler is cancelled and its sources stopped, no error
+    /// response is sent, a GOAWAY follows the output already serialized, which is still
+    /// written, and the transport is reset (closed with FIN under `non_abortive_close`). The
+    /// default ends only streams whose request is incomplete and keeps serving the others, so
+    /// a half-closed client still gets their responses. An EOF on a connection with no open
+    /// stream closes it as before. Both HTTP/2 drivers honor it; HTTP/1.1 connections ignore
+    /// it (their option is `abort_exchanges_on_eof`, `DIV-053`).
+    pub abort_http2_streams_on_eof: bool,
     /// Roxygen-only, default off (`DIV-038`): a connection the session resets (an
     /// HTTP/1.1 stream reset, such as a response body error, after writing what it
     /// already serialized; a connection error; `ServerConnection::cancel`) closes its
@@ -250,6 +263,7 @@ impl Default for ServerSessionConfig {
             owned_http1: false,
             owned_http2: false,
             abort_exchanges_on_eof: false,
+            abort_http2_streams_on_eof: false,
             non_abortive_close: false,
             exact_method_tokens: false,
             verbatim_http2_header_values: false,
@@ -891,6 +905,7 @@ pub(crate) fn http2_session_config(config: &ServerSessionConfig) -> Http2Session
         max_concurrent_outgoing_streams: config.max_concurrent_outgoing_streams,
         rate_limits: config.http2_rate_limits,
         goaway_timeout: config.goaway_timeout,
+        abort_streams_on_eof: config.abort_http2_streams_on_eof,
         ..Http2SessionConfig::default()
     }
 }

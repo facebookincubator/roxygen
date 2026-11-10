@@ -217,6 +217,26 @@ fn owned_upstream_h2_refuses_exact_method_tokens() {
     });
 }
 
+/// `abort_streams_on_eof` (`DIV-055`) judges a downstream peer's EOF. The owned upstream
+/// driver refuses it, as the owned HTTP/1.1 upstream driver refuses `abort_exchanges_on_eof`,
+/// instead of ignoring it.
+#[test]
+fn owned_upstream_h2_refuses_abort_streams_on_eof() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (transport, state) = FixtureTransport::new([]);
+            let mut config = options(context, transport);
+            config.http2.abort_streams_on_eof = true;
+            let error = match OwnedH2UpstreamSession::new(config) {
+                Err(error) => error,
+                Ok(_) => panic!("abort_streams_on_eof was silently accepted"),
+            };
+            assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+            assert!(state.borrow().writes.is_empty());
+        })
+    });
+}
+
 fn request_head(method: HttpMethod, eom: bool, length: Option<usize>) -> HttpHeaderEvent {
     let mut headers = committed_test_headers(b"/owned-upstream", eom);
     headers.headers_mut().set_method(method).unwrap();

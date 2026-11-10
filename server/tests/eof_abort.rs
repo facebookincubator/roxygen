@@ -1,9 +1,13 @@
 //! Opt-in abort of open exchanges on a downstream HTTP/1.1 peer's EOF
-//! (`ServerSessionConfig::abort_exchanges_on_eof`, `DIV-053`).
+//! (`ServerSessionConfig::abort_exchanges_on_eof`, `DIV-053`), and of open
+//! streams on a downstream HTTP/2 peer's EOF
+//! (`ServerSessionConfig::abort_http2_streams_on_eof`, `DIV-055`).
 //!
-//! Each HTTP/1.1 case runs in every server mode in `HTTP1_MODES`, on both
-//! workers. HTTP/2 connections are unchanged by the option, on `UniplexSession`
-//! and on the owned driver (`ServerSessionConfig::owned_http2`) alike.
+//! Each HTTP/1.1 case runs in every server mode in `HTTP1_MODES`, and each
+//! HTTP/2 case in every mode in `H2_MODES`, on both workers. HTTP/2 connections
+//! are unchanged by `abort_exchanges_on_eof`, on `UniplexSession` and on the
+//! owned driver (`ServerSessionConfig::owned_http2`) alike;
+//! `abort_http2_streams_on_eof` aborts their open streams on both drivers.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -1650,19 +1654,838 @@ fn http1_reset_aborts_a_held_exchange_by_default() {
     });
 }
 
-#[test]
-fn http2_eof_keeps_open_streams_by_default() {
-    http2_eof_keeps_an_open_stream(session(false, false));
+/// The HTTP/2 server modes each HTTP/2 case runs in, as `owned_http2` values:
+/// `UniplexSession` and the owned driver.
+const H2_MODES: &[bool] = &[false, true];
+
+/// Runs `test` in each HTTP/2 server mode in `H2_MODES`, each on both workers.
+/// Each mode is printed before it runs, so a failure's output names it.
+fn in_both_h2_modes<Test, Work>(test: Test)
+where
+    Test: FnOnce(WorkerContext, bool) -> Work + Clone + Send + 'static,
+    Work: Future<Output = ()> + 'static,
+{
+    for &owned_http2 in H2_MODES {
+        eprintln!("owned_http2: {owned_http2}");
+        let test = test.clone();
+        on_worker(move |context| test(context, owned_http2));
+    }
 }
 
-/// `DIV-053` leaves HTTP/2 unchanged: the half-closed stream keeps running.
+/// An untimed server, serving HTTP/2 on the owned driver when `owned_http2`,
+/// with `abort_http2_streams_on_eof` set to `abort`.
+fn h2_session(owned_http2: bool, abort: bool) -> ServerSessionConfig {
+    ServerSessionConfig {
+        owned_http2,
+        abort_http2_streams_on_eof: abort,
+        ..session(false, false)
+    }
+}
+
+const H2_SETTINGS: u8 = 0x4;
+const H2_GOAWAY: u8 = 0x7;
+/// HPACK static table index 14, `:status: 500`.
+const STATUS_500: u8 = 0x8e;
+const NO_ERROR: u32 = 0x0;
+const INTERNAL_ERROR: u32 = 0x2;
+/// The last stream of a drain's first GOAWAY.
+const MAXIMUM_STREAM: u32 = 0x7fff_ffff;
+
+/// The client preface and an empty SETTINGS frame.
+fn h2_preface() -> Vec<u8> {
+    let mut wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    wire.extend(h2_frame(H2_SETTINGS, 0, 0, &[]));
+    wire
+}
+
+/// The header block of a request for `path` on localhost: a GET, or a POST.
+fn h2_request_block(path: &[u8], get: bool) -> Vec<u8> {
+    // :method, :scheme http, then :path and :authority without indexing.
+    let length = u8::try_from(path.len()).expect("short path");
+    let mut block = vec![if get { 0x82 } else { 0x83 }, 0x86, 0x04, length];
+    block.extend_from_slice(path);
+    block.extend_from_slice(&[0x01, 9]);
+    block.extend_from_slice(b"localhost");
+    block
+}
+
+/// A request head on `stream` for `path`: a GET that ends the stream, or a
+/// POST whose body follows.
+fn h2_head(stream: u32, path: &[u8], get: bool) -> Vec<u8> {
+    let flags = if get {
+        END_STREAM | END_HEADERS
+    } else {
+        END_HEADERS
+    };
+    h2_frame(H2_HEADERS, flags, stream, &h2_request_block(path, get))
+}
+
+/// The length of the whole frames at the start of `wire`, which a reset may
+/// have cut short.
+fn h2_whole_prefix(wire: &[u8]) -> usize {
+    let mut offset = 0;
+    while let Some(header) = wire.get(offset..offset + 9) {
+        let length =
+            usize::from(header[0]) << 16 | usize::from(header[1]) << 8 | usize::from(header[2]);
+        if wire.len() < offset + 9 + length {
+            break;
+        }
+        offset += 9 + length;
+    }
+    offset
+}
+
+/// The kinds of the whole frames on `stream` in `wire`.
+fn h2_frame_kinds(wire: &[u8], stream: u32) -> Vec<u8> {
+    h2_stream_frames(&wire[..h2_whole_prefix(wire)], stream)
+        .expect("whole frames")
+        .iter()
+        .map(|frame| frame.kind)
+        .collect()
+}
+
+/// The last stream and error code of each whole GOAWAY frame in `wire`.
+fn h2_goaways(wire: &[u8]) -> Vec<(u32, u32)> {
+    h2_stream_frames(&wire[..h2_whole_prefix(wire)], 0)
+        .expect("whole frames")
+        .iter()
+        .filter(|frame| frame.kind == H2_GOAWAY)
+        .map(|frame| {
+            let field = |at: usize| {
+                u32::from_be_bytes(frame.payload[at..at + 4].try_into().expect("GOAWAY field"))
+            };
+            (field(0) & MAXIMUM_STREAM, field(4))
+        })
+        .collect()
+}
+
+/// Reads into `wire` until `done` holds for the bytes read.
+async fn read_h2_until(client: &mut TcpStream, wire: &mut Vec<u8>, done: impl Fn(&[u8]) -> bool) {
+    while !done(wire) {
+        let mut chunk = [0; 1024];
+        let read = client.read(&mut chunk).await.expect("server frames read");
+        assert_ne!(read, 0, "the connection ends early");
+        wire.extend_from_slice(&chunk[..read]);
+    }
+}
+
+#[test]
+fn abort_http2_streams_on_eof_is_off_by_default_and_reaches_both_http2_configs() {
+    assert!(!ServerSessionConfig::default().abort_http2_streams_on_eof);
+    assert!(
+        !crate::acceptor::http2_session_config(&ServerSessionConfig::default())
+            .abort_streams_on_eof
+    );
+    let enabled = h2_session(false, true);
+    assert!(crate::acceptor::http2_session_config(&enabled).abort_streams_on_eof);
+    assert!(crate::acceptor::owned_http2_session_config(&enabled).abort_streams_on_eof);
+}
+
+/// With `abort_http2_streams_on_eof` (`DIV-055`), a peer EOF while a stream is
+/// open fails the connection with `TRANSPORT_EOF`: the handler future is
+/// cancelled, nothing is written on the stream, and the transport is reset.
+#[test]
+fn http2_eof_aborts_a_held_stream_when_enabled() {
+    in_both_h2_modes(|context, owned| async move {
+        let held = Rc::new(Held::default());
+        let (connection, mut client) = serve_loopback(
+            &context,
+            CodecProtocol::Http2,
+            h2_session(owned, true),
+            Rc::new(HeldHandler(Rc::clone(&held))),
+        )
+        .await;
+        client
+            .write_all(&h2_request())
+            .await
+            .expect("request written");
+        until(|| held.invoked.get()).await;
+        client.shutdown().await.expect("client half-closes");
+        let error = connection
+            .wait_closed()
+            .await
+            .expect_err("the EOF fails the connection");
+        assert_eq!(error.code(), HttpErrorCode::TRANSPORT_EOF);
+        assert!(held.dropped.get(), "the handler future is cancelled");
+        let (wire, reset) = read_until_closed(&mut client).await;
+        assert!(
+            !h2_frame_kinds(&wire, 1).contains(&H2_HEADERS),
+            "no response head is written: {wire:?}"
+        );
+        assert!(reset, "the abort resets the transport");
+    });
+}
+
+/// Two complete POSTs that the application holds, then the client's
+/// half-close with its read side still open, as the router's h2c half-close
+/// test drives the connection: both handlers are cancelled.
+#[test]
+fn http2_eof_aborts_every_open_stream_when_enabled() {
+    in_both_h2_modes(|context, owned| async move {
+        let first = Rc::new(Held::default());
+        let second = Rc::new(Held::default());
+        let handler = Rc::new(RouteHandler(vec![
+            (
+                b"/one",
+                Rc::new(HeldHandler(Rc::clone(&first))) as HttpHandlerRef,
+            ),
+            (b"/three", Rc::new(HeldHandler(Rc::clone(&second)))),
+        ]));
+        let (connection, mut client) = serve_loopback(
+            &context,
+            CodecProtocol::Http2,
+            h2_session(owned, true),
+            handler,
+        )
+        .await;
+        let mut wire = h2_preface();
+        wire.extend(h2_head(1, b"/one", false));
+        wire.extend(h2_frame(H2_DATA, END_STREAM, 1, b"{}"));
+        wire.extend(h2_head(3, b"/three", false));
+        wire.extend(h2_frame(H2_DATA, END_STREAM, 3, b"{}"));
+        client.write_all(&wire).await.expect("requests written");
+        until(|| first.invoked.get() && second.invoked.get()).await;
+        client.shutdown().await.expect("client half-closes");
+        let error = connection
+            .wait_closed()
+            .await
+            .expect_err("the EOF fails the connection");
+        assert_eq!(error.code(), HttpErrorCode::TRANSPORT_EOF);
+        assert!(
+            first.dropped.get() && second.dropped.get(),
+            "both handler futures are cancelled"
+        );
+    });
+}
+
+#[test]
+fn http2_eof_stops_a_streaming_response_when_enabled() {
+    in_both_h2_modes(|context, owned| async move {
+        let probe = Rc::new(SourceProbe::default());
+        let (connection, mut client) = serve_loopback(
+            &context,
+            CodecProtocol::Http2,
+            h2_session(owned, true),
+            StreamingHandler::new(&probe, false),
+        )
+        .await;
+        client
+            .write_all(&h2_request())
+            .await
+            .expect("request written");
+        let mut wire = Vec::new();
+        read_h2_until(&mut client, &mut wire, |wire| {
+            h2_frame_kinds(wire, 1).contains(&H2_HEADERS)
+        })
+        .await;
+        assert!(!probe.stopped.get());
+        client.shutdown().await.expect("client half-closes");
+        let error = connection
+            .wait_closed()
+            .await
+            .expect_err("the EOF fails the connection");
+        assert_eq!(error.code(), HttpErrorCode::TRANSPORT_EOF);
+        assert!(probe.stopped.get(), "the response source is stopped");
+        assert!(probe.dropped.get(), "the response source is dropped");
+        let (rest, reset) = read_until_closed(&mut client).await;
+        wire.extend(rest);
+        assert!(
+            h2_stream_frames(&wire[..h2_whole_prefix(&wire)], 1)
+                .expect("whole frames")
+                .iter()
+                .all(|frame| frame.flags & END_STREAM == 0),
+            "the aborted response never ends its stream: {wire:?}"
+        );
+        assert!(reset, "the abort resets the transport");
+    });
+}
+
+/// An EOF inside a request body: by default the incomplete request fails with
+/// `TRANSPORT_EOF` and both drivers answer 500; with the option the stream is
+/// open, so the EOF aborts it with no response.
+#[test]
+fn http2_eof_mid_upload_aborts_without_the_500_when_enabled() {
+    let outcomes: Vec<_> = H2_MODES
+        .iter()
+        .flat_map(|&owned| [(owned, false), (owned, true)])
+        .flat_map(|(owned, abort)| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            on_worker(move |context| async move {
+                let (connection, mut client) = serve_loopback(
+                    &context,
+                    CodecProtocol::Http2,
+                    h2_session(owned, abort),
+                    Rc::new(UploadHandler),
+                )
+                .await;
+                let mut wire = h2_preface();
+                wire.extend(h2_head(1, b"/upload", false));
+                wire.extend(h2_frame(H2_DATA, 0, 1, b"abc"));
+                client
+                    .write_all(&wire)
+                    .await
+                    .expect("partial request written");
+                client.shutdown().await.expect("client half-closes");
+                let (wire, reset) = read_until_closed(&mut client).await;
+                let error = connection
+                    .wait_closed()
+                    .await
+                    .err()
+                    .map(|error| error.code());
+                let head = h2_stream_frames(&wire[..h2_whole_prefix(&wire)], 1)
+                    .expect("whole frames")
+                    .iter()
+                    .find(|frame| frame.kind == H2_HEADERS)
+                    .and_then(|frame| frame.payload.first().copied());
+                sender
+                    .send((owned, abort, head, reset, error))
+                    .expect("outcome recorded");
+            });
+            receiver.try_iter().collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        outcomes.len(),
+        4 * H2_MODES.len(),
+        "each setting ran in each mode on both executors"
+    );
+    assert!(
+        outcomes.iter().all(|(_, abort, head, reset, error)| {
+            if *abort {
+                head.is_none() && *reset && *error == Some(HttpErrorCode::TRANSPORT_EOF)
+            } else {
+                *head == Some(STATUS_500) && !*reset && error.is_none()
+            }
+        }),
+        "by default both drivers answer 500 and close cleanly; with the option the EOF \
+         aborts the open stream without a response: {outcomes:?}"
+    );
+}
+
+/// A response whose END_STREAM is serialized is not open: with no other open
+/// stream, the EOF takes the default path and the response is written whole to
+/// the half-closed peer once it reads. Had every byte reached the kernel
+/// before the EOF, the test could not tell, so it requires a blocked write.
+#[test]
+fn http2_eof_keeps_flushing_a_serialized_response_when_enabled() {
+    in_both_h2_modes(|context, owned| async move {
+        let probe = Rc::new(SourceProbe::default());
+        let (connection, mut client) = serve_loopback_with_buffers(
+            &context,
+            CodecProtocol::Http2,
+            h2_session(owned, true),
+            Rc::new(FinalBatchHandler(Rc::clone(&probe))),
+            Some(SMALL_SOCKET_BUFFER),
+        )
+        .await;
+        client
+            .write_all(&h2_request())
+            .await
+            .expect("request written");
+        let arrived = until_final_batch_blocked(&probe, &client).await;
+        assert!(
+            arrived < FINAL_BATCH,
+            "the transport holds back part of the response: {arrived} bytes arrived"
+        );
+        client.shutdown().await.expect("client half-closes");
+        assert!(
+            tokio::time::timeout(SETTLE, connection.wait_closed())
+                .await
+                .is_err(),
+            "the session keeps the serialized response"
+        );
+        let (wire, reset) = read_until_closed(&mut client).await;
+        assert!(!reset, "the connection closes without a reset");
+        assert_whole_h2_response(&wire, 1, &[b'x'; FINAL_BATCH]);
+        connection
+            .wait_closed()
+            .await
+            .expect("the serialized response completes the connection");
+        assert!(!probe.stopped.get(), "the response source is not stopped");
+    });
+}
+
+/// A serialized response on stream 1 and a held stream 3: the abort cancels
+/// stream 3, and stream 1's serialized bytes are still written, whole before
+/// the FIN under `non_abortive_close`, followed by the abort's GOAWAY.
+#[test]
+fn http2_eof_with_a_serialized_response_and_a_held_stream_writes_the_first_and_aborts_the_second_when_enabled()
+ {
+    in_both_h2_modes(|context, owned| async move {
+        let probe = Rc::new(SourceProbe::default());
+        let held = Rc::new(Held::default());
+        let handler = Rc::new(RouteHandler(vec![
+            (
+                b"/final",
+                Rc::new(FinalBatchHandler(Rc::clone(&probe))) as HttpHandlerRef,
+            ),
+            (b"/held", Rc::new(HeldHandler(Rc::clone(&held)))),
+        ]));
+        let session = ServerSessionConfig {
+            non_abortive_close: true,
+            ..h2_session(owned, true)
+        };
+        let (connection, mut client) = serve_loopback_with_buffers(
+            &context,
+            CodecProtocol::Http2,
+            session,
+            handler,
+            Some(SMALL_SOCKET_BUFFER),
+        )
+        .await;
+        let mut wire = h2_preface();
+        wire.extend(h2_head(1, b"/final", true));
+        wire.extend(h2_head(3, b"/held", true));
+        client.write_all(&wire).await.expect("requests written");
+        until(|| held.invoked.get()).await;
+        let arrived = until_final_batch_blocked(&probe, &client).await;
+        assert!(
+            arrived < FINAL_BATCH,
+            "the transport holds back part of the response: {arrived} bytes arrived"
+        );
+        client.shutdown().await.expect("client half-closes");
+        until(|| held.dropped.get()).await;
+        let (wire, reset) = read_until_closed(&mut client).await;
+        assert!(!reset, "non_abortive_close ends the connection with a FIN");
+        assert_whole_h2_response(&wire, 1, &[b'x'; FINAL_BATCH]);
+        assert!(
+            !h2_frame_kinds(&wire, 3).contains(&H2_HEADERS),
+            "the aborted stream gets no response"
+        );
+        assert_eq!(
+            h2_goaways(&wire),
+            [(3, INTERNAL_ERROR)],
+            "one GOAWAY with INTERNAL_ERROR"
+        );
+        let goaway = h2_frames_in_order(&wire)
+            .iter()
+            .position(|(stream, kind)| (*stream, *kind) == (0, H2_GOAWAY));
+        let end = h2_frames_in_order(&wire)
+            .iter()
+            .rposition(|(stream, _)| *stream == 1);
+        assert!(goaway > end, "the GOAWAY follows the written response");
+        let error = connection
+            .wait_closed()
+            .await
+            .expect_err("the EOF fails the connection");
+        assert_eq!(error.code(), HttpErrorCode::TRANSPORT_EOF);
+    });
+}
+
+/// The stream and kind of each whole frame in `wire`, in order.
+fn h2_frames_in_order(wire: &[u8]) -> Vec<(u32, u8)> {
+    let mut frames = Vec::new();
+    let mut rest = &wire[..h2_whole_prefix(wire)];
+    while !rest.is_empty() {
+        let length = usize::from(rest[0]) << 16 | usize::from(rest[1]) << 8 | usize::from(rest[2]);
+        let stream = u32::from_be_bytes([rest[5], rest[6], rest[7], rest[8]]) & MAXIMUM_STREAM;
+        frames.push((stream, rest[3]));
+        rest = &rest[9 + length..];
+    }
+    frames
+}
+
+#[test]
+fn http2_eof_on_an_idle_connection_closes_cleanly_when_enabled() {
+    in_both_h2_modes(|context, owned| async move {
+        let held = Rc::new(Held::default());
+        held.release.notify_one();
+        let (connection, mut client) = serve_loopback(
+            &context,
+            CodecProtocol::Http2,
+            h2_session(owned, true),
+            Rc::new(HeldHandler(Rc::clone(&held))),
+        )
+        .await;
+        client
+            .write_all(&h2_request())
+            .await
+            .expect("request written");
+        let mut wire = Vec::new();
+        read_h2_until(&mut client, &mut wire, |wire| {
+            h2_stream_frames(&wire[..h2_whole_prefix(wire)], 1)
+                .expect("whole frames")
+                .iter()
+                .any(|frame| frame.flags & END_STREAM != 0)
+        })
+        .await;
+        client
+            .shutdown()
+            .await
+            .expect("client closes the idle connection");
+        connection
+            .wait_closed()
+            .await
+            .expect("an EOF on an idle connection is a clean close");
+        let (rest, reset) = read_until_closed(&mut client).await;
+        wire.extend(rest);
+        assert!(!reset, "the connection closes without a reset");
+        assert_whole_h2_response(&wire, 1, b"held");
+        assert!(
+            h2_goaways(&wire).iter().all(|(_, code)| *code == NO_ERROR),
+            "no GOAWAY carries an error: {wire:?}"
+        );
+        assert!(!held.dropped.get());
+    });
+}
+
+/// The request and the EOF reach the session together; it parses the request
+/// first, so the handler runs, and the EOF then aborts the open stream.
+#[test]
+fn http2_request_and_eof_in_one_write_abort_when_enabled() {
+    in_both_h2_modes(|context, owned| async move {
+        let held = Rc::new(Held::default());
+        let (connection, client) = serve_loopback(
+            &context,
+            CodecProtocol::Http2,
+            h2_session(owned, true),
+            Rc::new(HeldHandler(Rc::clone(&held))),
+        )
+        .await;
+        let mut client = client.into_std().expect("standard client");
+        client.set_nonblocking(false).expect("blocking client");
+        client.write_all(&h2_request()).expect("request written");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("client half-closes");
+        client.set_nonblocking(true).expect("nonblocking client");
+        let mut client = TcpStream::from_std(client).expect("client adopted");
+        let error = connection
+            .wait_closed()
+            .await
+            .expect_err("the EOF fails the connection");
+        assert_eq!(error.code(), HttpErrorCode::TRANSPORT_EOF);
+        assert!(held.invoked.get(), "the request reaches the handler");
+        assert!(held.dropped.get(), "the handler future is cancelled");
+        let (wire, reset) = read_until_closed(&mut client).await;
+        assert!(
+            !h2_frame_kinds(&wire, 1).contains(&H2_HEADERS),
+            "no response head is written: {wire:?}"
+        );
+        assert!(reset, "the abort resets the transport");
+    });
+}
+
+/// Under `non_abortive_close` (`DIV-038`) the abort's reset is a FIN, so the
+/// client reads the abort's GOAWAY: one, with INTERNAL_ERROR and the held
+/// stream as the last.
+#[test]
+fn http2_eof_aborts_with_a_goaway_and_a_fin_under_non_abortive_close() {
+    in_both_h2_modes(|context, owned| async move {
+        let held = Rc::new(Held::default());
+        let session = ServerSessionConfig {
+            non_abortive_close: true,
+            ..h2_session(owned, true)
+        };
+        let (connection, mut client) = serve_loopback(
+            &context,
+            CodecProtocol::Http2,
+            session,
+            Rc::new(HeldHandler(Rc::clone(&held))),
+        )
+        .await;
+        client
+            .write_all(&h2_request())
+            .await
+            .expect("request written");
+        until(|| held.invoked.get()).await;
+        client.shutdown().await.expect("client half-closes");
+        let error = connection
+            .wait_closed()
+            .await
+            .expect_err("the EOF fails the connection");
+        assert_eq!(error.code(), HttpErrorCode::TRANSPORT_EOF);
+        assert!(held.dropped.get(), "the handler future is cancelled");
+        let (wire, reset) = read_until_closed(&mut client).await;
+        assert!(!reset, "non_abortive_close ends the connection with a FIN");
+        assert_eq!(h2_goaways(&wire), [(1, INTERNAL_ERROR)]);
+        eprintln!("stream 1 frames: {:?}", h2_frame_kinds(&wire, 1));
+        assert!(
+            !h2_frame_kinds(&wire, 1).contains(&H2_HEADERS),
+            "no response head is written"
+        );
+    });
+}
+
+/// A local drain holds its final GOAWAY for `goaway_timeout`. A peer EOF in
+/// that window with the option aborts the open stream, and the abort's GOAWAY,
+/// with INTERNAL_ERROR, is the final one. Without the option, the drained
+/// stream's response is written once released.
+#[test]
+fn http2_eof_during_a_drain_aborts_the_open_streams_when_enabled() {
+    for abort in [false, true] {
+        in_both_h2_modes(move |context, owned| async move {
+            let held = Rc::new(Held::default());
+            let session = ServerSessionConfig {
+                non_abortive_close: true,
+                ..h2_session(owned, abort)
+            };
+            let (connection, mut client) = serve_loopback(
+                &context,
+                CodecProtocol::Http2,
+                session,
+                Rc::new(HeldHandler(Rc::clone(&held))),
+            )
+            .await;
+            client
+                .write_all(&h2_request())
+                .await
+                .expect("request written");
+            until(|| held.invoked.get()).await;
+            assert!(connection.initiate_drain().expect("the drain starts"));
+            let mut wire = Vec::new();
+            read_h2_until(&mut client, &mut wire, |wire| !h2_goaways(wire).is_empty()).await;
+            client.shutdown().await.expect("client half-closes");
+            if abort {
+                let error = connection
+                    .wait_closed()
+                    .await
+                    .expect_err("the EOF fails the connection");
+                assert_eq!(error.code(), HttpErrorCode::TRANSPORT_EOF);
+                assert!(held.dropped.get(), "the handler future is cancelled");
+                let (rest, reset) = read_until_closed(&mut client).await;
+                wire.extend(rest);
+                assert!(!reset, "non_abortive_close ends the connection with a FIN");
+                assert_eq!(
+                    h2_goaways(&wire),
+                    [(MAXIMUM_STREAM, NO_ERROR), (1, INTERNAL_ERROR)]
+                );
+            } else {
+                tokio::time::sleep(SETTLE).await;
+                assert!(!held.dropped.get(), "the drained stream keeps running");
+                held.release.notify_one();
+                let (rest, reset) = read_until_closed(&mut client).await;
+                wire.extend(rest);
+                assert!(!reset, "the connection closes without a reset");
+                assert_whole_h2_response(&wire, 1, b"held");
+                connection
+                    .wait_closed()
+                    .await
+                    .expect("the drained connection completes");
+            }
+        });
+    }
+}
+
+/// With `goaway_timeout` zero a drain sends its final GOAWAY at once. A peer
+/// EOF after it still aborts the open stream, and no further GOAWAY follows
+/// the final one.
+#[test]
+fn http2_eof_after_the_final_goaway_aborts_without_another_goaway_when_enabled() {
+    in_both_h2_modes(|context, owned| async move {
+        let held = Rc::new(Held::default());
+        let session = ServerSessionConfig {
+            non_abortive_close: true,
+            goaway_timeout: Duration::ZERO,
+            ..h2_session(owned, true)
+        };
+        let (connection, mut client) = serve_loopback(
+            &context,
+            CodecProtocol::Http2,
+            session,
+            Rc::new(HeldHandler(Rc::clone(&held))),
+        )
+        .await;
+        client
+            .write_all(&h2_request())
+            .await
+            .expect("request written");
+        until(|| held.invoked.get()).await;
+        assert!(connection.initiate_drain().expect("the drain starts"));
+        let mut wire = Vec::new();
+        read_h2_until(&mut client, &mut wire, |wire| h2_goaways(wire).len() == 2).await;
+        client.shutdown().await.expect("client half-closes");
+        let error = connection
+            .wait_closed()
+            .await
+            .expect_err("the EOF fails the connection");
+        assert_eq!(error.code(), HttpErrorCode::TRANSPORT_EOF);
+        assert!(held.dropped.get(), "the handler future is cancelled");
+        let (rest, reset) = read_until_closed(&mut client).await;
+        wire.extend(rest);
+        assert!(!reset, "non_abortive_close ends the connection with a FIN");
+        assert_eq!(
+            h2_goaways(&wire),
+            [(MAXIMUM_STREAM, NO_ERROR), (1, NO_ERROR)],
+            "nothing follows the final GOAWAY"
+        );
+    });
+}
+
+/// A peer GOAWAY announces no new streams; it does not ask for the open ones
+/// to finish over a half-closed transport, so its EOF still aborts them.
+#[test]
+fn http2_eof_after_a_peer_goaway_aborts_the_open_streams_when_enabled() {
+    in_both_h2_modes(|context, owned| async move {
+        let held = Rc::new(Held::default());
+        let (connection, mut client) = serve_loopback(
+            &context,
+            CodecProtocol::Http2,
+            h2_session(owned, true),
+            Rc::new(HeldHandler(Rc::clone(&held))),
+        )
+        .await;
+        client
+            .write_all(&h2_request())
+            .await
+            .expect("request written");
+        until(|| held.invoked.get()).await;
+        client
+            .write_all(&h2_frame(H2_GOAWAY, 0, 0, &[0; 8]))
+            .await
+            .expect("GOAWAY written");
+        client.shutdown().await.expect("client half-closes");
+        let error = connection
+            .wait_closed()
+            .await
+            .expect_err("the EOF fails the connection");
+        assert_eq!(error.code(), HttpErrorCode::TRANSPORT_EOF);
+        assert!(held.dropped.get(), "the handler future is cancelled");
+    });
+}
+
+/// A HEADERS frame without END_HEADERS opens no stream in the session until its
+/// CONTINUATION frames end the block, but the request it begins is open: by
+/// default its EOF closes the connection as an idle one, and with the option
+/// the EOF aborts.
+#[test]
+fn http2_eof_inside_a_request_head_aborts_when_enabled() {
+    for abort in [false, true] {
+        in_both_h2_modes(move |context, owned| async move {
+            let held = Rc::new(Held::default());
+            let (connection, mut client) = serve_loopback(
+                &context,
+                CodecProtocol::Http2,
+                h2_session(owned, abort),
+                Rc::new(HeldHandler(Rc::clone(&held))),
+            )
+            .await;
+            let mut wire = h2_preface();
+            wire.extend(h2_frame(
+                H2_HEADERS,
+                END_STREAM,
+                1,
+                &h2_request_block(b"/", true),
+            ));
+            client.write_all(&wire).await.expect("partial head written");
+            client.shutdown().await.expect("client half-closes");
+            let closed = connection.wait_closed().await;
+            assert!(
+                !held.invoked.get(),
+                "the incomplete head reaches no handler"
+            );
+            let (_, reset) = read_until_closed(&mut client).await;
+            if abort {
+                let error = closed.expect_err("the EOF fails the connection");
+                assert_eq!(error.code(), HttpErrorCode::TRANSPORT_EOF);
+                assert!(reset, "the abort resets the transport");
+            } else {
+                closed.expect("by default the EOF closes the connection");
+                assert!(!reset, "the connection closes without a reset");
+            }
+        });
+    }
+}
+
+/// An established HTTP/2 CONNECT tunnel is open like any other stream: its
+/// half-close is its END_STREAM, so the connection's EOF aborts it, as hyper's
+/// h2 server does.
+#[test]
+fn http2_eof_aborts_a_connect_tunnel_when_enabled() {
+    in_both_h2_modes(|context, owned| async move {
+        let probe = Rc::new(SourceProbe::default());
+        let (connection, mut client) = serve_loopback(
+            &context,
+            CodecProtocol::Http2,
+            h2_session(owned, true),
+            StreamingHandler::new(&probe, false),
+        )
+        .await;
+        // :method CONNECT and :authority localhost:443, without indexing.
+        let mut block = vec![0x02, 7];
+        block.extend_from_slice(b"CONNECT");
+        block.extend_from_slice(&[0x01, 13]);
+        block.extend_from_slice(b"localhost:443");
+        let mut wire = h2_preface();
+        wire.extend(h2_frame(H2_HEADERS, END_HEADERS, 1, &block));
+        client.write_all(&wire).await.expect("CONNECT written");
+        let mut wire = Vec::new();
+        read_h2_until(&mut client, &mut wire, |wire| {
+            h2_frame_kinds(wire, 1).contains(&H2_HEADERS)
+        })
+        .await;
+        client.shutdown().await.expect("client half-closes");
+        let error = connection
+            .wait_closed()
+            .await
+            .expect_err("the EOF fails the connection");
+        assert_eq!(error.code(), HttpErrorCode::TRANSPORT_EOF);
+        assert!(probe.stopped.get(), "the tunnel's source is stopped");
+        assert!(probe.dropped.get(), "the tunnel's source is dropped");
+    });
+}
+
+/// `abort_http2_streams_on_eof` alone leaves HTTP/1.1 unchanged: a held
+/// exchange survives the half-close, and its response is written once
+/// released.
+#[test]
+fn http1_eof_ignores_abort_http2_streams_on_eof() {
+    in_both_modes(|context, owned| async move {
+        let held = Rc::new(Held::default());
+        let session = ServerSessionConfig {
+            abort_http2_streams_on_eof: true,
+            ..session(owned, false)
+        };
+        let (connection, mut client) = serve_loopback(
+            &context,
+            CodecProtocol::Http11,
+            session,
+            Rc::new(HeldHandler(Rc::clone(&held))),
+        )
+        .await;
+        client.write_all(REQUEST).await.expect("request written");
+        until(|| held.invoked.get()).await;
+        client.shutdown().await.expect("client half-closes");
+        tokio::time::sleep(SETTLE).await;
+        assert!(
+            !held.dropped.get(),
+            "the half-closed exchange keeps running"
+        );
+        held.release.notify_one();
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("the response is delivered");
+        assert!(
+            response.starts_with(b"HTTP/1.1 200") && response.ends_with(b"held"),
+            "the held response is written: {response:?}"
+        );
+        connection
+            .wait_closed()
+            .await
+            .expect("the half-closed connection completes");
+    });
+}
+
+#[test]
+fn http2_eof_keeps_open_streams_by_default() {
+    for &owned_http2 in H2_MODES {
+        eprintln!("owned_http2: {owned_http2}");
+        http2_eof_keeps_an_open_stream(h2_session(owned_http2, false));
+    }
+}
+
+/// `abort_exchanges_on_eof` alone leaves HTTP/2 unchanged (`DIV-053`; the
+/// HTTP/2 option is `DIV-055`): the half-closed stream keeps running.
 #[test]
 fn http2_eof_keeps_open_streams_when_enabled() {
     http2_eof_keeps_an_open_stream(session(false, true));
 }
 
 /// The owned HTTP/2 driver accepts `abort_exchanges_on_eof` and ignores it, as
-/// API Proxy's owned engine runs it.
+/// API Proxy's owned engine runs it: `abort_exchanges_on_eof` alone leaves
+/// HTTP/2 unchanged (`DIV-053`; the HTTP/2 option is `DIV-055`).
 #[test]
 fn owned_http2_eof_keeps_open_streams_when_enabled() {
     http2_eof_keeps_an_open_stream(ServerSessionConfig {

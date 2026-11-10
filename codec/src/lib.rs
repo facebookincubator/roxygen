@@ -635,6 +635,15 @@ pub trait HttpCodec {
     /// Last stream identifier initiated by the peer.
     fn last_incoming_stream_id(&self) -> StreamId;
 
+    /// Whether the codec holds part of a request head that opens a stream: a downstream
+    /// HTTP/2 HEADERS frame without END_HEADERS whose CONTINUATION frames have not yet ended
+    /// the block, so no callback has seen the stream. A block refused for concurrency, or on
+    /// a stream above the last stream of a GOAWAY the codec sent, opens none. Codecs that
+    /// keep no partial head return false.
+    fn has_partial_request_head(&self) -> bool {
+        false
+    }
+
     /// Serialize one operation and return exact wire-size and offset metadata.
     fn generate(
         &mut self,
@@ -1552,6 +1561,10 @@ impl HttpCodec for HttpCodecFilterChain {
 
     fn is_busy(&self) -> bool {
         self.query_tail().is_busy()
+    }
+
+    fn has_partial_request_head(&self) -> bool {
+        self.destination.has_partial_request_head()
     }
 
     fn set_parser_paused(&mut self, paused: bool) {

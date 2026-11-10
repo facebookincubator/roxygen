@@ -1149,7 +1149,8 @@ impl OwnedH2UpstreamSession {
     /// Creates the experimental upstream session. It honors `read_timeout`, whose expiry drains
     /// the connection, `write_timeout`, which bounds a stalled transport write and an upload's
     /// wait for flow-control credit, and `stream_read_timeout`, which bounds each wait for
-    /// response data from the request's EOM on (`DIV-028`).
+    /// response data from the request's EOM on (`DIV-028`). It refuses
+    /// `Http2SessionConfig::abort_streams_on_eof`.
     pub fn new(options: OwnedH2Options) -> Result<(Self, OwnedH2UpstreamHandle), HttpError> {
         let (session, handle) =
             Driver::<UpstreamApplication, true>::new(UpstreamApplication, options)?;

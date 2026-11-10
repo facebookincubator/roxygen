@@ -505,6 +505,10 @@ impl HttpCodec for FlowControlledCodec {
         HttpCodec::is_busy(self.codec.as_ref())
     }
 
+    fn has_partial_request_head(&self) -> bool {
+        HttpCodec::has_partial_request_head(self.codec.as_ref())
+    }
+
     fn set_parser_paused(&mut self, paused: bool) {
         HttpCodec::set_parser_paused(self.codec.as_mut(), paused);
     }

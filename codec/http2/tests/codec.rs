@@ -4792,6 +4792,172 @@ fn all_egress_frame_type_callbacks() {
     assert_eq!(continued_trace.events, expected);
 }
 
+fn split_after_first_frame(wire: &[u8]) -> (&[u8], &[u8]) {
+    let length = usize::from(wire[0]) << 16 | usize::from(wire[1]) << 8 | usize::from(wire[2]);
+    wire.split_at(FRAME_HEADER_SIZE + length)
+}
+
+/// A request head that needs a CONTINUATION frame reaches the callback only once its block
+/// ends; until then the downstream codec reports the partial head (`DIV-055`), and trailers
+/// on an open stream are not a request head.
+#[test]
+fn partial_request_head_is_reported_until_its_block_ends() {
+    let mut client = Http2Codec::new(TransportDirection::Upstream);
+    let mut big = request(b"/big");
+    big.headers_mut().add(b"x-big", vec![b'!'; 18_000]);
+    let stream = client.create_stream();
+    let mut head = BufQueue::new(128 * 1024);
+    client
+        .generate(
+            &mut head,
+            EgressFrame::Headers {
+                stream,
+                message: &big,
+                end_stream: false,
+                extra_headers: None,
+            },
+            &mut Trace::default(),
+        )
+        .unwrap();
+    let mut trailers = HttpHeaders::new();
+    trailers.add(b"x-trailer", vec![b'!'; 18_000]);
+    let mut trailer_block = BufQueue::new(128 * 1024);
+    client
+        .generate(
+            &mut trailer_block,
+            EgressFrame::Trailers {
+                stream,
+                trailers: &trailers,
+            },
+            &mut Trace::default(),
+        )
+        .unwrap();
+    let (head, trailer_block) = (bytes(&head), bytes(&trailer_block));
+
+    let mut server = Http2Codec::new(TransportDirection::Downstream);
+    let mut trace = Trace::default();
+    open(&mut server, &mut trace);
+    let mut egress = BufQueue::new(64 * 1024);
+    assert!(!server.has_partial_request_head());
+    let (first, rest) = split_after_first_frame(&head);
+    assert_eq!(
+        server
+            .on_ingress(&queue(first), &mut trace, &mut egress)
+            .consumed,
+        first.len()
+    );
+    assert!(
+        server.has_partial_request_head(),
+        "HEADERS without END_HEADERS"
+    );
+    assert!(!trace.events.contains(&Seen::Begin(1)));
+    assert_eq!(
+        server
+            .on_ingress(&queue(rest), &mut trace, &mut egress)
+            .consumed,
+        rest.len()
+    );
+    assert!(
+        !server.has_partial_request_head(),
+        "the CONTINUATION ends the block"
+    );
+    assert!(trace.events.contains(&Seen::Begin(1)));
+    let (first, _) = split_after_first_frame(&trailer_block);
+    assert_eq!(
+        server
+            .on_ingress(&queue(first), &mut trace, &mut egress)
+            .consumed,
+        first.len()
+    );
+    assert!(
+        !server.has_partial_request_head(),
+        "partial trailers open no stream"
+    );
+}
+
+/// A request block on a stream above the final GOAWAY's last stream opens no stream: the
+/// codec drops its events when the block ends, so it is no partial request head (`DIV-055`).
+#[test]
+fn partial_request_head_above_the_final_goaway_is_not_reported() {
+    let mut client = Http2Codec::new(TransportDirection::Upstream);
+    let mut first = BufQueue::new(1024);
+    let stream = client.create_stream();
+    client
+        .generate(
+            &mut first,
+            EgressFrame::Headers {
+                stream,
+                message: &request(b"/first"),
+                end_stream: true,
+                extra_headers: None,
+            },
+            &mut Trace::default(),
+        )
+        .unwrap();
+    let mut big = request(b"/big");
+    big.headers_mut().add(b"x-big", vec![b'!'; 18_000]);
+    let mut late = BufQueue::new(128 * 1024);
+    let stream = client.create_stream();
+    client
+        .generate(
+            &mut late,
+            EgressFrame::Headers {
+                stream,
+                message: &big,
+                end_stream: true,
+                extra_headers: None,
+            },
+            &mut Trace::default(),
+        )
+        .unwrap();
+    let (first, late) = (bytes(&first), bytes(&late));
+
+    let mut server = Http2Codec::new(TransportDirection::Downstream);
+    let mut trace = Trace::default();
+    open(&mut server, &mut trace);
+    let mut egress = BufQueue::new(64 * 1024);
+    assert_eq!(
+        server
+            .on_ingress(&queue(&first), &mut trace, &mut egress)
+            .consumed,
+        first.len()
+    );
+    assert!(trace.events.contains(&Seen::Begin(1)));
+    server
+        .generate(
+            &mut egress,
+            EgressFrame::Goaway {
+                last_stream: StreamId::new(1),
+                code: H2ErrorCode::NO_ERROR,
+                debug_data: None,
+            },
+            &mut Trace::default(),
+        )
+        .unwrap();
+    assert!(!server.is_waiting_to_drain(), "the GOAWAY is the final one");
+    let (head, rest) = split_after_first_frame(&late);
+    assert_eq!(
+        server
+            .on_ingress(&queue(head), &mut trace, &mut egress)
+            .consumed,
+        head.len()
+    );
+    assert!(
+        !server.has_partial_request_head(),
+        "stream 3 is above the final GOAWAY's last stream"
+    );
+    assert_eq!(
+        server
+            .on_ingress(&queue(rest), &mut trace, &mut egress)
+            .consumed,
+        rest.len()
+    );
+    assert!(
+        !trace.events.contains(&Seen::Begin(3)),
+        "the codec drops the block's events"
+    );
+}
+
 #[test]
 fn padding_frame() {
     let mut codec = Http2Codec::new(TransportDirection::Upstream);

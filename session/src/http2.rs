@@ -66,6 +66,12 @@ pub struct Http2SessionConfig {
     pub goaway_timeout: Duration,
     /// Experimental PING probes (`DIV-024`); `None`, the default, sends none.
     pub ping_probes: Option<PingProbeConfig>,
+    /// Downstream only, default off (`DIV-055`): a peer EOF read while a stream is open (its
+    /// response's END_STREAM not yet serialized, or its request head still arriving) fails the
+    /// connection with `TRANSPORT_EOF` instead of failing only the streams whose request is
+    /// incomplete. `UniplexSession` upstream ignores it; `OwnedH2UpstreamSession::new` refuses
+    /// it.
+    pub abort_streams_on_eof: bool,
 }
 
 impl Default for Http2SessionConfig {
@@ -83,6 +89,7 @@ impl Default for Http2SessionConfig {
             double_goaway_drain: true,
             goaway_timeout: Duration::from_secs(1),
             ping_probes: None,
+            abort_streams_on_eof: false,
         }
     }
 }

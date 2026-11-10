@@ -1597,7 +1597,9 @@ impl<A: OwnedApplication> OwnedH2Session<A> {
     /// transport write and the writer's wait for flow-control credit, and
     /// `stream_read_timeout`, which bounds each wait for request body and answers 408 while
     /// the response head is unsent (`DIV-028`). It limits only the flood categories that
-    /// `Http2SessionConfig::rate_limits` bounds (`DIV-052`).
+    /// `Http2SessionConfig::rate_limits` bounds (`DIV-052`). It honors
+    /// `Http2SessionConfig::abort_streams_on_eof`, which fails the connection on a peer EOF
+    /// while a stream is open (`DIV-055`).
     pub fn new(
         application: A,
         options: OwnedH2Options,
@@ -1691,6 +1693,7 @@ where
             || (!UPSTREAM && !io.drain_request_body_on_drop)
             || (UPSTREAM && io.drain_request_body_on_drop)
             || (!UPSTREAM && io.deliver_ingress_before_abort)
+            || (UPSTREAM && http2.abort_streams_on_eof)
             || (UPSTREAM && io.exact_method_tokens)
             || io.verbatim_http2_header_values
             || http2.stats.is_some()
@@ -3858,6 +3861,14 @@ where
             self.handle_failure(problem);
             self.check_cancel();
         }
+        if finishing_eof
+            && self.failure.fatal.is_none()
+            && !UPSTREAM
+            && self.h2.abort_streams_on_eof
+            && self.has_open_stream()
+        {
+            self.abort_open_streams_on_eof();
+        }
         if finishing_eof && self.failure.fatal.is_none() {
             let mut incomplete = self.streams.ids_in_order();
             incomplete.retain(|id| {
@@ -3887,6 +3898,26 @@ where
             streams.set((self.connection.state.discarded.len(), peak));
         });
         Ok(consumed != 0 || finishing_eof)
+    }
+
+    /// `DIV-055`: whether a request head is still arriving, or some stream's response
+    /// END_STREAM is not yet serialized and the peer has not reset it, the reset only awaiting
+    /// its owner's turn.
+    fn has_open_stream(&self) -> bool {
+        self.connection.codec.has_partial_request_head()
+            || self
+                .streams
+                .values()
+                .any(|stream| !stream.response_complete && stream.peer_reset.is_none())
+    }
+
+    /// `DIV-055`: fails the connection on a peer EOF while a stream is open, as a transport
+    /// read error does, which also skips the incomplete-stream failures that follow.
+    #[cold]
+    #[inline(never)]
+    fn abort_open_streams_on_eof(&mut self) {
+        self.fail_connection(failure(HttpErrorCode::TRANSPORT_EOF, b"transport EOF"));
+        self.check_cancel();
     }
 
     fn stream_connection(
