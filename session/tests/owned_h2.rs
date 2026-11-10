@@ -890,6 +890,42 @@ fn terminal_head_and_small_bodies_round_trip_over_fragmented_ingress() {
     }
 }
 
+/// H2-L6: after a read that drained the transport, the driver polls its reader again only once
+/// the reader's waker fires, so each read of a request that arrives in 64-byte reads is polled
+/// once, after one poll that waited for the first bytes.
+#[test]
+fn owned_h2_polls_a_drained_reader_once_per_read() {
+    let (counts, read_count) = run_on_worker(move |context| {
+        Box::pin(async move {
+            let input =
+                peer_request_bytes(HttpMethod::Post, &vec![b'q'; 1024], None, PeerControl::None);
+            let reads = input
+                .chunks(64)
+                .map(|chunk| FixtureRead::Data(chunk.to_vec()))
+                .chain([FixtureRead::DataEof(Vec::new())]);
+            let read_count = input.chunks(64).count() + 1;
+            let (fixture, _state) = FixtureTransport::new(reads);
+            let (transport, gate) = crate::uniplex_tests::GatedReaderTransport::new(fixture);
+            let (application, probes) = Application::new(vec![Reply::Body(1024)]);
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let (result, counts) = crate::uniplex_tests::GatedReaderTransport::run_gated(
+                &gate,
+                tokio::time::timeout(Duration::from_secs(5), session.run()),
+            )
+            .await;
+            result.unwrap().unwrap();
+            assert_eq!(probes.borrow()[0].completed.get(), 1);
+            (counts, read_count)
+        })
+    });
+    assert_eq!(
+        counts,
+        (read_count + 1, read_count),
+        "(polls, reads): each read polled once, after one poll that waited",
+    );
+}
+
 /// The driver reads through the transport's reader when it offers one, and writes the same bytes
 /// as when it reads through `read`.
 #[test]
@@ -14093,6 +14129,52 @@ fn idle_connection_drains_at_its_read_timeout() {
                     (StreamId::UNSPECIFIED, H2ErrorCode::NO_ERROR)
                 ]
             );
+            assert_eq!(state.borrow().close, FixtureClose::Closed);
+            assert!(probes.borrow().is_empty());
+        })
+    });
+}
+
+/// A drained reader's next read parks for its waker, and the parked read is outstanding for the
+/// read idle timeout, with its deadline stamped when it parks: a reader that drains `IDLE / 2`
+/// after its read started drains the idle connection `IDLE` after it parked.
+#[test]
+fn idle_connection_with_a_parked_reader_drains_at_its_read_timeout() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(0);
+            let (fixture, state) = FixtureTransport::new([FixtureRead::Data(preface)]);
+            let (transport, gate) =
+                crate::uniplex_tests::GatedReaderTransport::new(Rc::new(UntimedReads(fixture)));
+            let (application, probes) = Application::new(Vec::new());
+            let mut config = options(context, transport);
+            config.io.read_timeout = IDLE;
+            config.http2.goaway_timeout = Duration::ZERO;
+            let (session, _handle) =
+                OwnedH2Session::new(application, config).expect("timed owned H2");
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                assert!(gate.waiting(), "the first read waits for the preface");
+                host.advance(IDLE / 2);
+                gate.open_one();
+                settle_turns(32).await;
+                assert!(gate.waiting(), "the drained reader waits for its waker");
+                host.advance(IDLE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert!(written_goaways(&state).is_empty(), "the drain came early");
+                assert_eq!(state.borrow().close, FixtureClose::Open);
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    written_goaways(&state),
+                    [
+                        (GOAWAY_MAX, H2ErrorCode::NO_ERROR),
+                        (StreamId::UNSPECIFIED, H2ErrorCode::NO_ERROR)
+                    ],
+                    "the parked read timed out"
+                );
+            });
+            run.expect("an idle drain closes cleanly");
             assert_eq!(state.borrow().close, FixtureClose::Closed);
             assert!(probes.borrow().is_empty());
         })

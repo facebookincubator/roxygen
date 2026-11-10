@@ -537,6 +537,221 @@ impl UniplexTransport for ReaderTransport {
     }
 }
 
+/// The reads a [`GatedReaderTransport`]'s reader may return, and how often it was polled.
+#[derive(Default)]
+pub(crate) struct ReadGate {
+    /// Reads let through and not yet returned.
+    open: Cell<usize>,
+    /// The waker of the reader's last pending poll, or of the poll that returned a drained read.
+    waker: RefCell<Option<std::task::Waker>>,
+    /// `poll_read` calls, one per `poll_start_read`, that found the gate closed or returned a
+    /// read; a poll that waits only for `inner`'s own read future is not counted.
+    pub(crate) polls: Cell<usize>,
+    /// Reads returned.
+    pub(crate) reads: Cell<usize>,
+}
+
+impl ReadGate {
+    /// Lets one more read through, and wakes the reader.
+    pub(crate) fn open_one(&self) {
+        self.open.set(self.open.get() + 1);
+        let waker = self.waker.borrow_mut().take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Whether the reader waits for the gate: no read is let through and it keeps a waker.
+    pub(crate) fn waiting(&self) -> bool {
+        self.open.get() == 0 && self.waker.borrow().is_some()
+    }
+}
+
+/// Delegates to `inner`, and offers `inner`'s reads only through a reader that returns each
+/// once the [`ReadGate`] lets it through, as a socket returns bytes once they arrive. A read
+/// returned with no further read let through reports the transport drained and keeps the waker
+/// of its poll for the gate's next opening, as the native TCP reader does.
+pub(crate) struct GatedReaderTransport {
+    inner: Rc<dyn UniplexTransport>,
+    gate: Rc<ReadGate>,
+}
+
+impl GatedReaderTransport {
+    pub(crate) fn new(inner: Rc<dyn UniplexTransport>) -> (Rc<Self>, Rc<ReadGate>) {
+        let gate = Rc::new(ReadGate::default());
+        (
+            Rc::new(Self {
+                inner,
+                gate: Rc::clone(&gate),
+            }),
+            gate,
+        )
+    }
+
+    /// Runs `run` while opening the gate each time the reader waits for it, and returns the
+    /// run's output with the reader's (polls, reads).
+    pub(crate) async fn run_gated<T>(
+        gate: &ReadGate,
+        run: impl Future<Output = T>,
+    ) -> (T, (usize, usize)) {
+        let done = Cell::new(false);
+        let (output, ()) = futures::join!(
+            async {
+                let output = run.await;
+                done.set(true);
+                output
+            },
+            async {
+                while !done.get() {
+                    tokio::task::yield_now().await;
+                    if gate.waiting() {
+                        gate.open_one();
+                    }
+                }
+            }
+        );
+        (output, (gate.polls.get(), gate.reads.get()))
+    }
+}
+
+struct GatedReader {
+    inner: Rc<dyn UniplexTransport>,
+    context: WorkerContext,
+    timeout: Duration,
+    cancellation: CancellationToken,
+    gate: Rc<ReadGate>,
+    read: Option<LocalTransportFuture<Result<UniplexRead, HttpError>>>,
+    drained: bool,
+}
+
+impl UniplexReader for GatedReader {
+    fn start_read(&mut self, maximum: usize, allocation_size: usize) -> Result<(), HttpError> {
+        assert!(self.read.is_none(), "one read at a time");
+        self.drained = false;
+        self.read = Some(self.inner.read(
+            &self.context,
+            maximum,
+            allocation_size,
+            self.timeout,
+            self.cancellation.clone(),
+        ));
+        Ok(())
+    }
+
+    fn poll_read(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> Poll<Result<UniplexRead, HttpError>> {
+        if self.gate.open.get() == 0 {
+            self.gate.polls.set(self.gate.polls.get() + 1);
+            *self.gate.waker.borrow_mut() = Some(context.waker().clone());
+            return Poll::Pending;
+        }
+        let read = self.read.as_mut().expect("a polled read was started");
+        let result = std::task::ready!(read.as_mut().poll(context));
+        self.gate.polls.set(self.gate.polls.get() + 1);
+        self.read = None;
+        self.gate.open.set(self.gate.open.get() - 1);
+        self.gate.reads.set(self.gate.reads.get() + 1);
+        self.drained = self.gate.open.get() == 0 && matches!(&result, Ok(read) if !read.is_eof());
+        if self.drained {
+            *self.gate.waker.borrow_mut() = Some(context.waker().clone());
+        }
+        Poll::Ready(result)
+    }
+
+    fn is_drained(&self) -> bool {
+        self.drained
+    }
+}
+
+impl UniplexTransport for GatedReaderTransport {
+    fn try_write_queue(
+        &self,
+        context: &WorkerContext,
+        maximum_write_size: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<Option<Box<dyn crate::uniplex::UniplexWriteQueue>>, HttpError> {
+        self.inner
+            .try_write_queue(context, maximum_write_size, timeout, cancellation)
+    }
+
+    fn try_reader(
+        &self,
+        context: &WorkerContext,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<Option<Box<dyn UniplexReader>>, HttpError> {
+        Ok(Some(Box::new(GatedReader {
+            inner: Rc::clone(&self.inner),
+            context: context.clone(),
+            timeout,
+            cancellation,
+            gate: Rc::clone(&self.gate),
+            read: None,
+            drained: false,
+        })))
+    }
+
+    fn read(
+        &self,
+        _context: &WorkerContext,
+        _maximum: usize,
+        _allocation_size: usize,
+        _timeout: Duration,
+        _cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        panic!("a driver reads a transport that offers a reader only through it");
+    }
+
+    fn write(
+        &self,
+        context: &WorkerContext,
+        data: BufQueue,
+        flags: ByteEventWriteFlags,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        self.inner
+            .write(context, data, flags, timeout, cancellation)
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.shutdown_write(context)
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close_with_reset(context)
+    }
+
+    fn peer_identity(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<Option<roxygen_transport::byte_stream::PeerIdentity>, HttpError> {
+        self.inner.peer_identity(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.inner.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.inner.register_byte_event(context, registration)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum HandlerMode {
     Consume(u16, usize),

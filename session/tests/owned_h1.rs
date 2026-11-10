@@ -1004,6 +1004,62 @@ fn owned_h1_serves_a_get_on_a_manual_host() {
     assert!(probe.cancelled.is_empty());
 }
 
+/// H2-L6: after a read that drained the transport, the driver polls its reader again only once
+/// the reader's waker fires, so each read is polled once, after one poll that waited for the
+/// first bytes, and each request is answered on the kept-alive connection.
+#[test]
+fn owned_h1_polls_a_drained_reader_once_per_read() {
+    let request = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+    let reads = move || {
+        vec![
+            ReadAction::Data(request.to_vec()),
+            ReadAction::Data(request.to_vec()),
+            ReadAction::Data(request.to_vec()),
+            ReadAction::Eof,
+        ]
+    };
+    let responses = vec![
+        Response::fixed(200, b"one"),
+        Response::fixed(200, b"two"),
+        Response::fixed(200, b"six"),
+    ];
+    let (wire, counts) = run_on_host(move |context| {
+        Box::pin(async move {
+            let (scripted, state) = ScriptedTransport::new(reads());
+            let (transport, gate) = GatedReaderTransport::new(scripted);
+            let (application, _probes) = H1App::new(responses);
+            let (session, _handle) =
+                OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+            let turns = driver_turns();
+            let (result, counts) = GatedReaderTransport::run_gated(&gate, session.run()).await;
+            (wire_of(&state, result), (counts, driver_turns() - turns))
+        })
+    });
+    let (counts, turns) = counts;
+    assert_eq!(
+        counts,
+        (5, 4),
+        "(polls, reads): four reads, each polled once, after one poll that waited",
+    );
+    assert_eq!(
+        turns, 15,
+        "a drained reader makes no turn due; counting its read start as due would add an empty \
+         turn after each drained read (21)",
+    );
+    let response = |body: &str| {
+        format!(
+            "HTTP/1.1 200 \r\nDate: Tue, 03 Nov 2026 00:00:00 GMT\r\nConnection: keep-alive\r\n\
+             Content-Length: 3\r\n\r\n{body}"
+        )
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&wire.output),
+        [response("one"), response("two"), response("six")].concat(),
+    );
+    assert_eq!(wire.close, CloseKind::ShutdownWrite);
+    assert_eq!(wire.error, None);
+}
+
 /// The driver reads through the transport's reader when it offers one, and writes the same
 /// wire as when it reads through `read`.
 #[test]

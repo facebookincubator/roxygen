@@ -395,6 +395,56 @@ mod tcp_tls {
         fn prepare_reset(&self) {}
     }
 
+    /// A stream whose reads can report a drained stream, as plaintext TCP's do, whose first read
+    /// poll panics and whose later polls return `data` once.
+    struct FirstReadPanicStream {
+        panicked: bool,
+        data: Option<&'static [u8]>,
+    }
+
+    impl AsyncRead for FirstReadPanicStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if !std::mem::replace(&mut self.panicked, true) {
+                panic!("the first read poll panics");
+            }
+            match self.data.take() {
+                Some(data) => {
+                    buffer.put_slice(data);
+                    Poll::Ready(Ok(()))
+                }
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl AsyncWrite for FirstReadPanicStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl TokioByteStream for FirstReadPanicStream {
+        const READ_DRAINS: bool = true;
+
+        fn prepare_reset(&self) {}
+    }
+
     struct BackingProbeStream {
         read_payload: Box<[u8]>,
         read_offset: usize,
@@ -9263,12 +9313,15 @@ mod tcp_tls {
     }
 
     mod owned_reader {
+        use std::mem::ManuallyDrop;
         use std::task::RawWaker;
         use std::task::RawWakerVTable;
 
         use super::*;
+        use crate::byte_stream::OwnedReader;
         use crate::byte_stream::read_operations_for_test;
         use crate::byte_stream::read_queue_rebuilds_for_test;
+        use crate::byte_stream::read_registrations_for_test;
         use crate::tcp::io_read_futures_for_test;
         use crate::tcp_tls_tests::tcp_tls::native_write_queue::with_accepted_tcp;
 
@@ -9978,6 +10031,936 @@ mod tcp_tls {
                     "the 3 bytes arrive in the 7-byte first buffer",
                 );
                 assert_eq!(read_bytes(read), b"abc");
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// Starts a read through `poll_start_read` with `signal`'s waker, then polls it with that
+        /// waker until it is ready.
+        async fn read_through(
+            reader: &mut OwnedReader,
+            signal: &Arc<WakeSignal>,
+            maximum: usize,
+            allocation_size: usize,
+        ) -> Result<TransportRead, HttpError> {
+            let waker = Waker::from(Arc::clone(signal));
+            let mut context = Context::from_waker(&waker);
+            let mut polled = reader.poll_start_read(&mut context, maximum, allocation_size);
+            loop {
+                if let Poll::Ready(result) = polled {
+                    return result;
+                }
+                signal.wait().await;
+                polled = reader.poll_read(&mut context);
+            }
+        }
+
+        /// H2-L6: a read started and polled at once that ends at a short read reports the stream
+        /// drained, and the next bytes wake the waker of the poll that returned it. A read that
+        /// fills its maximum leaves the socket readable, so it does not report the stream drained.
+        #[test]
+        fn a_short_tcp_reader_read_reports_the_stream_drained() {
+            with_observed_tcp(
+                limits(),
+                |context, transport, mut peer, observer| async move {
+                    let mut reader = transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    let signal = Arc::new(WakeSignal::default());
+                    peer.write_all(b"one ").await.unwrap();
+                    wait_until_queued(&observer, 4).await;
+                    let read = read_through(&mut reader, &signal, 64, 64).await.unwrap();
+                    assert_eq!(read_bytes(read), b"one ");
+                    assert!(
+                        reader.is_drained(),
+                        "a 4-byte read of a 64-byte offer drains the socket",
+                    );
+
+                    signal.take();
+                    peer.write_all(b"two ").await.unwrap();
+                    time::timeout(Duration::from_secs(5), signal.wait())
+                        .await
+                        .expect("the next bytes wake the waker of the drained read's poll");
+
+                    // 104 bytes are queued, so an 8-byte read fills its maximum.
+                    let burst = pattern(100, 7);
+                    peer.write_all(&burst).await.unwrap();
+                    wait_until_queued(&observer, 104).await;
+                    let read = read_through(&mut reader, &signal, 8, 8).await.unwrap();
+                    assert_eq!(read_bytes(read), [&b"two "[..], &burst[..4]].concat());
+                    assert!(
+                        !reader.is_drained(),
+                        "a read that fills its maximum leaves the socket readable",
+                    );
+                    transport.close(&context).unwrap();
+                },
+            );
+        }
+
+        /// Reads 4 bytes through `poll_start_read` with `signal`'s waker, a read that drains the
+        /// socket, and clears the signal.
+        async fn drain_once(
+            reader: &mut OwnedReader,
+            signal: &Arc<WakeSignal>,
+            peer: &mut TcpStream,
+            observer: &std::net::TcpStream,
+        ) {
+            peer.write_all(b"one ").await.unwrap();
+            wait_until_queued(observer, 4).await;
+            let read = read_through(reader, signal, 64, 64).await.unwrap();
+            assert_eq!(read_bytes(read), b"one ");
+            assert!(reader.is_drained());
+            signal.take();
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum Ending {
+            Close,
+            Reset,
+            DropTransport,
+        }
+
+        /// H2-L6: a drained reader keeps its read registered with the waker of the poll that
+        /// drained the socket. Closing, resetting or dropping the transport therefore wakes that
+        /// waker and releases the socket's clone of it, as for a pending read, and the next read
+        /// observes the end.
+        fn ending_after_a_drained_read(ending: Ending) {
+            with_observed_tcp(
+                limits(),
+                move |context, transport, mut peer, observer| async move {
+                    let mut reader = transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    let signal = Arc::new(WakeSignal::default());
+                    drain_once(&mut reader, &signal, &mut peer, &observer).await;
+                    match ending {
+                        Ending::Close => transport.close(&context).unwrap(),
+                        Ending::Reset => transport.close_with_reset(&context).unwrap(),
+                        Ending::DropTransport => drop(transport),
+                    }
+                    assert!(
+                        signal.take(),
+                        "{ending:?} wakes the waker of the drained read's poll",
+                    );
+                    let waker = Waker::from(Arc::clone(&signal));
+                    let Poll::Ready(result) =
+                        reader.poll_start_read(&mut Context::from_waker(&waker), 64, 64)
+                    else {
+                        panic!("the next read observes the {ending:?} at once");
+                    };
+                    match ending {
+                        Ending::Close => assert!(result.unwrap().is_eof()),
+                        Ending::Reset => assert_eq!(
+                            result.unwrap_err().code(),
+                            HttpErrorCode::TRANSPORT_READ_ERROR
+                        ),
+                        Ending::DropTransport => {
+                            assert_eq!(result.unwrap_err().code(), HttpErrorCode::DROPPED)
+                        }
+                    }
+                    drop(waker);
+                    assert_eq!(
+                        Arc::strong_count(&signal),
+                        1,
+                        "the {ending:?} released every clone of the drained read's waker",
+                    );
+                },
+            );
+        }
+
+        #[test]
+        fn closing_after_a_drained_tcp_reader_read_wakes_the_reader() {
+            ending_after_a_drained_read(Ending::Close);
+        }
+
+        /// H2-L6: a drained reader's next drained read moves its registration to the waker of
+        /// that read's poll, as a pending read's poll moves it: a close then wakes that waker,
+        /// not an earlier one.
+        #[test]
+        fn closing_after_drained_reads_wakes_the_latest_drained_poll() {
+            with_observed_tcp(
+                limits(),
+                |context, transport, mut peer, observer| async move {
+                    let mut reader = transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    let first = Arc::new(WakeSignal::default());
+                    drain_once(&mut reader, &first, &mut peer, &observer).await;
+                    peer.write_all(b"two ").await.unwrap();
+                    time::timeout(Duration::from_secs(5), first.wait())
+                        .await
+                        .expect("the bytes wake the drained read's waker");
+                    let second = Arc::new(WakeSignal::default());
+                    let waker = Waker::from(Arc::clone(&second));
+                    let Poll::Ready(Ok(read)) =
+                        reader.poll_start_read(&mut Context::from_waker(&waker), 64, 64)
+                    else {
+                        panic!("the readable socket's bytes are read at once");
+                    };
+                    assert_eq!(read_bytes(read), b"two ");
+                    assert!(reader.is_drained());
+                    transport.close(&context).unwrap();
+                    assert!(
+                        second.take(),
+                        "closing wakes the latest drained poll's waker"
+                    );
+                    assert!(
+                        !first.take(),
+                        "closing does not wake an earlier poll's waker"
+                    );
+                },
+            );
+        }
+
+        #[test]
+        fn resetting_after_a_drained_tcp_reader_read_wakes_the_reader() {
+            ending_after_a_drained_read(Ending::Reset);
+        }
+
+        #[test]
+        fn dropping_the_transport_after_a_drained_tcp_reader_read_wakes_the_reader() {
+            ending_after_a_drained_read(Ending::DropTransport);
+        }
+
+        /// H2-L6: a drained reader's read stays registered, so an ordinary read is refused while
+        /// it is, as while a pending read is. Dropping the reader ends that registration as it
+        /// ends a pending read: the read is unregistered, the socket's clone of the waker is
+        /// released, and the transport's next read gets the next bytes.
+        #[test]
+        fn dropping_a_drained_tcp_reader_releases_its_registration() {
+            with_observed_tcp(
+                limits(),
+                |context, transport, mut peer, observer| async move {
+                    let mut reader = transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    let signal = Arc::new(WakeSignal::default());
+                    drain_once(&mut reader, &signal, &mut peer, &observer).await;
+                    assert!(
+                        transport.has_pending_read(&context).unwrap(),
+                        "a drained reader keeps its read registered",
+                    );
+                    assert_eq!(
+                        transport
+                            .read(&context, 64, 64, Duration::ZERO, CancellationToken::never())
+                            .await
+                            .unwrap_err()
+                            .code(),
+                        HttpErrorCode::INVALID_STATE_TRANSITION,
+                        "an ordinary read is refused while the drained read is registered",
+                    );
+                    drop(reader);
+                    assert!(!transport.has_pending_read(&context).unwrap());
+                    assert_eq!(
+                        Arc::strong_count(&signal),
+                        1,
+                        "dropping the reader released every clone of the drained read's waker",
+                    );
+                    peer.write_all(b"two ").await.unwrap();
+                    let read = transport
+                        .read(&context, 64, 64, Duration::ZERO, CancellationToken::never())
+                        .await
+                        .unwrap();
+                    assert_eq!(read_bytes(read), b"two ");
+                    transport.close(&context).unwrap();
+                },
+            );
+        }
+
+        /// H2-L6: `start_read` on a drained reader ends the drained registration as a cancelled
+        /// read ends, releasing the socket's clone of its waker, then starts the read it asks for.
+        #[test]
+        fn start_read_after_a_drained_tcp_reader_read_ends_its_registration() {
+            with_observed_tcp(
+                limits(),
+                |context, transport, mut peer, observer| async move {
+                    let mut reader = transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    let signal = Arc::new(WakeSignal::default());
+                    drain_once(&mut reader, &signal, &mut peer, &observer).await;
+                    reader.start_read(64, 64).unwrap();
+                    assert!(!reader.is_drained());
+                    assert!(transport.has_pending_read(&context).unwrap());
+                    assert_eq!(
+                        Arc::strong_count(&signal),
+                        1,
+                        "the ended registration released every clone of its waker",
+                    );
+                    peer.write_all(b"two ").await.unwrap();
+                    let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                    assert_eq!(read_bytes(read), b"two ");
+                    assert!(
+                        !reader.is_drained(),
+                        "start_read reads never report drained"
+                    );
+                    transport.close(&context).unwrap();
+                },
+            );
+        }
+
+        /// H2-L6: reads started and polled at once register no read per read. The first drained
+        /// read registers the reader's read once and the reads after it reuse that registration
+        /// while they find bytes, where `start_read` registers each read.
+        #[test]
+        fn tcp_reader_reads_polled_at_once_reuse_one_registration() {
+            with_observed_tcp(
+                limits(),
+                |context, transport, mut peer, observer| async move {
+                    let mut reader = transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    let signal = Arc::new(WakeSignal::default());
+                    let registrations = read_registrations_for_test();
+                    for chunk in [&b"one "[..], b"two ", b"six "] {
+                        peer.write_all(chunk).await.unwrap();
+                        wait_until_queued(&observer, chunk.len()).await;
+                        let read = read_through(&mut reader, &signal, 64, 64).await.unwrap();
+                        assert_eq!(read_bytes(read), chunk);
+                        assert!(reader.is_drained());
+                    }
+                    assert_eq!(
+                        read_registrations_for_test(),
+                        registrations + 1,
+                        "three drained reads share one registration",
+                    );
+                    drop(reader);
+
+                    // Control: `start_read` registers each read.
+                    let mut reader = transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    let registrations = read_registrations_for_test();
+                    for chunk in [&b"ten "[..], b"two "] {
+                        peer.write_all(chunk).await.unwrap();
+                        reader.start_read(64, 64).unwrap();
+                        let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                        assert_eq!(read_bytes(read), chunk);
+                    }
+                    assert_eq!(read_registrations_for_test(), registrations + 2);
+                    transport.close(&context).unwrap();
+                },
+            );
+        }
+
+        /// A read started and polled at once that finds no bytes pends registered, as a started
+        /// read does: another start is refused, and the next bytes wake and complete it.
+        #[test]
+        fn a_tcp_reader_read_polled_at_once_without_bytes_pends_registered() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                let signal = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&signal));
+                let mut context_ = Context::from_waker(&waker);
+                assert!(reader.poll_start_read(&mut context_, 64, 64).is_pending());
+                assert!(transport.has_pending_read(&context).unwrap());
+                assert_eq!(
+                    reader.start_read(64, 64).unwrap_err().code(),
+                    HttpErrorCode::INVALID_STATE_TRANSITION,
+                );
+                let Poll::Ready(Err(error)) = reader.poll_start_read(&mut context_, 64, 64) else {
+                    panic!("a second read is refused while the first pends");
+                };
+                assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+                peer.write_all(b"late").await.unwrap();
+                time::timeout(Duration::from_secs(5), signal.wait())
+                    .await
+                    .expect("the bytes wake the pending read");
+                let Poll::Ready(Ok(read)) = reader.poll_read(&mut context_) else {
+                    panic!("the woken read completes");
+                };
+                assert_eq!(read_bytes(read), b"late");
+                assert!(reader.is_drained());
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// Reads started and polled at once keep `read`'s entry results and clamps: an empty read
+        /// for a zero maximum, a zero allocation size refused, a read refused while an ordinary
+        /// read pends, the maximum clamped to the transport's limit, a cancelled reader refused,
+        /// and EOF after a graceful close.
+        #[test]
+        fn tcp_reader_reads_polled_at_once_keep_reads_entry_results() {
+            with_observed_tcp(
+                limits(),
+                |context, transport, mut peer, observer| async move {
+                    let mut reader = transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    let noop = &mut Context::from_waker(Waker::noop());
+                    let Poll::Ready(Ok(empty)) = reader.poll_start_read(noop, 0, 0) else {
+                        panic!("a zero maximum reads nothing at once");
+                    };
+                    assert_eq!(empty.bytes_read(), 0);
+                    assert!(!empty.is_eof());
+                    let Poll::Ready(Err(error)) = reader.poll_start_read(noop, 64, 0) else {
+                        panic!("a zero allocation size is refused at once");
+                    };
+                    assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+
+                    let mut pending = transport.read(
+                        &context,
+                        64,
+                        64,
+                        Duration::ZERO,
+                        CancellationToken::never(),
+                    );
+                    assert!(poll_once(pending.as_mut()).is_pending());
+                    let Poll::Ready(Err(error)) = reader.poll_start_read(noop, 64, 64) else {
+                        panic!("a read is refused while an ordinary read pends");
+                    };
+                    assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+                    drop(pending);
+
+                    // `limits()` caps reads at 64 bytes.
+                    let burst = pattern(100, 1);
+                    peer.write_all(&burst).await.unwrap();
+                    wait_until_queued(&observer, burst.len()).await;
+                    let signal = Arc::new(WakeSignal::default());
+                    let read = read_through(&mut reader, &signal, 200, 4_000)
+                        .await
+                        .unwrap();
+                    assert_eq!(read.data().limit(), 64);
+                    assert!(read_bytes(read) == burst[..64]);
+                    assert!(
+                        !reader.is_drained(),
+                        "a full read leaves the socket readable"
+                    );
+                    let read = read_through(&mut reader, &signal, 64, 64).await.unwrap();
+                    assert!(read_bytes(read) == burst[64..]);
+                    assert!(reader.is_drained());
+                    // A drained reader's next read is clamped as well.
+                    peer.write_all(&burst).await.unwrap();
+                    wait_until_queued(&observer, burst.len()).await;
+                    let read = read_through(&mut reader, &signal, 200, 4_000)
+                        .await
+                        .unwrap();
+                    assert_eq!(read.data().limit(), 64);
+                    assert!(read_bytes(read) == burst[..64]);
+                    let read = read_through(&mut reader, &signal, 64, 64).await.unwrap();
+                    assert!(read_bytes(read) == burst[64..]);
+
+                    let cancel = CancellationSource::new();
+                    let mut cancelled = transport
+                        .reader(&context, Duration::ZERO, cancel.token())
+                        .unwrap()
+                        .unwrap();
+                    cancel.request_cancellation();
+                    let Poll::Ready(Err(error)) = cancelled.poll_start_read(noop, 64, 64) else {
+                        panic!("a cancelled reader refuses a read at once");
+                    };
+                    assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+
+                    let mut idle = transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    drop(reader);
+                    transport.close(&context).unwrap();
+                    let Poll::Ready(Ok(eof)) = idle.poll_start_read(noop, 64, 64) else {
+                        panic!("a closed transport reads EOF at once");
+                    };
+                    assert!(eof.is_eof());
+                },
+            );
+        }
+
+        /// A read started and polled at once that pends registers its reader's cancellation
+        /// wake, as a pending poll of a started read does: cancelling wakes it and fails it.
+        #[test]
+        fn a_cancellation_wakes_and_fails_a_pending_tcp_reader_read_polled_at_once() {
+            with_accepted_tcp(limits(), |context, transport, _peer| async move {
+                let cancel = CancellationSource::new();
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, cancel.token())
+                    .unwrap()
+                    .unwrap();
+                let signal = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&signal));
+                let mut context_ = Context::from_waker(&waker);
+                assert!(reader.poll_start_read(&mut context_, 64, 64).is_pending());
+                cancel.request_cancellation();
+                assert!(signal.take(), "cancelling the pending read wakes its waker");
+                let Poll::Ready(Err(error)) = reader.poll_read(&mut context_) else {
+                    panic!("the woken read observes its cancellation");
+                };
+                assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+                assert!(!transport.has_pending_read(&context).unwrap());
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// H2-L6: a drained reader's cancellation wake follows the waker of the poll that
+        /// drained the socket, as it follows that of a pending poll: cancelling wakes that waker,
+        /// not an earlier one, and the next read fails with `CORO_CANCELLED`, releasing every
+        /// clone of the waker.
+        #[test]
+        fn a_cancellation_wakes_a_drained_tcp_reader_and_fails_its_next_read() {
+            with_observed_tcp(
+                limits(),
+                |context, transport, mut peer, observer| async move {
+                    let cancel = CancellationSource::new();
+                    let mut reader = transport
+                        .reader(&context, Duration::ZERO, cancel.token())
+                        .unwrap()
+                        .unwrap();
+                    let first = Arc::new(WakeSignal::default());
+                    drain_once(&mut reader, &first, &mut peer, &observer).await;
+                    // The bytes wake the first waker, so the socket is readable when the second
+                    // polls, and that poll reads them at once and drains the socket again.
+                    peer.write_all(b"two ").await.unwrap();
+                    time::timeout(Duration::from_secs(5), first.wait())
+                        .await
+                        .expect("the bytes wake the drained read's waker");
+                    let second = Arc::new(WakeSignal::default());
+                    let waker = Waker::from(Arc::clone(&second));
+                    let Poll::Ready(Ok(read)) =
+                        reader.poll_start_read(&mut Context::from_waker(&waker), 64, 64)
+                    else {
+                        panic!("the readable socket's bytes are read at once");
+                    };
+                    assert_eq!(read_bytes(read), b"two ");
+                    assert!(reader.is_drained());
+
+                    cancel.request_cancellation();
+                    assert!(
+                        second.take(),
+                        "cancelling wakes the waker of the drained read's poll",
+                    );
+                    assert!(!first.take(), "the earlier waker is not woken");
+                    let Poll::Ready(Err(error)) =
+                        reader.poll_start_read(&mut Context::from_waker(&waker), 64, 64)
+                    else {
+                        panic!("the next read observes the cancellation");
+                    };
+                    assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+                    assert!(!reader.is_drained());
+                    assert!(!transport.has_pending_read(&context).unwrap());
+                    drop(waker);
+                    assert_eq!(
+                        Arc::strong_count(&second),
+                        1,
+                        "the cancelled read released every clone of its waker",
+                    );
+                    transport.close(&context).unwrap();
+                },
+            );
+        }
+
+        /// A read started and polled at once whose first socket poll panics stays started, as a
+        /// started read whose poll panics does: it stays registered, another start is refused,
+        /// and the next poll finishes the same read.
+        #[test]
+        fn a_reader_read_polled_at_once_whose_poll_panics_stays_started() {
+            Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(LocalSet::new().run_until(async move {
+                    let (worker, driver) = WorkerDriver::new(8).unwrap();
+                    let call = worker
+                        .call_local(|context| async move {
+                            let transport = owned_from_stream(
+                                &context,
+                                FirstReadPanicStream {
+                                    panicked: false,
+                                    data: Some(b"data"),
+                                },
+                                SocketAddress::new("127.0.0.1", 1000),
+                                SocketAddress::new("127.0.0.1", 2000),
+                                None,
+                                limits(),
+                            )
+                            .unwrap();
+                            let mut reader = transport
+                                .reader(&context, Duration::ZERO, CancellationToken::never())
+                                .unwrap()
+                                .unwrap();
+                            let panic = catch_unwind(AssertUnwindSafe(|| {
+                                reader.poll_start_read(
+                                    &mut Context::from_waker(Waker::noop()),
+                                    64,
+                                    64,
+                                )
+                            }))
+                            .expect_err("the socket poll's panic surfaces from the read");
+                            assert_eq!(
+                                panic.downcast_ref::<&str>(),
+                                Some(&"the first read poll panics")
+                            );
+                            assert!(
+                                transport.has_pending_read(&context).unwrap(),
+                                "the read whose poll panicked stays registered",
+                            );
+                            assert_eq!(
+                                reader.start_read(64, 64).unwrap_err().code(),
+                                HttpErrorCode::INVALID_STATE_TRANSITION,
+                                "the read whose poll panicked is still started",
+                            );
+                            let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
+                            assert_eq!(read_bytes(read), b"data");
+                            assert!(!transport.has_pending_read(&context).unwrap());
+                            transport.close(&context).unwrap();
+                        })
+                        .unwrap();
+                    let driver_task = tokio::task::spawn_local(driver);
+                    time::timeout(Duration::from_secs(5), call)
+                        .await
+                        .expect("the panicking read test is bounded")
+                        .unwrap();
+                    worker.begin_shutdown();
+                    driver_task.await.unwrap();
+                }));
+        }
+
+        /// The state of a `hooked_waker`, whose strong count counts the waker's clones. Its wakes
+        /// set `signal`. The first clone after `cancel_on_clone` is set requests that
+        /// cancellation, and once `drops_before_panic` is set, the drop after that many more drops
+        /// panics; a wake that consumes a clone is not a drop.
+        #[derive(Default)]
+        struct HookedWake {
+            signal: Arc<WakeSignal>,
+            cancel_on_clone: Mutex<Option<CancellationSource>>,
+            drops_before_panic: Mutex<Option<usize>>,
+        }
+
+        const HOOKED_WAKER: RawWakerVTable =
+            RawWakerVTable::new(clone_hooked, wake_hooked, wake_hooked_by_ref, drop_hooked);
+
+        fn hooked_waker(hooked: &Arc<HookedWake>) -> Waker {
+            fn shareable<T: Send + Sync>(_: &T) {}
+            shareable(&**hooked);
+            let data = Arc::into_raw(Arc::clone(hooked)).cast::<()>();
+            // SAFETY: `data` is a strong reference of an `Arc<HookedWake>`, which the waker owns:
+            // each `HOOKED_WAKER` function takes a new reference for a clone and releases the
+            // waker's own when it consumes the waker, so `data` stays valid while any clone
+            // lives. `HookedWake` is `Send + Sync`, so the functions can run on any thread.
+            unsafe { Waker::from_raw(RawWaker::new(data, &HOOKED_WAKER)) }
+        }
+
+        /// # Safety
+        ///
+        /// `data` is a strong reference of an `Arc<HookedWake>` that the calling waker owns
+        /// (`hooked_waker`).
+        unsafe fn clone_hooked(data: *const ()) -> RawWaker {
+            // SAFETY: `data` is a live `Arc<HookedWake>` reference, per the contract;
+            // `ManuallyDrop` leaves it with the calling waker.
+            let hooked = ManuallyDrop::new(unsafe { Arc::from_raw(data.cast::<HookedWake>()) });
+            let cancel = hooked.cancel_on_clone.lock().unwrap().take();
+            if let Some(cancel) = cancel {
+                cancel.request_cancellation();
+            }
+            RawWaker::new(
+                Arc::into_raw(Arc::clone(&hooked)).cast::<()>(),
+                &HOOKED_WAKER,
+            )
+        }
+
+        /// # Safety
+        ///
+        /// As `clone_hooked`; the wake consumes the waker's reference.
+        unsafe fn wake_hooked(data: *const ()) {
+            // SAFETY: `data` is a live `Arc<HookedWake>` reference, per the contract, which the
+            // consumed waker gives up here.
+            let hooked = unsafe { Arc::from_raw(data.cast::<HookedWake>()) };
+            hooked.signal.wake_by_ref();
+        }
+
+        /// # Safety
+        ///
+        /// As `clone_hooked`.
+        unsafe fn wake_hooked_by_ref(data: *const ()) {
+            // SAFETY: `data` is a live `Arc<HookedWake>` reference, per the contract;
+            // `ManuallyDrop` leaves it with the calling waker.
+            let hooked = ManuallyDrop::new(unsafe { Arc::from_raw(data.cast::<HookedWake>()) });
+            hooked.signal.wake_by_ref();
+        }
+
+        /// # Safety
+        ///
+        /// As `clone_hooked`; the drop releases the waker's reference.
+        unsafe fn drop_hooked(data: *const ()) {
+            // SAFETY: `data` is a live `Arc<HookedWake>` reference, per the contract, which the
+            // dropped waker gives up here.
+            let hooked = unsafe { Arc::from_raw(data.cast::<HookedWake>()) };
+            let panics = {
+                let mut drops = hooked.drops_before_panic.lock().unwrap();
+                let panics = *drops == Some(0);
+                *drops = drops.and_then(|remaining| remaining.checked_sub(1));
+                panics
+            };
+            drop(hooked);
+            if panics {
+                panic!("the hooked waker's drop panics");
+            }
+        }
+
+        /// H2-L6: a cancellation requested before a drained reader's next read finds bytes loses
+        /// to those bytes, but that read's readiness poll registered its waker with the socket.
+        /// As the cancellation leaves the read not drained, the read ends its registration as a
+        /// cancelled read ends, which releases that clone: once the reader is dropped, the open
+        /// transport holds no clone of the waker.
+        #[test]
+        fn a_cancellation_overtaking_a_drained_tcp_reader_read_with_bytes_releases_its_waker() {
+            with_observed_tcp(
+                limits(),
+                |context, transport, mut peer, observer| async move {
+                    let cancel = CancellationSource::new();
+                    let mut reader = transport
+                        .reader(&context, Duration::ZERO, cancel.token())
+                        .unwrap()
+                        .unwrap();
+                    let first = Arc::new(WakeSignal::default());
+                    drain_once(&mut reader, &first, &mut peer, &observer).await;
+                    peer.write_all(b"two ").await.unwrap();
+                    time::timeout(Duration::from_secs(5), first.wait())
+                        .await
+                        .expect("the bytes wake the drained read's waker");
+                    cancel.request_cancellation();
+
+                    let second = Arc::new(WakeSignal::default());
+                    let waker = Waker::from(Arc::clone(&second));
+                    let Poll::Ready(Ok(read)) =
+                        reader.poll_start_read(&mut Context::from_waker(&waker), 64, 64)
+                    else {
+                        panic!("the bytes win over the cancellation");
+                    };
+                    assert_eq!(read_bytes(read), b"two ");
+                    assert!(
+                        !reader.is_drained(),
+                        "a read that a cancellation overtook is not drained",
+                    );
+                    assert!(!transport.has_pending_read(&context).unwrap());
+                    drop(reader);
+                    drop(waker);
+                    assert_eq!(
+                        Arc::strong_count(&second),
+                        1,
+                        "the open transport holds no clone of the overtaken read's waker",
+                    );
+                    transport.close(&context).unwrap();
+                },
+            );
+        }
+
+        /// H2-L6: as for a drained reader's next read, a cancellation requested before a pending
+        /// read polled at once finds bytes loses to them, and the read releases the waker that
+        /// its readiness poll registered with the socket.
+        #[test]
+        fn a_cancellation_overtaking_a_pending_tcp_reader_read_with_bytes_releases_its_waker() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let cancel = CancellationSource::new();
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, cancel.token())
+                    .unwrap()
+                    .unwrap();
+                let signal = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&signal));
+                let mut context_ = Context::from_waker(&waker);
+                assert!(reader.poll_start_read(&mut context_, 64, 64).is_pending());
+                peer.write_all(b"late").await.unwrap();
+                time::timeout(Duration::from_secs(5), signal.wait())
+                    .await
+                    .expect("the bytes wake the pending read");
+                cancel.request_cancellation();
+
+                let Poll::Ready(Ok(read)) = reader.poll_read(&mut context_) else {
+                    panic!("the bytes win over the cancellation");
+                };
+                assert_eq!(read_bytes(read), b"late");
+                assert!(
+                    !reader.is_drained(),
+                    "a read that a cancellation overtook is not drained",
+                );
+                assert!(!transport.has_pending_read(&context).unwrap());
+                drop(reader);
+                drop(waker);
+                assert_eq!(
+                    Arc::strong_count(&signal),
+                    1,
+                    "the open transport holds no clone of the overtaken read's waker",
+                );
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// H2-L6: a cancellation requested while an idle reader's read polled at once is under
+        /// way, here by its readiness poll's clone of the waker, loses to the bytes that read
+        /// found, and the read releases the waker that the poll registered with the socket.
+        #[test]
+        fn a_cancellation_during_an_idle_tcp_reader_read_with_bytes_releases_its_waker() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let cancel = CancellationSource::new();
+                let token = cancel.token();
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, cancel.token())
+                    .unwrap()
+                    .unwrap();
+                // A started read that fills its 4-byte maximum leaves the socket readable, and
+                // the reader idle.
+                reader.start_read(4, 4).unwrap();
+                let signal = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&signal));
+                let mut context_ = Context::from_waker(&waker);
+                assert!(reader.poll_read(&mut context_).is_pending());
+                peer.write_all(b"one two ").await.unwrap();
+                time::timeout(Duration::from_secs(5), signal.wait())
+                    .await
+                    .expect("the bytes wake the started read");
+                let Poll::Ready(Ok(read)) = reader.poll_read(&mut context_) else {
+                    panic!("the woken read completes");
+                };
+                assert_eq!(read_bytes(read), b"one ");
+
+                let hooked = Arc::new(HookedWake::default());
+                *hooked.cancel_on_clone.lock().unwrap() = Some(cancel);
+                let hooked_waker = hooked_waker(&hooked);
+                let Poll::Ready(Ok(read)) =
+                    reader.poll_start_read(&mut Context::from_waker(&hooked_waker), 64, 64)
+                else {
+                    panic!("the bytes win over the cancellation");
+                };
+                assert!(
+                    token.is_cancellation_requested(),
+                    "the read's readiness poll cloned the waker",
+                );
+                assert_eq!(read_bytes(read), b"two ");
+                assert!(
+                    !reader.is_drained(),
+                    "a read that a cancellation overtook is not drained",
+                );
+                assert!(!transport.has_pending_read(&context).unwrap());
+                drop(reader);
+                drop(hooked_waker);
+                assert_eq!(
+                    Arc::strong_count(&hooked),
+                    1,
+                    "the open transport holds no clone of the overtaken read's waker",
+                );
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// A read started and polled at once that pends stays started when updating the reader's
+        /// cancellation wake panics, here at the drop of the waker the update replaces: the read
+        /// stays registered, another start is refused, and the next poll resumes it.
+        #[test]
+        fn a_reader_read_polled_at_once_whose_cancellation_wake_update_panics_stays_started() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let cancel = CancellationSource::new();
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, cancel.token())
+                    .unwrap()
+                    .unwrap();
+                // The reader's cancellation wake keeps the waker of a started read's pending poll
+                // after that read returns.
+                let hooked = Arc::new(HookedWake::default());
+                let hooked_waker = hooked_waker(&hooked);
+                let mut hooked_context = Context::from_waker(&hooked_waker);
+                reader.start_read(64, 64).unwrap();
+                assert!(reader.poll_read(&mut hooked_context).is_pending());
+                peer.write_all(b"one ").await.unwrap();
+                time::timeout(Duration::from_secs(5), hooked.signal.wait())
+                    .await
+                    .expect("the bytes wake the started read");
+                let Poll::Ready(Ok(read)) = reader.poll_read(&mut hooked_context) else {
+                    panic!("the woken read completes");
+                };
+                assert_eq!(read_bytes(read), b"one ");
+
+                *hooked.drops_before_panic.lock().unwrap() = Some(0);
+                let signal = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&signal));
+                let mut context_ = Context::from_waker(&waker);
+                let panic = catch_unwind(AssertUnwindSafe(|| {
+                    reader.poll_start_read(&mut context_, 64, 64)
+                }))
+                .expect_err("the replaced cancellation waker's drop panics");
+                assert_eq!(
+                    panic.downcast_ref::<&str>(),
+                    Some(&"the hooked waker's drop panics")
+                );
+                assert!(
+                    reader.poll_read(&mut context_).is_pending(),
+                    "the read whose wake update panicked is still started",
+                );
+                assert!(transport.has_pending_read(&context).unwrap());
+                assert_eq!(
+                    reader.start_read(64, 64).unwrap_err().code(),
+                    HttpErrorCode::INVALID_STATE_TRANSITION,
+                );
+                peer.write_all(b"two ").await.unwrap();
+                time::timeout(Duration::from_secs(5), signal.wait())
+                    .await
+                    .expect("the bytes wake the resumed read");
+                let Poll::Ready(Ok(read)) = reader.poll_read(&mut context_) else {
+                    panic!("the resumed read completes");
+                };
+                assert_eq!(read_bytes(read), b"two ");
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// H2-L6: a pending read polled at once whose bytes drain the socket is the reader's
+        /// drained read before it updates the reader's cancellation wake, so when that update
+        /// panics, here at the drop of the waker it replaces, the reader is drained, its read
+        /// registered, and its next read finds the next bytes.
+        #[test]
+        fn a_drained_tcp_reader_read_whose_cancellation_wake_update_panics_stays_drained() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let cancel = CancellationSource::new();
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, cancel.token())
+                    .unwrap()
+                    .unwrap();
+                let hooked = Arc::new(HookedWake::default());
+                let hooked_waker = hooked_waker(&hooked);
+                assert!(
+                    reader
+                        .poll_start_read(&mut Context::from_waker(&hooked_waker), 64, 64)
+                        .is_pending()
+                );
+                peer.write_all(b"one ").await.unwrap();
+                time::timeout(Duration::from_secs(5), hooked.signal.wait())
+                    .await
+                    .expect("the bytes wake the pending read");
+
+                // The woken read's poll first moves the read's registration off the hooked
+                // waker; the drop after that one, of the cancellation wake's clone, panics.
+                *hooked.drops_before_panic.lock().unwrap() = Some(1);
+                let signal = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&signal));
+                let mut context_ = Context::from_waker(&waker);
+                let panic = catch_unwind(AssertUnwindSafe(|| reader.poll_read(&mut context_)))
+                    .expect_err("the replaced cancellation waker's drop panics");
+                assert_eq!(
+                    panic.downcast_ref::<&str>(),
+                    Some(&"the hooked waker's drop panics")
+                );
+                assert!(
+                    reader.is_drained(),
+                    "the read whose wake update panicked is the drained read",
+                );
+                assert!(transport.has_pending_read(&context).unwrap());
+                peer.write_all(b"two ").await.unwrap();
+                time::timeout(Duration::from_secs(5), signal.wait())
+                    .await
+                    .expect("the bytes wake the drained read's waker");
+                let Poll::Ready(Ok(read)) = reader.poll_start_read(&mut context_, 64, 64) else {
+                    panic!("the drained reader's next read finds the bytes");
+                };
+                assert_eq!(read_bytes(read), b"two ");
                 transport.close(&context).unwrap();
             });
         }

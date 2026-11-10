@@ -622,6 +622,57 @@ struct Wire {
     error: Option<HttpErrorCode>,
 }
 
+/// H2-L6: after a read that drained the transport, the driver polls its reader again only once
+/// the reader's waker fires, so each read of a response that arrives in three reads is polled
+/// once, after one poll that waited for the first bytes.
+#[test]
+fn owned_h1_upstream_polls_a_drained_reader_once_per_read() {
+    let (read, counts) = run_on_host(move |context| {
+        Box::pin(async move {
+            let (scripted, _state) = ScriptedTransport::new([
+                ReadAction::Data(b"HTTP/1.1 200 OK\r\n".to_vec()),
+                ReadAction::Data(b"Content-Length: 2\r\n\r\n".to_vec()),
+                ReadAction::Data(b"ok".to_vec()),
+                ReadAction::Eof,
+            ]);
+            let (transport, gate) = GatedReaderTransport::new(scripted);
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            let turns = driver_turns();
+            let ((run, read), counts) = GatedReaderTransport::run_gated(&gate, async {
+                futures::join!(session.run(), async {
+                    let (_stream, mut source, _control) =
+                        submission.await.unwrap().into_source_parts();
+                    read_response(&mut source).await
+                })
+            })
+            .await;
+            run.unwrap();
+            (read, (counts, driver_turns() - turns))
+        })
+    });
+    let (counts, turns) = counts;
+    assert_eq!(
+        counts,
+        (5, 4),
+        "(polls, reads): four reads, each polled once, after one poll that waited",
+    );
+    assert_eq!(
+        turns, 8,
+        "a drained reader makes no turn due; counting its read start as due would add an empty \
+         turn after each drained read (11)",
+    );
+    assert_eq!(read.statuses, [200]);
+    assert_eq!(read.body, b"ok");
+    assert!(read.eom);
+    assert_eq!(read.error, None);
+}
+
 /// The driver reads through the transport's reader when it offers one, with the same outcome as
 /// when it reads through `read`.
 #[test]

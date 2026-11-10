@@ -184,6 +184,8 @@ impl ByteStreamLimits {
 pub struct TransportRead {
     data: BufQueue,
     eof: bool,
+    /// The read drained its stream ([`OwnedReader::is_drained`]).
+    drained: bool,
 }
 
 impl TransportRead {
@@ -194,7 +196,7 @@ impl TransportRead {
     /// reads again at once after an empty result without `eof`, so a transport
     /// that returns one while idle spins instead of reaching its read timeout.
     pub fn new(data: BufQueue, eof: bool) -> Self {
-        Self { data, eof }
+        Self::from_io(data, eof)
     }
 
     pub fn bytes_read(&self) -> usize {
@@ -214,21 +216,25 @@ impl TransportRead {
     }
 
     fn empty() -> Self {
-        Self {
-            data: BufQueue::new(0),
-            eof: false,
-        }
+        Self::from_io(BufQueue::new(0), false)
     }
 
     fn eof() -> Self {
-        Self {
-            data: BufQueue::new(0),
-            eof: true,
-        }
+        Self::from_io(BufQueue::new(0), true)
     }
 
     pub(crate) fn from_io(data: BufQueue, eof: bool) -> Self {
-        Self { data, eof }
+        Self {
+            data,
+            eof,
+            drained: false,
+        }
+    }
+
+    /// Marks a backend read that drained its stream (`PolledReader::poll_read`).
+    pub(crate) fn with_drained(mut self, drained: bool) -> Self {
+        self.drained = drained;
+        self
     }
 }
 
@@ -389,9 +395,15 @@ pub trait ByteStreamTransport: 'static {
 /// between reads (`DIV-018`), where a `read` starts a new buffer. A
 /// cancellation wakes a pending read, as a timed read's wait does. The reader
 /// registers that wake once for all its reads, so a cancellation requested
-/// while no read is started wakes the task that last polled a pending read
-/// (`DIV-018`). Dropping the reader with a read started cancels that read, as
-/// dropping a read future does.
+/// while no read is started wakes the task that last polled a pending read,
+/// or that last received a drained read (`DIV-018`). Dropping the reader with
+/// a read started, or drained, cancels that read, as dropping a read future
+/// does.
+///
+/// Over plaintext TCP, a read started and polled at once (`poll_start_read`)
+/// registers nothing with the transport when it is ready at once. One that
+/// drains the socket (`is_drained`) stays registered until the next, so that
+/// the owner can wait for the socket without polling a new read.
 pub struct OwnedReader {
     worker: WorkerHandle,
     limits: ByteStreamLimits,
@@ -399,6 +411,9 @@ pub struct OwnedReader {
     cancellation: ReaderCancellation,
     /// The started read, until `poll_read` returns its result.
     read: ReaderRead,
+    /// The backend's reader when its reads can report a drained stream, which
+    /// `poll_start_read` polls before registering a read.
+    polled: Option<Weak<dyn PolledReader>>,
     /// The operation slot. Every read reuses it, with its transport handles.
     operation: ReadOperation,
 }
@@ -406,10 +421,17 @@ pub struct OwnedReader {
 /// The read an [`OwnedReader`] has started.
 enum ReaderRead {
     Idle,
-    /// The operation slot holds the read.
-    Reading,
+    /// The operation slot holds the read; `arm`: `poll_start_read` started it,
+    /// so its backend reports whether it drains the stream.
+    Reading {
+        arm: bool,
+    },
     /// The read ended at entry with this result.
     Finished(Result<TransportRead, HttpError>),
+    /// The read last returned drained the stream. No read is started, but the
+    /// operation slot keeps that read registered with the transport, with the
+    /// waker of the poll that returned it, as a pending read is registered.
+    Drained,
 }
 
 /// An [`OwnedReader`]'s cancellation: its token, and the one wake registration
@@ -435,11 +457,15 @@ impl OwnedReader {
     /// `allocation_size` bytes, with `read`'s entry checks and clamps. An error
     /// is interface misuse: a started read has not yet been returned.
     pub fn start_read(&mut self, maximum: usize, allocation_size: usize) -> Result<(), HttpError> {
-        if !matches!(self.read, ReaderRead::Idle) {
-            return Err(HttpError::with_message(
-                HttpErrorCode::INVALID_STATE_TRANSITION,
-                b"owned reader already has a started read",
-            ));
+        match self.read {
+            ReaderRead::Idle => {}
+            ReaderRead::Drained => self.end_drained(),
+            ReaderRead::Reading { .. } | ReaderRead::Finished(_) => {
+                return Err(HttpError::with_message(
+                    HttpErrorCode::INVALID_STATE_TRANSITION,
+                    b"owned reader already has a started read",
+                ));
+            }
         }
         let target = ReadTarget {
             io: &self.operation.io,
@@ -462,7 +488,7 @@ impl OwnedReader {
                 allocation_size,
             } => {
                 self.operation.restart(operation, maximum, allocation_size);
-                self.read = ReaderRead::Reading;
+                self.read = ReaderRead::Reading { arm: false };
             }
             ReadStart::Finished(result) => self.read = ReaderRead::Finished(result),
         }
@@ -476,12 +502,18 @@ impl OwnedReader {
         context: &mut Context<'_>,
     ) -> Poll<Result<TransportRead, HttpError>> {
         match self.read {
-            ReaderRead::Reading => {
-                let result = ready!(
-                    self.operation
-                        .poll_with(context, Some(&mut self.cancellation))
-                );
-                self.read = ReaderRead::Idle;
+            ReaderRead::Reading { arm } => {
+                let result = ready!(self.operation.poll_with(
+                    context,
+                    Some(&mut self.cancellation),
+                    arm
+                ));
+                if is_drained(&result) {
+                    self.read = ReaderRead::Drained;
+                    self.settle_drained(context);
+                } else {
+                    self.read = ReaderRead::Idle;
+                }
                 Poll::Ready(result)
             }
             ReaderRead::Finished(_) => {
@@ -492,11 +524,202 @@ impl OwnedReader {
                 };
                 Poll::Ready(result)
             }
-            ReaderRead::Idle => Poll::Ready(Err(HttpError::with_message(
+            ReaderRead::Idle | ReaderRead::Drained => Poll::Ready(Err(HttpError::with_message(
                 HttpErrorCode::INVALID_STATE_TRANSITION,
                 b"owned reader has no started read",
             ))),
         }
+    }
+
+    /// Starts a read as `start_read` does and polls it at once with
+    /// `context`'s waker, as `poll_read` does. Starting one while a read is
+    /// started is interface misuse, refused with an error.
+    ///
+    /// Over plaintext TCP, a read that is ready at once is never registered
+    /// with the transport. A drained reader's next read (`is_drained`) instead
+    /// reuses the registration that stands for the drained read, as the next
+    /// poll of a pending read would: it ends at a close, reset or drop of the
+    /// transport, observes the reader's cancellation if it pends, and otherwise
+    /// polls the socket with the bounds given here, clamped as `read` clamps
+    /// them.
+    pub fn poll_start_read(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: usize,
+        allocation_size: usize,
+    ) -> Poll<Result<TransportRead, HttpError>> {
+        let polled = match self.read {
+            ReaderRead::Idle => self.polled.as_ref().and_then(Weak::upgrade),
+            ReaderRead::Drained => return self.poll_drained(context, maximum, allocation_size),
+            ReaderRead::Reading { .. } | ReaderRead::Finished(_) => None,
+        };
+        let Some(polled) = polled else {
+            if let Err(error) = self.start_read(maximum, allocation_size) {
+                return Poll::Ready(Err(error));
+            }
+            if let ReaderRead::Reading { arm } = &mut self.read {
+                *arm = true;
+            }
+            return self.poll_read(context);
+        };
+        let target = ReadTarget {
+            io: &self.operation.io,
+            state: &self.operation.state,
+            worker: &self.worker,
+            limits: self.limits,
+        };
+        let (maximum, allocation_size, ()) = match admit_read(
+            target,
+            &self.context,
+            maximum,
+            allocation_size,
+            &self.cancellation.token,
+            |_| (),
+        ) {
+            Ok(admitted) => admitted,
+            Err(result) => return Poll::Ready(result),
+        };
+        match polled.try_read(context, maximum, allocation_size) {
+            TryRead::Ready(result) => {
+                let result = bounded_read(result, maximum, allocation_size);
+                if is_drained(&result) {
+                    self.register_read(polled, context, maximum, allocation_size);
+                    self.read = ReaderRead::Drained;
+                    self.settle_drained(context);
+                }
+                Poll::Ready(deliver_read(&self.operation.state, result))
+            }
+            TryRead::Pending => {
+                self.register_read(polled, context, maximum, allocation_size);
+                self.pend(context)
+            }
+            TryRead::Panicked(panic) => {
+                self.register_read(polled, context, maximum, allocation_size);
+                self.read = ReaderRead::Reading { arm: true };
+                resume_unwind(panic)
+            }
+        }
+    }
+
+    /// `poll_start_read` for a drained reader, whose read is still registered.
+    fn poll_drained(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: usize,
+        allocation_size: usize,
+    ) -> Poll<Result<TransportRead, HttpError>> {
+        if let Some(result) = self.operation.closed() {
+            self.read = ReaderRead::Idle;
+            return Poll::Ready(result);
+        }
+        // A read with no bounds ends at entry, after the drained registration.
+        let Some(polled) = self
+            .polled
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .filter(|_| maximum != 0 && allocation_size != 0)
+        else {
+            self.end_drained();
+            return self.poll_start_read(context, maximum, allocation_size);
+        };
+        let maximum = maximum.min(self.limits.maximum_read_size);
+        let allocation_size = allocation_size.min(maximum);
+        match polled.try_read(context, maximum, allocation_size) {
+            TryRead::Ready(result) => {
+                let result = bounded_read(result, maximum, allocation_size);
+                if !is_drained(&result) {
+                    self.operation.finish(None);
+                    self.read = ReaderRead::Idle;
+                } else if self.settle_drained(context) {
+                    self.operation.rewake(context);
+                }
+                Poll::Ready(deliver_read(&self.operation.state, result))
+            }
+            TryRead::Pending => {
+                self.operation.rebound(maximum, allocation_size);
+                self.operation.rewake(context);
+                self.pend(context)
+            }
+            TryRead::Panicked(panic) => {
+                self.operation.rebound(maximum, allocation_size);
+                self.operation.rewake(context);
+                self.read = ReaderRead::Reading { arm: true };
+                resume_unwind(panic)
+            }
+        }
+    }
+
+    /// Leaves the registered read pending, as a pending poll of a started read
+    /// does: the reader's cancellation wake follows `context`'s waker, and a
+    /// cancellation already requested fails the read. The read is started
+    /// before that update, which can unwind.
+    fn pend(&mut self, context: &Context<'_>) -> Poll<Result<TransportRead, HttpError>> {
+        self.read = ReaderRead::Reading { arm: true };
+        if self.cancellation.listener.update_waker(context.waker()) {
+            self.operation.finish(Some(HttpErrorCode::CORO_CANCELLED));
+            self.read = ReaderRead::Idle;
+            return Poll::Ready(Err(cancelled_error(b"byte-stream read cancelled")));
+        }
+        Poll::Pending
+    }
+
+    /// Settles the drained read that the reader holds registered, and returns
+    /// whether it stays drained: the reader's cancellation wake then follows
+    /// `context`'s waker, as for a pending read. A cancellation already
+    /// requested instead ends the registration as a cancelled read ends, which
+    /// releases the waker that the read's readiness poll left with the socket.
+    fn settle_drained(&mut self, context: &Context<'_>) -> bool {
+        if !self.cancellation.listener.update_waker(context.waker()) {
+            return true;
+        }
+        self.end_drained();
+        false
+    }
+
+    /// Registers a read that `try_read` started or drained, with `context`'s
+    /// waker.
+    fn register_read(
+        &mut self,
+        polled: Rc<dyn PolledReader>,
+        context: &Context<'_>,
+        maximum: usize,
+        allocation_size: usize,
+    ) {
+        let operation = {
+            let mut state = self.operation.state.borrow_mut();
+            debug_assert!(state.active_read.is_none(), "the read was admitted");
+            let operation = state.next_operation();
+            state.active_read = Some(ActiveRead {
+                operation,
+                drive: ReadDrive::Untimed {
+                    io: ActiveReadIo::Polled(PolledReadIo(polled)),
+                },
+                waker: Some(context.waker().clone()),
+            });
+            operation
+        };
+        #[cfg(test)]
+        record_read_registration();
+        self.operation.restart(operation, maximum, allocation_size);
+    }
+
+    /// Whether the read that `poll_start_read` last returned drained the
+    /// stream: it gathered bytes, with no error or EOF, and left the socket
+    /// unreadable. The waker of the poll that returned it is then registered
+    /// for the socket's next readiness, and the read stays registered with the
+    /// transport with that waker, so a close, reset or drop of the transport,
+    /// or a cancellation, wakes it as it wakes a pending read. Only plaintext
+    /// TCP reads report it.
+    pub fn is_drained(&self) -> bool {
+        matches!(self.read, ReaderRead::Drained)
+    }
+
+    /// Ends the drained read's registration as a cancelled read ends, which
+    /// releases the socket's waker.
+    #[cold]
+    fn end_drained(&mut self) {
+        self.operation.finish(Some(HttpErrorCode::CORO_CANCELLED));
+        self.read = ReaderRead::Idle;
     }
 }
 
@@ -942,10 +1165,15 @@ enum ActiveReadIo {
 }
 
 impl ActiveReadIo {
-    fn poll(&mut self, context: &mut Context<'_>) -> Poll<Result<TransportRead, HttpError>> {
+    /// Polls the read; `arm` as `PolledReader::poll_read`.
+    fn poll(
+        &mut self,
+        context: &mut Context<'_>,
+        arm: bool,
+    ) -> Poll<Result<TransportRead, HttpError>> {
         match self {
             Self::Future(future) => future.as_mut().poll(context),
-            Self::Polled(polled) => polled.0.poll_read(context),
+            Self::Polled(polled) => polled.0.poll_read(context, arm),
         }
     }
 
@@ -985,8 +1213,26 @@ impl Drop for PolledReadIo {
 pub(crate) trait PolledReader {
     fn start_read(&self, maximum: usize, allocation_size: usize);
 
-    /// `Ready` ends the read.
-    fn poll_read(&self, context: &mut Context<'_>) -> Poll<Result<TransportRead, HttpError>>;
+    /// `Ready` ends the read. With `arm`, a read that gathered bytes with no
+    /// error or EOF polls the stream's read readiness once more with
+    /// `context`'s waker; when the stream is not readable, which registers that
+    /// waker, the read is marked drained (`TransportRead::with_drained`).
+    fn poll_read(
+        &self,
+        context: &mut Context<'_>,
+        arm: bool,
+    ) -> Poll<Result<TransportRead, HttpError>>;
+
+    /// Starts a read and polls it at once, armed as `poll_read` is.
+    fn try_read(
+        &self,
+        context: &mut Context<'_>,
+        maximum: usize,
+        allocation_size: usize,
+    ) -> TryRead;
+
+    /// Whether its reads can report a drained stream.
+    fn reports_drained(&self) -> bool;
 
     /// Detaches the unfinished read's state, then calls `cancel` once, keeping
     /// that state until `cancel` returns or unwinds. `cancel` can start a
@@ -1016,12 +1262,25 @@ std::thread_local! {
     static READER_WAKE_REGISTRATIONS: Cell<usize> = const { Cell::new(0) };
     static READ_QUEUE_REBUILDS: Cell<usize> = const { Cell::new(0) };
     static READ_OPERATIONS: Cell<usize> = const { Cell::new(0) };
+    static READ_REGISTRATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// `ReadOperation`s built on this thread.
 #[cfg(test)]
 pub(crate) fn read_operations_for_test() -> usize {
     READ_OPERATIONS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn record_read_registration() {
+    READ_REGISTRATIONS.with(|count| count.set(count.get() + 1));
+}
+
+/// Reads registered with their transport (`TransportState::active_read`) on
+/// this thread.
+#[cfg(test)]
+pub(crate) fn read_registrations_for_test() -> usize {
+    READ_REGISTRATIONS.with(Cell::get)
 }
 
 /// Read-direction deadline batons built on this thread.
@@ -1361,6 +1620,18 @@ pub(crate) trait QueuedWriter {
 
     /// Ends an unfinished write, as dropping `ByteStreamIo::write`'s future does.
     fn retire_write(&self);
+}
+
+/// How a [`PolledReader::try_read`] attempt ended.
+pub(crate) enum TryRead {
+    /// The read finished with this result.
+    Ready(Result<TransportRead, HttpError>),
+    /// The read pends, and the backend holds it as after `start_read` and a
+    /// pending `poll_read`.
+    Pending,
+    /// The poll panicked, and the caller resumes `panic`. The backend holds the
+    /// read as for `Pending`, as after a `poll_read` that panicked.
+    Panicked(TransportPanic),
 }
 
 /// How a [`QueuedWriter::write_through`] attempt ended.
@@ -2011,6 +2282,57 @@ impl ReadKind<'_> {
     }
 }
 
+/// `read`'s entry checks and clamps: the clamped bounds of a read that the
+/// transport admits, with the result of `admit`, which runs under the same
+/// borrow of the transport's state, or the result the read ends with at entry.
+/// Inlined into each caller.
+#[inline(always)]
+fn admit_read<T>(
+    target: ReadTarget<'_>,
+    context: &WorkerContext,
+    maximum: usize,
+    allocation_size: usize,
+    cancellation: &CancellationToken,
+    admit: impl FnOnce(&mut TransportState) -> T,
+) -> Result<(usize, usize, T), Result<TransportRead, HttpError>> {
+    target.check_context(context).map_err(Err)?;
+    if cancellation.is_cancellation_requested() {
+        return Err(Err(cancelled_error(
+            b"byte-stream read cancelled before entry",
+        )));
+    }
+    if maximum == 0 {
+        return Err(Ok(TransportRead::empty()));
+    }
+    if allocation_size == 0 {
+        return Err(Err(HttpError::with_message(
+            HttpErrorCode::INVALID_STATE_TRANSITION,
+            b"byte-stream read allocation size must be non-zero",
+        )));
+    }
+
+    let maximum = maximum.min(target.limits.maximum_read_size);
+    let allocation_size = allocation_size.min(maximum);
+    let mut state = target.state.borrow_mut();
+    match state.close_state {
+        CloseState::Open => {}
+        CloseState::Graceful => return Err(Ok(TransportRead::eof())),
+        CloseState::Reset => return Err(Err(read_error(b"byte-stream was reset"))),
+        CloseState::Dropped => return Err(Err(dropped_error())),
+    }
+    if state.deferred_eof {
+        state.deferred_eof = false;
+        return Err(Ok(TransportRead::eof()));
+    }
+    if state.active_read.is_some() {
+        return Err(Err(HttpError::with_message(
+            HttpErrorCode::INVALID_STATE_TRANSITION,
+            b"byte-stream already has a pending read",
+        )));
+    }
+    Ok((maximum, allocation_size, admit(&mut state)))
+}
+
 /// Inlined into each caller, which then compiles for its own `kind`.
 #[inline(always)]
 fn start_read_operation(
@@ -2020,51 +2342,16 @@ fn start_read_operation(
     allocation_size: usize,
     kind: ReadKind<'_>,
 ) -> ReadStart {
-    if let Err(error) = target.check_context(context) {
-        return ReadStart::Finished(Err(error));
-    }
-    if kind.cancellation().is_cancellation_requested() {
-        return ReadStart::Finished(Err(cancelled_error(
-            b"byte-stream read cancelled before entry",
-        )));
-    }
-    if maximum == 0 {
-        return ReadStart::Finished(Ok(TransportRead::empty()));
-    }
-    if allocation_size == 0 {
-        return ReadStart::Finished(Err(HttpError::with_message(
-            HttpErrorCode::INVALID_STATE_TRANSITION,
-            b"byte-stream read allocation size must be non-zero",
-        )));
-    }
-
-    let maximum = maximum.min(target.limits.maximum_read_size);
-    let allocation_size = allocation_size.min(maximum);
-    let operation = {
-        let mut state = target.state.borrow_mut();
-        match state.close_state {
-            CloseState::Open => {}
-            CloseState::Graceful => {
-                return ReadStart::Finished(Ok(TransportRead::eof()));
-            }
-            CloseState::Reset => {
-                return ReadStart::Finished(Err(read_error(b"byte-stream was reset")));
-            }
-            CloseState::Dropped => {
-                return ReadStart::Finished(Err(dropped_error()));
-            }
-        }
-        if state.deferred_eof {
-            state.deferred_eof = false;
-            return ReadStart::Finished(Ok(TransportRead::eof()));
-        }
-        if state.active_read.is_some() {
-            return ReadStart::Finished(Err(HttpError::with_message(
-                HttpErrorCode::INVALID_STATE_TRANSITION,
-                b"byte-stream already has a pending read",
-            )));
-        }
-        state.next_operation()
+    let (maximum, allocation_size, operation) = match admit_read(
+        target,
+        context,
+        maximum,
+        allocation_size,
+        kind.cancellation(),
+        TransportState::next_operation,
+    ) {
+        Ok(admitted) => admitted,
+        Err(result) => return ReadStart::Finished(result),
     };
 
     let Some(io) = target.io.upgrade() else {
@@ -2097,6 +2384,8 @@ fn start_read_operation(
             ReadDrive::Untimed { io }
         }
     };
+    #[cfg(test)]
+    record_read_registration();
     target.state.borrow_mut().active_read = Some(ActiveRead {
         operation,
         drive,
@@ -2723,6 +3012,12 @@ impl ByteStreamTransport for OwnedByteStream {
             context: context.clone(),
             cancellation: ReaderCancellation::new(cancellation),
             read: ReaderRead::Idle,
+            polled: self
+                .io
+                .upgrade()
+                .and_then(|io| io.polled_reader())
+                .filter(|reader| reader.reports_drained())
+                .map(|reader| Rc::downgrade(&reader)),
             operation: ReadOperation::idle(self.io.clone(), Rc::clone(&self.state)),
         }))
     }
@@ -2862,32 +3157,25 @@ impl Future for ReadOperation {
     type Output = Result<TransportRead, HttpError>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        self.get_mut().poll_with(context, None)
+        self.get_mut().poll_with(context, None, false)
     }
 }
 
 impl ReadOperation {
     /// Polls the read. An [`OwnedReader`]'s read observes `reader`'s
-    /// cancellation; an ordinary read passes none. Inlined into each caller,
-    /// which then compiles for its own kind of read.
+    /// cancellation, and with `arm` its backend reports whether the read
+    /// drained the stream (`PolledReader::poll_read`); an ordinary read passes
+    /// neither. Inlined into each caller, which then compiles for its own kind
+    /// of read.
     #[inline(always)]
     fn poll_with(
         &mut self,
         context: &mut Context<'_>,
         reader: Option<&mut ReaderCancellation>,
+        arm: bool,
     ) -> Poll<Result<TransportRead, HttpError>> {
-        let close_state = {
-            let state = self.state.borrow();
-            state.assert_owner();
-            state.close_state
-        };
-        if let Some(error) = Self::close_error(close_state) {
-            self.finish(None);
-            return Poll::Ready(Err(error));
-        }
-        if close_state == CloseState::Graceful {
-            self.finish(None);
-            return Poll::Ready(Ok(TransportRead::eof()));
+        if let Some(result) = self.closed() {
+            return Poll::Ready(result);
         }
 
         enum ReadPoll {
@@ -2941,7 +3229,7 @@ impl ReadOperation {
                 ReadDrive::Untimed { io } => {
                     let reader =
                         reader.expect("an OwnedReader read polls with its reader's cancellation");
-                    let io = io.poll(context);
+                    let io = io.poll(context, arm);
                     let cancelled = if io.is_pending() {
                         reader.listener.update_waker(context.waker())
                     } else {
@@ -2971,21 +3259,100 @@ impl ReadOperation {
             }
             ReadPoll::Io(result) => result,
         };
-        self.finish(None);
-        let result = match result {
-            Ok(result) => normalize_read(result, self.maximum, self.allocation_size),
-            Err(error) => Err(error),
-        };
-        match result {
-            Ok(result) if result.is_eof() && result.bytes_read() != 0 => {
-                self.state.borrow_mut().deferred_eof = true;
-                Poll::Ready(Ok(TransportRead::from_io(result.into_data(), false)))
-            }
-            Ok(result) if !result.is_eof() && result.bytes_read() == 0 => Poll::Ready(Err(
-                read_error(b"byte-stream adapter made no read progress"),
-            )),
-            result => Poll::Ready(result),
+        let result = bounded_read(result, self.maximum, self.allocation_size);
+        // A read that drained its stream stays registered, for its reader to
+        // settle (`OwnedReader::settle_drained`).
+        if !(arm && is_drained(&result)) {
+            self.finish(None);
         }
+        Poll::Ready(deliver_read(&self.state, result))
+    }
+
+    /// Finishes the read and returns its result if the transport is closed,
+    /// reset or dropped.
+    #[inline(always)]
+    fn closed(&mut self) -> Option<Result<TransportRead, HttpError>> {
+        let close_state = {
+            let state = self.state.borrow();
+            state.assert_owner();
+            state.close_state
+        };
+        if let Some(error) = Self::close_error(close_state) {
+            self.finish(None);
+            return Some(Err(error));
+        }
+        if close_state == CloseState::Graceful {
+            self.finish(None);
+            return Some(Ok(TransportRead::eof()));
+        }
+        None
+    }
+
+    /// Makes the read's registration, if the transport still holds it, wake
+    /// `context`'s waker.
+    fn rewake(&self, context: &Context<'_>) {
+        let replaced = {
+            let mut state = self.state.borrow_mut();
+            let Some(active) = state
+                .active_read
+                .as_mut()
+                .filter(|active| active.operation == self.operation)
+            else {
+                return;
+            };
+            if active
+                .waker
+                .as_ref()
+                .is_some_and(|stored| stored.will_wake(context.waker()))
+            {
+                return;
+            }
+            active.waker.replace(context.waker().clone())
+        };
+        drop(replaced);
+    }
+
+    /// Gives the registered read the bounds of the read it now holds.
+    fn rebound(&mut self, maximum: usize, allocation_size: usize) {
+        debug_assert!(!self.complete, "only a registered read is rebounded");
+        self.maximum = maximum;
+        self.allocation_size = allocation_size;
+    }
+}
+
+/// A completed read's result within its bounds (`normalize_read`).
+#[inline(always)]
+fn bounded_read(
+    result: Result<TransportRead, HttpError>,
+    maximum: usize,
+    allocation_size: usize,
+) -> Result<TransportRead, HttpError> {
+    match result {
+        Ok(result) => normalize_read(result, maximum, allocation_size),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_drained(result: &Result<TransportRead, HttpError>) -> bool {
+    matches!(result, Ok(read) if read.drained)
+}
+
+/// What a completed read returns: an EOF that arrives with bytes is deferred to
+/// the next read, and a read with neither bytes nor EOF fails.
+#[inline(always)]
+fn deliver_read(
+    state: &RefCell<TransportState>,
+    result: Result<TransportRead, HttpError>,
+) -> Result<TransportRead, HttpError> {
+    match result {
+        Ok(result) if result.is_eof() && result.bytes_read() != 0 => {
+            state.borrow_mut().deferred_eof = true;
+            Ok(TransportRead::from_io(result.into_data(), false))
+        }
+        Ok(result) if !result.is_eof() && result.bytes_read() == 0 => {
+            Err(read_error(b"byte-stream adapter made no read progress"))
+        }
+        result => result,
     }
 }
 
@@ -3307,6 +3674,7 @@ fn normalize_read(
             b"byte-stream adapter exceeded the requested read bound",
         ));
     }
+    let drained = result.drained;
     let fits = result
         .data()
         .segments()
@@ -3323,7 +3691,7 @@ fn normalize_read(
         bounded
             .append(&mut data)
             .map_err(|_| read_error(b"byte-stream read buffer exceeded its bound"))?;
-        return Ok(TransportRead::from_io(bounded, eof));
+        return Ok(TransportRead::from_io(bounded, eof).with_drained(drained));
     }
     for mut segment in data.into_bytes_segments() {
         while segment.len() > allocation_size {
@@ -3335,7 +3703,7 @@ fn normalize_read(
             .push_bytes(segment)
             .map_err(|_| read_error(b"byte-stream read buffer exceeded its bound"))?;
     }
-    Ok(TransportRead::from_io(bounded, eof))
+    Ok(TransportRead::from_io(bounded, eof).with_drained(drained))
 }
 
 fn cancelled_error(message: &'static [u8]) -> HttpError {

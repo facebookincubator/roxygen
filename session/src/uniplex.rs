@@ -109,6 +109,7 @@ use roxygen_transport::byte_stream::LocalTransportFuture;
 use roxygen_transport::byte_stream::OwnedReader;
 use roxygen_transport::byte_stream::OwnedWriteQueue;
 use roxygen_transport::byte_stream::PeerIdentity;
+use roxygen_transport::byte_stream::TransportRead;
 use roxygen_transport::byte_stream::TransportWriteError;
 use roxygen_transport::byte_stream::WriteInfo;
 use tokio::sync::futures::Notified;
@@ -279,6 +280,27 @@ pub trait UniplexReader: 'static {
     fn start_read(&mut self, maximum: usize, allocation_size: usize) -> Result<(), HttpError>;
     /// Registers the owner waker and returns the started read's result once it is ready.
     fn poll_read(&mut self, context: &mut Context<'_>) -> Poll<Result<UniplexRead, HttpError>>;
+
+    /// Starts a read as `start_read` does and polls it at once, as `poll_read` does.
+    fn poll_start_read(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: usize,
+        allocation_size: usize,
+    ) -> Poll<Result<UniplexRead, HttpError>> {
+        if let Err(error) = self.start_read(maximum, allocation_size) {
+            return Poll::Ready(Err(error));
+        }
+        self.poll_read(context)
+    }
+
+    /// Whether the read last returned drained the transport: a read started now would pend, and
+    /// the waker of the poll that returned it is woken once the transport is readable, closed,
+    /// reset or dropped, or the reader's cancellation is requested. The owner then starts its
+    /// next read only once that waker fires. The default reports nothing.
+    fn is_drained(&self) -> bool {
+        false
+    }
 }
 
 /// The native byte stream's poll-based reader (`ByteStreamTransport::reader`).
@@ -288,13 +310,28 @@ impl UniplexReader for OwnedReader {
     }
 
     fn poll_read(&mut self, context: &mut Context<'_>) -> Poll<Result<UniplexRead, HttpError>> {
-        OwnedReader::poll_read(self, context).map(|result| {
-            result.map(|read| {
-                let eof = read.is_eof();
-                UniplexRead::new(read.into_data(), eof)
-            })
-        })
+        OwnedReader::poll_read(self, context).map(uniplex_read)
     }
+
+    fn poll_start_read(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: usize,
+        allocation_size: usize,
+    ) -> Poll<Result<UniplexRead, HttpError>> {
+        OwnedReader::poll_start_read(self, context, maximum, allocation_size).map(uniplex_read)
+    }
+
+    fn is_drained(&self) -> bool {
+        OwnedReader::is_drained(self)
+    }
+}
+
+fn uniplex_read(result: Result<TransportRead, HttpError>) -> Result<UniplexRead, HttpError> {
+    result.map(|read| {
+        let eof = read.is_eof();
+        UniplexRead::new(read.into_data(), eof)
+    })
 }
 
 /// Byte-stream surface used by the uniplex loops.

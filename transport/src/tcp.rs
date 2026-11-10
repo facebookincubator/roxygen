@@ -61,6 +61,7 @@ use crate::byte_stream::QueuedWriter;
 use crate::byte_stream::TransportPanic;
 use crate::byte_stream::TransportRead;
 use crate::byte_stream::TransportRetirement;
+use crate::byte_stream::TryRead;
 use crate::byte_stream::WriteProgress;
 use crate::byte_stream::WriteThrough;
 use crate::byte_stream::finish_transport_panic;
@@ -610,6 +611,9 @@ pub(crate) trait TokioByteStream: AsyncRead + AsyncWrite + Unpin + 'static {
     /// stream: plaintext TCP.
     const WRITE_QUEUE: bool = false;
 
+    /// Whether `poll_read_drained` can report a drained stream: plaintext TCP.
+    const READ_DRAINS: bool = false;
+
     fn prepare_reset(&self);
 
     fn prepare_write_timeout(&mut self, _timeout: Duration) {}
@@ -663,6 +667,14 @@ pub(crate) trait TokioByteStream: AsyncRead + AsyncWrite + Unpin + 'static {
     }
 
     fn cancel_read(&mut self) {}
+
+    /// Called after a reader read that gathered bytes with no error or EOF:
+    /// whether the stream is drained, its read readiness cleared, in which
+    /// case this poll registered `context`'s waker for the next. The default
+    /// reports nothing.
+    fn poll_read_drained(&self, _context: &mut Context<'_>) -> bool {
+        false
+    }
 
     fn enable_zero_copy(&self, _context: &WorkerContext, _threshold: usize) -> io::Result<bool> {
         Ok(false)
@@ -734,6 +746,7 @@ pub(crate) trait TokioByteStream: AsyncRead + AsyncWrite + Unpin + 'static {
 
 impl TokioByteStream for TcpStream {
     const WRITE_QUEUE: bool = true;
+    const READ_DRAINS: bool = true;
 
     fn prepare_reset(&self) {
         #[expect(
@@ -779,6 +792,22 @@ impl TokioByteStream for TcpStream {
     fn cancel_read(&mut self) {
         release_read_waker(self);
     }
+
+    /// Tokio clears a socket's read readiness at a read shorter than its
+    /// buffer, or one that would block; its readiness poll then registers
+    /// `context`'s waker. The budget is ignored so that the poll reports the
+    /// reactor's readiness.
+    fn poll_read_drained(&self, context: &mut Context<'_>) -> bool {
+        poll_tcp_drained(self, context)
+    }
+}
+
+fn poll_tcp_drained(stream: &TcpStream, context: &mut Context<'_>) -> bool {
+    pin!(coop::unconstrained(poll_fn(|context| {
+        stream.poll_read_ready(context)
+    })))
+    .poll(context)
+    .is_pending()
 }
 
 /// Tokio keeps the waker of a pending read until the socket becomes readable
@@ -859,6 +888,7 @@ impl AsyncWrite for AcceptedTcpStream {
 
 impl TokioByteStream for AcceptedTcpStream {
     const WRITE_QUEUE: bool = true;
+    const READ_DRAINS: bool = true;
 
     fn prepare_reset(&self) {
         #[expect(
@@ -893,6 +923,10 @@ impl TokioByteStream for AcceptedTcpStream {
 
     fn cancel_read(&mut self) {
         release_read_waker(&self.stream);
+    }
+
+    fn poll_read_drained(&self, context: &mut Context<'_>) -> bool {
+        poll_tcp_drained(&self.stream, context)
     }
 
     fn enable_zero_copy(&self, _context: &WorkerContext, threshold: usize) -> io::Result<bool> {
@@ -1029,6 +1063,7 @@ impl<S: TokioByteStream> AsyncWrite for ObservedStream<S> {
 
 impl<S: TokioByteStream> TokioByteStream for ObservedStream<S> {
     const WRITE_QUEUE: bool = S::WRITE_QUEUE;
+    const READ_DRAINS: bool = S::READ_DRAINS;
 
     fn prepare_reset(&self) {
         self.stream().prepare_reset();
@@ -1063,6 +1098,10 @@ impl<S: TokioByteStream> TokioByteStream for ObservedStream<S> {
 
     fn cancel_read(&mut self) {
         self.stream_mut().cancel_read();
+    }
+
+    fn poll_read_drained(&self, context: &mut Context<'_>) -> bool {
+        self.stream().poll_read_drained(context)
     }
 
     fn enable_zero_copy(&self, context: &WorkerContext, threshold: usize) -> io::Result<bool> {
@@ -1742,12 +1781,14 @@ impl IoRead {
 /// Polls a `PolledReader` read with the steps of `ByteStreamIo::read`'s
 /// future: a read error deferred from the previous read, else at most
 /// `maximum` gathered bytes (`DIV-016`), the first of them in `room` when the
-/// stream reuses it.
+/// stream reuses it. With `arm`, gathered bytes with no error or EOF poll
+/// whether the stream is drained (`TokioByteStream::poll_read_drained`).
 fn poll_io_read<S>(
     shared: &TokioIoShared<S>,
     context: &mut Context<'_>,
     io: &mut IoRead,
     room: &mut ReadRoom,
+    arm: bool,
 ) -> Poll<Result<TransportRead, HttpError>>
 where
     S: TokioByteStream,
@@ -1766,19 +1807,27 @@ where
             read.insert(OwnedRead::new(*maximum))
         }
     };
-    let ended = ready!({
+    let (ended, drained) = {
         let mut stream = shared.stream.borrow_mut();
         match stream.as_mut() {
-            Some(stream) => stream
-                .poll_read_reusing(context, *maximum, *allocation_size, gathered, room)
-                .map_err(read_io_error),
-            None => Poll::Ready(Err(dropped_error())),
+            Some(stream) => {
+                let ended = ready!(
+                    stream
+                        .poll_read_reusing(context, *maximum, *allocation_size, gathered, room)
+                        .map_err(read_io_error)
+                );
+                let drained =
+                    arm && matches!(ended, Ok(false)) && stream.poll_read_drained(context);
+                (ended, drained)
+            }
+            None => (Err(dropped_error()), false),
         }
-    });
+    };
     let read = read.take().expect("a polled read holds its gathered bytes");
     Poll::Ready(
-        read_eof(shared, &read, ended)
-            .and_then(|eof| Ok(TransportRead::from_io(read.into_data()?, eof))),
+        read_eof(shared, &read, ended).and_then(|eof| {
+            Ok(TransportRead::from_io(read.into_data()?, eof).with_drained(drained))
+        }),
     )
 }
 
@@ -1795,17 +1844,50 @@ where
         assert!(replaced.is_none(), "a polled read ended before the next");
     }
 
-    fn poll_read(&self, context: &mut Context<'_>) -> Poll<Result<TransportRead, HttpError>> {
+    fn poll_read(
+        &self,
+        context: &mut Context<'_>,
+        arm: bool,
+    ) -> Poll<Result<TransportRead, HttpError>> {
         let polled = {
             let mut polled = self.polled_read.borrow_mut();
             let PolledRead { read, room } = &mut *polled;
             let read = read.as_mut().expect("a polled read is active");
-            poll_io_read(self, context, read, room)
+            poll_io_read(self, context, read, room, arm)
         };
         if polled.is_ready() {
             self.retire_read();
         }
         polled
+    }
+
+    fn try_read(
+        &self,
+        context: &mut Context<'_>,
+        maximum: usize,
+        allocation_size: usize,
+    ) -> TryRead {
+        let mut io = IoRead::new(maximum, allocation_size);
+        let attempt = catch_unwind(AssertUnwindSafe(|| {
+            let mut polled = self.polled_read.borrow_mut();
+            debug_assert!(polled.read.is_none(), "a polled read ended before the next");
+            poll_io_read(self, context, &mut io, &mut polled.room, true)
+        }));
+        match attempt {
+            Ok(Poll::Ready(result)) => TryRead::Ready(result),
+            Ok(Poll::Pending) => {
+                self.polled_read.borrow_mut().read = Some(io);
+                TryRead::Pending
+            }
+            Err(panic) => {
+                self.polled_read.borrow_mut().read = Some(io);
+                TryRead::Panicked(panic)
+            }
+        }
+    }
+
+    fn reports_drained(&self) -> bool {
+        S::READ_DRAINS
     }
 
     fn cancel_read(&self, cancel: &mut dyn FnMut()) {

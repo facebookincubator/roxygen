@@ -1672,7 +1672,7 @@ impl UpstreamDriver {
                     Some(exchange) => exchange.cancel_requested(),
                     None => self.shared.cancelled(),
                 })
-            || (!self.read.is_reading() && self.read_capacity() != 0)
+            || (!self.read.is_reading() && !self.read.is_drained() && self.read_capacity() != 0)
             || (self.fatal.is_none()
                 && (self.admission_due() || (!self.ingress.is_empty() && self.exchange.is_none())))
             || self.parse_due()
@@ -2245,23 +2245,26 @@ impl UpstreamDriver {
     }
 
     fn poll_read_once(&mut self) -> Option<ReadPoll> {
-        if !self.read.is_reading() {
-            let maximum = self.read_capacity();
-            if maximum != 0 {
-                self.read.start(
-                    self.transport.as_ref(),
-                    &self.context,
-                    maximum,
-                    self.config.read_allocation_size.min(maximum),
-                );
-                self.read_wake.mark();
+        let polled = if self.read.is_reading() {
+            if !self.read_wake.take_ready() {
+                return None;
             }
-        }
-        if !self.read.is_reading() || !self.read_wake.take_ready() {
-            return None;
-        }
-        let mut context = Context::from_waker(&self.read_waker);
-        let Poll::Ready(result) = self.read.poll(&mut context) else {
+            self.read.poll(&mut Context::from_waker(&self.read_waker))
+        } else {
+            let maximum = self.read_capacity();
+            // A drained reader's next read waits for its waker (`ReadSlot::is_drained`).
+            if maximum == 0 || (!self.read_wake.take_ready() && self.read.is_drained()) {
+                return None;
+            }
+            self.read.poll_start(
+                self.transport.as_ref(),
+                &self.context,
+                &mut Context::from_waker(&self.read_waker),
+                maximum,
+                self.config.read_allocation_size.min(maximum),
+            )
+        };
+        let Poll::Ready(result) = polled else {
             return Some(ReadPoll::Pending);
         };
         match result {

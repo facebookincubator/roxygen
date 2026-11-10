@@ -111,6 +111,9 @@ pub(crate) struct ReadSlot {
     timeout: Duration,
     cancellation: CancellationToken,
     read: Option<SlotRead>,
+    /// The read last returned drained the transport (`UniplexReader::is_drained`): a read started
+    /// before the waker of the poll that returned it fires would pend.
+    drained: bool,
 }
 
 /// A started read.
@@ -133,6 +136,7 @@ impl ReadSlot {
             timeout,
             cancellation,
             read: None,
+            drained: false,
         })
     }
 
@@ -141,29 +145,46 @@ impl ReadSlot {
         self.read.is_some()
     }
 
-    /// Starts a read of at most `maximum` bytes that first offers `allocation_size` bytes.
-    pub(crate) fn start(
+    /// Whether the read last returned drained the transport. A driver then starts its next read
+    /// only once its read waker fires.
+    pub(crate) fn is_drained(&self) -> bool {
+        self.drained
+    }
+
+    /// Starts a read of at most `maximum` bytes that first offers `allocation_size` bytes, and
+    /// polls it at once; `Ready` returns it.
+    pub(crate) fn poll_start(
         &mut self,
         transport: &dyn UniplexTransport,
         context: &WorkerContext,
+        waker: &mut Context<'_>,
         maximum: usize,
         allocation_size: usize,
-    ) {
-        self.read = Some(match &mut self.reader {
+    ) -> Poll<Result<UniplexRead, HttpError>> {
+        debug_assert!(
+            self.read.is_none(),
+            "a driver starts a read only when none is started"
+        );
+        // The read counts as started before its first poll, so a poll that panics leaves it
+        // started, as a read started and then polled does.
+        let result = match &mut self.reader {
             Some(reader) => {
-                reader
-                    .start_read(maximum, allocation_size)
-                    .expect("a driver starts a read only when none is started");
-                SlotRead::Reader
+                self.read = Some(SlotRead::Reader);
+                ready!(reader.poll_start_read(waker, maximum, allocation_size))
             }
-            None => SlotRead::Future(transport.read(
-                context,
-                maximum,
-                allocation_size,
-                self.timeout,
-                self.cancellation.clone(),
-            )),
-        });
+            None => {
+                self.read = Some(SlotRead::Future(transport.read(
+                    context,
+                    maximum,
+                    allocation_size,
+                    self.timeout,
+                    self.cancellation.clone(),
+                )));
+                return self.poll(waker);
+            }
+        };
+        self.read = None;
+        self.note_drained(Poll::Ready(result))
     }
 
     /// Polls the started read; `Ready` returns it.
@@ -181,6 +202,20 @@ impl ReadSlot {
             ),
         };
         self.read = None;
-        Poll::Ready(result)
+        self.note_drained(Poll::Ready(result))
+    }
+
+    fn note_drained(
+        &mut self,
+        polled: Poll<Result<UniplexRead, HttpError>>,
+    ) -> Poll<Result<UniplexRead, HttpError>> {
+        self.drained = match &polled {
+            Poll::Ready(Ok(_)) => self
+                .reader
+                .as_ref()
+                .is_some_and(|reader| reader.is_drained()),
+            Poll::Ready(Err(_)) | Poll::Pending => false,
+        };
+        polled
     }
 }

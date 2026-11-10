@@ -1231,6 +1231,9 @@ where
     goaway_deadline: Option<Instant>,
     budget_yield: Option<roxygen_runtime::host::LocalFuture>,
     timers: Option<Box<ConnectionTimers>>,
+    /// The last `poll_read` left a drained reader's next read waiting for its waker. That read
+    /// is issued and outstanding for `read_idle`, as the read a re-poll left registered was.
+    read_parked: bool,
     ready_waker: Option<Arc<Waker>>,
     /// A queued write started without arming the writer, and no `poll_complete` has since
     /// registered its waker or found the queue idle.
@@ -1727,6 +1730,7 @@ where
                 goaway_deadline: None,
                 budget_yield: None,
                 timers: None,
+                read_parked: false,
                 ready_waker: None,
                 unarmed_write: false,
             },
@@ -1904,7 +1908,10 @@ where
                 ran = true;
             }
             // Data or EOF the read phase just observed beats an expiry in the same turn.
-            if timer_fired && self.read.is_reading() && self.read_idle_expired() {
+            if timer_fired
+                && (self.read.is_reading() || self.read_parked)
+                && self.read_idle_expired()
+            {
                 self.read_idle_timeout();
                 ran = true;
             }
@@ -2262,45 +2269,54 @@ where
         Ok(())
     }
 
-    /// `None` when an outstanding read was not ready and nothing was polled.
+    /// `None` when an outstanding read, or a drained reader's next read, was not ready and nothing
+    /// was polled.
     fn poll_read(&mut self) -> Option<bool> {
-        if !self.read.is_reading()
-            && !self.eof
-            && self.failure.fatal.is_none()
-            && !self.cancelled()
-            && !self.cancellation.is_cancellation_requested()
-        {
+        let polled = if self.read.is_reading() {
+            if !self.read_wake.take_ready() {
+                return None;
+            }
+            self.read.poll(&mut Context::from_waker(&self.read_waker))
+        } else {
+            let parked = std::mem::take(&mut self.read_parked);
+            if self.eof
+                || self.failure.fatal.is_some()
+                || self.cancelled()
+                || self.cancellation.is_cancellation_requested()
+            {
+                return Some(false);
+            }
             let maximum = self
                 .connection
                 .state
                 .config
                 .maximum_read_size
                 .min(self.ingress.remaining_capacity());
-            if maximum != 0 {
-                self.read.start(
-                    self.transport.as_ref(),
-                    &self.context,
-                    maximum,
-                    self.connection
-                        .state
-                        .config
-                        .read_allocation_size
-                        .min(maximum),
-                );
-                self.read_wake.ready.store(true, Ordering::Release);
-                if !self.connection.state.config.read_timeout.is_zero() {
-                    self.stamp_read_idle();
-                }
+            if maximum == 0 {
+                return Some(false);
             }
-        }
-        if !self.read.is_reading() {
-            return Some(false);
-        }
-        if !self.read_wake.take_ready() {
-            return None;
-        }
-        let mut context = Context::from_waker(&self.read_waker);
-        let Poll::Ready(result) = self.read.poll(&mut context) else {
+            // A parked read was issued when it parked; its poll at the waker issues nothing.
+            if !parked && !self.connection.state.config.read_timeout.is_zero() {
+                self.stamp_read_idle();
+            }
+            // A drained reader's next read waits for its waker (`ReadSlot::is_drained`).
+            if !self.read_wake.take_ready() && self.read.is_drained() {
+                self.read_parked = true;
+                return None;
+            }
+            self.read.poll_start(
+                self.transport.as_ref(),
+                &self.context,
+                &mut Context::from_waker(&self.read_waker),
+                maximum,
+                self.connection
+                    .state
+                    .config
+                    .read_allocation_size
+                    .min(maximum),
+            )
+        };
+        let Poll::Ready(result) = polled else {
             return Some(false);
         };
         match result {
