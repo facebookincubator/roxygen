@@ -124,6 +124,8 @@ thread_local! {
     static PHASE_CHECKS: Cell<usize> = const { Cell::new(0) };
     static CANCEL_SELECTIONS: Cell<usize> = const { Cell::new(0) };
     static RESPONSE_EVENTS: Cell<usize> = const { Cell::new(0) };
+    static RESPONSE_DELIVERIES: Cell<usize> = const { Cell::new(0) };
+    static DYN_RESPONSE_DELIVERIES: Cell<usize> = const { Cell::new(0) };
     static BYTE_EVENT_REFUSALS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -134,7 +136,7 @@ pub(crate) fn driver_turns() -> usize {
 }
 
 /// How many times the owned HTTP/1.1 drivers on this thread have handed their input to the
-/// codec (`on_ingress`).
+/// codec (`on_ingress`, or `on_ingress_with_callback` upstream).
 #[cfg(test)]
 pub(crate) fn codec_parses() -> usize {
     CODEC_PARSES.with(Cell::get)
@@ -159,6 +161,16 @@ pub(crate) fn cancel_selections() -> usize {
 #[cfg(test)]
 pub(crate) fn response_events() -> usize {
     RESPONSE_EVENTS.with(Cell::get)
+}
+
+/// How many response codec callbacks the owned HTTP/1.1 upstream drivers on this thread have
+/// received (`on_ingress_event`), and how many of them came through `dyn HttpCodecCallback`.
+#[cfg(test)]
+pub(crate) fn response_deliveries() -> (usize, usize) {
+    (
+        RESPONSE_DELIVERIES.with(Cell::get),
+        DYN_RESPONSE_DELIVERIES.with(Cell::get),
+    )
 }
 
 /// How many byte-event refusal errors the owned HTTP/1.1 drivers on this thread have built

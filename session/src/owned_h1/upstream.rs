@@ -1219,7 +1219,7 @@ struct UpstreamDriver {
     ordinary_upgrades: bool,
 }
 
-/// The codec callback: borrows what one response `on_ingress` call may change.
+/// The codec callback: borrows what one response `on_ingress_with_callback` call may change.
 struct ResponseInput<'a> {
     config: &'a UniplexConfig,
     exchange: &'a mut Option<Box<Exchange>>,
@@ -1324,10 +1324,24 @@ impl ResponseInput<'_> {
     }
 }
 
+/// Counts one response codec callback, and whether it came through `dyn HttpCodecCallback`: a
+/// `#[track_caller]` method called through a trait object reports its own definition as its
+/// caller, and a direct call reports the call site, in the codec.
+#[cfg(test)]
+fn count_response_delivery(caller: &std::panic::Location<'_>) {
+    count(&RESPONSE_DELIVERIES);
+    if caller.file() == file!() {
+        count(&DYN_RESPONSE_DELIVERIES);
+    }
+}
+
 impl HttpCodecCallback for ResponseInput<'_> {
     fn on_event(&mut self, _event: CodecEvent<'_>) {}
 
+    #[cfg_attr(test, track_caller)]
     fn on_ingress_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
+        #[cfg(test)]
+        count_response_delivery(std::panic::Location::caller());
         // The response ignores chunk boundaries: one acts only to stop the parse, for a failure,
         // a missing exchange or a cancel, so a boundary with none of them returns at once.
         if let CodecEvent::ChunkHeader {
@@ -1932,10 +1946,11 @@ impl UpstreamDriver {
         } else {
             #[cfg(test)]
             count(&CODEC_PARSES);
-            let result =
-                self.codec
-                    .codec
-                    .on_ingress(&self.ingress, &mut callback, &mut self.egress);
+            let result = self.codec.codec.on_ingress_with_callback(
+                &self.ingress,
+                &mut callback,
+                &mut self.egress,
+            );
             (result.consumed, result.egress_results)
         };
         // EOF ends a close-delimited response, or fails an unfinished one, once every byte

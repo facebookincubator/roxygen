@@ -30,6 +30,7 @@ use crate::owned_h1::cancel_selections;
 use crate::owned_h1::codec_parses;
 use crate::owned_h1::driver_turns;
 use crate::owned_h1::phase_checks;
+use crate::owned_h1::response_deliveries;
 use crate::owned_h1::response_events;
 
 const OK_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
@@ -571,13 +572,25 @@ impl roxygen_core::stream_source::HttpStreamSourceCallback for NoUploadCallback 
 /// One GET through an owned upstream session whose origin answers with `response`, released
 /// once the request is committed; the origin then sends EOF.
 fn owned_get(response: &'static [u8]) -> (ReadResponse, Wire) {
+    let (read, wire, _deliveries) = owned_get_reads(vec![response.to_vec()]);
+    (read, wire)
+}
+
+/// As `owned_get`, with an origin that sends each of `reads` as one read, the first released
+/// once the request is committed. Also returns how many response codec callbacks the driver
+/// received, and how many of them came through `dyn HttpCodecCallback`.
+fn owned_get_reads(reads: Vec<Vec<u8>>) -> (ReadResponse, Wire, (usize, usize)) {
     run_on_host(move |context| {
         Box::pin(async move {
+            let before = response_deliveries();
             let gate = Arc::new(tokio::sync::Notify::new());
-            let (transport, state) = ScriptedTransport::new([
-                ReadAction::WaitData(Arc::clone(&gate), response.to_vec()),
-                ReadAction::Eof,
-            ]);
+            let mut reads = reads.into_iter();
+            let first = ReadAction::WaitData(Arc::clone(&gate), reads.next().unwrap());
+            let (transport, state) = ScriptedTransport::new(
+                std::iter::once(first)
+                    .chain(reads.map(ReadAction::Data))
+                    .chain([ReadAction::Eof]),
+            );
             let (session, handle) =
                 OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
             let submission = handle.reserve_request().unwrap().submit(
@@ -590,6 +603,7 @@ fn owned_get(response: &'static [u8]) -> (ReadResponse, Wire) {
                 gate.notify_one();
                 read_response(&mut source).await
             });
+            let after = response_deliveries();
             let state = state.borrow();
             (
                 read,
@@ -597,6 +611,7 @@ fn owned_get(response: &'static [u8]) -> (ReadResponse, Wire) {
                     close: state.close,
                     error: run.err().map(|error| error.code()),
                 },
+                (after.0 - before.0, after.1 - before.1),
             )
         })
     })
@@ -7036,6 +7051,68 @@ fn a_streamed_response_chunk_handles_only_its_body_event() {
         [(2, 1); 3],
         "(driver turns, response events) per chunk"
     );
+}
+
+/// The driver hands the codec its own callback type, so the codec calls it directly for every
+/// callback that parsing delivers. Only `on_ingress_eof`, which ends a close-delimited
+/// response, still delivers its completion through `dyn HttpCodecCallback`.
+#[test]
+fn parsed_response_callbacks_are_not_delivered_through_dyn() {
+    let responses: [(&str, &[u8]); 3] = [
+        // The message's begin, head, body and completion.
+        ("content-length", OK_RESPONSE),
+        // The begin, head, chunk size line, body, chunk terminator and completion: the last
+        // chunk has neither a size callback nor a terminator callback.
+        (
+            "chunked",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        ),
+        // The begin, head and body; the completion at EOF.
+        (
+            "close-delimited",
+            b"HTTP/1.1 200 OK\r\nDate: x\r\n\r\nstreamed until close",
+        ),
+    ];
+    let deliveries: Vec<_> = responses
+        .into_iter()
+        .map(|(name, response)| {
+            let (read, wire, deliveries) = owned_get_reads(vec![response.to_vec()]);
+            assert!(read.eom, "{name}: {read:?}");
+            assert_eq!(read.error, None, "{name}");
+            assert_eq!(wire.error, None, "{name}");
+            (name, deliveries)
+        })
+        .collect();
+    assert_eq!(
+        deliveries,
+        [
+            ("content-length", (4, 0)),
+            ("chunked", (6, 0)),
+            ("close-delimited", (4, 1)),
+        ],
+        "(response callbacks, of them through dyn) per response"
+    );
+}
+
+/// A response read one byte at a time, so that the codec stops and resumes inside every head,
+/// chunk size line, chunk and trailer, reads as it does in one read.
+#[test]
+fn a_response_read_one_byte_at_a_time_reads_as_in_one_read() {
+    const RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\ngrpc-status: 0\r\n\r\n";
+    let (whole, whole_wire, _) = owned_get_reads(vec![RESPONSE.to_vec()]);
+    let (bytes, bytes_wire, _) = owned_get_reads(RESPONSE.iter().map(|&byte| vec![byte]).collect());
+    let expected = ReadResponse {
+        statuses: vec![100, 200],
+        body: b"hello world".to_vec(),
+        trailers: vec![(b"grpc-status".to_vec(), b"0".to_vec())],
+        eom: true,
+        error: None,
+    };
+    assert_eq!(whole, expected);
+    assert_eq!(bytes, expected);
+    assert_eq!(whole_wire.error, None);
+    assert_eq!(bytes_wire.error, None);
+    assert_eq!(bytes_wire.close, whole_wire.close);
 }
 
 /// An exchange that nothing cancels, from its commitment to its retirement, never selects a
