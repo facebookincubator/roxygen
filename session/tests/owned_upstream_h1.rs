@@ -30,6 +30,7 @@ use crate::owned_h1::cancel_selections;
 use crate::owned_h1::codec_parses;
 use crate::owned_h1::driver_turns;
 use crate::owned_h1::phase_checks;
+use crate::owned_h1::read_start_checks;
 use crate::owned_h1::response_deliveries;
 use crate::owned_h1::response_events;
 
@@ -8917,10 +8918,74 @@ mod n8 {
         }
     }
 
-    /// Writes and closes through a [`ScriptedTransport`]; reads come from an [`Origin`].
+    /// Writes and closes through a [`ScriptedTransport`]; reads come from an [`Origin`], through
+    /// an [`OriginReader`] when `drains` is set.
     pub(super) struct PtTransport {
         inner: Rc<ScriptedTransport>,
         origin: Rc<Origin>,
+        drains: bool,
+    }
+
+    /// One pushed read's result.
+    fn delivered(read: Pushed) -> Result<crate::uniplex::UniplexRead, HttpError> {
+        match read {
+            Pushed::Bytes(bytes) => Ok(crate::uniplex::UniplexRead::new(queue(&bytes), false)),
+            Pushed::Eof => Ok(crate::uniplex::UniplexRead::new(BufQueue::new(0), true)),
+            Pushed::Error(code) => Err(HttpError::with_message(code, b"pushed read failure")),
+        }
+    }
+
+    /// Reads an [`Origin`]'s pushed reads. A read that takes the last pushed bytes reports the
+    /// transport drained and keeps its poll's waker for the next push, as the native TCP reader
+    /// does.
+    struct OriginReader {
+        origin: Rc<Origin>,
+        cancellation: CancellationToken,
+        drained: bool,
+    }
+
+    impl UniplexReader for OriginReader {
+        fn start_read(
+            &mut self,
+            _maximum: usize,
+            _allocation_size: usize,
+        ) -> Result<(), HttpError> {
+            self.origin.starts.set(self.origin.starts.get() + 1);
+            let hook = self.origin.on_read_start.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            self.drained = false;
+            Ok(())
+        }
+
+        fn poll_read(
+            &mut self,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<crate::uniplex::UniplexRead, HttpError>> {
+            let read = self.origin.reads.borrow_mut().pop_front();
+            let Some(read) = read else {
+                if self.cancellation.is_cancellation_requested() {
+                    return Poll::Ready(Err(HttpError::with_message(
+                        HttpErrorCode::CORO_CANCELLED,
+                        b"pushed read cancelled",
+                    )));
+                }
+                *self.origin.waker.borrow_mut() = Some(context.waker().clone());
+                return Poll::Pending;
+            };
+            self.origin.delivered.set(self.origin.delivered.get() + 1);
+            self.drained =
+                matches!(read, Pushed::Bytes(_)) && self.origin.reads.borrow().is_empty();
+            if self.drained {
+                *self.origin.waker.borrow_mut() = Some(context.waker().clone());
+            }
+            Poll::Ready(delivered(read))
+        }
+
+        fn is_drained(&self) -> bool {
+            self.drained
+        }
     }
 
     impl Drop for PtTransport {
@@ -8930,6 +8995,21 @@ mod n8 {
     }
 
     impl UniplexTransport for PtTransport {
+        fn try_reader(
+            &self,
+            _context: &WorkerContext,
+            _timeout: Duration,
+            cancellation: CancellationToken,
+        ) -> Result<Option<Box<dyn UniplexReader>>, HttpError> {
+            Ok(self.drains.then(|| {
+                Box::new(OriginReader {
+                    origin: Rc::clone(&self.origin),
+                    cancellation,
+                    drained: false,
+                }) as Box<dyn UniplexReader>
+            }))
+        }
+
         fn read(
             &self,
             _context: &WorkerContext,
@@ -8948,15 +9028,7 @@ mod n8 {
                 let read = origin.reads.borrow_mut().pop_front();
                 if let Some(read) = read {
                     origin.delivered.set(origin.delivered.get() + 1);
-                    return Poll::Ready(match read {
-                        Pushed::Bytes(bytes) => {
-                            Ok(crate::uniplex::UniplexRead::new(queue(&bytes), false))
-                        }
-                        Pushed::Eof => Ok(crate::uniplex::UniplexRead::new(BufQueue::new(0), true)),
-                        Pushed::Error(code) => {
-                            Err(HttpError::with_message(code, b"pushed read failure"))
-                        }
-                    });
+                    return Poll::Ready(delivered(read));
                 }
                 if cancellation.is_cancellation_requested() {
                     return Poll::Ready(Err(HttpError::with_message(
@@ -9104,11 +9176,27 @@ mod n8 {
             mode: Mode,
             configure: impl FnOnce(&mut UniplexConfig),
         ) -> Self {
+            Self::build(context, mode, configure, false)
+        }
+
+        /// As `new`, over a transport whose reader reports it drained once a read took the last
+        /// pushed bytes (an [`OriginReader`]).
+        pub(super) fn draining(context: WorkerContext, mode: Mode) -> Self {
+            Self::build(context, mode, |_| {}, true)
+        }
+
+        fn build(
+            context: WorkerContext,
+            mode: Mode,
+            configure: impl FnOnce(&mut UniplexConfig),
+            drains: bool,
+        ) -> Self {
             let (inner, state) = ScriptedTransport::new([]);
             let origin = Rc::new(Origin::default());
             let transport = Rc::new(PtTransport {
                 inner,
                 origin: Rc::clone(&origin),
+                drains,
             });
             let mut options = upstream_options(context, transport);
             configure(&mut options.io);
@@ -10996,5 +11084,164 @@ mod n8 {
             "the event taken in the drive is dropped unserialized: the wire and both outcomes \
              are run's"
         );
+    }
+
+    /// A chunked response whose head a draining reader read, after which the reader is parked:
+    /// read by a suspend-free reader of a plain submission under `run`, or through the body of
+    /// a pull-through exchange, which holds the drive.
+    fn parked_response(fixture: &mut Fixture) -> Response {
+        if fixture.mode == Mode::PullThrough {
+            return fixture.held();
+        }
+        let mut response = fixture.submit(
+            get_head(),
+            HttpSourceHolder::empty(),
+            CancellationToken::never(),
+        );
+        fixture.origin.send(CHUNKED_HEAD);
+        let mut head = fixture.next_header(&mut response);
+        assert_eq!(head.headers_mut().status_code().unwrap(), 200);
+        response
+    }
+
+    /// H2-L6b: while a drained reader waits for its waker ("parked"), each driver turn leaves
+    /// the read phase without evaluating a read start, so each chunk's read is the only read
+    /// start evaluated for it: under `run`, and in a pull-through body's inline drive (`DIV-047`).
+    /// Without the fast exit, the turns after each read evaluate one each. The chunk's arrival
+    /// wakes the parked reader's waker, which reaches the run future under `run` and the holder
+    /// while it holds the drive.
+    #[test]
+    fn owned_h1_upstream_a_parked_reader_evaluates_one_read_start_per_read() {
+        let counts = [Mode::Run, Mode::PullThrough].map(|mode| {
+            let counts = run_on_host(move |context| {
+                Box::pin(async move {
+                    let mut fixture = Fixture::draining(context, mode);
+                    let mut response = parked_response(&mut fixture);
+                    let counts = [b"one".as_slice(), b"two", b"three"]
+                        .map(|piece| {
+                            let wakes = (fixture.holder_wake.get(), fixture.run_wake.get());
+                            let before = read_start_checks();
+                            fixture.origin.send(&chunk(piece));
+                            let woken = (
+                                fixture.holder_wake.get() - wakes.0,
+                                fixture.run_wake.get() - wakes.1,
+                            );
+                            let event = fixture.next_event(&mut response, u32::MAX).unwrap();
+                            assert_eq!(body_bytes(&event), piece, "{mode:?}");
+                            (woken, read_start_checks() - before)
+                        })
+                        .to_vec();
+                    fixture.finish(&mut response).unwrap();
+                    counts
+                })
+            });
+            (mode, counts)
+        });
+        assert_eq!(
+            counts,
+            [
+                (Mode::Run, vec![((0, 1), 1); 3]),
+                (Mode::PullThrough, vec![((1, 0), 1); 3])
+            ],
+            "(mode, per chunk ((holder wakes, run wakes) at its arrival, read starts evaluated))"
+        );
+    }
+
+    /// What a reader read after a parked reader's connection was ended by `end`, mid-response
+    /// (or, for `Close`, after the response's end): its last read's error, `run`'s error, and
+    /// how the transport closed.
+    fn parked_upstream_end(
+        mode: Mode,
+        end: ParkedEnd,
+    ) -> (Option<HttpErrorCode>, Option<HttpErrorCode>, CloseKind) {
+        run_on_host(move |context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::draining(context, mode);
+                let mut response = parked_response(&mut fixture);
+                fixture.origin.send(&chunk(b"one"));
+                let event = fixture.next_event(&mut response, u32::MAX).unwrap();
+                assert_eq!(body_bytes(&event), b"one");
+                match end {
+                    ParkedEnd::PeerEof => fixture.origin.push(Pushed::Eof),
+                    ParkedEnd::ReadError(code) => fixture.origin.push(Pushed::Error(code)),
+                    ParkedEnd::Close => fixture.origin.send(b"0\r\n\r\n"),
+                    ParkedEnd::Cancel => fixture.handle.cancel(),
+                }
+                // Reads to the response's end or error, letting the run settle while a read
+                // waits.
+                let mut run = None;
+                let mut read = None;
+                for _ in 0..8 {
+                    match fixture.body(&mut response, u32::MAX) {
+                        Poll::Ready(Ok(event)) if !event.eom() => {}
+                        Poll::Ready(result) => {
+                            read = Some(result.err().map(|error| error.code()));
+                            break;
+                        }
+                        Poll::Pending => {
+                            if let Some(result) = fixture.settle_run() {
+                                run = Some(result);
+                            }
+                        }
+                    }
+                }
+                let read = read.expect("the response ends");
+                if matches!(end, ParkedEnd::Close) {
+                    assert!(fixture.settle_run().is_none());
+                    assert!(fixture.handle.is_idle(), "the exchange retired");
+                    assert!(fixture.handle.close_when_idle().unwrap());
+                }
+                let run = run
+                    .or_else(|| fixture.settle_run())
+                    .expect("the parked connection ends");
+                (
+                    read,
+                    run.err().map(|error| error.code()),
+                    fixture.state.borrow().close,
+                )
+            })
+        })
+    }
+
+    /// H2-L6b: a parked reader still ends, under `run` and with a pull-through body holding the
+    /// drive. The next read's EOF or failure wakes it, and the driver's own idle close and abort
+    /// mark its read wake in the same call (`close_idle`, `reset_transport`); a connection cancel
+    /// revokes a held drive first. Each connection ends as it did before the fast exit.
+    #[test]
+    fn owned_h1_upstream_a_parked_reader_still_ends_on_its_wake_close_and_abort() {
+        let read_error = HttpErrorCode::TRANSPORT_READ_ERROR;
+        let dropped = HttpErrorCode::DROPPED;
+        let cancelled = HttpErrorCode::CORO_CANCELLED;
+        for mode in [Mode::Run, Mode::PullThrough] {
+            for (end, outcome) in [
+                (
+                    ParkedEnd::PeerEof,
+                    (
+                        Some(HttpErrorCode::TRANSPORT_EOF),
+                        Some(HttpErrorCode::TRANSPORT_EOF),
+                        CloseKind::Reset,
+                    ),
+                ),
+                (
+                    ParkedEnd::ReadError(read_error),
+                    (Some(read_error), Some(read_error), CloseKind::Reset),
+                ),
+                (
+                    ParkedEnd::ReadError(dropped),
+                    (Some(dropped), Some(dropped), CloseKind::Reset),
+                ),
+                (ParkedEnd::Close, (None, None, CloseKind::ShutdownWrite)),
+                (
+                    ParkedEnd::Cancel,
+                    (Some(cancelled), Some(cancelled), CloseKind::Reset),
+                ),
+            ] {
+                assert_eq!(
+                    parked_upstream_end(mode, end),
+                    outcome,
+                    "{mode:?} {end:?}: (read error, run error, close)"
+                );
+            }
+        }
     }
 }

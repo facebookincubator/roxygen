@@ -2963,12 +2963,20 @@ impl UpstreamDriver {
     }
 
     fn poll_read_once(&mut self) -> Option<ReadPoll> {
+        // Until a drained reader's waker fires, a call checks only that waker, as for an
+        // outstanding read; inside a pull-through body's drive too (`DIV-047`), whose holder
+        // that waker wakes.
+        if self.read.is_drained() && !self.read_wake.is_ready() {
+            return None;
+        }
         let polled = if self.read.is_reading() {
             if !self.read_wake.take_ready() {
                 return None;
             }
             self.read.poll(&mut Context::from_waker(&self.read_waker))
         } else {
+            #[cfg(test)]
+            count(&READ_START_CHECKS);
             let maximum = self.read_capacity();
             // A drained reader's next read waits for its waker (`ReadSlot::is_drained`).
             if maximum == 0 || (!self.read_wake.take_ready() && self.read.is_drained()) {

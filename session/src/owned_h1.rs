@@ -130,6 +130,7 @@ thread_local! {
     static RESPONSE_DELIVERIES: Cell<usize> = const { Cell::new(0) };
     static DYN_RESPONSE_DELIVERIES: Cell<usize> = const { Cell::new(0) };
     static BYTE_EVENT_REFUSALS: Cell<usize> = const { Cell::new(0) };
+    static READ_START_CHECKS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// How many turns the owned HTTP/1.1 drivers on this thread have run.
@@ -181,6 +182,13 @@ pub(crate) fn response_deliveries() -> (usize, usize) {
 #[cfg(test)]
 pub(crate) fn byte_event_refusals() -> usize {
     BYTE_EVENT_REFUSALS.with(Cell::get)
+}
+
+/// How many times the owned HTTP/1.1 drivers on this thread, with no read started, have evaluated
+/// whether to start one (`poll_read_once`).
+#[cfg(test)]
+pub(crate) fn read_start_checks() -> usize {
+    READ_START_CHECKS.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -1696,12 +1704,19 @@ impl<A: OwnedApplication> Driver<A> {
 
     /// `None` when no read was outstanding to poll.
     fn poll_read_once(&mut self) -> Option<ReadPoll> {
+        // Until a drained reader's waker fires, a call checks only that waker, as for an
+        // outstanding read.
+        if self.read.is_drained() && !self.read_wake.is_ready() {
+            return None;
+        }
         let polled = if self.read.is_reading() {
             if !self.read_wake.take_ready() {
                 return None;
             }
             self.read.poll(&mut Context::from_waker(&self.read_waker))
         } else {
+            #[cfg(test)]
+            count(&READ_START_CHECKS);
             let maximum = self.read_capacity();
             // A drained reader's next read waits for its waker (`ReadSlot::is_drained`).
             if maximum == 0 || (!self.read_wake.take_ready() && self.read.is_drained()) {

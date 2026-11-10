@@ -33,6 +33,7 @@ use crate::owned_h2::OwnedH2UpstreamSubmission;
 use crate::owned_h2::stream_seed_order;
 use crate::owned_h2::take_discarded_streams;
 use crate::uniplex::UniplexRunSummary;
+use crate::uniplex_tests::ParkedEnd;
 
 #[derive(Clone, Copy)]
 enum Reply {
@@ -924,6 +925,134 @@ fn owned_h2_polls_a_drained_reader_once_per_read() {
         (read_count + 1, read_count),
         "(polls, reads): each read polled once, after one poll that waited",
     );
+}
+
+/// What an owned H2 session showed whose drained reader stayed parked while it answered four
+/// GETs, read in one read, with 256-byte bodies in 32-byte events, before `end` ended it.
+struct ParkedH2 {
+    /// Read starts the driver evaluated from the first read's wait until every exchange
+    /// completed.
+    read_start_checks: usize,
+    /// The body bytes each exchange produced.
+    produced: Vec<usize>,
+    run: Result<(), HttpErrorCode>,
+    close: FixtureClose,
+}
+
+/// Yields until `ready` holds.
+async fn yield_until_ready(mut ready: impl FnMut() -> bool) {
+    for _ in 0..10_000 {
+        if ready() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("the awaited condition never held");
+}
+
+fn parked_h2(end: ParkedEnd) -> ParkedH2 {
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut reads = vec![FixtureRead::Data(retirement_requests(&mut peer, 4))];
+            match end {
+                ParkedEnd::PeerEof => reads.push(FixtureRead::DataEof(Vec::new())),
+                ParkedEnd::ReadError(code) => reads.push(FixtureRead::Error(code)),
+                ParkedEnd::Close | ParkedEnd::Cancel => {}
+            }
+            let (fixture, state) = FixtureTransport::new(reads);
+            let (transport, gate) = crate::uniplex_tests::GatedReaderTransport::new(fixture);
+            let (mut application, probes) = Application::new(vec![Reply::Body(256); 4]);
+            application.body_chunk = 32;
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let (run, read_start_checks) = futures::join!(
+                tokio::time::timeout(Duration::from_secs(5), session.run()),
+                async {
+                    yield_until_ready(|| gate.waiting()).await;
+                    let before = crate::owned_h2::read_start_checks();
+                    gate.open_one();
+                    yield_until_ready(|| {
+                        let probes = probes.borrow();
+                        gate.waiting()
+                            && probes.len() == 4
+                            && probes.iter().all(|probe| probe.completed.get() == 1)
+                    })
+                    .await;
+                    let checks = crate::owned_h2::read_start_checks() - before;
+                    match end {
+                        ParkedEnd::PeerEof | ParkedEnd::ReadError(_) => gate.open_one(),
+                        ParkedEnd::Close => assert!(handle.initiate_drain().unwrap()),
+                        ParkedEnd::Cancel => handle.cancel(),
+                    }
+                    checks
+                }
+            );
+            let run = run
+                .expect("the parked session ends")
+                .map(|_| ())
+                .map_err(|error| error.code());
+            let produced = probes
+                .borrow()
+                .iter()
+                .map(|probe| probe.produced_bytes.get())
+                .collect();
+            ParkedH2 {
+                read_start_checks,
+                produced,
+                run,
+                close: state.borrow().close,
+            }
+        })
+    })
+}
+
+/// H2-L6b: while a drained reader waits for its waker ("parked"), each driver turn leaves the
+/// read phase without evaluating a read start. Only the turn that parks the drained reader's
+/// next read evaluates one (it stamps the read's `read_idle` deadline); the turns that produce
+/// four responses in 32 body events evaluate none; without the fast exit each would evaluate one.
+#[test]
+fn owned_h2_a_parked_reader_evaluates_no_read_start_while_responses_are_produced() {
+    let parked = parked_h2(ParkedEnd::PeerEof);
+    assert_eq!(
+        parked.produced, [256; 4],
+        "four 256-byte bodies (32 events) were produced while the reader was parked"
+    );
+    assert_eq!(
+        parked.read_start_checks, 1,
+        "only the turn that parks the reader evaluates a read start"
+    );
+    assert_eq!(parked.run, Ok(()));
+}
+
+/// H2-L6b: a parked reader still ends. The next read's EOF or failure wakes it, and the driver's
+/// own close and abort mark its read wake in the same call (`close_idle`, `reset_transport`), so
+/// each parked session ends as it did before the fast exit.
+#[test]
+fn owned_h2_a_parked_reader_still_ends_on_its_wake_close_and_abort() {
+    for (end, run, close) in [
+        (ParkedEnd::PeerEof, Ok(()), FixtureClose::Closed),
+        (
+            ParkedEnd::ReadError(HttpErrorCode::TRANSPORT_READ_ERROR),
+            Err(HttpErrorCode::TRANSPORT_READ_ERROR),
+            FixtureClose::Reset,
+        ),
+        (
+            ParkedEnd::ReadError(HttpErrorCode::DROPPED),
+            Err(HttpErrorCode::DROPPED),
+            FixtureClose::Reset,
+        ),
+        (ParkedEnd::Close, Ok(()), FixtureClose::Closed),
+        (
+            ParkedEnd::Cancel,
+            Err(HttpErrorCode::CORO_CANCELLED),
+            FixtureClose::Reset,
+        ),
+    ] {
+        let parked = parked_h2(end);
+        assert_eq!(parked.produced, [256; 4], "{end:?}");
+        assert_eq!((parked.run, parked.close), (run, close), "{end:?}");
+    }
 }
 
 /// The driver reads through the transport's reader when it offers one, and writes the same bytes

@@ -225,8 +225,14 @@ impl IoWake {
         })
     }
 
+    /// Whether the waker fired since the flag was last taken, without taking it.
+    #[inline]
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
     fn take_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire) && self.ready.swap(false, Ordering::AcqRel)
+        self.is_ready() && self.ready.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -1116,6 +1122,7 @@ pub(crate) fn stream_seed_order(seed: u64, streams: &[u64]) -> Vec<u64> {
 #[cfg(test)]
 thread_local! {
     static OWNER_WRITE_STATE_READS: Cell<usize> = const { Cell::new(0) };
+    static READ_START_CHECKS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// How many times stream-owner code on this thread has evaluated whether writes are pending.
@@ -1134,6 +1141,13 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn take_discarded_streams() -> (usize, usize) {
     DISCARDED_STREAMS.with(|streams| streams.replace((0, 0)))
+}
+
+/// How many times the owned H2 drivers on this thread, with no read started, have evaluated
+/// whether to start one (`Driver::poll_read`).
+#[cfg(test)]
+pub(crate) fn read_start_checks() -> usize {
+    READ_START_CHECKS.with(Cell::get)
 }
 
 /// A concrete-exchange H2 driver, selected only by experimental opt-in integrations.
@@ -2272,12 +2286,21 @@ where
     /// `None` when an outstanding read, or a drained reader's next read, was not ready and nothing
     /// was polled.
     fn poll_read(&mut self) -> Option<bool> {
+        // Until a parked read's waker fires, a turn checks only that waker, as for an outstanding
+        // read. Every close, reset and cancellation of the read sets that wake in the same call,
+        // so the checks this skips cannot change meanwhile. A drained reader's next read parks
+        // first, so the turn that parks it stamps its `read_idle` deadline.
+        if self.read_parked && !self.read_wake.is_ready() {
+            return None;
+        }
         let polled = if self.read.is_reading() {
             if !self.read_wake.take_ready() {
                 return None;
             }
             self.read.poll(&mut Context::from_waker(&self.read_waker))
         } else {
+            #[cfg(test)]
+            READ_START_CHECKS.with(|count| count.set(count.get() + 1));
             let parked = std::mem::take(&mut self.read_parked);
             if self.eof
                 || self.failure.fatal.is_some()

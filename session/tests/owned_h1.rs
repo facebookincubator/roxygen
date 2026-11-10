@@ -30,6 +30,7 @@ use crate::owned_h1::OwnedH1Session;
 use crate::owned_h1::codec_parses;
 use crate::owned_h1::driver_turns;
 use crate::owned_h1::phase_checks;
+use crate::owned_h1::read_start_checks;
 use crate::uniplex::UniplexWriteCompletion;
 use crate::uniplex::UniplexWriteQueue;
 
@@ -1058,6 +1059,114 @@ fn owned_h1_polls_a_drained_reader_once_per_read() {
     );
     assert_eq!(wire.close, CloseKind::ShutdownWrite);
     assert_eq!(wire.error, None);
+}
+
+/// Serves a keep-alive GET, read in one read that drains the transport, with a chunked response
+/// whose body events the test pushes while the reader stays parked: it waits for its waker,
+/// with no read started. Returns the driver turns and read starts evaluated for each of three
+/// pushed events, then the wire once the response ended and `end` ended the connection.
+fn parked_h1(end: ParkedEnd) -> (Vec<(usize, usize)>, Wire) {
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let mut reads = vec![ReadAction::Data(KEEP_ALIVE_GET.to_vec())];
+            match end {
+                ParkedEnd::PeerEof => reads.push(ReadAction::Eof),
+                ParkedEnd::ReadError(code) => reads.push(ReadAction::Error(code)),
+                ParkedEnd::Close | ParkedEnd::Cancel => {}
+            }
+            let (scripted, state) = ScriptedTransport::new(reads);
+            let (transport, gate) = GatedReaderTransport::new(scripted);
+            let body = Rc::new(PushedBody::default());
+            let application = PushedApp {
+                body: Rc::clone(&body),
+            };
+            let (session, handle) =
+                OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+            // A lost wake stalls the manual host, which then panics.
+            let mut run = std::pin::pin!(session.run());
+            let mut poll = Context::from_waker(Waker::noop());
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            assert!(gate.waiting(), "the first read waits for the request");
+            gate.open_one();
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            assert!(
+                gate.waiting(),
+                "the request's read drained the transport and parked the reader"
+            );
+            assert_eq!(state.borrow().writes.len(), 1, "the head is written first");
+            let counts = [b"one".as_slice(), b"two", b"three"]
+                .map(|chunk| {
+                    let before = (driver_turns(), read_start_checks());
+                    body.push(HttpBodyEvent::body(queue(chunk), false));
+                    assert!(run.as_mut().poll(&mut poll).is_pending());
+                    (driver_turns() - before.0, read_start_checks() - before.1)
+                })
+                .to_vec();
+            body.push(HttpBodyEvent::body(queue(b"end"), true));
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            match end {
+                ParkedEnd::PeerEof | ParkedEnd::ReadError(_) => gate.open_one(),
+                ParkedEnd::Close => assert!(handle.initiate_drain().unwrap()),
+                ParkedEnd::Cancel => handle.cancel(),
+            }
+            let result = run.await;
+            (counts, wire_of(&state, result))
+        })
+    })
+}
+
+/// H2-L6b: while a drained reader waits for its waker ("parked"), each driver turn leaves the
+/// read phase without evaluating a read start. Each pushed body event's two turns evaluate none;
+/// without the fast exit each turn would evaluate one.
+#[test]
+fn owned_h1_a_parked_reader_evaluates_no_read_start_while_a_response_body_is_pushed() {
+    let (counts, wire) = parked_h1(ParkedEnd::Close);
+    assert_eq!(
+        counts,
+        [(2, 0); 3],
+        "(driver turns, read starts evaluated) per pushed body event"
+    );
+    assert!(
+        wire.output
+            .ends_with(b"3\r\none\r\n3\r\ntwo\r\n5\r\nthree\r\n3\r\nend\r\n0\r\n\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&wire.output)
+    );
+    assert_eq!(wire.error, None);
+}
+
+/// H2-L6b: a parked reader still ends. The next read's EOF or failure wakes it, and the driver's
+/// own idle close and abort mark its read wake in the same call (`close_idle`,
+/// `reset_transport`), so each parked connection ends as it did before the fast exit.
+#[test]
+fn owned_h1_a_parked_reader_still_ends_on_its_wake_close_and_abort() {
+    for (end, close, error) in [
+        (ParkedEnd::PeerEof, CloseKind::ShutdownWrite, None),
+        (
+            ParkedEnd::ReadError(HttpErrorCode::TRANSPORT_READ_ERROR),
+            CloseKind::Reset,
+            Some(HttpErrorCode::TRANSPORT_READ_ERROR),
+        ),
+        (
+            ParkedEnd::ReadError(HttpErrorCode::DROPPED),
+            CloseKind::Reset,
+            Some(HttpErrorCode::DROPPED),
+        ),
+        (ParkedEnd::Close, CloseKind::ShutdownWrite, None),
+        (
+            ParkedEnd::Cancel,
+            CloseKind::Reset,
+            Some(HttpErrorCode::CORO_CANCELLED),
+        ),
+    ] {
+        let (_, wire) = parked_h1(end);
+        assert!(
+            wire.output.ends_with(b"3\r\nend\r\n0\r\n\r\n"),
+            "{end:?}: the whole response is written first: {:?}",
+            String::from_utf8_lossy(&wire.output)
+        );
+        assert_eq!((wire.close, wire.error), (close, error), "{end:?}");
+    }
 }
 
 /// The driver reads through the transport's reader when it offers one, and writes the same

@@ -614,6 +614,23 @@ impl GatedReaderTransport {
     }
 }
 
+/// How a test ends an owned driver whose drained reader is parked: it waits for its waker, with
+/// no read started.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ParkedEnd {
+    /// The peer's EOF arrives and wakes the reader, as a closed socket wakes a drained reader.
+    PeerEof,
+    /// The next read fails with this code and wakes the reader, as a reset
+    /// (`TRANSPORT_READ_ERROR`) or dropped (`DROPPED`) transport wakes a drained reader.
+    ReadError(HttpErrorCode),
+    /// The connection is drained, or closed once idle: the driver's idle close requests the
+    /// read's cancellation and marks the read wake in the same call (`close_idle`).
+    Close,
+    /// The connection is cancelled: the abort resets the transport, which requests the read's
+    /// cancellation and marks the read wake in the same call (`reset_transport`).
+    Cancel,
+}
+
 struct GatedReader {
     inner: Rc<dyn UniplexTransport>,
     context: WorkerContext,
