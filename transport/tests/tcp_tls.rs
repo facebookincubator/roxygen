@@ -7454,4 +7454,676 @@ mod tcp_tls {
             })
         });
     }
+
+    mod native_write_queue {
+        use roxygen_runtime::worker::WorkerContext;
+
+        use super::*;
+        use crate::byte_stream::write_deadline_batons_for_test;
+        use crate::byte_stream::write_progress_cells_for_test;
+        use crate::tcp::io_write_futures_for_test;
+
+        /// Runs `test` on a worker with an accepted TCP transport bounded by `limits` and the
+        /// connecting peer's Tokio stream.
+        fn with_accepted_tcp<F, Fut>(limits: ByteStreamLimits, test: F)
+        where
+            F: FnOnce(WorkerContext, OwnedByteStream, TcpStream) -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + 'static,
+        {
+            Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(LocalSet::new().run_until(async move {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let peer = TcpStream::connect(listener.local_addr().unwrap())
+                        .await
+                        .unwrap();
+                    let (accepted, _) = listener.accept().await.unwrap();
+                    let accepted = accepted.into_std().unwrap();
+                    let (worker, driver) = WorkerDriver::new(8).unwrap();
+                    let call = worker
+                        .call_local(move |context| async move {
+                            let transport =
+                                TcpTransport::from_accepted(&context, accepted, limits).unwrap();
+                            test(context, transport, peer).await;
+                        })
+                        .unwrap();
+                    let driver_task = tokio::task::spawn_local(driver);
+                    time::timeout(Duration::from_secs(10), call)
+                        .await
+                        .expect("the queue test is bounded")
+                        .unwrap();
+                    worker.begin_shutdown();
+                    driver_task.await.unwrap();
+                }));
+        }
+
+        #[test]
+        fn tcp_transport_offers_an_untimed_native_write_queue() {
+            with_accepted_tcp(limits(), |context, transport, _peer| async move {
+                let queue = transport
+                    .write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .expect("an untimed TCP transport offers its native write queue");
+                assert!(queue.is_idle());
+                assert!(
+                    !queue.is_saturated(),
+                    "an idle queue on an open transport is not saturated"
+                );
+                assert!(queue.can_write(1024));
+                assert!(
+                    transport
+                        .write_queue(
+                            &context,
+                            1024,
+                            Duration::from_secs(5),
+                            CancellationToken::never(),
+                        )
+                        .unwrap()
+                        .is_none(),
+                    "a write timeout keeps the single-write API, which times each write",
+                );
+                drop(queue);
+                transport.close(&context).unwrap();
+            });
+        }
+
+        #[test]
+        fn queued_writes_reach_the_peer_with_ordered_receipts() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let mut writer = transport
+                    .write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                writer.start_write(BufQueue::new(0)).unwrap();
+                writer.start_write(queue(&[b"first "])).unwrap();
+                let receipts = [
+                    poll_fn(|context| writer.poll_complete(context)).await,
+                    poll_fn(|context| writer.poll_complete(context)).await,
+                ];
+                assert_eq!(
+                    receipts
+                        .iter()
+                        .map(|receipt| (
+                            receipt.requested_bytes,
+                            receipt.result.as_ref().unwrap().bytes_written
+                        ))
+                        .collect::<Vec<_>>(),
+                    [(0, 0), (6, 6)],
+                    "the empty submission's receipt comes first, then the write's",
+                );
+                writer.start_write(queue(&[b"sec", b"ond"])).unwrap();
+                let receipt = poll_fn(|context| writer.poll_complete(context)).await;
+                assert_eq!(receipt.requested_bytes, 6);
+                assert_eq!(receipt.result.unwrap().bytes_written, 6);
+                assert!(writer.is_idle());
+                let mut received = [0; 12];
+                peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"first second");
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// More bytes than loopback socket buffers hold while the peer does not read.
+        const STALLING_WRITE: usize = 16 << 20;
+
+        /// Polls `writer` once.
+        async fn poll_once(
+            writer: &mut crate::byte_stream::OwnedWriteQueue,
+        ) -> Poll<crate::byte_stream::QueuedWriteCompletion> {
+            poll_fn(|context| Poll::Ready(writer.poll_complete(context))).await
+        }
+
+        /// Drives `writer`'s outstanding write until `peer` has received some of its bytes; the
+        /// write stays outstanding because `peer` does not read.
+        async fn stall_after_progress(
+            writer: &mut crate::byte_stream::OwnedWriteQueue,
+            peer: &TcpStream,
+        ) {
+            let mut byte = [0];
+            tokio::select! {
+                _ = poll_fn(|context| writer.poll_complete(context)) => {
+                    panic!("a write larger than the socket buffers completes only as the peer reads")
+                }
+                peeked = peer.peek(&mut byte) => assert_eq!(peeked.unwrap(), 1),
+            }
+        }
+
+        #[test]
+        fn an_outstanding_write_holds_capacity_and_saturates_the_queue() {
+            let limits = ByteStreamLimits::new(64, STALLING_WRITE, 8).unwrap();
+            with_accepted_tcp(limits, |context, transport, mut peer| async move {
+                let mut writer = transport
+                    .write_queue(
+                        &context,
+                        STALLING_WRITE,
+                        Duration::ZERO,
+                        CancellationToken::never(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                let payload = pattern(STALLING_WRITE, 3);
+                writer.start_write(queue(&[&payload])).unwrap();
+                assert!(
+                    writer.is_saturated(),
+                    "a started write is outstanding until it is polled to completion"
+                );
+                assert!(!writer.can_write(0) && !writer.can_write(1));
+                assert!(poll_once(&mut writer).await.is_pending());
+                assert!(writer.is_saturated());
+                assert!(!writer.can_write(1));
+                assert!(!writer.is_idle());
+                let reader = async {
+                    let mut received = vec![0; STALLING_WRITE];
+                    peer.read_exact(&mut received).await.unwrap();
+                    received
+                };
+                let (receipt, received) =
+                    tokio::join!(poll_fn(|context| writer.poll_complete(context)), reader);
+                assert_eq!(receipt.requested_bytes, STALLING_WRITE);
+                assert_eq!(receipt.result.unwrap().bytes_written, STALLING_WRITE);
+                assert!(
+                    received == payload,
+                    "the peer receives the payload in order"
+                );
+                assert!(!writer.is_saturated());
+                assert!(writer.can_write(1));
+                assert!(writer.is_idle());
+                transport.close(&context).unwrap();
+            });
+        }
+
+        #[test]
+        fn unconsumed_receipts_bound_the_queue() {
+            with_accepted_tcp(limits(), |context, transport, _peer| async move {
+                let mut writer = transport
+                    .write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                for _ in 0..8 {
+                    assert!(writer.can_write(0));
+                    writer.start_write(BufQueue::new(0)).unwrap();
+                }
+                assert!(
+                    !writer.can_write(0) && !writer.can_write(1),
+                    "eight unconsumed receipts fill the queue"
+                );
+                let receipt = poll_fn(|context| writer.poll_complete(context)).await;
+                assert_eq!(receipt.result.unwrap().bytes_written, 0);
+                assert!(
+                    writer.can_write(1),
+                    "consuming a receipt returns its capacity"
+                );
+                transport.close(&context).unwrap();
+            });
+        }
+
+        #[test]
+        fn a_write_shut_transport_saturates_the_queue_and_fails_submissions() {
+            with_accepted_tcp(limits(), |context, transport, _peer| async move {
+                let mut writer = transport
+                    .write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                transport.shutdown_write(&context).unwrap();
+                assert!(
+                    writer.is_saturated(),
+                    "a transport whose write side is shut can no longer write"
+                );
+                assert!(
+                    writer.can_write(5),
+                    "capacity does not hide terminal transport state"
+                );
+                writer.start_write(queue(&[b"after"])).unwrap();
+                let receipt = poll_fn(|context| writer.poll_complete(context)).await;
+                assert_eq!(receipt.requested_bytes, 5);
+                let error = receipt.result.unwrap_err();
+                assert_eq!(error.code(), HttpErrorCode::TRANSPORT_WRITE_ERROR);
+                assert_eq!(error.bytes_written(), 0, "a zero-byte failure receipt");
+                transport.close(&context).unwrap();
+            });
+        }
+
+        #[test]
+        fn a_reset_fails_the_outstanding_write_and_saturates_the_queue() {
+            let limits = ByteStreamLimits::new(64, STALLING_WRITE, 8).unwrap();
+            with_accepted_tcp(limits, |context, transport, peer| async move {
+                let mut writer = transport
+                    .write_queue(
+                        &context,
+                        STALLING_WRITE,
+                        Duration::ZERO,
+                        CancellationToken::never(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                writer
+                    .start_write(queue(&[&pattern(STALLING_WRITE, 5)]))
+                    .unwrap();
+                stall_after_progress(&mut writer, &peer).await;
+                transport.close_with_reset(&context).unwrap();
+                let receipt = poll_fn(|context| writer.poll_complete(context)).await;
+                assert_eq!(receipt.requested_bytes, STALLING_WRITE);
+                let error = receipt.result.unwrap_err();
+                assert_eq!(error.code(), HttpErrorCode::TRANSPORT_WRITE_ERROR);
+                assert!(
+                    error.bytes_written() > 0 && error.bytes_written() < STALLING_WRITE,
+                    "the receipt reports the bytes the socket took before the reset: {}",
+                    error.bytes_written(),
+                );
+                assert!(
+                    writer.is_saturated(),
+                    "a reset transport can no longer write"
+                );
+                writer.start_write(queue(&[b"late"])).unwrap();
+                let late = poll_fn(|context| writer.poll_complete(context)).await;
+                assert_eq!(late.result.unwrap_err().bytes_written(), 0);
+            });
+        }
+
+        #[test]
+        fn a_graceful_close_finishes_the_outstanding_write_before_its_fin() {
+            let limits = ByteStreamLimits::new(64, STALLING_WRITE, 8).unwrap();
+            with_accepted_tcp(limits, |context, transport, mut peer| async move {
+                let mut writer = transport
+                    .write_queue(
+                        &context,
+                        STALLING_WRITE,
+                        Duration::ZERO,
+                        CancellationToken::never(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                let payload = pattern(STALLING_WRITE, 7);
+                writer.start_write(queue(&[&payload])).unwrap();
+                stall_after_progress(&mut writer, &peer).await;
+                transport.close(&context).unwrap();
+                let reader = async {
+                    let mut received = Vec::new();
+                    peer.read_to_end(&mut received).await.unwrap();
+                    received
+                };
+                let (receipt, received) =
+                    tokio::join!(poll_fn(|context| writer.poll_complete(context)), reader);
+                assert_eq!(receipt.result.unwrap().bytes_written, STALLING_WRITE);
+                assert!(
+                    received == payload,
+                    "the peer reads the whole write, then the FIN"
+                );
+            });
+        }
+
+        #[test]
+        fn cancellation_fails_the_outstanding_write_and_resets_the_transport() {
+            let limits = ByteStreamLimits::new(64, STALLING_WRITE, 8).unwrap();
+            with_accepted_tcp(limits, |context, transport, mut peer| async move {
+                let cancellation = CancellationSource::new();
+                let mut writer = transport
+                    .write_queue(
+                        &context,
+                        STALLING_WRITE,
+                        Duration::ZERO,
+                        cancellation.token(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                writer
+                    .start_write(queue(&[&pattern(STALLING_WRITE, 11)]))
+                    .unwrap();
+                stall_after_progress(&mut writer, &peer).await;
+                cancellation.request_cancellation();
+                let receipt = poll_fn(|context| writer.poll_complete(context)).await;
+                let error = receipt.result.unwrap_err();
+                assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+                assert!(error.bytes_written() > 0);
+                assert!(
+                    writer.is_saturated(),
+                    "the cancelled write reset the transport"
+                );
+                let mut drained = Vec::new();
+                assert_eq!(
+                    peer.read_to_end(&mut drained).await.unwrap_err().kind(),
+                    io::ErrorKind::ConnectionReset,
+                );
+            });
+        }
+
+        #[test]
+        fn dropping_the_queue_with_an_outstanding_write_resets_the_transport() {
+            let limits = ByteStreamLimits::new(64, STALLING_WRITE, 8).unwrap();
+            with_accepted_tcp(limits, |context, transport, mut peer| async move {
+                let mut writer = transport
+                    .write_queue(
+                        &context,
+                        STALLING_WRITE,
+                        Duration::ZERO,
+                        CancellationToken::never(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                writer
+                    .start_write(queue(&[&pattern(STALLING_WRITE, 13)]))
+                    .unwrap();
+                stall_after_progress(&mut writer, &peer).await;
+                drop(writer);
+                assert!(
+                    !transport.has_pending_write(&context).unwrap(),
+                    "the abandoned write is retired"
+                );
+                let error = transport
+                    .write(
+                        &context,
+                        queue(&[b"x"]),
+                        Duration::ZERO,
+                        CancellationToken::never(),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.code(),
+                    HttpErrorCode::TRANSPORT_WRITE_ERROR,
+                    "the transport was reset, as for a dropped write future"
+                );
+                let mut drained = Vec::new();
+                assert_eq!(
+                    peer.read_to_end(&mut drained).await.unwrap_err().kind(),
+                    io::ErrorKind::ConnectionReset,
+                );
+            });
+        }
+
+        #[test]
+        fn submissions_without_capacity_or_over_the_bound_are_misuse() {
+            let limits = ByteStreamLimits::new(64, STALLING_WRITE, 8).unwrap();
+            with_accepted_tcp(limits, |context, transport, mut peer| async move {
+                let mut writer = transport
+                    .write_queue(&context, 8, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                let error = writer.start_write(queue(&[b"012345678"])).unwrap_err();
+                assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+                assert!(writer.is_idle(), "a refused submission leaves no receipt");
+                writer.start_write(queue(&[b"01234567"])).unwrap();
+                assert!(!writer.can_write(1));
+                let error = writer.start_write(queue(&[b"8"])).unwrap_err();
+                assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+                let receipt = poll_fn(|context| writer.poll_complete(context)).await;
+                assert_eq!(receipt.result.unwrap().bytes_written, 8);
+                assert!(writer.is_idle(), "the refused submission left no receipt");
+                let mut received = [0; 8];
+                peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"01234567");
+                transport.close(&context).unwrap();
+            });
+        }
+
+        #[test]
+        fn a_stream_without_native_queue_support_offers_no_queue() {
+            Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(LocalSet::new().run_until(async move {
+                    let (worker, driver) = WorkerDriver::new(8).unwrap();
+                    let call = worker
+                        .call_local(|context| async move {
+                            let transport = owned_from_stream(
+                                &context,
+                                DrainStream {
+                                    control: DrainControl::default(),
+                                    worker: context.handle().clone(),
+                                },
+                                SocketAddress::new("127.0.0.1", 1000),
+                                SocketAddress::new("127.0.0.1", 2000),
+                                None,
+                                limits(),
+                            )
+                            .unwrap();
+                            assert!(
+                                transport
+                                    .write_queue(
+                                        &context,
+                                        1024,
+                                        Duration::ZERO,
+                                        CancellationToken::never(),
+                                    )
+                                    .unwrap()
+                                    .is_none(),
+                                "only TCP streams drive queued writes; others keep the \
+                                 single-write API",
+                            );
+                            transport.close_with_reset(&context).unwrap();
+                        })
+                        .unwrap();
+                    let driver_task = tokio::task::spawn_local(driver);
+                    call.await.unwrap();
+                    worker.begin_shutdown();
+                    driver_task.await.unwrap();
+                }));
+        }
+
+        #[test]
+        fn a_pending_queued_write_arms_no_deadline_baton() {
+            let limits = ByteStreamLimits::new(64, STALLING_WRITE, 8).unwrap();
+            with_accepted_tcp(limits, |context, transport, mut peer| async move {
+                let mut writer = transport
+                    .write_queue(
+                        &context,
+                        STALLING_WRITE,
+                        Duration::ZERO,
+                        CancellationToken::never(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                let batons = write_deadline_batons_for_test();
+                writer
+                    .start_write(queue(&[&pattern(STALLING_WRITE, 17)]))
+                    .unwrap();
+                stall_after_progress(&mut writer, &peer).await;
+                assert_eq!(
+                    write_deadline_batons_for_test(),
+                    batons,
+                    "an untimed queued write that pends arms no per-write deadline"
+                );
+                let drain = async {
+                    let mut received = vec![0; STALLING_WRITE];
+                    peer.read_exact(&mut received).await.unwrap();
+                };
+                let (receipt, ()) =
+                    tokio::join!(poll_fn(|context| writer.poll_complete(context)), drain);
+                receipt.result.unwrap();
+                drop(writer);
+
+                // Control: the single-write API arms one deadline for a write that pends.
+                let mut write = transport.write(
+                    &context,
+                    queue(&[&pattern(STALLING_WRITE, 19)]),
+                    Duration::ZERO,
+                    CancellationToken::never(),
+                );
+                let mut byte = [0];
+                tokio::select! {
+                    _ = &mut write => panic!("the write completes only as the peer reads"),
+                    peeked = peer.peek(&mut byte) => assert_eq!(peeked.unwrap(), 1),
+                }
+                assert_eq!(write_deadline_batons_for_test(), batons + 1);
+                let drain = async {
+                    let mut received = vec![0; STALLING_WRITE];
+                    peer.read_exact(&mut received).await.unwrap();
+                };
+                let (written, ()) = tokio::join!(write, drain);
+                written.unwrap();
+                transport.close(&context).unwrap();
+            });
+        }
+
+        #[test]
+        fn queued_writes_reuse_one_progress_cell() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let mut writer = transport
+                    .write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                let cells = write_progress_cells_for_test();
+                for chunk in [&b"one "[..], b"two "] {
+                    writer.start_write(queue(&[chunk])).unwrap();
+                    let receipt = poll_fn(|context| writer.poll_complete(context)).await;
+                    assert_eq!(
+                        receipt.result.unwrap().bytes_written,
+                        4,
+                        "each write counts its own progress"
+                    );
+                }
+                assert_eq!(
+                    write_progress_cells_for_test(),
+                    cells,
+                    "queued writes count their progress in the queue's one cell"
+                );
+                // Control: the single-write API builds one cell per write.
+                transport
+                    .write(
+                        &context,
+                        queue(&[b"six "]),
+                        Duration::ZERO,
+                        CancellationToken::never(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(write_progress_cells_for_test(), cells + 1);
+                let mut received = [0; 12];
+                peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"one two six ");
+                transport.close(&context).unwrap();
+            });
+        }
+
+        #[test]
+        fn queued_writes_build_no_io_write_future() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let mut writer = transport
+                    .write_queue(&context, 1024, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                let futures = io_write_futures_for_test();
+                for chunk in [&b"one "[..], b"two "] {
+                    writer.start_write(queue(&[chunk])).unwrap();
+                    let receipt = poll_fn(|context| writer.poll_complete(context)).await;
+                    assert_eq!(receipt.result.unwrap().bytes_written, 4);
+                }
+                assert_eq!(
+                    io_write_futures_for_test(),
+                    futures,
+                    "queued writes keep their I/O state in the backend, not in a boxed future"
+                );
+                // Control: the single-write API builds one I/O future per write.
+                transport
+                    .write(
+                        &context,
+                        queue(&[b"six "]),
+                        Duration::ZERO,
+                        CancellationToken::never(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(io_write_futures_for_test(), futures + 1);
+                let mut received = [0; 12];
+                peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"one two six ");
+                transport.close(&context).unwrap();
+            });
+        }
+
+        /// A reset of the transport wakes the task that polled the outstanding write, so that
+        /// task observes the failure receipt without polling again for another reason.
+        #[test]
+        fn a_reset_wakes_the_task_awaiting_the_outstanding_write() {
+            let limits = ByteStreamLimits::new(64, STALLING_WRITE, 8).unwrap();
+            with_accepted_tcp(limits, |context, transport, peer| async move {
+                let mut writer = transport
+                    .write_queue(
+                        &context,
+                        STALLING_WRITE,
+                        Duration::ZERO,
+                        CancellationToken::never(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                writer
+                    .start_write(queue(&[&pattern(STALLING_WRITE, 17)]))
+                    .unwrap();
+                stall_after_progress(&mut writer, &peer).await;
+                let wake = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&wake));
+                assert!(
+                    writer
+                        .poll_complete(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                assert!(!wake.take(), "the stalled write has not woken its task");
+                transport.close_with_reset(&context).unwrap();
+                assert!(wake.take(), "the reset wakes the task awaiting the write");
+                let Poll::Ready(receipt) = poll_once(&mut writer).await else {
+                    panic!("the reset completes the outstanding write");
+                };
+                assert_eq!(
+                    receipt.result.unwrap_err().code(),
+                    HttpErrorCode::TRANSPORT_WRITE_ERROR
+                );
+            });
+        }
+
+        /// A cancellation requested from another thread wakes the task that last polled the
+        /// outstanding write, which then observes the cancelled receipt and the reset transport.
+        #[test]
+        fn a_cancellation_from_another_thread_wakes_the_task_awaiting_the_outstanding_write() {
+            let limits = ByteStreamLimits::new(64, STALLING_WRITE, 8).unwrap();
+            with_accepted_tcp(limits, |context, transport, mut peer| async move {
+                let cancellation = CancellationSource::new();
+                let mut writer = transport
+                    .write_queue(
+                        &context,
+                        STALLING_WRITE,
+                        Duration::ZERO,
+                        cancellation.token(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                writer
+                    .start_write(queue(&[&pattern(STALLING_WRITE, 19)]))
+                    .unwrap();
+                stall_after_progress(&mut writer, &peer).await;
+                let wake = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&wake));
+                assert!(
+                    writer
+                        .poll_complete(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                assert!(!wake.take(), "the stalled write has not woken its task");
+                std::thread::spawn(move || cancellation.request_cancellation())
+                    .join()
+                    .unwrap();
+                time::timeout(Duration::from_secs(2), wake.wait())
+                    .await
+                    .expect("the cancellation wakes the task awaiting the write");
+                let Poll::Ready(receipt) = poll_once(&mut writer).await else {
+                    panic!("the cancellation completes the outstanding write");
+                };
+                assert_eq!(
+                    receipt.result.unwrap_err().code(),
+                    HttpErrorCode::CORO_CANCELLED
+                );
+                assert!(
+                    writer.is_saturated(),
+                    "the cancelled write reset the transport"
+                );
+                let mut drained = Vec::new();
+                assert_eq!(
+                    peer.read_to_end(&mut drained).await.unwrap_err().kind(),
+                    io::ErrorKind::ConnectionReset,
+                );
+            });
+        }
+    }
 }

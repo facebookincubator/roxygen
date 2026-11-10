@@ -106,6 +106,7 @@ use roxygen_transport::byte_stream::ByteEventCapability;
 use roxygen_transport::byte_stream::ByteEventRegistrationError;
 use roxygen_transport::byte_stream::ByteStreamTransport;
 use roxygen_transport::byte_stream::LocalTransportFuture;
+use roxygen_transport::byte_stream::OwnedWriteQueue;
 use roxygen_transport::byte_stream::PeerIdentity;
 use roxygen_transport::byte_stream::TransportWriteError;
 use roxygen_transport::byte_stream::WriteInfo;
@@ -222,6 +223,12 @@ pub struct UniplexWriteCompletion {
 /// queue retains its capacity until the caller consumes its completed receipts.
 pub trait UniplexWriteQueue: 'static {
     /// Reports capacity only; terminal transport state does not hide admission errors.
+    ///
+    /// A queue whose writes progress only while `poll_complete` is polled must withhold
+    /// capacity while a write is outstanding. Owned HTTP/2 arms its writer for a submission
+    /// only while something waits for the receipt, and a refused capacity is that wait
+    /// (`write_completion_needed`). An unarmed write on such a queue would stall until an
+    /// unrelated wake polled the session.
     fn can_write(&self, bytes: usize) -> bool;
     /// Consumes one capacity-admitted submission. Errors indicate interface misuse;
     /// transport rejection and cancellation are delivered by `poll_complete`.
@@ -239,6 +246,29 @@ pub trait UniplexWriteQueue: 'static {
     }
 }
 
+/// The native TCP byte stream's queue (`ByteStreamTransport::write_queue`). It keeps the
+/// default `is_saturated`, so the owned drivers keep their write fence on TCP (`DIV-028`).
+impl UniplexWriteQueue for OwnedWriteQueue {
+    fn can_write(&self, bytes: usize) -> bool {
+        OwnedWriteQueue::can_write(self, bytes)
+    }
+
+    fn start_write(&mut self, data: BufQueue) -> Result<(), HttpError> {
+        OwnedWriteQueue::start_write(self, data)
+    }
+
+    fn poll_complete(&mut self, context: &mut Context<'_>) -> Poll<UniplexWriteCompletion> {
+        OwnedWriteQueue::poll_complete(self, context).map(|completion| UniplexWriteCompletion {
+            requested_bytes: completion.requested_bytes,
+            result: completion.result,
+        })
+    }
+
+    fn is_idle(&self) -> bool {
+        OwnedWriteQueue::is_idle(self)
+    }
+}
+
 /// Byte-stream surface used by the uniplex loops.
 ///
 /// Every `ByteStreamTransport`, including `OwnedByteStream`, implements this
@@ -247,6 +277,10 @@ pub trait UniplexWriteQueue: 'static {
 pub trait UniplexTransport: 'static {
     /// Acquires an optional exclusive writer. Unsupported configurations retain
     /// the ordinary single-write API, including its timeout behavior.
+    ///
+    /// A queue may observe `cancellation` only when polled, as the native TCP
+    /// queue does. A cancellation requested from another task then wakes the
+    /// task that last polled the outstanding write.
     fn try_write_queue(
         &self,
         _context: &WorkerContext,
@@ -296,6 +330,23 @@ pub trait UniplexTransport: 'static {
 }
 
 impl<T: ByteStreamTransport> UniplexTransport for T {
+    fn try_write_queue(
+        &self,
+        context: &WorkerContext,
+        maximum_write_size: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<Option<Box<dyn UniplexWriteQueue>>, HttpError> {
+        Ok(ByteStreamTransport::write_queue(
+            self,
+            context,
+            maximum_write_size,
+            timeout,
+            cancellation,
+        )?
+        .map(|queue| Box::new(queue) as Box<dyn UniplexWriteQueue>))
+    }
+
     fn read(
         &self,
         context: &WorkerContext,

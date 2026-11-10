@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
@@ -24,6 +25,7 @@ use roxygen_core::error::HttpError;
 use roxygen_core::error::HttpErrorCode;
 use roxygen_core::message::SocketAddress;
 use roxygen_runtime::cancellation::CancellationToken;
+use roxygen_runtime::cancellation::CancellationWakeRegistration;
 use roxygen_runtime::host::Host;
 use roxygen_runtime::thread::current_id;
 use roxygen_runtime::wait::TimedBaton;
@@ -341,6 +343,188 @@ pub trait ByteStreamTransport: 'static {
         context: &WorkerContext,
         registration: HttpByteEventRegistration,
     ) -> Result<(), ByteEventRegistrationError>;
+
+    /// Acquires the transport's native write queue, which writes at most
+    /// `maximum_write_size` bytes per submission and is untimed, so it is
+    /// offered only for a zero `timeout`. `None` keeps the single-write API,
+    /// including its timeout.
+    ///
+    /// The queue observes `cancellation` when it is polled. A cancellation
+    /// requested from another task wakes the task that last polled the
+    /// outstanding write.
+    fn write_queue(
+        &self,
+        _context: &WorkerContext,
+        _maximum_write_size: usize,
+        _timeout: Duration,
+        _cancellation: CancellationToken,
+    ) -> Result<Option<OwnedWriteQueue>, HttpError> {
+        Ok(None)
+    }
+}
+
+/// Unconsumed receipts an [`OwnedWriteQueue`] holds before it refuses submissions.
+const WRITE_QUEUE_RECEIPTS: usize = 8;
+
+/// One retired submission of an [`OwnedWriteQueue`].
+#[derive(Debug)]
+pub struct QueuedWriteCompletion {
+    pub requested_bytes: usize,
+    pub result: Result<WriteInfo, TransportWriteError>,
+}
+
+/// A submission whose receipt the queue has not yet delivered.
+enum QueuedReceipt {
+    /// The physical write of this many bytes is outstanding.
+    Writing(usize),
+    Done(QueuedWriteCompletion),
+}
+
+/// The native write queue of an [`OwnedByteStream`] over plaintext TCP
+/// ([`ByteStreamTransport::write_queue`]): a bounded writer with ordered
+/// completion receipts, which the owned uniplex drivers use instead of one
+/// write future per write.
+///
+/// Like Proxygen coro's uniplex write loop, which keeps one transport write
+/// outstanding while later egress gathers in its write buffer, the queue admits
+/// a submission only while no physical write is outstanding, and holds at most
+/// `WRITE_QUEUE_RECEIPTS` unconsumed receipts. A submitted write is registered
+/// with the transport at once, and its bytes are written as
+/// [`OwnedWriteQueue::poll_complete`] polls it, with the transport's
+/// single-write semantics except for timing: the write has no deadline and
+/// allocates nothing, and its completion wakes no task. A cancellation is
+/// observed at the next poll; one requested from another task wakes the task
+/// that last polled the outstanding write, as a reset of the transport does.
+/// Dropping the queue with a write outstanding resets the transport, as
+/// dropping a write future does.
+pub struct OwnedWriteQueue {
+    io: Weak<dyn ByteStreamIo>,
+    state: Rc<RefCell<TransportState>>,
+    worker: WorkerHandle,
+    limits: ByteStreamLimits,
+    byte_event_capability: ByteEventCapability,
+    context: WorkerContext,
+    maximum_write_size: usize,
+    cancellation: CancellationToken,
+    /// Wakes the task that last polled the outstanding write when another task
+    /// requests cancellation; it installs no listener until a write pends.
+    cancellation_wake: CancellationWakeRegistration,
+    /// Counts each write's progress in turn.
+    progress: WriteProgress,
+    operation: Option<WriteOperation>,
+    receipts: VecDeque<QueuedReceipt>,
+}
+
+impl OwnedWriteQueue {
+    /// Reports capacity only, for a submission of any size up to the maximum.
+    ///
+    /// The outstanding write progresses only while `poll_complete` is polled,
+    /// so capacity is withheld until it completes. That refusal is what arms
+    /// owned HTTP/2's writer for every write the queue holds
+    /// (`UniplexWriteQueue::can_write`).
+    pub fn can_write(&self, _bytes: usize) -> bool {
+        self.operation.is_none() && self.receipts.len() < WRITE_QUEUE_RECEIPTS
+    }
+
+    /// Submits `data`, which needs capacity and at most the maximum write
+    /// size; an error is interface misuse and leaves no receipt. A submission
+    /// the transport refuses at entry, or an empty one, gets its receipt at
+    /// once.
+    pub fn start_write(&mut self, data: BufQueue) -> Result<(), HttpError> {
+        let requested_bytes = data.chain_length();
+        if requested_bytes > self.maximum_write_size {
+            return Err(HttpError::with_message(
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"write queue submission exceeds its maximum write size",
+            ));
+        }
+        if !self.can_write(requested_bytes) {
+            return Err(HttpError::with_message(
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"write queue has no capacity",
+            ));
+        }
+        let target = WriteTarget {
+            io: &self.io,
+            state: &self.state,
+            worker: &self.worker,
+            limits: self.limits,
+            byte_event_capability: self.byte_event_capability,
+        };
+        match start_write_operation(
+            target,
+            &self.context,
+            data,
+            ByteEventWriteFlags::default(),
+            WriteKind::Queued {
+                progress: &self.progress,
+            },
+            self.cancellation.clone(),
+        ) {
+            WriteStart::Started(operation) => {
+                self.operation = Some(operation);
+                self.receipts
+                    .push_back(QueuedReceipt::Writing(requested_bytes));
+            }
+            WriteStart::Finished(result) => {
+                self.receipts
+                    .push_back(QueuedReceipt::Done(QueuedWriteCompletion {
+                        requested_bytes,
+                        result,
+                    }));
+            }
+        }
+        Ok(())
+    }
+
+    /// Drives the outstanding write with `context`'s waker and yields the
+    /// oldest receipt once its submission is complete. An idle queue registers
+    /// nothing.
+    pub fn poll_complete(&mut self, context: &mut Context<'_>) -> Poll<QueuedWriteCompletion> {
+        if let Some(operation) = self.operation.as_mut() {
+            match Pin::new(operation).poll(context) {
+                Poll::Ready(result) => {
+                    self.operation = None;
+                    let receipt = self
+                        .receipts
+                        .back_mut()
+                        .expect("an outstanding write keeps its receipt");
+                    let QueuedReceipt::Writing(requested_bytes) = *receipt else {
+                        unreachable!("only the newest receipt can be outstanding");
+                    };
+                    *receipt = QueuedReceipt::Done(QueuedWriteCompletion {
+                        requested_bytes,
+                        result,
+                    });
+                }
+                Poll::Pending => {
+                    if self.cancellation_wake.update_waker(context.waker()) {
+                        context.waker().wake_by_ref();
+                    }
+                }
+            }
+        }
+        if !matches!(self.receipts.front(), Some(QueuedReceipt::Done(_))) {
+            return Poll::Pending;
+        }
+        let Some(QueuedReceipt::Done(completion)) = self.receipts.pop_front() else {
+            unreachable!("the oldest receipt is done");
+        };
+        Poll::Ready(completion)
+    }
+
+    /// Whether every receipt was consumed.
+    pub fn is_idle(&self) -> bool {
+        self.receipts.is_empty()
+    }
+
+    /// Whether bytes submitted now would wait behind bytes the transport has
+    /// not yet accepted: a physical write is outstanding, or the transport can
+    /// no longer write.
+    pub fn is_saturated(&self) -> bool {
+        let state = self.state.borrow();
+        self.operation.is_some() || state.write_shutdown || state.close_state != CloseState::Open
+    }
 }
 
 #[derive(Clone)]
@@ -351,6 +535,8 @@ pub(crate) struct WriteProgress {
 
 impl WriteProgress {
     fn new(maximum: usize) -> Self {
+        #[cfg(test)]
+        WRITE_PROGRESS_CELLS.with(|count| count.set(count.get() + 1));
         Self {
             written: Rc::new(Cell::new(0)),
             maximum,
@@ -374,6 +560,16 @@ impl WriteProgress {
 
     fn get(&self) -> usize {
         self.written.get()
+    }
+
+    /// Restarts this cell, which no other write is recording into, for a write of
+    /// `maximum` bytes.
+    fn restart(&self, maximum: usize) -> Self {
+        self.written.set(0);
+        Self {
+            written: Rc::clone(&self.written),
+            maximum,
+        }
     }
 }
 
@@ -489,6 +685,12 @@ pub(crate) trait ByteStreamIo: 'static {
 
     fn close_with_reset(&self);
 
+    /// The writer of an [`OwnedWriteQueue`] over this backend; `None` offers no
+    /// queue.
+    fn queued_writer(&self) -> Option<Rc<dyn QueuedWriter>> {
+        None
+    }
+
     fn enable_zero_copy(
         &self,
         _context: &WorkerContext,
@@ -536,6 +738,17 @@ struct ActiveRead {
 std::thread_local! {
     static WRITE_DEADLINE_BATONS: Cell<usize> = const { Cell::new(0) };
     static CLOSE_PATH_ERRORS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static WRITE_PROGRESS_CELLS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Write progress cells built on this thread.
+#[cfg(test)]
+pub(crate) fn write_progress_cells_for_test() -> usize {
+    WRITE_PROGRESS_CELLS.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -685,7 +898,7 @@ fn transition_close_resources(
     }
     if let Some(active) = active_write {
         let ActiveWrite {
-            io_future,
+            io,
             byte_events,
             _progress: progress,
             wait,
@@ -699,7 +912,7 @@ fn transition_close_resources(
             }
             wait => retire_transport_value(wait, &mut failure),
         }
-        retire_transport_value(io_future, &mut failure);
+        retire_transport_value(io, &mut failure);
         retire_transport_value(byte_events, &mut failure);
         retire_transport_value(progress, &mut failure);
         retire_transport_value(waker, &mut failure);
@@ -776,11 +989,56 @@ fn retire_transport_value<Value>(value: Value, failure: &mut Option<TransportPan
 
 struct ActiveWrite {
     operation: u64,
-    io_future: LocalTransportFuture<Result<(), HttpError>>,
+    io: ActiveIo,
     byte_events: Option<ByteEventWriteState>,
     _progress: WriteProgress,
     wait: WriteWait,
     waker: Option<Waker>,
+}
+
+/// The I/O of one physical write: an ordinary write's boxed future, or the
+/// backend that holds an [`OwnedWriteQueue`] write's state.
+enum ActiveIo {
+    Future(LocalTransportFuture<Result<(), HttpError>>),
+    Queued(QueuedIo),
+}
+
+impl ActiveIo {
+    fn poll(&mut self, context: &mut Context<'_>) -> Poll<Result<(), HttpError>> {
+        match self {
+            Self::Future(future) => future.as_mut().poll(context),
+            Self::Queued(queued) => queued.0.poll_write(context),
+        }
+    }
+}
+
+/// A write that a [`QueuedWriter`] holds. Dropping it ends the write, as
+/// dropping an ordinary write's future does; after `Ready` that does nothing.
+struct QueuedIo(Rc<dyn QueuedWriter>);
+
+impl Drop for QueuedIo {
+    fn drop(&mut self) {
+        self.0.retire_write();
+    }
+}
+
+/// A backend that keeps one write's state itself, so that an
+/// [`OwnedWriteQueue`] write allocates no future. Each write has the effects of
+/// `ByteStreamIo::write`'s future.
+pub(crate) trait QueuedWriter {
+    fn start_write(
+        &self,
+        data: BufQueue,
+        progress: WriteProgress,
+        flags: ByteEventWriteFlags,
+        byte_events: Option<ByteEventWriteState>,
+    );
+
+    /// `Ready` ends the write.
+    fn poll_write(&self, context: &mut Context<'_>) -> Poll<Result<(), HttpError>>;
+
+    /// Ends an unfinished write, as dropping `ByteStreamIo::write`'s future does.
+    fn retire_write(&self);
 }
 
 /// A write's deadline, built once a backend poll leaves the write pending, as
@@ -804,6 +1062,9 @@ enum WriteWait {
     /// An unarmed write that `WriteOperation::finish` retires, waking its task
     /// at the point where an armed write's `TimedBaton::drop` wakes it.
     Retired { _wake: CompletionWake },
+    /// An [`OwnedWriteQueue`]'s write: no deadline, and cancellation is observed
+    /// when the write is polled, which wakes no task.
+    Untimed { cancellation: CancellationToken },
 }
 
 struct CompletionWake(Option<Waker>);
@@ -1310,90 +1571,27 @@ impl OwnedByteStream {
         timeout: Duration,
         cancellation: CancellationToken,
     ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
-        if let Err(error) = self.check_context(context) {
-            return Box::pin(std::future::ready(Err(TransportWriteError::new(error, 0))));
+        match start_write_operation(
+            self.write_target(),
+            context,
+            data,
+            flags,
+            WriteKind::Ordinary { timeout },
+            cancellation,
+        ) {
+            WriteStart::Started(operation) => Box::pin(operation),
+            WriteStart::Finished(result) => Box::pin(std::future::ready(result)),
         }
-        if flags != ByteEventWriteFlags::default()
-            && self.byte_event_capability == ByteEventCapability::Unsupported
-        {
-            return Box::pin(std::future::ready(Err(TransportWriteError::new(
-                write_error(b"byte-event write flags are unsupported by this transport"),
-                0,
-            ))));
-        }
-        if cancellation.is_cancellation_requested() {
-            let _ = self.transition_close(CloseState::Reset, Some(context));
-            return Box::pin(std::future::ready(Err(TransportWriteError::new(
-                cancelled_error(b"byte-stream write cancelled before entry"),
-                0,
-            ))));
-        }
-        let length = data.chain_length();
-        if length > self.limits.maximum_write_size {
-            return Box::pin(std::future::ready(Err(TransportWriteError::new(
-                write_error(b"byte-stream write exceeds the configured bound"),
-                0,
-            ))));
-        }
-        if length == 0 && !flags.timestamp_write && !flags.timestamp_tx && !flags.timestamp_ack {
-            return Box::pin(std::future::ready(Ok(WriteInfo::default())));
-        }
+    }
 
-        let (operation, byte_events) = {
-            let mut state = self.state.borrow_mut();
-            if state.close_state != CloseState::Open || state.write_shutdown {
-                return Box::pin(std::future::ready(Err(TransportWriteError::new(
-                    write_error(b"byte-stream write side is closed"),
-                    0,
-                ))));
-            }
-            if state.active_write.is_some() {
-                return Box::pin(std::future::ready(Err(TransportWriteError::new(
-                    HttpError::with_message(
-                        HttpErrorCode::INVALID_STATE_TRANSITION,
-                        b"byte-stream already has a pending write",
-                    ),
-                    0,
-                ))));
-            }
-            let operation = state.next_operation();
-            for pending in &mut state.registrations {
-                if pending.write_operation.is_none() {
-                    pending.write_operation = Some(operation);
-                }
-            }
-            let registrations = state.take_write_notifications(operation, flags);
-            (operation, ByteEventWriteState::new(registrations))
-        };
-
-        let Some(io) = self.io.upgrade() else {
-            return Box::pin(std::future::ready(Err(TransportWriteError::new(
-                dropped_error(),
-                0,
-            ))));
-        };
-        io.prepare_write_timeout(timeout);
-        let progress = WriteProgress::new(length);
-        let io_future = io.write(data, progress.clone(), flags, byte_events.clone());
-        self.state.borrow_mut().active_write = Some(ActiveWrite {
-            operation,
-            io_future,
-            byte_events: byte_events.clone(),
-            _progress: progress.clone(),
-            wait: WriteWait::Unarmed {
-                timeout,
-                cancellation,
-                started: None,
-            },
-            waker: None,
-        });
-        Box::pin(WriteOperation::new(
-            self.io.clone(),
-            Rc::clone(&self.state),
-            operation,
-            length,
-            progress,
-        ))
+    fn write_target(&self) -> WriteTarget<'_> {
+        WriteTarget {
+            io: &self.io,
+            state: &self.state,
+            worker: &self.worker,
+            limits: self.limits,
+            byte_event_capability: self.byte_event_capability,
+        }
     }
 
     fn transition_close(
@@ -1409,30 +1607,208 @@ impl OwnedByteStream {
     }
 
     fn assert_owner(&self) {
-        let state = self.state.borrow();
-        state.assert_owner();
-        assert_eq!(self.worker.owner_thread(), state.owner_thread);
+        assert_transport_owner(&self.state, &self.worker);
     }
 
     fn check_context(&self, context: &WorkerContext) -> Result<(), HttpError> {
-        self.assert_owner();
-        self.check_identity(context)?;
-        if self.worker.state() != WorkerState::Open {
-            return Err(dropped_error());
-        }
-        Ok(())
+        check_transport_context(&self.state, &self.worker, context)
     }
 
     fn check_identity(&self, context: &WorkerContext) -> Result<(), HttpError> {
-        // Callers assert the transport owner before checking worker identity.
-        if !self.worker.same_worker(context.handle()) {
-            return Err(HttpError::with_message(
-                HttpErrorCode::INVALID_STATE_TRANSITION,
-                b"byte-stream transport used from a different worker context",
-            ));
+        check_transport_identity(&self.worker, context)
+    }
+}
+
+/// What a write needs from its transport: borrowed from an [`OwnedByteStream`], or from the
+/// handles its [`OwnedWriteQueue`] holds.
+#[derive(Clone, Copy)]
+struct WriteTarget<'a> {
+    io: &'a Weak<dyn ByteStreamIo>,
+    state: &'a Rc<RefCell<TransportState>>,
+    worker: &'a WorkerHandle,
+    limits: ByteStreamLimits,
+    byte_event_capability: ByteEventCapability,
+}
+
+impl WriteTarget<'_> {
+    fn check_context(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        check_transport_context(self.state, self.worker, context)
+    }
+
+    fn transition_close(
+        &self,
+        close_state: CloseState,
+        context: Option<&WorkerContext>,
+    ) -> Result<(), HttpError> {
+        assert_transport_owner(self.state, self.worker);
+        if let Some(io) = self.io.upgrade() {
+            transition_close_resources(io.as_ref(), self.state, close_state, context)?;
         }
         Ok(())
     }
+}
+
+/// A write that [`start_write_operation`] began, or the result it ended with at entry.
+enum WriteStart {
+    Started(WriteOperation),
+    Finished(Result<WriteInfo, TransportWriteError>),
+}
+
+fn assert_transport_owner(state: &RefCell<TransportState>, worker: &WorkerHandle) {
+    let state = state.borrow();
+    state.assert_owner();
+    assert_eq!(worker.owner_thread(), state.owner_thread);
+}
+
+fn check_transport_context(
+    state: &RefCell<TransportState>,
+    worker: &WorkerHandle,
+    context: &WorkerContext,
+) -> Result<(), HttpError> {
+    assert_transport_owner(state, worker);
+    check_transport_identity(worker, context)?;
+    if worker.state() != WorkerState::Open {
+        return Err(dropped_error());
+    }
+    Ok(())
+}
+
+fn check_transport_identity(
+    worker: &WorkerHandle,
+    context: &WorkerContext,
+) -> Result<(), HttpError> {
+    // Callers assert the transport owner before checking worker identity.
+    if !worker.same_worker(context.handle()) {
+        return Err(HttpError::with_message(
+            HttpErrorCode::INVALID_STATE_TRANSITION,
+            b"byte-stream transport used from a different worker context",
+        ));
+    }
+    Ok(())
+}
+
+/// How [`start_write_operation`] writes.
+#[derive(Clone, Copy)]
+enum WriteKind<'a> {
+    /// An ordinary write, timed by `timeout`.
+    Ordinary { timeout: Duration },
+    /// An [`OwnedWriteQueue`]'s write: untimed, counting its progress in the queue's cell.
+    Queued { progress: &'a WriteProgress },
+}
+
+fn start_write_operation(
+    target: WriteTarget<'_>,
+    context: &WorkerContext,
+    data: BufQueue,
+    flags: ByteEventWriteFlags,
+    kind: WriteKind<'_>,
+    cancellation: CancellationToken,
+) -> WriteStart {
+    if let Err(error) = target.check_context(context) {
+        return WriteStart::Finished(Err(TransportWriteError::new(error, 0)));
+    }
+    if flags != ByteEventWriteFlags::default()
+        && target.byte_event_capability == ByteEventCapability::Unsupported
+    {
+        return WriteStart::Finished(Err(TransportWriteError::new(
+            write_error(b"byte-event write flags are unsupported by this transport"),
+            0,
+        )));
+    }
+    if cancellation.is_cancellation_requested() {
+        let _ = target.transition_close(CloseState::Reset, Some(context));
+        return WriteStart::Finished(Err(TransportWriteError::new(
+            cancelled_error(b"byte-stream write cancelled before entry"),
+            0,
+        )));
+    }
+    let length = data.chain_length();
+    if length > target.limits.maximum_write_size {
+        return WriteStart::Finished(Err(TransportWriteError::new(
+            write_error(b"byte-stream write exceeds the configured bound"),
+            0,
+        )));
+    }
+    if length == 0 && !flags.timestamp_write && !flags.timestamp_tx && !flags.timestamp_ack {
+        return WriteStart::Finished(Ok(WriteInfo::default()));
+    }
+
+    let (operation, byte_events) = {
+        let mut state = target.state.borrow_mut();
+        if state.close_state != CloseState::Open || state.write_shutdown {
+            return WriteStart::Finished(Err(TransportWriteError::new(
+                write_error(b"byte-stream write side is closed"),
+                0,
+            )));
+        }
+        if state.active_write.is_some() {
+            return WriteStart::Finished(Err(TransportWriteError::new(
+                HttpError::with_message(
+                    HttpErrorCode::INVALID_STATE_TRANSITION,
+                    b"byte-stream already has a pending write",
+                ),
+                0,
+            )));
+        }
+        let operation = state.next_operation();
+        for pending in &mut state.registrations {
+            if pending.write_operation.is_none() {
+                pending.write_operation = Some(operation);
+            }
+        }
+        let registrations = state.take_write_notifications(operation, flags);
+        (operation, ByteEventWriteState::new(registrations))
+    };
+
+    let Some(io) = target.io.upgrade() else {
+        return WriteStart::Finished(Err(TransportWriteError::new(dropped_error(), 0)));
+    };
+    let (progress, wait) = match kind {
+        WriteKind::Ordinary { timeout } => {
+            io.prepare_write_timeout(timeout);
+            (
+                WriteProgress::new(length),
+                WriteWait::Unarmed {
+                    timeout,
+                    cancellation,
+                    started: None,
+                },
+            )
+        }
+        WriteKind::Queued { progress } => {
+            io.prepare_write_timeout(Duration::ZERO);
+            (
+                progress.restart(length),
+                WriteWait::Untimed { cancellation },
+            )
+        }
+    };
+    let queued_writer = match kind {
+        WriteKind::Ordinary { .. } => None,
+        WriteKind::Queued { .. } => io.queued_writer(),
+    };
+    let io = match queued_writer {
+        Some(writer) => {
+            writer.start_write(data, progress.clone(), flags, byte_events.clone());
+            ActiveIo::Queued(QueuedIo(writer))
+        }
+        None => ActiveIo::Future(io.write(data, progress.clone(), flags, byte_events.clone())),
+    };
+    target.state.borrow_mut().active_write = Some(ActiveWrite {
+        operation,
+        io,
+        byte_events: byte_events.clone(),
+        _progress: progress.clone(),
+        wait,
+        waker: None,
+    });
+    WriteStart::Started(WriteOperation::new(
+        target.io.clone(),
+        Rc::clone(target.state),
+        operation,
+        length,
+        progress,
+    ))
 }
 
 impl ByteStreamTransport for OwnedByteStream {
@@ -1609,6 +1985,37 @@ impl ByteStreamTransport for OwnedByteStream {
             registration,
         });
         Ok(())
+    }
+
+    fn write_queue(
+        &self,
+        context: &WorkerContext,
+        maximum_write_size: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<Option<OwnedWriteQueue>, HttpError> {
+        if !timeout.is_zero()
+            || !self
+                .io
+                .upgrade()
+                .is_some_and(|io| io.queued_writer().is_some())
+        {
+            return Ok(None);
+        }
+        Ok(Some(OwnedWriteQueue {
+            io: self.io.clone(),
+            state: Rc::clone(&self.state),
+            worker: self.worker.clone(),
+            limits: self.limits,
+            byte_event_capability: self.byte_event_capability,
+            context: context.clone(),
+            maximum_write_size,
+            cancellation_wake: cancellation.wake_registration(),
+            cancellation,
+            progress: WriteProgress::new(0),
+            operation: None,
+            receipts: VecDeque::with_capacity(WRITE_QUEUE_RECEIPTS),
+        }))
     }
 }
 
@@ -1945,9 +2352,7 @@ impl Future for WriteOperation {
                             *started = Some(host.now());
                         }
                         let started = *started;
-                        let io = catch_unwind(AssertUnwindSafe(|| {
-                            active.io_future.as_mut().poll(context)
-                        }));
+                        let io = catch_unwind(AssertUnwindSafe(|| active.io.poll(context)));
                         match io {
                             Ok(Poll::Ready(result)) => WritePoll::Io(result),
                             Ok(Poll::Pending) => {
@@ -1975,7 +2380,7 @@ impl Future for WriteOperation {
                             }
                             Poll::Ready(WaitStatus::Signalled | WaitStatus::NotReady)
                             | Poll::Pending => {
-                                let io = active.io_future.as_mut().poll(context);
+                                let io = active.io.poll(context);
                                 if deadline.status() == WaitStatus::TimedOut {
                                     WritePoll::TimedOut
                                 } else {
@@ -1988,6 +2393,16 @@ impl Future for WriteOperation {
                         }
                     }
                 },
+                WriteWait::Untimed { cancellation } => {
+                    if cancellation.is_cancellation_requested() {
+                        WritePoll::Cancelled
+                    } else {
+                        match active.io.poll(context) {
+                            Poll::Ready(result) => WritePoll::Io(result),
+                            Poll::Pending => WritePoll::Pending,
+                        }
+                    }
+                }
                 WriteWait::Retired { .. } => {
                     unreachable!("a retired write is no longer registered")
                 }

@@ -7793,3 +7793,188 @@ fn a_cancelled_request_burst_past_the_turn_budget_writes_the_recorded_pieces() {
         .collect();
     assert_eq!(actual, expected, "write lengths:\n{}", actual.join("\n"));
 }
+
+/// More request body than loopback socket buffers hold while the origin does not read.
+const TCP_UPLOAD: usize = 16 << 20;
+
+/// A patterned request body in events of at most 64 KiB, recording how many bytes the driver
+/// has pulled.
+struct CountedUpload {
+    body: Rc<Vec<u8>>,
+    pulled: Rc<Cell<usize>>,
+}
+
+impl HttpSource for CountedUpload {
+    fn read_header_event(&mut self) -> LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
+        panic!("an owned submission takes the request head separately")
+    }
+
+    fn read_body_event(
+        &mut self,
+        maximum: u32,
+    ) -> LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
+        let start = self.pulled.get();
+        let end = self
+            .body
+            .len()
+            .min(start + (maximum as usize).min(64 << 10));
+        self.pulled.set(end);
+        Box::pin(std::future::ready(Ok(HttpBodyEvent::body(
+            queue(&self.body[start..end]),
+            end == self.body.len(),
+        ))))
+    }
+
+    fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {}
+}
+
+/// Sleeps until `ready` holds.
+async fn sleep_until(mut ready: impl FnMut() -> bool) {
+    while !ready() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// Owned HTTP/1.1 upstream over a real TCP `OwnedByteStream`, which offers the native write
+/// queue. A GET, then a POST, run on one connection. The POST's body pends against an origin
+/// that does not read, until the origin reads both requests whole. The session then closes the
+/// idle connection cleanly.
+#[test]
+fn owned_h1_upstream_runs_sequential_exchanges_over_a_tcp_byte_stream() {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    const GET_WIRE: &[u8] = b"GET / HTTP/1.1\r\nHost: origin\r\nConnection: keep-alive\r\n\r\n";
+    let (received, responses, stalled_at) = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(LocalSet::new().run_until(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (worker, driver) = WorkerDriver::new(16).unwrap();
+            let call = worker
+                .call_local(move |context| async move {
+                    let accept = async { listener.accept().await.unwrap().0 };
+                    let connect = roxygen_transport::tcp::TcpTransport::connect(
+                        &context,
+                        roxygen_core::message::SocketAddress::new("127.0.0.1", port),
+                        roxygen_transport::byte_stream::ByteStreamLimits::new(
+                            64 << 10,
+                            64 << 10,
+                            8,
+                        )
+                        .unwrap(),
+                        Duration::from_secs(5),
+                        CancellationToken::never(),
+                    );
+                    let (mut origin, transport) = tokio::join!(accept, connect);
+                    let transport: Rc<dyn UniplexTransport> = Rc::new(transport.unwrap());
+                    assert!(
+                        transport
+                            .try_write_queue(
+                                &context,
+                                64 << 10,
+                                Duration::ZERO,
+                                CancellationToken::never()
+                            )
+                            .unwrap()
+                            .is_some(),
+                        "the TCP transport offers its native write queue"
+                    );
+                    let (session, handle) =
+                        OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+                    // The origin and the submitter run in their own task, so their wakes never
+                    // poll the session.
+                    let script = tokio::task::spawn_local(async move {
+                        let body = Rc::new(patterned(TCP_UPLOAD));
+                        let pulled = Rc::new(Cell::new(0));
+                        let mut received = vec![0; GET_WIRE.len()];
+                        let first = handle.reserve_request().unwrap().submit(
+                            get_head(),
+                            HttpSourceHolder::empty(),
+                            CancellationToken::never(),
+                        );
+                        let (_stream, mut source, _control) =
+                            first.await.unwrap().into_source_parts();
+                        origin.read_exact(&mut received).await.unwrap();
+                        origin.write_all(OK_RESPONSE).await.unwrap();
+                        let first = read_response(&mut source).await;
+                        drop(source);
+                        sleep_until(|| handle.is_idle()).await;
+                        let second = handle.reserve_request().unwrap().submit(
+                            post_head(Some(TCP_UPLOAD), false),
+                            HttpSourceHolder::new(Box::new(CountedUpload {
+                                body: Rc::clone(&body),
+                                pulled: Rc::clone(&pulled),
+                            })),
+                            CancellationToken::never(),
+                        );
+                        let (_stream, mut source, _control) =
+                            second.await.unwrap().into_source_parts();
+                        // The origin reads nothing until the driver stops pulling the body.
+                        let mut previous = usize::MAX;
+                        while pulled.get() != previous {
+                            previous = pulled.get();
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        let stalled_at = pulled.get();
+                        let mut rest = vec![0; declared_head_wire(TCP_UPLOAD).len() + TCP_UPLOAD];
+                        origin.read_exact(&mut rest).await.unwrap();
+                        received.extend_from_slice(&rest);
+                        origin.write_all(OK_RESPONSE).await.unwrap();
+                        let second = read_response(&mut source).await;
+                        drop(source);
+                        sleep_until(|| handle.is_idle()).await;
+                        assert!(handle.close_when_idle().unwrap());
+                        let mut trailing = Vec::new();
+                        origin.read_to_end(&mut trailing).await.unwrap();
+                        assert!(trailing.is_empty(), "the session wrote past its requests");
+                        (received, [first, second], stalled_at)
+                    });
+                    let (run, script) =
+                        match futures::future::select(Box::pin(session.run()), script).await {
+                            futures::future::Either::Left((run, script)) => (run, script.await),
+                            futures::future::Either::Right((Err(failure), _)) => {
+                                std::panic::resume_unwind(failure.into_panic())
+                            }
+                            futures::future::Either::Right((script, run)) => (run.await, script),
+                        };
+                    run.expect("the session closes the idle connection cleanly");
+                    script.unwrap_or_else(|failure| std::panic::resume_unwind(failure.into_panic()))
+                })
+                .unwrap();
+            let driver_task = tokio::task::spawn_local(driver);
+            let result = tokio::time::timeout(Duration::from_secs(30), call)
+                .await
+                .expect("the TCP exchanges finish")
+                .unwrap();
+            worker.begin_shutdown();
+            driver_task.await.unwrap();
+            result
+        }));
+    assert!(
+        stalled_at < TCP_UPLOAD,
+        "a write pends against the origin that does not read, so the driver stops pulling the \
+         body: it stopped at {stalled_at} bytes"
+    );
+    let mut expected = GET_WIRE.to_vec();
+    expected.extend(declared_head_wire(TCP_UPLOAD));
+    expected.extend(patterned(TCP_UPLOAD));
+    assert!(
+        received == expected,
+        "the origin receives the GET, then the POST head and its whole body, in order"
+    );
+    for response in responses {
+        assert_eq!(
+            response,
+            ReadResponse {
+                statuses: vec![200],
+                body: b"ok".to_vec(),
+                trailers: Vec::new(),
+                eom: true,
+                error: None,
+            }
+        );
+    }
+}

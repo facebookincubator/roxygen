@@ -54,6 +54,7 @@ use crate::byte_stream::LocalTransportFuture;
 use crate::byte_stream::OwnedByteStream;
 use crate::byte_stream::OwnedTransportReset;
 use crate::byte_stream::PeerIdentity;
+use crate::byte_stream::QueuedWriter;
 use crate::byte_stream::TransportPanic;
 use crate::byte_stream::TransportRead;
 use crate::byte_stream::TransportRetirement;
@@ -429,7 +430,22 @@ fn poll_tcp_first(
     polled
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static IO_WRITE_FUTURES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Boxed `ByteStreamIo::write` futures built on this thread.
+#[cfg(test)]
+pub(crate) fn io_write_futures_for_test() -> usize {
+    IO_WRITE_FUTURES.with(Cell::get)
+}
+
 pub(crate) trait TokioByteStream: AsyncRead + AsyncWrite + Unpin + 'static {
+    /// Whether the transport offers a [`crate::byte_stream::OwnedWriteQueue`] over this
+    /// stream: plaintext TCP.
+    const WRITE_QUEUE: bool = false;
+
     fn prepare_reset(&self);
 
     fn prepare_write_timeout(&mut self, _timeout: Duration) {}
@@ -540,6 +556,8 @@ pub(crate) trait TokioByteStream: AsyncRead + AsyncWrite + Unpin + 'static {
 }
 
 impl TokioByteStream for TcpStream {
+    const WRITE_QUEUE: bool = true;
+
     fn prepare_reset(&self) {
         #[expect(
             deprecated,
@@ -650,6 +668,8 @@ impl AsyncWrite for AcceptedTcpStream {
 }
 
 impl TokioByteStream for AcceptedTcpStream {
+    const WRITE_QUEUE: bool = true;
+
     fn prepare_reset(&self) {
         #[expect(
             deprecated,
@@ -806,6 +826,8 @@ impl<S: TokioByteStream> AsyncWrite for ObservedStream<S> {
 }
 
 impl<S: TokioByteStream> TokioByteStream for ObservedStream<S> {
+    const WRITE_QUEUE: bool = S::WRITE_QUEUE;
+
     fn prepare_reset(&self) {
         self.stream().prepare_reset();
     }
@@ -904,6 +926,8 @@ struct TokioIoShared<S> {
     close_after_shutdown: Cell<bool>,
     close_wait_waker: RefCell<Option<Waker>>,
     non_abortive_close: Cell<bool>,
+    /// An `OwnedWriteQueue` write's state while it is active (`QueuedWriter`).
+    queued_write: RefCell<Option<IoWrite>>,
 }
 
 // Drop order follows declaration order here and in `TokioIoShared`: the I/O
@@ -931,6 +955,7 @@ impl<S> TokioByteStreamIo<S> {
                 close_after_shutdown: Cell::new(false),
                 close_wait_waker: RefCell::new(None),
                 non_abortive_close: Cell::new(false),
+                queued_write: RefCell::new(None),
             }),
             close_drain,
         }
@@ -995,80 +1020,22 @@ where
 
     fn write(
         &self,
-        mut data: BufQueue,
+        data: BufQueue,
         progress: WriteProgress,
         flags: ByteEventWriteFlags,
         byte_events: Option<ByteEventWriteState>,
     ) -> LocalTransportFuture<Result<(), HttpError>> {
         assert!(!self.shared.write_active.replace(true));
+        #[cfg(test)]
+        IO_WRITE_FUTURES.with(|count| count.set(count.get() + 1));
         let shared = Rc::clone(&self.shared);
         let active = WriteActiveGuard {
             shared: Rc::clone(&shared),
         };
+        let mut write = IoWrite::new(data, progress, flags, byte_events);
         Box::pin(async move {
             let _active = active;
-            let zero_copy = {
-                let mut stream = shared.stream.borrow_mut();
-                let Some(stream) = stream.as_mut() else {
-                    return Err(dropped_error());
-                };
-                stream.begin_owned_write(data.chain_length())
-            };
-            while !data.is_empty() {
-                let written = {
-                    poll_fn(|context| {
-                        let mut stream = shared.stream.borrow_mut();
-                        let Some(stream) = stream.as_mut() else {
-                            return Poll::Ready(Err(dropped_error()));
-                        };
-                        match stream.poll_write_owned(context, &data, zero_copy) {
-                            Poll::Ready(Ok(0)) => {
-                                Poll::Ready(Err(write_error(b"TCP write made no progress")))
-                            }
-                            Poll::Ready(Ok(written)) => Poll::Ready(Ok(written)),
-                            Poll::Ready(Err(error)) => Poll::Ready(Err(write_io_error(error))),
-                            Poll::Pending => Poll::Pending,
-                        }
-                    })
-                    .await?
-                };
-                progress.record(written)?;
-                shared
-                    .write_offset
-                    .set(shared.write_offset.get().saturating_add(written as u64));
-                data.trim_start(written)
-                    .map_err(|_| write_error(b"TCP write progress exceeded queued bytes"))?;
-            }
-            poll_fn(|context| {
-                let mut stream = shared.stream.borrow_mut();
-                let Some(stream) = stream.as_mut() else {
-                    return Poll::Ready(Err(dropped_error()));
-                };
-                stream.poll_write_flush(context).map_err(write_io_error)
-            })
-            .await?;
-            if flags != ByteEventWriteFlags::default() || byte_events.is_some() {
-                let mut stream = shared.stream.borrow_mut();
-                let Some(stream) = stream.as_mut() else {
-                    return Err(dropped_error());
-                };
-                stream
-                    .register_byte_events(flags, shared.write_offset.get(), byte_events)
-                    .map_err(write_io_error)?;
-            }
-            if shared.write_shutdown.get() {
-                let shutdown_result = shared.write_shutdown_result.borrow().clone();
-                let result = match shutdown_result {
-                    Some(result) => result,
-                    None => {
-                        let result = poll_shutdown(&shared.stream).await;
-                        shared.write_shutdown_result.replace(Some(result.clone()));
-                        result
-                    }
-                };
-                result?;
-            }
-            Ok(())
+            poll_fn(|context| poll_io_write(&shared, context, &mut write)).await
         })
     }
 
@@ -1121,6 +1088,10 @@ where
 
     fn enable_non_abortive_close(&self) {
         self.shared.non_abortive_close.set(true);
+    }
+
+    fn queued_writer(&self) -> Option<Rc<dyn QueuedWriter>> {
+        S::WRITE_QUEUE.then(|| Rc::clone(&self.shared) as Rc<dyn QueuedWriter>)
     }
 
     fn enable_zero_copy(
@@ -1338,34 +1309,221 @@ where
     S: TokioByteStream,
 {
     fn drop(&mut self) {
-        let shared = &self.shared;
-        shared.write_active.set(false);
-        if let Some(waker) = shared.close_wait_waker.borrow_mut().take() {
-            waker.wake();
-        } else if shared.write_shutdown.get() && shared.write_shutdown_result.borrow().is_none() {
-            if let Some(result) = poll_shutdown_once(&shared.stream) {
-                shared.write_shutdown_result.replace(Some(result));
+        end_write(&self.shared);
+    }
+}
+
+/// Ends a write: a close drain waiting for it resumes, or a shutdown requested
+/// during it is attempted once.
+fn end_write<S>(shared: &TokioIoShared<S>)
+where
+    S: TokioByteStream,
+{
+    shared.write_active.set(false);
+    if let Some(waker) = shared.close_wait_waker.borrow_mut().take() {
+        waker.wake();
+    } else if shared.write_shutdown.get() && shared.write_shutdown_result.borrow().is_none() {
+        if let Some(result) = poll_shutdown_once(&shared.stream) {
+            shared.write_shutdown_result.replace(Some(result));
+        }
+    }
+}
+
+/// One write's progress through [`poll_io_write`].
+struct IoWrite {
+    data: BufQueue,
+    progress: WriteProgress,
+    flags: ByteEventWriteFlags,
+    byte_events: Option<ByteEventWriteState>,
+    stage: IoWriteStage,
+}
+
+enum IoWriteStage {
+    /// The first poll makes the whole write's zero-copy decision.
+    Begin,
+    Write {
+        zero_copy: bool,
+    },
+    Flush,
+    /// The write side was shut during the write, which shuts it after its bytes.
+    Shutdown,
+}
+
+impl IoWrite {
+    fn new(
+        data: BufQueue,
+        progress: WriteProgress,
+        flags: ByteEventWriteFlags,
+        byte_events: Option<ByteEventWriteState>,
+    ) -> Self {
+        Self {
+            data,
+            progress,
+            flags,
+            byte_events,
+            stage: IoWriteStage::Begin,
+        }
+    }
+}
+
+/// Writes all of `write`'s bytes, flushes, registers its byte events, then
+/// shuts the write side if a shutdown was requested during the write.
+fn poll_io_write<S>(
+    shared: &TokioIoShared<S>,
+    context: &mut Context<'_>,
+    write: &mut IoWrite,
+) -> Poll<Result<(), HttpError>>
+where
+    S: TokioByteStream,
+{
+    loop {
+        match write.stage {
+            IoWriteStage::Begin => {
+                let mut stream = shared.stream.borrow_mut();
+                let Some(stream) = stream.as_mut() else {
+                    return Poll::Ready(Err(dropped_error()));
+                };
+                write.stage = IoWriteStage::Write {
+                    zero_copy: stream.begin_owned_write(write.data.chain_length()),
+                };
+            }
+            IoWriteStage::Write { zero_copy } => {
+                if write.data.is_empty() {
+                    write.stage = IoWriteStage::Flush;
+                    continue;
+                }
+                let written = {
+                    let mut stream = shared.stream.borrow_mut();
+                    let Some(stream) = stream.as_mut() else {
+                        return Poll::Ready(Err(dropped_error()));
+                    };
+                    match ready!(stream.poll_write_owned(context, &write.data, zero_copy)) {
+                        Ok(0) => {
+                            return Poll::Ready(Err(write_error(b"TCP write made no progress")));
+                        }
+                        Ok(written) => written,
+                        Err(error) => return Poll::Ready(Err(write_io_error(error))),
+                    }
+                };
+                if let Err(error) = write.progress.record(written) {
+                    return Poll::Ready(Err(error));
+                }
+                shared
+                    .write_offset
+                    .set(shared.write_offset.get().saturating_add(written as u64));
+                if write.data.trim_start(written).is_err() {
+                    return Poll::Ready(Err(write_error(
+                        b"TCP write progress exceeded queued bytes",
+                    )));
+                }
+            }
+            IoWriteStage::Flush => {
+                {
+                    let mut stream = shared.stream.borrow_mut();
+                    let Some(stream) = stream.as_mut() else {
+                        return Poll::Ready(Err(dropped_error()));
+                    };
+                    if let Err(error) = ready!(stream.poll_write_flush(context)) {
+                        return Poll::Ready(Err(write_io_error(error)));
+                    }
+                }
+                if write.flags != ByteEventWriteFlags::default() || write.byte_events.is_some() {
+                    let mut stream = shared.stream.borrow_mut();
+                    let Some(stream) = stream.as_mut() else {
+                        return Poll::Ready(Err(dropped_error()));
+                    };
+                    if let Err(error) = stream.register_byte_events(
+                        write.flags,
+                        shared.write_offset.get(),
+                        write.byte_events.take(),
+                    ) {
+                        return Poll::Ready(Err(write_io_error(error)));
+                    }
+                }
+                if !shared.write_shutdown.get() {
+                    return Poll::Ready(Ok(()));
+                }
+                let shutdown_result = shared.write_shutdown_result.borrow().clone();
+                if let Some(result) = shutdown_result {
+                    return Poll::Ready(result);
+                }
+                write.stage = IoWriteStage::Shutdown;
+            }
+            IoWriteStage::Shutdown => {
+                let result = ready!(poll_shutdown(&shared.stream, context));
+                shared.write_shutdown_result.replace(Some(result.clone()));
+                return Poll::Ready(result);
             }
         }
     }
 }
 
-async fn poll_shutdown<S>(stream: &RefCell<Option<S>>) -> Result<(), HttpError>
+impl<S> QueuedWriter for TokioIoShared<S>
 where
     S: TokioByteStream,
 {
-    poll_fn(|context| {
-        let mut stream = stream.borrow_mut();
-        let Some(stream) = stream.as_mut() else {
-            return Poll::Ready(Err(dropped_error()));
+    fn start_write(
+        &self,
+        data: BufQueue,
+        progress: WriteProgress,
+        flags: ByteEventWriteFlags,
+        byte_events: Option<ByteEventWriteState>,
+    ) {
+        assert!(!self.write_active.replace(true));
+        let replaced =
+            self.queued_write
+                .replace(Some(IoWrite::new(data, progress, flags, byte_events)));
+        assert!(replaced.is_none(), "a queued write ended before the next");
+    }
+
+    fn poll_write(&self, context: &mut Context<'_>) -> Poll<Result<(), HttpError>> {
+        let polled = {
+            let mut write = self.queued_write.borrow_mut();
+            let write = write.as_mut().expect("a polled queued write is active");
+            poll_io_write(self, context, write)
         };
-        match Pin::new(stream).poll_shutdown(context) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(error)) => Poll::Ready(Err(write_io_error(error))),
-            Poll::Pending => Poll::Pending,
+        if polled.is_ready() {
+            self.end_queued_write();
         }
-    })
-    .await
+        polled
+    }
+
+    fn retire_write(&self) {
+        if self.queued_write.borrow().is_some() {
+            self.end_queued_write();
+        }
+    }
+}
+
+impl<S> TokioIoShared<S>
+where
+    S: TokioByteStream,
+{
+    /// Ends the queued write as an ordinary write's future does: its
+    /// `WriteActiveGuard` drops first, then its state.
+    fn end_queued_write(&self) {
+        let write = self.queued_write.borrow_mut().take();
+        end_write(self);
+        drop(write);
+    }
+}
+
+fn poll_shutdown<S>(
+    stream: &RefCell<Option<S>>,
+    context: &mut Context<'_>,
+) -> Poll<Result<(), HttpError>>
+where
+    S: TokioByteStream,
+{
+    let mut stream = stream.borrow_mut();
+    let Some(stream) = stream.as_mut() else {
+        return Poll::Ready(Err(dropped_error()));
+    };
+    match Pin::new(stream).poll_shutdown(context) {
+        Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+        Poll::Ready(Err(error)) => Poll::Ready(Err(write_io_error(error))),
+        Poll::Pending => Poll::Pending,
+    }
 }
 
 fn poll_shutdown_once<S>(stream: &RefCell<Option<S>>) -> Option<Result<(), HttpError>>
