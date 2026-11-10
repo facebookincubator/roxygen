@@ -1091,6 +1091,53 @@ mod stream_source {
     }
 
     #[test]
+    fn resume_threshold_reports_only_the_crossing_read() {
+        let (source, producer, log) = session_source(64 << 10);
+        assert!(producer.set_resume_threshold(Some(16 << 10)));
+        assert!(producer.headers(request(None), false));
+        read_header(&source).unwrap();
+        assert_eq!(
+            producer.body(sized_body(20 << 10), 0, false),
+            FlowControlState::Open
+        );
+        // 20 KiB to 16 KiB stays at the threshold; 16 KiB to 12 KiB crosses below it.
+        for _ in 0..2 {
+            read_body(&source, 4 << 10).unwrap();
+        }
+        assert_eq!(log.borrow().processed, [(StreamId::new(7), 4 << 10, 0)]);
+        // Below the threshold, neither more input nor reads report anything.
+        assert_eq!(
+            producer.body(sized_body(2 << 10), 0, true),
+            FlowControlState::Open
+        );
+        while !read_body(&source, 4 << 10).unwrap().eom() {}
+        assert_eq!(log.borrow().processed, [(StreamId::new(7), 4 << 10, 0)]);
+        assert!(log.borrow().opened.is_empty());
+    }
+
+    #[test]
+    fn resume_threshold_still_reports_a_reopened_window() {
+        let (source, producer, log) = session_source(32 << 10);
+        assert!(producer.set_resume_threshold(Some(8 << 10)));
+        assert!(producer.headers(request(None), false));
+        read_header(&source).unwrap();
+        assert_eq!(
+            producer.body(sized_body(32 << 10), 0, false),
+            FlowControlState::Closed
+        );
+        // 32 KiB to 28 KiB reopens the window above the threshold: only `window_open`.
+        read_body(&source, 4 << 10).unwrap();
+        assert!(log.borrow().processed.is_empty());
+        assert_eq!(log.borrow().opened, [StreamId::new(7)]);
+        // 8 KiB to 4 KiB crosses below the threshold; the window opens only once.
+        for _ in 0..6 {
+            read_body(&source, 4 << 10).unwrap();
+        }
+        assert_eq!(log.borrow().processed, [(StreamId::new(7), 4 << 10, 0)]);
+        assert_eq!(log.borrow().opened, [StreamId::new(7)]);
+    }
+
+    #[test]
     fn trailers_are_terminal() {
         let (source, producer, _) = session_source(65_535);
         producer.headers(request(None), false);
@@ -3357,12 +3404,13 @@ mod stream_source {
         Read(u32),
     }
 
-    /// Reads a 200 response from an 8-byte window, inline or with suspend-free
-    /// waiting reads, producing as `steps` say. Returns each step's outcome
-    /// followed by the callback log.
+    /// Reads a 200 response from an 8-byte window with a resume threshold of 6
+    /// (`DIV-044`), inline or with suspend-free waiting reads, producing as
+    /// `steps` say. Returns each step's outcome followed by the callback log.
     fn credit_transcript(inline: bool, steps: &[CreditStep]) -> Vec<String> {
         let (owner, mut reader, producer, log) = inline_response(8, inline, false);
         reader.set_suspend_free(true);
+        assert!(producer.set_resume_threshold(Some(6)));
         assert!(producer.headers(response(200, None), false));
         let mut context = Context::from_waker(Waker::noop());
         if inline {
@@ -3432,15 +3480,15 @@ mod stream_source {
             ];
             let inline = credit_transcript(true, &steps);
             let id = StreamId::new(1);
-            // Every read reports its credit. The first opens the closed
-            // window, which owes no update until 4 bytes are read; the second
-            // acknowledges the 6 bytes read so far, and the read of "ijk" the
-            // 5 read since. The EOM read completes.
+            // The first read crosses the threshold (8 to 5 buffered) and opens
+            // the closed window; the window owes no update until 4 bytes are
+            // read. The fifth read crosses it again (6 to 3) and acknowledges
+            // the 5 bytes read since the last update. The EOM read completes.
             assert_eq!(
                 inline.last().unwrap(),
                 &format!(
                     "Body \"lmn\" eom=true | processed={:?} opened={:?} completions=[None]",
-                    [(id, 3, 0), (id, 3, 6), (id, 2, 0), (id, 3, 5), (id, 3, 0)],
+                    [(id, 3, 0), (id, 3, 5)],
                     [id]
                 )
             );

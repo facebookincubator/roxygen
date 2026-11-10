@@ -2593,6 +2593,8 @@ impl UpstreamDriver {
             source.deliver_ingress_before_abort();
         }
         let producer = source.producer();
+        // DIV-044: parsing resumes once the unread body is below the limit it paused at.
+        producer.set_resume_threshold(Some(self.config.ingress_buffer_limit));
         if pull_through.is_some() && !producer.enable_inline_reads() {
             return Err(failure(
                 HttpErrorCode::INVALID_STATE_TRANSITION,

@@ -296,6 +296,8 @@ struct StreamState {
     /// The largest growth hint of a body that left the queue, so coalescing
     /// grows a body container once instead of doubling it.
     body_segment_hint: u16,
+    /// The producer's resume threshold (`DIV-044`).
+    resume_threshold: Option<u32>,
     /// The producer declared that the exclusive reader drives it (`DIV-047`).
     inline_reads: bool,
 }
@@ -1343,6 +1345,7 @@ impl HttpStreamSource {
                     can_suspend: true,
                     suspend_wait_active: false,
                     body_segment_hint: 0,
+                    resume_threshold: None,
                     inline_reads: false,
                 }),
                 callback: RefCell::new(CallbackSlot {
@@ -1921,6 +1924,24 @@ impl HttpStreamSourceProducer {
             return false;
         };
         stop_reading(&shared, error)
+    }
+
+    /// Roxygen-only (`DIV-044`): declares the buffered-ingress level at which the producer
+    /// pauses its input, and below which it resumes it.
+    ///
+    /// With a threshold, `bytes_processed` reports only a read that takes the buffered body
+    /// bytes from at or above it to below it, with that read's amount and acknowledgement;
+    /// other reads report nothing, so a producer that sets one must not need per-read credit.
+    /// `window_open` is unchanged. `None`, the default, reports every read. A threshold of
+    /// zero reports no read, as buffered ingress never falls below zero. Returns false if the
+    /// source state has retired.
+    pub fn set_resume_threshold(&self, threshold: Option<u32>) -> bool {
+        let Some(shared) = self.shared.upgrade() else {
+            return false;
+        };
+        shared.assert_owner();
+        shared.state.borrow_mut().resume_threshold = threshold;
+        true
     }
 
     /// Roxygen-only (`DIV-047`): declares that the source's exclusive reader
@@ -3247,28 +3268,35 @@ fn enable_sink_mode(shared: &Rc<StreamShared>) {
 }
 
 fn update_flow_control(shared: &Rc<StreamShared>, length: usize) {
-    let (id, to_acknowledge, opened) = {
+    let (id, to_acknowledge, processed, opened) = {
         let mut state = shared.state.borrow_mut();
         let was_blocked = !state.sink_mode && state.receive_window.size() <= 0;
+        let buffered = state.receive_window.window().outstanding();
         let to_acknowledge = state
             .receive_window
             .processed(length)
             .expect("admitted body credit must remain representable");
         let input_finished = state.error.is_some() || is_eom_seen(&state);
+        let processed = state.resume_threshold.is_none_or(|threshold| {
+            buffered >= threshold && state.receive_window.window().outstanding() < threshold
+        });
         (
             state.id,
             if input_finished { 0 } else { to_acknowledge },
+            processed,
             was_blocked && state.receive_window.size() > 0,
         )
     };
-    emit_callback(
-        shared,
-        CallbackEvent::BytesProcessed {
-            id,
-            amount: length,
-            to_acknowledge,
-        },
-    );
+    if processed {
+        emit_callback(
+            shared,
+            CallbackEvent::BytesProcessed {
+                id,
+                amount: length,
+                to_acknowledge,
+            },
+        );
+    }
     if opened {
         emit_callback(shared, CallbackEvent::WindowOpen(id));
     }

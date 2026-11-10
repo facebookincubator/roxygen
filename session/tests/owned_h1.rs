@@ -250,6 +250,8 @@ struct H1App {
     probes: Rc<RefCell<Vec<Rc<H1Probe>>>>,
     /// Each exchange starts reading its request body only once this is notified.
     body_gate: Option<Rc<tokio::sync::Notify>>,
+    /// The `maximum` of each request body read.
+    body_read_size: u32,
     /// Each exchange drops its request body unread and answers at once.
     respond_early: bool,
     /// Each response head asks to be told its encoded size, and every response event registers
@@ -392,9 +394,13 @@ fn record_head(probe: &H1Probe, head: &mut HttpMessage, eom: bool) {
 }
 
 /// Reads a request body to its end as either application does, recording each event.
-async fn read_request_body(probe: &H1Probe, body: &mut HttpSourceHolder) -> Result<(), HttpError> {
+async fn read_request_body(
+    probe: &H1Probe,
+    body: &mut HttpSourceHolder,
+    maximum: u32,
+) -> Result<(), HttpError> {
     loop {
-        let event = match body.read_body_event(u32::MAX).await {
+        let event = match body.read_body_event(maximum).await {
             Ok(event) => event,
             Err(error) => {
                 probe.request_error.set(Some(error.code()));
@@ -433,6 +439,7 @@ impl H1App {
                 responses,
                 probes: Rc::clone(&probes),
                 body_gate: None,
+                body_read_size: u32::MAX,
                 respond_early: false,
                 instrument: false,
                 cancel_in: Rc::default(),
@@ -449,6 +456,7 @@ impl H1App {
 struct H1Exchange {
     ordinal: usize,
     body_gate: Option<Rc<tokio::sync::Notify>>,
+    body_read_size: u32,
     respond_early: bool,
     tunnel: bool,
     cancel_in: CancelIn,
@@ -520,6 +528,7 @@ impl OwnedApplication for H1App {
         H1Exchange {
             ordinal,
             body_gate: self.body_gate.clone(),
+            body_read_size: self.body_read_size,
             respond_early: self.respond_early,
             tunnel: response.tunnel,
             cancel_in: Rc::clone(&self.cancel_in),
@@ -586,11 +595,12 @@ impl OwnedExchange for H1Exchange {
         }
         let probe = Rc::clone(&self.probe);
         let gate = self.body_gate.clone();
+        let maximum = self.body_read_size;
         self.upload = Some(Box::pin(async move {
             if let Some(gate) = gate {
                 gate.notified().await;
             }
-            read_request_body(&probe, &mut body).await
+            read_request_body(&probe, &mut body, maximum).await
         }));
     }
 
@@ -718,6 +728,8 @@ impl Drop for H1Exchange {
 struct ScriptHandler {
     responses: Vec<Response>,
     served: Cell<usize>,
+    /// The `maximum` of each request body read.
+    body_read_size: u32,
     /// Answers without reading the request body, dropping it.
     respond_early: bool,
     probes: Rc<RefCell<Vec<Rc<H1Probe>>>>,
@@ -728,6 +740,7 @@ impl ScriptHandler {
         Self {
             responses,
             served: Cell::new(0),
+            body_read_size: u32::MAX,
             respond_early: false,
             probes: Rc::default(),
         }
@@ -745,6 +758,7 @@ impl HttpHandler for ScriptHandler {
         let (header, body) = response.events();
         let interim = response.interim_events();
         let tunnel = response.tunnel;
+        let body_read_size = self.body_read_size;
         let respond_early = self.respond_early;
         let probe = Rc::new(H1Probe::default());
         self.probes.borrow_mut().push(Rc::clone(&probe));
@@ -768,7 +782,7 @@ impl HttpHandler for ScriptHandler {
                 })));
             }
             if interim.is_empty() && !tunnel {
-                read_request_body(&probe, &mut request_source).await?;
+                read_request_body(&probe, &mut request_source, body_read_size).await?;
                 return Ok(HttpSourceHolder::new(Box::new(StopProbe {
                     inner: EventSource {
                         header: Some(header),
@@ -810,7 +824,7 @@ impl ScriptSource {
         let probe = Rc::clone(&self.probe);
         Box::pin(async move {
             if let Some(mut request) = request {
-                read_request_body(&probe, &mut request).await?;
+                read_request_body(&probe, &mut request, u32::MAX).await?;
             }
             then
         })
@@ -2317,6 +2331,171 @@ fn request_body_ending_at_the_ingress_limit_completes() {
         "the last body bytes reach the ingress limit, and the request still ends with EOM"
     );
     assert_eq!(observed[0].completed, 1);
+}
+
+/// The `record_buffered_read_bytes` deltas a session reported.
+#[derive(Default)]
+pub(super) struct BufferedReadDeltas(pub(super) RefCell<Vec<i64>>);
+
+impl crate::http2::stats::Http2SessionStats for BufferedReadDeltas {
+    fn record_buffered_read_bytes(&self, delta: i64) {
+        self.0.borrow_mut().push(delta);
+    }
+}
+
+/// Takes this thread's count of `bytes_processed` callbacks that owned drivers, or Uniplex
+/// sessions, received.
+pub(super) fn take_ingress_credit_callbacks(owned: bool) -> usize {
+    if owned {
+        crate::owned_h1::take_ingress_credit_callbacks_for_test()
+    } else {
+        crate::uniplex::take_ingress_credit_callbacks_for_test()
+    }
+}
+
+/// What one server saw of [`resume_threshold_run`]'s request.
+struct ResumeThresholdRun {
+    wire: Wire,
+    observed: Vec<Observed>,
+    /// `bytes_processed` callbacks the request source gave its session.
+    callbacks: usize,
+    /// The `record_buffered_read_bytes` deltas of a `UniplexSession` that reports stats.
+    buffered_read_deltas: Vec<i64>,
+}
+
+/// A 22 KiB request body, between `ingress_buffer_limit` (16 KiB) and `buffer_limit` (64 KiB),
+/// read 4 KiB at a time. The first transport read carries 20 KiB of it, which pause parsing;
+/// the last 2 KiB wait behind that pause, and with them the request's end. Every read arrives
+/// as one buffer, so parsing pauses once. With `stats`, a `UniplexSession` reports session stats.
+fn resume_threshold_run(owned: bool, stats: bool) -> ResumeThresholdRun {
+    let body = patterned(22 << 10);
+    let mut first = format!(
+        "POST /u HTTP/1.1\r\nHost: a\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    first.extend_from_slice(&body[..20 << 10]);
+    let reads = vec![
+        ReadAction::Data(first),
+        ReadAction::Data(body[20 << 10..].to_vec()),
+    ];
+    let io = UniplexConfig {
+        buffer_limit: 64 << 10,
+        ingress_buffer_limit: 16 << 10,
+        maximum_read_size: 64 << 10,
+        read_allocation_size: 64 << 10,
+        ..h1_config()
+    };
+    let response = Response::fixed(200, b"ok");
+    run_on_host(move |context| {
+        Box::pin(async move {
+            take_ingress_credit_callbacks(owned);
+            let deltas = Rc::new(BufferedReadDeltas::default());
+            let (transport, state) = ScriptedTransport::new(reads);
+            let (result, probes) = if owned {
+                let (mut application, probes) = H1App::new(vec![response]);
+                application.body_read_size = 4 << 10;
+                let mut options = owned_options(context, transport);
+                options.io = io;
+                let (session, _handle) = OwnedH1Session::new(application, options).unwrap();
+                (session.run().await, probes)
+            } else {
+                let mut handler = ScriptHandler::new(vec![response]);
+                handler.body_read_size = 4 << 10;
+                let handler = Rc::new(handler);
+                let erased: HttpHandlerRef = handler.clone();
+                let (session, _handle) = if stats {
+                    UniplexSession::new_with_stats(
+                        context,
+                        TransportDirection::Downstream,
+                        transport,
+                        Some(erased),
+                        io,
+                        Rc::clone(&deltas) as Rc<dyn crate::http2::stats::Http2SessionStats>,
+                    )
+                } else {
+                    UniplexSession::new(
+                        context,
+                        TransportDirection::Downstream,
+                        transport,
+                        Some(erased),
+                        io,
+                    )
+                }
+                .unwrap();
+                (session.run().await, Rc::clone(&handler.probes))
+            };
+            let callbacks = take_ingress_credit_callbacks(owned);
+            let observed = probes
+                .borrow()
+                .iter()
+                .map(|probe| probe.observed())
+                .collect();
+            ResumeThresholdRun {
+                wire: wire_of(&state, result),
+                observed,
+                callbacks,
+                buffered_read_deltas: deltas.0.take(),
+            }
+        })
+    })
+}
+
+/// Asserts that `run` received the whole body and answered it, after one pause and the one
+/// callback that resumed it (`DIV-044`).
+fn assert_resumed_once_below_the_threshold(run: &ResumeThresholdRun) {
+    assert_eq!(run.wire.error, None);
+    assert!(
+        run.wire.output.starts_with(b"HTTP/1.1 200 ") && run.wire.output.ends_with(b"\r\n\r\nok"),
+        "{:?}",
+        String::from_utf8_lossy(&run.wire.output)
+    );
+    assert_eq!(run.observed.len(), 1);
+    assert!(
+        run.observed[0].request_body == patterned(22 << 10),
+        "the body arrives intact: {} bytes",
+        run.observed[0].request_body.len()
+    );
+    assert!(
+        run.observed[0].request_finished,
+        "parsing resumed and reached the request's end"
+    );
+    assert_eq!(
+        run.callbacks, 1,
+        "only the read that takes the unread body below the threshold reports credit"
+    );
+}
+
+#[test]
+fn uniplex_server_resumes_below_the_ingress_threshold() {
+    assert_resumed_once_below_the_threshold(&resume_threshold_run(false, false));
+}
+
+#[test]
+fn owned_server_resumes_below_the_ingress_threshold() {
+    assert_resumed_once_below_the_threshold(&resume_threshold_run(true, false));
+}
+
+/// HTTP/1.1 session stats count buffered request bytes down on every read, so a Uniplex
+/// session that reports them keeps a callback per read (`DIV-044`).
+#[test]
+fn uniplex_server_with_stats_keeps_a_callback_per_read() {
+    let run = resume_threshold_run(false, true);
+    assert_eq!(run.wire.error, None);
+    assert!(run.observed[0].request_body == patterned(22 << 10));
+    let deltas = &run.buffered_read_deltas;
+    let reads: Vec<i64> = deltas.iter().copied().filter(|delta| *delta < 0).collect();
+    assert_eq!(
+        reads,
+        [-4096, -4096, -4096, -4096, -4096, -2048],
+        "one delta per 4 KiB read of the 22 KiB body; all deltas: {deltas:?}"
+    );
+    assert_eq!(
+        deltas.iter().sum::<i64>(),
+        0,
+        "every buffered byte is counted out"
+    );
+    assert_eq!(run.callbacks, 6);
 }
 
 #[test]
@@ -6521,7 +6700,7 @@ fn a_read_landing_after_a_body_event_is_serialized_is_handled_before_the_body_is
 
 /// A request body read that lands right after a response body event is serialized, as an
 /// exchange that reads its request body while it streams its response makes, and that takes the
-/// unread body below `ingress_buffer_limit`, lifts the flow-control pause before the
+/// unread body below `ingress_buffer_limit` (`DIV-044`), lifts the flow-control pause before the
 /// body is polled again, as when it landed before the next turn: parsing resumes in that poll,
 /// and the request's end, which waited behind the pause, reaches the exchange.
 #[test]

@@ -457,8 +457,22 @@ impl IngressSignals {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `bytes_processed` callbacks that this thread's owned HTTP/1.1 drivers received.
+    static INGRESS_CREDIT_CALLBACKS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Takes this thread's count of owned HTTP/1.1 `bytes_processed` callbacks, resetting it.
+#[cfg(test)]
+pub(crate) fn take_ingress_credit_callbacks_for_test() -> usize {
+    INGRESS_CREDIT_CALLBACKS.replace(0)
+}
+
 impl HttpStreamSourceSharedCallback for IngressSignals {
     fn bytes_processed(&self, _id: StreamId, _amount: usize, _acknowledge: usize) {
+        #[cfg(test)]
+        INGRESS_CREDIT_CALLBACKS.set(INGRESS_CREDIT_CALLBACKS.get() + 1);
         self.stream.wake_by_ref();
     }
 
@@ -602,7 +616,7 @@ fn check_cancel(control: &Control, context: &WorkerContext) -> Result<(), HttpEr
 }
 
 /// Whether parsing paused behind the unread request body may resume: it is below
-/// `ingress_buffer_limit`, or the source no longer buffers any.
+/// `ingress_buffer_limit` (`DIV-044`), or the source no longer buffers any.
 #[inline]
 fn resumes_parsing(producer: &HttpStreamSourceProducer, ingress_buffer_limit: u32) -> bool {
     producer
@@ -851,6 +865,8 @@ impl<A: OwnedApplication> CodecInput<'_, A> {
             )
         })?;
         let producer = source.producer();
+        // DIV-044: parsing resumes once the unread body is below the limit it paused at.
+        producer.set_resume_threshold(Some(self.config.ingress_buffer_limit));
         let drain = source.drain_on_drop();
         let ingress = source
             .ingress_completion()

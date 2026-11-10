@@ -2260,6 +2260,18 @@ pub(crate) fn egress_stream_is_ready_for_test(front: StreamId, earliest: StreamI
     egress_stream_is_ready(Some(front), Some(earliest))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `bytes_processed` callbacks that this thread's sessions drained from their sources.
+    static INGRESS_CREDIT_CALLBACKS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Takes this thread's count of drained `bytes_processed` callbacks, resetting it.
+#[cfg(test)]
+pub(crate) fn take_ingress_credit_callbacks_for_test() -> usize {
+    INGRESS_CREDIT_CALLBACKS.replace(0)
+}
+
 struct DetachedSessionCore<'a> {
     state: &'a Rc<RefCell<DriverState>>,
     core: Option<Box<SessionCore>>,
@@ -3033,12 +3045,16 @@ impl UniplexHandle {
             }
             _ => DeferredReadTimeout::ReplaceUpdates(driver.stream_read_timeout),
         };
-        driver
+        let producer = driver
             .core()
             .stream(stream)
             .expect("committed stream")
-            .ingress_producer()
-            .defer_read_timeout(timeout);
+            .ingress_producer();
+        producer.defer_read_timeout(timeout);
+        if driver.http2.is_none() && driver.http1_stats.is_none() {
+            // DIV-044: only the read that resumes parsing reports credit; stats count every read.
+            producer.set_resume_threshold(Some(driver.ingress_buffer_limit));
+        }
         driver
             .egress_meta
             .entry(stream)
@@ -6137,6 +6153,16 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
                                 && let Some(http1) = self.http1_stats.as_mut()
                             {
                                 http1.record_transaction_opened();
+                            }
+                            if self.http2.is_none()
+                                && self.http1_stats.is_none()
+                                && let Some(state) = self.core.stream_if_present(stream)
+                            {
+                                // DIV-044: only the read that resumes parsing reports credit;
+                                // stats count every read.
+                                state
+                                    .ingress_producer()
+                                    .set_resume_threshold(Some(self.ingress_buffer_limit));
                             }
                             request
                                 .source_mut()
@@ -9394,6 +9420,8 @@ fn drive_core_callbacks(
     let mut core = DetachedSessionCore::take(state);
     let processed = core.core_mut().process_pending_events_for_driver();
     let flow_updates = core.core_mut().take_flow_control_updates();
+    #[cfg(test)]
+    INGRESS_CREDIT_CALLBACKS.set(INGRESS_CREDIT_CALLBACKS.get() + flow_updates.len());
     core.restore();
     let processed = match processed {
         Ok(processed) => processed,

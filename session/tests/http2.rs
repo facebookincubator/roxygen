@@ -18047,6 +18047,148 @@ pub mod h2 {
         });
     }
 
+    /// Reads each request body `read_size` bytes at a time, counting the bytes in `consumed`,
+    /// then answers 200 without a body.
+    struct ChunkedBodyReader {
+        read_size: u32,
+        consumed: Rc<Cell<usize>>,
+    }
+
+    impl HttpHandler for ChunkedBodyReader {
+        fn handle_request(
+            &self,
+            _context: HandlerSessionContext,
+            mut request: HttpSourceHolder,
+        ) -> LocalHandlerFuture {
+            let read_size = self.read_size;
+            let consumed = Rc::clone(&self.consumed);
+            Box::pin(async move {
+                if !request.read_header_event().await?.eom() {
+                    loop {
+                        let event = request.read_body_event(read_size).await?;
+                        let eom = event.eom();
+                        match event.into_kind() {
+                            roxygen_core::events::HttpBodyEventKind::Body(body) => {
+                                consumed.set(consumed.get() + body.chain_length());
+                            }
+                            roxygen_core::events::HttpBodyEventKind::Suspend(resume) => {
+                                let _ = resume.await;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        if eom {
+                            break;
+                        }
+                    }
+                }
+                let response =
+                    HttpFixedSource::make_fixed_response(200, None).expect("fixture response");
+                Ok(HttpSourceHolder::new(Box::new(response)))
+            })
+        }
+    }
+
+    /// Each written WINDOW_UPDATE frame, header and payload, in wire order.
+    fn window_update_frames(wire: &[u8]) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        let mut rest = wire;
+        while !rest.is_empty() {
+            let length = u32::from_be_bytes([0, rest[0], rest[1], rest[2]]) as usize;
+            let (frame, tail) = rest.split_at(FRAME_HEADER_SIZE + length);
+            if frame[3] == FrameType::WINDOW_UPDATE.as_u8() {
+                frames.push(frame.to_vec());
+            }
+            rest = tail;
+        }
+        frames
+    }
+
+    /// The WINDOW_UPDATE frames written for a 60,000-byte upload read 8 KiB at a time, recorded
+    /// at `62d2959bb6d3`, before HTTP/1.1 streams could declare a resume threshold (`DIV-044`).
+    /// HTTP/2 streams declare none, so the frames stay byte for byte those of the parent. The
+    /// first three 16,000-byte DATA frames are read in full before the last arrives, so stream
+    /// credit is still owed while they are read.
+    #[test]
+    fn upload_window_updates_are_unchanged_by_http1_resume_thresholds() {
+        let frames = run_on_worker(|context| {
+            Box::pin(async move {
+                let (initial, data) = peer_padded_post_parts(&[b'w'; 60_000], 0);
+                let (first, last) = data.split_at(3 * (FRAME_HEADER_SIZE + 16_000));
+                let release_last = Arc::new(tokio::sync::Notify::new());
+                let release_eof = Arc::new(tokio::sync::Notify::new());
+                let (transport, state) = FixtureTransport::new([
+                    FixtureRead::Data([initial.as_slice(), first].concat()),
+                    FixtureRead::WaitData(Arc::clone(&release_last), last.to_vec()),
+                    FixtureRead::WaitDataEof(Arc::clone(&release_eof), Vec::new()),
+                ]);
+                let consumed = Rc::new(Cell::new(0));
+                let handler: Rc<dyn HttpHandler> = Rc::new(ChunkedBodyReader {
+                    read_size: 8 << 10,
+                    consumed: Rc::clone(&consumed),
+                });
+                let (session, _) = UniplexSession::new_http2(
+                    context,
+                    TransportDirection::Downstream,
+                    transport,
+                    Some(handler),
+                    UniplexConfig {
+                        maximum_read_size: 64 << 10,
+                        read_allocation_size: 64 << 10,
+                        ..UniplexConfig::default()
+                    },
+                    Http2SessionConfig::default(),
+                )
+                .expect("downstream H2 session");
+                let mut run = Box::pin(session.run());
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while consumed.get() != 48_000 {
+                        tokio::select! {
+                            result = run.as_mut() => {
+                                panic!("session ended before the first frames were read: {result:?}")
+                            }
+                            _ = tokio::task::yield_now() => {}
+                        }
+                    }
+                })
+                .await
+                .expect("the first three DATA frames were read");
+                release_last.notify_one();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !decode_server_frames(&state.borrow().writes.concat())
+                        .header_statuses
+                        .contains(&(StreamId::new(1), 200))
+                    {
+                        tokio::select! {
+                            result = run.as_mut() => {
+                                panic!("session ended before the response: {result:?}")
+                            }
+                            _ = tokio::task::yield_now() => {}
+                        }
+                    }
+                })
+                .await
+                .expect("the upload was read and answered");
+                release_eof.notify_one();
+                let _ = tokio::time::timeout(Duration::from_secs(5), run.as_mut())
+                    .await
+                    .expect("the session ends at EOF");
+                window_update_frames(&state.borrow().writes.concat())
+            })
+        });
+        assert_eq!(
+            frames,
+            [
+                // Length 4, type 8, no flags, stream 1, increment 32,768.
+                [0, 0, 4, 8, 0, 0, 0, 0, 1, 0, 0, 0x80, 0],
+                // The same on stream 0, the connection.
+                [0, 0, 4, 8, 0, 0, 0, 0, 0, 0, 0, 0x80, 0],
+            ],
+            "stream and connection WINDOW_UPDATE frames, byte for byte and in wire order: each \
+             half of the 65,535-byte window is returned after four 8 KiB reads"
+        );
+    }
+
     impl ConnectionFlowControlCallback for WindowNotification {
         fn on_connection_send_window_open(&self) {
             self.opened.set(self.opened.get() + 1);

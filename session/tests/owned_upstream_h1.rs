@@ -4127,6 +4127,164 @@ fn bytes_read_before_a_read_error_reach_the_response_as_uniplex() {
     );
 }
 
+/// What the caller saw of [`resume_threshold_outcome`]'s response.
+struct ResumeThresholdOutcome {
+    run: Option<HttpErrorCode>,
+    body: Vec<u8>,
+    /// `bytes_processed` callbacks the response source gave its session.
+    callbacks: usize,
+    /// The `record_buffered_read_bytes` deltas of a `UniplexSession` that reports stats.
+    buffered_read_deltas: Vec<i64>,
+}
+
+/// A 22 KiB response body, between `ingress_buffer_limit` (16 KiB) and `buffer_limit`
+/// (64 KiB), read 4 KiB at a time by an owned upstream session's caller, or a `UniplexSession`
+/// client's. The first transport read carries 20 KiB of it, which pause parsing; the last 2 KiB
+/// wait behind that pause, and with them the response's end. Every read arrives as one buffer,
+/// so parsing pauses once. With `stats`, the `UniplexSession` reports session stats.
+fn resume_threshold_outcome(owned: bool, stats: bool) -> ResumeThresholdOutcome {
+    let body = patterned(22 << 10);
+    let mut first = format!(
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    first.extend_from_slice(&body[..20 << 10]);
+    let second = body[20 << 10..].to_vec();
+    run_on_host(move |context| {
+        Box::pin(async move {
+            super::owned_h1::take_ingress_credit_callbacks(owned);
+            let deltas = Rc::new(super::owned_h1::BufferedReadDeltas::default());
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (transport, _state) = ScriptedTransport::new([
+                ReadAction::WaitData(Arc::clone(&gate), first),
+                ReadAction::Data(second),
+            ]);
+            let config = UniplexConfig {
+                buffer_limit: 64 << 10,
+                ingress_buffer_limit: 16 << 10,
+                maximum_read_size: 64 << 10,
+                read_allocation_size: 64 << 10,
+                ..upstream_config()
+            };
+            let read_body = |mut source: HttpSourceHolder| async move {
+                let mut head = source.read_header_event().await.unwrap();
+                assert_eq!(head.headers_mut().status_code().unwrap(), 200);
+                let mut body = Vec::new();
+                loop {
+                    let event = source.read_body_event(4 << 10).await.unwrap();
+                    if let Some(bytes) = event.as_body() {
+                        let length = bytes.chain_length();
+                        body.extend_from_slice(&bytes.coalesce(length).unwrap());
+                    }
+                    if event.eom() {
+                        return body;
+                    }
+                }
+            };
+            let (run, body) = if owned {
+                let mut options = upstream_options(context, transport);
+                options.io = config;
+                let (session, handle) = OwnedH1UpstreamSession::new(options).unwrap();
+                let submission = handle.reserve_request().unwrap().submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                futures::join!(session.run(), async {
+                    let (_stream, source, _control) = submission.await.unwrap().into_source_parts();
+                    gate.notify_one();
+                    read_body(source).await
+                })
+            } else {
+                let (session, handle) = if stats {
+                    UniplexSession::new_with_stats(
+                        context,
+                        TransportDirection::Upstream,
+                        transport,
+                        None,
+                        config,
+                        Rc::clone(&deltas) as Rc<dyn crate::http2::stats::Http2SessionStats>,
+                    )
+                } else {
+                    UniplexSession::new(
+                        context,
+                        TransportDirection::Upstream,
+                        transport,
+                        None,
+                        config,
+                    )
+                }
+                .unwrap();
+                futures::join!(session.run(), async {
+                    let response = handle
+                        .send_request(
+                            RequestSource::held(Some(get_head()), Vec::new()),
+                            CancellationToken::never(),
+                        )
+                        .await
+                        .unwrap();
+                    gate.notify_one();
+                    read_body(response.source).await
+                })
+            };
+            ResumeThresholdOutcome {
+                run: run.err().map(|error| error.code()),
+                body,
+                callbacks: super::owned_h1::take_ingress_credit_callbacks(owned),
+                buffered_read_deltas: deltas.0.take(),
+            }
+        })
+    })
+}
+
+/// Asserts that the caller read the whole response after one pause and the one callback that
+/// resumed it (`DIV-044`).
+fn assert_resumed_once_below_the_threshold(outcome: &ResumeThresholdOutcome) {
+    assert_eq!(outcome.run, None);
+    assert!(
+        outcome.body == patterned(22 << 10),
+        "parsing resumed and the body arrived intact through its end: {} bytes",
+        outcome.body.len()
+    );
+    assert_eq!(
+        outcome.callbacks, 1,
+        "only the read that takes the unread body below the threshold reports credit"
+    );
+}
+
+#[test]
+fn uniplex_client_resumes_below_the_ingress_threshold() {
+    assert_resumed_once_below_the_threshold(&resume_threshold_outcome(false, false));
+}
+
+#[test]
+fn owned_client_resumes_below_the_ingress_threshold() {
+    assert_resumed_once_below_the_threshold(&resume_threshold_outcome(true, false));
+}
+
+/// HTTP/1.1 session stats count buffered response bytes down on every read, so a Uniplex
+/// client that reports them keeps a callback per read (`DIV-044`).
+#[test]
+fn uniplex_client_with_stats_keeps_a_callback_per_read() {
+    let outcome = resume_threshold_outcome(false, true);
+    assert_eq!(outcome.run, None);
+    assert!(outcome.body == patterned(22 << 10));
+    let deltas = &outcome.buffered_read_deltas;
+    let reads: Vec<i64> = deltas.iter().copied().filter(|delta| *delta < 0).collect();
+    assert_eq!(
+        reads,
+        [-4096, -4096, -4096, -4096, -4096, -2048],
+        "one delta per 4 KiB read of the 22 KiB body; all deltas: {deltas:?}"
+    );
+    assert_eq!(
+        deltas.iter().sum::<i64>(),
+        0,
+        "every buffered byte is counted out"
+    );
+    assert_eq!(outcome.callbacks, 6);
+}
+
 /// A scripted request whose last body event waits for `gate`.
 struct GatedTail {
     head: Option<HttpHeaderEvent>,
@@ -9847,6 +10005,14 @@ mod n8 {
                         fixture.body(&mut response, u32::MAX).is_pending(),
                         "the re-read finds nothing"
                     );
+                    assert_eq!(
+                        (
+                            fixture.holder_wake.get() - holder,
+                            fixture.run_wake.get() - run
+                        ),
+                        (1, 0),
+                        "parsing and taking the event wake nothing: no waiter is registered"
+                    );
                 }
                 fixture.finish(&mut response).unwrap();
             })
@@ -9940,11 +10106,17 @@ mod n8 {
                     head.expect("the try read succeeds: the pending waiting read was retired");
                 assert_eq!(head.headers_mut().status_code().unwrap(), 200);
                 assert!(response.body().holds_the_drive());
+                let holder = fixture.holder_wake.get();
                 fixture.origin.send(&chunk(b"one"));
                 let Poll::Ready(event) = fixture.body(&mut response, u32::MAX) else {
                     panic!("the chunk is taken");
                 };
                 assert_eq!(body_bytes(&event.unwrap()), b"one");
+                assert_eq!(
+                    fixture.holder_wake.get() - holder,
+                    1,
+                    "the chunk wakes the holder once, through the driver: the retired wait is gone"
+                );
                 fixture.finish(&mut response).unwrap();
             })
         });
@@ -11077,8 +11249,8 @@ mod n8 {
                 for piece in body.chunks(16 << 10) {
                     fixture.origin.send(piece);
                 }
-                // The holder reads 4 KiB at a time, and again only after a wake: the resume
-                // credit wakes it once parsing may resume.
+                // The holder reads 4 KiB at a time, and again only after a wake: the DIV-044
+                // resume credit wakes it once parsing may resume.
                 let mut read = Vec::new();
                 let mut seen = fixture.holder_wake.get();
                 for _ in 0..10_000 {
