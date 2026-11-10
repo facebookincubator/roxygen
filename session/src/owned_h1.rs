@@ -124,6 +124,7 @@ thread_local! {
     static PHASE_CHECKS: Cell<usize> = const { Cell::new(0) };
     static CANCEL_SELECTIONS: Cell<usize> = const { Cell::new(0) };
     static RESPONSE_EVENTS: Cell<usize> = const { Cell::new(0) };
+    static BYTE_EVENT_REFUSALS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// How many turns the owned HTTP/1.1 drivers on this thread have run.
@@ -158,6 +159,13 @@ pub(crate) fn cancel_selections() -> usize {
 #[cfg(test)]
 pub(crate) fn response_events() -> usize {
     RESPONSE_EVENTS.with(Cell::get)
+}
+
+/// How many byte-event refusal errors the owned HTTP/1.1 drivers on this thread have built
+/// (`cancel_byte_events`).
+#[cfg(test)]
+pub(crate) fn byte_event_refusals() -> usize {
+    BYTE_EVENT_REFUSALS.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -353,6 +361,11 @@ fn refuse_byte_events(
 /// Cancels each registration with `INVALID_STATE_TRANSITION`: this driver delivers no byte
 /// events.
 fn cancel_byte_events(registrations: Vec<HttpByteEventRegistration>) {
+    if registrations.is_empty() {
+        return;
+    }
+    #[cfg(test)]
+    count(&BYTE_EVENT_REFUSALS);
     let error = failure(
         HttpErrorCode::INVALID_STATE_TRANSITION,
         b"owned H1 delivers no byte events",

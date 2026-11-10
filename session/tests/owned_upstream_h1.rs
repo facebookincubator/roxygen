@@ -21,6 +21,7 @@ use crate::owned_h1::Http1DriverConfig;
 use crate::owned_h1::OwnedH1Options;
 use crate::owned_h1::OwnedH1UpstreamReservation;
 use crate::owned_h1::OwnedH1UpstreamSession;
+use crate::owned_h1::byte_event_refusals;
 use crate::owned_h1::cancel_selections;
 use crate::owned_h1::codec_parses;
 use crate::owned_h1::driver_turns;
@@ -244,15 +245,16 @@ fn owned_exchange_writes(
 }
 
 /// As `owned_exchange_writes`; also returns how many times the driver selected the exchange's
-/// cancel cause.
+/// cancel cause, and how many byte-event refusal errors it built.
 fn owned_exchange_run(
     request: impl FnOnce() -> (HttpHeaderEvent, Vec<HttpBodyEvent>) + Send + 'static,
     response: &'static [u8],
     response_body: &'static [u8],
-) -> (Vec<Vec<u8>>, usize) {
+) -> (Vec<Vec<u8>>, usize, usize) {
     run_on_host(move |context| {
         Box::pin(async move {
             let selections = cancel_selections();
+            let refusals = byte_event_refusals();
             let gate = Arc::new(tokio::sync::Notify::new());
             let (transport, state) = ScriptedTransport::new([
                 ReadAction::WaitData(Arc::clone(&gate), response.to_vec()),
@@ -276,6 +278,7 @@ fn owned_exchange_run(
             (
                 state.borrow().writes.clone(),
                 cancel_selections() - selections,
+                byte_event_refusals() - refusals,
             )
         })
     })
@@ -1567,6 +1570,77 @@ fn request_head_size_is_reported_and_byte_events_are_refused() {
         events,
         vec![Some(HttpErrorCode::INVALID_STATE_TRANSITION); 2],
         "the head's and the body's registrations are each cancelled with the documented error"
+    );
+}
+
+/// Records request byte-event outcomes: `None` if one fired, else its cancel code and message.
+#[derive(Default)]
+struct ByteEventCancels(RefCell<Vec<Option<(HttpErrorCode, Vec<u8>)>>>);
+
+impl HttpByteEventCallback for ByteEventCancels {
+    fn on_byte_event(&self, _event: HttpByteEvent) {
+        self.0.borrow_mut().push(None);
+    }
+
+    fn on_byte_event_cancelled(&self, _event: HttpByteEvent, error: HttpError) {
+        self.0
+            .borrow_mut()
+            .push(Some((error.code(), error.message().to_vec())));
+    }
+}
+
+#[test]
+fn byte_event_refusals_are_built_only_for_events_that_register() {
+    let (cancels, refusals) = run_on_host(move |context| {
+        Box::pin(async move {
+            let log = Rc::new(ByteEventCancels::default());
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (transport, _state) = ScriptedTransport::new([ReadAction::WaitData(
+                Arc::clone(&gate),
+                OK_RESPONSE.to_vec(),
+            )]);
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let write = ByteEventType::TransportWrite.bit();
+            let (mut head, mut body) = scripted_request(true);
+            for _ in 0..2 {
+                head.byte_event_registrations_mut()
+                    .push(HttpByteEventRegistration::new(None, write, &log));
+            }
+            body[1]
+                .byte_event_registrations_mut()
+                .push(HttpByteEventRegistration::new(None, write, &log));
+            let refusals = byte_event_refusals();
+            let submission = handle.reserve_request().unwrap().submit(
+                head,
+                RequestSource::held(None, body),
+                CancellationToken::never(),
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                let (_stream, mut source, _control) = submission.await.unwrap().into_source_parts();
+                gate.notify_one();
+                assert_eq!(read_response(&mut source).await.body, b"ok");
+                drop(source);
+                close_once_idle(&handle).await;
+            });
+            run.unwrap();
+            (log.0.take(), byte_event_refusals() - refusals)
+        })
+    });
+    let refused = Some((
+        HttpErrorCode::INVALID_STATE_TRANSITION,
+        b"owned H1 delivers no byte events".to_vec(),
+    ));
+    assert_eq!(
+        cancels,
+        vec![refused; 3],
+        "the head's two registrations and the last body event's one are each cancelled with the \
+         documented error"
+    );
+    assert_eq!(
+        refusals, 2,
+        "one refusal error for the head and one for the last body event; the first body event \
+         registers nothing"
     );
 }
 
@@ -6744,6 +6818,31 @@ fn an_uncancelled_exchange_selects_no_cancel_cause() {
             ("get", 0)
         ],
         "cancel cause selections per exchange"
+    );
+}
+
+#[test]
+fn an_unregistered_request_builds_no_byte_event_refusal() {
+    type Request = fn() -> (HttpHeaderEvent, Vec<HttpBodyEvent>);
+    let requests: [(&str, Request); 4] = [
+        ("content-length", || scripted_request(false)),
+        ("chunked", || scripted_request(true)),
+        ("large", large_request),
+        ("get", || (get_head(), Vec::new())),
+    ];
+    let refusals: Vec<(&str, usize)> = requests
+        .into_iter()
+        .map(|(name, request)| (name, owned_exchange_run(request, OK_RESPONSE, b"ok").2))
+        .collect();
+    assert_eq!(
+        refusals,
+        [
+            ("content-length", 0),
+            ("chunked", 0),
+            ("large", 0),
+            ("get", 0)
+        ],
+        "byte-event refusal errors per exchange whose events register nothing"
     );
 }
 
