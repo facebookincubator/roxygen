@@ -1,13 +1,17 @@
 // Owned HTTP/1.1 upstream session tests. Each byte comparison runs a `UniplexSession` HTTP/1.1
 // client with the same request, the same zero-timeout `UniplexConfig` and the same origin bytes.
 
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::task::Context;
+use std::task::Wake;
 use std::task::Waker;
 
 use roxygen_core::ids::StreamId;
 use roxygen_core::source::LocalSourceFuture;
 use roxygen_core::stream_source::FlowControlState;
 use roxygen_runtime::tokio_host::ManagedWorkerError;
+use thiserror::Error;
 
 use super::*;
 use crate::experimental::OwnedRequestProgressExt;
@@ -1806,6 +1810,197 @@ fn cancel_before_the_response_is_claimed_fails_the_submission() {
             })
         });
     }
+}
+
+/// The request keeps its first explicit cause: a later cause and a later cancellation of its
+/// token change neither the connection's error nor the response's.
+#[test]
+fn repeated_request_cancellation_preserves_the_first_error() {
+    for cancellable in [false, true] {
+        run_on_host(move |context| {
+            Box::pin(async move {
+                let never = Arc::new(tokio::sync::Notify::new());
+                let (transport, state) =
+                    ScriptedTransport::new([ReadAction::WaitDataOrCancellation(never, Vec::new())]);
+                let (session, handle) =
+                    OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+                let cancellation = CancellationSource::new();
+                let submission = handle.reserve_request().unwrap().submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    if cancellable {
+                        cancellation.token()
+                    } else {
+                        CancellationToken::never()
+                    },
+                );
+                let (run, read) = futures::join!(session.run(), async {
+                    let (_, mut source, control) = submission.await.unwrap().into_source_parts();
+                    control.cancel(HttpError::with_message(
+                        HttpErrorCode::READ_TIMEOUT,
+                        b"first explicit error",
+                    ));
+                    control.cancel(HttpError::with_message(
+                        HttpErrorCode::WRITE_TIMEOUT,
+                        b"later explicit error",
+                    ));
+                    cancellation.request_cancellation();
+                    source
+                        .read_header_event()
+                        .await
+                        .err()
+                        .expect("cancellation fails the response before its head")
+                });
+                let run_error = run.expect_err("cancellation resets the connection");
+                assert_eq!(
+                    run_error.code(),
+                    HttpErrorCode::READ_TIMEOUT,
+                    "{cancellable}"
+                );
+                assert_eq!(
+                    run_error.message(),
+                    b"first explicit error",
+                    "{cancellable}"
+                );
+                assert_eq!(read.code(), HttpErrorCode::READ_TIMEOUT, "{cancellable}");
+                assert_eq!(
+                    read.message(),
+                    b"HTTP source aborted err=READ_TIMEOUT, details=owned H1 upstream exchange cancelled",
+                    "{cancellable}"
+                );
+                assert_eq!(state.borrow().close, CloseKind::Reset);
+            })
+        });
+    }
+}
+
+thread_local! {
+    static REJECTED_CAUSE_DROP: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// Clears `REJECTED_CAUSE_DROP` when the test ends, whether or not the callback ran.
+struct RejectedCauseDropGuard;
+
+impl Drop for RejectedCauseDropGuard {
+    fn drop(&mut self) {
+        REJECTED_CAUSE_DROP.with_borrow_mut(Option::take);
+    }
+}
+
+/// A cause whose destructor runs the thread's `REJECTED_CAUSE_DROP` callback once.
+#[derive(Debug, Error)]
+#[error("rejected request error cause")]
+struct RejectedRequestCause {
+    owner: ThreadId,
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Drop for RejectedRequestCause {
+    fn drop(&mut self) {
+        assert_eq!(std::thread::current().id(), self.owner);
+        self.events.lock().unwrap().push("drop-start");
+        let reenter = REJECTED_CAUSE_DROP
+            .with_borrow_mut(Option::take)
+            .expect("the rejected cause has one destructor callback");
+        reenter();
+        self.events.lock().unwrap().push("drop-end");
+    }
+}
+
+/// Records each wake while `recording` is set.
+struct RequestErrorWake {
+    recording: AtomicBool,
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Wake for RequestErrorWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if self.recording.load(Ordering::Acquire) {
+            self.events.lock().unwrap().push("wake");
+        }
+    }
+}
+
+/// A cause the request rejects is destroyed before the request wakes the driver, and its
+/// destructor may cancel the request again.
+#[test]
+fn rejected_request_cause_can_reenter_before_the_cancellation_wake() {
+    run_on_host(|context| {
+        Box::pin(async move {
+            let never = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) =
+                ScriptedTransport::new([ReadAction::WaitDataOrCancellation(never, Vec::new())]);
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let wake = Arc::new(RequestErrorWake {
+                recording: AtomicBool::new(false),
+                events: Arc::clone(&events),
+            });
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut run = std::pin::pin!(session.run());
+            assert!(
+                run.as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            let (_, mut source, control) = submission.await.unwrap().into_source_parts();
+            control.cancel(HttpError::with_message(
+                HttpErrorCode::READ_TIMEOUT,
+                b"first explicit error",
+            ));
+            let _drop_guard = RejectedCauseDropGuard;
+            let reentrant_control = control.clone();
+            let reentrant_events = Arc::clone(&events);
+            REJECTED_CAUSE_DROP.with_borrow_mut(|slot| {
+                assert!(slot.is_none());
+                *slot = Some(Box::new(move || {
+                    reentrant_control.cancel(HttpError::new(HttpErrorCode::CANCEL));
+                    reentrant_events.lock().unwrap().push("reentered");
+                }));
+            });
+            let rejected = HttpError::new(HttpErrorCode::WRITE_TIMEOUT).with_cause(Arc::new(
+                RejectedRequestCause {
+                    owner: std::thread::current().id(),
+                    events: Arc::clone(&events),
+                },
+            ));
+            wake.recording.store(true, Ordering::Release);
+            control.cancel(rejected);
+            wake.recording.store(false, Ordering::Release);
+            assert_eq!(
+                *events.lock().unwrap(),
+                ["drop-start", "wake", "reentered", "drop-end", "wake"],
+                "the outer cancellation wakes after the rejected cause finishes reentry"
+            );
+            let run_error = run
+                .await
+                .expect_err("the first cancellation resets the connection");
+            let response_error = source
+                .read_header_event()
+                .await
+                .err()
+                .expect("the retained first error reaches the response");
+            assert_eq!(run_error.code(), HttpErrorCode::READ_TIMEOUT);
+            assert_eq!(run_error.message(), b"first explicit error");
+            assert_eq!(response_error.code(), HttpErrorCode::READ_TIMEOUT);
+            assert_eq!(
+                response_error.message(),
+                b"HTTP source aborted err=READ_TIMEOUT, details=owned H1 upstream exchange cancelled"
+            );
+            assert_eq!(state.borrow().close, CloseKind::Reset);
+            assert!(REJECTED_CAUSE_DROP.with_borrow(|slot| slot.is_none()));
+        })
+    });
 }
 
 /// A write queue whose writes complete at once; its capacity check runs `hook` once, its

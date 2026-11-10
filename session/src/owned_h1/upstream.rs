@@ -38,6 +38,7 @@
 //! already readable, or a failed read, closes admission first; a request that admission refuses
 //! reports `OwnedRequestProgressExt::request_unprocessed` (`DIV-035`).
 
+use std::cell::OnceCell;
 use std::cell::RefCell;
 
 use roxygen_core::body_event_queue::HttpBodySource;
@@ -360,7 +361,7 @@ impl OwnedH1UpstreamReservation {
             counted: Cell::new(false),
             released: Cell::new(false),
             cancellation,
-            error: RefCell::new(None),
+            error: OnceCell::new(),
             response: RefCell::new(None),
             response_ready: Cell::new(false),
             response_interest,
@@ -433,7 +434,7 @@ impl OwnedH1UpstreamSubmission {
         if self.status.response_ready.get()
             && (!self.status.response_interest
                 || self.status.response_published.get()
-                || self.status.error.borrow().is_some())
+                || self.status.error.get().is_some())
         {
             let response = self
                 .status
@@ -639,7 +640,7 @@ struct RequestStatus {
     counted: Cell<bool>,
     released: Cell<bool>,
     cancellation: CancellationToken,
-    error: RefCell<Option<HttpError>>,
+    error: OnceCell<HttpError>,
     response: RefCell<Option<Result<(StreamId, HttpResponseSource), HttpError>>>,
     response_ready: Cell<bool>,
     response_interest: bool,
@@ -667,7 +668,7 @@ impl RequestStatus {
     }
 
     fn selected_error(&self) -> Option<HttpError> {
-        if let Some(error) = &*self.error.borrow() {
+        if let Some(error) = self.error.get() {
             return Some(error.clone());
         }
         self.cancellation.is_cancellation_requested().then(|| {
@@ -679,7 +680,7 @@ impl RequestStatus {
     }
 
     fn cancel(&self, error: HttpError) {
-        self.error.borrow_mut().get_or_insert(error);
+        drop(self.error.set(error));
         self.shared.wake.wake_by_ref();
     }
 
@@ -687,7 +688,7 @@ impl RequestStatus {
     /// submission's cancel, the submission's drop, or its cancellation token), or a supplied
     /// producer's failure, which is selected only before the response is delivered.
     fn cause_selected(&self) -> bool {
-        self.error.borrow().is_some() || self.cancellation.is_cancellation_requested()
+        self.error.get().is_some() || self.cancellation.is_cancellation_requested()
     }
 
     fn notify(&self) {
@@ -698,10 +699,12 @@ impl RequestStatus {
     }
 
     fn fail(&self, error: HttpError) {
-        let error = {
-            let mut selected = self.error.borrow_mut();
-            selected.get_or_insert(error).clone()
-        };
+        drop(self.error.set(error));
+        let error = self
+            .error
+            .get()
+            .expect("the request retains its first error")
+            .clone();
         if !self.delivered.get() {
             let old = self.response.borrow_mut().replace(Err(error));
             self.response_ready.set(true);
@@ -852,7 +855,7 @@ impl Exchange {
         let shared = &self.status.shared;
         shared.cancel.get()
             || (!(self.request_complete && self.response_complete)
-                && (self.status.error.borrow().is_some()
+                && (self.status.error.get().is_some()
                     || self.status.cancellation.is_cancellation_requested()))
             || shared.context.is_cancelled()
     }
@@ -1001,7 +1004,14 @@ impl Exchange {
         else {
             return None;
         };
-        Some(self.status.error.borrow_mut().get_or_insert(error).clone())
+        drop(self.status.error.set(error));
+        Some(
+            self.status
+                .error
+                .get()
+                .expect("the request retains its first error")
+                .clone(),
+        )
     }
 
     /// The connection's error for a failed upload: the selected producer failure, or the
