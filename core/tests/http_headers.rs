@@ -702,6 +702,70 @@ fn value_trimming_preserves_vertical_tab_and_form_feed() {
 }
 
 #[test]
+fn verbatim_values_keep_surrounding_whitespace_where_add_trims() {
+    let fields: [(&[u8], &[u8]); 5] = [
+        (b"user-agent", b" ua\t"),
+        (b"x-lead", b"  leading"),
+        (b"x-only-space", b" \t "),
+        (b"x-empty", b""),
+        (b"x-lead", b"second "),
+    ];
+    let mut verbatim = HttpHeaders::new();
+    let mut trimmed = HttpHeaders::new();
+    for (name, value) in fields {
+        if HttpCommonHeaders::hash(name) == HttpHeaderCode::Other {
+            verbatim.add_uncommon_verbatim(name, value);
+        } else {
+            verbatim.add_verbatim(name, value);
+        }
+        trimmed.add(name, value);
+    }
+    let collect = |headers: &HttpHeaders| {
+        let mut seen = Vec::new();
+        headers.for_each_with_code(|code, name, value| {
+            seen.push((code, name.to_vec(), value.to_vec()));
+        });
+        seen
+    };
+    assert_eq!(
+        collect(&verbatim),
+        [
+            (
+                HttpHeaderCode::UserAgent,
+                b"User-Agent".to_vec(),
+                b" ua\t".to_vec()
+            ),
+            (
+                HttpHeaderCode::Other,
+                b"x-lead".to_vec(),
+                b"  leading".to_vec()
+            ),
+            (
+                HttpHeaderCode::Other,
+                b"x-only-space".to_vec(),
+                b" \t ".to_vec()
+            ),
+            (HttpHeaderCode::Other, b"x-empty".to_vec(), b"".to_vec()),
+            (
+                HttpHeaderCode::Other,
+                b"x-lead".to_vec(),
+                b"second ".to_vec()
+            ),
+        ]
+    );
+    assert_eq!(
+        verbatim.combine_default("x-lead"),
+        b"  leading, second ".to_vec().into()
+    );
+    assert_eq!(trimmed.get_single_or_empty("user-agent"), b"ua");
+    assert_eq!(trimmed.get_single_or_empty("x-only-space"), b"");
+    assert_eq!(
+        trimmed.combine_default("x-lead"),
+        b"leading, second".to_vec().into()
+    );
+}
+
+#[test]
 fn short_and_long_header_bytes_remain_independently_owned() {
     for len in [0, 1, 7, 8, 21, 22, 23, 64] {
         let mut name = vec![b'x'; len.max(1)];

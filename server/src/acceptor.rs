@@ -197,6 +197,17 @@ pub struct ServerSessionConfig {
     /// regard to case and uppercases extension methods. A method that is not a token is still
     /// a malformed request. `owned_http1` and `owned_http2` refuse it.
     pub exact_method_tokens: bool,
+    /// Roxygen-only, default off (`DIV-041`): an HTTP/2 connection hands the application
+    /// each request field value exactly as decoded, surrounding spaces and tabs included,
+    /// as h2 and hyper's server do, instead of trimmed; values h2 refuses (a control byte
+    /// other than HTAB, DEL, a `content-length` that is not decimal digits, a `te` other
+    /// than `trailers`) make the request malformed. An empty `content-length` reaches the
+    /// application as an empty field and the body is checked against zero, as h2 reads it.
+    /// Response heads are encoded with their values as stored, so values inserted with
+    /// `HttpHeaders::add_verbatim` reach the client byte for byte, as hyper writes a
+    /// `HeaderValue`. HTTP/1.1 connections still trim optional request whitespace, as
+    /// `httparse` does, and write every stored value unchanged. `owned_http2` refuses it.
+    pub verbatim_http2_header_values: bool,
     #[cfg(test)]
     pub(crate) accepted_socket_profile: Option<Arc<AcceptedSocketProfile>>,
 }
@@ -241,6 +252,7 @@ impl Default for ServerSessionConfig {
             abort_exchanges_on_eof: false,
             non_abortive_close: false,
             exact_method_tokens: false,
+            verbatim_http2_header_values: false,
             #[cfg(test)]
             accepted_socket_profile: None,
         }
@@ -289,6 +301,9 @@ impl ServerSessionConfig {
         }
         if self.exact_method_tokens {
             return Err("owned_http2 does not support exact_method_tokens");
+        }
+        if self.verbatim_http2_header_values {
+            return Err("owned_http2 does not support verbatim_http2_header_values");
         }
         Ok(())
     }
@@ -694,6 +709,7 @@ pub(crate) fn attach_session(
         unframed_bodiless_http1_requests: false,
         non_abortive_close: config.session.non_abortive_close,
         exact_method_tokens: config.session.exact_method_tokens,
+        verbatim_http2_header_values: config.session.verbatim_http2_header_values,
     };
     if let Some(limits) = transport_limits {
         uniplex.maximum_read_size = uniplex.maximum_read_size.min(limits.maximum_read_size());

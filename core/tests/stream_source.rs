@@ -836,6 +836,57 @@ mod stream_source {
         assert!(event.eom());
     }
 
+    /// A request whose `content-length` field is present and empty.
+    fn request_with_empty_content_length() -> HttpMessage {
+        let mut message = request(None);
+        message
+            .headers_mut()
+            .add_verbatim(HttpHeaderCode::ContentLength, b"");
+        message
+    }
+
+    #[test]
+    fn an_empty_content_length_disables_the_check_by_default() {
+        let (source, producer, _) = session_source(65_535);
+        producer.headers(request_with_empty_content_length(), false);
+        producer.body(body(b"body"), 0, true);
+        assert!(!read_header(&source).unwrap().eom());
+        let event = read_body(&source, u32::MAX).unwrap();
+        assert_eq!(event.as_body().unwrap().coalesce(4).unwrap(), b"body"[..]);
+        assert!(event.eom());
+    }
+
+    #[test]
+    fn an_empty_content_length_reads_as_zero_when_enabled() {
+        let (source, producer, _) = session_source(65_535);
+        source.read_empty_content_length_as_zero();
+        producer.headers(request_with_empty_content_length(), true);
+        assert!(
+            read_header(&source).unwrap().eom(),
+            "an empty body matches a zero length"
+        );
+
+        let (source, producer, _) = session_source(65_535);
+        source.read_empty_content_length_as_zero();
+        producer.headers(request_with_empty_content_length(), false);
+        producer.body(body(b"body"), 0, true);
+        assert_eq!(
+            error_code(read_header(&source)),
+            HttpErrorCode::CONTENT_LENGTH_MISMATCH,
+            "a body overruns a zero length"
+        );
+    }
+
+    #[test]
+    fn reading_an_empty_content_length_as_zero_leaves_a_missing_one_unchecked() {
+        let (source, producer, _) = session_source(65_535);
+        source.read_empty_content_length_as_zero();
+        producer.headers(request(None), false);
+        producer.body(body(b"body"), 0, true);
+        assert!(!read_header(&source).unwrap().eom());
+        assert!(read_body(&source, u32::MAX).unwrap().eom());
+    }
+
     #[test]
     fn content_length_accepts_all_folly_c_whitespace() {
         for content_length in [b"\x0b5\x0c".as_slice(), b"\x0c5\x0b".as_slice()] {

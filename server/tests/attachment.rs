@@ -1871,6 +1871,10 @@ fn owned_http2_attachment_rejects_unsupported_configuration() {
                     exact_method_tokens: true,
                     ..untimed_owned(false, true)
                 };
+                let verbatim_values = crate::acceptor::ServerSessionConfig {
+                    verbatim_http2_header_values: true,
+                    ..untimed_owned(false, true)
+                };
                 for (session, refusal) in [
                     (
                         stats,
@@ -1879,6 +1883,10 @@ fn owned_http2_attachment_rejects_unsupported_configuration() {
                     (
                         exact_methods,
                         b"owned_http2 does not support exact_method_tokens".as_slice(),
+                    ),
+                    (
+                        verbatim_values,
+                        b"owned_http2 does not support verbatim_http2_header_values".as_slice(),
                     ),
                 ] {
                     let (io, _peer) = tokio::io::duplex(64);

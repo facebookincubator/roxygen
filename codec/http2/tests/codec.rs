@@ -1674,6 +1674,260 @@ fn exact_methods_reject_a_method_that_is_not_a_token_when_enabled() {
     }
 }
 
+/// Every header but `Host` (which `:authority` sets), in order.
+fn regular_headers(message: &HttpMessage) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut headers = Vec::new();
+    message.headers().for_each_with_code(|code, name, value| {
+        if code != HttpHeaderCode::Host {
+            headers.push((name.to_ascii_lowercase(), value.to_vec()));
+        }
+    });
+    headers
+}
+
+fn request_with_fields(fields: &[(&[u8], &[u8])]) -> Vec<HpackHeader> {
+    let mut request = request_fields(b"/generate");
+    request.extend(
+        fields
+            .iter()
+            .map(|(name, value)| HpackHeader::new(name, value)),
+    );
+    request
+}
+
+const PADDED_FIELDS: [(&[u8], &[u8]); 8] = [
+    (b"user-agent", b" ua\t"),
+    (b"x-lead", b"  leading"),
+    (b"x-trail", b"trailing\t"),
+    (b"x-both", b"\t both "),
+    (b"x-empty", b""),
+    (b"x-only-space", b" \t "),
+    (b"x-dup", b" one"),
+    (b"x-dup", b"two "),
+];
+
+fn owned_fields(fields: &[(&[u8], &[u8])]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fields
+        .iter()
+        .map(|(name, value)| (name.to_vec(), value.to_vec()))
+        .collect()
+}
+
+#[test]
+fn verbatim_field_values_keep_surrounding_whitespace_when_enabled() {
+    let capture = decode_twice_with(&request_with_fields(&PADDED_FIELDS), |codec| {
+        codec.set_verbatim_field_values(true);
+    });
+    assert_eq!(capture.messages.len(), 2);
+    for message in &capture.messages {
+        assert_eq!(regular_headers(message), owned_fields(&PADDED_FIELDS));
+        assert_eq!(
+            message.headers().combine_default(b"x-dup"),
+            b" one, two ".to_vec().into()
+        );
+    }
+}
+
+#[test]
+fn field_values_are_trimmed_by_default() {
+    let capture = decode_twice_with(&request_with_fields(&PADDED_FIELDS), |_| {});
+    assert_eq!(capture.messages.len(), 2);
+    for message in &capture.messages {
+        assert_eq!(
+            regular_headers(message),
+            owned_fields(&[
+                (b"user-agent", b"ua"),
+                (b"x-lead", b"leading"),
+                (b"x-trail", b"trailing"),
+                (b"x-both", b"both"),
+                (b"x-empty", b""),
+                (b"x-only-space", b""),
+                (b"x-dup", b"one"),
+                (b"x-dup", b"two"),
+            ])
+        );
+    }
+}
+
+/// Whether the request with the extra `fields` decodes, with verbatim values
+/// when `verbatim`; a refused request is a stream error answered with 400.
+fn field_values_accepted(fields: &[(&[u8], &[u8])], verbatim: bool) -> bool {
+    let capture = decode_twice_with(&request_with_fields(fields), |codec| {
+        codec.set_verbatim_field_values(verbatim);
+    });
+    if capture.messages.len() == 2 {
+        return true;
+    }
+    assert_eq!(
+        capture
+            .error
+            .map(|(_, _, status, new_stream)| (status, new_stream)),
+        Some((Some(400), true)),
+        "{fields:?}"
+    );
+    false
+}
+
+#[test]
+fn verbatim_field_values_refuse_what_h2_refuses_when_enabled() {
+    // h2 0.4 (`HeaderValue::from_bytes`) refuses a value byte below 0x20 other
+    // than HTAB, and DEL; RFC 9113 section 8.2.1 forbids NUL, CR and LF.
+    for value in [
+        b"a\r\n b".as_slice(),
+        b"abc\r\n ",
+        b"a\rb",
+        b"a\nb",
+        b"a\0b",
+        b"a\x01b",
+        b"a\x7fb",
+    ] {
+        assert!(
+            !field_values_accepted(&[(b"x-value", value)], true),
+            "{value:?}"
+        );
+    }
+    // h2 resets a stream whose content-length is not decimal digits (at most 19).
+    for value in [b" 0".as_slice(), b"0 ", b"+0", b"00000000000000000000"] {
+        assert!(
+            !field_values_accepted(&[(b"content-length", value)], true),
+            "{value:?}"
+        );
+    }
+    // h2's `parse_u64` reads an empty content-length as zero.
+    for value in [b"0".as_slice(), b"0000000000000000000", b""] {
+        assert!(
+            field_values_accepted(&[(b"content-length", value)], true),
+            "{value:?}"
+        );
+    }
+    // h2 resets a stream whose te is anything but exactly `trailers`.
+    assert!(field_values_accepted(&[(b"te", b"trailers")], true));
+    for value in [b"trailers ".as_slice(), b"gzip"] {
+        assert!(!field_values_accepted(&[(b"te", value)], true), "{value:?}");
+    }
+    // Obsolete text is a field value byte h2 accepts.
+    assert!(field_values_accepted(&[(b"x-value", b"\x80\xff")], true));
+}
+
+#[test]
+fn verbatim_field_values_keep_an_empty_content_length_when_enabled() {
+    let capture = decode_twice_with(&request_with_fields(&[(b"content-length", b"")]), |codec| {
+        codec.set_verbatim_field_values(true);
+    });
+    assert_eq!(capture.messages.len(), 2);
+    for message in &capture.messages {
+        assert_eq!(
+            regular_headers(message),
+            owned_fields(&[(b"content-length", b"")]),
+            "the empty field is kept, as h2 keeps it"
+        );
+    }
+}
+
+/// The regular fields of a response head the codec generates, its values
+/// inserted with `add_verbatim`, as HPACK decodes them (no `date`).
+fn generated_padded_response_fields(verbatim: bool) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut sender = Http2Codec::new(TransportDirection::Downstream);
+    sender.set_verbatim_field_values(verbatim);
+    let mut message = response(200);
+    for (name, value) in [
+        (b"x-request-id".as_slice(), b" rid-7\t".as_slice()),
+        (b"x-padded", b" v\t"),
+        (b"x-empty", b""),
+    ] {
+        message.headers_mut().add_verbatim(name, value);
+    }
+    let mut output = BufQueue::new(4096);
+    sender
+        .generate(
+            &mut output,
+            EgressFrame::Headers {
+                stream: StreamId::new(1),
+                message: &message,
+                end_stream: true,
+                extra_headers: None,
+            },
+            &mut Trace::default(),
+        )
+        .unwrap();
+    let parsed = parse_frame(&mut output).unwrap().unwrap();
+    let Frame::Headers(block) = parsed.frame else {
+        panic!("expected one HEADERS frame");
+    };
+    HpackCodec::new()
+        .decode_buf_queue(&block, block.chain_length())
+        .unwrap()
+        .headers
+        .into_iter()
+        .map(|header| (header.name.as_bytes().to_vec(), header.value.to_vec()))
+        .filter(|(name, _)| !name.starts_with(b":") && name != b"date")
+        .collect()
+}
+
+#[test]
+fn verbatim_field_values_are_generated_as_stored_when_enabled() {
+    assert_eq!(
+        generated_padded_response_fields(true),
+        owned_fields(&[
+            (b"x-request-id", b" rid-7\t"),
+            (b"x-padded", b" v\t"),
+            (b"x-empty", b""),
+        ]),
+        "as h2 writes a `HeaderValue`, byte for byte"
+    );
+    assert_eq!(
+        generated_padded_response_fields(false),
+        owned_fields(&[
+            (b"x-request-id", b"rid-7"),
+            (b"x-padded", b"v"),
+            (b"x-empty", b""),
+        ]),
+        "by default the encoder trims surrounding spaces and tabs"
+    );
+}
+
+#[test]
+fn field_value_checks_are_unchanged_by_default() {
+    for (value, accepted) in [
+        (b"a\r\n b".as_slice(), true),
+        (b"abc\r\n ", true),
+        (b"a\rb", false),
+        (b"a\nb", false),
+        (b"a\0b", false),
+        (b"a\x01b", false),
+        (b"a\x7fb", false),
+    ] {
+        assert_eq!(
+            field_values_accepted(&[(b"x-value", value)], false),
+            accepted,
+            "{value:?}"
+        );
+    }
+    assert!(field_values_accepted(&[(b"content-length", b" 0")], false));
+    assert!(field_values_accepted(&[(b"te", b"gzip")], false));
+    let capture = decode_twice_with(&request_with_fields(&[(b"x-value", b"abc\r\n ")]), |_| {});
+    assert_eq!(
+        capture.messages[0]
+            .headers()
+            .get_single_or_empty(b"x-value"),
+        b"abc"
+    );
+}
+
+#[test]
+fn verbatim_field_values_combine_cookie_crumbs_without_trimming_when_enabled() {
+    let crumbs: [(&[u8], &[u8]); 2] = [(b"cookie", b" a=1"), (b"cookie", b"b=2 ")];
+    for (verbatim, combined) in [(true, b" a=1; b=2 ".as_slice()), (false, b"a=1; b=2")] {
+        let capture = decode_twice_with(&request_with_fields(&crumbs), |codec| {
+            codec.set_verbatim_field_values(verbatim);
+        });
+        for message in &capture.messages {
+            assert_eq!(message.headers().number_of_values(b"cookie"), 1);
+            assert_eq!(message.headers().get_single_or_empty(b"cookie"), combined);
+        }
+    }
+}
+
 #[test]
 fn request_methods_are_canonicalized_by_default() {
     for (method, canonical, recognized) in [

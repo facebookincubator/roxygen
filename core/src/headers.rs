@@ -882,6 +882,35 @@ impl HttpHeaders {
         self.entries_for_push().push(entry);
     }
 
+    /// Roxygen-only (`DIV-041`): adds a header with its value exactly as given, surrounding
+    /// whitespace included, as h2 and hyper keep an HTTP/2 field value; `add` trims it.
+    ///
+    /// Otherwise the same as `add`.
+    pub fn add_verbatim<'a>(
+        &mut self,
+        name: impl Into<HttpHeaderName<'a>>,
+        value: impl AsRef<[u8]>,
+    ) {
+        let name = Self::resolve_name(name.into());
+        let entry = HeaderEntry::new(name, value.as_ref());
+        self.remember_code(entry.code());
+        self.entries_for_push().push(entry);
+    }
+
+    /// `add_uncommon`, keeping the value exactly as given (`add_verbatim`).
+    #[doc(hidden)]
+    pub fn add_uncommon_verbatim(&mut self, name: &[u8], value: &[u8]) {
+        assert!(!name.is_empty(), "HTTP header names must not be empty");
+        debug_assert_eq!(
+            HttpCommonHeaders::hash(name),
+            HttpHeaderCode::Other,
+            "add_uncommon_verbatim requires a name without a common code"
+        );
+        let entry = HeaderEntry::new(ResolvedHeaderName::Other(name), value);
+        self.remember_code(entry.code());
+        self.entries_for_push().push(entry);
+    }
+
     /// Adds every header from an initializer-style sequence in sequence order.
     pub fn add_all<'a, I, V>(&mut self, headers: I)
     where

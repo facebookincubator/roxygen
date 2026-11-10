@@ -960,6 +960,7 @@ pub struct SessionCore {
     ingress_receive_window: u32,
     drain_request_body_on_drop: bool,
     deliver_ingress_before_abort: bool,
+    empty_content_length_is_zero: bool,
     egress_write_timeout: std::time::Duration,
     buffered_egress_stats_enabled: bool,
     peer_identity: Option<Rc<[u8]>>,
@@ -1026,6 +1027,7 @@ impl SessionCore {
             ingress_receive_window: DEFAULT_INGRESS_RECEIVE_WINDOW,
             drain_request_body_on_drop: false,
             deliver_ingress_before_abort: false,
+            empty_content_length_is_zero: false,
             egress_write_timeout: DEFAULT_EGRESS_WRITE_TIMEOUT,
             buffered_egress_stats_enabled: true,
             peer_identity: None,
@@ -1160,6 +1162,22 @@ impl SessionCore {
         }
         self.deliver_ingress_before_abort = enabled;
         true
+    }
+
+    /// Roxygen-only (`DIV-041`): a stream created after this call checks the body
+    /// of a final head whose `content-length` is present and empty against zero, as
+    /// h2 reads such a field. Existing streams retain their creation-time policy.
+    pub fn set_empty_content_length_is_zero(&mut self, enabled: bool) -> bool {
+        self.assert_owner();
+        if !self.streams.is_empty() {
+            return false;
+        }
+        self.empty_content_length_is_zero = enabled;
+        true
+    }
+
+    pub(crate) fn empty_content_length_is_zero(&self) -> bool {
+        self.empty_content_length_is_zero
     }
 
     pub(crate) fn set_peer_identity(&mut self, peer_identity: Option<Rc<[u8]>>) -> bool {
@@ -2567,6 +2585,7 @@ impl SessionCore {
             head_response,
             self.direction.is_downstream() && self.drain_request_body_on_drop,
             self.deliver_ingress_before_abort,
+            self.empty_content_length_is_zero,
             self.host.clone(),
         )?;
         if !self.buffered_egress_stats_enabled {

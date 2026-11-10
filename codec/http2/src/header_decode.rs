@@ -26,6 +26,29 @@ pub struct FieldDecodeOptions {
     /// for byte (`Method::from_exact_token`), as `http::Method::from_bytes` reads it, instead
     /// of a run of letters and `-` whose recognized methods match without regard to case.
     pub exact_methods: bool,
+    /// `DIV-041`: regular field values are stored exactly as decoded, as h2 stores them,
+    /// instead of trimmed of surrounding whitespace, and are validated as h2 validates
+    /// them: no byte below 0x20 other than HTAB and no DEL (so no obsolete line folding),
+    /// in strict mode also no byte above 0x7E, a `content-length` of at most 19 digits (an
+    /// empty one is kept, and a session reads it as zero), and a `te` of exactly
+    /// `trailers`. Crumbs of `cookie` are still combined into one value, without trimming
+    /// it.
+    pub verbatim_values: bool,
+}
+
+/// Whether `value` is a field value h2 0.4 accepts (`HeaderValue::from_bytes`): no byte
+/// below 0x20 other than HTAB, and no DEL; with `strict`, Roxygen's strict validation, no
+/// byte above 0x7E either.
+fn is_h2_field_value(value: &[u8], strict: bool) -> bool {
+    value
+        .iter()
+        .all(|byte| (*byte >= 0x20 || *byte == b'\t') && *byte != 0x7f && (!strict || *byte < 0x80))
+}
+
+/// Whether `value` is a `content-length` h2 0.4 accepts (`frame::headers::parse_u64`): at most
+/// 19 decimal digits, an empty value (which it reads as zero) included.
+fn is_h2_content_length(value: &[u8]) -> bool {
+    value.len() <= 19 && value.iter().all(u8::is_ascii_digit)
 }
 
 /// Request pseudo-header state and validation.
@@ -374,9 +397,16 @@ impl HeaderDecodeInfo {
         }
 
         self.regular_header_seen = true;
+        let verbatim = self.options.verbatim_values;
         match code {
             HttpHeaderCode::Connection => {
                 return self.fail("HTTP/2 Message with Connection header");
+            }
+            HttpHeaderCode::ContentLength if verbatim && !is_h2_content_length(value) => {
+                return self.fail("Invalid content-length");
+            }
+            HttpHeaderCode::Te if verbatim && value != b"trailers" => {
+                return self.fail("HTTP/2 Message with a TE other than trailers");
             }
             HttpHeaderCode::ContentLength => {
                 if self
@@ -418,9 +448,14 @@ impl HeaderDecodeInfo {
         } else {
             ControlEscapeMode::StrictCompat
         };
+        let value_valid = if verbatim {
+            is_h2_field_value(value, self.strict)
+        } else {
+            validate_header_value(value, value_mode)
+        };
         if self.validate
             && ((!name.is_common_header() && !validate_header_name(bytes, name_mode))
-                || !validate_header_value(value, value_mode))
+                || !value_valid)
         {
             self.proxygen_error = Some(if bytes.is_empty() {
                 ProxygenError::PARSE_HEADER
@@ -433,10 +468,14 @@ impl HeaderDecodeInfo {
                 String::from_utf8_lossy(bytes)
             ));
         }
-        if name.is_common_header() {
-            self.message.headers_mut().add(code, value);
-        } else {
-            self.message.headers_mut().add_uncommon(bytes, value);
+        match (name.is_common_header(), verbatim) {
+            (true, false) => self.message.headers_mut().add(code, value),
+            (false, false) => self.message.headers_mut().add_uncommon(bytes, value),
+            (true, true) => self.message.headers_mut().add_verbatim(code, value),
+            (false, true) => self
+                .message
+                .headers_mut()
+                .add_uncommon_verbatim(bytes, value),
         }
         true
     }
@@ -451,9 +490,13 @@ impl HeaderDecodeInfo {
                 .headers()
                 .combine(HttpHeaderCode::Cookie, b"; ");
             if !cookie.is_empty() {
-                self.message
-                    .headers_mut()
-                    .set(HttpHeaderCode::Cookie, cookie);
+                let headers = self.message.headers_mut();
+                if self.options.verbatim_values {
+                    headers.remove(HttpHeaderCode::Cookie);
+                    headers.add_verbatim(HttpHeaderCode::Cookie, cookie);
+                } else {
+                    headers.set(HttpHeaderCode::Cookie, cookie);
+                }
             }
             if !self.verifier.validate(&mut self.message) {
                 self.parsing_error = self.verifier.error().map(str::to_owned);

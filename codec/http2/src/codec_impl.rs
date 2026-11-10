@@ -141,6 +141,8 @@ struct PreparedMessageHeaders<'a> {
     headers: &'a HttpHeaders,
     extra: Option<&'a HttpHeaders>,
     date: Option<String>,
+    /// `DIV-041`: values are encoded as stored instead of trimmed.
+    verbatim_values: bool,
 }
 
 #[cfg(test)]
@@ -163,8 +165,8 @@ pub(crate) fn take_header_visits() -> usize {
 
 impl PreparedMessageHeaders<'_> {
     /// Visits the pseudo-headers, then each header and the date. With `MESSAGE_FIELDS_ONLY`, it
-    /// skips headers that HTTP/2 does not carry and trims their values; without it, it visits
-    /// every header untrimmed, which only suits length bounds.
+    /// skips headers that HTTP/2 does not carry and trims their values unless they are verbatim;
+    /// without it, it visits every header untrimmed, which only suits length bounds.
     fn visit<'a, const MESSAGE_FIELDS_ONLY: bool>(&'a self, mut visitor: impl FnMut(Header<'a>)) {
         match &self.pseudo {
             MessagePseudoHeaders::Request {
@@ -205,7 +207,11 @@ impl PreparedMessageHeaders<'_> {
                     visitor(Header {
                         code,
                         name,
-                        value: trim_lws(value),
+                        value: if self.verbatim_values {
+                            value
+                        } else {
+                            trim_lws(value)
+                        },
                     });
                 }
             }
@@ -398,6 +404,23 @@ impl Http2Codec {
     pub fn set_exact_methods(&mut self, enabled: bool) {
         self.decoder_memo = None;
         self.field_options.exact_methods = enabled;
+    }
+
+    /// Roxygen-only (`DIV-041`): every decoded field section (request and response heads,
+    /// trailers, push promises) stores its regular field values exactly as decoded, surrounding
+    /// spaces and tabs included, as h2 (and hyper over it) does, instead of trimming them as the
+    /// reference decoder does for every field; and every generated message head encodes its
+    /// regular field values as stored (as h2 writes a `HeaderValue`), instead of trimming them
+    /// (trailers already go out as stored). Values are then checked as h2 checks them, so the
+    /// decoder never accepts one h2 refuses: a byte below 0x20 other than HTAB, or DEL, makes the
+    /// message malformed (no obsolete line folding), as does a `content-length` that is not at
+    /// most 19 digits or a `te` other than `trailers`. An empty `content-length`, which h2 reads
+    /// as zero, is kept as an empty field (a uniplex session with
+    /// `verbatim_http2_header_values` checks the body against zero). `cookie` crumbs are still
+    /// combined into one value, untrimmed. Pseudo-headers are unchanged. Off by default.
+    pub fn set_verbatim_field_values(&mut self, enabled: bool) {
+        self.decoder_memo = None;
+        self.field_options.verbatim_values = enabled;
     }
 
     pub fn set_header_indexing_strategy(
@@ -1781,6 +1804,7 @@ impl Http2Codec {
             headers: message.headers(),
             extra,
             date,
+            verbatim_values: self.field_options.verbatim_values,
         })
     }
 

@@ -1,16 +1,24 @@
-//! Opt-in exact method tokens (`DIV-040`) over `serve_transport` and loopback
-//! TCP, on a `RuntimeOwner` worker and a `HostedWorker`, for HTTP/1.1 and h2c,
-//! next to hyper's server answering the same bytes.
+//! Opt-in exact method tokens (`DIV-040`) and verbatim HTTP/2 field values
+//! (`DIV-041`) over `serve_transport` and loopback TCP, on a `RuntimeOwner`
+//! worker and a `HostedWorker`, for HTTP/1.1 and h2c, next to hyper's server
+//! answering the same bytes.
 
 use std::cell::RefCell;
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
+use http_body::Body as _;
 use roxygen_core::connection::TransportSecurity;
+use roxygen_core::error::HttpError;
+use roxygen_core::error::HttpErrorCode;
 use roxygen_core::fixed_source::HttpFixedSource;
 use roxygen_core::handler::HandlerSessionContext;
 use roxygen_core::handler::HttpHandler;
+use roxygen_core::handler::HttpHandlerRef;
 use roxygen_core::handler::LocalHandlerFuture;
 use roxygen_core::http::CodecProtocol;
 use roxygen_core::source::HttpSource;
@@ -30,7 +38,46 @@ use crate::eof_abort_tests::on_worker;
 
 const METHODS: [&[u8]; 4] = [b"POST", b"post", b"Post", b"PURGE"];
 
-/// Records each request's method as the application reads it, and answers 200.
+/// Header fields whose values have surrounding whitespace, are empty, or repeat.
+const PADDED_FIELDS: [(&[u8], &[u8]); 8] = [
+    (b"user-agent", b" ua\t"),
+    (b"x-lead", b"  leading"),
+    (b"x-trail", b"trailing\t"),
+    (b"x-both", b"\t both "),
+    (b"x-empty", b""),
+    (b"x-only-space", b" \t "),
+    (b"x-dup", b" one"),
+    (b"x-dup", b"two "),
+];
+
+/// `PADDED_FIELDS` with optional whitespace around each value removed.
+const TRIMMED_FIELDS: [(&[u8], &[u8]); 8] = [
+    (b"user-agent", b"ua"),
+    (b"x-lead", b"leading"),
+    (b"x-trail", b"trailing"),
+    (b"x-both", b"both"),
+    (b"x-empty", b""),
+    (b"x-only-space", b""),
+    (b"x-dup", b"one"),
+    (b"x-dup", b"two"),
+];
+
+/// What the application saw of one request: its method, and every header but
+/// `host`, in order, names in lowercase.
+#[derive(Debug, PartialEq)]
+struct Seen {
+    method: String,
+    headers: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+fn fields(fields: &[(&[u8], &[u8])]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fields
+        .iter()
+        .map(|(name, value)| (name.to_vec(), value.to_vec()))
+        .collect()
+}
+
+/// Records what each request carried as the application reads it, and answers 200.
 struct RecordingHandler;
 
 impl HttpHandler for RecordingHandler {
@@ -41,12 +88,18 @@ impl HttpHandler for RecordingHandler {
     ) -> LocalHandlerFuture {
         Box::pin(async move {
             let head = request.read_header_event().await?;
-            let method = head
-                .headers()
-                .request_method()
-                .unwrap_or_default()
-                .to_owned();
-            RECORDED.with(|recorded| recorded.borrow_mut().push(method));
+            let message = head.headers();
+            let mut headers = Vec::new();
+            message.headers().for_each(|name, value| {
+                if !name.eq_ignore_ascii_case(b"host") {
+                    headers.push((name.to_ascii_lowercase(), value.to_vec()));
+                }
+            });
+            let seen = Seen {
+                method: message.request_method().unwrap_or_default().to_owned(),
+                headers,
+            };
+            RECORDED.with(|recorded| recorded.borrow_mut().push(seen));
             Ok(HttpSourceHolder::new(Box::new(
                 HttpFixedSource::make_fixed_response(200, None).expect("response"),
             )))
@@ -55,7 +108,7 @@ impl HttpHandler for RecordingHandler {
 }
 
 thread_local! {
-    static RECORDED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static RECORDED: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
 }
 
 fn session(exact_method_tokens: bool) -> ServerSessionConfig {
@@ -68,10 +121,26 @@ fn session(exact_method_tokens: bool) -> ServerSessionConfig {
     }
 }
 
+fn verbatim_session(verbatim_http2_header_values: bool) -> ServerSessionConfig {
+    ServerSessionConfig {
+        verbatim_http2_header_values,
+        ..session(false)
+    }
+}
+
 async fn connect_served(
     context: &WorkerContext,
     protocol: CodecProtocol,
     session: ServerSessionConfig,
+) -> (ServerConnection, TcpStream) {
+    connect_served_with(context, protocol, session, Rc::new(RecordingHandler)).await
+}
+
+async fn connect_served_with(
+    context: &WorkerContext,
+    protocol: CodecProtocol,
+    session: ServerSessionConfig,
+    handler: HttpHandlerRef,
 ) -> (ServerConnection, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let client = TcpStream::connect(listener.local_addr().expect("address"))
@@ -86,8 +155,7 @@ async fn connect_served(
     .expect("transport adopted");
     let mut options = ServeTransportOptions::new(protocol, TransportSecurity::Plaintext);
     options.session = session;
-    let connection =
-        serve_transport(context, transport, Rc::new(RecordingHandler), options).expect("attached");
+    let connection = serve_transport(context, transport, handler, options).expect("attached");
     (connection, client)
 }
 
@@ -97,6 +165,19 @@ fn http1_request(method: &[u8]) -> Vec<u8> {
         b" /generate HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
     ]
     .concat()
+}
+
+/// A GET carrying `fields`, each as `name: value` with no other whitespace.
+fn http1_request_with_fields(fields: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut wire = b"GET /generate HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+    for (name, value) in fields {
+        wire.extend_from_slice(name);
+        wire.extend_from_slice(b":");
+        wire.extend_from_slice(value);
+        wire.extend_from_slice(b"\r\n");
+    }
+    wire.extend_from_slice(b"\r\n");
+    wire
 }
 
 /// Reads one HTTP/1.1 response head and returns its status code.
@@ -149,11 +230,21 @@ fn h2_request_block(method: &[u8], fields: &[(&[u8], &[u8])]) -> Vec<u8> {
 /// The client preface, empty SETTINGS, and one bodiless request per method on
 /// streams 1, 3, 5, ...
 fn h2c_requests(methods: &[&[u8]]) -> Vec<u8> {
+    h2c_requests_with_fields(methods, &[])
+}
+
+/// `h2c_requests`, each request carrying `fields`.
+fn h2c_requests_with_fields(methods: &[&[u8]], fields: &[(&[u8], &[u8])]) -> Vec<u8> {
     let mut wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
     wire.extend(h2_frame(0x4, 0, 0, &[]));
     for (index, method) in methods.iter().enumerate() {
         let stream = 1 + 2 * u32::try_from(index).expect("few streams");
-        wire.extend(h2_frame(0x1, 0x5, stream, &h2_request_block(method, &[])));
+        wire.extend(h2_frame(
+            0x1,
+            0x5,
+            stream,
+            &h2_request_block(method, fields),
+        ));
     }
     wire
 }
@@ -183,6 +274,30 @@ async fn h2_until_headers(client: &mut TcpStream, streams: usize) {
     }
 }
 
+/// Sends each of `requests` and returns what the application saw, and each
+/// response's status over HTTP/1.1 (one connection per request); over h2c the
+/// one request is a whole connection's bytes carrying `streams` requests.
+async fn serve(
+    context: &WorkerContext,
+    protocol: CodecProtocol,
+    session: ServerSessionConfig,
+    requests: &[Vec<u8>],
+    streams: usize,
+) -> (Vec<Seen>, Vec<u16>) {
+    RECORDED.with(|recorded| recorded.borrow_mut().clear());
+    let mut statuses = Vec::new();
+    for request in requests {
+        let (_connection, mut client) = connect_served(context, protocol, session.clone()).await;
+        client.write_all(request).await.expect("request written");
+        if protocol == CodecProtocol::Http11 {
+            statuses.push(http1_status(&mut client).await);
+        } else {
+            h2_until_headers(&mut client, streams).await;
+        }
+    }
+    (RECORDED.with(|recorded| recorded.take()), statuses)
+}
+
 /// The methods the application saw, and each HTTP/1.1 request's status (one
 /// connection per request), or the h2c responses (one connection).
 async fn serve_methods(
@@ -190,33 +305,54 @@ async fn serve_methods(
     protocol: CodecProtocol,
     exact_method_tokens: bool,
 ) -> (Vec<String>, Vec<u16>) {
-    RECORDED.with(|recorded| recorded.borrow_mut().clear());
-    let mut statuses = Vec::new();
+    let (seen, statuses) = serve(
+        &context,
+        protocol,
+        session(exact_method_tokens),
+        &method_requests(protocol),
+        METHODS.len(),
+    )
+    .await;
+    (seen.into_iter().map(|seen| seen.method).collect(), statuses)
+}
+
+fn method_requests(protocol: CodecProtocol) -> Vec<Vec<u8>> {
     if protocol == CodecProtocol::Http11 {
-        for method in METHODS {
-            let (_connection, mut client) =
-                connect_served(&context, protocol, session(exact_method_tokens)).await;
-            client
-                .write_all(&http1_request(method))
-                .await
-                .expect("request written");
-            statuses.push(http1_status(&mut client).await);
-        }
+        METHODS.iter().map(|method| http1_request(method)).collect()
     } else {
-        let (_connection, mut client) =
-            connect_served(&context, protocol, session(exact_method_tokens)).await;
-        client
-            .write_all(&h2c_requests(&METHODS))
-            .await
-            .expect("requests written");
-        h2_until_headers(&mut client, METHODS.len()).await;
+        vec![h2c_requests(&METHODS)]
     }
-    (RECORDED.with(|recorded| recorded.take()), statuses)
+}
+
+fn field_requests(protocol: CodecProtocol) -> Vec<Vec<u8>> {
+    if protocol == CodecProtocol::Http11 {
+        vec![http1_request_with_fields(&PADDED_FIELDS)]
+    } else {
+        vec![h2c_requests_with_fields(&[b"GET"], &PADDED_FIELDS)]
+    }
+}
+
+/// The header fields the application saw on the one request of `field_requests`.
+async fn serve_fields(
+    context: WorkerContext,
+    protocol: CodecProtocol,
+    verbatim_http2_header_values: bool,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let (mut seen, _) = serve(
+        &context,
+        protocol,
+        verbatim_session(verbatim_http2_header_values),
+        &field_requests(protocol),
+        1,
+    )
+    .await;
+    assert_eq!(seen.len(), 1);
+    seen.remove(0).headers
 }
 
 /// What hyper's server (hyper-util's `auto` builder, as `axum::serve` uses it)
-/// shows its service for the same bytes.
-fn hyper_methods(protocol: CodecProtocol) -> Vec<String> {
+/// shows its service for the same `requests` (as `serve` sends them).
+fn hyper_seen(protocol: CodecProtocol, requests: &[Vec<u8>], streams: usize) -> Vec<Seen> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -236,7 +372,21 @@ fn hyper_methods(protocol: CodecProtocol) -> Vec<String> {
                         tokio::task::spawn_local(async move {
                             let service = hyper::service::service_fn(
                                 move |request: hyper::Request<hyper::body::Incoming>| {
-                                    seen.borrow_mut().push(request.method().as_str().to_owned());
+                                    let headers = request
+                                        .headers()
+                                        .iter()
+                                        .filter(|(name, _)| *name != "host")
+                                        .map(|(name, value)| {
+                                            (
+                                                name.as_str().as_bytes().to_vec(),
+                                                value.as_bytes().to_vec(),
+                                            )
+                                        })
+                                        .collect();
+                                    seen.borrow_mut().push(Seen {
+                                        method: request.method().as_str().to_owned(),
+                                        headers,
+                                    });
                                     std::future::ready(Ok::<_, Infallible>(hyper::Response::new(
                                         http_body_util_empty(),
                                     )))
@@ -250,27 +400,32 @@ fn hyper_methods(protocol: CodecProtocol) -> Vec<String> {
                         });
                     }
                 });
-                if protocol == CodecProtocol::Http11 {
-                    for method in METHODS {
-                        let mut client = TcpStream::connect(address).await.expect("connects");
-                        client
-                            .write_all(&http1_request(method))
-                            .await
-                            .expect("request written");
-                        http1_status(&mut client).await;
-                    }
-                } else {
+                for request in requests {
                     let mut client = TcpStream::connect(address).await.expect("connects");
-                    client
-                        .write_all(&h2c_requests(&METHODS))
-                        .await
-                        .expect("requests written");
-                    h2_until_headers(&mut client, METHODS.len()).await;
+                    client.write_all(request).await.expect("request written");
+                    if protocol == CodecProtocol::Http11 {
+                        http1_status(&mut client).await;
+                    } else {
+                        h2_until_headers(&mut client, streams).await;
+                    }
                 }
             })
             .await;
         seen.take()
     })
+}
+
+fn hyper_methods(protocol: CodecProtocol) -> Vec<String> {
+    hyper_seen(protocol, &method_requests(protocol), METHODS.len())
+        .into_iter()
+        .map(|seen| seen.method)
+        .collect()
+}
+
+fn hyper_fields(protocol: CodecProtocol) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut seen = hyper_seen(protocol, &field_requests(protocol), 1);
+    assert_eq!(seen.len(), 1);
+    seen.remove(0).headers
 }
 
 /// An empty body for hyper's responses, without an extra crate.
@@ -399,5 +554,281 @@ fn exact_method_tokens_still_refuse_a_method_that_is_not_a_token() {
         // request (h2 instead treats such a `:method` as a connection error).
         assert_eq!(h2_stream_1_frames(&mut client).await, [(0x1, 0)]);
         assert!(RECORDED.with(|recorded| recorded.borrow().is_empty()));
+    });
+}
+
+#[test]
+fn verbatim_http2_header_values_are_off_by_default() {
+    assert!(!ServerSessionConfig::default().verbatim_http2_header_values);
+}
+
+#[test]
+fn verbatim_http2_header_values_reach_the_application_as_sent_over_h2c_when_enabled() {
+    on_worker(|context| async move {
+        assert_eq!(
+            serve_fields(context, CodecProtocol::Http2, true).await,
+            fields(&PADDED_FIELDS)
+        );
+    });
+    assert_eq!(hyper_fields(CodecProtocol::Http2), fields(&PADDED_FIELDS));
+}
+
+#[test]
+fn h2c_field_values_are_trimmed_by_default() {
+    on_worker(|context| async move {
+        assert_eq!(
+            serve_fields(context, CodecProtocol::Http2, false).await,
+            fields(&TRIMMED_FIELDS)
+        );
+    });
+}
+
+#[test]
+fn http1_field_values_keep_their_whitespace_trimmed_with_verbatim_http2_header_values() {
+    on_worker(|context| async move {
+        assert_eq!(
+            serve_fields(context, CodecProtocol::Http11, true).await,
+            fields(&TRIMMED_FIELDS)
+        );
+    });
+    assert_eq!(hyper_fields(CodecProtocol::Http11), fields(&TRIMMED_FIELDS));
+}
+
+/// What the application saw of one request.
+#[derive(Clone, Debug, PartialEq)]
+enum RequestSeen {
+    /// Reading the head failed.
+    HeadFailed,
+    /// The head's `content-length` values, and the body, or `None` if reading it
+    /// failed.
+    Read {
+        content_length: Vec<Vec<u8>>,
+        body: Option<Vec<u8>>,
+    },
+}
+
+thread_local! {
+    static REQUESTS: RefCell<Vec<RequestSeen>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Reads each request to its end and records what it saw; answers 200, or fails
+/// the exchange if a read failed.
+struct BodyRecordingHandler;
+
+impl HttpHandler for BodyRecordingHandler {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        mut request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        Box::pin(async move {
+            let head = match request.read_header_event().await {
+                Ok(head) => head,
+                Err(error) => {
+                    REQUESTS.with(|seen| seen.borrow_mut().push(RequestSeen::HeadFailed));
+                    return Err(error);
+                }
+            };
+            let mut content_length = Vec::new();
+            head.headers().headers().for_each(|name, value| {
+                if name.eq_ignore_ascii_case(b"content-length") {
+                    content_length.push(value.to_vec());
+                }
+            });
+            let mut eom = head.eom();
+            let mut body = Some(Vec::new());
+            while !eom {
+                let Ok(event) = request.read_body_event(u32::MAX).await else {
+                    body = None;
+                    break;
+                };
+                eom = event.eom();
+                if let (Some(body), Some(bytes)) = (body.as_mut(), event.as_body()) {
+                    body.extend_from_slice(&bytes.coalesce(usize::MAX).expect("body bytes"));
+                }
+            }
+            let failed = body.is_none();
+            REQUESTS.with(|seen| {
+                seen.borrow_mut().push(RequestSeen::Read {
+                    content_length,
+                    body,
+                })
+            });
+            if failed {
+                return Err(HttpError::with_message(
+                    HttpErrorCode::INTERNAL_ERROR,
+                    b"request body failed",
+                ));
+            }
+            Ok(HttpSourceHolder::new(Box::new(
+                HttpFixedSource::make_fixed_response(200, None).expect("response"),
+            )))
+        })
+    }
+}
+
+/// An h2c connection carrying one POST with `content-length: <content_length>`,
+/// ended by its HEADERS frame or, with `data`, by one DATA frame carrying it.
+fn h2c_content_length_request(content_length: &[u8], data: Option<&[u8]>) -> Vec<u8> {
+    let mut wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    wire.extend(h2_frame(0x4, 0, 0, &[]));
+    let block = h2_request_block(b"POST", &[(b"content-length", content_length)]);
+    match data {
+        None => wire.extend(h2_frame(0x1, 0x5, 1, &block)),
+        Some(data) => {
+            wire.extend(h2_frame(0x1, 0x4, 1, &block));
+            wire.extend(h2_frame(0x0, 0x1, 1, data));
+        }
+    }
+    wire
+}
+
+/// Waits, within a bound, until `recorded` returns an entry, and returns the one.
+async fn one_recorded(mut recorded: impl FnMut() -> Vec<RequestSeen>) -> RequestSeen {
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while seen.is_empty() {
+            seen = recorded();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the application read the request within the bound");
+    assert_eq!(seen.len(), 1);
+    seen.remove(0)
+}
+
+/// What the application saw of `request` over h2c, and the frames (with
+/// RST_STREAM codes) the server sent on stream 1.
+async fn serve_body(
+    context: &WorkerContext,
+    session: ServerSessionConfig,
+    request: &[u8],
+) -> (RequestSeen, Vec<(u8, u32)>) {
+    REQUESTS.with(|seen| seen.borrow_mut().clear());
+    let (_connection, mut client) = connect_served_with(
+        context,
+        CodecProtocol::Http2,
+        session,
+        Rc::new(BodyRecordingHandler),
+    )
+    .await;
+    client.write_all(request).await.expect("request written");
+    let frames = h2_stream_1_frames(&mut client).await;
+    let seen = one_recorded(|| REQUESTS.with(|seen| seen.take())).await;
+    (seen, frames)
+}
+
+/// What hyper's service sees of `request` over h2c, reading its body to its end,
+/// and the frames (with RST_STREAM codes) hyper's server sent on stream 1.
+fn hyper_body_seen(request: &[u8]) -> (RequestSeen, Vec<(u8, u32)>) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("hyper runtime");
+    runtime.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("address");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let serve_seen = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accepted");
+            let service = hyper::service::service_fn(
+                move |request: hyper::Request<hyper::body::Incoming>| {
+                    let seen = Arc::clone(&serve_seen);
+                    async move {
+                        let content_length = request
+                            .headers()
+                            .get_all("content-length")
+                            .iter()
+                            .map(|value| value.as_bytes().to_vec())
+                            .collect();
+                        let mut incoming = request.into_body();
+                        let mut body = Some(Vec::new());
+                        while let Some(frame) =
+                            std::future::poll_fn(|cx| Pin::new(&mut incoming).poll_frame(cx)).await
+                        {
+                            let Ok(frame) = frame else {
+                                body = None;
+                                break;
+                            };
+                            if let (Some(body), Ok(data)) = (body.as_mut(), frame.into_data()) {
+                                body.extend_from_slice(&data);
+                            }
+                        }
+                        seen.lock().expect("seen").push(RequestSeen::Read {
+                            content_length,
+                            body,
+                        });
+                        Ok::<_, Infallible>(hyper::Response::new(http_body_util_empty()))
+                    }
+                },
+            );
+            let _ =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+        });
+        let mut client = TcpStream::connect(address).await.expect("connects");
+        client.write_all(request).await.expect("request written");
+        let frames = h2_stream_1_frames(&mut client).await;
+        let seen = one_recorded(|| std::mem::take(&mut *seen.lock().expect("seen"))).await;
+        (seen, frames)
+    })
+}
+
+#[test]
+fn an_empty_h2c_content_length_ending_the_request_reads_as_zero_as_h2_reads_it() {
+    let request = h2c_content_length_request(b"", None);
+    let expected = (
+        RequestSeen::Read {
+            content_length: vec![Vec::new()],
+            body: Some(Vec::new()),
+        },
+        vec![(0x1, 0)],
+    );
+    assert_eq!(
+        hyper_body_seen(&request),
+        expected,
+        "hyper's service reads the empty field and an empty body, and its 200 is one \
+         HEADERS frame"
+    );
+    on_worker(move |context| async move {
+        assert_eq!(
+            serve_body(&context, verbatim_session(true), &request).await,
+            expected
+        );
+    });
+}
+
+#[test]
+fn an_empty_h2c_content_length_followed_by_data_fails_the_request_as_a_zero_one_does() {
+    let empty = h2c_content_length_request(b"", Some(b"abc"));
+    let zero = h2c_content_length_request(b"0", Some(b"abc"));
+    // h2 reads both lengths as zero: hyper's service reads the head, the body read
+    // fails, and h2 resets the stream with PROTOCOL_ERROR.
+    for (request, value) in [(&empty, b"".as_slice()), (&zero, b"0")] {
+        assert_eq!(
+            hyper_body_seen(request),
+            (
+                RequestSeen::Read {
+                    content_length: vec![value.to_vec()],
+                    body: None,
+                },
+                vec![(0x3, 0x1)],
+            ),
+            "{value:?}"
+        );
+    }
+    // Roxygen fails both as it fails any overrun of a declared length that arrives
+    // with the head: the error discards the head before the handler reads it, and
+    // the stream is reset with INTERNAL_ERROR (`DIV-041`).
+    on_worker(move |context| async move {
+        for request in [&empty, &zero] {
+            assert_eq!(
+                serve_body(&context, verbatim_session(true), request).await,
+                (RequestSeen::HeadFailed, vec![(0x3, 0x2)])
+            );
+        }
     });
 }

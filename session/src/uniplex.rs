@@ -429,6 +429,16 @@ pub struct UniplexConfig {
     /// and HTTP/2 canonicalizes the methods it recognizes without regard to case. Upstream
     /// sessions ignore it; the owned drivers refuse it.
     pub exact_method_tokens: bool,
+    /// Roxygen-only, default off (`DIV-041`): an HTTP/2 session's codec stores every
+    /// decoded field value exactly as decoded, surrounding spaces and tabs included, as h2
+    /// and hyper do, instead of trimming it, and checks values as h2 does (no control byte
+    /// but HTAB, no DEL, a decimal `content-length`, `te: trailers` only), so it never
+    /// accepts a value h2 refuses (`Http2Codec::set_verbatim_field_values`); it also encodes
+    /// the heads it sends with their values as stored, as h2 does. An empty `content-length`
+    /// is kept, and its stream's body is checked against zero, as h2 reads it. HTTP/1.1
+    /// sessions ignore it (they trim optional whitespace, as `httparse` does); the owned
+    /// HTTP/2 drivers refuse it.
+    pub verbatim_http2_header_values: bool,
 }
 
 impl Default for UniplexConfig {
@@ -449,6 +459,7 @@ impl Default for UniplexConfig {
             unframed_bodiless_http1_requests: false,
             non_abortive_close: false,
             exact_method_tokens: false,
+            verbatim_http2_header_values: false,
         }
     }
 }
@@ -542,6 +553,25 @@ pub(crate) fn message_content_length(message: &roxygen_core::message::HttpMessag
     .trim()
     .parse()
     .ok()
+}
+
+/// The length a downstream request's body is checked against: its
+/// `content-length`, or zero for a present, empty one with `empty_is_zero`
+/// (`DIV-041`).
+fn checked_content_length(
+    message: &roxygen_core::message::HttpMessage,
+    empty_is_zero: bool,
+) -> Option<u64> {
+    let headers = message.headers();
+    if empty_is_zero
+        && headers.number_of_values(HttpHeaderCode::ContentLength) == 1
+        && headers
+            .get_single_or_empty(HttpHeaderCode::ContentLength)
+            .is_empty()
+    {
+        return Some(0);
+    }
+    message_content_length(message)
 }
 
 pub(crate) fn request_has_forbidden_body(message: &mut roxygen_core::message::HttpMessage) -> bool {
@@ -3897,6 +3927,7 @@ impl UniplexSession {
                 codec.set_header_indexing_strategy(Rc::clone(strategy));
             }
             codec.set_exact_methods(config.exact_method_tokens && direction.is_downstream());
+            codec.set_verbatim_field_values(config.verbatim_http2_header_values);
             let mut callback = NoopCodecCallback;
             codec.generate(&mut egress, EgressFrame::ConnectionPreface, &mut callback)?;
             codec.generate_configured_settings(&mut egress, &mut callback)?;
@@ -4311,6 +4342,9 @@ impl UniplexSession {
         let _ = core.set_egress_write_timeout(config.write_timeout);
         let _ = core.set_drain_request_body_on_drop(config.drain_request_body_on_drop);
         let _ = core.set_deliver_ingress_before_abort(config.deliver_ingress_before_abort);
+        let _ = core.set_empty_content_length_is_zero(
+            http2_config.is_some() && config.verbatim_http2_header_values,
+        );
         let _ = core.set_peer_identity(peer_identity);
         let outgoing_activity = core.outgoing_transaction_activity();
         state.borrow_mut().core = Some(Box::new(core));
@@ -6051,7 +6085,10 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
                 if !self.stream_is_discarded(stream) {
                     if let Some(meta) = self.ingress_meta.get_mut(&stream) {
                         meta.expected_content_length = if self.core.direction().is_downstream() {
-                            message_content_length(&message)
+                            checked_content_length(
+                                &message,
+                                self.core.empty_content_length_is_zero(),
+                            )
                         } else {
                             None
                         };

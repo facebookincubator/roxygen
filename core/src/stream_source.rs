@@ -288,6 +288,9 @@ struct StreamState {
     source_complete: bool,
     strict_flow_control: bool,
     should_validate_content_length: bool,
+    /// Roxygen-only (`DIV-041`): a present, empty `content-length` is checked as
+    /// zero.
+    empty_content_length_is_zero: bool,
     can_suspend: bool,
     suspend_wait_active: bool,
     /// The largest growth hint of a body that left the queue, so coalescing
@@ -1216,6 +1219,7 @@ impl HttpStreamSource {
                     source_complete: false,
                     strict_flow_control,
                     should_validate_content_length: true,
+                    empty_content_length_is_zero: false,
                     can_suspend: true,
                     suspend_wait_active: false,
                     body_segment_hint: 0,
@@ -1296,6 +1300,15 @@ impl HttpStreamSource {
             .state
             .borrow_mut()
             .should_validate_content_length = false;
+    }
+
+    /// Roxygen-only (`DIV-041`): a final head whose `content-length` is present
+    /// and empty has its body checked against a length of zero, as h2 reads such
+    /// a field, instead of going unchecked as an unparseable length does. The
+    /// field itself is left as it is.
+    pub fn read_empty_content_length_as_zero(&self) {
+        self.shared.assert_owner();
+        self.shared.state.borrow_mut().empty_content_length_is_zero = true;
     }
 
     pub fn is_eom_seen(&self) -> bool {
@@ -2792,10 +2805,17 @@ fn validate_headers(shared: &Rc<StreamShared>, message: &mut HttpMessage, eom: b
         shared.state.borrow_mut().should_validate_content_length = false;
     }
     if final_headers && shared.state.borrow().should_validate_content_length {
-        let content_length = message
-            .headers()
-            .get_single_or_empty(HttpHeaderCode::ContentLength);
-        if let Some(content_length) = parse_folly_u64(content_length) {
+        let headers = message.headers();
+        let content_length = headers.get_single_or_empty(HttpHeaderCode::ContentLength);
+        let empty_is_zero = shared.state.borrow().empty_content_length_is_zero
+            && content_length.is_empty()
+            && headers.number_of_values(HttpHeaderCode::ContentLength) == 1;
+        let content_length = if empty_is_zero {
+            Some(0)
+        } else {
+            parse_folly_u64(content_length)
+        };
+        if let Some(content_length) = content_length {
             {
                 let mut state = shared.state.borrow_mut();
                 state.expected_content_length = content_length;

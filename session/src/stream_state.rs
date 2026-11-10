@@ -969,6 +969,7 @@ impl StreamState {
         head_response: bool,
         drain_request_body_on_drop: bool,
         deliver_ingress_before_abort: bool,
+        empty_content_length_is_zero: bool,
         host: Host,
     ) -> Result<(Self, HttpSourceHolder), HttpError> {
         let exchange = exchange_owner.tracker();
@@ -990,6 +991,9 @@ impl StreamState {
         }
         if deliver_ingress_before_abort {
             source.deliver_ingress_before_abort();
+        }
+        if empty_content_length_is_zero {
+            source.read_empty_content_length_as_zero();
         }
         let ingress = source.producer();
         let ingress_drain = drain_request_body_on_drop.then(|| source.drain_on_drop());
