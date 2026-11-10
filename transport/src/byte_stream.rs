@@ -2083,11 +2083,92 @@ fn start_read_operation(
         drive,
         waker: None,
     });
+    if Rc::strong_count(&io) == 1 {
+        release_last_backend_owner(io, target.state, operation);
+    } else {
+        drop(io);
+    }
     ReadStart::Started {
         operation,
         maximum,
         allocation_size,
     }
+}
+
+/// Releases `io`, the backend's last owner, after [`start_read_operation`]
+/// installed the read `operation`. If the backend's destruction panics, retires
+/// that read and resumes the first panic. Cold and out of line: a read start
+/// whose backend has another owner only drops its count.
+#[cold]
+#[inline(never)]
+fn release_last_backend_owner(
+    io: Rc<dyn ByteStreamIo>,
+    state: &RefCell<TransportState>,
+    operation: u64,
+) {
+    let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(io))) else {
+        return;
+    };
+    let active = {
+        let mut state = state.borrow_mut();
+        if state
+            .active_read
+            .as_ref()
+            .is_some_and(|active| active.operation == operation)
+        {
+            state.active_read.take()
+        } else {
+            None
+        }
+    };
+    let mut failure = Some(panic);
+    retire_transport_value(active, &mut failure);
+    resume_unwind(failure.expect("the release's panic is retained first"));
+}
+
+/// Drops `io` after the write `operation` was registered, through
+/// [`release_last_write_backend_owner`] when it is the backend's last owner.
+#[inline(always)]
+fn release_write_backend_owner(
+    io: Rc<dyn ByteStreamIo>,
+    state: &RefCell<TransportState>,
+    operation: u64,
+) {
+    if Rc::strong_count(&io) == 1 {
+        release_last_write_backend_owner(io, state, operation);
+    } else {
+        drop(io);
+    }
+}
+
+/// Releases `io`, the backend's last owner, after the write `operation` was
+/// registered. If the backend's destruction panics, retires that write and
+/// resumes the first panic, as [`release_last_backend_owner`] does for reads.
+#[cold]
+#[inline(never)]
+fn release_last_write_backend_owner(
+    io: Rc<dyn ByteStreamIo>,
+    state: &RefCell<TransportState>,
+    operation: u64,
+) {
+    let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(io))) else {
+        return;
+    };
+    let active = {
+        let mut state = state.borrow_mut();
+        if state
+            .active_write
+            .as_ref()
+            .is_some_and(|active| active.operation == operation)
+        {
+            state.active_write.take()
+        } else {
+            None
+        }
+    };
+    let mut failure = Some(panic);
+    retire_transport_value(active, &mut failure);
+    resume_unwind(failure.expect("the release's panic is retained first"));
 }
 
 /// A write that [`start_write_operation`] began, or the result it ended with at entry.
@@ -2267,7 +2348,7 @@ fn start_write_operation(
             )
         }
     };
-    let io = match queued_writer {
+    let active_io = match queued_writer {
         Some(writer) => {
             writer.start_write(data, progress.clone(), flags, byte_events.clone());
             ActiveIo::Queued(QueuedIo(writer))
@@ -2278,12 +2359,13 @@ fn start_write_operation(
     WRITE_REGISTRATIONS.with(|count| count.set(count.get() + 1));
     target.state.borrow_mut().active_write = Some(ActiveWrite {
         operation,
-        io,
+        io: active_io,
         byte_events: byte_events.clone(),
         _progress: progress.clone(),
         wait,
         waker: None,
     });
+    release_write_backend_owner(io, target.state, operation);
     WriteStart::Started {
         operation,
         expected: length,
@@ -2312,9 +2394,11 @@ fn write_through(
     let progress = progress.restart(length);
     let flags = ByteEventWriteFlags::default();
     let Some(writer) = io.queued_writer() else {
-        let io = ActiveIo::Future(io.write(data, progress.clone(), flags, None));
+        let active_io = ActiveIo::Future(io.write(data, progress.clone(), flags, None));
+        let operation = register_queued_write(target, active_io, &progress);
+        release_write_backend_owner(io, target.state, operation);
         return WriteStart::Started {
-            operation: register_queued_write(target, io, &progress),
+            operation,
             expected: length,
             progress,
         };
@@ -2331,17 +2415,27 @@ fn write_through(
                     .map_err(|error| TransportWriteError::new(error, written)),
             )
         }
-        Ok(Poll::Pending) => WriteStart::Started {
-            operation: register_queued_write(target, ActiveIo::Queued(QueuedIo(writer)), &progress),
-            expected: length,
-            progress,
-        },
-        Err(panic) => WriteStart::Unwinding {
-            operation: register_queued_write(target, ActiveIo::Queued(QueuedIo(writer)), &progress),
-            expected: length,
-            progress,
-            panic,
-        },
+        Ok(Poll::Pending) => {
+            let operation =
+                register_queued_write(target, ActiveIo::Queued(QueuedIo(writer)), &progress);
+            release_write_backend_owner(io, target.state, operation);
+            WriteStart::Started {
+                operation,
+                expected: length,
+                progress,
+            }
+        }
+        Err(panic) => {
+            let operation =
+                register_queued_write(target, ActiveIo::Queued(QueuedIo(writer)), &progress);
+            release_write_backend_owner(io, target.state, operation);
+            WriteStart::Unwinding {
+                operation,
+                expected: length,
+                progress,
+                panic,
+            }
+        }
     }
 }
 

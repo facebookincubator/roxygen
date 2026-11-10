@@ -4098,11 +4098,330 @@ mod byte_stream {
     }
 
     mod owned_reader {
+        use std::cell::Cell;
         use std::future::poll_fn;
 
         use super::*;
         use crate::byte_stream::read_deadline_batons_for_test;
         use crate::byte_stream::reader_wake_registrations_for_test;
+
+        struct StartupFutureDrop {
+            trace: Rc<RefCell<Vec<&'static str>>>,
+            panic_on_drop: bool,
+        }
+
+        impl Drop for StartupFutureDrop {
+            fn drop(&mut self) {
+                self.trace.borrow_mut().push("read-future-drop");
+                assert!(!self.panic_on_drop, "read startup future drop");
+            }
+        }
+
+        /// A backend whose `read` drops the transport, which leaves the read
+        /// start's upgraded `io` as the backend's last owner, and whose
+        /// destruction then panics.
+        struct StartupDropIo {
+            inner: FakeIo,
+            transport: Rc<RefCell<Option<OwnedByteStream>>>,
+            trace: Rc<RefCell<Vec<&'static str>>>,
+            armed: Cell<bool>,
+            panic_on_read_drop: bool,
+        }
+
+        impl ByteStreamIo for StartupDropIo {
+            fn read(
+                &self,
+                maximum: usize,
+                allocation_size: usize,
+            ) -> LocalTransportFuture<Result<TransportRead, HttpError>> {
+                let future = self.inner.read(maximum, allocation_size);
+                let guard = StartupFutureDrop {
+                    trace: Rc::clone(&self.trace),
+                    panic_on_drop: self.panic_on_read_drop,
+                };
+                let transport = self.transport.borrow_mut().take().unwrap();
+                self.trace.borrow_mut().push("transport-drop");
+                drop(transport);
+                self.armed.set(true);
+                Box::pin(async move {
+                    let _guard = guard;
+                    future.await
+                })
+            }
+
+            fn write(
+                &self,
+                data: BufQueue,
+                progress: WriteProgress,
+                flags: ByteEventWriteFlags,
+                byte_events: Option<crate::byte_stream::ByteEventWriteState>,
+            ) -> LocalTransportFuture<Result<(), HttpError>> {
+                self.inner.write(data, progress, flags, byte_events)
+            }
+
+            fn cancel_read(&self, error: HttpErrorCode) {
+                self.inner.cancel_read(error);
+            }
+
+            fn cancel_write(&self, error: HttpErrorCode) {
+                self.inner.cancel_write(error);
+            }
+
+            fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+                self.inner.shutdown_write(context)
+            }
+
+            fn close(&self, context: &WorkerContext, drain_write: bool) -> Result<(), HttpError> {
+                self.inner.close(context, drain_write)
+            }
+
+            fn drop_transport(&self) {
+                self.inner.drop_transport();
+            }
+
+            fn close_with_reset(&self) {
+                self.inner.close_with_reset();
+            }
+        }
+
+        impl Drop for StartupDropIo {
+            fn drop(&mut self) {
+                if self.armed.get() {
+                    self.trace.borrow_mut().push("backend-drop");
+                    panic!("read startup backend drop");
+                }
+            }
+        }
+
+        /// The backend's destruction panics after the read start admitted its
+        /// read: the read is retired during that unwind, before the panic
+        /// leaves `start_read`, and a panic in the read's own cleanup does not
+        /// replace the backend's.
+        fn startup_unwind_cleans_read(panic_on_read_drop: bool) {
+            run_worker(move |context| async move {
+                let slot = Rc::new(RefCell::new(None));
+                let trace = Rc::new(RefCell::new(Vec::new()));
+                let transport = OwnedByteStream::new(
+                    StartupDropIo {
+                        inner: FakeIo {
+                            state: Rc::new(RefCell::new(FakeState::new())),
+                        },
+                        transport: Rc::clone(&slot),
+                        trace: Rc::clone(&trace),
+                        armed: Cell::new(false),
+                        panic_on_read_drop,
+                    },
+                    context.handle().clone(),
+                    &context,
+                    ByteStreamLimits::new(64, 64, 1).unwrap(),
+                    SocketAddress::new(b"127.0.0.1", 1),
+                    SocketAddress::new(b"127.0.0.1", 2),
+                    None,
+                    ByteEventCapability::Unsupported,
+                )
+                .unwrap();
+                let mut reader = transport
+                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .unwrap();
+                *slot.borrow_mut() = Some(transport);
+                let panic = catch_unwind(AssertUnwindSafe(|| reader.start_read(64, 64)))
+                    .expect_err("the read start's last backend owner panics at release");
+                assert_eq!(
+                    panic.downcast_ref::<&'static str>(),
+                    Some(&"read startup backend drop")
+                );
+                let after_start = trace.borrow().clone();
+                drop(reader);
+                let after_drop = trace.borrow().clone();
+                assert_eq!(
+                    after_start,
+                    ["transport-drop", "backend-drop", "read-future-drop"],
+                    "the admitted read is retired before the panic leaves start_read"
+                );
+                assert_eq!(after_drop, after_start);
+            });
+        }
+
+        #[test]
+        fn owned_reader_startup_unwind_preserves_read_cleanup() {
+            startup_unwind_cleans_read(false);
+        }
+
+        #[test]
+        fn owned_reader_startup_unwind_preserves_backend_panic_when_read_cleanup_panics() {
+            startup_unwind_cleans_read(true);
+        }
+
+        /// The queued writer of `StartupDropWriteIo`: its `start_write` drops the transport,
+        /// which leaves the write start's upgraded `io` as the backend's last owner, and its
+        /// write's cleanup (`retire_write`) is traced and optionally panics.
+        struct StartupWriter {
+            transport: Rc<RefCell<Option<OwnedByteStream>>>,
+            trace: Rc<RefCell<Vec<&'static str>>>,
+            armed: Rc<Cell<bool>>,
+            panic_on_retire: bool,
+        }
+
+        impl crate::byte_stream::QueuedWriter for StartupWriter {
+            fn start_write(
+                &self,
+                _data: BufQueue,
+                _progress: WriteProgress,
+                _flags: ByteEventWriteFlags,
+                _byte_events: Option<crate::byte_stream::ByteEventWriteState>,
+            ) {
+                let transport = self.transport.borrow_mut().take().unwrap();
+                self.trace.borrow_mut().push("transport-drop");
+                drop(transport);
+                self.armed.set(true);
+            }
+
+            fn poll_write(&self, _context: &mut Context<'_>) -> Poll<Result<(), HttpError>> {
+                Poll::Pending
+            }
+
+            fn retire_write(&self) {
+                self.trace.borrow_mut().push("write-future-drop");
+                assert!(!self.panic_on_retire, "write startup cleanup");
+            }
+        }
+
+        /// A backend whose queued writer drops the transport at a write's start, and whose
+        /// destruction then panics.
+        struct StartupDropWriteIo {
+            inner: FakeIo,
+            writer: Rc<StartupWriter>,
+        }
+
+        impl ByteStreamIo for StartupDropWriteIo {
+            fn read(
+                &self,
+                maximum: usize,
+                allocation_size: usize,
+            ) -> LocalTransportFuture<Result<TransportRead, HttpError>> {
+                self.inner.read(maximum, allocation_size)
+            }
+
+            fn write(
+                &self,
+                data: BufQueue,
+                progress: WriteProgress,
+                flags: ByteEventWriteFlags,
+                byte_events: Option<crate::byte_stream::ByteEventWriteState>,
+            ) -> LocalTransportFuture<Result<(), HttpError>> {
+                self.inner.write(data, progress, flags, byte_events)
+            }
+
+            fn cancel_read(&self, error: HttpErrorCode) {
+                self.inner.cancel_read(error);
+            }
+
+            fn cancel_write(&self, error: HttpErrorCode) {
+                self.inner.cancel_write(error);
+            }
+
+            fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+                self.inner.shutdown_write(context)
+            }
+
+            fn close(&self, context: &WorkerContext, drain_write: bool) -> Result<(), HttpError> {
+                self.inner.close(context, drain_write)
+            }
+
+            fn drop_transport(&self) {
+                self.inner.drop_transport();
+            }
+
+            fn close_with_reset(&self) {
+                self.inner.close_with_reset();
+            }
+
+            fn queued_writer(&self) -> Option<Rc<dyn crate::byte_stream::QueuedWriter>> {
+                Some(Rc::clone(&self.writer) as Rc<dyn crate::byte_stream::QueuedWriter>)
+            }
+        }
+
+        impl Drop for StartupDropWriteIo {
+            fn drop(&mut self) {
+                if self.writer.armed.get() {
+                    self.writer.trace.borrow_mut().push("backend-drop");
+                    panic!("write startup backend drop");
+                }
+            }
+        }
+
+        /// The backend's destruction panics after the write start registered its write: the
+        /// write is retired during that unwind, before the panic leaves
+        /// `OwnedWriteQueue::start_write`, and a panic in the write's own cleanup does not
+        /// replace the backend's. With byte events the queue's write starts through
+        /// `start_write_operation`; without them it is written through at entry and, left
+        /// pending, registered there.
+        fn startup_unwind_cleans_write(byte_events: ByteEventCapability, panic_on_retire: bool) {
+            run_worker(move |context| async move {
+                let slot = Rc::new(RefCell::new(None));
+                let trace = Rc::new(RefCell::new(Vec::new()));
+                let transport = OwnedByteStream::new(
+                    StartupDropWriteIo {
+                        inner: FakeIo {
+                            state: Rc::new(RefCell::new(FakeState::new())),
+                        },
+                        writer: Rc::new(StartupWriter {
+                            transport: Rc::clone(&slot),
+                            trace: Rc::clone(&trace),
+                            armed: Rc::new(Cell::new(false)),
+                            panic_on_retire,
+                        }),
+                    },
+                    context.handle().clone(),
+                    &context,
+                    ByteStreamLimits::new(64, 64, 1).unwrap(),
+                    SocketAddress::new(b"127.0.0.1", 1),
+                    SocketAddress::new(b"127.0.0.1", 2),
+                    None,
+                    byte_events,
+                )
+                .unwrap();
+                let mut writer = transport
+                    .write_queue(&context, 64, Duration::ZERO, CancellationToken::never())
+                    .unwrap()
+                    .expect("a backend with a queued writer offers the queue");
+                *slot.borrow_mut() = Some(transport);
+                let panic = catch_unwind(AssertUnwindSafe(|| {
+                    writer.start_write(queue(&[b"data"], 4))
+                }))
+                .expect_err("the write start's last backend owner panics at release");
+                assert_eq!(
+                    panic.downcast_ref::<&'static str>(),
+                    Some(&"write startup backend drop")
+                );
+                let after_start = trace.borrow().clone();
+                drop(writer);
+                let after_drop = trace.borrow().clone();
+                assert_eq!(
+                    after_start,
+                    ["transport-drop", "backend-drop", "write-future-drop"],
+                    "the registered write is retired before the panic leaves start_write"
+                );
+                assert_eq!(after_drop, after_start);
+            });
+        }
+
+        #[test]
+        fn owned_write_startup_unwind_preserves_write_cleanup() {
+            startup_unwind_cleans_write(ByteEventCapability::TransportEvents, false);
+        }
+
+        #[test]
+        fn owned_write_startup_unwind_preserves_write_cleanup_queued() {
+            startup_unwind_cleans_write(ByteEventCapability::Unsupported, false);
+        }
+
+        #[test]
+        fn owned_write_startup_unwind_preserves_backend_panic_when_write_cleanup_panics() {
+            startup_unwind_cleans_write(ByteEventCapability::TransportEvents, true);
+            startup_unwind_cleans_write(ByteEventCapability::Unsupported, true);
+        }
 
         #[test]
         fn owned_reader_is_offered_only_untimed() {
