@@ -5969,10 +5969,27 @@ impl OwnedExchange for PushedExchange {
 fn pushed_body_turns(
     chunks: &'static [&'static [u8]],
 ) -> (Vec<(usize, usize, usize)>, Vec<Vec<u8>>) {
+    pushed_body_turns_through(false, chunks)
+}
+
+/// As [`pushed_body_turns`]; every write completes when first polled, as a socket write does
+/// when the socket takes it whole: a direct [`ScriptedTransport`] write, or, when `queued`, a
+/// write through an open [`FenceQueue`], the write queue path an owned connection over TCP takes.
+fn pushed_body_turns_through(
+    queued: bool,
+    chunks: &'static [&'static [u8]],
+) -> (Vec<(usize, usize, usize)>, Vec<Vec<u8>>) {
     run_on_host(move |context| {
         Box::pin(async move {
-            let (transport, state) =
-                ScriptedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())]);
+            let reads = [ReadAction::Data(KEEP_ALIVE_GET.to_vec())];
+            let (transport, state): (Rc<dyn UniplexTransport>, _) = if queued {
+                let (transport, state, fence) = FencedTransport::new(reads, true);
+                fence.open.set(true);
+                (transport, state)
+            } else {
+                let (transport, state) = ScriptedTransport::new(reads);
+                (transport, state)
+            };
             let body = Rc::new(PushedBody::default());
             let application = PushedApp {
                 body: Rc::clone(&body),
@@ -6006,51 +6023,183 @@ fn pushed_body_turns(
     })
 }
 
-/// Each response body event pushed to a waiting exchange takes three driver turns: one
-/// serializes it, one finds the body pending again and, as no phase before the write has work
-/// left, starts the event's write, and one takes the write's completion. No turn runs only to
-/// find nothing to do, and the parser, paused behind the request, is handed nothing.
+/// Each response body event pushed to a waiting exchange takes two driver turns: one serializes
+/// it, and one finds the body pending again and, as no phase before the write has work left,
+/// starts the event's write, then takes the write's completion where the next turn would have
+/// taken it first. No turn runs only to take that completion, directly or through a write queue,
+/// and the parser, paused behind the request, is handed nothing.
 #[test]
-fn a_pushed_response_body_event_takes_three_driver_turns() {
-    let (counts, writes) = pushed_body_turns(&[b"one", b"two", b"three"]);
-    let turns: Vec<_> = counts
-        .iter()
-        .map(|&(turns, parses, _)| (turns, parses))
-        .collect();
-    assert_eq!(turns, [(3, 0); 3], "(driver turns, codec parses) per event");
-    assert!(
-        writes[0].starts_with(b"HTTP/1.1 200 \r\n"),
-        "{:?}",
-        String::from_utf8_lossy(&writes[0])
-    );
-    assert_eq!(
-        writes[1..],
-        [
-            b"3\r\none\r\n".to_vec(),
-            b"3\r\ntwo\r\n".to_vec(),
-            b"5\r\nthree\r\n".to_vec(),
-            b"3\r\nend\r\n0\r\n\r\n".to_vec(),
-        ],
-        "each event is written alone, as it arrives"
-    );
+fn a_pushed_response_body_event_takes_two_driver_turns() {
+    for queued in [false, true] {
+        let (counts, writes) = pushed_body_turns_through(queued, &[b"one", b"two", b"three"]);
+        let turns: Vec<_> = counts
+            .iter()
+            .map(|&(turns, parses, _)| (turns, parses))
+            .collect();
+        assert_eq!(
+            turns,
+            [(2, 0); 3],
+            "queued {queued}: (driver turns, codec parses) per event"
+        );
+        assert!(
+            writes[0].starts_with(b"HTTP/1.1 200 \r\n"),
+            "queued {queued}: {:?}",
+            String::from_utf8_lossy(&writes[0])
+        );
+        assert_eq!(
+            writes[1..],
+            [
+                b"3\r\none\r\n".to_vec(),
+                b"3\r\ntwo\r\n".to_vec(),
+                b"5\r\nthree\r\n".to_vec(),
+                b"3\r\nend\r\n0\r\n\r\n".to_vec(),
+            ],
+            "queued {queued}: each event is written alone, as it arrives"
+        );
+    }
 }
 
-/// The driver checks whether a phase before the write would act at most once per turn. A turn
-/// that could start a write either finds such a phase due, which holds the write back and is due
-/// in the next turn too, or starts the write, which marks the write's signal; either way its next
-/// turn is due without a second check. So each pushed body event checks once in each of its three
-/// turns: the write check of the first two, and the end of the third.
+/// The driver checks whether a phase before the write would act at most once per turn, and once
+/// after a write it started. A turn that could start a write either finds such a phase due, which
+/// holds the write back and is due in the next turn too, so the turn ends without a second check;
+/// or starts the write, after which the next turn's first phases, up to the write's completion,
+/// run at once and one check decides whether the rest of that turn would act. So each pushed body
+/// event checks three times in its two turns: the write check of each, and once after its write.
 #[test]
-fn a_pushed_response_body_event_checks_the_phases_once_per_turn() {
-    let (counts, _) = pushed_body_turns(&[b"one", b"two", b"three"]);
-    let checks: Vec<_> = counts
+fn a_pushed_response_body_event_checks_the_phases_three_times() {
+    for queued in [false, true] {
+        let (counts, _) = pushed_body_turns_through(queued, &[b"one", b"two", b"three"]);
+        let checks: Vec<_> = counts
+            .iter()
+            .map(|&(turns, _, checks)| (turns, checks))
+            .collect();
+        assert_eq!(
+            checks,
+            [(2, 3); 3],
+            "queued {queued}: (driver turns, phase checks) per event"
+        );
+    }
+}
+
+/// Pushes one body event to a `PushedApp` exchange whose head was written, while the fence holds
+/// writes, and polls the driver; then opens the fence and polls again. Returns the driver turns
+/// of each poll and every write.
+fn fenced_pushed_body_turns(queued: bool) -> ((usize, usize), Vec<Vec<u8>>) {
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let (transport, state, fence) =
+                FencedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())], queued);
+            fence.open.set(true);
+            let body = Rc::new(PushedBody::default());
+            let application = PushedApp {
+                body: Rc::clone(&body),
+            };
+            let (session, handle) =
+                OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+            let mut run = std::pin::pin!(session.run());
+            let mut poll = Context::from_waker(Waker::noop());
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            assert_eq!(state.borrow().writes.len(), 1, "the head is written first");
+            fence.open.set(false);
+            let before = driver_turns();
+            body.push(HttpBodyEvent::body(queue(b"one"), false));
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            let pushed = driver_turns() - before;
+            assert_eq!(state.borrow().writes.len(), 2, "the event's write started");
+            let before = driver_turns();
+            fence.open();
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            let completed = driver_turns() - before;
+            body.push(HttpBodyEvent::body(queue(b"end"), true));
+            assert!(handle.initiate_drain().unwrap());
+            run.await.unwrap();
+            let writes = state.borrow().writes.clone();
+            ((pushed, completed), writes)
+        })
+    })
+}
+
+/// A pushed body event whose write does not complete when first polled takes two driver turns
+/// as well: the second starts the write and finds its completion pending where the next turn
+/// would have, and the poll ends. The poll that the write's completion wakes takes it in one turn.
+#[test]
+fn a_pushed_body_event_whose_write_waits_takes_two_driver_turns() {
+    for queued in [false, true] {
+        let (turns, writes) = fenced_pushed_body_turns(queued);
+        assert_eq!(
+            turns,
+            (2, 1),
+            "queued {queued}: driver turns of the push's poll and of the completion's poll"
+        );
+        assert_eq!(
+            writes[1..],
+            [b"3\r\none\r\n".to_vec(), b"3\r\nend\r\n0\r\n\r\n".to_vec()],
+            "queued {queued}"
+        );
+    }
+}
+
+/// Pushes `events` one-byte body events at once to a `PushedApp` exchange whose head was
+/// written, and polls the driver once. Returns that poll's driver turns and host yields, and the
+/// length of every write.
+fn pushed_events_in_one_poll(events: usize) -> (usize, usize, Vec<usize>) {
+    run_on_host_with(move |host, context| {
+        Box::pin(async move {
+            let (transport, state) =
+                ScriptedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())]);
+            let body = Rc::new(PushedBody::default());
+            let application = PushedApp {
+                body: Rc::clone(&body),
+            };
+            let (session, handle) =
+                OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+            let mut run = std::pin::pin!(session.run());
+            let mut poll = Context::from_waker(Waker::noop());
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            let before = (driver_turns(), host.yields());
+            for _ in 0..events {
+                body.push(HttpBodyEvent::body(queue(b"x"), false));
+            }
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            let (turns, yields) = (driver_turns() - before.0, host.yields() - before.1);
+            body.push(HttpBodyEvent::body(queue(b"end"), true));
+            assert!(handle.initiate_drain().unwrap());
+            run.await.unwrap();
+            let writes = state.borrow().writes.iter().map(Vec::len).collect();
+            (turns, yields, writes)
+        })
+    })
+}
+
+/// Body events ready at once are serialized one per turn and written together once the body is
+/// pending. When that write starts in the turn before the budget's last, the budget still runs
+/// out after the write's completion is taken, and the driver yields, as when a whole turn took
+/// that completion (recorded from the driver at `5e14be54f168`): 61 events take turns 1 to 61,
+/// the write counts as turns 62 and 63, and the completion uses the 64th. One event fewer ends
+/// the poll without a yield; one more starts the write in the last turn, which yields at once.
+#[test]
+fn a_write_started_at_the_turn_budget_edge_yields_as_before() {
+    let recorded: &[(usize, usize, &[usize])] = &[
+        (60, 0, &[106, 360, 13]),
+        (61, 1, &[106, 366, 13]),
+        (62, 1, &[106, 372, 13]),
+    ];
+    let actual: Vec<String> = [60, 61, 62]
+        .into_iter()
+        .map(|events| {
+            let (_, yields, writes) = pushed_events_in_one_poll(events);
+            format!("({events}, {yields}, &{writes:?}),")
+        })
+        .collect();
+    let expected: Vec<String> = recorded
         .iter()
-        .map(|&(turns, _, checks)| (turns, checks))
+        .map(|(events, yields, writes)| format!("({events}, {yields}, &{writes:?}),"))
         .collect();
     assert_eq!(
-        checks,
-        [(3, 3); 3],
-        "(driver turns, phase checks) per event"
+        actual,
+        expected,
+        "(events, yields, write lengths):\n{}",
+        actual.join("\n")
     );
 }
 

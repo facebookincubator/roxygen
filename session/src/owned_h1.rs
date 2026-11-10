@@ -976,16 +976,15 @@ impl<A: OwnedApplication> Driver<A> {
             return Poll::Pending;
         }
         let mut turn = 0;
+        // The progress of this turn's opening phases, when the turn before ran them.
+        let mut opened = None;
         while turn < TURN_BUDGET {
             #[cfg(test)]
             count(&DRIVER_TURNS);
-            self.observe_cancel();
-            self.observe_drain();
-            let mut progress = false;
-            if let Some(wrote) = self.poll_write() {
-                progress |= wrote;
-                self.observe_cancel();
-            }
+            let mut progress = match opened.take() {
+                Some(progress) => progress,
+                None => self.open_turn(),
+            };
             if let Some(read) = self.poll_read(&mut turn) {
                 progress |= read;
                 self.observe_cancel();
@@ -1030,7 +1029,8 @@ impl<A: OwnedApplication> Driver<A> {
                 && self.fatal.is_none();
             let write_ready =
                 !self.transport_reset && !self.egress.is_empty() && self.can_start_write();
-            if write_ready && (!write_waits || !self.phases_due_before_write()) {
+            let write_started = write_ready && (!write_waits || !self.phases_due_before_write());
+            if write_started {
                 if write_waits {
                     turn += 1;
                 }
@@ -1087,10 +1087,24 @@ impl<A: OwnedApplication> Driver<A> {
                 return Poll::Pending;
             }
             turn += 1;
-            // A next turn that would find nothing to do would return here. After a turn ready to
-            // write, the next is due: the phase that held the write back still is, or the write
-            // marked its signal, or a failure reset the connection.
-            if turn < TURN_BUDGET && !write_ready && !self.turn_due() {
+            if turn >= TURN_BUDGET {
+                break;
+            }
+            // After a turn that started a write, the next is due: the write marked its signal, or
+            // a failure reset the connection. That turn opens by taking the write's completion,
+            // so it is opened here, and the rest of it runs only if it would act. If not, that
+            // turn would have ended the poll, with the yield if it was the budget's last.
+            if write_started {
+                let progress = self.open_turn();
+                if turn + 1 < TURN_BUDGET && !self.turn_due() {
+                    return Poll::Pending;
+                }
+                opened = Some(progress);
+                continue;
+            }
+            // A next turn that would find nothing to do would return here. After a turn that held
+            // its write back, the next is due: the phase that held the write back still is.
+            if !write_ready && !self.turn_due() {
                 return Poll::Pending;
             }
         }
@@ -1170,6 +1184,19 @@ impl<A: OwnedApplication> Driver<A> {
                 exchange.signals.source_complete.get()
             }
         })
+    }
+
+    /// A turn's opening phases: the cancel and drain checks, then the write's completion. Returns
+    /// whether the write progressed.
+    #[inline(always)]
+    fn open_turn(&mut self) -> bool {
+        self.observe_cancel();
+        self.observe_drain();
+        let Some(wrote) = self.poll_write() else {
+            return false;
+        };
+        self.observe_cancel();
+        wrote
     }
 
     /// Run at each phase boundary: the transport's callbacks, like the application's, may
