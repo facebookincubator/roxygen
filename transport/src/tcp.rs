@@ -994,8 +994,18 @@ where
         #[cfg(test)]
         IO_READ_FUTURES.with(|count| count.set(count.get() + 1));
         let shared = Rc::clone(&self.shared);
-        let mut read = IoRead::new(maximum, allocation_size);
-        Box::pin(async move { poll_fn(|context| poll_io_read(&shared, context, &mut read)).await })
+        Box::pin(async move {
+            if let Some(error) = shared.read_error.take() {
+                return Err(error);
+            }
+            let mut read = OwnedRead::new(maximum);
+            let ended = poll_fn(|context| {
+                poll_stream_read(&shared, context, maximum, allocation_size, &mut read)
+            })
+            .await;
+            let eof = read_eof(&shared, &read, ended)?;
+            Ok(TransportRead::from_io(read.into_data()?, eof))
+        })
     }
 
     fn prepare_write_timeout(&self, timeout: Duration) {
@@ -1448,6 +1458,54 @@ where
     }
 }
 
+/// Polls the stream once to gather at most `maximum` bytes into `read`;
+/// `Ready` carries whether the stream reached EOF. Inlined into both read
+/// paths, which poll once per wake.
+#[inline(always)]
+fn poll_stream_read<S>(
+    shared: &TokioIoShared<S>,
+    context: &mut Context<'_>,
+    maximum: usize,
+    allocation_size: usize,
+    read: &mut OwnedRead,
+) -> Poll<Result<bool, HttpError>>
+where
+    S: TokioByteStream,
+{
+    let mut stream = shared.stream.borrow_mut();
+    let Some(stream) = stream.as_mut() else {
+        return Poll::Ready(Err(dropped_error()));
+    };
+    stream
+        .poll_read_owned(context, maximum, allocation_size, read)
+        .map_err(read_io_error)
+}
+
+/// Whether a read that gathered `read` and `ended` reached EOF. An error ends
+/// a read that gathered nothing; after gathered bytes it is deferred to the
+/// next read (`DIV-016`).
+fn read_eof<S>(
+    shared: &TokioIoShared<S>,
+    read: &OwnedRead,
+    ended: Result<bool, HttpError>,
+) -> Result<bool, HttpError>
+where
+    S: TokioByteStream,
+{
+    match ended {
+        Ok(eof) => Ok(eof),
+        Err(error) if read.is_empty() => Err(error),
+        // A socket reports a failure once, so the next read returns it
+        // after these bytes, as EOF is deferred (`deferredReadEOF_`).
+        // Folly's `Transport::read` throws instead, so Proxygen never
+        // parses these bytes (`DIV-016`).
+        Err(error) => {
+            shared.read_error.set(Some(error));
+            Ok(false)
+        }
+    }
+}
+
 /// One read's progress through [`poll_io_read`].
 struct IoRead {
     maximum: usize,
@@ -1466,9 +1524,9 @@ impl IoRead {
     }
 }
 
-/// Returns a read error deferred from the previous read, or else gathers at
-/// most `maximum` bytes; an error after gathered bytes is deferred to the next
-/// read (`DIV-016`).
+/// Polls a `PolledReader` read with the steps of `ByteStreamIo::read`'s
+/// future: a read error deferred from the previous read, else at most
+/// `maximum` gathered bytes (`DIV-016`).
 fn poll_io_read<S>(
     shared: &TokioIoShared<S>,
     context: &mut Context<'_>,
@@ -1491,32 +1549,17 @@ where
             read.insert(OwnedRead::new(*maximum))
         }
     };
-    let ended = {
-        let mut stream = shared.stream.borrow_mut();
-        match stream.as_mut() {
-            Some(stream) => {
-                ready!(stream.poll_read_owned(context, *maximum, *allocation_size, gathered))
-                    .map_err(read_io_error)
-            }
-            None => Err(dropped_error()),
-        }
-    };
+    let ended = ready!(poll_stream_read(
+        shared,
+        context,
+        *maximum,
+        *allocation_size,
+        gathered
+    ));
     let read = read.take().expect("a polled read holds its gathered bytes");
-    let eof = match ended {
-        Ok(eof) => eof,
-        Err(error) if read.is_empty() => return Poll::Ready(Err(error)),
-        // A socket reports a failure once, so the next read returns it
-        // after these bytes, as EOF is deferred (`deferredReadEOF_`).
-        // Folly's `Transport::read` throws instead, so Proxygen never
-        // parses these bytes (`DIV-016`).
-        Err(error) => {
-            shared.read_error.set(Some(error));
-            false
-        }
-    };
     Poll::Ready(
-        read.into_data()
-            .map(|data| TransportRead::from_io(data, eof)),
+        read_eof(shared, &read, ended)
+            .and_then(|eof| Ok(TransportRead::from_io(read.into_data()?, eof))),
     )
 }
 

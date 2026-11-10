@@ -823,13 +823,30 @@ enum CloseState {
 
 struct ActiveRead {
     operation: u64,
-    io: ActiveReadIo,
-    wait: ReadWait,
+    drive: ReadDrive,
     waker: Option<Waker>,
 }
 
-/// The I/O of one read: `ByteStreamIo::read`'s boxed future, or the backend
-/// that holds an [`OwnedReader`] read's state.
+/// What one read polls. Fields drop in declaration order.
+enum ReadDrive {
+    /// An ordinary read: `ByteStreamIo::read`'s boxed future, its deadline,
+    /// then the deadline's wait.
+    Timed {
+        io_future: LocalTransportFuture<Result<TransportRead, HttpError>>,
+        deadline: TimedBaton,
+        wait: Pin<Box<TimedWait>>,
+    },
+    /// An [`OwnedReader`]'s read: no deadline. While it pends, `listener`
+    /// wakes it on cancellation, as a timed read's wait does.
+    Untimed {
+        io: ActiveReadIo,
+        cancellation: CancellationToken,
+        listener: Option<CancellationWakeRegistration>,
+    },
+}
+
+/// The I/O of an [`OwnedReader`] read: `ByteStreamIo::read`'s boxed future,
+/// or the backend that holds the read's state.
 enum ActiveReadIo {
     Future(LocalTransportFuture<Result<TransportRead, HttpError>>),
     Polled(PolledReadIo),
@@ -866,21 +883,6 @@ pub(crate) trait PolledReader {
 
     /// Ends an unfinished read, as dropping `ByteStreamIo::read`'s future does.
     fn retire_read(&self);
-}
-
-/// A read's deadline and cancellation.
-enum ReadWait {
-    /// Fields drop in order: the baton before its wait.
-    Timed {
-        deadline: TimedBaton,
-        wait: Pin<Box<TimedWait>>,
-    },
-    /// An [`OwnedReader`]'s read: no deadline. While it pends, `listener`
-    /// wakes it on cancellation, as a timed read's wait does.
-    Untimed {
-        cancellation: CancellationToken,
-        listener: Option<CancellationWakeRegistration>,
-    },
 }
 
 #[cfg(test)]
@@ -1044,17 +1046,26 @@ fn transition_close_resources(
         );
     }
     if let Some(active) = active_read {
-        let ActiveRead {
-            io, wait, waker, ..
-        } = active;
-        match wait {
-            ReadWait::Timed { deadline, wait } => {
+        let ActiveRead { drive, waker, .. } = active;
+        match drive {
+            ReadDrive::Timed {
+                io_future,
+                deadline,
+                wait,
+            } => {
                 retire_transport_value(wait, &mut failure);
                 retire_transport_value(deadline, &mut failure);
+                retire_transport_value(io_future, &mut failure);
             }
-            wait => retire_transport_value(wait, &mut failure),
+            ReadDrive::Untimed {
+                io,
+                cancellation,
+                listener,
+            } => {
+                retire_transport_value((cancellation, listener), &mut failure);
+                retire_transport_value(io, &mut failure);
+            }
         }
-        retire_transport_value(io, &mut failure);
         retire_transport_value(waker, &mut failure);
     }
     if let Some(active) = active_write {
@@ -1792,6 +1803,8 @@ enum ReadKind {
     Reader,
 }
 
+/// Inlined into each caller, which then compiles for its own `kind`.
+#[inline(always)]
 fn start_read_operation(
     target: ReadTarget<'_>,
     context: &WorkerContext,
@@ -1850,34 +1863,37 @@ fn start_read_operation(
     let Some(io) = target.io.upgrade() else {
         return ReadStart::Finished(Err(dropped_error()));
     };
-    let polled_reader = match kind {
-        ReadKind::Ordinary { .. } => None,
-        ReadKind::Reader => io.polled_reader(),
-    };
-    let io = match polled_reader {
-        Some(reader) => {
-            reader.start_read(maximum, allocation_size);
-            ActiveReadIo::Polled(PolledReadIo(reader))
-        }
-        None => ActiveReadIo::Future(io.read(maximum, allocation_size)),
-    };
-    let wait = match kind {
+    let drive = match kind {
         ReadKind::Ordinary { timeout } => {
+            let io_future = io.read(maximum, allocation_size);
             #[cfg(test)]
             READ_DEADLINE_BATONS.with(|count| count.set(count.get() + 1));
             let deadline = TimedBaton::with_host(Some(timeout), context.host().clone());
             let wait = Box::pin(deadline.wait(cancellation));
-            ReadWait::Timed { deadline, wait }
+            ReadDrive::Timed {
+                io_future,
+                deadline,
+                wait,
+            }
         }
-        ReadKind::Reader => ReadWait::Untimed {
-            cancellation,
-            listener: None,
-        },
+        ReadKind::Reader => {
+            let io = match io.polled_reader() {
+                Some(reader) => {
+                    reader.start_read(maximum, allocation_size);
+                    ActiveReadIo::Polled(PolledReadIo(reader))
+                }
+                None => ActiveReadIo::Future(io.read(maximum, allocation_size)),
+            };
+            ReadDrive::Untimed {
+                io,
+                cancellation,
+                listener: None,
+            }
+        }
     };
     target.state.borrow_mut().active_read = Some(ActiveRead {
         operation,
-        io,
-        wait,
+        drive,
         waker: None,
     });
     ReadStart::Started(ReadOperation::new(
@@ -2384,6 +2400,23 @@ impl Future for ReadOperation {
             TimedOut,
             Io(Result<TransportRead, HttpError>),
         }
+        impl ReadPoll {
+            /// Inlined into each kind of read's poll.
+            #[inline(always)]
+            fn new(io: Poll<Result<TransportRead, HttpError>>, wait: Poll<WaitStatus>) -> Self {
+                match (io, wait) {
+                    (Poll::Ready(Err(error)), _) => Self::Io(Err(error)),
+                    (
+                        Poll::Ready(Ok(result)),
+                        Poll::Ready(WaitStatus::Cancelled | WaitStatus::TimedOut),
+                    ) if result.is_eof() || result.bytes_read() != 0 => Self::Io(Ok(result)),
+                    (_, Poll::Ready(WaitStatus::Cancelled)) => Self::Cancelled,
+                    (_, Poll::Ready(WaitStatus::TimedOut)) => Self::TimedOut,
+                    (Poll::Ready(result), _) => Self::Io(result),
+                    (Poll::Pending, _) => Self::Pending,
+                }
+            }
+        }
         let outcome = {
             let mut state = self.state.borrow_mut();
             let active = state
@@ -2392,43 +2425,36 @@ impl Future for ReadOperation {
                 .filter(|active| active.operation == self.operation)
                 .expect("an open read operation remains registered with its transport");
             active.waker = Some(context.waker().clone());
-            if matches!(
-                &active.wait,
-                ReadWait::Timed { deadline, .. } if deadline.status() == WaitStatus::TimedOut
-            ) {
-                ReadPoll::TimedOut
-            } else {
-                let io = active.io.poll(context);
-                let wait = match &mut active.wait {
-                    ReadWait::Timed { wait, .. } => wait.as_mut().poll(context),
-                    ReadWait::Untimed {
-                        cancellation,
-                        listener,
-                    } => {
-                        let cancelled = if io.is_pending() {
-                            listener
-                                .get_or_insert_with(|| cancellation.wake_registration())
-                                .update_waker(context.waker())
-                        } else {
-                            cancellation.is_cancellation_requested()
-                        };
-                        if cancelled {
-                            Poll::Ready(WaitStatus::Cancelled)
-                        } else {
-                            Poll::Pending
-                        }
-                    }
-                };
-                match (io, wait) {
-                    (Poll::Ready(Err(error)), _) => ReadPoll::Io(Err(error)),
-                    (
-                        Poll::Ready(Ok(result)),
-                        Poll::Ready(WaitStatus::Cancelled | WaitStatus::TimedOut),
-                    ) if result.is_eof() || result.bytes_read() != 0 => ReadPoll::Io(Ok(result)),
-                    (_, Poll::Ready(WaitStatus::Cancelled)) => ReadPoll::Cancelled,
-                    (_, Poll::Ready(WaitStatus::TimedOut)) => ReadPoll::TimedOut,
-                    (Poll::Ready(result), _) => ReadPoll::Io(result),
-                    (Poll::Pending, _) => ReadPoll::Pending,
+            match &mut active.drive {
+                ReadDrive::Timed { deadline, .. } if deadline.status() == WaitStatus::TimedOut => {
+                    ReadPoll::TimedOut
+                }
+                ReadDrive::Timed {
+                    io_future, wait, ..
+                } => {
+                    let io = io_future.as_mut().poll(context);
+                    let wait = wait.as_mut().poll(context);
+                    ReadPoll::new(io, wait)
+                }
+                ReadDrive::Untimed {
+                    io,
+                    cancellation,
+                    listener,
+                } => {
+                    let io = io.poll(context);
+                    let cancelled = if io.is_pending() {
+                        listener
+                            .get_or_insert_with(|| cancellation.wake_registration())
+                            .update_waker(context.waker())
+                    } else {
+                        cancellation.is_cancellation_requested()
+                    };
+                    let wait = if cancelled {
+                        Poll::Ready(WaitStatus::Cancelled)
+                    } else {
+                        Poll::Pending
+                    };
+                    ReadPoll::new(io, wait)
                 }
             }
         };
