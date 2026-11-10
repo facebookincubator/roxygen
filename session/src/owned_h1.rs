@@ -122,6 +122,7 @@ thread_local! {
     static DRIVER_TURNS: Cell<usize> = const { Cell::new(0) };
     static CODEC_PARSES: Cell<usize> = const { Cell::new(0) };
     static PHASE_CHECKS: Cell<usize> = const { Cell::new(0) };
+    static CANCEL_SELECTIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// How many turns the owned HTTP/1.1 drivers on this thread have run.
@@ -142,6 +143,13 @@ pub(crate) fn codec_parses() -> usize {
 #[cfg(test)]
 pub(crate) fn phase_checks() -> usize {
     PHASE_CHECKS.with(Cell::get)
+}
+
+/// How many times the owned HTTP/1.1 upstream drivers on this thread have selected a live
+/// exchange's cancel cause (`Exchange::cancel_error`).
+#[cfg(test)]
+pub(crate) fn cancel_selections() -> usize {
+    CANCEL_SELECTIONS.with(Cell::get)
 }
 
 #[cfg(test)]

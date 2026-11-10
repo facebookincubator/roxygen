@@ -21,6 +21,7 @@ use crate::owned_h1::Http1DriverConfig;
 use crate::owned_h1::OwnedH1Options;
 use crate::owned_h1::OwnedH1UpstreamReservation;
 use crate::owned_h1::OwnedH1UpstreamSession;
+use crate::owned_h1::cancel_selections;
 use crate::owned_h1::codec_parses;
 use crate::owned_h1::driver_turns;
 
@@ -237,8 +238,19 @@ fn owned_exchange_writes(
     response: &'static [u8],
     response_body: &'static [u8],
 ) -> Vec<Vec<u8>> {
+    owned_exchange_run(request, response, response_body).0
+}
+
+/// As `owned_exchange_writes`; also returns how many times the driver selected the exchange's
+/// cancel cause.
+fn owned_exchange_run(
+    request: impl FnOnce() -> (HttpHeaderEvent, Vec<HttpBodyEvent>) + Send + 'static,
+    response: &'static [u8],
+    response_body: &'static [u8],
+) -> (Vec<Vec<u8>>, usize) {
     run_on_host(move |context| {
         Box::pin(async move {
+            let selections = cancel_selections();
             let gate = Arc::new(tokio::sync::Notify::new());
             let (transport, state) = ScriptedTransport::new([
                 ReadAction::WaitData(Arc::clone(&gate), response.to_vec()),
@@ -259,7 +271,10 @@ fn owned_exchange_writes(
             });
             run.unwrap();
             assert_eq!(read.body, response_body);
-            state.borrow().writes.clone()
+            (
+                state.borrow().writes.clone(),
+                cancel_selections() - selections,
+            )
         })
     })
 }
@@ -2852,6 +2867,73 @@ fn connection_cancel_from_the_response_observer_reads_no_more_request() {
                     .control
                     .observe_response(Box::new(CancelConnectionOnComplete {
                         handle: handle.clone(),
+                        upload: Arc::clone(&upload_gate),
+                    }))
+                    .unwrap();
+                response_gate.notify_one();
+                let (_stream, mut source, _control) = response.into_source_parts();
+                read_response(&mut source).await;
+            });
+            assert!(
+                !body_read.get(),
+                "the request body is read after the cancel"
+            );
+            assert!(!state.borrow().writes.concat().ends_with(b"hello"));
+            assert_eq!(
+                run.map_err(|error| error.code()).err(),
+                Some(HttpErrorCode::CORO_CANCELLED)
+            );
+            assert_eq!(state.borrow().close, CloseKind::Reset);
+        })
+    });
+}
+
+/// A response observer whose completion cancels the worker, then releases the upload.
+struct CancelWorkerOnComplete {
+    worker: roxygen_runtime::worker::WorkerHandle,
+    upload: Arc<tokio::sync::Notify>,
+}
+
+impl crate::owned::OwnedResponseObserver for CancelWorkerOnComplete {
+    fn poll_deadline(&mut self, _context: &mut std::task::Context<'_>) -> Poll<HttpError> {
+        Poll::Pending
+    }
+
+    fn response_complete(self: Box<Self>, _completed: Result<std::time::Instant, HttpError>) {
+        assert!(self.worker.begin_shutdown());
+        self.upload.notify_one();
+    }
+}
+
+/// As `connection_cancel_from_the_response_observer_reads_no_more_request`, with the worker
+/// cancelled instead of the connection: the driver observes it at the end of that phase and reads
+/// no more of the request.
+#[test]
+fn worker_cancel_from_the_response_observer_reads_no_more_request() {
+    run_on_host(|context| {
+        Box::pin(async move {
+            let response_gate = Arc::new(tokio::sync::Notify::new());
+            let upload_gate = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = ScriptedTransport::new([ReadAction::WaitData(
+                Arc::clone(&response_gate),
+                OK_RESPONSE.to_vec(),
+            )]);
+            let worker = context.handle().clone();
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let body_read = Rc::new(Cell::new(false));
+            let read = Rc::clone(&body_read);
+            let submission = handle.reserve_request().unwrap().submit(
+                post_head(Some(5), false),
+                GatedUpload::held(&upload_gate, Some(Box::new(move || read.set(true)))),
+                CancellationToken::never(),
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                let response = submission.await.unwrap();
+                response
+                    .control
+                    .observe_response(Box::new(CancelWorkerOnComplete {
+                        worker,
                         upload: Arc::clone(&upload_gate),
                     }))
                     .unwrap();
@@ -6470,8 +6552,9 @@ impl UniplexTransport for PushedReadTransport {
 
 /// Sends a GET whose chunked response head the origin sends at once, then, for each of
 /// `chunks`, pushes it as one read, polls the driver, reads the chunk from the response source
-/// and polls the driver again. Returns the driver turns and codec parses each chunk took.
-fn streamed_chunk_turns(chunks: &'static [&'static [u8]]) -> Vec<(usize, usize)> {
+/// and polls the driver again. Returns the driver turns, codec parses and cancel cause
+/// selections each chunk took.
+fn streamed_chunk_turns(chunks: &'static [&'static [u8]]) -> Vec<(usize, usize, usize)> {
     run_on_host(move |context| {
         Box::pin(async move {
             let (inner, _state) = ScriptedTransport::new([]);
@@ -6506,7 +6589,7 @@ fn streamed_chunk_turns(chunks: &'static [&'static [u8]]) -> Vec<(usize, usize)>
             assert_eq!(head.unwrap().headers_mut().status_code().unwrap(), 200);
             let mut turns = Vec::new();
             for chunk in chunks {
-                let before = (driver_turns(), codec_parses());
+                let before = (driver_turns(), codec_parses(), cancel_selections());
                 let mut wire = format!("{:x}\r\n", chunk.len()).into_bytes();
                 wire.extend_from_slice(chunk);
                 wire.extend_from_slice(b"\r\n");
@@ -6526,7 +6609,11 @@ fn streamed_chunk_turns(chunks: &'static [&'static [u8]]) -> Vec<(usize, usize)>
                     run.as_mut().poll(&mut poll).is_pending(),
                     "the read chunk is acknowledged"
                 );
-                turns.push((driver_turns() - before.0, codec_parses() - before.1));
+                turns.push((
+                    driver_turns() - before.0,
+                    codec_parses() - before.1,
+                    cancel_selections() - before.2,
+                ));
             }
             reads.push(b"0\r\n\r\n");
             let (run, ()) = futures::join!(run, async {
@@ -6569,8 +6656,54 @@ async fn read_response_body(source: &mut HttpSourceHolder) -> ReadResponse {
 /// as no input arrived since. No turn runs only to find nothing to do.
 #[test]
 fn a_streamed_response_chunk_takes_two_driver_turns_and_one_parse() {
-    let turns = streamed_chunk_turns(&[b"one", b"two", b"three"]);
+    let turns: Vec<_> = streamed_chunk_turns(&[b"one", b"two", b"three"])
+        .iter()
+        .map(|&(turns, parses, _)| (turns, parses))
+        .collect();
     assert_eq!(turns, [(2, 1); 3], "(driver turns, codec parses) per chunk");
+}
+
+/// While nothing cancels, the driver's cancel checks, at its phase boundaries and before each
+/// codec callback, find no cancellation pending without selecting a cause: no chunk of a
+/// streamed response builds or looks for a cancel error.
+#[test]
+fn a_streamed_response_chunk_selects_no_cancel_cause() {
+    let selections: Vec<_> = streamed_chunk_turns(&[b"one", b"two", b"three"])
+        .iter()
+        .map(|&(turns, _, selections)| (turns, selections))
+        .collect();
+    assert_eq!(
+        selections,
+        [(2, 0); 3],
+        "(driver turns, cancel cause selections) per chunk"
+    );
+}
+
+/// An exchange that nothing cancels, from its commitment to its retirement, never selects a
+/// cancel cause, whatever its request body.
+#[test]
+fn an_uncancelled_exchange_selects_no_cancel_cause() {
+    type Request = fn() -> (HttpHeaderEvent, Vec<HttpBodyEvent>);
+    let requests: [(&str, Request); 4] = [
+        ("content-length", || scripted_request(false)),
+        ("chunked", || scripted_request(true)),
+        ("large", large_request),
+        ("get", || (get_head(), Vec::new())),
+    ];
+    let selections: Vec<(&str, usize)> = requests
+        .into_iter()
+        .map(|(name, request)| (name, owned_exchange_run(request, OK_RESPONSE, b"ok").1))
+        .collect();
+    assert_eq!(
+        selections,
+        [
+            ("content-length", 0),
+            ("chunked", 0),
+            ("large", 0),
+            ("get", 0)
+        ],
+        "cancel cause selections per exchange"
+    );
 }
 
 /// The owned upstream driver writes each request in the same pieces as it did before its turns

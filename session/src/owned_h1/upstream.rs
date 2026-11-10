@@ -83,6 +83,7 @@ struct Shared {
 
 impl Shared {
     /// The connection is cancelled, by its handle or its worker.
+    #[inline]
     fn cancelled(&self) -> bool {
         self.cancel.get() || self.context.is_cancelled()
     }
@@ -844,18 +845,35 @@ struct Exchange {
 }
 
 impl Exchange {
-    /// Whether `cancel_error` selects a cause, without building it.
+    /// Whether `cancel_error` selects a cause, without building it. Its terms are pure, so
+    /// their order sets only the cost: the worker's flag, one pointer further away, comes last.
+    #[inline]
     fn cancel_requested(&self) -> bool {
-        self.status.shared.cancelled()
+        let shared = &self.status.shared;
+        shared.cancel.get()
             || (!(self.request_complete && self.response_complete)
                 && (self.status.error.borrow().is_some()
                     || self.status.cancellation.is_cancellation_requested()))
+            || shared.context.is_cancelled()
     }
 
     /// What stops the exchange now: a connection cancel, or the request's selected cause
     /// while it still closes the connection (an HTTP/1.1 exchange cannot be reset alone before
-    /// both messages end).
+    /// both messages end). The cause is selected only once `cancel_requested` holds.
+    #[inline]
     fn cancel_error(&self) -> Option<HttpError> {
+        if self.cancel_requested() {
+            self.select_cancel_error()
+        } else {
+            None
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn select_cancel_error(&self) -> Option<HttpError> {
+        #[cfg(test)]
+        count(&CANCEL_SELECTIONS);
         if self.status.shared.cancelled() {
             return Some(cancelled());
         }

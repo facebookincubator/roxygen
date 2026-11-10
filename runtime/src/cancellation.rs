@@ -259,6 +259,7 @@ impl CancellationSource {
     }
 
     /// Same answer as `self.token().is_cancellation_requested()`.
+    #[inline]
     pub fn is_cancellation_requested(&self) -> bool {
         self.state.requested.load(Ordering::Acquire)
     }
@@ -313,6 +314,7 @@ impl CancellationToken {
         self.state.is_some()
     }
 
+    #[inline]
     pub fn is_cancellation_requested(&self) -> bool {
         self.state
             .as_ref()

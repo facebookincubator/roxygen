@@ -960,8 +960,10 @@ impl WorkerContext {
         current_id() == self.owner_thread()
     }
 
+    /// Same answer as `self.handle().is_cancelled()`.
+    #[inline]
     pub fn is_cancelled(&self) -> bool {
-        self.handle.is_cancelled()
+        self.handle.shared.cancelled.load(Ordering::Acquire)
     }
 
     /// Lets an admitted scope start its own graceful drain before cancellation.
