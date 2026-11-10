@@ -42,6 +42,10 @@ use roxygen_core::connection::TransportEndpoint;
 use roxygen_core::error::HttpErrorCode;
 use roxygen_core::events::HttpHeaderEvent;
 use roxygen_core::fixed_source::HttpFixedSource;
+use roxygen_core::handler::HandlerSessionContext;
+use roxygen_core::handler::HttpHandler;
+use roxygen_core::handler::HttpHandlerRef;
+use roxygen_core::handler::LocalHandlerFuture;
 use roxygen_core::http::CodecProtocol;
 use roxygen_core::message::SocketAddress;
 use roxygen_core::source::HttpSource;
@@ -55,6 +59,11 @@ use roxygen_runtime::tokio_host::HostedWorkerJoin;
 use roxygen_runtime::tokio_host::HostedWorkerOptions;
 use roxygen_runtime::tokio_host::ManagedWorkerError;
 use roxygen_runtime::worker::WorkerContext;
+use roxygen_server::scoped_server::ScopedHttpServer;
+use roxygen_server::server::ServerConfig;
+use roxygen_session::experimental::OwnedRequestProgressExt;
+use roxygen_session::http2::rate_limit::Http2RateLimitConfig;
+use roxygen_session::http2::rate_limit::RateLimitConfig;
 use roxygen_transport::tls::TlsClientOptions;
 
 use crate::connector::ClientSession;
@@ -2071,6 +2080,197 @@ fn max_connections_zero_disables_reuse() {
 }
 
 /// Polls `future` once, with the current task's waker.
+/// Answers every request with an empty 200.
+struct Ok200;
+
+impl HttpHandler for Ok200 {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        _request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        Box::pin(async {
+            Ok(HttpSourceHolder::new(Box::new(
+                HttpFixedSource::make_fixed_response(200, None).expect("response"),
+            )))
+        })
+    }
+}
+
+/// Submits a GET on `reservation` and reads its response: the status, or the
+/// error code; and whether the request failed unprocessed (`DIV-035`).
+async fn outcome(reservation: OwnedClientReservation) -> (Result<u16, HttpErrorCode>, bool) {
+    let (head, body) = request("/").await;
+    let mut submission = pin!(reservation.submit(head, body, CancellationToken::never()));
+    let response = match submission.as_mut().await {
+        Ok(response) => response,
+        Err(error) => return (Err(error.code()), submission.request_unprocessed()),
+    };
+    let request = response.request.clone();
+    let mut source = response.source.into_source_owner().into_source_holder();
+    let status = async {
+        let head = source.read_header_event().await?;
+        let mut eom = head.eom();
+        while !eom {
+            eom = source.read_body_event(u32::MAX).await?.eom();
+        }
+        Ok(head.headers().response_status().expect("a response status"))
+    }
+    .await
+    .map_err(|error: roxygen_core::error::HttpError| error.code());
+    (status, request.request_unprocessed())
+}
+
+/// `DIV-052` with `DIV-035`: four acquisitions on a one-connection owned
+/// HTTP/2 pool, sent in one burst to an `owned_http2` server whose header
+/// limit is 2 per long interval. The first two are answered. The third header
+/// block crosses the limit: its head is not delivered, it is cancelled without
+/// a RST_STREAM, and the server drains with GOAWAY(last incoming stream,
+/// `NO_ERROR`). The GOAWAY covers it, so it fails when the connection ends
+/// and is not unprocessed; only an unprocessed request would be resent, on a
+/// connection the pool dials for it.
+#[test]
+fn an_owned_http2_burst_past_the_header_limit_resends_only_unprocessed_requests() {
+    let mut config = ServerConfig {
+        plaintext_protocol: CodecProtocol::Http2,
+        shutdown_on_signals: Vec::new(),
+        ..ServerConfig::default()
+    };
+    config.session.owned_http2 = true;
+    config.session.http2_rate_limits = Http2RateLimitConfig {
+        header_frames: RateLimitConfig::new(2, Duration::from_secs(60), 2),
+        ..Http2RateLimitConfig::default()
+    };
+    let server =
+        ScopedHttpServer::start(config, Arc::new(|_| Rc::new(Ok200) as HttpHandlerRef), None)
+            .expect("server starts");
+    let address = server.address().expect("server address");
+    let (outcomes, resent, attempts) = run_on_worker(move |context| async move {
+        let pool = pool(&context, address, CodecProtocol::Http2, 1);
+        let acquired: Vec<OwnedGetSessionResult> =
+            futures::stream::iter((0..4).map(|_| acquire(&pool)))
+                .buffered(4)
+                .collect()
+                .await;
+        let first = local(&acquired[0].session);
+        assert!(
+            acquired
+                .iter()
+                .all(|acquired| local(&acquired.session) == first),
+            "the burst shares one connection"
+        );
+        let attempts = pool.connection_attempts_for_test();
+        let outcomes: Vec<(Result<u16, HttpErrorCode>, bool)> = futures::stream::iter(
+            acquired
+                .into_iter()
+                .map(|acquired| outcome(acquired.reservation)),
+        )
+        .buffered(4)
+        .collect()
+        .await;
+        let mut resent = Vec::new();
+        for _ in outcomes.iter().filter(|(_, unprocessed)| *unprocessed) {
+            let next = acquire(&pool).await;
+            assert_ne!(
+                local(&next.session),
+                first,
+                "the pool dials a new connection"
+            );
+            resent.push(outcome(next.reservation).await);
+        }
+        (
+            outcomes,
+            resent,
+            pool.connection_attempts_for_test() - attempts,
+        )
+    });
+    // The burst reaches the server in one read, so the fourth header block breaches too and
+    // is aborted the same way, under the same GOAWAY (`DIV-052` difference 3): no request is
+    // left for the GOAWAY to exclude, and none is resent. The two aborted requests fail when
+    // the drained connection ends: at its EOF, or at a client write that races the close.
+    let ended = |outcome: &(Result<u16, HttpErrorCode>, bool)| {
+        matches!(
+            outcome,
+            (
+                Err(HttpErrorCode::TRANSPORT_EOF | HttpErrorCode::TRANSPORT_WRITE_ERROR),
+                false
+            )
+        )
+    };
+    assert_eq!(
+        (
+            &outcomes[..2],
+            ended(&outcomes[2]),
+            ended(&outcomes[3]),
+            resent,
+            attempts
+        ),
+        (
+            &[(Ok(200), false), (Ok(200), false)][..],
+            true,
+            true,
+            Vec::new(),
+            0
+        ),
+        "(answered, crossing request ended, next request ended, resent, new connection \
+         attempts): {outcomes:?}"
+    );
+}
+
+/// `DIV-003`: a non-hosted worker polls only the cleanups that were woken.
+/// The owned pool's cleanups still run on a `RuntimeOwner` worker, each step
+/// within a bound: eight back-to-back HTTP/1.1 acquisitions wait for their
+/// returning session (`DIV-029`), an idle session is retired without an
+/// acquisition (`DIV-032`), and the worker then shuts down with the pool's and
+/// a session's cleanups pending and joins without forcing.
+#[test]
+fn owned_pool_cleanups_run_and_join_under_woken_only_polling() {
+    async fn bounded<Work: Future>(what: &str, work: Work) -> Work::Output {
+        tokio::time::timeout(Duration::from_secs(5), work)
+            .await
+            .unwrap_or_else(|_| panic!("{what} does not finish"))
+    }
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let (same, retired) = run_on_worker(move |context| async move {
+        let pool = idle_pool(
+            &context,
+            address,
+            CodecProtocol::Http11,
+            idle_params(
+                4,
+                SessionReuseOrder::MostRecentlyUsed,
+                IDLE,
+                IdleSweep::Interval,
+            ),
+        );
+        let first = bounded("the first acquisition", acquire(&pool)).await;
+        let session = local(&first.session);
+        assert_eq!(exchange(first.reservation, "/").await, b"ok");
+        let mut same = Vec::new();
+        for _ in 0..8 {
+            let next = bounded("a returning-session wait", acquire(&pool)).await;
+            same.push(local(&next.session) == session);
+            assert_eq!(
+                bounded("an exchange", exchange(next.reservation, "/")).await,
+                b"ok"
+            );
+        }
+        bounded("idle retirement", until(|| pool.session_count() == 0)).await;
+        let retired = pool.session_count() == 0;
+        // Leave a fresh session idle in the pool: the scenario's end drops both with their
+        // cleanups pending, and the worker's shutdown must join them.
+        let last = bounded("a new session", acquire(&pool)).await;
+        assert_eq!(exchange(last.reservation, "/").await, b"ok");
+        (same, retired)
+    });
+    assert_eq!(
+        (same, retired, origin.accepted()),
+        (vec![true; 8], true, 2),
+        "(served on the first session, idle session retired, connections)"
+    );
+}
+
 async fn poll_once<Work: Future>(mut future: Pin<&mut Work>) -> Poll<Work::Output> {
     std::future::poll_fn(|context| Poll::Ready(future.as_mut().poll(context))).await
 }

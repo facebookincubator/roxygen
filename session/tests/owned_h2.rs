@@ -3435,6 +3435,54 @@ fn a_forced_worker_teardown_abandons_an_owned_h2_downstream() {
     );
 }
 
+/// `DIV-051` with `DIV-043`: a lifecycle observer on an owned HTTP/2 downstream that a forced
+/// `HostedWorker` teardown destroys sees its connection's destroy exactly once, as the last
+/// event: `Drop` reports it before the forced-teardown check. No panic escapes, and the worker
+/// reports a clean overrun.
+#[test]
+fn a_forced_worker_teardown_reports_an_owned_h2_destroy_to_its_observer_once() {
+    let (events_tx, events_rx) = std::sync::mpsc::channel();
+    let completion = forced_teardown_of_scope(move |context| {
+        let (transport, _state) = FixtureTransport::new([FixtureRead::WaitData(
+            Arc::new(tokio::sync::Notify::new()),
+            Vec::new(),
+        )]);
+        let (application, _probes) = Application::new(vec![]);
+        let (mut session, handle) =
+            OwnedH2Session::new(application, options(context, transport)).unwrap();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        session
+            .add_lifecycle_observer(Rc::new(LifecycleProbe {
+                events: Rc::clone(&events),
+            }))
+            .unwrap();
+        after_forced_teardown(move || events_tx.send(events.take()).unwrap());
+        Box::pin(async move {
+            let _ = session.run().await;
+            drop(handle);
+        })
+    });
+    assert_eq!(
+        completion,
+        Err(ManagedWorkerError::TeardownDeadlineExceeded),
+        "the forced destruction of the observed driver is a clean overrun"
+    );
+    let events = events_rx.recv().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| **event == LifecycleEvent::Destroy)
+            .count(),
+        1,
+        "the observer sees one destroy: {events:?}"
+    );
+    assert_eq!(
+        events.last(),
+        Some(&LifecycleEvent::Destroy),
+        "the destroy is the last event: {events:?}"
+    );
+}
+
 #[test]
 fn synthesized_error_head_waits_for_the_admitted_ingress_read() {
     run_on_worker(|context| {

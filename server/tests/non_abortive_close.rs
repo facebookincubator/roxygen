@@ -28,6 +28,8 @@ use roxygen_runtime::managed::RuntimeOwner;
 use roxygen_runtime::tokio_host::HostedWorker;
 use roxygen_runtime::tokio_host::HostedWorkerOptions;
 use roxygen_runtime::worker::WorkerContext;
+use roxygen_session::http2::rate_limit::Http2RateLimitConfig;
+use roxygen_session::http2::rate_limit::RateLimitConfig;
 use roxygen_transport::tcp::TcpTransport;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -493,6 +495,91 @@ fn owned_http2_cancelled_connection_closes_with_eof_when_enabled() {
         assert!(
             !owned_http2_cancelled(context, true).await,
             "a cancelled owned HTTP/2 connection ends with EOF when enabled"
+        );
+    });
+}
+
+/// A HEADERS frame (END_STREAM, END_HEADERS) for `GET http://localhost/` on
+/// `stream`, then RST_STREAM(`CANCEL`) on it.
+fn h2_request_then_reset(stream: u32) -> Vec<u8> {
+    let id = stream.to_be_bytes();
+    let mut frames = vec![0, 0, 0x0e, 0x01, 0x05];
+    frames.extend_from_slice(&id);
+    frames.extend_from_slice(b"\x82\x86\x84\x41\x09localhost");
+    frames.extend_from_slice(&[0, 0, 4, 0x03, 0]);
+    frames.extend_from_slice(&id);
+    frames.extend_from_slice(&8_u32.to_be_bytes());
+    frames
+}
+
+/// The error codes of the GOAWAY frames in `wire`, which starts with the
+/// server's first frame.
+fn goaway_codes(wire: &[u8]) -> Vec<u32> {
+    let mut codes = Vec::new();
+    let mut rest = wire;
+    while rest.len() >= 9 {
+        let length = usize::from(rest[0]) << 16 | usize::from(rest[1]) << 8 | usize::from(rest[2]);
+        let Some(payload) = rest.get(9..9 + length) else {
+            break;
+        };
+        if rest[3] == 0x07 && payload.len() >= 8 {
+            codes.push(u32::from_be_bytes(
+                payload[4..8].try_into().expect("4 bytes"),
+            ));
+        }
+        rest = &rest[9 + length..];
+    }
+    codes
+}
+
+/// An `owned_http2` connection whose reset limit is 1 receives three requests,
+/// each reset by the client; returns the GOAWAY codes it wrote and whether it
+/// ended with a reset.
+async fn owned_http2_reset_flood(
+    context: WorkerContext,
+    non_abortive_close: bool,
+) -> (Vec<u32>, bool) {
+    let held = Rc::new(Held::default());
+    let one = RateLimitConfig::new(1, Duration::from_secs(60), 1);
+    let session = ServerSessionConfig {
+        owned_http2: true,
+        http2_rate_limits: Http2RateLimitConfig {
+            resets: one,
+            ..Http2RateLimitConfig::default()
+        },
+        ..session(non_abortive_close, false)
+    };
+    let (_connection, mut client) = serve_loopback_with(
+        &context,
+        CodecProtocol::Http2,
+        session,
+        Rc::new(HeldHandler(Rc::clone(&held))),
+    )
+    .await;
+    let mut flood = H2_REQUEST[..33].to_vec();
+    for stream in [1, 3, 5] {
+        flood.extend_from_slice(&h2_request_then_reset(stream));
+    }
+    client.write_all(&flood).await.expect("flood written");
+    let (wire, reset) = read_until_closed(&mut client).await;
+    (goaway_codes(&wire), reset)
+}
+
+/// `DIV-052` with `DIV-038`: a reset-flood breach on `owned_http2` fails the
+/// connection with GOAWAY(`CANCEL`), and `non_abortive_close` turns the reset
+/// that follows into a FIN.
+#[test]
+fn owned_http2_reset_flood_closes_with_eof_when_enabled() {
+    on_worker(|context| async move {
+        assert_eq!(
+            owned_http2_reset_flood(context.clone(), false).await,
+            (vec![0x8], true),
+            "by default the breach sends GOAWAY(CANCEL), then resets"
+        );
+        assert_eq!(
+            owned_http2_reset_flood(context, true).await,
+            (vec![0x8], false),
+            "with non_abortive_close the breach sends GOAWAY(CANCEL), then a FIN"
         );
     });
 }
