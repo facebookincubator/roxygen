@@ -29,6 +29,7 @@ use crate::owned_h1::OwnedH1Options;
 use crate::owned_h1::OwnedH1Session;
 use crate::owned_h1::codec_parses;
 use crate::owned_h1::driver_turns;
+use crate::owned_h1::phase_checks;
 use crate::uniplex::UniplexWriteCompletion;
 use crate::uniplex::UniplexWriteQueue;
 
@@ -5963,9 +5964,11 @@ impl OwnedExchange for PushedExchange {
 }
 
 /// Serves a keep-alive GET whose chunked response head is written at once, then pushes each of
-/// `chunks` to its body and polls the driver once; returns the driver turns and codec parses
-/// each push took, and every write.
-fn pushed_body_turns(chunks: &'static [&'static [u8]]) -> (Vec<(usize, usize)>, Vec<Vec<u8>>) {
+/// `chunks` to its body and polls the driver once; returns the driver turns, codec parses and
+/// phase checks each push took, and every write.
+fn pushed_body_turns(
+    chunks: &'static [&'static [u8]],
+) -> (Vec<(usize, usize, usize)>, Vec<Vec<u8>>) {
     run_on_host(move |context| {
         Box::pin(async move {
             let (transport, state) =
@@ -5985,10 +5988,14 @@ fn pushed_body_turns(chunks: &'static [&'static [u8]]) -> (Vec<(usize, usize)>, 
             assert_eq!(state.borrow().writes.len(), 1, "the head is written first");
             let mut turns = Vec::new();
             for chunk in chunks {
-                let before = (driver_turns(), codec_parses());
+                let before = (driver_turns(), codec_parses(), phase_checks());
                 body.push(HttpBodyEvent::body(queue(chunk), false));
                 assert!(run.as_mut().poll(&mut poll).is_pending());
-                turns.push((driver_turns() - before.0, codec_parses() - before.1));
+                turns.push((
+                    driver_turns() - before.0,
+                    codec_parses() - before.1,
+                    phase_checks() - before.2,
+                ));
             }
             body.push(HttpBodyEvent::body(queue(b"end"), true));
             assert!(handle.initiate_drain().unwrap());
@@ -6005,7 +6012,11 @@ fn pushed_body_turns(chunks: &'static [&'static [u8]]) -> (Vec<(usize, usize)>, 
 /// find nothing to do, and the parser, paused behind the request, is handed nothing.
 #[test]
 fn a_pushed_response_body_event_takes_three_driver_turns() {
-    let (turns, writes) = pushed_body_turns(&[b"one", b"two", b"three"]);
+    let (counts, writes) = pushed_body_turns(&[b"one", b"two", b"three"]);
+    let turns: Vec<_> = counts
+        .iter()
+        .map(|&(turns, parses, _)| (turns, parses))
+        .collect();
     assert_eq!(turns, [(3, 0); 3], "(driver turns, codec parses) per event");
     assert!(
         writes[0].starts_with(b"HTTP/1.1 200 \r\n"),
@@ -6021,6 +6032,25 @@ fn a_pushed_response_body_event_takes_three_driver_turns() {
             b"3\r\nend\r\n0\r\n\r\n".to_vec(),
         ],
         "each event is written alone, as it arrives"
+    );
+}
+
+/// The driver checks whether a phase before the write would act at most once per turn. A turn
+/// that could start a write either finds such a phase due, which holds the write back and is due
+/// in the next turn too, or starts the write, which marks the write's signal; either way its next
+/// turn is due without a second check. So each pushed body event checks once in each of its three
+/// turns: the write check of the first two, and the end of the third.
+#[test]
+fn a_pushed_response_body_event_checks_the_phases_once_per_turn() {
+    let (counts, _) = pushed_body_turns(&[b"one", b"two", b"three"]);
+    let checks: Vec<_> = counts
+        .iter()
+        .map(|&(turns, _, checks)| (turns, checks))
+        .collect();
+    assert_eq!(
+        checks,
+        [(3, 3); 3],
+        "(driver turns, phase checks) per event"
     );
 }
 

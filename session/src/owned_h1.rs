@@ -121,6 +121,7 @@ const CHUNK_OVERHEAD: usize = 8 + b"\r\n".len() + b"\r\n0\r\n\r\n".len();
 thread_local! {
     static DRIVER_TURNS: Cell<usize> = const { Cell::new(0) };
     static CODEC_PARSES: Cell<usize> = const { Cell::new(0) };
+    static PHASE_CHECKS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// How many turns the owned HTTP/1.1 drivers on this thread have run.
@@ -134,6 +135,13 @@ pub(crate) fn driver_turns() -> usize {
 #[cfg(test)]
 pub(crate) fn codec_parses() -> usize {
     CODEC_PARSES.with(Cell::get)
+}
+
+/// How many times the owned HTTP/1.1 downstream drivers on this thread have checked whether a
+/// phase before the write would act (`phases_due_before_write`).
+#[cfg(test)]
+pub(crate) fn phase_checks() -> usize {
+    PHASE_CHECKS.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -224,6 +232,7 @@ impl Signal {
         self.ready.store(true, Ordering::Release);
     }
 
+    #[inline]
     fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
@@ -417,6 +426,7 @@ enum ReadPoll {
     Data,
 }
 
+#[inline]
 fn cancel_requested(control: &Control, context: &WorkerContext) -> bool {
     control.cancel.get() || context.is_cancelled()
 }
@@ -989,11 +999,9 @@ impl<A: OwnedApplication> Driver<A> {
                 && self.egress.chain_length() < self.config.maximum_write_size
                 && turn + 1 < TURN_BUDGET
                 && self.fatal.is_none();
-            if !self.transport_reset
-                && !self.egress.is_empty()
-                && self.can_start_write()
-                && (!write_waits || !self.phases_due_before_write())
-            {
+            let write_ready =
+                !self.transport_reset && !self.egress.is_empty() && self.can_start_write();
+            if write_ready && (!write_waits || !self.phases_due_before_write()) {
                 if write_waits {
                     turn += 1;
                 }
@@ -1050,8 +1058,10 @@ impl<A: OwnedApplication> Driver<A> {
                 return Poll::Pending;
             }
             turn += 1;
-            // A next turn that would find nothing to do would return here.
-            if turn < TURN_BUDGET && !self.turn_due() {
+            // A next turn that would find nothing to do would return here. After a turn ready to
+            // write, the next is due: the phase that held the write back still is, or the write
+            // marked its signal, or a failure reset the connection.
+            if turn < TURN_BUDGET && !write_ready && !self.turn_due() {
                 return Poll::Pending;
             }
         }
@@ -1079,19 +1089,25 @@ impl<A: OwnedApplication> Driver<A> {
             }
     }
 
-    /// Whether a phase before the write would act in a next turn: the cancel and drain checks,
-    /// the write completion, the read, the parse, a held read failure, the exchange, its
-    /// retirement or `DIV-053`'s EOF judgment. Each term is the condition under which that phase
-    /// acts, or a wider one, and none runs transport or application code.
+    /// Whether a phase before the write would act in a next turn: the write completion, the read,
+    /// the exchange, the cancel and drain checks, a read start, the parse, a held read failure,
+    /// the exchange's retirement or `DIV-053`'s EOF judgment. Each term is the condition under which
+    /// that phase acts, or a wider one, and none runs transport or application code or changes
+    /// anything, so their order sets only the cost: the signals, which most often make a turn
+    /// due, come first.
+    #[inline(always)]
     fn phases_due_before_write(&self) -> bool {
-        (!self.transport_reset && cancel_requested(&self.control, &self.context))
-            || (self.control.drain.get() && !self.draining && self.fatal.is_none())
-            || self.write_wake.is_ready()
+        #[cfg(test)]
+        count(&PHASE_CHECKS);
+        self.write_wake.is_ready()
             || self.read_wake.is_ready()
+            || (self.fatal.is_none() && self.stream_wake.is_ready())
+            || (!self.transport_reset && cancel_requested(&self.control, &self.context))
+            || (self.control.drain.get() && !self.draining && self.fatal.is_none())
             || (self.read.is_none() && self.read_capacity() != 0)
             || self.parse_due()
             || (self.read_error.is_some() && !self.holds_read_error())
-            || (self.fatal.is_none() && (self.stream_wake.is_ready() || self.retire_due()))
+            || (self.fatal.is_none() && self.retire_due())
             || self.eof_abort_due()
     }
 
