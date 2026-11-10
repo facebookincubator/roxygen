@@ -123,6 +123,7 @@ thread_local! {
     static CODEC_PARSES: Cell<usize> = const { Cell::new(0) };
     static PHASE_CHECKS: Cell<usize> = const { Cell::new(0) };
     static CANCEL_SELECTIONS: Cell<usize> = const { Cell::new(0) };
+    static RESPONSE_EVENTS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// How many turns the owned HTTP/1.1 drivers on this thread have run.
@@ -150,6 +151,13 @@ pub(crate) fn phase_checks() -> usize {
 #[cfg(test)]
 pub(crate) fn cancel_selections() -> usize {
     CANCEL_SELECTIONS.with(Cell::get)
+}
+
+/// How many response codec events the owned HTTP/1.1 upstream drivers on this thread have
+/// handled: checked for a failure, a missing exchange and a cancel, then acted on.
+#[cfg(test)]
+pub(crate) fn response_events() -> usize {
+    RESPONSE_EVENTS.with(Cell::get)
 }
 
 #[cfg(test)]

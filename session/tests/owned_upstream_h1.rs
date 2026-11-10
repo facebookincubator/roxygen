@@ -25,6 +25,7 @@ use crate::owned_h1::cancel_selections;
 use crate::owned_h1::codec_parses;
 use crate::owned_h1::driver_turns;
 use crate::owned_h1::phase_checks;
+use crate::owned_h1::response_events;
 
 const OK_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 /// `OK_RESPONSE` on a connection the origin will not keep open.
@@ -6462,16 +6463,24 @@ fn a_teardown_panic_on_a_read_error_during_a_request_write_resets_at_once() {
     }
 }
 
-/// Bytes pushed by the test, which `PushedReadTransport` reads deliver as they arrive.
+/// Bytes, or read failures, pushed by the test, which `PushedReadTransport` reads deliver as they
+/// arrive.
 #[derive(Default)]
 struct PushedReads {
-    chunks: RefCell<VecDeque<Vec<u8>>>,
+    chunks: RefCell<VecDeque<Result<Bytes, HttpErrorCode>>>,
     waker: RefCell<Option<Waker>>,
+    /// How many times the transport was closed with a reset.
+    resets: Arc<AtomicUsize>,
 }
 
 impl PushedReads {
     fn push(&self, bytes: &[u8]) {
-        self.chunks.borrow_mut().push_back(bytes.to_vec());
+        self.push_read(Ok(Bytes::copy_from_slice(bytes)));
+    }
+
+    /// Pushes a read (bytes, delivered as they are, or a failure).
+    fn push_read(&self, read: Result<Bytes, HttpErrorCode>) {
+        self.chunks.borrow_mut().push_back(read);
         let waker = self.waker.borrow_mut().take();
         if let Some(waker) = waker {
             waker.wake();
@@ -6497,8 +6506,17 @@ impl UniplexTransport for PushedReadTransport {
     ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
         let reads = Rc::clone(&self.reads);
         Box::pin(std::future::poll_fn(move |context| {
-            if let Some(bytes) = reads.chunks.borrow_mut().pop_front() {
-                return Poll::Ready(Ok(UniplexRead::new(queue(&bytes), false)));
+            if let Some(read) = reads.chunks.borrow_mut().pop_front() {
+                return Poll::Ready(match read {
+                    Ok(bytes) => {
+                        let length = bytes.len();
+                        Ok(UniplexRead::new(
+                            BufQueue::from_bytes(bytes, length).unwrap(),
+                            false,
+                        ))
+                    }
+                    Err(code) => Err(HttpError::with_message(code, b"pushed read failure")),
+                });
             }
             if cancellation.is_cancellation_requested() {
                 return Poll::Ready(Err(HttpError::with_message(
@@ -6532,6 +6550,7 @@ impl UniplexTransport for PushedReadTransport {
     }
 
     fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.reads.resets.fetch_add(1, Ordering::SeqCst);
         self.inner.close_with_reset(context)
     }
 
@@ -6553,9 +6572,9 @@ impl UniplexTransport for PushedReadTransport {
 
 /// Sends a GET whose chunked response head the origin sends at once, then, for each of
 /// `chunks`, pushes it as one read, polls the driver, reads the chunk from the response source
-/// and polls the driver again. Returns the driver turns, codec parses and cancel cause
-/// selections each chunk took.
-fn streamed_chunk_turns(chunks: &'static [&'static [u8]]) -> Vec<(usize, usize, usize)> {
+/// and polls the driver again. Returns the driver turns, codec parses, cancel cause selections
+/// and response events each chunk took.
+fn streamed_chunk_turns(chunks: &'static [&'static [u8]]) -> Vec<(usize, usize, usize, usize)> {
     run_on_host(move |context| {
         Box::pin(async move {
             let (inner, _state) = ScriptedTransport::new([]);
@@ -6590,7 +6609,12 @@ fn streamed_chunk_turns(chunks: &'static [&'static [u8]]) -> Vec<(usize, usize, 
             assert_eq!(head.unwrap().headers_mut().status_code().unwrap(), 200);
             let mut turns = Vec::new();
             for chunk in chunks {
-                let before = (driver_turns(), codec_parses(), cancel_selections());
+                let before = (
+                    driver_turns(),
+                    codec_parses(),
+                    cancel_selections(),
+                    response_events(),
+                );
                 let mut wire = format!("{:x}\r\n", chunk.len()).into_bytes();
                 wire.extend_from_slice(chunk);
                 wire.extend_from_slice(b"\r\n");
@@ -6614,6 +6638,7 @@ fn streamed_chunk_turns(chunks: &'static [&'static [u8]]) -> Vec<(usize, usize, 
                     driver_turns() - before.0,
                     codec_parses() - before.1,
                     cancel_selections() - before.2,
+                    response_events() - before.3,
                 ));
             }
             reads.push(b"0\r\n\r\n");
@@ -6659,7 +6684,7 @@ async fn read_response_body(source: &mut HttpSourceHolder) -> ReadResponse {
 fn a_streamed_response_chunk_takes_two_driver_turns_and_one_parse() {
     let turns: Vec<_> = streamed_chunk_turns(&[b"one", b"two", b"three"])
         .iter()
-        .map(|&(turns, parses, _)| (turns, parses))
+        .map(|&(turns, parses, ..)| (turns, parses))
         .collect();
     assert_eq!(turns, [(2, 1); 3], "(driver turns, codec parses) per chunk");
 }
@@ -6671,12 +6696,27 @@ fn a_streamed_response_chunk_takes_two_driver_turns_and_one_parse() {
 fn a_streamed_response_chunk_selects_no_cancel_cause() {
     let selections: Vec<_> = streamed_chunk_turns(&[b"one", b"two", b"three"])
         .iter()
-        .map(|&(turns, _, selections)| (turns, selections))
+        .map(|&(turns, _, selections, ..)| (turns, selections))
         .collect();
     assert_eq!(
         selections,
         [(2, 0); 3],
         "(driver turns, cancel cause selections) per chunk"
+    );
+}
+
+/// The response ignores a chunk's boundaries, its size line and its terminator, so of a chunk's
+/// three codec callbacks only the body's is handled as an event.
+#[test]
+fn a_streamed_response_chunk_handles_only_its_body_event() {
+    let counts: Vec<_> = streamed_chunk_turns(&[b"one", b"two", b"three"])
+        .iter()
+        .map(|&(turns, _, _, events)| (turns, events))
+        .collect();
+    assert_eq!(
+        counts,
+        [(2, 1); 3],
+        "(driver turns, response events) per chunk"
     );
 }
 
@@ -6956,6 +6996,306 @@ fn worker_cancel_from_a_body_read_wake_ends_the_connection_in_that_poll() {
             assert_eq!(state.borrow().close, CloseKind::Reset);
         })
     });
+}
+
+/// What one poll of the driver did, and what the response source yielded after it.
+#[derive(Debug, PartialEq)]
+struct PublicationCancel {
+    /// The poll's result: `None` while the run is pending.
+    run: Option<Result<(), HttpErrorCode>>,
+    /// The body the response source yields before it fails.
+    body: Vec<u8>,
+    /// The response source's failure.
+    error: HttpErrorCode,
+    close: CloseKind,
+}
+
+/// Sends a GET whose chunked response head is read first. A body read then suspends, and its
+/// resume future is polled with a waker that cancels the request's token, as a caller that
+/// cancels when the body arrives. Then the origin sends `reads` (bytes, or a failed read) and the
+/// driver is polled once for them. Returns that poll's result, then what the response source
+/// yields.
+fn cancel_from_a_body_publication(
+    reads: &'static [Result<&'static [u8], HttpErrorCode>],
+) -> PublicationCancel {
+    let reads = reads
+        .iter()
+        .map(|read| read.map(Bytes::from_static))
+        .collect();
+    cancel_from_a_body_publication_with(reads, Arc::default())
+}
+
+/// As `cancel_from_a_body_publication`, with reads that the test owns, on a transport that counts
+/// its resets in `resets`.
+fn cancel_from_a_body_publication_with(
+    reads: Vec<Result<Bytes, HttpErrorCode>>,
+    resets: Arc<AtomicUsize>,
+) -> PublicationCancel {
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let (inner, state) = ScriptedTransport::new([]);
+            let pushed = Rc::new(PushedReads {
+                resets,
+                ..PushedReads::default()
+            });
+            let transport = Rc::new(PushedReadTransport {
+                inner,
+                reads: Rc::clone(&pushed),
+            });
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let source = CancellationSource::new();
+            let token = source.token();
+            let submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                token,
+            );
+            let mut poll = Context::from_waker(Waker::noop());
+            let mut run = std::pin::pin!(session.run());
+            assert!(
+                run.as_mut().poll(&mut poll).is_pending(),
+                "the GET waits for its response"
+            );
+            let mut submission = std::pin::pin!(submission);
+            let Poll::Ready(response) = submission.as_mut().poll(&mut poll) else {
+                panic!("the GET is committed in the first poll");
+            };
+            let (_stream, mut response, _control) = response.unwrap().into_source_parts();
+            pushed.push(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            let Poll::Ready(head) = response.read_header_event().as_mut().poll(&mut poll) else {
+                panic!("the response head is readable");
+            };
+            assert_eq!(head.unwrap().headers_mut().status_code().unwrap(), 200);
+            let Poll::Ready(Ok(event)) =
+                response.read_body_event(u32::MAX).as_mut().poll(&mut poll)
+            else {
+                panic!("a read before the body suspends");
+            };
+            let HttpBodyEventKind::Suspend(mut resume) = event.into_kind() else {
+                panic!("no body has arrived");
+            };
+            let waker = Waker::from(Arc::new(CancelOnWake {
+                source,
+                task: std::sync::Mutex::new(None),
+            }));
+            assert!(
+                resume
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            for read in reads {
+                pushed.push_read(read);
+            }
+            let run = match run.as_mut().poll(&mut poll) {
+                Poll::Ready(run) => Some(run.map(drop).map_err(|error| error.code())),
+                Poll::Pending => None,
+            };
+            drop(resume);
+            let mut body = Vec::new();
+            let error = loop {
+                let Poll::Ready(read) = response.read_body_event(u32::MAX).as_mut().poll(&mut poll)
+                else {
+                    panic!("the failed response is readable");
+                };
+                match read {
+                    Ok(event) => {
+                        assert!(!event.eom(), "the response is unfinished");
+                        let bytes = event.as_body().expect("a body event");
+                        body.extend_from_slice(&bytes.coalesce(bytes.chain_length()).unwrap());
+                    }
+                    Err(error) => break error.code(),
+                }
+            };
+            let close = state.borrow().close;
+            PublicationCancel {
+                run,
+                body,
+                error,
+                close,
+            }
+        })
+    })
+}
+
+/// A cancel that a chunk's body publication raises stops the parse before any later event acts:
+/// the response fails, though the same read carries its next chunk and its end, and the
+/// buffered body is discarded.
+#[test]
+fn request_cancel_from_a_chunk_publication_fails_the_response_ending_in_that_read() {
+    assert_eq!(
+        cancel_from_a_body_publication(&[Ok(b"3\r\none\r\n3\r\ntwo\r\n0\r\n\r\n")]),
+        PublicationCancel {
+            run: Some(Err(HttpErrorCode::CORO_CANCELLED)),
+            body: Vec::new(),
+            error: HttpErrorCode::CORO_CANCELLED,
+            close: CloseKind::Reset,
+        }
+    );
+}
+
+/// A cancel that a chunk's body publication raises, when the read ends with the chunk, is
+/// observed by that parse, and so selected before a failure of the read after it.
+#[test]
+fn request_cancel_from_a_chunk_publication_precedes_a_held_read_failure() {
+    assert_eq!(
+        cancel_from_a_body_publication(&[
+            Ok(b"3\r\none\r\n"),
+            Err(HttpErrorCode::TRANSPORT_READ_ERROR)
+        ]),
+        PublicationCancel {
+            run: Some(Err(HttpErrorCode::CORO_CANCELLED)),
+            body: Vec::new(),
+            error: HttpErrorCode::CORO_CANCELLED,
+            close: CloseKind::Reset,
+        }
+    );
+}
+
+/// A read buffer that notes, when it is released, how many resets its transport had seen.
+struct ResetObservedBytes {
+    bytes: &'static [u8],
+    resets: Arc<AtomicUsize>,
+    /// `usize::MAX` until the buffer is released.
+    resets_at_release: Arc<AtomicUsize>,
+}
+
+impl AsRef<[u8]> for ResetObservedBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes
+    }
+}
+
+impl Drop for ResetObservedBytes {
+    fn drop(&mut self) {
+        self.resets_at_release
+            .store(self.resets.load(Ordering::SeqCst), Ordering::SeqCst);
+    }
+}
+
+/// A cancel that a chunk's body publication raises stops the parse at that chunk's end: the
+/// next chunk's size line, read separately in the same turn, stays unparsed, so its buffer is
+/// released with the driver, after the abort reset the transport, not before the abort.
+#[test]
+fn request_cancel_from_a_chunk_publication_leaves_a_later_read_unparsed() {
+    let resets = Arc::new(AtomicUsize::new(0));
+    let resets_at_release = Arc::new(AtomicUsize::new(usize::MAX));
+    let size_line = Bytes::from_owner(ResetObservedBytes {
+        bytes: b"3\r\n",
+        resets: Arc::clone(&resets),
+        resets_at_release: Arc::clone(&resets_at_release),
+    });
+    assert_eq!(
+        cancel_from_a_body_publication_with(
+            vec![Ok(Bytes::from_static(b"3\r\none\r\n")), Ok(size_line)],
+            Arc::clone(&resets),
+        ),
+        PublicationCancel {
+            run: Some(Err(HttpErrorCode::CORO_CANCELLED)),
+            body: Vec::new(),
+            error: HttpErrorCode::CORO_CANCELLED,
+            close: CloseKind::Reset,
+        }
+    );
+    assert_eq!(
+        resets_at_release.load(Ordering::SeqCst),
+        1,
+        "the unparsed size line is released after the transport reset"
+    );
+}
+
+/// A chunk's body publication that fails, as the caller dropped the response source, stops the
+/// parse at that chunk's end: the next chunk's size line, read separately in the same turn,
+/// stays unparsed, so its buffer is released with the driver, after the abort reset the
+/// transport, not before the abort.
+#[test]
+fn a_failed_chunk_publication_leaves_a_later_read_unparsed() {
+    let resets = Arc::new(AtomicUsize::new(0));
+    let resets_at_release = Arc::new(AtomicUsize::new(usize::MAX));
+    let size_line = Bytes::from_owner(ResetObservedBytes {
+        bytes: b"3\r\n",
+        resets: Arc::clone(&resets),
+        resets_at_release: Arc::clone(&resets_at_release),
+    });
+    let (run, close) = run_on_host(move |context| {
+        Box::pin(async move {
+            let (inner, state) = ScriptedTransport::new([]);
+            let pushed = Rc::new(PushedReads {
+                resets,
+                ..PushedReads::default()
+            });
+            let transport = Rc::new(PushedReadTransport {
+                inner,
+                reads: Rc::clone(&pushed),
+            });
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            let mut poll = Context::from_waker(Waker::noop());
+            let mut run = std::pin::pin!(session.run());
+            assert!(
+                run.as_mut().poll(&mut poll).is_pending(),
+                "the GET waits for its response"
+            );
+            let mut submission = std::pin::pin!(submission);
+            let Poll::Ready(response) = submission.as_mut().poll(&mut poll) else {
+                panic!("the GET is committed in the first poll");
+            };
+            let (_stream, mut response, control) = response.unwrap().into_source_parts();
+            pushed.push(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            assert!(run.as_mut().poll(&mut poll).is_pending());
+            let Poll::Ready(head) = response.read_header_event().as_mut().poll(&mut poll) else {
+                panic!("the response head is readable");
+            };
+            assert_eq!(head.unwrap().headers_mut().status_code().unwrap(), 200);
+            drop((response, control));
+            pushed.push(b"3\r\none\r\n");
+            pushed.push_read(Ok(size_line));
+            let run = match run.as_mut().poll(&mut poll) {
+                Poll::Ready(run) => Some(run.map(drop).map_err(|error| error.code())),
+                Poll::Pending => None,
+            };
+            (run, state.borrow().close)
+        })
+    });
+    assert_eq!(
+        (run, close),
+        (
+            Some(Err(HttpErrorCode::FLOW_CONTROL_ERROR)),
+            CloseKind::Reset
+        ),
+        "the body publication fails the run"
+    );
+    assert_eq!(
+        resets_at_release.load(Ordering::SeqCst),
+        1,
+        "the unparsed size line is released after the transport reset"
+    );
+}
+
+/// A cancel that the body publication raises when the body is the read's last event is not
+/// observed by that parse: a failure of the read after it, held until those bytes are parsed,
+/// is applied first.
+#[test]
+fn a_held_read_failure_precedes_a_cancel_from_the_last_body_publication() {
+    assert_eq!(
+        cancel_from_a_body_publication(&[
+            Ok(b"3\r\none"),
+            Err(HttpErrorCode::TRANSPORT_READ_ERROR)
+        ]),
+        PublicationCancel {
+            run: Some(Err(HttpErrorCode::TRANSPORT_READ_ERROR)),
+            body: Vec::new(),
+            error: HttpErrorCode::TRANSPORT_READ_ERROR,
+            close: CloseKind::Reset,
+        }
+    );
 }
 
 /// The owned upstream driver writes each request in the same pieces as it did before its turns

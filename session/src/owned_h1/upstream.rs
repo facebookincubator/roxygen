@@ -1223,12 +1223,13 @@ impl ResponseInput<'_> {
     fn fail(&mut self, error: HttpError) {
         self.failure.get_or_insert(error);
     }
-}
 
-impl HttpCodecCallback for ResponseInput<'_> {
-    fn on_event(&mut self, _event: CodecEvent<'_>) {}
-
-    fn on_ingress_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
+    /// Handles one response event. Out of line, so that the chunk boundaries `on_ingress_event`
+    /// skips do not set up this frame.
+    #[inline(never)]
+    fn handle_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
+        #[cfg(test)]
+        count(&RESPONSE_EVENTS);
         let mut actions = Vec::new();
         if self.failure.is_some() {
             actions.push(CodecCallbackAction::SetParserPaused(true));
@@ -1310,6 +1311,32 @@ impl HttpCodecCallback for ResponseInput<'_> {
             _ => {}
         }
         actions.into()
+    }
+}
+
+impl HttpCodecCallback for ResponseInput<'_> {
+    fn on_event(&mut self, _event: CodecEvent<'_>) {}
+
+    fn on_ingress_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
+        // The response ignores chunk boundaries: one acts only to stop the parse, for a failure,
+        // a missing exchange or a cancel, so a boundary with none of them returns at once.
+        if let CodecEvent::ChunkHeader {
+            stream: _,
+            length: _,
+        }
+        | CodecEvent::ChunkComplete { stream: _ } = event
+            && self.failure.is_none()
+            && self
+                .exchange
+                .as_ref()
+                .is_some_and(|exchange| !exchange.cancel_requested())
+        {
+            // The patterns name every field, all plain data: a boundary owns nothing to drop, and
+            // forgetting it spares the call to `CodecEvent`'s drop glue.
+            std::mem::forget(event);
+            return CodecCallbackActions::new();
+        }
+        self.handle_event(event)
     }
 }
 
