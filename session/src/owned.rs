@@ -145,6 +145,12 @@ impl ReadSlot {
         self.read.is_some()
     }
 
+    /// Whether reads go through the transport's [`UniplexReader`] rather than one read future
+    /// each.
+    pub(crate) fn uses_reader(&self) -> bool {
+        self.reader.is_some()
+    }
+
     /// Whether the read last returned drained the transport. A driver then starts its next read
     /// only once its read waker fires.
     pub(crate) fn is_drained(&self) -> bool {

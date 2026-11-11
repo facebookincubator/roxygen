@@ -20,6 +20,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
@@ -146,7 +147,8 @@ pub struct OwnedH2Options {
 #[derive(Default)]
 struct ReadyQueue {
     state: Mutex<ReadyQueueState>,
-    /// Set under the lock by every wake and every push; cleared only by `settle`.
+    /// Set under the lock by every wake and every push, except a wake that
+    /// `IoWake::poll_inline` holds for a completed operation; cleared only by `settle`.
     busy: AtomicBool,
 }
 
@@ -211,15 +213,29 @@ impl ReadyQueue {
     }
 }
 
+/// `IoWake::inline`: no inline poll is running; the session is polling the wake's operation; that
+/// operation woke the wake during the poll.
+const INLINE_IDLE: u8 = 0;
+const INLINE_POLLING: u8 = 1;
+const INLINE_WOKEN: u8 = 2;
+
 struct IoWake {
     ready: AtomicBool,
+    /// Where `poll_inline` is (`INLINE_*`).
+    inline: AtomicU8,
+    /// Whether the operation can wake this from inside the poll that completes it, so that
+    /// `poll_inline` holds wakes: a read or write future can, while the native reader and write
+    /// queue complete without waking.
+    completion_wakes: bool,
     queue: Arc<ReadyQueue>,
 }
 
 impl IoWake {
-    fn new(queue: &Arc<ReadyQueue>) -> Arc<Self> {
+    fn new(queue: &Arc<ReadyQueue>, completion_wakes: bool) -> Arc<Self> {
         Arc::new(Self {
             ready: AtomicBool::new(false),
+            inline: AtomicU8::new(INLINE_IDLE),
+            completion_wakes,
             queue: Arc::clone(queue),
         })
     }
@@ -233,6 +249,74 @@ impl IoWake {
     fn take_ready(&self) -> bool {
         self.is_ready() && self.ready.swap(false, Ordering::AcqRel)
     }
+
+    /// Runs `poll`, which starts or polls the transport read or write this wake belongs to, from
+    /// the session's turn with `waker`, holding a wake that comes during the poll until it
+    /// returns. The wake of an operation that completed only marks `ready`, as it always did,
+    /// without scheduling the session again: this turn consumes the completion. `OwnedByteStream`'s
+    /// read and write futures wake on retiring from inside the completing poll (a read's
+    /// `TimedBaton::drop`, a write's `CompletionWake`), and this saves the session poll that wake
+    /// would cost. A pending operation's wake goes out as it would have. A poll that panics leaves
+    /// the state polling or woken, and until the next `poll_inline` resets it, every wake is held
+    /// rather than sent. Nothing is lost meanwhile: the session aborts, `reset_transport` stores
+    /// both `ready` flags directly, and `poll_panicked` wakes the session through its own
+    /// context's waker. Without `completion_wakes` it only polls: there is no wake to save.
+    #[inline]
+    fn poll_inline<T>(
+        self: &Arc<Self>,
+        waker: &Waker,
+        poll: impl FnOnce(&mut Context<'_>) -> Poll<T>,
+    ) -> Poll<T> {
+        if self.completion_wakes {
+            self.poll_holding(waker, poll)
+        } else {
+            poll(&mut Context::from_waker(waker))
+        }
+    }
+
+    /// `poll_inline`'s hold. Cold and out of line, so that a driver whose transport completes
+    /// without waking keeps the code it had without it.
+    #[cold]
+    #[inline(never)]
+    fn poll_holding<T>(
+        self: &Arc<Self>,
+        waker: &Waker,
+        poll: impl FnOnce(&mut Context<'_>) -> Poll<T>,
+    ) -> Poll<T> {
+        #[cfg(test)]
+        INLINE_POLLS.with(|polls| polls.set(polls.get() + 1));
+        self.inline.store(INLINE_POLLING, Ordering::Relaxed);
+        let polled = poll(&mut Context::from_waker(waker));
+        if self.inline.swap(INLINE_IDLE, Ordering::AcqRel) == INLINE_WOKEN {
+            if polled.is_ready() {
+                // No `busy` store: this turn cleared `quiescent`, and only its closing `settle`
+                // publishes it again, which either sees this mark or clears `busy` itself.
+                self.ready.store(true, Ordering::Release);
+            } else {
+                self.wake_by_ref();
+            }
+        }
+        polled
+    }
+
+    /// Marks the running `poll_holding` woken; false once it has returned.
+    #[cold]
+    #[inline(never)]
+    fn hold_wake(&self) -> bool {
+        let mut inline = self.inline.load(Ordering::Acquire);
+        while inline != INLINE_IDLE {
+            match self.inline.compare_exchange_weak(
+                inline,
+                INLINE_WOKEN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => inline = current,
+            }
+        }
+        false
+    }
 }
 
 impl Wake for IoWake {
@@ -241,6 +325,9 @@ impl Wake for IoWake {
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
+        if self.inline.load(Ordering::Acquire) != INLINE_IDLE && self.hold_wake() {
+            return;
+        }
         self.queue
             .wake_after(|| self.ready.store(true, Ordering::Release));
     }
@@ -273,7 +360,7 @@ impl ConnectionTimers {
     #[cold]
     #[inline(never)]
     fn new(host: &Host, queue: &Arc<ReadyQueue>) -> Box<Self> {
-        let wake = IoWake::new(queue);
+        let wake = IoWake::new(queue, false);
         Box::new(Self {
             waker: Waker::from(Arc::clone(&wake)),
             wake,
@@ -1261,6 +1348,7 @@ pub(crate) fn stream_seed_order(seed: u64, streams: &[u64]) -> Vec<u64> {
 thread_local! {
     static OWNER_WRITE_STATE_READS: Cell<usize> = const { Cell::new(0) };
     static READ_START_CHECKS: Cell<usize> = const { Cell::new(0) };
+    static INLINE_POLLS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// How many times stream-owner code on this thread has evaluated whether writes are pending.
@@ -1286,6 +1374,13 @@ pub(crate) fn take_discarded_streams() -> (usize, usize) {
 #[cfg(test)]
 pub(crate) fn read_start_checks() -> usize {
     READ_START_CHECKS.with(Cell::get)
+}
+
+/// How many transport polls the owned H2 drivers on this thread have held with
+/// `IoWake::poll_inline`.
+#[cfg(test)]
+pub(crate) fn inline_polls() -> usize {
+    INLINE_POLLS.with(Cell::get)
 }
 
 /// A concrete-exchange H2 driver, selected only by experimental opt-in integrations.
@@ -1811,8 +1906,6 @@ where
         )?;
         let observer = AsyncSocketByteEventObserver::new(&context)?;
         observer.set_tx_ack_events_enabled(&context, false)?;
-        let read_wake = IoWake::new(&control.ready);
-        let write_wake = IoWake::new(&control.ready);
         let cancellation = CancellationSource::new();
         let write_cancellation = CancellationSource::new();
         let write_queue = transport.try_write_queue(
@@ -1828,6 +1921,8 @@ where
             Duration::ZERO,
             cancellation.token(),
         )?;
+        let read_wake = IoWake::new(&control.ready, !read.uses_reader());
+        let write_wake = IoWake::new(&control.ready, write_queue.is_none());
         Ok((
             Self {
                 context,
@@ -2439,7 +2534,8 @@ where
             if !self.read_wake.take_ready() {
                 return None;
             }
-            self.read.poll(&mut Context::from_waker(&self.read_waker))
+            self.read_wake
+                .poll_inline(&self.read_waker, |context| self.read.poll(context))
         } else {
             #[cfg(test)]
             READ_START_CHECKS.with(|count| count.set(count.get() + 1));
@@ -2469,17 +2565,21 @@ where
                 self.read_parked = true;
                 return None;
             }
-            self.read.poll_start(
-                self.transport.as_ref(),
-                &self.context,
-                &mut Context::from_waker(&self.read_waker),
-                maximum,
-                self.connection
-                    .state
-                    .config
-                    .read_allocation_size
-                    .min(maximum),
-            )
+            let allocation_size = self
+                .connection
+                .state
+                .config
+                .read_allocation_size
+                .min(maximum);
+            self.read_wake.poll_inline(&self.read_waker, |context| {
+                self.read.poll_start(
+                    self.transport.as_ref(),
+                    &self.context,
+                    context,
+                    maximum,
+                    allocation_size,
+                )
+            })
         };
         let Poll::Ready(result) = polled else {
             return Some(false);
@@ -2826,9 +2926,10 @@ where
         if !self.write_wake.take_ready() {
             return None;
         }
-        let mut context = Context::from_waker(&self.write_waker);
         {
-            let polled = write.as_mut().poll(&mut context);
+            let polled = self
+                .write_wake
+                .poll_inline(&self.write_waker, |context| write.as_mut().poll(context));
             let Poll::Ready(result) = &polled else {
                 return Some(false);
             };
@@ -5350,7 +5451,7 @@ mod ready_queue_tests {
     #[test]
     fn io_wake_marks_ready_only_under_the_queue_lock() {
         let queue = Arc::new(ReadyQueue::default());
-        let read = IoWake::new(&queue);
+        let read = IoWake::new(&queue, false);
         let waker = Waker::from(Arc::clone(&read));
         let held = queue.state.lock();
         let waking = thread::spawn(move || waker.wake_by_ref());

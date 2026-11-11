@@ -17833,6 +17833,8 @@ async fn read_frames_until(
 /// - The second response goes out as one physical write that pends while the client does not
 ///   read. That exchange retires as its END_STREAM is serialized (`DIV-028`): its `complete()`
 ///   runs while the write carrying its response is still outstanding.
+/// - Its native reader and write queue complete without waking, so the driver holds none of
+///   their polls inline (`IoWake::poll_inline`).
 #[test]
 fn owned_h2_serves_sequential_exchanges_over_a_tcp_byte_stream() {
     use tokio::io::AsyncReadExt;
@@ -18005,6 +18007,7 @@ fn owned_h2_serves_sequential_exchanges_over_a_tcp_byte_stream() {
                         client.read_to_end(&mut received).await.unwrap();
                         (received, retired_before_read)
                     });
+                    let inline_polls = crate::owned_h2::inline_polls();
                     let session_task = tokio::task::spawn_local(session.run());
                     let (run, client) = match select(session_task, client_task).await {
                         Either::Left((run, client)) => (run, client.await),
@@ -18013,6 +18016,11 @@ fn owned_h2_serves_sequential_exchanges_over_a_tcp_byte_stream() {
                     };
                     run.unwrap_or_else(|failure| resume_unwind(failure.into_panic()))
                         .expect("the session finishes cleanly after the client's GOAWAY and EOF");
+                    assert_eq!(
+                        crate::owned_h2::inline_polls() - inline_polls,
+                        0,
+                        "no native read or queued write poll is held inline"
+                    );
                     let (received, retired_before_read) =
                         client.unwrap_or_else(|failure| resume_unwind(failure.into_panic()));
                     for (ordinal, probe) in probes.borrow().iter().enumerate() {
@@ -18101,5 +18109,850 @@ fn owned_h2_serves_sequential_exchanges_over_a_tcp_byte_stream() {
         ],
         "SETTINGS, an ACK of each client SETTINGS, the first response, the PING's ACK, the second \
          response, then the final GOAWAY"
+    );
+}
+
+// ---- Inline completion wakes of the session's own transport operations ----
+
+/// How many reads and writes an `InlineCompletionWakes` transport woke from inside the poll that
+/// completed them.
+#[derive(Default)]
+struct InlineWakes {
+    reads: Cell<usize>,
+    writes: Cell<usize>,
+}
+
+/// A transport whose reads and writes wake the waker they are polled with from inside the poll
+/// that completes them, before it returns `Ready`, as `OwnedByteStream`'s operations do: retiring
+/// a read drops its `TimedBaton`, which wakes the registered waiter, and retiring a write that
+/// completed on its first poll drops its `CompletionWake`.
+struct InlineCompletionWakes {
+    inner: Rc<dyn UniplexTransport>,
+    wakes: Rc<InlineWakes>,
+}
+
+impl InlineCompletionWakes {
+    fn wrap(inner: Rc<dyn UniplexTransport>) -> (Rc<Self>, Rc<InlineWakes>) {
+        let wakes = Rc::new(InlineWakes::default());
+        let transport = Rc::new(Self {
+            inner,
+            wakes: Rc::clone(&wakes),
+        });
+        (transport, wakes)
+    }
+
+    fn waking<T: 'static>(
+        &self,
+        mut operation: LocalTransportFuture<T>,
+        read: bool,
+    ) -> LocalTransportFuture<T> {
+        let wakes = Rc::clone(&self.wakes);
+        Box::pin(poll_fn(move |context| {
+            let polled = operation.as_mut().poll(context);
+            if polled.is_ready() {
+                let completed = if read { &wakes.reads } else { &wakes.writes };
+                completed.set(completed.get() + 1);
+                context.waker().wake_by_ref();
+            }
+            polled
+        }))
+    }
+}
+
+impl UniplexTransport for InlineCompletionWakes {
+    fn read(
+        &self,
+        context: &WorkerContext,
+        maximum: usize,
+        allocation_size: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        self.waking(
+            self.inner
+                .read(context, maximum, allocation_size, timeout, cancellation),
+            true,
+        )
+    }
+
+    fn write(
+        &self,
+        context: &WorkerContext,
+        data: BufQueue,
+        flags: ByteEventWriteFlags,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        self.waking(
+            self.inner
+                .write(context, data, flags, timeout, cancellation),
+            false,
+        )
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.shutdown_write(context)
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close_with_reset(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.inner.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.inner.register_byte_event(context, registration)
+    }
+}
+
+/// One SSE response's feed: the test pushes events and wakes the stream's owner.
+#[derive(Default)]
+struct SseFeed {
+    events: RefCell<VecDeque<&'static [u8]>>,
+    waker: RefCell<Option<Waker>>,
+}
+
+/// Answers every request with `200 text/event-stream` and a body of the events its feed holds.
+struct SseFeedApplication {
+    feeds: Rc<RefCell<Vec<Rc<SseFeed>>>>,
+}
+
+struct SseFeedExchange {
+    feed: Rc<SseFeed>,
+    _request: Option<HttpSourceHolder>,
+}
+
+impl OwnedH2Application for SseFeedApplication {
+    type Exchange = SseFeedExchange;
+
+    fn new_exchange(&self, _stream: StreamId, _ingress: IngressCompletion) -> SseFeedExchange {
+        let feed = Rc::new(SseFeed::default());
+        self.feeds.borrow_mut().push(Rc::clone(&feed));
+        SseFeedExchange {
+            feed,
+            _request: None,
+        }
+    }
+}
+
+impl OwnedH2Exchange for SseFeedExchange {
+    fn request(&mut self, _head: Box<HttpMessage>, body: HttpStreamSourceOwner, eom: bool) {
+        if !eom {
+            self._request = Some(body.into_source_holder());
+        }
+    }
+
+    fn poll_headers(
+        &mut self,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        let mut response = HttpMessage::new();
+        response.set_status_code(200).unwrap();
+        response.set_http_version(1, 1);
+        response
+            .headers_mut()
+            .set(HttpHeaderCode::ContentType, b"text/event-stream");
+        Poll::Ready(Ok(HttpHeaderEvent::new(response, false).unwrap()))
+    }
+
+    fn poll_body(
+        &mut self,
+        context: &mut Context<'_>,
+        _maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        if let Some(event) = self.feed.events.borrow_mut().pop_front() {
+            return Poll::Ready(Ok(HttpBodyEvent::body(
+                BufQueue::from_bytes(Bytes::from_static(event), event.len()).unwrap(),
+                false,
+            )));
+        }
+        *self.feed.waker.borrow_mut() = Some(context.waker().clone());
+        Poll::Pending
+    }
+
+    fn cancel(&mut self, _error: &HttpError, _peer_reset: bool) {}
+
+    fn response_complete(&mut self) {}
+
+    fn complete(self) {}
+}
+
+const SSE_EVENT: &[u8] =
+    b"event: response.output_text.delta\ndata: {\"delta\":\"lorem ipsum\"}\n\n";
+
+/// A session's run future, counting the polls its own task gives it.
+struct CountedRun<F> {
+    run: Pin<Box<F>>,
+    polls: Rc<Cell<usize>>,
+}
+
+impl<F: Future> Future for CountedRun<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<F::Output> {
+        self.polls.set(self.polls.get() + 1);
+        self.run.as_mut().poll(context)
+    }
+}
+
+/// The run result of a session spawned with `spawn_counted`, once it ends.
+type SpawnedRun = Rc<RefCell<Option<Result<UniplexRunSummary, HttpError>>>>;
+
+/// Spawns `session` as its own task on `host`, so that its poll count is its own wakes'.
+fn spawn_counted<A: OwnedH2Application + 'static>(
+    host: &ManualHost,
+    session: OwnedH2Session<A>,
+) -> (Rc<Cell<usize>>, SpawnedRun) {
+    let polls = Rc::new(Cell::new(0));
+    let outcome: SpawnedRun = Rc::new(RefCell::new(None));
+    let run = CountedRun {
+        run: Box::pin(session.run()),
+        polls: Rc::clone(&polls),
+    };
+    let finished = Rc::clone(&outcome);
+    roxygen_runtime::host::LocalHost::spawn_local(
+        host,
+        Box::pin(async move {
+            let result = run.await;
+            *finished.borrow_mut() = Some(result);
+        }),
+    );
+    (polls, outcome)
+}
+
+/// Cancels a session spawned with `spawn_counted` and returns its result.
+async fn cancel_spawned(
+    handle: &OwnedH2Handle,
+    outcome: &SpawnedRun,
+) -> Result<UniplexRunSummary, HttpError> {
+    handle.cancel();
+    for _ in 0..1_000 {
+        if let Some(result) = outcome.borrow_mut().take() {
+            return result;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("the cancelled session did not end");
+}
+
+/// API Proxy's owned-engine session timeouts: stream read 30 s, connection idle 120 s, write
+/// 60 s, GOAWAY 1 s.
+fn api_proxy_timeouts(config: &mut OwnedH2Options) {
+    config.io.stream_read_timeout = Duration::from_secs(30);
+    config.io.read_timeout = Duration::from_secs(120);
+    config.io.write_timeout = Duration::from_secs(60);
+    config.http2.goaway_timeout = Duration::from_secs(1);
+}
+
+/// What a window of SSE events cost the session: its polls, the transport writes, and the writes
+/// the transport woke the session from inside.
+#[derive(Debug, Eq, PartialEq)]
+struct SseWindow {
+    session_polls: usize,
+    writes: usize,
+    inline_write_wakes: usize,
+}
+
+/// Delivers `events` SSE events round robin on `streams` open streams, one event per owner wake,
+/// over a transport whose writes wake the session from inside their completing poll.
+fn sse_events_over_inline_write_wakes(streams: usize, events: usize, timed: bool) -> SseWindow {
+    crate::external_host_tests::run_on_wheel_host_with(move |host, context| {
+        Box::pin(async move {
+            let (mut peer, mut input) = ready_owner_requests(streams);
+            let widen = i32::MAX as u32 - 65_535;
+            input.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::UNSPECIFIED,
+                    amount: widen,
+                },
+            ));
+            for index in 0..streams {
+                input.extend(eligibility_frame(
+                    &mut peer,
+                    EgressFrame::WindowUpdate {
+                        stream: StreamId::new(2 * index as u64 + 1),
+                        amount: widen,
+                    },
+                ));
+            }
+            let (fixture, state) = FixtureTransport::new([FixtureRead::Data(input)]);
+            let (transport, wakes) = InlineCompletionWakes::wrap(Rc::new(UntimedReads(fixture)));
+            let feeds = Rc::new(RefCell::new(Vec::new()));
+            let application = SseFeedApplication {
+                feeds: Rc::clone(&feeds),
+            };
+            let mut config = options(context, transport);
+            if timed {
+                api_proxy_timeouts(&mut config);
+            }
+            let (session, handle) = OwnedH2Session::new(application, config).expect("owned H2");
+            let (polls, outcome) = spawn_counted(&host, session);
+            while feeds.borrow().len() < streams
+                || feeds
+                    .borrow()
+                    .iter()
+                    .any(|feed| feed.waker.borrow().is_none())
+            {
+                tokio::task::yield_now().await;
+            }
+            settle_turns(16).await;
+            let feeds = feeds.borrow().clone();
+            let before = (polls.get(), state.borrow().writes.len(), wakes.writes.get());
+            for index in 0..events {
+                let feed = &feeds[index % streams];
+                feed.events.borrow_mut().push_back(SSE_EVENT);
+                feed.waker
+                    .borrow()
+                    .as_ref()
+                    .expect("the response body waits")
+                    .wake_by_ref();
+                settle_turns(8).await;
+                assert!(
+                    feed.events.borrow().is_empty(),
+                    "event {index} was not read"
+                );
+            }
+            let window = SseWindow {
+                session_polls: polls.get() - before.0,
+                writes: state.borrow().writes.len() - before.1,
+                inline_write_wakes: wakes.writes.get() - before.2,
+            };
+            let result = cancel_spawned(&handle, &outcome).await;
+            assert_eq!(
+                result.expect_err("the test ends the session").code(),
+                HttpErrorCode::CORO_CANCELLED
+            );
+            let frames = written_frames(&state, streams);
+            assert!(frames.resets.is_empty());
+            assert!(frames.errors.is_empty());
+            assert_eq!(frames.header_statuses.len(), streams);
+            assert_eq!(frames.body_bytes, events * SSE_EVENT.len());
+            window
+        })
+    })
+}
+
+/// A write that completes on its first poll and wakes the session from inside it, as every
+/// `OwnedByteStream` write does, costs no second session poll: the poll that wrote the event
+/// consumed the completion. One session poll and one write per event, with every timeout zero
+/// and with API Proxy's.
+#[test]
+fn inline_write_completion_wakes_cost_no_session_poll() {
+    for timed in [false, true] {
+        assert_eq!(
+            sse_events_over_inline_write_wakes(4, 16, timed),
+            SseWindow {
+                session_polls: 16,
+                writes: 16,
+                inline_write_wakes: 16,
+            },
+            "timed: {timed}"
+        );
+    }
+}
+
+/// Gated client frames in `inline_read_wake_polls`.
+const INLINE_READS: usize = 12;
+
+/// The session polls for `INLINE_READS` client frames, each a gated read that completes with an
+/// inline wake, read through a reader when `through_reader`.
+fn inline_read_wake_polls(through_reader: bool) -> usize {
+    let (session_polls, inline_read_wakes, writes) =
+        crate::external_host_tests::run_on_wheel_host_with(move |host, context| {
+            Box::pin(async move {
+                let (mut peer, preface) = ready_owner_requests(0);
+                let gates: Vec<_> = (0..INLINE_READS)
+                    .map(|_| Arc::new(tokio::sync::Notify::new()))
+                    .collect();
+                let mut reads = vec![FixtureRead::Data(preface)];
+                for gate in &gates {
+                    reads.push(FixtureRead::WaitData(
+                        Arc::clone(gate),
+                        eligibility_frame(
+                            &mut peer,
+                            EgressFrame::WindowUpdate {
+                                stream: StreamId::UNSPECIFIED,
+                                amount: 1,
+                            },
+                        ),
+                    ));
+                }
+                let (fixture, state) = FixtureTransport::new(reads);
+                let (transport, wakes) =
+                    InlineCompletionWakes::wrap(Rc::new(UntimedReads(fixture)));
+                let transport: Rc<dyn UniplexTransport> = if through_reader {
+                    crate::uniplex_tests::ReaderTransport::new(transport).0
+                } else {
+                    transport
+                };
+                let (application, _probes) = Application::new(Vec::new());
+                let (session, handle) =
+                    OwnedH2Session::new(application, options(context, transport))
+                        .expect("owned H2");
+                let (polls, outcome) = spawn_counted(&host, session);
+                settle_turns(16).await;
+                let before = (polls.get(), wakes.reads.get(), state.borrow().writes.len());
+                for gate in &gates {
+                    gate.notify_one();
+                    settle_turns(8).await;
+                }
+                let window = (
+                    polls.get() - before.0,
+                    wakes.reads.get() - before.1,
+                    state.borrow().writes.len() - before.2,
+                );
+                let result = cancel_spawned(&handle, &outcome).await;
+                assert_eq!(
+                    result.expect_err("the test ends the session").code(),
+                    HttpErrorCode::CORO_CANCELLED
+                );
+                window
+            })
+        });
+    assert_eq!(
+        inline_read_wakes, INLINE_READS,
+        "every read completed with an inline wake"
+    );
+    assert_eq!(
+        writes, 0,
+        "a connection WINDOW_UPDATE is answered with nothing"
+    );
+    session_polls
+}
+
+/// A read that completes and wakes the session from inside the completing poll, as every
+/// `OwnedByteStream` read future does, costs no second session poll: one poll per client frame
+/// read.
+#[test]
+fn inline_read_completion_wakes_cost_no_session_poll() {
+    assert_eq!(
+        inline_read_wake_polls(false),
+        INLINE_READS,
+        "one session poll per read"
+    );
+}
+
+/// The driver holds no wake of a read through a reader, as the native reader completes without
+/// waking. A reader whose reads do wake inline loses only the saving: every wake still reaches the
+/// session, and each read costs a second session poll, as before.
+#[test]
+fn inline_read_completion_wakes_through_a_reader_still_reach_the_session() {
+    assert_eq!(
+        inline_read_wake_polls(true),
+        2 * INLINE_READS,
+        "two session polls per read"
+    );
+}
+
+/// A read that is ready on the poll that starts it, and wakes the session from inside that poll,
+/// costs no session poll either. The session starts and first polls a read in one call
+/// (`ReadSlot::poll_start`), and that call holds the wake as the poll of an outstanding read does.
+/// Each client frame here is a gated read, then a read that is ready as soon as it starts.
+#[test]
+fn inline_completion_of_a_read_ready_at_its_start_costs_no_session_poll() {
+    const GATES: usize = 8;
+    let (session_polls, inline_read_wakes, writes) =
+        crate::external_host_tests::run_on_wheel_host_with(|host, context| {
+            Box::pin(async move {
+                let (mut peer, preface) = ready_owner_requests(0);
+                let mut connection_credit = || {
+                    eligibility_frame(
+                        &mut peer,
+                        EgressFrame::WindowUpdate {
+                            stream: StreamId::UNSPECIFIED,
+                            amount: 1,
+                        },
+                    )
+                };
+                let gates: Vec<_> = (0..GATES)
+                    .map(|_| Arc::new(tokio::sync::Notify::new()))
+                    .collect();
+                let mut reads = vec![FixtureRead::Data(preface)];
+                for gate in &gates {
+                    reads.push(FixtureRead::WaitData(Arc::clone(gate), connection_credit()));
+                    reads.push(FixtureRead::SegmentedData(queue(&connection_credit())));
+                }
+                let (fixture, state) = FixtureTransport::new(reads);
+                let (transport, wakes) =
+                    InlineCompletionWakes::wrap(Rc::new(UntimedReads(fixture)));
+                let (application, _probes) = Application::new(Vec::new());
+                let (session, handle) =
+                    OwnedH2Session::new(application, options(context, transport))
+                        .expect("owned H2");
+                let (polls, outcome) = spawn_counted(&host, session);
+                settle_turns(16).await;
+                let before = (polls.get(), wakes.reads.get(), state.borrow().writes.len());
+                for gate in &gates {
+                    gate.notify_one();
+                    settle_turns(8).await;
+                }
+                let window = (
+                    polls.get() - before.0,
+                    wakes.reads.get() - before.1,
+                    state.borrow().writes.len() - before.2,
+                );
+                let result = cancel_spawned(&handle, &outcome).await;
+                assert_eq!(
+                    result.expect_err("the test ends the session").code(),
+                    HttpErrorCode::CORO_CANCELLED
+                );
+                window
+            })
+        });
+    assert_eq!(
+        inline_read_wakes,
+        2 * GATES,
+        "every read completed with an inline wake"
+    );
+    assert_eq!(
+        writes, 0,
+        "a connection WINDOW_UPDATE is answered with nothing"
+    );
+    assert_eq!(
+        session_polls, GATES,
+        "one session poll per gated read and the read ready at its start"
+    );
+}
+
+/// The write-timer behavior over a transport whose operations wake inline: a response blocked on
+/// its stream window is reset with FLOW_CONTROL_ERROR exactly the write timeout after its last
+/// activity, as over the fixture's transport.
+#[test]
+fn flow_control_timeout_fires_at_the_same_instant_over_inline_completion_wakes() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, input) = flow_blocked_get(false);
+            let (fixture, state) = FixtureTransport::new([FixtureRead::Data(input)]);
+            let (transport, wakes) = InlineCompletionWakes::wrap(Rc::new(UntimedReads(fixture)));
+            let (application, probes) = Application::new(vec![Reply::Body(FLOW_BODY)]);
+            let mut config = options(context, transport);
+            config.io.write_timeout = WRITE;
+            let (session, handle) = OwnedH2Session::new(application, config).expect("owned H2");
+            let (run, ()) = futures::join!(session.run(), async {
+                complete_credit_wait(|| written_frames(&state, 1).body_bytes == 65_535).await;
+                settle_turns(32).await;
+                assert!(wakes.writes.get() > 0, "the writes woke the session inline");
+                host.advance(WRITE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert!(
+                    written_frames(&state, 1).resets.is_empty(),
+                    "the flow-control timeout came early"
+                );
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                let frames = written_frames(&state, 1);
+                assert_eq!(
+                    frames.resets,
+                    [(StreamId::new(1), H2ErrorCode::FLOW_CONTROL_ERROR)]
+                );
+                assert_eq!(frames.body_bytes, 65_535);
+                assert!(frames.goaways.is_empty(), "the connection stays open");
+                assert_eq!(
+                    probes.borrow()[0].cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::FLOW_CONTROL_ERROR, false)]
+                );
+                assert!(handle.initiate_drain().unwrap());
+            });
+            run.expect("the drained connection closes cleanly");
+            assert_eq!(state.borrow().close, FixtureClose::Closed);
+        })
+    });
+}
+
+/// The read idle timeout over a transport whose operations wake inline: an idle connection drains
+/// at its read timeout, not a millisecond earlier, and sends both GOAWAYs.
+#[test]
+fn idle_drain_fires_at_the_same_instant_over_inline_completion_wakes() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(0);
+            let (fixture, state) = FixtureTransport::new([FixtureRead::Data(preface)]);
+            let (transport, wakes) = InlineCompletionWakes::wrap(Rc::new(UntimedReads(fixture)));
+            let (application, _probes) = Application::new(Vec::new());
+            let mut config = options(context, transport);
+            config.io.read_timeout = IDLE;
+            let (session, _handle) = OwnedH2Session::new(application, config).expect("owned H2");
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                assert!(wakes.reads.get() > 0 && wakes.writes.get() > 0);
+                host.advance(IDLE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert!(written_goaways(&state).is_empty(), "the drain came early");
+                host.advance(Duration::from_millis(1));
+            });
+            run.expect("an idle drain closes cleanly");
+            assert_eq!(
+                written_goaways(&state),
+                [
+                    (GOAWAY_MAX, H2ErrorCode::NO_ERROR),
+                    (StreamId::UNSPECIFIED, H2ErrorCode::NO_ERROR)
+                ]
+            );
+            assert_eq!(state.borrow().close, FixtureClose::Closed);
+        })
+    });
+}
+
+/// A transport whose first write wakes inline and panics, then wakes inline and stays pending,
+/// then completes.
+struct PanickingInlineWrite {
+    inner: Rc<FixtureTransport>,
+    polls: Rc<Cell<usize>>,
+}
+
+impl UniplexTransport for PanickingInlineWrite {
+    fn read(
+        &self,
+        context: &WorkerContext,
+        maximum: usize,
+        allocation_size: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        self.inner
+            .read(context, maximum, allocation_size, timeout, cancellation)
+    }
+
+    fn write(
+        &self,
+        context: &WorkerContext,
+        data: BufQueue,
+        flags: ByteEventWriteFlags,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        let mut inner = self
+            .inner
+            .write(context, data, flags, timeout, cancellation);
+        let polls = Rc::clone(&self.polls);
+        Box::pin(poll_fn(move |context| {
+            polls.set(polls.get() + 1);
+            match polls.get() {
+                1 => {
+                    context.waker().wake_by_ref();
+                    panic_any("first inline-waking write poll");
+                }
+                2 => {
+                    context.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                _ => inner.as_mut().poll(context),
+            }
+        }))
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.shutdown_write(context)
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close_with_reset(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.inner.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.inner.register_byte_event(context, registration)
+    }
+}
+
+/// A write poll that wakes the session and panics leaves the session to abort, keep polling the
+/// write until it completes, and only then resume the panic; the wake its pending re-poll asks for
+/// from inside still reaches the session.
+#[test]
+fn inline_waking_write_poll_panic_still_joins_the_write() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(0);
+            let (inner, wire) = FixtureTransport::new([FixtureRead::Data(preface)]);
+            let polls = Rc::new(Cell::new(0));
+            let transport = Rc::new(PanickingInlineWrite {
+                inner,
+                polls: Rc::clone(&polls),
+            });
+            let (application, _probes) = Application::new(Vec::new());
+            let (session, _handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                eligibility_catch_unwind(session.run()),
+            )
+            .await
+            .expect("the panicked session joins its write");
+            let panic = result.expect_err("the write poll's panic is resumed");
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"first inline-waking write poll")
+            );
+            assert_eq!(polls.get(), 3, "the write was polled until it completed");
+            assert_eq!(wire.borrow().close, FixtureClose::Reset);
+        })
+    });
+}
+
+/// `small_body_read_wakes` with the fixture's writes optionally completing with an inline wake:
+/// the session wakes that reading a retained 128 B body outside the session's poll costs.
+async fn small_body_read_wakes_over(context: WorkerContext, inline_wakes: bool) -> usize {
+    let input = peer_request_bytes(HttpMethod::Post, &[b'q'; 128], None, PeerControl::None);
+    let (fixture, state) = FixtureTransport::new([FixtureRead::Data(input)]);
+    let transport: Rc<dyn UniplexTransport> = if inline_wakes {
+        InlineCompletionWakes::wrap(fixture).0
+    } else {
+        fixture
+    };
+    let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+    application.retain_request = true;
+    application.hold_headers = true;
+    let (session, handle) = OwnedH2Session::new(application, options(context, transport)).unwrap();
+    let counts = SessionCounts::default();
+    let wakes = Cell::new(usize::MAX);
+    counted_exercise(session, &handle, &counts, async {
+        complete_credit_wait(|| {
+            held_body_buffered(&probes, 0, 128) && !state.borrow().writes.is_empty()
+        })
+        .await;
+        settle_turns(16).await;
+        let probe = Rc::clone(&probes.borrow()[0]);
+        let mut body = probe.held_body.borrow_mut().take().unwrap();
+        let before = counts.wakes();
+        assert_eq!(read_buffered_body(&mut body), 128);
+        wakes.set(counts.wakes() - before);
+        drop(body);
+    })
+    .await;
+    wakes.get()
+}
+
+/// A write that completed with an inline wake leaves its wake marked ready, as before the wake
+/// was held, so on a host that folds credit the session is not quiescent after it: a body read
+/// then wakes the session instead of folding its credit. Over the fixture's own transport, whose
+/// writes complete without waking, the same read folds. This pins current behavior: a change that
+/// clears the stale mark would let the first case fold too, and should invert its expectation.
+#[test]
+fn credit_after_an_inline_woken_write_wakes_the_session_as_before() {
+    let inline = run_on_fold_worker(|context| Box::pin(small_body_read_wakes_over(context, true)));
+    let fixture =
+        run_on_fold_worker(|context| Box::pin(small_body_read_wakes_over(context, false)));
+    assert_eq!(
+        (inline, fixture),
+        (1, 0),
+        "session wakes of the body read (over inline-waking writes, over the fixture's)"
+    );
+}
+
+/// What serving a window of requests cost a session: its polls and wakes, and the transport polls
+/// it held with `IoWake::poll_inline`.
+#[derive(Debug, Eq, PartialEq)]
+struct ServedWindow {
+    session_polls: usize,
+    session_wakes: usize,
+    inline_polls: usize,
+}
+
+/// Serves `requests` GETs with 128-byte bodies over a transport that reads through a reader and
+/// writes through a queue, neither of whose completions wakes a task, as plaintext TCP's native
+/// reader and write queue do. Each request arrives in a gated read, followed by a connection
+/// WINDOW_UPDATE that is ready on the poll that starts its read.
+fn requests_over_a_reader_and_write_queue(requests: usize) -> ServedWindow {
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let (mut peer, preface) = ready_owner_requests(0);
+            let gates: Vec<_> = (0..requests)
+                .map(|_| Arc::new(tokio::sync::Notify::new()))
+                .collect();
+            let mut reads = vec![FixtureRead::Data(preface)];
+            for gate in &gates {
+                reads.push(FixtureRead::WaitData(
+                    Arc::clone(gate),
+                    retirement_get(&mut peer),
+                ));
+                reads.push(FixtureRead::SegmentedData(queue(&eligibility_frame(
+                    &mut peer,
+                    EgressFrame::WindowUpdate {
+                        stream: StreamId::UNSPECIFIED,
+                        amount: 1,
+                    },
+                ))));
+            }
+            let queued = QueuedFixtureTransport::new(reads);
+            queued.probe.borrow_mut().complete_inline = true;
+            let (transport, reads) = crate::uniplex_tests::ReaderTransport::new(queued);
+            let (application, probes) = Application::new(vec![Reply::Body(128); requests]);
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let counts = SessionCounts::default();
+            let window = Cell::new(None);
+            counted_exercise(session, &handle, &counts, async {
+                settle_turns(16).await;
+                let before = (
+                    counts.polls.get(),
+                    counts.wakes(),
+                    crate::owned_h2::inline_polls(),
+                );
+                for (request, gate) in gates.iter().enumerate() {
+                    gate.notify_one();
+                    settle_turns(8).await;
+                    assert_eq!(
+                        probes.borrow()[request].produced_bytes.get(),
+                        128,
+                        "request {request} was answered"
+                    );
+                }
+                window.set(Some(ServedWindow {
+                    session_polls: counts.polls.get() - before.0,
+                    session_wakes: counts.wakes() - before.1,
+                    inline_polls: crate::owned_h2::inline_polls() - before.2,
+                }));
+            })
+            .await;
+            assert_eq!(
+                (reads.direct.get(), reads.reader.get()),
+                (0, 1 + 2 * requests + 1),
+                "every read went through the reader"
+            );
+            window.take().expect("the window was measured")
+        })
+    })
+}
+
+/// A transport whose reads and writes complete without waking, as plaintext TCP's native reader
+/// and write queue do, costs what it did before `IoWake::poll_inline`: the same session polls and
+/// wakes per request, and no transport poll held inline.
+#[test]
+fn reads_and_queued_writes_that_complete_without_waking_poll_nothing_inline() {
+    assert_eq!(
+        requests_over_a_reader_and_write_queue(8),
+        ServedWindow {
+            session_polls: 16,
+            session_wakes: 24,
+            inline_polls: 0,
+        }
     );
 }
