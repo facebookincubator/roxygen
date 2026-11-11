@@ -26,6 +26,8 @@ pub(crate) struct PriorityQueue {
     incremental: [VecDeque<StreamId>; URGENCY_LEVELS],
     // Paused entries retain enqueue intent without occupying either queue.
     nonempty_urgencies: u8,
+    /// The only queued stream, held outside the urgency queues while they are empty.
+    solo: Option<(StreamId, HttpPriority)>,
 }
 
 /// RFC 9218 scheduler used by an HTTP/2 session.
@@ -119,6 +121,14 @@ impl Http2PriorityScheduler {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// The streams held in the urgency queues.
+    #[cfg(test)]
+    pub(crate) fn urgency_queue_entries_for_test(&self) -> usize {
+        let queues = &self.queues;
+        queues.ordered.iter().map(BTreeSet::len).sum::<usize>()
+            + queues.incremental.iter().map(VecDeque::len).sum::<usize>()
+    }
 }
 
 impl PriorityQueue {
@@ -149,11 +159,14 @@ impl PriorityQueue {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.nonempty_urgencies == 0
+        self.nonempty_urgencies == 0 && self.solo.is_none()
     }
 
     /// Equivalent to `next_matching(|_| true)`.
     pub(crate) fn head(&self) -> Option<StreamId> {
+        if let Some((stream, _)) = self.solo {
+            return Some(stream);
+        }
         let mut urgencies = self.nonempty_urgencies;
         while urgencies != 0 {
             let urgency = urgencies.trailing_zeros() as usize;
@@ -172,6 +185,9 @@ impl PriorityQueue {
         &self,
         mut eligible: impl FnMut(StreamId) -> bool,
     ) -> Option<StreamId> {
+        if let Some((stream, _)) = self.solo {
+            return eligible(stream).then_some(stream);
+        }
         let mut urgencies = self.nonempty_urgencies;
         while urgencies != 0 {
             let urgency = urgencies.trailing_zeros() as usize;
@@ -200,7 +216,7 @@ impl PriorityQueue {
         entry: &PriorityEntry,
         bytes: usize,
     ) -> bool {
-        if !entry.enqueued || bytes == 0 || !entry.priority.incremental {
+        if !entry.enqueued || bytes == 0 || !entry.priority.incremental || self.solo.is_some() {
             return entry.enqueued;
         }
         let queue = &mut self.incremental[usize::from(entry.priority.urgency.min(7))];
@@ -221,6 +237,19 @@ impl PriorityQueue {
     }
 
     fn insert(&mut self, stream: StreamId, priority: HttpPriority) {
+        if self.nonempty_urgencies == 0 {
+            match self.solo.take() {
+                None => {
+                    self.solo = Some((stream, priority));
+                    return;
+                }
+                Some((solo, solo_priority)) => self.insert_queued(solo, solo_priority),
+            }
+        }
+        self.insert_queued(stream, priority);
+    }
+
+    fn insert_queued(&mut self, stream: StreamId, priority: HttpPriority) {
         let urgency = usize::from(priority.urgency.min(7));
         if priority.incremental {
             self.incremental[urgency].push_back(stream);
@@ -234,6 +263,12 @@ impl PriorityQueue {
     }
 
     fn remove(&mut self, stream: StreamId, priority: HttpPriority) {
+        if let Some((solo, _)) = self.solo {
+            if solo == stream {
+                self.solo = None;
+            }
+            return;
+        }
         let urgency = usize::from(priority.urgency.min(7));
         if priority.incremental {
             let queue = &mut self.incremental[urgency];

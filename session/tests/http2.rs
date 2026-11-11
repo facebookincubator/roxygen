@@ -18435,6 +18435,229 @@ pub mod h2 {
         assert!(scheduler.is_empty());
     }
 
+    /// A reference model of `Http2PriorityScheduler`'s selection order, kept as a flat list and
+    /// sorted at each query: lower urgency first; at one urgency, non-incremental streams by
+    /// `(order_id, stream)`, then incremental streams in the order they were queued or last
+    /// rotated. Paused streams keep their enqueue intent but are not selectable.
+    #[derive(Default)]
+    struct SchedulerModel {
+        entries: Vec<SchedulerModelEntry>,
+        next_sequence: u64,
+    }
+
+    struct SchedulerModelEntry {
+        stream: StreamId,
+        priority: HttpPriority,
+        enqueued: bool,
+        sequence: u64,
+    }
+
+    impl SchedulerModel {
+        fn entry(&mut self, stream: StreamId) -> Option<&mut SchedulerModelEntry> {
+            self.entries.iter_mut().find(|entry| entry.stream == stream)
+        }
+
+        fn sequence(&mut self) -> u64 {
+            self.next_sequence += 1;
+            self.next_sequence
+        }
+
+        fn insert(&mut self, stream: StreamId, priority: HttpPriority) -> bool {
+            if self.entry(stream).is_some() {
+                return false;
+            }
+            self.entries.push(SchedulerModelEntry {
+                stream,
+                priority,
+                enqueued: false,
+                sequence: 0,
+            });
+            true
+        }
+
+        fn update(&mut self, stream: StreamId, priority: HttpPriority) -> bool {
+            let sequence = self.sequence();
+            let Some(entry) = self.entry(stream) else {
+                return false;
+            };
+            entry.priority = priority;
+            entry.sequence = sequence;
+            true
+        }
+
+        fn enqueue(&mut self, stream: StreamId) -> bool {
+            let sequence = self.sequence();
+            let Some(entry) = self.entry(stream) else {
+                return false;
+            };
+            if entry.enqueued || entry.priority.paused {
+                return false;
+            }
+            entry.enqueued = true;
+            entry.sequence = sequence;
+            true
+        }
+
+        fn consume(&mut self, stream: StreamId, bytes: usize) -> bool {
+            let sequence = self.sequence();
+            let Some(entry) = self.entry(stream) else {
+                return false;
+            };
+            if entry.enqueued && bytes != 0 && entry.priority.incremental && !entry.priority.paused
+            {
+                entry.sequence = sequence;
+            }
+            entry.enqueued
+        }
+
+        fn dequeue(&mut self, stream: StreamId) -> bool {
+            let Some(entry) = self.entry(stream) else {
+                return false;
+            };
+            std::mem::replace(&mut entry.enqueued, false)
+        }
+
+        fn remove(&mut self, stream: StreamId) -> bool {
+            let before = self.entries.len();
+            self.entries.retain(|entry| entry.stream != stream);
+            self.entries.len() != before
+        }
+
+        /// The selectable streams in selection order.
+        fn order(&self) -> Vec<StreamId> {
+            let mut queued: Vec<_> = self
+                .entries
+                .iter()
+                .filter(|entry| entry.enqueued && !entry.priority.paused)
+                .collect();
+            queued.sort_by_key(|entry| {
+                let within = if entry.priority.incremental {
+                    (1, 0, 0, entry.sequence)
+                } else {
+                    (0, entry.priority.order_id, entry.stream.get(), 0)
+                };
+                (entry.priority.urgency.min(7), within)
+            });
+            queued.into_iter().map(|entry| entry.stream).collect()
+        }
+    }
+
+    /// The scheduler selects and visits streams in the reference model's order through every
+    /// sequence of operations a session issues, from one queued stream to many: inserting,
+    /// enqueueing, pausing, priority updates, incremental rotation, dequeueing and removal.
+    #[test]
+    fn priority_scheduler_matches_its_reference_model() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut random = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        for round in 0..64 {
+            let mut scheduler = Http2PriorityScheduler::new();
+            let mut model = SchedulerModel::default();
+            let streams = 1 + random(6);
+            for step in 0..400 {
+                let stream = StreamId::new(2 * random(streams) + 1);
+                let priority = HttpPriority::new(
+                    random(3) as u8 * 3,
+                    random(2) == 0,
+                    random(4) as u32,
+                    random(8) == 0,
+                    0,
+                );
+                let (operation, scheduled, modeled) = match random(9) {
+                    0 | 1 => (
+                        "insert",
+                        scheduler.insert(stream, priority),
+                        model.insert(stream, priority),
+                    ),
+                    2..=4 => ("enqueue", scheduler.enqueue(stream), model.enqueue(stream)),
+                    5 => (
+                        "update",
+                        scheduler.update(stream, priority),
+                        model.update(stream, priority),
+                    ),
+                    6 => {
+                        let bytes = random(2) as usize;
+                        (
+                            "consume",
+                            scheduler.consume(stream, bytes),
+                            model.consume(stream, bytes),
+                        )
+                    }
+                    7 => ("dequeue", scheduler.dequeue(stream), model.dequeue(stream)),
+                    _ => ("remove", scheduler.remove(stream), model.remove(stream)),
+                };
+                let at = format!("round {round}, step {step}: {operation} {stream:?}");
+                assert_eq!(scheduled, modeled, "{at}");
+                let order = model.order();
+                assert_eq!(scheduler.next(), order.first().copied(), "{at}");
+                let mut visited = Vec::new();
+                assert_eq!(
+                    scheduler.next_matching(|candidate| {
+                        visited.push(candidate);
+                        false
+                    }),
+                    None,
+                    "{at}"
+                );
+                assert_eq!(visited, order, "{at}");
+                if let Some(&last) = order.last() {
+                    assert_eq!(
+                        scheduler.next_matching(|candidate| candidate == last),
+                        Some(last),
+                        "{at}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A lone queued stream, ordered or incremental, stays out of the urgency queues through
+    /// selection, consumption and a priority update; a second queued stream moves both into them.
+    #[test]
+    fn priority_scheduler_keeps_a_lone_queued_stream_out_of_the_urgency_queues() {
+        let mut scheduler = Http2PriorityScheduler::new();
+        let ordered = StreamId::new(1);
+        let incremental = StreamId::new(3);
+        let priority = HttpPriority::from_urgency_and_incremental;
+        assert!(scheduler.insert(ordered, priority(3, false)));
+        assert!(scheduler.insert(incremental, priority(3, true)));
+
+        assert!(scheduler.enqueue(ordered));
+        assert_eq!(scheduler.next(), Some(ordered));
+        assert!(scheduler.consume(ordered, 1));
+        assert!(scheduler.update(ordered, priority(1, false)));
+        assert_eq!(
+            scheduler.urgency_queue_entries_for_test(),
+            0,
+            "the only queued stream is held outside the urgency queues"
+        );
+
+        assert!(scheduler.enqueue(incremental));
+        assert_eq!(
+            scheduler.urgency_queue_entries_for_test(),
+            2,
+            "a second queued stream moves both streams into the urgency queues"
+        );
+        assert_eq!(scheduler.next(), Some(ordered));
+        assert!(scheduler.dequeue(ordered));
+        assert!(scheduler.dequeue(incremental));
+        assert_eq!(scheduler.urgency_queue_entries_for_test(), 0);
+
+        assert!(scheduler.enqueue(incremental));
+        assert_eq!(scheduler.next(), Some(incremental));
+        assert_eq!(
+            scheduler.urgency_queue_entries_for_test(),
+            0,
+            "a lone incremental stream is held outside the urgency queues too"
+        );
+        assert!(scheduler.remove(incremental));
+        assert_eq!(scheduler.next(), None);
+    }
+
     #[test]
     fn stream_window_updates_preserve_signed_accounting() {
         let stream = StreamId::new(1);
