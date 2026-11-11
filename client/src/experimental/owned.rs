@@ -140,6 +140,7 @@ use crate::connector::wait_session_completion;
 use crate::pool::PoolState;
 use crate::pool::PooledSession;
 use crate::pool::SessionSlot;
+use crate::pool::count_pool_stats;
 use crate::pool::notify_session_event;
 use crate::pool::record_reservation;
 use crate::pool::record_returning;
@@ -148,6 +149,7 @@ mod pool;
 
 pub use pool::OwnedGetSessionResult;
 pub use pool::OwnedHttpSessionPool;
+pub use pool::OwnedPoolStats;
 pub use pool::OwnedSessionAcquisition;
 pub use pool::OwnedSessionSelection;
 
@@ -236,10 +238,21 @@ enum PoolEvent {
     Idle,
 }
 
-/// The driver's capacity and admission callbacks, which feed the pool's
-/// notifications.
+/// The driver's callbacks, which feed the pool's notifications and counters.
 struct PoolObserver {
     session: Weak<SessionInner>,
+    /// Apart from `session`: once the pool drops a session whose admission closed and its
+    /// handles are gone, the driver still reports its streams' resets.
+    pool: Weak<RefCell<PoolState>>,
+}
+
+impl PoolObserver {
+    /// Counts in the pool's stats (`DIV-032`).
+    fn count(&self, count: impl FnOnce(&mut OwnedPoolStats)) {
+        if let Some(pool) = self.pool.upgrade() {
+            count_pool_stats(&pool, count);
+        }
+    }
 }
 
 impl OwnedUpstreamObserver for PoolObserver {
@@ -251,9 +264,34 @@ impl OwnedUpstreamObserver for PoolObserver {
 
     fn admission_closed(&self) {
         if let Some(inner) = self.session.upgrade() {
-            inner.pool.draining.set(true);
+            let retired = inner.pool.draining.replace(true);
+            let peer_goaway = match &inner.upstream {
+                Upstream::Http2(handle) if !retired => handle.peer_goaway(),
+                _ => None,
+            };
+            if retired || peer_goaway.is_some() {
+                self.count(|stats| match peer_goaway {
+                    None => stats.local_drains += 1,
+                    Some(code) => {
+                        stats.peer_goaways += 1;
+                        if code != HttpErrorCode::NO_ERROR {
+                            stats.peer_goaway_errors += 1;
+                        }
+                    }
+                });
+            }
             notify_pool(&inner, PoolEvent::AdmissionClosed);
         }
+    }
+
+    fn peer_reset(&self, code: HttpErrorCode) {
+        self.count(|stats| {
+            if code == HttpErrorCode::REFUSED_STREAM {
+                stats.refused_streams += 1;
+            } else {
+                stats.reset_streams += 1;
+            }
+        });
     }
 }
 
@@ -682,11 +720,12 @@ impl OwnedClientSession {
         pool: Weak<RefCell<PoolState>>,
         unsettled: Option<Rc<Cell<bool>>>,
     ) {
-        self.inner.pool.pool.replace(Some(pool));
+        self.inner.pool.pool.replace(Some(Weak::clone(&pool)));
         self.inner.pool.unsettled.replace(unsettled);
         self.inner.pool.reported_idle.set(self.is_idle());
         let observer = Rc::new(PoolObserver {
             session: Rc::downgrade(&self.inner),
+            pool,
         });
         // A finished session refuses the observer; the pool drops it at its next turn.
         let _ = match &self.inner.upstream {

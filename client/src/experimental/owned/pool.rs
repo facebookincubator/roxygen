@@ -61,6 +61,49 @@ pub enum OwnedSessionSelection {
     LeastLoaded,
 }
 
+/// A snapshot of an [`OwnedHttpSessionPool`]'s counters (`DIV-032`), which the pool keeps
+/// on its worker and updates only on its slow paths: dials, waits, admission closes,
+/// session completions and peer stream resets. Every field but `waiters` only grows.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct OwnedPoolStats {
+    /// Sessions the pool's dials established and added to the pool.
+    pub sessions_opened: u64,
+    /// Of those, the sessions whose run has completed, cleanly or not.
+    pub sessions_closed: u64,
+    /// Dial attempts, retries included.
+    pub connect_attempts: u64,
+    /// Dial attempts that failed.
+    pub connect_failures: u64,
+    /// Sessions whose admission a peer's GOAWAY closed, counted when it closed, before the
+    /// session's streams finish: a `NO_ERROR` GOAWAY, which drains the connection, as well
+    /// as one with an error code. A GOAWAY that arrives after admission closed for another
+    /// reason is not counted.
+    pub peer_goaways: u64,
+    /// Of `peer_goaways`, those whose GOAWAY carried a code other than `NO_ERROR`.
+    pub peer_goaway_errors: u64,
+    /// Sessions whose admission the pool closed to retire them: at `max_age` or
+    /// `idle_timeout`, at their release when `max_connections` is zero, or in the pool's
+    /// drain.
+    pub local_drains: u64,
+    /// Streams the peer refused, unprocessed: with an RST_STREAM carrying
+    /// `REFUSED_STREAM`, or with a GOAWAY whose last stream precedes them. Counted at the
+    /// refusal, also on a session the pool no longer holds, as after a GOAWAY.
+    pub refused_streams: u64,
+    /// Streams the peer reset with an RST_STREAM carrying another code, counted as
+    /// `refused_streams` are; not a `NO_ERROR` reset after the stream's whole response,
+    /// which stops only its upload (`DIV-050`).
+    pub reset_streams: u64,
+    /// Acquisitions waiting now for a session, a stream slot or a dial.
+    pub waiters: usize,
+    /// The most acquisitions that waited at once.
+    pub peak_waiters: usize,
+    /// Acquisitions that failed with [`PoolError::Timeout`].
+    pub acquisition_timeouts: u64,
+    /// Acquisitions refused with [`PoolError::MaxWaiters`].
+    pub max_waiters_rejections: u64,
+}
+
 /// One reservation on the session an acquisition selected.
 pub struct OwnedGetSessionResult {
     pub reservation: OwnedClientReservation,
@@ -184,6 +227,11 @@ impl OwnedHttpSessionPool {
 
     pub fn session_count(&self) -> usize {
         self.0.session_count()
+    }
+
+    /// The pool's counters now (`DIV-032`).
+    pub fn stats(&self) -> OwnedPoolStats {
+        self.0.owned_stats()
     }
 
     /// No session, waiter or pending connect.

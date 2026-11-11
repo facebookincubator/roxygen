@@ -25,6 +25,8 @@ pub(super) struct Admission {
     /// Requests committed on the connection (`DIV-035`).
     committed: Cell<u64>,
     closed: RefCell<Option<HttpError>>,
+    /// The code of the peer GOAWAY that closed admission, when one did before anything else.
+    peer_goaway: Cell<Option<HttpErrorCode>>,
     observer: RefCell<Option<Rc<dyn OwnedUpstreamObserver>>>,
     queued: RefCell<VecDeque<Submission>>,
     /// Set while the owning driver is polling.
@@ -45,6 +47,7 @@ impl Admission {
             used: Cell::new(0),
             committed: Cell::new(0),
             closed: RefCell::new(None),
+            peer_goaway: Cell::new(None),
             observer: RefCell::new(None),
             queued: RefCell::new(VecDeque::new()),
             polling: Cell::new(false),
@@ -104,6 +107,27 @@ impl Admission {
         }
     }
 
+    /// Closes admission for a peer GOAWAY carrying `code`, which `peer_goaway` then reports
+    /// if admission was open.
+    pub(super) fn close_for_peer_goaway(&self, code: HttpErrorCode) {
+        if self.closed.borrow().is_none() {
+            self.peer_goaway.set(Some(code));
+        }
+        self.close(failure(
+            HttpErrorCode::REFUSED_STREAM,
+            b"peer GOAWAY closed admission",
+        ));
+    }
+
+    pub(super) fn peer_reset(&self, code: HttpErrorCode) {
+        let observer = self.observer.borrow().clone();
+        let mut panic = None;
+        if let Some(observer) = observer {
+            capture(&mut panic, || observer.peer_reset(code));
+        }
+        finish_panic(panic);
+    }
+
     pub(super) fn close(&self, error: HttpError) {
         let changed = {
             let mut closed = self.closed.borrow_mut();
@@ -155,6 +179,12 @@ impl OwnedH2UpstreamHandle {
         } else {
             self.admission.available()
         }
+    }
+
+    /// The code of the peer GOAWAY that closed admission, if one closed it while it was open;
+    /// set before the observer's `admission_closed`.
+    pub fn peer_goaway(&self) -> Option<HttpErrorCode> {
+        self.admission.peer_goaway.get()
     }
 
     /// Reservations and streams holding an admission slot: what `available_capacity` subtracts

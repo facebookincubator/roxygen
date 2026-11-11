@@ -12,8 +12,11 @@ use std::cell::RefCell;
 use std::convert::Infallible;
 use std::future::Future;
 use std::future::poll_fn;
+use std::io::Read;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::net::TcpListener;
+use std::net::TcpStream;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::pin::pin;
@@ -21,6 +24,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Wake;
@@ -39,6 +43,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
+use roxygen_core::buf_queue::BufQueue;
 use roxygen_core::connection::TransportEndpoint;
 use roxygen_core::error::HttpErrorCode;
 use roxygen_core::events::HttpHeaderEvent;
@@ -48,6 +53,7 @@ use roxygen_core::handler::HttpHandler;
 use roxygen_core::handler::HttpHandlerRef;
 use roxygen_core::handler::LocalHandlerFuture;
 use roxygen_core::http::CodecProtocol;
+use roxygen_core::http::HttpMethod;
 use roxygen_core::message::SocketAddress;
 use roxygen_core::source::HttpSource;
 use roxygen_core::source_holder::HttpSourceHolder;
@@ -76,6 +82,7 @@ use crate::experimental::owned::OwnedClientResponse;
 use crate::experimental::owned::OwnedClientSession;
 use crate::experimental::owned::OwnedGetSessionResult;
 use crate::experimental::owned::OwnedHttpSessionPool;
+use crate::experimental::owned::OwnedPoolStats;
 use crate::experimental::owned::OwnedSessionSelection;
 use crate::experimental::owned::worker_admission_checks_for_test;
 use crate::pool::GetSessionResult;
@@ -4950,4 +4957,596 @@ fn a_released_session_wakes_its_waiter_in_one_pool_batch_pass() {
             "{protocol:?}: one pass signals the one waiter, which takes the released session"
         );
     }
+}
+
+/// `stats` after one exchange on each protocol's pool, and after the pool's drain:
+/// one dial, which the exchange's acquisition waited for, one session opened, and
+/// that session closed by the pool's drain, which closed its admission first.
+#[test]
+fn stats_count_the_sessions_a_pool_opens_and_closes() {
+    for protocol in PROTOCOLS {
+        let origin = Origin::start(protocol);
+        let address = origin.address;
+        let (served, drained) = run_on_worker(move |context| async move {
+            let pool = pool(&context, address, protocol, 1);
+            one_exchange(&pool).await;
+            let served = pool.stats();
+            pool.drain_and_join().await.expect("pool joins");
+            (served, pool.stats())
+        });
+        let served_expected = OwnedPoolStats {
+            sessions_opened: 1,
+            connect_attempts: 1,
+            peak_waiters: 1,
+            ..OwnedPoolStats::default()
+        };
+        assert_eq!(served, served_expected, "{protocol:?}: after one exchange");
+        assert_eq!(
+            drained,
+            OwnedPoolStats {
+                sessions_closed: 1,
+                local_drains: 1,
+                ..served_expected
+            },
+            "{protocol:?}: after the drain"
+        );
+    }
+}
+
+/// A dial refused three times, its attempts all retried for the one waiter.
+#[test]
+fn stats_count_connect_attempts_and_failures() {
+    let address = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        listener.local_addr().expect("address")
+    };
+    let (error, stats) = run_on_worker(move |context| async move {
+        let pool = pool_with(
+            &context,
+            address,
+            CodecProtocol::Http2,
+            PoolParams {
+                max_connection_attempts: 3,
+                ..params(1)
+            },
+            untimed(),
+        );
+        let error = pool
+            .get_session_with_reservation(CancellationToken::never())
+            .await
+            .err();
+        (error, pool.stats())
+    });
+    assert!(
+        matches!(error, Some(PoolError::ConnectFailed { .. })),
+        "{error:?}"
+    );
+    assert_eq!(
+        stats,
+        OwnedPoolStats {
+            connect_attempts: 3,
+            connect_failures: 3,
+            peak_waiters: 1,
+            ..OwnedPoolStats::default()
+        }
+    );
+}
+
+/// Two acquisitions wait for the only stream of a pool with `max_waiters` 2, a third is
+/// refused, a step past the deadline times out, and the two waiters time out.
+#[test]
+fn stats_count_waiters_timeouts_and_max_waiter_rejections() {
+    let origin = Origin::start(CodecProtocol::Http2);
+    let address = origin.address;
+    let (waiting, refused, ended) = run_on_worker(move |context| async move {
+        let pool = pool_with(
+            &context,
+            address,
+            CodecProtocol::Http2,
+            PoolParams {
+                max_waiters: 2,
+                connect_timeout: Duration::from_millis(300),
+                ..params(1)
+            },
+            one_stream(CodecProtocol::Http2),
+        );
+        let _held = acquire(&pool).await;
+        let mut first = pin!(pool.get_session_with_reservation(CancellationToken::never()));
+        let mut second = pin!(pool.get_session_with_reservation(CancellationToken::never()));
+        assert!(poll_once(first.as_mut()).await.is_pending());
+        assert!(poll_once(second.as_mut()).await.is_pending());
+        let waiting = pool.stats();
+        let refused = pool
+            .get_session_with_reservation(CancellationToken::never())
+            .await
+            .err();
+        assert!(
+            matches!(refused, Some(PoolError::MaxWaiters)),
+            "{refused:?}"
+        );
+        let late = pool.acquisition_step_for_test(Instant::now() - TIMEOUT);
+        assert!(matches!(late, Err(PoolError::Timeout)), "{late:?}");
+        let refused_stats = pool.stats();
+        for waiter in [first, second] {
+            let error = waiter.await.err();
+            assert!(matches!(error, Some(PoolError::Timeout)), "{error:?}");
+        }
+        (waiting, refused_stats, pool.stats())
+    });
+    let waiting_expected = OwnedPoolStats {
+        sessions_opened: 1,
+        connect_attempts: 1,
+        waiters: 2,
+        peak_waiters: 2,
+        ..OwnedPoolStats::default()
+    };
+    assert_eq!(waiting, waiting_expected, "two acquisitions wait");
+    let refused_expected = OwnedPoolStats {
+        acquisition_timeouts: 1,
+        max_waiters_rejections: 1,
+        ..waiting_expected
+    };
+    assert_eq!(
+        refused, refused_expected,
+        "a third is refused, a late step times out"
+    );
+    assert_eq!(
+        ended,
+        OwnedPoolStats {
+            waiters: 0,
+            acquisition_timeouts: 3,
+            ..refused_expected
+        },
+        "both waiters time out"
+    );
+}
+
+const HEADERS: u8 = 1;
+const RST_STREAM: u8 = 3;
+const SETTINGS: u8 = 4;
+const GOAWAY: u8 = 7;
+const ACK: u8 = 1;
+/// END_STREAM | END_HEADERS.
+const END_STREAM_HEADERS: u8 = 0x5;
+/// HPACK: `:status: 200`, static table index 8.
+const STATUS_200: [u8; 1] = [0x88];
+const NO_ERROR: u32 = 0;
+const INTERNAL_ERROR: u32 = 2;
+const REFUSED_STREAM: u32 = 7;
+const ENHANCE_YOUR_CALM: u32 = 0xb;
+
+fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let length = u32::try_from(payload.len())
+        .expect("small frame")
+        .to_be_bytes();
+    let mut frame = vec![length[1], length[2], length[3], kind, flags];
+    frame.extend_from_slice(&stream.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn goaway(last_stream: u32, code: u32) -> Vec<u8> {
+    let mut payload = last_stream.to_be_bytes().to_vec();
+    payload.extend_from_slice(&code.to_be_bytes());
+    frame(GOAWAY, 0, 0, &payload)
+}
+
+/// Reads one frame: its type, flags and stream; `None` at EOF or a reset.
+fn read_frame(stream: &mut TcpStream) -> Option<(u8, u8, u32)> {
+    let mut header = [0; 9];
+    stream.read_exact(&mut header).ok()?;
+    let length = u32::from_be_bytes([0, header[0], header[1], header[2]]);
+    let mut payload = vec![0; usize::try_from(length).expect("small frame")];
+    stream.read_exact(&mut payload).ok()?;
+    let id = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) & 0x7fff_ffff;
+    Some((header[3], header[4], id))
+}
+
+/// Reads the client's frames, acknowledging its SETTINGS, until it has sent `count`
+/// HEADERS frames, and returns their streams.
+fn read_requests(stream: &mut TcpStream, count: usize) -> Vec<u32> {
+    let mut requests = Vec::new();
+    while requests.len() < count {
+        let (kind, flags, id) = read_frame(stream).expect("a client frame");
+        if kind == SETTINGS && flags & ACK == 0 {
+            stream
+                .write_all(&frame(SETTINGS, ACK, 0, &[]))
+                .expect("peer acknowledges");
+        } else if kind == HEADERS {
+            requests.push(id);
+        }
+    }
+    requests
+}
+
+/// A raw HTTP/2 peer for one connection on loopback, on its own thread, whose accept and
+/// reads each give up after `TIMEOUT`. Dropping it joins the thread and raises a panic of
+/// its script, unless the test already fails.
+struct RawPeer {
+    address: SocketAddr,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for RawPeer {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take()
+            && !std::thread::panicking()
+            && let Err(panic) = thread.join()
+        {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+/// Starts a [`RawPeer`] that reads the client's preface, sends empty SETTINGS, runs
+/// `script`, then reads until the client closes.
+fn raw_http2_peer(script: impl FnOnce(&mut TcpStream) + Send + 'static) -> RawPeer {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("peer binds");
+    let address = listener.local_addr().expect("peer address");
+    listener
+        .set_nonblocking(true)
+        .expect("peer polls its listener");
+    let thread = std::thread::spawn(move || {
+        let started = Instant::now();
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && started.elapsed() < TIMEOUT =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("peer accepts: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).expect("peer blocks");
+        stream
+            .set_read_timeout(Some(TIMEOUT))
+            .expect("peer bounds its reads");
+        let mut preface = [0; 24];
+        stream.read_exact(&mut preface).expect("client preface");
+        stream
+            .write_all(&frame(SETTINGS, 0, 0, &[]))
+            .expect("peer SETTINGS");
+        script(&mut stream);
+        while read_frame(&mut stream).is_some() {}
+    });
+    RawPeer {
+        address,
+        thread: Some(thread),
+    }
+}
+
+/// A NO_ERROR GOAWAY that covers the one request in flight is counted when it closes the
+/// session's admission, while the request waits for its response; the session closes
+/// cleanly once the response ends.
+#[test]
+fn stats_count_a_no_error_goaway_when_it_closes_admission() {
+    let (release, released) = mpsc::channel::<()>();
+    let peer = raw_http2_peer(move |stream| {
+        let requests = read_requests(stream, 1);
+        stream
+            .write_all(&goaway(requests[0], NO_ERROR))
+            .expect("peer drains");
+        released.recv().expect("the client releases the response");
+        stream
+            .write_all(&frame(
+                HEADERS,
+                END_STREAM_HEADERS,
+                requests[0],
+                &STATUS_200,
+            ))
+            .expect("peer responds");
+    });
+    let address = peer.address;
+    let (admission_closed, closed) = run_on_worker(move |context| async move {
+        let pool = pool(&context, address, CodecProtocol::Http2, 1);
+        let acquired = acquire(&pool).await;
+        let response = submit(acquired.reservation, "/").await;
+        until(|| pool.stats().peer_goaways != 0).await;
+        let admission_closed = pool.stats();
+        release.send(()).expect("the peer waits");
+        assert_eq!(read_body(response).await, b"");
+        acquired
+            .session
+            .wait_closed()
+            .await
+            .expect("the session closes cleanly");
+        (admission_closed, pool.stats())
+    });
+    let admission_closed_expected = OwnedPoolStats {
+        sessions_opened: 1,
+        connect_attempts: 1,
+        peak_waiters: 1,
+        peer_goaways: 1,
+        ..OwnedPoolStats::default()
+    };
+    assert_eq!(
+        admission_closed, admission_closed_expected,
+        "counted while the session still has a stream in flight"
+    );
+    assert_eq!(
+        closed,
+        OwnedPoolStats {
+            sessions_closed: 1,
+            ..admission_closed_expected
+        }
+    );
+}
+
+/// A GOAWAY with an error code fails the session; it is counted as a peer GOAWAY and as
+/// an error.
+#[test]
+fn stats_count_a_goaway_with_an_error_code() {
+    let peer = raw_http2_peer(|stream| {
+        let requests = read_requests(stream, 1);
+        stream
+            .write_all(&goaway(requests[0], ENHANCE_YOUR_CALM))
+            .expect("peer fails the connection");
+    });
+    let address = peer.address;
+    let (status, closed, stats) = run_on_worker(move |context| async move {
+        let pool = pool(&context, address, CodecProtocol::Http2, 1);
+        let acquired = acquire(&pool).await;
+        let (status, _) = outcome(acquired.reservation).await;
+        let closed = acquired
+            .session
+            .wait_closed()
+            .await
+            .err()
+            .map(|error| error.code());
+        until(|| pool.stats().sessions_closed != 0).await;
+        (status, closed, pool.stats())
+    });
+    assert_eq!(
+        (status.is_err(), closed),
+        (true, Some(HttpErrorCode::ENHANCE_YOUR_CALM)),
+        "{status:?}"
+    );
+    assert_eq!(
+        stats,
+        OwnedPoolStats {
+            sessions_opened: 1,
+            sessions_closed: 1,
+            connect_attempts: 1,
+            peak_waiters: 1,
+            peer_goaways: 1,
+            peer_goaway_errors: 1,
+            ..OwnedPoolStats::default()
+        }
+    );
+}
+
+/// A session past `max_age` that an acquisition retires, and the pool's drain of its
+/// replacement, are local drains. Each session counts once, under the reason that closed
+/// its admission first: no GOAWAY the origin sends back is counted.
+#[test]
+fn stats_count_local_drains_once_per_session() {
+    for protocol in PROTOCOLS {
+        let origin = Origin::start(protocol);
+        let address = origin.address;
+        let (aged, drained) = run_on_worker(move |context| async move {
+            let pool = pool_with(
+                &context,
+                address,
+                protocol,
+                PoolParams {
+                    // Sampled between 70% and 130%.
+                    max_age: Duration::from_millis(40),
+                    ..params(1)
+                },
+                untimed(),
+            );
+            let first = one_exchange(&pool).await;
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let second = one_exchange(&pool).await;
+            assert_ne!(
+                local(&first),
+                local(&second),
+                "the aged session is replaced"
+            );
+            first.wait_closed().await.expect("the aged session closes");
+            until(|| pool.stats().sessions_closed == 1).await;
+            let aged = pool.stats();
+            pool.drain_and_join().await.expect("pool joins");
+            (aged, pool.stats())
+        });
+        assert_eq!(
+            (
+                aged.sessions_opened,
+                aged.sessions_closed,
+                aged.local_drains,
+                aged.peer_goaways
+            ),
+            (2, 1, 1, 0),
+            "{protocol:?}: (opened, closed, local drains, peer GOAWAYs) once the aged session closed"
+        );
+        assert_eq!(
+            (
+                drained.sessions_opened,
+                drained.sessions_closed,
+                drained.local_drains,
+                drained.peer_goaways
+            ),
+            (2, 2, 2, 0),
+            "{protocol:?}: (opened, closed, local drains, peer GOAWAYs) after the pool's drain"
+        );
+    }
+}
+
+/// The peer refuses one stream and resets another, which are counted while the session
+/// stays open; then a GOAWAY whose last stream precedes a request in flight refuses it.
+#[test]
+fn stats_count_the_streams_a_peer_refuses_or_resets() {
+    let peer = raw_http2_peer(|stream| {
+        let requests = read_requests(stream, 2);
+        let mut reply = frame(RST_STREAM, 0, requests[0], &REFUSED_STREAM.to_be_bytes());
+        reply.extend(frame(
+            RST_STREAM,
+            0,
+            requests[1],
+            &INTERNAL_ERROR.to_be_bytes(),
+        ));
+        stream.write_all(&reply).expect("peer resets");
+        let requests = read_requests(stream, 2);
+        let mut reply = frame(HEADERS, END_STREAM_HEADERS, requests[0], &STATUS_200);
+        reply.extend(goaway(requests[0], NO_ERROR));
+        stream.write_all(&reply).expect("peer answers and drains");
+    });
+    let address = peer.address;
+    let (reset, reset_open, goaway_refused) = run_on_worker(move |context| async move {
+        let pool = pool(&context, address, CodecProtocol::Http2, 1);
+        let mut rounds = Vec::new();
+        for _ in 0..2 {
+            let acquired = hold(&pool, 2).await;
+            let session = acquired[0].session.clone();
+            let mut outcomes: Vec<(Result<u16, HttpErrorCode>, bool)> = futures::stream::iter(
+                acquired
+                    .into_iter()
+                    .map(|acquired| outcome(acquired.reservation)),
+            )
+            .buffered(2)
+            .collect()
+            .await;
+            outcomes.sort();
+            rounds.push((outcomes, pool.stats(), !session.is_finished()));
+        }
+        let [(first, reset, open), (second, refused, _)] = &rounds[..] else {
+            panic!("two rounds ran");
+        };
+        assert_eq!(
+            first,
+            &[
+                (Err(HttpErrorCode::INTERNAL_ERROR), false),
+                (Err(HttpErrorCode::REFUSED_STREAM), true),
+            ],
+            "the first round's outcomes"
+        );
+        assert_eq!(
+            second,
+            &[(Ok(200), false), (Err(HttpErrorCode::REFUSED_STREAM), true)],
+            "the second round's outcomes"
+        );
+        (*reset, *open, *refused)
+    });
+    assert_eq!(
+        (reset.refused_streams, reset.reset_streams, reset_open),
+        (1, 1, true),
+        "(refused, reset, session open) after the resets"
+    );
+    assert_eq!(
+        (
+            goaway_refused.refused_streams,
+            goaway_refused.reset_streams,
+            goaway_refused.peer_goaways
+        ),
+        (2, 1, 1),
+        "(refused, reset, peer GOAWAYs) after the GOAWAY"
+    );
+}
+
+/// Resets on a session that the pool dropped when a GOAWAY closed its admission, and whose
+/// handles are all gone, are counted: an RST_STREAM on a stream the GOAWAY covered, and a
+/// second GOAWAY that refuses another.
+#[test]
+fn stats_count_resets_on_a_session_the_pool_dropped() {
+    let peer = raw_http2_peer(|stream| {
+        let requests = read_requests(stream, 2);
+        let mut reply = goaway(requests[1], NO_ERROR);
+        reply.extend(frame(
+            RST_STREAM,
+            0,
+            requests[0],
+            &INTERNAL_ERROR.to_be_bytes(),
+        ));
+        reply.extend(goaway(requests[0], NO_ERROR));
+        stream
+            .write_all(&reply)
+            .expect("peer drains, resets and refuses");
+    });
+    let address = peer.address;
+    let (outcomes, stats, sessions) = run_on_worker(move |context| async move {
+        let pool = pool(&context, address, CodecProtocol::Http2, 1);
+        let reservations: Vec<_> = hold(&pool, 2)
+            .await
+            .into_iter()
+            .map(|acquired| acquired.reservation)
+            .collect();
+        let mut outcomes: Vec<(Result<u16, HttpErrorCode>, bool)> =
+            futures::stream::iter(reservations.into_iter().map(outcome))
+                .buffered(2)
+                .collect()
+                .await;
+        outcomes.sort();
+        (outcomes, pool.stats(), pool.session_count())
+    });
+    assert_eq!(
+        outcomes,
+        [
+            (Err(HttpErrorCode::INTERNAL_ERROR), false),
+            (Err(HttpErrorCode::REFUSED_STREAM), true),
+        ]
+    );
+    assert_eq!(
+        (
+            stats.refused_streams,
+            stats.reset_streams,
+            stats.peer_goaways,
+            sessions
+        ),
+        (1, 1, 1, 0),
+        "(refused, reset, peer GOAWAYs, pooled sessions)"
+    );
+}
+
+/// A peer's NO_ERROR reset after a stream's whole response stops only its upload
+/// (`DIV-050`) and is not counted; one before the response fails the stream and is.
+#[test]
+fn stats_count_a_no_error_reset_only_before_the_whole_response() {
+    let peer = raw_http2_peer(|stream| {
+        let requests = read_requests(stream, 2);
+        let mut reply = frame(HEADERS, END_STREAM_HEADERS, requests[0], &STATUS_200);
+        reply.extend(frame(RST_STREAM, 0, requests[0], &NO_ERROR.to_be_bytes()));
+        reply.extend(frame(RST_STREAM, 0, requests[1], &NO_ERROR.to_be_bytes()));
+        stream
+            .write_all(&reply)
+            .expect("peer answers the upload and resets both");
+    });
+    let address = peer.address;
+    let (body, get, stats) = run_on_worker(move |context| async move {
+        let pool = pool(&context, address, CodecProtocol::Http2, 1);
+        let mut held = hold(&pool, 2).await;
+        let get = held.pop().expect("two acquisitions");
+        let upload = held.pop().expect("two acquisitions");
+        // Larger than the peer's initial windows, which it never opens: the upload stays open.
+        let size = 128 * 1024;
+        let upload_body =
+            BufQueue::copy_from_slice(&vec![0x5a; size], size).expect("bounded upload");
+        let mut source = HttpSourceHolder::new(Box::new(
+            HttpFixedSource::make_fixed_request("/", HttpMethod::Post, Some(upload_body))
+                .expect("valid request"),
+        ));
+        let mut head = source.read_header_event().await.expect("request head");
+        head.headers_mut()
+            .headers_mut()
+            .add("host", "origin.example");
+        let response = upload
+            .reservation
+            .submit(head, source, CancellationToken::never())
+            .await
+            .expect("request is committed");
+        let (body, get) = tokio::join!(read_body(response), outcome(get.reservation));
+        (body, get.0, pool.stats())
+    });
+    assert_eq!(
+        (body, get),
+        (Vec::new(), Err(HttpErrorCode::CANCEL)),
+        "the upload's response stays whole; the request reset before its response fails"
+    );
+    assert_eq!(
+        (stats.refused_streams, stats.reset_streams),
+        (0, 1),
+        "(refused, reset)"
+    );
 }

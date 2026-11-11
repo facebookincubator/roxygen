@@ -60,6 +60,7 @@ use crate::connector::ResolvedHost;
 use crate::connector::SessionConnector;
 use crate::connector::SessionParams;
 use crate::experimental::owned::OwnedClientSession;
+use crate::experimental::owned::OwnedPoolStats;
 use crate::experimental::owned::OwnedSessionSelection;
 use crate::experimental::owned::worker_admits;
 use crate::pool::session_list::Class;
@@ -1187,6 +1188,8 @@ pub(crate) struct PoolState {
     /// Steps and releases take the pool's passes, as without an index.
     #[cfg(test)]
     force_scans: Cell<bool>,
+    /// The counters an owned pool reports (`DIV-032`), except `waiters`, the list's length.
+    stats: OwnedPoolStats,
     next_waiter_id: u64,
     pooling_enabled: bool,
     draining: bool,
@@ -2459,6 +2462,8 @@ impl Drop for OwnershipGuard {
 struct SessionCompletion {
     closed: LocalClientFuture<Result<(), HttpError>>,
     ownership: Rc<SessionOwnership>,
+    /// The session joined the pool, whose stats counted it opened and count it closed.
+    counted: bool,
 }
 
 impl SessionCompletion {
@@ -2467,6 +2472,7 @@ impl SessionCompletion {
         Self {
             closed: Box::pin(async move { closed.await.map(|_| ()) }),
             ownership,
+            counted: false,
         }
     }
 
@@ -2475,12 +2481,20 @@ impl SessionCompletion {
             biased;
             _ = self.ownership.transferred.wait(CancellationToken::never()) => {}
             result = self.closed => {
+                if self.counted && let Some(pool) = self.ownership.pool.upgrade() {
+                    pool.borrow_mut().stats.sessions_closed += 1;
+                }
                 if let Err(source) = result {
                     tasks.fail(PoolError::SessionJoin { source });
                 }
             }
         }
     }
+}
+
+/// Counts in `pool`'s stats (`DIV-032`).
+pub(crate) fn count_pool_stats(pool: &RefCell<PoolState>, count: impl FnOnce(&mut OwnedPoolStats)) {
+    count(&mut pool.borrow_mut().stats);
 }
 
 enum ConnectionFactory {
@@ -2756,6 +2770,7 @@ impl HttpSessionPool {
                 claim_scans: Cell::default(),
                 #[cfg(test)]
                 force_scans: Cell::default(),
+                stats: OwnedPoolStats::default(),
                 next_waiter_id: 1,
                 pooling_enabled,
                 draining: false,
@@ -3270,6 +3285,15 @@ impl HttpSessionPool {
         self.state.borrow().sessions.len()
     }
 
+    /// The counters an owned pool reports (`DIV-032`).
+    pub(crate) fn owned_stats(&self) -> OwnedPoolStats {
+        let state = self.state.borrow();
+        OwnedPoolStats {
+            waiters: state.waiters.len(),
+            ..state.stats
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn task_count_for_test(&self) -> usize {
         self.state
@@ -3626,7 +3650,14 @@ async fn acquire_after_wait<Reservation: PoolReservation>(
             registration,
             wait_timeout,
         } = wait;
-        wait_for_wakeup(waiter, registration, wait_timeout, cancellation.clone()).await?;
+        wait_for_wakeup(
+            &state,
+            waiter,
+            registration,
+            wait_timeout,
+            cancellation.clone(),
+        )
+        .await?;
         if cancellation.is_cancellation_requested() {
             return Err(PoolError::Cancelled);
         }
@@ -3650,6 +3681,7 @@ pub(crate) fn take_waits_for_wakeup_for_test() -> u64 {
 }
 
 async fn wait_for_wakeup(
+    state: &RefCell<PoolState>,
     waiter: Rc<Waiter>,
     registration: WaiterRegistration,
     wait_timeout: Duration,
@@ -3664,7 +3696,10 @@ async fn wait_for_wakeup(
     }
     match status {
         WaitStatus::Signalled => Ok(()),
-        WaitStatus::TimedOut => Err(PoolError::Timeout),
+        WaitStatus::TimedOut => {
+            state.borrow_mut().stats.acquisition_timeouts += 1;
+            Err(PoolError::Timeout)
+        }
         WaitStatus::Cancelled | WaitStatus::NotReady => Err(PoolError::Cancelled),
     }
 }
@@ -3754,6 +3789,7 @@ async fn run_connection_attempt(
             break;
         };
         attempts = attempts.saturating_add(1);
+        pool.borrow_mut().stats.connect_attempts += 1;
         let mut connecting = match (&*factory, config) {
             (
                 ConnectionFactory::Native { address, connector },
@@ -3815,7 +3851,7 @@ async fn run_connection_attempt(
                         continue;
                     }
                 }
-                let completion = SessionCompletion::new(&connected, Rc::clone(ownership));
+                let mut completion = SessionCompletion::new(&connected, Rc::clone(ownership));
                 let Some(pool) = state.upgrade() else {
                     drain_sessions(vec![connected]);
                     return Some(completion);
@@ -3830,11 +3866,16 @@ async fn run_connection_attempt(
                 connected.bind_pool(Rc::downgrade(&pool), unsettled);
                 let wake_count = connected.available_transactions();
                 let max_age = sampled_max_age(pool.borrow().pool_params.max_age);
-                pool.borrow_mut().sessions.push_back(SessionEntry::new(
-                    connected,
-                    max_age,
-                    Some(Rc::clone(ownership)),
-                ));
+                {
+                    let mut state = pool.borrow_mut();
+                    state.sessions.push_back(SessionEntry::new(
+                        connected,
+                        max_age,
+                        Some(Rc::clone(ownership)),
+                    ));
+                    state.stats.sessions_opened += 1;
+                }
+                completion.counted = true;
                 notify_session_event(&pool, context.worker_id(), None, false, wake_count, false);
                 if let Some(credit) = &guard.credit {
                     let credited = {
@@ -3850,6 +3891,9 @@ async fn run_connection_attempt(
                 return Some(completion);
             }
             Err(source) => {
+                if let Some(pool) = state.upgrade() {
+                    pool.borrow_mut().stats.connect_failures += 1;
+                }
                 last_error = Some(if source.external_cause().is_some() {
                     PoolError::AttachedConnectFailed { source }
                 } else {
@@ -3977,12 +4021,14 @@ fn next_step(
             if (!pool.backend.is_attached() || !wait_timeout.is_zero())
                 && started.elapsed() > wait_timeout
             {
+                pool.stats.acquisition_timeouts += 1;
                 return Err(PoolError::Timeout);
             }
             let at_connection_capacity = pool.full();
             if pool.established_sessions_at_limit()
                 && pool.waiters.len() >= usize::from(pool.pool_params.max_waiters)
             {
+                pool.stats.max_waiters_rejections += 1;
                 return Err(PoolError::MaxWaiters);
             }
             let absorbed = if at_connection_capacity {
@@ -4025,6 +4071,7 @@ fn next_step(
             });
             pool.next_waiter_id = pool.next_waiter_id.wrapping_add(1);
             pool.waiters.push_back(Rc::clone(&waiter));
+            pool.stats.peak_waiters = pool.stats.peak_waiters.max(pool.waiters.len());
             if let Some(session) = &claim {
                 session.claim(waiter.id);
             }

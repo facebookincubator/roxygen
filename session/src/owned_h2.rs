@@ -3633,6 +3633,7 @@ where
                     return actions.into();
                 }
                 let code = h2_error_code_to_http_error_code(code);
+                let peer_code = code;
                 if let Some(observation) = self.state.observation.as_deref() {
                     // Observers are downstream-only (`DIV-051`) and see a peer's NO_ERROR
                     // as CANCEL.
@@ -3666,6 +3667,12 @@ where
                         || failure(code, b"peer reset cancelled local byte events"),
                     );
                     owner.wake.enqueue();
+                    if first_reset
+                        && code != HttpErrorCode::NO_ERROR
+                        && let Some(admission) = &self.state.control.upstream
+                    {
+                        admission.peer_reset(peer_code);
+                    }
                 }
             }
             CodecEvent::WindowUpdate { stream, amount } => {
@@ -3783,13 +3790,13 @@ where
                             failure(HttpErrorCode::REFUSED_STREAM, b"peer GOAWAY refused stream")
                         });
                         owner.wake.enqueue();
+                        if first_reset && let Some(admission) = &self.state.control.upstream {
+                            admission.peer_reset(HttpErrorCode::REFUSED_STREAM);
+                        }
                     }
                 }
                 if let Some(admission) = &self.state.control.upstream {
-                    admission.close(failure(
-                        HttpErrorCode::REFUSED_STREAM,
-                        b"peer GOAWAY closed admission",
-                    ));
+                    admission.close_for_peer_goaway(h2_error_code_to_http_error_code(code));
                 }
                 if code != H2ErrorCode::NO_ERROR {
                     self.fail(Failure::new(

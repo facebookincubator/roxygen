@@ -7,6 +7,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use roxygen_core::error::HttpError;
+use roxygen_core::error::HttpErrorCode;
 use roxygen_core::events::HttpBodyEvent;
 use roxygen_core::events::HttpHeaderEvent;
 use roxygen_core::ids::StreamId;
@@ -91,6 +92,11 @@ pub trait OwnedUpstreamObserver: 'static {
     fn released_submission_retired(&self) {}
     fn capacity_available(&self) {}
     fn admission_closed(&self) {}
+    /// The peer reset a live stream, on HTTP/2: with an RST_STREAM carrying `code`, or with a
+    /// GOAWAY that refused the stream, as `REFUSED_STREAM`. Once per stream, at its first
+    /// peer reset; not for a `NO_ERROR` reset after the stream's whole response, which stops
+    /// only its upload (`DIV-050`).
+    fn peer_reset(&self, _code: HttpErrorCode) {}
 }
 
 /// An owner-local deadline observed independently of response-body consumption.
