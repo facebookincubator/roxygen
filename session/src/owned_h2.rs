@@ -1789,8 +1789,6 @@ where
             || (UPSTREAM && io.drain_request_body_on_drop)
             || (!UPSTREAM && io.deliver_ingress_before_abort)
             || (UPSTREAM && http2.abort_streams_on_eof)
-            || (UPSTREAM && io.exact_method_tokens)
-            || io.verbatim_http2_header_values
             || http2.stats.is_some()
             || http2
                 .ping_probes
@@ -1801,6 +1799,18 @@ where
             return Err(failure(
                 HttpErrorCode::INVALID_STATE_TRANSITION,
                 b"owned H2 diagnostic configuration is not supported",
+            ));
+        }
+        if UPSTREAM && io.exact_method_tokens {
+            return Err(failure(
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"owned H2 upstream does not support exact_method_tokens",
+            ));
+        }
+        if UPSTREAM && io.verbatim_http2_header_values {
+            return Err(failure(
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"owned H2 upstream does not support verbatim_http2_header_values",
             ));
         }
         let advertised_window = http2.settings.iter().rev().find_map(|setting| {
@@ -1891,6 +1901,7 @@ where
             codec.set_header_indexing_strategy(Rc::clone(strategy));
         }
         codec.set_exact_methods(io.exact_method_tokens && !UPSTREAM);
+        codec.set_verbatim_field_values(io.verbatim_http2_header_values && !UPSTREAM);
         codec.generate(
             &mut egress,
             EgressFrame::ConnectionPreface,
@@ -3227,6 +3238,9 @@ where
                 b"invalid stream receive window",
             )
         })?;
+        if self.state.config.verbatim_http2_header_values {
+            source.read_empty_content_length_as_zero();
+        }
         let producer = source.producer();
         // Proxygen's `HTTPStreamSource::setReadTimeout` and Uniplex time a request body from the
         // stream's creation.
@@ -3421,7 +3435,10 @@ where
                     return actions.into();
                 };
                 owner.request_head = message.method().ok().flatten() == Some(HttpMethod::Head);
-                owner.expected_request_length = crate::uniplex::message_content_length(&message);
+                owner.expected_request_length = crate::uniplex::checked_content_length(
+                    &message,
+                    self.state.config.verbatim_http2_header_values,
+                );
                 if let Some(priority) = message.get_http_priority() {
                     self.state
                         .scheduler

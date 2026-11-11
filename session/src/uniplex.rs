@@ -583,8 +583,9 @@ pub struct UniplexConfig {
     /// accepts a value h2 refuses (`Http2Codec::set_verbatim_field_values`); it also encodes
     /// the heads it sends with their values as stored, as h2 does. An empty `content-length`
     /// is kept, and its stream's body is checked against zero, as h2 reads it. HTTP/1.1
-    /// sessions ignore it (they trim optional whitespace, as `httparse` does); the owned
-    /// HTTP/2 drivers refuse it.
+    /// sessions ignore it (they trim optional whitespace, as `httparse` does). The owned
+    /// downstream HTTP/2 driver (`OwnedH2Session`) applies it as a downstream session does;
+    /// the owned upstream HTTP/2 driver refuses it.
     pub verbatim_http2_header_values: bool,
 }
 
@@ -705,7 +706,7 @@ pub(crate) fn message_content_length(message: &roxygen_core::message::HttpMessag
 /// The length a downstream request's body is checked against: its
 /// `content-length`, or zero for a present, empty one with `empty_is_zero`
 /// (`DIV-041`).
-fn checked_content_length(
+pub(crate) fn checked_content_length(
     message: &roxygen_core::message::HttpMessage,
     empty_is_zero: bool,
 ) -> Option<u64> {

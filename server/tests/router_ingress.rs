@@ -411,58 +411,81 @@ fn router_ingress_reads_exact_methods_and_writes_verbatim_response_values_over_h
 #[test]
 fn router_ingress_reads_exact_methods_and_writes_verbatim_response_values_over_h2c() {
     on_worker(move |context| async move {
-        let script = Rc::new(Script::default());
-        let (_connection, client) =
-            serve_router_connection(&context, &script, CodecProtocol::Http2).await;
-        let (sender, connection) = h2::client::handshake(client).await.expect("h2 handshake");
-        let mut connection = std::pin::pin!(connection);
-        let exchanges = async move {
-            let mut sender = sender;
-            let mut heads = Vec::new();
-            for method in ["POST", "post", "PURGE"] {
-                let request = http::Request::builder()
-                    .method(method)
-                    .uri("http://localhost/generate")
-                    .header("x-request-id", PADDED_REQUEST_ID)
-                    .body(())
-                    .expect("request");
-                sender = sender.ready().await.expect("stream capacity");
-                let (response, _) = sender.send_request(request, true).expect("request sent");
-                let response = response.await.expect("response head");
-                assert_eq!(response.status(), 200);
-                let value = |name| {
-                    response
-                        .headers()
-                        .get(name)
-                        .map(|value: &http::HeaderValue| value.as_bytes().to_vec())
-                };
-                heads.push((value("x-request-id"), value("x-padded")));
-            }
-            heads
-        };
-        let heads = tokio::select! {
-            heads = within("the responses", exchanges) => heads,
-            ended = &mut connection => panic!("the h2 connection ended first: {ended:?}"),
-        };
-        assert_eq!(
-            heads,
-            vec![
-                (
-                    Some(PADDED_REQUEST_ID.to_vec()),
-                    Some(PADDED_VALUE.to_vec())
-                );
-                3
-            ]
-        );
-        assert_eq!(
-            *script.requests.borrow(),
-            [
-                ("POST".to_owned(), Some(PADDED_REQUEST_ID.to_vec())),
-                ("post".to_owned(), Some(PADDED_REQUEST_ID.to_vec())),
-                ("PURGE".to_owned(), Some(PADDED_REQUEST_ID.to_vec())),
-            ],
-        );
+        exact_methods_and_verbatim_values_over_h2c(&context, router_session()).await;
     });
+}
+
+/// As `router_ingress_reads_exact_methods_and_writes_verbatim_response_values_over_h2c`,
+/// with h2c on the owned HTTP/2 driver (`owned_http2`), which applies both options as
+/// `UniplexSession` does.
+#[test]
+fn router_ingress_reads_exact_methods_and_writes_verbatim_response_values_over_owned_h2c() {
+    on_worker(move |context| async move {
+        let session = ServerSessionConfig {
+            owned_http2: true,
+            ..router_session()
+        };
+        exact_methods_and_verbatim_values_over_h2c(&context, session).await;
+    });
+}
+
+/// Sends the three requests of the h2c method and value test through h2's client to a
+/// connection served with `session`, and checks what the handler read and what h2 decoded.
+async fn exact_methods_and_verbatim_values_over_h2c(
+    context: &WorkerContext,
+    session: ServerSessionConfig,
+) {
+    let script = Rc::new(Script::default());
+    let (_connection, client) =
+        serve_router_connection_with(context, &script, CodecProtocol::Http2, session).await;
+    let (sender, connection) = h2::client::handshake(client).await.expect("h2 handshake");
+    let mut connection = std::pin::pin!(connection);
+    let exchanges = async move {
+        let mut sender = sender;
+        let mut heads = Vec::new();
+        for method in ["POST", "post", "PURGE"] {
+            let request = http::Request::builder()
+                .method(method)
+                .uri("http://localhost/generate")
+                .header("x-request-id", PADDED_REQUEST_ID)
+                .body(())
+                .expect("request");
+            sender = sender.ready().await.expect("stream capacity");
+            let (response, _) = sender.send_request(request, true).expect("request sent");
+            let response = response.await.expect("response head");
+            assert_eq!(response.status(), 200);
+            let value = |name| {
+                response
+                    .headers()
+                    .get(name)
+                    .map(|value: &http::HeaderValue| value.as_bytes().to_vec())
+            };
+            heads.push((value("x-request-id"), value("x-padded")));
+        }
+        heads
+    };
+    let heads = tokio::select! {
+        heads = within("the responses", exchanges) => heads,
+        ended = &mut connection => panic!("the h2 connection ended first: {ended:?}"),
+    };
+    assert_eq!(
+        heads,
+        vec![
+            (
+                Some(PADDED_REQUEST_ID.to_vec()),
+                Some(PADDED_VALUE.to_vec())
+            );
+            3
+        ]
+    );
+    assert_eq!(
+        *script.requests.borrow(),
+        [
+            ("POST".to_owned(), Some(PADDED_REQUEST_ID.to_vec())),
+            ("post".to_owned(), Some(PADDED_REQUEST_ID.to_vec())),
+            ("PURGE".to_owned(), Some(PADDED_REQUEST_ID.to_vec())),
+        ],
+    );
 }
 
 fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {

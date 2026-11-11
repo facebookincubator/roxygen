@@ -212,6 +212,10 @@ fn owned_upstream_h2_refuses_exact_method_tokens() {
                 Ok(_) => panic!("exact_method_tokens was silently accepted"),
             };
             assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+            assert_eq!(
+                error.message(),
+                b"owned H2 upstream does not support exact_method_tokens"
+            );
             assert!(state.borrow().writes.is_empty());
         })
     });
@@ -232,6 +236,29 @@ fn owned_upstream_h2_refuses_abort_streams_on_eof() {
                 Ok(_) => panic!("abort_streams_on_eof was silently accepted"),
             };
             assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+            assert!(state.borrow().writes.is_empty());
+        })
+    });
+}
+
+/// The owned downstream driver applies `verbatim_http2_header_values` (`DIV-041`); the owned
+/// upstream driver still refuses it instead of ignoring it.
+#[test]
+fn owned_upstream_h2_refuses_verbatim_http2_header_values() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (transport, state) = FixtureTransport::new([]);
+            let mut config = options(context, transport);
+            config.io.verbatim_http2_header_values = true;
+            let error = match OwnedH2UpstreamSession::new(config) {
+                Err(error) => error,
+                Ok(_) => panic!("verbatim_http2_header_values was silently accepted"),
+            };
+            assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+            assert_eq!(
+                error.message(),
+                b"owned H2 upstream does not support verbatim_http2_header_values"
+            );
             assert!(state.borrow().writes.is_empty());
         })
     });

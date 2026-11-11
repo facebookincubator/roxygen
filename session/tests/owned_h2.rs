@@ -1833,6 +1833,830 @@ fn request_methods_are_canonicalized_by_default_as_uniplex() {
     assert_eq!(owned, method_run(false, false, &METHODS));
 }
 
+/// Regular request fields whose values have surrounding whitespace, are empty, or repeat, and a
+/// padded request id the application echoes.
+const VERBATIM_FIELDS: [(&[u8], &[u8]); 9] = [
+    (b"user-agent", b" ua\t"),
+    (b"x-lead", b"  leading"),
+    (b"x-trail", b"trailing\t"),
+    (b"x-both", b"\t both "),
+    (b"x-empty", b""),
+    (b"x-only-space", b" \t "),
+    (b"x-dup", b" one"),
+    (b"x-dup", b"two "),
+    (b"x-request-id", b" rid-7\t"),
+];
+
+/// `VERBATIM_FIELDS` with surrounding whitespace removed, as the reference decoder stores them.
+const TRIMMED_VERBATIM_FIELDS: [(&[u8], &[u8]); 9] = [
+    (b"user-agent", b"ua"),
+    (b"x-lead", b"leading"),
+    (b"x-trail", b"trailing"),
+    (b"x-both", b"both"),
+    (b"x-empty", b""),
+    (b"x-only-space", b""),
+    (b"x-dup", b"one"),
+    (b"x-dup", b"two"),
+    (b"x-request-id", b"rid-7"),
+];
+
+/// A value the application adds to its response head with `add_verbatim`.
+const PADDED_RESPONSE_VALUE: &[u8] = b" v\t";
+
+/// One request of a field run: its regular fields, encoded byte for byte after the
+/// pseudo-headers, and the one DATA frame ending it, or `None` if its HEADERS frame ends it.
+type FieldRequest<'a> = (&'a [(&'a [u8], &'a [u8])], Option<&'a [u8]>);
+
+fn owned_fields(fields: &[(&[u8], &[u8])]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fields
+        .iter()
+        .map(|(name, value)| (name.to_vec(), value.to_vec()))
+        .collect()
+}
+
+/// The regular fields of `message` but `host`, in order, names in lowercase.
+fn message_fields(message: &HttpMessage) -> Vec<(Vec<u8>, Vec<u8>)> {
+    header_fields(message.headers())
+}
+
+/// The fields of `headers` but `host`, in order, names in lowercase.
+fn header_fields(headers: &HttpHeaders) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut fields = Vec::new();
+    headers.for_each(|name, value| {
+        if !name.eq_ignore_ascii_case(b"host") {
+            fields.push((name.to_ascii_lowercase(), value.to_vec()));
+        }
+    });
+    fields
+}
+
+/// Appends `event`'s body bytes to `bytes`, or its trailer fields (`header_fields`) to
+/// `trailers`.
+fn record_body_event(
+    event: &HttpBodyEvent,
+    bytes: &mut Vec<u8>,
+    trailers: &mut Vec<(Vec<u8>, Vec<u8>)>,
+) {
+    match event.kind() {
+        HttpBodyEventKind::Body(chunk) => {
+            bytes.extend_from_slice(&chunk.coalesce(usize::MAX).unwrap());
+        }
+        HttpBodyEventKind::Trailers(fields) => trailers.extend(header_fields(fields)),
+        _ => {}
+    }
+}
+
+/// A 200 head that echoes the request's `x-request-id` and carries `x-padded`, each inserted
+/// with `add_verbatim`, as the router copies `http::HeaderValue` bytes into its heads.
+fn echo_head(request: &HttpMessage) -> HttpMessage {
+    let mut response = HttpMessage::new();
+    response.set_status_code(200).unwrap();
+    response.set_http_version(1, 1);
+    if let Some(request_id) = request.headers().get_single(b"x-request-id").value {
+        response
+            .headers_mut()
+            .add_verbatim(b"x-request-id", request_id);
+    }
+    response
+        .headers_mut()
+        .add_verbatim(b"x-padded", PADDED_RESPONSE_VALUE);
+    response
+}
+
+/// What the application read of one request: its fields (`message_fields`); its body, or, if
+/// reading the body failed or the exchange was cancelled first, the body bytes it read before;
+/// and the trailer fields it read.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FieldsSeen {
+    fields: Vec<(Vec<u8>, Vec<u8>)>,
+    body: Result<Vec<u8>, Vec<u8>>,
+    trailers: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// Records what each request carried as the application reads it, reading its body to its
+/// end, and answers with `echo_head`, or fails the exchange if the body read failed. The
+/// counter counts the request heads that arrived.
+struct FieldApplication(Rc<RefCell<Vec<FieldsSeen>>>, Rc<Cell<usize>>);
+
+struct FieldExchange {
+    seen: Rc<RefCell<Vec<FieldsSeen>>>,
+    heads: Rc<Cell<usize>>,
+    read: Option<(Vec<(Vec<u8>, Vec<u8>)>, HttpMessage)>,
+    body: Rc<RefCell<(Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>)>>,
+    upload: Option<LocalSourceFuture<Result<(), HttpError>>>,
+}
+
+impl FieldExchange {
+    /// Records the request whose head arrived, with the body bytes and trailers read so far,
+    /// its body as failed unless `read`.
+    fn record(&mut self, read: bool) -> Option<HttpMessage> {
+        let (fields, response) = self.read.take()?;
+        let (bytes, trailers) = self.body.take();
+        let body = if read { Ok(bytes) } else { Err(bytes) };
+        self.seen.borrow_mut().push(FieldsSeen {
+            fields,
+            body,
+            trailers,
+        });
+        Some(response)
+    }
+}
+
+impl OwnedH2Application for FieldApplication {
+    type Exchange = FieldExchange;
+
+    fn new_exchange(&self, _stream: StreamId, _ingress: IngressCompletion) -> FieldExchange {
+        FieldExchange {
+            seen: Rc::clone(&self.0),
+            heads: Rc::clone(&self.1),
+            read: None,
+            body: Rc::default(),
+            upload: None,
+        }
+    }
+}
+
+impl OwnedH2Exchange for FieldExchange {
+    fn request(&mut self, head: Box<HttpMessage>, body: HttpStreamSourceOwner, eom: bool) {
+        self.heads.set(self.heads.get() + 1);
+        self.read = Some((message_fields(&head), echo_head(&head)));
+        let mut body = body.into_source_holder();
+        let read = Rc::clone(&self.body);
+        self.upload = Some(Box::pin(async move {
+            let mut eom = eom;
+            while !eom {
+                let event = body.read_body_event(u32::MAX).await?;
+                eom = event.eom();
+                let (bytes, trailers) = &mut *read.borrow_mut();
+                record_body_event(&event, bytes, trailers);
+            }
+            Ok(())
+        }));
+    }
+
+    fn poll_headers(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        let upload = self.upload.as_mut().expect("the request arrived");
+        let result = std::task::ready!(upload.as_mut().poll(context));
+        self.upload = None;
+        let response = self.record(result.is_ok()).expect("the request arrived");
+        result?;
+        Poll::Ready(Ok(HttpHeaderEvent::new(response, true).unwrap()))
+    }
+
+    fn poll_body(
+        &mut self,
+        _context: &mut Context<'_>,
+        _maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        unreachable!("the head ends the response")
+    }
+
+    /// Ends the body read, as its failure ends `FieldHandler`'s: a request whose head arrived is
+    /// recorded with what was read so far.
+    fn cancel(&mut self, _error: &HttpError, _peer_reset: bool) {
+        self.upload = None;
+        self.record(false);
+    }
+
+    fn response_complete(&mut self) {}
+
+    fn complete(self) {}
+}
+
+/// `FieldApplication` as a `UniplexSession` handler.
+struct FieldHandler(Rc<RefCell<Vec<FieldsSeen>>>, Rc<Cell<usize>>);
+
+impl HttpHandler for FieldHandler {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        mut request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        let seen = Rc::clone(&self.0);
+        let heads = Rc::clone(&self.1);
+        Box::pin(async move {
+            let head = request.read_header_event().await?;
+            heads.set(heads.get() + 1);
+            let fields = message_fields(head.headers());
+            let response = echo_head(head.headers());
+            let mut eom = head.eom();
+            let mut bytes = Vec::new();
+            let mut trailers = Vec::new();
+            while !eom {
+                match request.read_body_event(u32::MAX).await {
+                    Ok(event) => {
+                        eom = event.eom();
+                        record_body_event(&event, &mut bytes, &mut trailers);
+                    }
+                    Err(error) => {
+                        seen.borrow_mut().push(FieldsSeen {
+                            fields,
+                            body: Err(bytes),
+                            trailers,
+                        });
+                        return Err(error);
+                    }
+                }
+            }
+            seen.borrow_mut().push(FieldsSeen {
+                fields,
+                body: Ok(bytes),
+                trailers,
+            });
+            Ok(HttpSourceHolder::new(Box::new(HttpFixedSource::new(
+                response, None,
+            ))))
+        })
+    }
+}
+
+/// The client preface, empty SETTINGS, and one POST per request on streams 1, 3, 5, ...
+/// (`FieldRequest`).
+fn field_requests(requests: &[FieldRequest<'_>]) -> Vec<u8> {
+    let (mut wire, mut encoder) = field_preface();
+    for (index, (fields, data)) in requests.iter().enumerate() {
+        let stream = 1 + 2 * u32::try_from(index).unwrap();
+        push_request_head(&mut wire, &mut encoder, stream, fields, data.is_none());
+        if let Some(data) = data {
+            push_frame(&mut wire, FrameType::DATA, END_STREAM, stream, data);
+        }
+    }
+    wire
+}
+
+/// The client preface, empty SETTINGS, and one POST on stream 1 with `fields`, one DATA frame
+/// carrying `data`, and a trailer section of `trailers` ending the request.
+fn trailered_field_request(
+    fields: &[(&[u8], &[u8])],
+    data: &[u8],
+    trailers: &[(&[u8], &[u8])],
+) -> Vec<u8> {
+    const END_HEADERS: u8 = 0x4;
+    let (mut wire, mut encoder) = field_preface();
+    push_request_head(&mut wire, &mut encoder, 1, fields, false);
+    push_frame(&mut wire, FrameType::DATA, 0, 1, data);
+    let trailers: Vec<_> = trailers
+        .iter()
+        .map(|(name, value)| HpackHeader::new(name, value))
+        .collect();
+    let block = encoder.encode(&trailers);
+    push_frame(
+        &mut wire,
+        FrameType::HEADERS,
+        END_HEADERS | END_STREAM,
+        1,
+        &block,
+    );
+    wire
+}
+
+/// The client preface and an empty SETTINGS frame, and the HPACK encoder of the requests.
+fn field_preface() -> (Vec<u8>, HpackEncoder) {
+    let mut wire = CONNECTION_PREFACE.to_vec();
+    push_frame(&mut wire, FrameType::SETTINGS, 0, 0, &[]);
+    (wire, HpackEncoder::new(false))
+}
+
+/// A POST head on `stream` whose regular `fields` follow the pseudo-headers byte for byte.
+fn push_request_head(
+    wire: &mut Vec<u8>,
+    encoder: &mut HpackEncoder,
+    stream: u32,
+    fields: &[(&[u8], &[u8])],
+    end_stream: bool,
+) {
+    const END_HEADERS: u8 = 0x4;
+    let mut headers = vec![
+        HpackHeader::new(":method", "POST"),
+        HpackHeader::new(":scheme", "http"),
+        HpackHeader::new(":path", "/generate"),
+        HpackHeader::new(":authority", "example.com"),
+    ];
+    headers.extend(
+        fields
+            .iter()
+            .map(|(name, value)| HpackHeader::new(name, value)),
+    );
+    let block = encoder.encode(&headers);
+    let flags = if end_stream {
+        END_HEADERS | END_STREAM
+    } else {
+        END_HEADERS
+    };
+    push_frame(wire, FrameType::HEADERS, flags, stream, &block);
+}
+
+fn push_frame(wire: &mut Vec<u8>, kind: FrameType, flags: u8, stream: u32, payload: &[u8]) {
+    wire.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes()[1..]);
+    wire.extend_from_slice(&[kind.as_u8(), flags]);
+    wire.extend_from_slice(&stream.to_be_bytes());
+    wire.extend_from_slice(payload);
+}
+
+/// The response heads (status and `x-` fields, as a verbatim decoder reads them), RST_STREAM
+/// and GOAWAY frames a server wrote.
+#[derive(Default)]
+struct ResponseHeads {
+    heads: Vec<(StreamId, u16, Vec<(Vec<u8>, Vec<u8>)>)>,
+    resets: Vec<(StreamId, H2ErrorCode)>,
+    goaways: Vec<(StreamId, H2ErrorCode)>,
+}
+
+impl HttpCodecCallback for ResponseHeads {
+    fn on_event(&mut self, event: CodecEvent<'_>) {
+        match event {
+            CodecEvent::HeadersComplete {
+                stream,
+                mut message,
+            } => {
+                let status = message.status_code().unwrap();
+                let mut fields = message_fields(&message);
+                fields.retain(|(name, _)| name.starts_with(b"x-"));
+                self.heads.push((stream, status, fields));
+            }
+            CodecEvent::Abort { stream, code } => self.resets.push((stream, code)),
+            CodecEvent::Goaway {
+                last_good_stream,
+                code,
+                ..
+            } => self.goaways.push((last_good_stream, code)),
+            _ => {}
+        }
+    }
+}
+
+/// Decodes what a server wrote for `requests` client streams with a verbatim decoder, so values
+/// it encoded trimmed arrive trimmed and values it encoded as stored arrive as stored.
+fn decode_response_heads(wire: &[u8], requests: usize) -> ResponseHeads {
+    let mut codec = Http2Codec::new(TransportDirection::Upstream);
+    codec.set_verbatim_field_values(true);
+    for _ in 0..requests {
+        codec.create_stream();
+    }
+    let mut decoded = ResponseHeads::default();
+    let mut output = BufQueue::new(1 << 20);
+    let input = BufQueue::copy_from_slice(wire, wire.len()).expect("frame input fits");
+    let result = codec.on_ingress(&input, &mut decoded, &mut output);
+    assert_eq!(result.consumed, wire.len());
+    decoded
+}
+
+/// What one field run produced: what the application read of each request, in sorted order;
+/// each response head, by stream; the RST_STREAM and GOAWAY frames written; and the session's
+/// error. The order is normalized because the two sessions start and answer their streams in
+/// different orders.
+#[derive(Debug, PartialEq)]
+struct FieldRun {
+    seen: Vec<FieldsSeen>,
+    responses: Vec<(StreamId, u16, Vec<(Vec<u8>, Vec<u8>)>)>,
+    resets: Vec<(StreamId, H2ErrorCode)>,
+    goaways: Vec<(StreamId, H2ErrorCode)>,
+    error: Option<HttpErrorCode>,
+}
+
+/// Serves `requests` (`field_requests`), then peer EOF, with the owned driver (`owned`) or
+/// `UniplexSession`, both configured as `options` with `verbatim_http2_header_values` set to
+/// `verbatim`.
+fn field_run(owned: bool, verbatim: bool, requests: &[FieldRequest<'_>]) -> FieldRun {
+    let input = field_requests(requests);
+    serve_field_run(owned, verbatim, requests.len(), input, None)
+}
+
+/// As `field_run` for one request with `fields` and no body, then, in a later read released once
+/// the application has its head, one DATA frame carrying `data`, with END_STREAM if
+/// `end_stream`. Peer EOF follows END_STREAM at once; without END_STREAM it waits until the
+/// application recorded the request (its body read failed), for at most a second.
+fn split_field_run(
+    owned: bool,
+    verbatim: bool,
+    fields: &[(&[u8], &[u8])],
+    data: &[u8],
+    end_stream: bool,
+) -> FieldRun {
+    let whole = field_requests(&[(fields, Some(data))]);
+    let data_frame = FRAME_HEADER_SIZE + data.len();
+    let (head, rest) = whole.split_at(whole.len() - data_frame);
+    let mut rest = rest.to_vec();
+    if !end_stream {
+        rest[4] = 0;
+    }
+    serve_field_run(owned, verbatim, 1, head.to_vec(), Some((rest, !end_stream)))
+}
+
+/// Serves `input`, then `rest` once the application has a request head (or, without `rest`,
+/// peer EOF after `input`), as `field_run` describes, for `streams` client streams. With
+/// `hold_eof`, peer EOF follows `rest` once the application recorded a request, or a second
+/// passed.
+fn serve_field_run(
+    owned: bool,
+    verbatim: bool,
+    streams: usize,
+    input: Vec<u8>,
+    rest: Option<(Vec<u8>, bool)>,
+) -> FieldRun {
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let release = Arc::new(tokio::sync::Notify::new());
+            let release_eof = Arc::new(tokio::sync::Notify::new());
+            let split = rest.is_some();
+            let hold_eof = rest.as_ref().is_some_and(|(_, hold)| *hold);
+            let reads = match rest {
+                None => vec![FixtureRead::DataEof(input)],
+                Some((rest, false)) => vec![
+                    FixtureRead::Data(input),
+                    FixtureRead::WaitDataEof(Arc::clone(&release), rest),
+                ],
+                Some((rest, true)) => vec![
+                    FixtureRead::Data(input),
+                    FixtureRead::WaitData(Arc::clone(&release), rest),
+                    FixtureRead::WaitDataEof(Arc::clone(&release_eof), Vec::new()),
+                ],
+            };
+            let (transport, state) = FixtureTransport::new(reads);
+            let mut config = options(context, transport);
+            config.io.verbatim_http2_header_values = verbatim;
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let heads = Rc::new(Cell::new(0));
+            let run: LocalSourceFuture<Result<(), HttpError>> = if owned {
+                let application = FieldApplication(Rc::clone(&seen), Rc::clone(&heads));
+                let (session, _) = OwnedH2Session::new(application, config).unwrap();
+                Box::pin(async move { session.run().await.map(|_| ()) })
+            } else {
+                let OwnedH2Options {
+                    context,
+                    transport,
+                    io,
+                    http2,
+                } = config;
+                let handler: Rc<dyn HttpHandler> =
+                    Rc::new(FieldHandler(Rc::clone(&seen), Rc::clone(&heads)));
+                let (session, _) = UniplexSession::new_http2(
+                    context,
+                    TransportDirection::Downstream,
+                    transport,
+                    Some(handler),
+                    io,
+                    http2,
+                )
+                .unwrap();
+                Box::pin(async move { session.run().await.map(|_| ()) })
+            };
+            let releaser = async {
+                if split {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                        while heads.get() == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await;
+                    release.notify_one();
+                }
+                if hold_eof {
+                    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                        while seen.borrow().is_empty() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await;
+                    release_eof.notify_one();
+                }
+            };
+            let (result, ()) =
+                tokio::join!(tokio::time::timeout(Duration::from_secs(5), run), releaser);
+            let error = result
+                .expect("the run ends")
+                .err()
+                .map(|error| error.code());
+            let mut decoded = decode_response_heads(&state.borrow().writes.concat(), streams);
+            decoded.heads.sort_by_key(|(stream, ..)| *stream);
+            decoded.resets.sort_by_key(|(stream, _)| *stream);
+            let mut seen = seen.take();
+            seen.sort();
+            FieldRun {
+                seen,
+                responses: decoded.heads,
+                resets: decoded.resets,
+                goaways: decoded.goaways,
+                error,
+            }
+        })
+    })
+}
+
+/// A field run of one request that reads `fields` and an empty body, answered 200 with the
+/// echoed request id `request_id` and the padded value `padded` (`echo_head`).
+fn answered_run(fields: &[(&[u8], &[u8])], request_id: Option<&[u8]>, padded: &[u8]) -> FieldRun {
+    let mut response = Vec::new();
+    if let Some(request_id) = request_id {
+        response.push((b"x-request-id".to_vec(), request_id.to_vec()));
+    }
+    response.push((b"x-padded".to_vec(), padded.to_vec()));
+    FieldRun {
+        seen: vec![FieldsSeen {
+            fields: owned_fields(fields),
+            body: Ok(Vec::new()),
+            trailers: Vec::new(),
+        }],
+        responses: vec![(StreamId::new(1), 200, response)],
+        resets: Vec::new(),
+        goaways: Vec::new(),
+        error: None,
+    }
+}
+
+/// Under `verbatim_http2_header_values` (`DIV-041`), the owned driver hands each request field
+/// value to its exchange exactly as decoded: surrounding spaces and tabs, empty and
+/// whitespace-only values and duplicates are kept, and `cookie` crumbs combine untrimmed. The
+/// response head it encodes keeps the values the application inserted with `add_verbatim` (the
+/// echoed request id among them) byte for byte. Everything equals `UniplexSession` under the
+/// option.
+#[test]
+fn verbatim_field_values_reach_each_stream_as_sent_as_uniplex() {
+    let owned = field_run(true, true, &[(&VERBATIM_FIELDS, None)]);
+    assert_eq!(
+        owned,
+        answered_run(&VERBATIM_FIELDS, Some(b" rid-7\t"), PADDED_RESPONSE_VALUE)
+    );
+    assert_eq!(owned, field_run(false, true, &[(&VERBATIM_FIELDS, None)]));
+    let cookies: [(&[u8], &[u8]); 2] = [(b"cookie", b" a=1"), (b"cookie", b"b=2 ")];
+    let owned = field_run(true, true, &[(&cookies, None)]);
+    assert_eq!(
+        owned,
+        answered_run(&[(b"cookie", b" a=1; b=2 ")], None, PADDED_RESPONSE_VALUE)
+    );
+    assert_eq!(owned, field_run(false, true, &[(&cookies, None)]));
+}
+
+/// Request fields that h2 refuses and that the codec refuses under
+/// `verbatim_http2_header_values`.
+const H2_REFUSED_FIELDS: [(&[u8], &[u8]); 14] = [
+    (b"x-value", b"a\r\n b"),
+    (b"x-value", b"abc\r\n "),
+    (b"x-value", b"a\rb"),
+    (b"x-value", b"a\nb"),
+    (b"x-value", b"a\0b"),
+    (b"x-value", b"a\x01b"),
+    (b"x-value", b"a\x7fb"),
+    (b"content-length", b" 0"),
+    (b"content-length", b"0 "),
+    (b"content-length", b"+0"),
+    (b"content-length", b"00000000000000000000"),
+    (b"te", b"trailers "),
+    (b"te", b"gzip"),
+    (b"connection", b"close"),
+];
+
+fn field_label(field: (&[u8], &[u8])) -> String {
+    format!("{}: {}", field.0.escape_ascii(), field.1.escape_ascii())
+}
+
+/// Without `verbatim_http2_header_values`, the owned driver keeps the reference reading, as
+/// `UniplexSession` does: request field values are trimmed when decoded and response field
+/// values when encoded, and each field h2 refuses gets the same result from both sessions
+/// (folded values are accepted, as `CodecUtil::validateHeaderValue` accepts them).
+#[test]
+fn field_values_are_trimmed_by_default_as_uniplex() {
+    let owned = field_run(true, false, &[(&VERBATIM_FIELDS, None)]);
+    assert_eq!(
+        owned,
+        answered_run(&TRIMMED_VERBATIM_FIELDS, Some(b"rid-7"), b"v")
+    );
+    assert_eq!(owned, field_run(false, false, &[(&VERBATIM_FIELDS, None)]));
+    for field in H2_REFUSED_FIELDS {
+        let label = field_label(field);
+        let owned = field_run(true, false, &[(&[field], None)]);
+        assert_eq!(
+            owned,
+            field_run(false, false, &[(&[field], None)]),
+            "{label}"
+        );
+    }
+    let folded = field_run(true, false, &[(&[(b"x-value", b"a\r\n b")], None)]);
+    assert_eq!(folded.responses.len(), 1);
+    assert_eq!(folded.responses[0].1, 200, "{folded:?}");
+}
+
+/// Under `verbatim_http2_header_values`, the owned driver still checks each value as h2 does:
+/// a control byte other than HTAB, or DEL (so no line folding), a `content-length` that is not
+/// at most 19 digits, a `te` other than `trailers`, and `connection` make the request
+/// malformed, answered with the session's 400 and never handed to the exchange; obsolete text,
+/// 19 digits and `te: trailers` are accepted. Each run equals `UniplexSession`'s under the
+/// option.
+#[test]
+fn verbatim_field_values_refuse_what_h2_refuses_as_uniplex() {
+    for field in H2_REFUSED_FIELDS {
+        let label = field_label(field);
+        let owned = field_run(true, true, &[(&[field], None)]);
+        assert!(owned.seen.is_empty(), "{label}: {:?}", owned.seen);
+        assert_eq!(
+            owned.responses,
+            [(StreamId::new(1), 400, Vec::new())],
+            "{label}"
+        );
+        assert!(owned.resets.is_empty(), "{label}");
+        assert!(owned.goaways.is_empty(), "{label}");
+        assert_eq!(
+            owned,
+            field_run(false, true, &[(&[field], None)]),
+            "{label}"
+        );
+    }
+    let accepted: [(&[u8], &[u8]); 3] = [
+        (b"x-value", b"\x80\xff"),
+        (b"content-length", b"0000000000000000000"),
+        (b"te", b"trailers"),
+    ];
+    for field in accepted {
+        let label = field_label(field);
+        let owned = field_run(true, true, &[(&[field], None)]);
+        assert_eq!(
+            owned,
+            answered_run(&[field], None, PADDED_RESPONSE_VALUE),
+            "{label}"
+        );
+        assert_eq!(
+            owned,
+            field_run(false, true, &[(&[field], None)]),
+            "{label}"
+        );
+    }
+}
+
+/// Trailer fields whose values have surrounding whitespace, are empty, or repeat.
+const VERBATIM_TRAILERS: [(&[u8], &[u8]); 5] = [
+    (b"x-checksum", b" c0ffee\t"),
+    (b"x-empty", b""),
+    (b"x-only-space", b" \t "),
+    (b"x-dup", b" one"),
+    (b"x-dup", b"two "),
+];
+
+/// `VERBATIM_TRAILERS` with surrounding whitespace removed.
+const TRIMMED_VERBATIM_TRAILERS: [(&[u8], &[u8]); 5] = [
+    (b"x-checksum", b"c0ffee"),
+    (b"x-empty", b""),
+    (b"x-only-space", b""),
+    (b"x-dup", b"one"),
+    (b"x-dup", b"two"),
+];
+
+/// Under `verbatim_http2_header_values`, request trailer values reach the owned driver's
+/// exchange exactly as decoded too, and without it trimmed, each equal to `UniplexSession`'s
+/// run. A trailer value h2 refuses makes the trailer section malformed, and both sessions
+/// reset the stream with PROTOCOL_ERROR; arriving with its head, the request never reaches the
+/// application.
+#[test]
+fn verbatim_trailer_values_reach_each_stream_as_sent_as_uniplex() {
+    let run = |owned, verbatim, trailers: &[(&[u8], &[u8])]| {
+        let input = trailered_field_request(&[], b"abc", trailers);
+        serve_field_run(owned, verbatim, 1, input, None)
+    };
+    for (verbatim, trailers, padded) in [
+        (true, &VERBATIM_TRAILERS, PADDED_RESPONSE_VALUE),
+        (false, &TRIMMED_VERBATIM_TRAILERS, b"v".as_slice()),
+    ] {
+        let owned = run(true, verbatim, &VERBATIM_TRAILERS);
+        assert_eq!(
+            owned,
+            FieldRun {
+                seen: vec![FieldsSeen {
+                    fields: Vec::new(),
+                    body: Ok(b"abc".to_vec()),
+                    trailers: owned_fields(trailers),
+                }],
+                ..answered_run(&[], None, padded)
+            },
+            "verbatim {verbatim}"
+        );
+        assert_eq!(
+            owned,
+            run(false, verbatim, &VERBATIM_TRAILERS),
+            "verbatim {verbatim}"
+        );
+    }
+    for field in [
+        (b"x-value".as_slice(), b"a\rb".as_slice()),
+        (b"x-value", b"a\x7fb"),
+    ] {
+        let label = field_label(field);
+        let owned = run(true, true, &[field]);
+        assert!(owned.seen.is_empty(), "{label}: {owned:?}");
+        assert!(owned.responses.is_empty(), "{label}: {owned:?}");
+        assert_eq!(
+            owned.resets,
+            [(StreamId::new(1), H2ErrorCode::PROTOCOL_ERROR)],
+            "{label}"
+        );
+        assert_eq!(owned, run(false, true, &[field]), "{label}");
+    }
+}
+
+/// Under `verbatim_http2_header_values`, the owned driver reads an empty `content-length` as
+/// zero, as h2 reads it: a request ending with its head reaches the exchange with the empty
+/// field and an empty body, and one followed by DATA fails exactly as the same request with
+/// `content-length: 0` does. Each run equals `UniplexSession`'s under the option, except where
+/// the two sessions already differ for `content-length: 0`. Without the option the empty value
+/// leaves the body unchecked, on both sessions.
+#[test]
+fn an_empty_content_length_reads_as_zero_with_verbatim_field_values_as_uniplex() {
+    let empty: [(&[u8], &[u8]); 1] = [(b"content-length", b"")];
+    let zero: [(&[u8], &[u8]); 1] = [(b"content-length", b"0")];
+    let owned = field_run(true, true, &[(&empty, None)]);
+    assert_eq!(owned, answered_run(&empty, None, PADDED_RESPONSE_VALUE));
+    assert_eq!(owned, field_run(false, true, &[(&empty, None)]));
+
+    let overrun = |owned, verbatim, fields| field_run(owned, verbatim, &[(fields, Some(b"abc"))]);
+    let owned_empty = overrun(true, true, &empty);
+    let owned_zero = overrun(true, true, &zero);
+    assert!(
+        owned_zero.seen.is_empty(),
+        "an overrun arriving with the head fails it before the exchange starts: {owned_zero:?}"
+    );
+    let normalized = |run: &FieldRun| FieldRun {
+        seen: run
+            .seen
+            .iter()
+            .map(|seen| FieldsSeen {
+                fields: Vec::new(),
+                ..seen.clone()
+            })
+            .collect(),
+        responses: run.responses.clone(),
+        resets: run.resets.clone(),
+        goaways: run.goaways.clone(),
+        error: run.error,
+    };
+    assert_eq!(normalized(&owned_empty), normalized(&owned_zero));
+    assert_eq!(owned_empty, overrun(false, true, &empty));
+    assert_eq!(owned_zero, overrun(false, true, &zero));
+
+    // The same overrun arriving after the application has the head, ending the request or not:
+    // its body read fails before any overrunning byte. With END_STREAM both sessions reset the
+    // stream. Without it the exchange fails while the request is open, which the owned driver
+    // answers with a reset and `UniplexSession` with its 500 (`FieldExchange` fails its head
+    // poll, `FieldHandler` its handler), for any declared length; on each session the empty
+    // length fails exactly as `0` does.
+    for end_stream in [true, false] {
+        let split_overrun =
+            |owned, verbatim, fields| split_field_run(owned, verbatim, fields, b"abc", end_stream);
+        let owned_empty = split_overrun(true, true, &empty);
+        let owned_zero = split_overrun(true, true, &zero);
+        let uniplex_empty = split_overrun(false, true, &empty);
+        let uniplex_zero = split_overrun(false, true, &zero);
+        for run in [&owned_zero, &uniplex_zero] {
+            assert_eq!(
+                run.seen,
+                [FieldsSeen {
+                    fields: owned_fields(&zero),
+                    body: Err(Vec::new()),
+                    trailers: Vec::new(),
+                }],
+                "END_STREAM {end_stream}: no overrunning byte is read"
+            );
+        }
+        assert_eq!(
+            owned_zero.resets,
+            [(StreamId::new(1), H2ErrorCode::INTERNAL_ERROR)],
+            "END_STREAM {end_stream}"
+        );
+        assert_eq!(
+            normalized(&owned_empty),
+            normalized(&owned_zero),
+            "END_STREAM {end_stream}"
+        );
+        assert_eq!(
+            normalized(&uniplex_empty),
+            normalized(&uniplex_zero),
+            "END_STREAM {end_stream}"
+        );
+        if end_stream {
+            assert_eq!(owned_empty, uniplex_empty);
+            assert_eq!(owned_zero, uniplex_zero);
+        } else {
+            assert_eq!(
+                uniplex_zero.responses,
+                [(StreamId::new(1), 500, Vec::new())]
+            );
+            assert!(uniplex_zero.resets.is_empty());
+        }
+    }
+
+    let unchecked = FieldRun {
+        seen: vec![FieldsSeen {
+            fields: owned_fields(&empty),
+            body: Ok(b"abc".to_vec()),
+            trailers: Vec::new(),
+        }],
+        ..answered_run(&empty, None, b"v")
+    };
+    let owned = overrun(true, false, &empty);
+    assert_eq!(owned, unchecked);
+    assert_eq!(owned, overrun(false, false, &empty));
+}
+
 /// Never answers, and records each exchange dropped while its response is owed.
 struct HeldApplication(Rc<Cell<usize>>);
 
@@ -2178,7 +3002,7 @@ fn uniplex_eof_aborts_a_held_stream_after_a_refusal_found_no_room() {
 fn unsupported_config_is_rejected_before_transport_or_application_work() {
     run_on_worker(|context| {
         Box::pin(async move {
-            for case in 0..6 {
+            for case in 0..5 {
                 let (transport, state) = FixtureTransport::new([]);
                 let mut config = options(context.clone(), transport);
                 match case {
@@ -2192,7 +3016,6 @@ fn unsupported_config_is_rejected_before_transport_or_application_work() {
                     2 => config.http2.stream_receive_window = 0,
                     3 => state.borrow_mut().capability = ByteEventCapability::TransportEvents,
                     4 => config.io.deliver_ingress_before_abort = true,
-                    5 => config.io.verbatim_http2_header_values = true,
                     _ => unreachable!(),
                 }
                 let (application, probes) = Application::new(vec![]);

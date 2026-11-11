@@ -1810,6 +1810,37 @@ fn verbatim_field_values_refuse_what_h2_refuses_when_enabled() {
 }
 
 #[test]
+fn verbatim_field_values_keep_strict_validation_when_enabled() {
+    for (value, accepted) in [(b"\x80\xff".as_slice(), false), (b" v\t", true)] {
+        let capture = decode_twice_with(&request_with_fields(&[(b"x-value", value)]), |codec| {
+            codec.set_verbatim_field_values(true);
+            codec.set_strict_validation(true);
+        });
+        if accepted {
+            assert_eq!(capture.messages.len(), 2, "{value:?}");
+            for message in &capture.messages {
+                assert_eq!(
+                    regular_headers(message),
+                    owned_fields(&[(b"x-value", b" v\t")]),
+                    "the padded value is kept"
+                );
+            }
+            continue;
+        }
+        assert!(
+            capture.messages.is_empty(),
+            "strict validation refuses a byte above 0x7E: {value:?}"
+        );
+        assert_eq!(
+            capture
+                .error
+                .map(|(_, _, status, new_stream)| (status, new_stream)),
+            Some((Some(400), true))
+        );
+    }
+}
+
+#[test]
 fn verbatim_field_values_keep_an_empty_content_length_when_enabled() {
     let capture = decode_twice_with(&request_with_fields(&[(b"content-length", b"")]), |codec| {
         codec.set_verbatim_field_values(true);

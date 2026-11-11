@@ -1158,6 +1158,15 @@ impl HttpIngressBody {
             .drain_on_drop()
     }
 
+    /// Roxygen-only (`DIV-041`): checks the body of a head whose `content-length` is
+    /// present and empty against zero (`HttpStreamSource::read_empty_content_length_as_zero`).
+    pub fn read_empty_content_length_as_zero(&self) {
+        self.owner
+            .source()
+            .expect("a fresh source is owned")
+            .read_empty_content_length_as_zero();
+    }
+
     /// Validates the separately delivered request head and enters body reading.
     pub fn initialize_body_only(&self, message: &mut HttpMessage, eom: bool) -> bool {
         self.owner

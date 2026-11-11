@@ -1861,48 +1861,34 @@ fn owned_http2_attachment_rejects_unsupported_configuration() {
                 stats.stats_factory = Some(Arc::new(|_: &ConnectionInfo| {
                     unreachable!("a refused configuration builds no recorder")
                 }));
-                let verbatim_values = crate::acceptor::ServerSessionConfig {
-                    verbatim_http2_header_values: true,
-                    ..untimed_owned(false, true)
-                };
-                for (session, refusal) in [
-                    (
-                        stats,
-                        b"owned_http2 does not support stats_factory".as_slice(),
+                let (io, _peer) = tokio::io::duplex(64);
+                let transport = adopt_local(
+                    &context,
+                    EstablishedIo::new(
+                        io,
+                        TransportEndpoint::Unknown,
+                        TransportEndpoint::Unknown,
+                        None,
                     ),
-                    (
-                        verbatim_values,
-                        b"owned_http2 does not support verbatim_http2_header_values".as_slice(),
-                    ),
-                ] {
-                    let (io, _peer) = tokio::io::duplex(64);
-                    let transport = adopt_local(
-                        &context,
-                        EstablishedIo::new(
-                            io,
-                            TransportEndpoint::Unknown,
-                            TransportEndpoint::Unknown,
-                            None,
-                        ),
-                        limits(),
-                    )
-                    .expect("I/O adopted");
-                    let mut options = ServeTransportOptions::new(
-                        CodecProtocol::Http2,
-                        TransportSecurity::Plaintext,
-                    );
-                    options.session = session;
-                    let error = serve_transport(
-                        &context,
-                        transport,
-                        Rc::new(RecordingHandler(Arc::new(Evidence::default()))),
-                        options,
-                    )
-                    .err()
-                    .expect("the unsupported configuration is refused");
-                    assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
-                    assert_eq!(error.message(), refusal);
-                }
+                    limits(),
+                )
+                .expect("I/O adopted");
+                let mut options =
+                    ServeTransportOptions::new(CodecProtocol::Http2, TransportSecurity::Plaintext);
+                options.session = stats;
+                let error = serve_transport(
+                    &context,
+                    transport,
+                    Rc::new(RecordingHandler(Arc::new(Evidence::default()))),
+                    options,
+                )
+                .err()
+                .expect("the unsupported configuration is refused");
+                assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+                assert_eq!(
+                    error.message(),
+                    b"owned_http2 does not support stats_factory".as_slice()
+                );
             })
             .expect("initializer admitted"),
     )

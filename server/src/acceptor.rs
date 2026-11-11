@@ -167,7 +167,8 @@ pub struct ServerSessionConfig {
     /// a stream detaches when it retires. The driver requires the configured
     /// stream receive window to equal the advertised `INITIAL_WINDOW_SIZE`; the acceptor
     /// aligns the two (see `owned_http2_session_config`). It honors
-    /// `abort_http2_streams_on_eof` (`DIV-055`).
+    /// `abort_http2_streams_on_eof` (`DIV-055`), `exact_method_tokens` (`DIV-040`) and
+    /// `verbatim_http2_header_values` (`DIV-041`).
     pub owned_http2: bool,
     /// Experimental, default off (`DIV-053`): when a downstream HTTP/1.1 peer's EOF arrives
     /// while a transaction other than an established tunnel is open, fail the connection as a
@@ -219,7 +220,7 @@ pub struct ServerSessionConfig {
     /// Response heads are encoded with their values as stored, so values inserted with
     /// `HttpHeaders::add_verbatim` reach the client byte for byte, as hyper writes a
     /// `HeaderValue`. HTTP/1.1 connections still trim optional request whitespace, as
-    /// `httparse` does, and write every stored value unchanged. `owned_http2` refuses it.
+    /// `httparse` does, and write every stored value unchanged. `owned_http2` applies it.
     pub verbatim_http2_header_values: bool,
     #[cfg(test)]
     pub(crate) accepted_socket_profile: Option<Arc<AcceptedSocketProfile>>,
@@ -306,9 +307,6 @@ impl ServerSessionConfig {
         }
         if self.stats_factory.is_some() {
             return Err("owned_http2 does not support stats_factory");
-        }
-        if self.verbatim_http2_header_values {
-            return Err("owned_http2 does not support verbatim_http2_header_values");
         }
         Ok(())
     }

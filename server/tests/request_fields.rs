@@ -3,6 +3,7 @@
 //! worker and a `HostedWorker`, for HTTP/1.1 and h2c, next to hyper's server
 //! answering the same bytes.
 
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -355,16 +356,31 @@ async fn serve_fields(
     protocol: CodecProtocol,
     verbatim_http2_header_values: bool,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let (mut seen, _) = serve(
-        &context,
+    serve_fields_with(
+        context,
         protocol,
         verbatim_session(verbatim_http2_header_values),
-        &field_requests(protocol),
-        1,
     )
-    .await;
+    .await
+}
+
+/// As `serve_fields`, with the session configuration `session`.
+async fn serve_fields_with(
+    context: WorkerContext,
+    protocol: CodecProtocol,
+    session: ServerSessionConfig,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let (mut seen, _) = serve(&context, protocol, session, &field_requests(protocol), 1).await;
     assert_eq!(seen.len(), 1);
     seen.remove(0).headers
+}
+
+/// `verbatim_session(verbatim_http2_header_values)` with `owned_http2`.
+fn owned_h2_verbatim_session(verbatim_http2_header_values: bool) -> ServerSessionConfig {
+    ServerSessionConfig {
+        owned_http2: true,
+        ..verbatim_session(verbatim_http2_header_values)
+    }
 }
 
 /// What hyper's server (hyper-util's `auto` builder, as `axum::serve` uses it)
@@ -540,6 +556,23 @@ fn exact_method_tokens_still_refuse_a_method_that_is_not_a_token_over_owned_http
 /// The frame types (and RST_STREAM error codes) the server sent on stream 1,
 /// until the stream or the connection ends.
 async fn h2_stream_1_frames(client: &mut TcpStream) -> Vec<(u8, u32)> {
+    h2_stream_1_frame_bytes(client)
+        .await
+        .into_iter()
+        .map(|(kind, _, payload)| {
+            let code = if kind == 0x3 {
+                u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+            } else {
+                0
+            };
+            (kind, code)
+        })
+        .collect()
+}
+
+/// Each frame the server sent on stream 1 as its type, flags and payload, until the
+/// stream or the connection ends.
+async fn h2_stream_1_frame_bytes(client: &mut TcpStream) -> Vec<(u8, u8, Vec<u8>)> {
     let mut wire = Vec::new();
     loop {
         let mut frames = Vec::new();
@@ -552,14 +585,8 @@ async fn h2_stream_1_frames(client: &mut TcpStream) -> Vec<(u8, u32)> {
                 break;
             }
             let stream = u32::from_be_bytes([rest[5], rest[6], rest[7], rest[8]]) & 0x7fff_ffff;
-            let payload = &rest[9..9 + length];
             if stream == 1 {
-                let code = if rest[3] == 0x3 {
-                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
-                } else {
-                    0
-                };
-                frames.push((rest[3], code));
+                frames.push((rest[3], rest[4], rest[9..9 + length].to_vec()));
                 ended |= rest[3] == 0x3 || rest[4] & 0x1 != 0;
             }
             ended |= rest[3] == 0x7;
@@ -628,6 +655,41 @@ fn h2c_field_values_are_trimmed_by_default() {
 }
 
 #[test]
+fn owned_http2_accepts_verbatim_http2_header_values() {
+    assert_eq!(owned_h2_verbatim_session(true).check_owned_http2(), Ok(()));
+}
+
+#[test]
+fn verbatim_http2_header_values_reach_the_application_as_sent_over_owned_h2c_when_enabled() {
+    on_worker(|context| async move {
+        assert_eq!(
+            serve_fields_with(
+                context,
+                CodecProtocol::Http2,
+                owned_h2_verbatim_session(true)
+            )
+            .await,
+            fields(&PADDED_FIELDS)
+        );
+    });
+}
+
+#[test]
+fn owned_h2c_field_values_are_trimmed_by_default() {
+    on_worker(|context| async move {
+        assert_eq!(
+            serve_fields_with(
+                context,
+                CodecProtocol::Http2,
+                owned_h2_verbatim_session(false)
+            )
+            .await,
+            fields(&TRIMMED_FIELDS)
+        );
+    });
+}
+
+#[test]
 fn http1_field_values_keep_their_whitespace_trimmed_with_verbatim_http2_header_values() {
     on_worker(|context| async move {
         assert_eq!(
@@ -653,6 +715,8 @@ enum RequestSeen {
 
 thread_local! {
     static REQUESTS: RefCell<Vec<RequestSeen>> = const { RefCell::new(Vec::new()) };
+    /// The request heads `BodyRecordingHandler` has read.
+    static HEADS_READ: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Reads each request to its end and records what it saw; answers 200, or fails
@@ -673,6 +737,7 @@ impl HttpHandler for BodyRecordingHandler {
                     return Err(error);
                 }
             };
+            HEADS_READ.with(|heads| heads.set(heads.get() + 1));
             let mut content_length = Vec::new();
             head.headers().headers().for_each(|name, value| {
                 if name.eq_ignore_ascii_case(b"content-length") {
@@ -872,6 +937,200 @@ fn an_empty_h2c_content_length_followed_by_data_fails_the_request_as_a_zero_one_
             assert_eq!(
                 serve_body(&context, verbatim_session(true), request).await,
                 (RequestSeen::HeadFailed, vec![(0x3, 0x2)])
+            );
+        }
+    });
+}
+
+/// What the application recorded of `request` over h2c, if it read anything, and the frames
+/// (with RST_STREAM codes) the server sent on stream 1. A request the session refuses before
+/// its head reaches the handler records nothing.
+async fn serve_body_recorded(
+    context: &WorkerContext,
+    session: ServerSessionConfig,
+    request: &[u8],
+) -> (Vec<RequestSeen>, Vec<(u8, u32)>) {
+    REQUESTS.with(|seen| seen.borrow_mut().clear());
+    let (_connection, mut client) = connect_served_with(
+        context,
+        CodecProtocol::Http2,
+        session,
+        Rc::new(BodyRecordingHandler),
+    )
+    .await;
+    client.write_all(request).await.expect("request written");
+    let frames = h2_stream_1_frames(&mut client).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (REQUESTS.with(|seen| seen.take()), frames)
+}
+
+#[test]
+fn an_empty_h2c_content_length_ending_the_request_reads_as_zero_over_owned_http2() {
+    let request = h2c_content_length_request(b"", None);
+    on_worker(move |context| async move {
+        let (seen, frames) =
+            serve_body_recorded(&context, owned_h2_verbatim_session(true), &request).await;
+        assert_eq!(
+            seen,
+            [RequestSeen::Read {
+                content_length: vec![Vec::new()],
+                body: Some(Vec::new()),
+            }]
+        );
+        assert!(
+            frames.iter().all(|(kind, _)| *kind != 0x3),
+            "the 200 ends the stream without a reset: {frames:?}"
+        );
+        assert_eq!(frames.first(), Some(&(0x1, 0)));
+    });
+}
+
+#[test]
+fn an_empty_h2c_content_length_followed_by_data_fails_the_request_as_a_zero_one_does_over_owned_http2()
+ {
+    let empty = h2c_content_length_request(b"", Some(b"abc"));
+    let zero = h2c_content_length_request(b"0", Some(b"abc"));
+    on_worker(move |context| async move {
+        let (zero_seen, zero_frames) =
+            serve_body_recorded(&context, owned_h2_verbatim_session(true), &zero).await;
+        let (empty_seen, empty_frames) =
+            serve_body_recorded(&context, owned_h2_verbatim_session(true), &empty).await;
+        // As over the managed session
+        // (`an_empty_h2c_content_length_followed_by_data_fails_the_request_as_a_zero_one_does`),
+        // the overrun fails the request before the application reads its head, and the stream
+        // is reset with INTERNAL_ERROR.
+        assert_eq!(zero_frames, [(0x3, 0x2)]);
+        assert!(
+            zero_seen.is_empty(),
+            "the owned driver fails the stream before the head reaches the handler: \
+             {zero_seen:?}"
+        );
+        assert_eq!(empty_frames, zero_frames);
+        assert_eq!(empty_seen, zero_seen);
+    });
+}
+
+/// What the application saw of an h2c POST with `content-length: <content_length>` whose
+/// HEADERS frame leaves the stream open and whose one DATA frame, `abc` without END_STREAM,
+/// is sent once the application has read the head; and each frame (type, flags, payload)
+/// the server sent on stream 1.
+async fn serve_split_overrun(
+    context: &WorkerContext,
+    session: ServerSessionConfig,
+    content_length: &[u8],
+) -> (RequestSeen, Vec<(u8, u8, Vec<u8>)>) {
+    REQUESTS.with(|seen| seen.borrow_mut().clear());
+    HEADS_READ.with(|heads| heads.set(0));
+    let (_connection, mut client) = connect_served_with(
+        context,
+        CodecProtocol::Http2,
+        session,
+        Rc::new(BodyRecordingHandler),
+    )
+    .await;
+    let mut head = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    head.extend(h2_frame(0x4, 0, 0, &[]));
+    head.extend(h2_frame(
+        0x1,
+        0x4,
+        1,
+        &h2_request_block(b"POST", &[(b"content-length", content_length)]),
+    ));
+    client.write_all(&head).await.expect("head written");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while HEADS_READ.with(Cell::get) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the application read the head within the bound");
+    client
+        .write_all(&h2_frame(0x0, 0, 1, b"abc"))
+        .await
+        .expect("data written");
+    let frames = tokio::time::timeout(Duration::from_secs(5), h2_stream_1_frame_bytes(&mut client))
+        .await
+        .expect("stream 1 ended within the bound");
+    let seen = one_recorded(|| REQUESTS.with(|seen| seen.take())).await;
+    (seen, frames)
+}
+
+/// A body read that fails while the request is still open, after the application has read
+/// the head, here on DATA overrunning the declared length: the handler's failure becomes a
+/// 500 on both drivers, then the managed session sends that 500's body with END_STREAM and
+/// `owned_http2` resets the stream with INTERNAL_ERROR (`DIV-028`). This holds for any
+/// declared length, and an empty one with `verbatim_http2_header_values` fails on each
+/// driver as `0` does (`DIV-041`).
+#[test]
+fn an_h2c_overrun_after_the_head_gets_a_500_then_its_body_or_over_owned_http2_a_reset() {
+    on_worker(|context| async move {
+        for (verbatim, content_length) in [
+            (false, b"0".as_slice()),
+            (false, b"2"),
+            (true, b"0"),
+            (true, b""),
+        ] {
+            for owned_http2 in [false, true] {
+                let case = format!(
+                    "verbatim {verbatim}, content-length {:?}, owned_http2 {owned_http2}",
+                    String::from_utf8_lossy(content_length)
+                );
+                let session = ServerSessionConfig {
+                    owned_http2,
+                    ..verbatim_session(verbatim)
+                };
+                let (seen, frames) = serve_split_overrun(&context, session, content_length).await;
+                assert_eq!(
+                    seen,
+                    RequestSeen::Read {
+                        content_length: vec![content_length.to_vec()],
+                        body: None,
+                    },
+                    "{case}: the body read fails before any overrunning byte"
+                );
+                let [(head_kind, head_flags, head), (kind, flags, payload)] = frames.as_slice()
+                else {
+                    panic!("{case}: {frames:?}");
+                };
+                // A HEADERS frame that ends its block but not the stream, led by `:status 500`
+                // (HPACK static entry 14).
+                assert_eq!(
+                    (*head_kind, *head_flags, head.first()),
+                    (0x1, 0x4, Some(&0x8e)),
+                    "{case}"
+                );
+                let expected: (u8, u8, &[u8]) = if owned_http2 {
+                    (0x3, 0, &[0, 0, 0, 0x2])
+                } else {
+                    (0x0, 0x1, b"request body failed")
+                };
+                assert_eq!((*kind, *flags, payload.as_slice()), expected, "{case}");
+            }
+        }
+    });
+}
+
+/// Without `verbatim_http2_header_values` an empty `content-length` leaves the body unchecked
+/// on both drivers (`DIV-041`): the application reads the DATA and answers 200.
+#[test]
+fn an_empty_h2c_content_length_leaves_the_body_unchecked_by_default_on_both_drivers() {
+    let request = h2c_content_length_request(b"", Some(b"abc"));
+    on_worker(move |context| async move {
+        for owned_http2 in [false, true] {
+            let session = ServerSessionConfig {
+                owned_http2,
+                ..verbatim_session(false)
+            };
+            assert_eq!(
+                serve_body_recorded(&context, session, &request).await,
+                (
+                    vec![RequestSeen::Read {
+                        content_length: vec![Vec::new()],
+                        body: Some(b"abc".to_vec()),
+                    }],
+                    vec![(0x1, 0)],
+                ),
+                "owned_http2 {owned_http2}"
             );
         }
     });
