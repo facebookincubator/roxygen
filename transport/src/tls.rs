@@ -492,6 +492,9 @@ impl StoredIoError {
     }
 }
 
+/// The bound Tokio's `safe_delay` puts on a `tokio::time::sleep` duration: about 30 years.
+const TOKIO_MAX_SLEEP: Duration = Duration::from_secs(86_400 * 365 * 30);
+
 struct CiphertextState<S> {
     stream: Option<S>,
     pending: BufQueue,
@@ -508,6 +511,10 @@ struct CiphertextState<S> {
     plaintext_complete: bool,
     next_timeout: Option<Duration>,
     deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// The deadline of a timed write none of whose ciphertext is staged yet. The background reads
+    /// the deadline only while ciphertext is staged, so its timer is built only when ciphertext
+    /// is first staged (`stage_deadline`), and a write that TCP takes at once builds none.
+    unstaged_deadline: Option<Instant>,
     stopped: bool,
 }
 
@@ -522,29 +529,57 @@ where
         self.plaintext_complete = false;
         if timeout.is_zero() {
             if self.pending.is_empty() {
-                self.deadline = None;
+                self.clear_deadline();
             }
             return;
         }
-        let deadline = Box::pin(tokio::time::sleep(timeout));
-        let replace = self
-            .deadline
-            .as_ref()
-            .is_none_or(|current| deadline.deadline() < current.deadline());
-        if replace {
-            self.deadline = Some(deadline);
-            if (!self.pending.is_empty()
-                || self.flush_requested
-                || self.shutdown_requested
-                || self.shutdown_complete
-                || self.stopped
-                || self.error.is_some()
-                || self.stream.is_none())
-                && let Some(waker) = self.task_waker.take()
-            {
-                waker.wake();
-            }
+        // `tokio::time::sleep(timeout)`'s deadline, which clamps the timeout to `TOKIO_MAX_SLEEP`.
+        let deadline = Instant::now() + timeout.min(TOKIO_MAX_SLEEP);
+        if self
+            .deadline_instant()
+            .is_some_and(|current| deadline >= current)
+        {
+            return;
         }
+        if self.pending.is_empty()
+            && !self.flush_requested
+            && !self.shutdown_requested
+            && !self.shutdown_complete
+            && !self.stopped
+            && self.error.is_none()
+            && self.stream.is_some()
+        {
+            self.deadline = None;
+            self.unstaged_deadline = Some(deadline);
+            return;
+        }
+        self.unstaged_deadline = Some(deadline);
+        self.stage_deadline();
+        if let Some(waker) = self.task_waker.take() {
+            waker.wake();
+        }
+    }
+
+    /// The current write deadline, whether its timer is built or not.
+    fn deadline_instant(&self) -> Option<Instant> {
+        self.deadline
+            .as_ref()
+            .map(|deadline| deadline.deadline())
+            .or(self.unstaged_deadline)
+    }
+
+    /// Builds the timer of an unstaged deadline: ciphertext is about to be staged.
+    fn stage_deadline(&mut self) {
+        if let Some(deadline) = self.unstaged_deadline.take() {
+            #[cfg(test)]
+            record_deadline_timer();
+            self.deadline = Some(Box::pin(tokio::time::sleep_until(deadline)));
+        }
+    }
+
+    fn clear_deadline(&mut self) {
+        self.deadline = None;
+        self.unstaged_deadline = None;
     }
 
     fn foreground_waker_for(&mut self, role: ForegroundRole) -> &mut Option<std::task::Waker> {
@@ -610,7 +645,7 @@ where
         self.flush_requested = false;
         self.shutdown_requested = false;
         self.next_timeout = None;
-        self.deadline = None;
+        self.clear_deadline();
         self.wake_waiters();
         if let Some(waker) = self.task_waker.take() {
             waker.wake();
@@ -684,7 +719,7 @@ where
 
             self.pending_zero_copy = None;
             if self.plaintext_complete {
-                self.deadline = None;
+                self.clear_deadline();
             }
             let Some(stream) = self.stream.as_mut() else {
                 return Poll::Ready(());
@@ -771,8 +806,30 @@ where
     pub(crate) fn has_deadline(&self) -> bool {
         self.state
             .upgrade()
-            .is_some_and(|state| state.borrow().deadline.is_some())
+            .is_some_and(|state| state.borrow().deadline_instant().is_some())
     }
+
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.state
+            .upgrade()
+            .and_then(|state| state.borrow().deadline_instant())
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static DEADLINE_TIMERS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_deadline_timer() {
+    DEADLINE_TIMERS.with(|timers| timers.set(timers.get() + 1));
+}
+
+/// The ciphertext write-deadline timers built on this thread.
+#[cfg(test)]
+pub(crate) fn deadline_timers_for_test() -> usize {
+    DEADLINE_TIMERS.with(Cell::get)
 }
 
 std::thread_local! {
@@ -814,6 +871,7 @@ where
                 plaintext_complete: true,
                 next_timeout: None,
                 deadline: None,
+                unstaged_deadline: None,
                 stopped: false,
             })),
             background_id: None,
@@ -869,7 +927,7 @@ where
         let mut state = self.state.borrow_mut();
         state.plaintext_complete = true;
         if state.pending.is_empty() {
-            state.deadline = None;
+            state.clear_deadline();
         }
     }
 
@@ -964,9 +1022,8 @@ where
                 && !state.shutdown_requested
                 && !state.shutdown_complete
                 && state
-                    .deadline
-                    .as_ref()
-                    .is_none_or(|deadline| deadline.deadline() > Instant::now())
+                    .deadline_instant()
+                    .is_none_or(|deadline| deadline > Instant::now())
                 && let Some(offered) = buffers
                     .iter()
                     .try_fold(0usize, |length, buffer| length.checked_add(buffer.len()))
@@ -1012,6 +1069,7 @@ where
                 state.clear_foreground_waker();
                 return Poll::Ready(Ok(0));
             }
+            state.stage_deadline();
             #[cfg(test)]
             self.staged_batches.set(self.staged_batches.get() + 1);
             state.clear_foreground_waker();

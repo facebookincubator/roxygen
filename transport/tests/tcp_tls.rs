@@ -10965,4 +10965,328 @@ mod tcp_tls {
             });
         }
     }
+
+    /// A TLS stream over the ciphertext probe that turns 4 plaintext bytes into the 6-byte record
+    /// `record`.
+    fn record_stream(
+        transport: OwnedCiphertextStream<CiphertextProbeStream>,
+    ) -> OwnedTlsStream<ScriptedTlsStream> {
+        OwnedTlsStream::new(ScriptedTlsStream {
+            transport,
+            ciphertext: b"record",
+            accepted_plaintext: 4,
+            flushes: VecDeque::new(),
+            plaintext_writes: Rc::new(Cell::new(0)),
+            wants_write: false,
+            wants_write_after_accept: false,
+            block_after_first: false,
+        })
+    }
+
+    /// A timed plaintext write whose ciphertext TCP takes at once needs no background service, so
+    /// it builds no deadline timer; one whose ciphertext is staged builds exactly one.
+    #[test]
+    fn tls_timed_write_builds_a_deadline_timer_only_for_staged_ciphertext() {
+        Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                time::pause();
+                let control = CiphertextProbeControl::default();
+                control.0.borrow_mut().borrowed_sends = VecDeque::from([CiphertextSend::Write(6)]);
+                let transport =
+                    OwnedCiphertextStream::new(control.stream([CiphertextSend::Pending]));
+                let background = transport.background_for_test();
+                let mut stream = record_stream(transport);
+                let mut context = Context::from_waker(Waker::noop());
+                let data = queue(&[b"ping"]);
+
+                let before = crate::tls::deadline_timers_for_test();
+                stream.prepare_write_timeout(Duration::from_secs(60));
+                assert!(!stream.begin_owned_write(4));
+                assert!(matches!(
+                    stream.poll_write_owned(&mut context, &data, false),
+                    Poll::Ready(Ok(4)),
+                ));
+                assert_eq!(control.0.borrow().written, b"record");
+                assert!(!background.has_deadline());
+                assert_eq!(
+                    crate::tls::deadline_timers_for_test() - before,
+                    0,
+                    "ciphertext TCP took at once needs no deadline timer"
+                );
+
+                stream.prepare_write_timeout(Duration::from_secs(60));
+                assert!(!stream.begin_owned_write(4));
+                assert!(matches!(
+                    stream.poll_write_owned(&mut context, &data, false),
+                    Poll::Ready(Ok(4)),
+                ));
+                assert!(background.has_deadline(), "staged ciphertext is timed");
+                assert_eq!(crate::tls::deadline_timers_for_test() - before, 1);
+            });
+    }
+
+    /// A write timeout beyond Tokio's 30-year `sleep` bound gets the deadline
+    /// `tokio::time::sleep(timeout)` would, before and after its ciphertext is staged.
+    #[test]
+    fn tls_write_deadline_clamps_a_long_timeout_like_tokio_sleep() {
+        Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                time::pause();
+                let timeout = Duration::from_secs(86_400 * 365 * 31);
+                let control = CiphertextProbeControl::default();
+                let transport =
+                    OwnedCiphertextStream::new(control.stream([CiphertextSend::Pending]));
+                let background = transport.background_for_test();
+                let mut stream = record_stream(transport);
+                let mut context = Context::from_waker(Waker::noop());
+                let data = queue(&[b"ping"]);
+
+                let expected = time::sleep(timeout).deadline();
+                stream.prepare_write_timeout(timeout);
+                assert!(!stream.begin_owned_write(4));
+                assert_eq!(background.deadline(), Some(expected), "unstaged");
+                assert!(matches!(
+                    stream.poll_write_owned(&mut context, &data, false),
+                    Poll::Ready(Ok(4)),
+                ));
+                assert!(control.0.borrow().written.is_empty());
+                assert_eq!(background.deadline(), Some(expected), "staged");
+            });
+    }
+
+    /// The deadline of staged ciphertext runs from the start of its plaintext write, not from the
+    /// staging: time that passes between `begin_owned_write` and the poll that stages counts.
+    #[test]
+    fn tls_staged_ciphertext_deadline_runs_from_the_write_start() {
+        Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                time::pause();
+                let timeout = Duration::from_secs(5);
+                let before_staging = Duration::from_secs(2);
+                let control = CiphertextProbeControl::default();
+                let transport =
+                    OwnedCiphertextStream::new(control.stream([CiphertextSend::Pending]));
+                let background = transport.background_for_test();
+                let mut stream = record_stream(transport);
+                let signal = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&signal));
+                let mut background_context = Context::from_waker(&waker);
+                let mut context = Context::from_waker(Waker::noop());
+                let data = queue(&[b"ping"]);
+
+                stream.prepare_write_timeout(timeout);
+                assert!(!stream.begin_owned_write(4));
+                time::advance(before_staging).await;
+                assert!(matches!(
+                    stream.poll_write_owned(&mut context, &data, false),
+                    Poll::Ready(Ok(4)),
+                ));
+                assert!(background.poll(&mut background_context).is_pending());
+                assert!(!signal.take());
+
+                time::advance(timeout - before_staging - Duration::from_millis(1)).await;
+                tokio::task::yield_now().await;
+                assert!(
+                    !signal.take(),
+                    "the deadline did not pass before its write's start plus the timeout"
+                );
+                assert!(background.poll(&mut background_context).is_pending());
+
+                time::advance(Duration::from_millis(2)).await;
+                tokio::task::yield_now().await;
+                assert!(
+                    signal.take(),
+                    "the deadline passed at its write's start plus the timeout"
+                );
+                assert!(background.poll(&mut background_context).is_ready());
+                let Poll::Ready(Err(error)) = Pin::new(&mut stream).poll_flush(&mut context) else {
+                    panic!("the background timeout is sticky");
+                };
+                assert_ciphertext_write_timeout(&error);
+                assert!(control.0.borrow().reset);
+            });
+    }
+
+    /// A plaintext write still unstaged when its deadline passes stages its ciphertext instead of
+    /// handing it to TCP, and the background fails it with the timeout.
+    #[test]
+    fn tls_write_polled_after_its_deadline_stages_and_times_out() {
+        Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                time::pause();
+                let timeout = Duration::from_secs(1);
+                let control = CiphertextProbeControl::default();
+                control.0.borrow_mut().borrowed_sends = VecDeque::from([CiphertextSend::Write(6)]);
+                let transport =
+                    OwnedCiphertextStream::new(control.stream([CiphertextSend::Pending]));
+                let background = transport.background_for_test();
+                let mut stream = record_stream(transport);
+                let signal = Arc::new(WakeSignal::default());
+                let waker = Waker::from(Arc::clone(&signal));
+                let mut background_context = Context::from_waker(&waker);
+                let mut context = Context::from_waker(Waker::noop());
+                let data = queue(&[b"ping"]);
+
+                stream.prepare_write_timeout(timeout);
+                assert!(!stream.begin_owned_write(4));
+                time::advance(timeout + Duration::from_millis(1)).await;
+                assert!(matches!(
+                    stream.poll_write_owned(&mut context, &data, false),
+                    Poll::Ready(Ok(4)),
+                ));
+                assert!(
+                    control.0.borrow().written.is_empty(),
+                    "an expired write's ciphertext does not go to TCP directly"
+                );
+                assert!(background.has_deadline());
+                assert!(background.poll(&mut background_context).is_ready());
+                let Poll::Ready(Err(error)) = Pin::new(&mut stream).poll_flush(&mut context) else {
+                    panic!("the background timeout is sticky");
+                };
+                assert_ciphertext_write_timeout(&error);
+                assert_eq!(control.0.borrow().operations, Vec::<&str>::new());
+            });
+    }
+
+    /// The background's deadline failure, typed so that `write_io_error` reports `WRITE_TIMEOUT`.
+    fn assert_ciphertext_write_timeout(error: &io::Error) {
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<crate::tls::CiphertextWriteTimeout>()),
+            "the background deadline failure keeps its typed cause: {error:?}"
+        );
+    }
+
+    /// A timed write whose ciphertext TCP takes at once builds no deadline timer. The next one,
+    /// whose ciphertext is staged, builds its timer only at the staging, yet the deadline still
+    /// runs from that write's start, and its expiry reports `WRITE_TIMEOUT` to the operation it
+    /// poisons.
+    #[test]
+    fn tls_lazily_built_write_deadline_reports_write_timeout() {
+        Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(LocalSet::new().run_until(async move {
+                time::pause();
+                let (worker, driver) = WorkerDriver::new(4).unwrap();
+                let call = worker
+                    .call_local(move |context| async move {
+                        let timeout = Duration::from_millis(20);
+                        let control = CiphertextProbeControl::default();
+                        control.0.borrow_mut().borrowed_sends =
+                            VecDeque::from([CiphertextSend::Write(6)]);
+                        let transport =
+                            OwnedCiphertextStream::new(control.stream([CiphertextSend::Pending]));
+                        let background = transport.background_for_test();
+                        let background_task = {
+                            let background = background.clone();
+                            tokio::task::spawn_local(async move {
+                                std::future::poll_fn(|task_context| background.poll(task_context))
+                                    .await;
+                                time::Instant::now()
+                            })
+                        };
+                        let stream = owned_from_stream(
+                            &context,
+                            record_stream(transport),
+                            SocketAddress::default(),
+                            SocketAddress::default(),
+                            None,
+                            limits(),
+                        )
+                        .unwrap();
+                        let timers = crate::tls::deadline_timers_for_test();
+
+                        let first = stream
+                            .write(
+                                &context,
+                                queue(&[b"warm"]),
+                                timeout,
+                                CancellationToken::never(),
+                            )
+                            .await
+                            .expect("TCP takes the first write's ciphertext at once");
+                        assert_eq!(first.bytes_written, 4);
+                        assert_eq!(control.0.borrow().written, b"record");
+                        assert!(!background.has_deadline());
+                        assert_eq!(
+                            crate::tls::deadline_timers_for_test() - timers,
+                            0,
+                            "ciphertext TCP took at once builds no deadline timer"
+                        );
+
+                        let started = time::Instant::now();
+                        let second = stream
+                            .write(
+                                &context,
+                                queue(&[b"ping"]),
+                                timeout,
+                                CancellationToken::never(),
+                            )
+                            .await
+                            .expect("the second write's plaintext is reported once staged");
+                        assert_eq!(second.bytes_written, 4);
+                        assert!(background.has_deadline(), "staged ciphertext is timed");
+                        assert_eq!(
+                            crate::tls::deadline_timers_for_test() - timers,
+                            1,
+                            "the staging builds the deadline timer"
+                        );
+
+                        let elapsed = background_task.await.unwrap() - started;
+                        assert!(
+                            elapsed >= timeout && elapsed <= timeout + Duration::from_millis(1),
+                            "the lazily built deadline runs from its write's start, within the \
+                             timer's 1 ms tick: {elapsed:?}"
+                        );
+                        let error = stream
+                            .write(
+                                &context,
+                                queue(&[b"x"]),
+                                Duration::ZERO,
+                                CancellationToken::never(),
+                            )
+                            .await
+                            .expect_err("the background timeout poisons the next operation");
+                        assert_eq!(error.code(), HttpErrorCode::WRITE_TIMEOUT);
+                        assert_eq!(error.bytes_written(), 0);
+                        let mut cause = std::error::Error::source(error.error());
+                        let mut typed = false;
+                        while let Some(current) = cause {
+                            typed |= current.is::<crate::tls::CiphertextWriteTimeout>()
+                                || current.downcast_ref::<io::Error>().is_some_and(|io| {
+                                    io.get_ref().is_some_and(|inner| {
+                                        inner.is::<crate::tls::CiphertextWriteTimeout>()
+                                    })
+                                });
+                            cause = current.source();
+                        }
+                        assert!(typed, "the typed timeout is the error's cause: {error:?}");
+                        let state = control.0.borrow();
+                        assert!(state.reset);
+                        assert!(state.abandoned);
+                        assert_eq!(state.written, b"record");
+                    })
+                    .unwrap();
+                let driver_task = tokio::task::spawn_local(driver);
+                call.await.unwrap();
+                worker.begin_shutdown();
+                driver_task.await.unwrap();
+            }));
+    }
 }
