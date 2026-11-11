@@ -597,6 +597,247 @@ fn a_waiter_times_out_at_the_connect_timeout() {
     );
 }
 
+/// One-connection pool parameters with `connect_timeout` and `acquisition_timeout`.
+fn timed_params(connect_timeout: Duration, acquisition_timeout: Option<Duration>) -> PoolParams {
+    PoolParams {
+        connect_timeout,
+        acquisition_timeout,
+        ..params(1)
+    }
+}
+
+/// How an acquisition from a one-connection pool with `params` ends, and after how long,
+/// while an earlier acquisition holds the session's only slot: an owned pool's, or with
+/// `native` an `HttpSessionPool`'s.
+fn held_slot_acquisition(
+    protocol: CodecProtocol,
+    params: PoolParams,
+    native: bool,
+) -> (Option<PoolError>, Duration) {
+    let origin = Origin::start(protocol);
+    let address = origin.address;
+    run_on_worker(move |context| async move {
+        if native {
+            let pool = HttpSessionPool::new(
+                context,
+                socket_address(address),
+                params,
+                plaintext(protocol),
+                one_stream(protocol),
+            );
+            let _held = pool
+                .get_session_with_reservation(CancellationToken::never())
+                .await
+                .expect("acquisition succeeds");
+            let started = Instant::now();
+            let error = pool
+                .get_session_with_reservation(CancellationToken::never())
+                .await
+                .err();
+            (error, started.elapsed())
+        } else {
+            let pool = pool_with(&context, address, protocol, params, one_stream(protocol));
+            let _held = acquire(&pool).await;
+            let started = Instant::now();
+            let error = pool
+                .get_session_with_reservation(CancellationToken::never())
+                .await
+                .err();
+            (error, started.elapsed())
+        }
+    })
+}
+
+#[test]
+fn a_waiter_times_out_at_the_acquisition_timeout() {
+    let params = timed_params(Duration::from_secs(5), Some(Duration::from_millis(200)));
+    for (protocol, native) in [
+        (CodecProtocol::Http11, false),
+        (CodecProtocol::Http2, false),
+        (CodecProtocol::Http11, true),
+    ] {
+        let (error, waited) = held_slot_acquisition(protocol, params, native);
+        assert!(
+            matches!(error, Some(PoolError::Timeout)),
+            "{protocol:?}, native {native}: {error:?}"
+        );
+        assert!(
+            (Duration::from_millis(200)..Duration::from_secs(2)).contains(&waited),
+            "{protocol:?}, native {native}: waited {waited:?}, not the 200 ms acquisition timeout"
+        );
+    }
+}
+
+#[test]
+fn without_an_acquisition_timeout_a_waiter_times_out_at_the_connect_timeout() {
+    assert_eq!(PoolParams::default().acquisition_timeout, None);
+    let params = timed_params(Duration::from_millis(200), None);
+    for protocol in PROTOCOLS {
+        let (error, waited) = held_slot_acquisition(protocol, params, false);
+        assert!(
+            matches!(error, Some(PoolError::Timeout)),
+            "{protocol:?}: {error:?}"
+        );
+        assert!(
+            (Duration::from_millis(200)..Duration::from_secs(2)).contains(&waited),
+            "{protocol:?}: waited {waited:?}, not the 200 ms connect timeout"
+        );
+    }
+}
+
+/// The deadline check reads `acquisition_timeout` too, not only the waits: a step that finds
+/// no session 300 ms after the acquisition's first such step times out under a 200 ms or a
+/// zero acquisition timeout with a 5 s connect timeout, and not under a 5 s acquisition
+/// timeout with a 200 ms connect timeout. A zero one fails the acquisition that would dial
+/// the session to hold, so its step runs on the empty pool.
+#[test]
+fn a_step_past_the_acquisition_timeout_times_out() {
+    let short = Duration::from_millis(200);
+    let long = Duration::from_secs(5);
+    let origin = Origin::start(CodecProtocol::Http2);
+    let address = origin.address;
+    let steps = run_on_worker(move |context| async move {
+        let mut steps = Vec::new();
+        for (connect_timeout, acquisition_timeout) in [
+            (long, Some(short)),
+            (long, Some(Duration::ZERO)),
+            (short, Some(long)),
+        ] {
+            let pool = pool_with(
+                &context,
+                address,
+                CodecProtocol::Http2,
+                timed_params(connect_timeout, acquisition_timeout),
+                one_stream(CodecProtocol::Http2),
+            );
+            let _held = if acquisition_timeout == Some(Duration::ZERO) {
+                None
+            } else {
+                Some(acquire(&pool).await)
+            };
+            steps.push(pool.acquisition_step_for_test(Instant::now() - Duration::from_millis(300)));
+        }
+        steps
+    });
+    assert!(
+        matches!(
+            &steps[..],
+            [Err(PoolError::Timeout), Err(PoolError::Timeout), Ok(())]
+        ),
+        "{steps:?}"
+    );
+}
+
+#[test]
+fn an_http2_waiter_outlives_the_connect_timeout_until_a_stream_frees() {
+    let origin = Origin::start(CodecProtocol::Http2);
+    let address = origin.address;
+    let (error, same, body, waited) = run_on_worker(move |context| async move {
+        let pool = pool_with(
+            &context,
+            address,
+            CodecProtocol::Http2,
+            timed_params(Duration::from_millis(100), Some(Duration::from_secs(5))),
+            one_stream(CodecProtocol::Http2),
+        );
+        let first = acquire(&pool).await;
+        let started = Instant::now();
+        let second = pool.get_session_with_reservation(CancellationToken::never());
+        tokio::pin!(second);
+        // The only stream stays reserved for three connect timeouts.
+        let early = tokio::select! {
+            result = &mut second => Some(result),
+            () = tokio::time::sleep(Duration::from_millis(300)) => None,
+        };
+        let result = match early {
+            Some(result) => result,
+            None => {
+                drop(first.reservation);
+                second.await
+            }
+        };
+        let waited = started.elapsed();
+        match result {
+            Ok(second) => (
+                None,
+                local(&first.session) == local(&second.session),
+                exchange(second.reservation, "/").await,
+                waited,
+            ),
+            Err(error) => (Some(error), false, Vec::new(), waited),
+        }
+    });
+    assert!(
+        error.is_none(),
+        "the waiter failed after {waited:?}: {error:?}"
+    );
+    assert_eq!(
+        (same, body, origin.accepted()),
+        (true, b"ok".to_vec(), 1),
+        "the waiter takes the freed stream on the one connection"
+    );
+    assert!(waited >= Duration::from_millis(300), "waited {waited:?}");
+}
+
+/// Linux drops the SYNs that reach a full accept queue: with a backlog of 0, one
+/// connection left unaccepted fills it, and the pool's dial stalls.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dial_stays_bounded_by_the_connect_timeout() {
+    let short = Duration::from_millis(200);
+    let long = Duration::from_secs(5);
+    let outcomes = run_on_worker(move |context| async move {
+        let socket = tokio::net::TcpSocket::new_v4().expect("listener socket");
+        socket
+            .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("listener binds");
+        let listener = socket.listen(0).expect("listener listens");
+        let address = listener.local_addr().expect("listener address");
+        let _queued = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("the first connection is queued");
+        let mut outcomes = Vec::new();
+        for (connect_timeout, acquisition_timeout) in [(short, long), (long, short)] {
+            let pool = pool_with(
+                &context,
+                address,
+                CodecProtocol::Http2,
+                PoolParams {
+                    max_connection_attempts: 1,
+                    ..timed_params(connect_timeout, Some(acquisition_timeout))
+                },
+                untimed(),
+            );
+            let started = Instant::now();
+            let error = pool
+                .get_session_with_reservation(CancellationToken::never())
+                .await
+                .err();
+            outcomes.push((error, started.elapsed()));
+        }
+        outcomes
+    });
+    let [(dial, dial_waited), (wait, wait_waited)] = &outcomes[..] else {
+        panic!("two scenarios ran: {outcomes:?}");
+    };
+    assert!(
+        matches!(dial, Some(PoolError::ConnectFailed { .. })),
+        "the dial fails at the 200 ms connect timeout under a 5 s acquisition timeout: {dial:?}"
+    );
+    assert!(
+        (short..Duration::from_secs(2)).contains(dial_waited),
+        "waited {dial_waited:?}"
+    );
+    assert!(
+        matches!(wait, Some(PoolError::Timeout)),
+        "the wait for the stalled dial ends at the 200 ms acquisition timeout: {wait:?}"
+    );
+    assert!(
+        (short..Duration::from_secs(2)).contains(wait_waited),
+        "waited {wait_waited:?}"
+    );
+}
+
 #[test]
 fn a_waiter_dials_a_replacement_when_the_only_session_closes_admission() {
     let origin = Origin::start(CodecProtocol::Http11);
@@ -3993,6 +4234,7 @@ fn router_http1() -> (PoolParams, SessionParams) {
             idle_timeout: Duration::from_secs(90),
             reuse_order: SessionReuseOrder::MostRecentlyUsed,
             idle_sweep: IdleSweep::Interval,
+            acquisition_timeout: None,
         },
         SessionParams {
             deliver_ingress_before_abort: true,

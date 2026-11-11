@@ -137,6 +137,17 @@ pub struct PoolParams {
     /// Roxygen-only (`DIV-032`): when the pool task and acquisitions retire
     /// sessions idle for `idle_timeout`.
     pub idle_sweep: IdleSweep,
+    /// Roxygen-only (`DIV-032`): bounds each of an acquisition's waits, for a session, a
+    /// stream slot or the dial it started, and fails it with [`PoolError::Timeout`] at a step
+    /// that finds no session to take once this long has passed since its first such step. A
+    /// step that finds a session takes it however late, and a woken acquisition that again
+    /// finds none waits again for the whole bound, so one acquisition can wait up to about
+    /// twice it. `None`, the default, uses `connect_timeout`, as before; each dial attempt
+    /// stays bounded by `connect_timeout`. `Some(Duration::ZERO)` acts as a zero
+    /// `connect_timeout` does: an acquisition that would wait or dial fails. Native and owned
+    /// pools: an attached pool's [`AttachedPoolParams`] has none, and its `connect_timeout`
+    /// bounds both.
+    pub acquisition_timeout: Option<Duration>,
 }
 
 /// When idle retirement retires sessions (`DIV-032`).
@@ -179,6 +190,7 @@ impl Default for PoolParams {
             idle_timeout: Duration::ZERO,
             reuse_order: SessionReuseOrder::LeastRecentlyUsed,
             idle_sweep: IdleSweep::AtExpiry,
+            acquisition_timeout: None,
         }
     }
 }
@@ -2675,6 +2687,7 @@ impl HttpSessionPool {
                 idle_timeout: Duration::ZERO,
                 reuse_order: SessionReuseOrder::LeastRecentlyUsed,
                 idle_sweep: IdleSweep::AtExpiry,
+                acquisition_timeout: None,
             },
             PoolBackend::Attached {
                 security,
@@ -3956,7 +3969,10 @@ fn next_step(
                 retired: RetiredSessions::default(),
             }
         } else {
-            let wait_timeout = pool.pool_params.connect_timeout;
+            let wait_timeout = pool
+                .pool_params
+                .acquisition_timeout
+                .unwrap_or(pool.pool_params.connect_timeout);
             let started = *started.get_or_insert_with(Instant::now);
             if (!pool.backend.is_attached() || !wait_timeout.is_zero())
                 && started.elapsed() > wait_timeout

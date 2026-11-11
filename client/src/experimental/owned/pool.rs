@@ -8,6 +8,8 @@ use std::task::Context;
 use std::task::Poll;
 #[cfg(test)]
 use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use roxygen_core::error::HttpError;
 use roxygen_core::message::SocketAddress;
@@ -33,8 +35,8 @@ use crate::pool::start_acquisition;
 
 /// A worker-local pool of [`OwnedClientSession`]s to one address, with
 /// `HttpSessionPool`'s scheduler and [`PoolParams`]: the same connection,
-/// waiter, connect-timeout, maximum-age, idle-timeout, reuse-order and
-/// idle-sweep semantics (`DIV-032`), shared with it. An HTTP/1.1 pool keeps its
+/// waiter, connect-timeout, acquisition-timeout, maximum-age, idle-timeout,
+/// reuse-order and idle-sweep semantics (`DIV-032`), shared with it. An HTTP/1.1 pool keeps its
 /// sessions that can take an exchange in a selection index, so that an
 /// acquisition that finds one, and a release, make no pass over the pool's
 /// sessions however many it holds; the selection is the scheduler's, or, opted into with
@@ -211,6 +213,11 @@ impl OwnedHttpSessionPool {
     #[cfg(test)]
     pub(crate) fn connection_attempts_for_test(&self) -> u64 {
         self.0.connection_attempts_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acquisition_step_for_test(&self, started: Instant) -> Result<(), PoolError> {
+        self.0.acquisition_step_for_test(started)
     }
 
     #[cfg(test)]
