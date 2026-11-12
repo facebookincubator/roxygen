@@ -15,6 +15,7 @@ use roxygen_codec::HttpCodec;
 use roxygen_codec::HttpCodecCallback;
 use roxygen_codec::HttpExceptionDirection;
 use roxygen_codec::OwnedEgressFrame;
+use roxygen_codec::ProxygenError;
 use roxygen_core::buf_queue::BufQueue;
 use roxygen_core::buf_queue::COMPACT_WRITE_LIMIT;
 use roxygen_core::headers::HttpCommonHeaderTable;
@@ -39,6 +40,7 @@ use super::frame::Frame;
 use super::frame::FrameType;
 use super::frame::Setting;
 use super::frame::parse_frame;
+use super::header_decode::FieldDecodeOptions;
 use super::hpack::HeaderCodecStats;
 use super::hpack::HeaderIndexingStrategy;
 use super::hpack::HeaderName;
@@ -1957,6 +1959,624 @@ fn verbatim_field_values_combine_cookie_crumbs_without_trimming_when_enabled() {
             assert_eq!(message.headers().get_single_or_empty(b"cookie"), combined);
         }
     }
+}
+
+/// A field section `decoded_outcome` decodes. A request's fields follow `:method POST`,
+/// `:scheme https`, `:authority a` and `:path /`, a method request's follow its `:method` and
+/// those three, and the other sections' fields are the whole section.
+#[derive(Clone, Copy, Debug)]
+enum Section {
+    Request,
+    Method(&'static [u8]),
+    WholeRequest,
+    RequestTrailers,
+    Response,
+}
+
+/// What `HeaderDecodeInfo` makes of `fields` in `section` with `validate`, `strict` and
+/// `options` (`None`: as `HeaderDecodeInfo::new` alone builds it): the request line or status
+/// and every field in order, or `!`, the parsing error and any Proxygen error and offending
+/// value.
+fn decoded_outcome(
+    section: Section,
+    fields: &[(&[u8], &[u8])],
+    (validate, strict): (bool, bool),
+    options: Option<FieldDecodeOptions>,
+) -> String {
+    use super::header_decode::HeaderDecodeInfo;
+
+    let method = match section {
+        Section::Method(method) => method,
+        _ => b"POST",
+    };
+    let pseudo: [(&[u8], &[u8]); 4] = [
+        (b":method", method),
+        (b":scheme", b"https"),
+        (b":authority", b"a"),
+        (b":path", b"/"),
+    ];
+    let fields: Vec<HpackHeader> = match section {
+        Section::Request | Section::Method(_) => pseudo.iter().chain(fields).collect(),
+        _ => fields.iter().collect::<Vec<_>>(),
+    }
+    .into_iter()
+    .map(|(name, value)| HpackHeader::new(name, value))
+    .collect();
+    let decoded = HpackCodec::new()
+        .decode(&HpackCodec::new().encode(&fields))
+        .unwrap();
+    let (request, trailers) = match section {
+        Section::RequestTrailers => (true, true),
+        Section::Response => (false, false),
+        _ => (true, false),
+    };
+    let info = HeaderDecodeInfo::new(request, trailers, validate, strict, false);
+    let info = match options {
+        Some(options) => info.with_options(options),
+        None => info,
+    };
+    let mut message = match info.decode(decoded) {
+        Ok(message) => message,
+        Err(info) => {
+            let mut outcome = format!("! {}", info.parsing_error.unwrap_or_default());
+            if let Some(error) = info.proxygen_error {
+                let error = match error {
+                    ProxygenError::PARSE_HEADER => "PARSE_HEADER".to_owned(),
+                    ProxygenError::HEADER_CONTENT_VALIDATION => {
+                        "HEADER_CONTENT_VALIDATION".to_owned()
+                    }
+                    other => format!("{other:?}"),
+                };
+                outcome += &format!(" [{error}] {}", info.header_error_value.escape_ascii());
+            }
+            return outcome;
+        }
+    };
+    let url = message.request_url().map(<[u8]>::to_vec);
+    let mut outcome = match (url, message.response_status()) {
+        (Some(url), _) => format!(
+            "{} {}",
+            message.method_string().unwrap(),
+            url.escape_ascii()
+        ),
+        (None, Some(status)) => status.to_string(),
+        (None, None) => String::new(),
+    };
+    message.headers().for_each(|name, value| {
+        outcome += &format!(" {}={}", name.escape_ascii(), value.escape_ascii());
+    });
+    outcome
+}
+
+/// Which option a pinned section exercises.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Exercised {
+    ExactMethods,
+    VerbatimValues,
+}
+
+/// `validate` and `strict` of a pinned outcome.
+const CHECKED: (bool, bool) = (true, false);
+const STRICT: (bool, bool) = (true, true);
+const UNCHECKED: (bool, bool) = (false, false);
+
+/// A field section and, for each `validate` and `strict`, what current Roxygen makes of it
+/// with its option off and on, byte for byte.
+struct PinnedSection {
+    section: Section,
+    fields: &'static [(&'static [u8], &'static [u8])],
+    exercised: Exercised,
+    outcomes: &'static [((bool, bool), &'static str, &'static str)],
+}
+
+const PINNED_SECTIONS: &[PinnedSection] = &[
+    PinnedSection {
+        section: Section::Request,
+        fields: &[
+            (b"user-agent", b" ua\t"),
+            (b"x-both", b"\t b "),
+            (b"x-empty", b""),
+            (b"x-blank", b" \t "),
+        ],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[
+            (
+                CHECKED,
+                "POST / Host=a User-Agent=ua x-both=b x-empty= x-blank=",
+                "POST / Host=a User-Agent= ua\\t x-both=\\t b  x-empty= x-blank= \\t ",
+            ),
+            (
+                STRICT,
+                "POST / Host=a User-Agent=ua x-both=b x-empty= x-blank=",
+                "POST / Host=a User-Agent= ua\\t x-both=\\t b  x-empty= x-blank= \\t ",
+            ),
+            (
+                UNCHECKED,
+                "POST / Host=a User-Agent=ua x-both=b x-empty= x-blank=",
+                "POST / Host=a User-Agent= ua\\t x-both=\\t b  x-empty= x-blank= \\t ",
+            ),
+        ],
+    },
+    PinnedSection {
+        section: Section::Request,
+        fields: &[(b"x-value", b"abc\r\n ")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[
+            (
+                CHECKED,
+                "POST / Host=a x-value=abc",
+                "! Invalid header name=x-value [HEADER_CONTENT_VALIDATION] abc\\r\\n ",
+            ),
+            (
+                STRICT,
+                "POST / Host=a x-value=abc",
+                "! Invalid header name=x-value [HEADER_CONTENT_VALIDATION] abc\\r\\n ",
+            ),
+            (
+                UNCHECKED,
+                "POST / Host=a x-value=abc",
+                "POST / Host=a x-value=abc\\r\\n ",
+            ),
+        ],
+    },
+    PinnedSection {
+        section: Section::Request,
+        fields: &[(b"x-value", b"a\x01b")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[
+            (
+                CHECKED,
+                "! Invalid header name=x-value [HEADER_CONTENT_VALIDATION] a\\x01b",
+                "! Invalid header name=x-value [HEADER_CONTENT_VALIDATION] a\\x01b",
+            ),
+            (
+                UNCHECKED,
+                "POST / Host=a x-value=a\\x01b",
+                "POST / Host=a x-value=a\\x01b",
+            ),
+        ],
+    },
+    PinnedSection {
+        section: Section::Request,
+        fields: &[(b"x-value", b"a\x7fb")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[(
+            CHECKED,
+            "! Invalid header name=x-value [HEADER_CONTENT_VALIDATION] a\\x7fb",
+            "! Invalid header name=x-value [HEADER_CONTENT_VALIDATION] a\\x7fb",
+        )],
+    },
+    PinnedSection {
+        section: Section::Request,
+        fields: &[(b"x-value", b"\x80\xff")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[
+            (
+                CHECKED,
+                "POST / Host=a x-value=\\x80\\xff",
+                "POST / Host=a x-value=\\x80\\xff",
+            ),
+            (
+                STRICT,
+                "! Invalid header name=x-value [HEADER_CONTENT_VALIDATION] \\x80\\xff",
+                "! Invalid header name=x-value [HEADER_CONTENT_VALIDATION] \\x80\\xff",
+            ),
+        ],
+    },
+    PinnedSection {
+        section: Section::Request,
+        fields: &[(b"content-length", b"")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[(
+            CHECKED,
+            "POST / Host=a Content-Length=",
+            "POST / Host=a Content-Length=",
+        )],
+    },
+    PinnedSection {
+        section: Section::Request,
+        fields: &[(b"content-length", b" 5 ")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[
+            (
+                CHECKED,
+                "POST / Host=a Content-Length=5",
+                "! Invalid content-length",
+            ),
+            (
+                UNCHECKED,
+                "POST / Host=a Content-Length=5",
+                "! Invalid content-length",
+            ),
+        ],
+    },
+    PinnedSection {
+        section: Section::Request,
+        fields: &[(b"content-length", b"5"), (b"content-length", b"5")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[(
+            CHECKED,
+            "POST / Host=a Content-Length=5",
+            "POST / Host=a Content-Length=5",
+        )],
+    },
+    PinnedSection {
+        section: Section::Request,
+        fields: &[(b"content-length", b"5"), (b"content-length", b"x")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[(
+            CHECKED,
+            "! Multiple content-length headers",
+            "! Invalid content-length",
+        )],
+    },
+    PinnedSection {
+        section: Section::Request,
+        fields: &[(b"te", b"trailers")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[(
+            CHECKED,
+            "POST / Host=a TE=trailers",
+            "POST / Host=a TE=trailers",
+        )],
+    },
+    PinnedSection {
+        section: Section::Request,
+        fields: &[(b"te", b" gzip")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[
+            (
+                CHECKED,
+                "POST / Host=a TE=gzip",
+                "! HTTP/2 Message with a TE other than trailers",
+            ),
+            (
+                UNCHECKED,
+                "POST / Host=a TE=gzip",
+                "! HTTP/2 Message with a TE other than trailers",
+            ),
+        ],
+    },
+    PinnedSection {
+        section: Section::Request,
+        fields: &[(b"te", b"gz\x01ip")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[
+            (
+                CHECKED,
+                "! Invalid header name=te [HEADER_CONTENT_VALIDATION] gz\\x01ip",
+                "! HTTP/2 Message with a TE other than trailers",
+            ),
+            (
+                STRICT,
+                "! Invalid header name=te [HEADER_CONTENT_VALIDATION] gz\\x01ip",
+                "! HTTP/2 Message with a TE other than trailers",
+            ),
+            (
+                UNCHECKED,
+                "POST / Host=a TE=gz\\x01ip",
+                "! HTTP/2 Message with a TE other than trailers",
+            ),
+        ],
+    },
+    PinnedSection {
+        section: Section::Request,
+        fields: &[(b"connection", b"close")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[(
+            CHECKED,
+            "! HTTP/2 Message with Connection header",
+            "! HTTP/2 Message with Connection header",
+        )],
+    },
+    PinnedSection {
+        section: Section::Request,
+        fields: &[(b"host", b"a"), (b"host", b"b")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[(
+            CHECKED,
+            "! :authority/Host header mismatch",
+            "! :authority/Host header mismatch",
+        )],
+    },
+    PinnedSection {
+        section: Section::Request,
+        fields: &[(b"x bad", b" v")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[
+            (CHECKED, "POST / Host=a x bad=v", "POST / Host=a x bad= v"),
+            (
+                STRICT,
+                "! Invalid header name=x bad [HEADER_CONTENT_VALIDATION]  v",
+                "! Invalid header name=x bad [HEADER_CONTENT_VALIDATION]  v",
+            ),
+            (UNCHECKED, "POST / Host=a x bad=v", "POST / Host=a x bad= v"),
+        ],
+    },
+    PinnedSection {
+        section: Section::Request,
+        fields: &[(b"cookie", b" a=1"), (b"cookie", b"b=2 ")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[
+            (
+                CHECKED,
+                "POST / Host=a Cookie=a=1; b=2",
+                "POST / Host=a Cookie= a=1; b=2 ",
+            ),
+            (
+                UNCHECKED,
+                "POST / Host=a Cookie=a=1; b=2",
+                "POST / Host=a Cookie= a=1; b=2 ",
+            ),
+        ],
+    },
+    PinnedSection {
+        section: Section::Request,
+        fields: &[(b"", b" v")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[
+            (
+                CHECKED,
+                "! Invalid header name= [PARSE_HEADER]  v",
+                "! Invalid header name= [PARSE_HEADER]  v",
+            ),
+            (
+                STRICT,
+                "! Invalid header name= [PARSE_HEADER]  v",
+                "! Invalid header name= [PARSE_HEADER]  v",
+            ),
+        ],
+    },
+    PinnedSection {
+        section: Section::WholeRequest,
+        fields: &[(b":method", b"GET"), (b"x-a", b"1"), (b":path", b"/")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[(
+            CHECKED,
+            "! Illegal pseudo header name=:path",
+            "! Illegal pseudo header name=:path",
+        )],
+    },
+    PinnedSection {
+        section: Section::Response,
+        fields: &[
+            (b":status", b"200"),
+            (b"x-a", b" v "),
+            (b"content-length", b"7"),
+        ],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[(
+            CHECKED,
+            "200 x-a=v Content-Length=7",
+            "200 x-a= v  Content-Length=7",
+        )],
+    },
+    PinnedSection {
+        section: Section::Response,
+        fields: &[(b":status", b"200"), (b"te", b"gzip"), (b"x-b", b"a\x01b")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[
+            (
+                CHECKED,
+                "! Invalid header name=x-b [HEADER_CONTENT_VALIDATION] a\\x01b",
+                "! HTTP/2 Message with a TE other than trailers",
+            ),
+            (
+                UNCHECKED,
+                "200 TE=gzip x-b=a\\x01b",
+                "! HTTP/2 Message with a TE other than trailers",
+            ),
+        ],
+    },
+    PinnedSection {
+        section: Section::Request,
+        fields: &[(b"x-b", b"a\x01b"), (b"te", b"gzip")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[
+            (
+                CHECKED,
+                "! Invalid header name=x-b [HEADER_CONTENT_VALIDATION] a\\x01b",
+                "! Invalid header name=x-b [HEADER_CONTENT_VALIDATION] a\\x01b",
+            ),
+            (
+                UNCHECKED,
+                "POST / Host=a x-b=a\\x01b TE=gzip",
+                "! HTTP/2 Message with a TE other than trailers",
+            ),
+        ],
+    },
+    PinnedSection {
+        section: Section::RequestTrailers,
+        fields: &[(b"x-t", b" t "), (b"te", b"gzip")],
+        exercised: Exercised::VerbatimValues,
+        outcomes: &[(
+            CHECKED,
+            " x-t=t TE=gzip",
+            "! HTTP/2 Message with a TE other than trailers",
+        )],
+    },
+    PinnedSection {
+        section: Section::Method(b"post"),
+        fields: &[],
+        exercised: Exercised::ExactMethods,
+        outcomes: &[
+            (CHECKED, "POST / Host=a", "post / Host=a"),
+            (UNCHECKED, "POST / Host=a", "post / Host=a"),
+        ],
+    },
+    PinnedSection {
+        section: Section::Method(b"PURGE"),
+        fields: &[],
+        exercised: Exercised::ExactMethods,
+        outcomes: &[(CHECKED, "PURGE / Host=a", "PURGE / Host=a")],
+    },
+    PinnedSection {
+        section: Section::Method(b"purge"),
+        fields: &[],
+        exercised: Exercised::ExactMethods,
+        outcomes: &[(CHECKED, "PURGE / Host=a", "purge / Host=a")],
+    },
+    PinnedSection {
+        section: Section::Method(b"FOO_BAR.1~"),
+        fields: &[],
+        exercised: Exercised::ExactMethods,
+        outcomes: &[
+            (
+                CHECKED,
+                "! Invalid method: FOO_BAR.1~ [HEADER_CONTENT_VALIDATION] ",
+                "FOO_BAR.1~ / Host=a",
+            ),
+            (
+                UNCHECKED,
+                "! Invalid method: FOO_BAR.1~ [HEADER_CONTENT_VALIDATION] ",
+                "FOO_BAR.1~ / Host=a",
+            ),
+        ],
+    },
+    PinnedSection {
+        section: Section::Method(b""),
+        fields: &[],
+        exercised: Exercised::ExactMethods,
+        outcomes: &[(
+            CHECKED,
+            " / Host=a",
+            "! Invalid method:  [HEADER_CONTENT_VALIDATION] ",
+        )],
+    },
+    PinnedSection {
+        section: Section::Method(b"-GET"),
+        fields: &[],
+        exercised: Exercised::ExactMethods,
+        outcomes: &[(
+            CHECKED,
+            "! Invalid method: -GET [HEADER_CONTENT_VALIDATION] ",
+            "-GET / Host=a",
+        )],
+    },
+    PinnedSection {
+        section: Section::Method(b"P@ST"),
+        fields: &[],
+        exercised: Exercised::ExactMethods,
+        outcomes: &[(
+            CHECKED,
+            "! Invalid method: P@ST [HEADER_CONTENT_VALIDATION] ",
+            "! Invalid method: P@ST [HEADER_CONTENT_VALIDATION] ",
+        )],
+    },
+    PinnedSection {
+        section: Section::WholeRequest,
+        fields: &[
+            (b":method", b"GET"),
+            (b":method", b"get"),
+            (b":scheme", b"https"),
+            (b":path", b"/"),
+        ],
+        exercised: Exercised::ExactMethods,
+        outcomes: &[(CHECKED, "! Duplicate method", "! Duplicate method")],
+    },
+];
+
+#[test]
+fn field_section_outcomes_are_pinned_with_each_option_off_and_on() {
+    let exact = FieldDecodeOptions {
+        exact_methods: true,
+        verbatim_values: false,
+    };
+    let verbatim = FieldDecodeOptions {
+        exact_methods: false,
+        verbatim_values: true,
+    };
+    let both = FieldDecodeOptions {
+        exact_methods: true,
+        verbatim_values: true,
+    };
+    let mut mismatches = Vec::new();
+    for case in PINNED_SECTIONS {
+        let (on, other) = match case.exercised {
+            Exercised::ExactMethods => (exact, verbatim),
+            Exercised::VerbatimValues => (verbatim, exact),
+        };
+        for (config, off_outcome, on_outcome) in case.outcomes {
+            for (label, options, expected) in [
+                ("no options set", None, off_outcome),
+                ("off", Some(FieldDecodeOptions::default()), off_outcome),
+                ("other option on", Some(other), off_outcome),
+                ("on", Some(on), on_outcome),
+                ("both on", Some(both), on_outcome),
+            ] {
+                let actual = decoded_outcome(case.section, case.fields, *config, options);
+                if actual != *expected {
+                    mismatches.push(format!(
+                        "{:?} {:?} {config:?} {label}:\n  actual   {actual:?}\n  expected {expected:?}",
+                        case.section, case.fields
+                    ));
+                }
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// A request section that both options change, with `validate` and `strict`, and what current
+/// Roxygen makes of it with both off, with exact methods alone, with verbatim values alone and
+/// with both on.
+const PINNED_COMBINED: &[(Section, &[(&[u8], &[u8])], (bool, bool), [&str; 4])] = &[
+    (
+        Section::Method(b"post"),
+        &[(b"x-a", b" v ")],
+        CHECKED,
+        [
+            "POST / Host=a x-a=v",
+            "post / Host=a x-a=v",
+            "POST / Host=a x-a= v ",
+            "post / Host=a x-a= v ",
+        ],
+    ),
+    (
+        Section::Method(b"FOO_BAR.1~"),
+        &[(b"te", b"gzip")],
+        CHECKED,
+        [
+            "! Invalid method: FOO_BAR.1~ [HEADER_CONTENT_VALIDATION] ",
+            "FOO_BAR.1~ / Host=a TE=gzip",
+            "! Invalid method: FOO_BAR.1~ [HEADER_CONTENT_VALIDATION] ",
+            "! HTTP/2 Message with a TE other than trailers",
+        ],
+    ),
+    (
+        Section::Method(b"FOO_BAR.1~"),
+        &[(b"te", b"gzip")],
+        UNCHECKED,
+        [
+            "! Invalid method: FOO_BAR.1~ [HEADER_CONTENT_VALIDATION] ",
+            "FOO_BAR.1~ / Host=a TE=gzip",
+            "! Invalid method: FOO_BAR.1~ [HEADER_CONTENT_VALIDATION] ",
+            "! HTTP/2 Message with a TE other than trailers",
+        ],
+    ),
+];
+
+#[test]
+fn field_section_outcomes_are_pinned_with_both_options_on() {
+    let mut mismatches = Vec::new();
+    for (section, fields, config, expected) in PINNED_COMBINED {
+        for (options, expected) in [(false, false), (true, false), (false, true), (true, true)]
+            .into_iter()
+            .map(|(exact_methods, verbatim_values)| FieldDecodeOptions {
+                exact_methods,
+                verbatim_values,
+            })
+            .zip(expected)
+        {
+            let actual = decoded_outcome(*section, fields, *config, Some(options));
+            if actual != *expected {
+                mismatches.push(format!(
+                    "{section:?} {fields:?} {config:?} {options:?}:\n  actual   {actual:?}\n  expected {expected:?}"
+                ));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 #[test]

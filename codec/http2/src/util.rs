@@ -30,7 +30,14 @@ pub fn validate_url(url: &[u8], strict: bool) -> bool {
     if url.is_empty() || rejected != 0 {
         return false;
     }
-    !strict || ParseUrl::parse_url(url, true).is_some()
+    !strict || parses_strictly(url)
+}
+
+/// `validate_url`'s strict check, out of line so that the default check does not save the
+/// registers that the parse needs.
+#[inline(never)]
+fn parses_strictly(url: &[u8]) -> bool {
+    ParseUrl::parse_url(url, true).is_some()
 }
 
 pub fn validate_method(method: &[u8]) -> bool {

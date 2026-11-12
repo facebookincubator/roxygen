@@ -413,6 +413,194 @@ fn methods_outside_the_frozen_table_are_rejected_by_default() {
     assert_eq!(message.method().unwrap(), Some(HttpMethod::Post));
 }
 
+/// What a `direction` codec makes of `wire` with exact methods `exact`, parsed whole or one
+/// byte at a time: its events, then each request's method, recognized method and URL or each
+/// response's status, and each error, its status and its message.
+fn start_line_outcome(
+    direction: TransportDirection,
+    wire: &[u8],
+    exact: bool,
+    bytewise: bool,
+) -> String {
+    let mut codec = Http1xCodec::new(direction);
+    codec.set_exact_methods(exact);
+    let mut callback = Recorder::default();
+    if bytewise {
+        let mut egress = BufQueue::new(QUEUE_LIMIT);
+        for byte in wire.chunks(1) {
+            let _ = codec.on_ingress(&ingress_queue(byte), &mut callback, &mut egress);
+        }
+    } else {
+        parse(&mut codec, &mut callback, wire);
+    }
+    let mut outcome = callback.events.join(",");
+    for message in &mut callback.messages {
+        if let Some(status) = message.response_status() {
+            write!(outcome, " | {status}").unwrap();
+            continue;
+        }
+        let url = message
+            .request_url()
+            .unwrap_or_default()
+            .escape_ascii()
+            .to_string();
+        let recognized = message.method().unwrap();
+        let method = message.method_string().unwrap();
+        write!(outcome, " | {method} {recognized:?} {url}").unwrap();
+    }
+    for ((error, status, _), text) in callback.errors.iter().zip(&callback.error_messages) {
+        let error = if *error == ProxygenError::PARSE_HEADER {
+            "PARSE_HEADER".to_owned()
+        } else {
+            format!("{error:?}")
+        };
+        write!(outcome, " | {error} {status:?} {}", text.escape_ascii()).unwrap();
+    }
+    outcome
+}
+
+/// A request head and what current Roxygen makes of it with exact methods off and on, the
+/// same whole and one byte at a time.
+const PINNED_REQUEST_LINES: &[(&[u8], &str, &str)] = &[
+    (
+        b"POST /generate HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "begin,headers,complete | POST Some(Post) /generate",
+        "begin,headers,complete | POST Some(Post) /generate",
+    ),
+    (
+        b"post /generate HTTP/1.1\r\n\r\n",
+        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
+        "begin,headers,complete | post None /generate",
+    ),
+    (
+        b"Post /generate HTTP/1.1\r\n\r\n",
+        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
+        "begin,headers,complete | Post None /generate",
+    ),
+    (
+        b"PURGE /generate HTTP/1.1\r\n\r\n",
+        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
+        "begin,headers,complete | PURGE None /generate",
+    ),
+    (
+        b"M-SEARCH * HTTP/1.1\r\n\r\n",
+        "begin,headers,complete | M-SEARCH None *",
+        "begin,headers,complete | M-SEARCH None *",
+    ),
+    (
+        b"FOO_BAR.1~ / HTTP/1.1\r\n\r\n",
+        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
+        "begin,headers,complete | FOO_BAR.1~ None /",
+    ),
+    (
+        b"head / HTTP/1.1\r\n\r\n",
+        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
+        "begin,headers,complete | head None /",
+    ),
+    (
+        b"A-VERY-LONG-EXTENSION-METHOD / HTTP/1.1\r\n\r\n",
+        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
+        "begin,headers,complete | A-VERY-LONG-EXTENSION-METHOD None /",
+    ),
+    (
+        b"P@ST / HTTP/1.1\r\n\r\n",
+        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
+        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
+    ),
+    (
+        b"(GET) / HTTP/1.1\r\n\r\n",
+        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
+        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
+    ),
+    (
+        b"POST\x7f / HTTP/1.1\r\n\r\n",
+        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
+        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
+    ),
+    (
+        b"XYZ / HTTP/1.1\r\n\r\n",
+        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
+        "begin,headers,complete | XYZ None /",
+    ),
+    (
+        b" / HTTP/1.1\r\n\r\n",
+        "begin,error | PARSE_HEADER Some(400) invalid HTTP request line",
+        "begin,error | PARSE_HEADER Some(400) invalid HTTP request line",
+    ),
+    (
+        b"GET / HTTP/1.0\r\n\r\n",
+        "begin,headers,complete | GET Some(Get) /",
+        "begin,headers,complete | GET Some(Get) /",
+    ),
+    (
+        b"CONNECT example.com:443 HTTP/1.1\r\n\r\n",
+        "begin,headers,complete | CONNECT Some(Connect) example.com:443",
+        "begin,headers,complete | CONNECT Some(Connect) example.com:443",
+    ),
+    (
+        b"connect example.com:443 HTTP/1.1\r\n\r\n",
+        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
+        "begin,headers,complete | connect None example.com:443",
+    ),
+];
+
+#[test]
+fn request_line_outcomes_are_pinned_with_exact_methods_off_and_on() {
+    let mut mismatches = Vec::new();
+    for (wire, off, on) in PINNED_REQUEST_LINES {
+        for (exact, expected) in [(false, off), (true, on)] {
+            for bytewise in [false, true] {
+                let actual =
+                    start_line_outcome(TransportDirection::Downstream, wire, exact, bytewise);
+                if actual != *expected {
+                    mismatches.push(format!(
+                        "{:?} exact={exact} bytewise={bytewise}:\n  actual   {actual:?}\n  expected {expected:?}",
+                        wire.escape_ascii().to_string()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// A response head and what current Roxygen makes of it upstream, where exact methods have no
+/// effect, the same whole and one byte at a time.
+const PINNED_STATUS_LINES: &[(&[u8], &str)] = &[
+    (
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        "begin,headers,complete | 200",
+    ),
+    (
+        b"HTTX/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        "begin,error | PARSE_HEADER None invalid HTTP start line",
+    ),
+    (
+        b"http/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        "begin,error | PARSE_HEADER None invalid HTTP start line",
+    ),
+];
+
+#[test]
+fn status_line_outcomes_are_pinned_with_exact_methods_off_and_on() {
+    let mut mismatches = Vec::new();
+    for (wire, expected) in PINNED_STATUS_LINES {
+        for exact in [false, true] {
+            for bytewise in [false, true] {
+                let actual =
+                    start_line_outcome(TransportDirection::Upstream, wire, exact, bytewise);
+                if actual != *expected {
+                    mismatches.push(format!(
+                        "{:?} exact={exact} bytewise={bytewise}:\n  actual   {actual:?}\n  expected {expected:?}",
+                        wire.escape_ascii().to_string()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
 #[test]
 fn test_simple_headers_queue() {
     let wire = b"GET /one HTTP/1.1\nHost: one\n\nGET /two HTTP/1.1\nHost: two\n\n";

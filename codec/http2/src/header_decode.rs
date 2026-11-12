@@ -68,10 +68,6 @@ impl HttpRequestVerifier {
         *self = Self::default();
     }
 
-    pub fn set_method(&mut self, message: &mut HttpMessage, method: &[u8]) -> bool {
-        self.set_method_with(message, method, FieldDecodeOptions::default())
-    }
-
     /// `set_method`, reading the method as `options` say.
     pub fn set_method_with(
         &mut self,
@@ -79,18 +75,32 @@ impl HttpRequestVerifier {
         method: &[u8],
         options: FieldDecodeOptions,
     ) -> bool {
+        if options.exact_methods {
+            return self.set_exact_method(message, method);
+        }
+        self.set_method(message, method)
+    }
+
+    /// `set_method` with `FieldDecodeOptions::exact_methods`, out of line so that the
+    /// default path keeps its own frame.
+    #[inline(never)]
+    fn set_exact_method(&mut self, message: &mut HttpMessage, method: &[u8]) -> bool {
         if self.has_method {
             return self.fail("Duplicate method", false);
         }
-        if options.exact_methods {
-            let Some(exact) = Method::from_exact_token(method) else {
-                return self.fail(
-                    format!("Invalid method: {}", String::from_utf8_lossy(method)),
-                    true,
-                );
-            };
-            self.has_method = true;
-            return message.set_method(exact).is_ok();
+        let Some(exact) = Method::from_exact_token(method) else {
+            return self.fail(
+                format!("Invalid method: {}", String::from_utf8_lossy(method)),
+                true,
+            );
+        };
+        self.has_method = true;
+        message.set_method(exact).is_ok()
+    }
+
+    pub fn set_method(&mut self, message: &mut HttpMessage, method: &[u8]) -> bool {
+        if self.has_method {
+            return self.fail("Duplicate method", false);
         }
         if !validate_method(method) {
             return self.fail(
@@ -247,6 +257,9 @@ pub struct HeaderDecodeInfo {
     pub decode_error: Option<HpackError>,
     verifier: HttpRequestVerifier,
     options: FieldDecodeOptions,
+    /// `validate` without `FieldDecodeOptions::verbatim_values`: regular fields are validated
+    /// and stored trimmed, with one flag test in `on_header`.
+    reference_fields: bool,
     is_request: bool,
     request_trailers: bool,
     validate: bool,
@@ -265,6 +278,7 @@ impl HeaderDecodeInfo {
         strict: bool,
         allow_empty_path: bool,
     ) -> Self {
+        let options = FieldDecodeOptions::default();
         Self {
             message: Box::new(HttpMessage::new()),
             parsing_error: None,
@@ -272,7 +286,8 @@ impl HeaderDecodeInfo {
             proxygen_error: None,
             decode_error: None,
             verifier: HttpRequestVerifier::default(),
-            options: FieldDecodeOptions::default(),
+            options,
+            reference_fields: Self::uses_reference_fields(validate, options),
             is_request,
             request_trailers,
             validate,
@@ -287,8 +302,19 @@ impl HeaderDecodeInfo {
     /// Decodes with `options` instead of the defaults.
     #[must_use]
     pub const fn with_options(mut self, options: FieldDecodeOptions) -> Self {
-        self.options = options;
+        self.set_options(options);
         self
+    }
+
+    /// Sets `options` in place, as `with_options` does by value.
+    pub(crate) const fn set_options(&mut self, options: FieldDecodeOptions) {
+        self.options = options;
+        self.reference_fields = Self::uses_reference_fields(self.validate, options);
+    }
+
+    /// `reference_fields` for `validate` and `options`.
+    const fn uses_reference_fields(validate: bool, options: FieldDecodeOptions) -> bool {
+        validate && !options.verbatim_values
     }
 
     pub fn decode(mut self, decoded: DecodedHeaderBlock) -> Result<HttpMessage, Box<Self>> {
@@ -315,6 +341,10 @@ impl HeaderDecodeInfo {
     }
 
     fn on_header(&mut self, name: &HeaderName, value: &[u8]) -> bool {
+        debug_assert_eq!(
+            self.reference_fields,
+            Self::uses_reference_fields(self.validate, self.options)
+        );
         if self.decode_error.is_some() || self.parsing_error.is_some() {
             return true;
         }
@@ -397,16 +427,14 @@ impl HeaderDecodeInfo {
         }
 
         self.regular_header_seen = true;
-        let verbatim = self.options.verbatim_values;
         match code {
             HttpHeaderCode::Connection => {
                 return self.fail("HTTP/2 Message with Connection header");
             }
-            HttpHeaderCode::ContentLength if verbatim && !is_h2_content_length(value) => {
+            HttpHeaderCode::ContentLength
+                if self.options.verbatim_values && !is_h2_content_length(value) =>
+            {
                 return self.fail("Invalid content-length");
-            }
-            HttpHeaderCode::Te if verbatim && value != b"trailers" => {
-                return self.fail("HTTP/2 Message with a TE other than trailers");
             }
             HttpHeaderCode::ContentLength => {
                 if self
@@ -438,46 +466,76 @@ impl HeaderDecodeInfo {
             }
             _ => {}
         }
-        let name_mode = if self.strict {
+        if self.reference_fields {
+            if (!name.is_common_header() && !validate_header_name(bytes, self.name_mode()))
+                || !validate_header_value(value, self.value_mode())
+            {
+                return self.reject_field(bytes, value);
+            }
+        } else if self.options.verbatim_values {
+            return self.add_verbatim_field(name, value);
+        }
+        if name.is_common_header() {
+            self.message.headers_mut().add(code, value);
+        } else {
+            self.message.headers_mut().add_uncommon(bytes, value);
+        }
+        true
+    }
+
+    /// The rest of `on_header` for a regular field kept verbatim (`DIV-041`), checked as h2
+    /// checks it.
+    #[inline(never)]
+    fn add_verbatim_field(&mut self, name: &HeaderName, value: &[u8]) -> bool {
+        let bytes = name.as_bytes();
+        if name.code() == HttpHeaderCode::Te && value != b"trailers" {
+            return self.fail("HTTP/2 Message with a TE other than trailers");
+        }
+        if self.validate
+            && ((!name.is_common_header() && !validate_header_name(bytes, self.name_mode()))
+                || !is_h2_field_value(value, self.strict))
+        {
+            return self.reject_field(bytes, value);
+        }
+        if name.is_common_header() {
+            self.message.headers_mut().add_verbatim(name.code(), value);
+        } else {
+            self.message
+                .headers_mut()
+                .add_uncommon_verbatim(bytes, value);
+        }
+        true
+    }
+
+    const fn name_mode(&self) -> HeaderNameValidationMode {
+        if self.strict {
             HeaderNameValidationMode::Strict
         } else {
             HeaderNameValidationMode::StrictCompat
-        };
-        let value_mode = if self.strict {
+        }
+    }
+
+    const fn value_mode(&self) -> ControlEscapeMode {
+        if self.strict {
             ControlEscapeMode::Strict
         } else {
             ControlEscapeMode::StrictCompat
-        };
-        let value_valid = if verbatim {
-            is_h2_field_value(value, self.strict)
+        }
+    }
+
+    /// Fails on a regular field that validation refuses, keeping its value.
+    #[cold]
+    fn reject_field(&mut self, bytes: &[u8], value: &[u8]) -> bool {
+        self.proxygen_error = Some(if bytes.is_empty() {
+            ProxygenError::PARSE_HEADER
         } else {
-            validate_header_value(value, value_mode)
-        };
-        if self.validate
-            && ((!name.is_common_header() && !validate_header_name(bytes, name_mode))
-                || !value_valid)
-        {
-            self.proxygen_error = Some(if bytes.is_empty() {
-                ProxygenError::PARSE_HEADER
-            } else {
-                ProxygenError::HEADER_CONTENT_VALIDATION
-            });
-            self.header_error_value = value.to_vec().into_boxed_slice();
-            return self.fail(format!(
-                "Invalid header name={}",
-                String::from_utf8_lossy(bytes)
-            ));
-        }
-        match (name.is_common_header(), verbatim) {
-            (true, false) => self.message.headers_mut().add(code, value),
-            (false, false) => self.message.headers_mut().add_uncommon(bytes, value),
-            (true, true) => self.message.headers_mut().add_verbatim(code, value),
-            (false, true) => self
-                .message
-                .headers_mut()
-                .add_uncommon_verbatim(bytes, value),
-        }
-        true
+            ProxygenError::HEADER_CONTENT_VALIDATION
+        });
+        self.header_error_value = value.to_vec().into_boxed_slice();
+        self.fail(format!(
+            "Invalid header name={}",
+            String::from_utf8_lossy(bytes)
+        ))
     }
 
     fn on_headers_complete(&mut self, decoded_size: HttpHeaderSize) {
@@ -490,13 +548,7 @@ impl HeaderDecodeInfo {
                 .headers()
                 .combine(HttpHeaderCode::Cookie, b"; ");
             if !cookie.is_empty() {
-                let headers = self.message.headers_mut();
-                if self.options.verbatim_values {
-                    headers.remove(HttpHeaderCode::Cookie);
-                    headers.add_verbatim(HttpHeaderCode::Cookie, cookie);
-                } else {
-                    headers.set(HttpHeaderCode::Cookie, cookie);
-                }
+                self.set_combined_cookie(cookie);
             }
             if !self.verifier.validate(&mut self.message) {
                 self.parsing_error = self.verifier.error().map(str::to_owned);
@@ -510,6 +562,19 @@ impl HeaderDecodeInfo {
         }
         self.message.set_http_version(1, 1);
         self.message.set_ingress_header_size(decoded_size);
+    }
+
+    /// Replaces the `cookie` crumbs with `cookie`, their combination, kept verbatim with
+    /// `FieldDecodeOptions::verbatim_values`.
+    #[inline(never)]
+    fn set_combined_cookie(&mut self, cookie: Box<[u8]>) {
+        let headers = self.message.headers_mut();
+        if self.options.verbatim_values {
+            headers.remove(HttpHeaderCode::Cookie);
+            headers.add_verbatim(HttpHeaderCode::Cookie, cookie);
+        } else {
+            headers.set(HttpHeaderCode::Cookie, cookie);
+        }
     }
 
     fn fail(&mut self, error: impl Into<String>) -> bool {

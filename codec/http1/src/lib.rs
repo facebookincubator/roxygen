@@ -368,24 +368,22 @@ static METHOD_BYTE_MASKS: [[u32; 27]; INITIAL_PREFIX_LIMIT - 1] = {
 
 /// `valid_initial_prefix` of a head that grows one byte at a time, with each
 /// byte read once. Downstream it keeps the frozen methods that the method token
-/// still prefixes (with exact methods, that every byte so far is a `tchar`) and
-/// whether a delimiter has ended the token; upstream, which byte of `HTTP/`
+/// still prefixes (with `EXACT_METHODS`, that every byte so far is a `tchar`)
+/// and whether a delimiter has ended the token; upstream, which byte of `HTTP/`
 /// comes next. A prefix that fails stays failed: every longer head holds the
 /// same mismatch.
-struct PrefixMatch {
+struct PrefixMatch<const EXACT_METHODS: bool> {
     upstream: bool,
-    exact_methods: bool,
     length: usize,
     candidates: u32,
     delimited: bool,
     valid: bool,
 }
 
-impl PrefixMatch {
-    fn new(upstream: bool, exact_methods: bool) -> Self {
+impl<const EXACT_METHODS: bool> PrefixMatch<EXACT_METHODS> {
+    fn new(upstream: bool) -> Self {
         Self {
             upstream,
-            exact_methods,
             length: 0,
             candidates: ALL_FROZEN_HTTP_METHODS,
             delimited: false,
@@ -420,7 +418,7 @@ impl PrefixMatch {
         } else if !self.delimited {
             if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
                 self.delimited = true;
-            } else if self.exact_methods {
+            } else if EXACT_METHODS {
                 self.valid = is_tchar(byte);
             } else {
                 #[cfg(test)]
@@ -1094,6 +1092,62 @@ impl Http1xCodec {
             .any(|method| method.starts_with(token))
     }
 
+    /// The start-line prefix check of `scan_head_counting_line_feeds`: the
+    /// position in `segment` of the first byte of `segment[from..window_end]`
+    /// that fails it, after the head's earlier bytes, `buffered` and then
+    /// `segment[..from]`. It stops at the first byte after which every longer
+    /// head passes.
+    #[inline(always)]
+    fn scan_prefix<const EXACT_METHODS: bool>(
+        &self,
+        buffered: &[u8],
+        segment: &[u8],
+        from: usize,
+        window_end: usize,
+    ) -> Option<usize> {
+        let push_prefix = |prefix: &mut PrefixMatch<EXACT_METHODS>, byte: &u8| {
+            #[cfg(test)]
+            {
+                count_work(&self.head_work.prefix_reads, 1);
+                let address = std::ptr::from_ref(byte);
+                let in_place = buffered.as_ptr_range().contains(&address)
+                    || segment.as_ptr_range().contains(&address);
+                count_work(&self.head_work.prefix_copies, usize::from(!in_place));
+            }
+            prefix.push(*byte)
+        };
+        let mut prefix = PrefixMatch::<EXACT_METHODS>::new(self.direction.is_upstream());
+        for byte in buffered {
+            push_prefix(&mut prefix, byte);
+        }
+        for byte in &segment[..from] {
+            push_prefix(&mut prefix, byte);
+        }
+        let window = segment.get(from..window_end).unwrap_or_default();
+        for (offset, byte) in window.iter().enumerate() {
+            if !push_prefix(&mut prefix, byte) {
+                return Some(from + offset);
+            }
+            if prefix.settled() {
+                break;
+            }
+        }
+        None
+    }
+
+    /// `scan_prefix` with `exact_methods`, out of line so that the scan keeps
+    /// the frozen-method check's registers.
+    #[inline(never)]
+    fn scan_exact_method_prefix(
+        &self,
+        buffered: &[u8],
+        segment: &[u8],
+        from: usize,
+        window_end: usize,
+    ) -> Option<usize> {
+        self.scan_prefix::<true>(buffered, segment, from, window_end)
+    }
+
     /// The scan of `scan_head_counting_line_feeds`, without its count.
     #[cfg(test)]
     fn scan_head(&self, buffered: &[u8], segment: &[u8], from: usize) -> HeadScan {
@@ -1133,40 +1187,16 @@ impl Http1xCodec {
         } else {
             INITIAL_PREFIX_LIMIT
         };
-        let push_prefix = |prefix: &mut PrefixMatch, byte: &u8| {
-            #[cfg(test)]
-            {
-                count_work(&self.head_work.prefix_reads, 1);
-                let address = std::ptr::from_ref(byte);
-                let in_place = buffered.as_ptr_range().contains(&address)
-                    || segment.as_ptr_range().contains(&address);
-                count_work(&self.head_work.prefix_copies, usize::from(!in_place));
-            }
-            prefix.push(*byte)
-        };
         // The position of the first byte this call reaches that fails the
         // start-line prefix check. Bytes past it are not scanned.
         let mut prefix_stop = None;
         if base + from < prefix_limit {
-            let mut prefix = PrefixMatch::new(self.direction.is_upstream(), self.exact_methods);
-            for byte in buffered {
-                push_prefix(&mut prefix, byte);
-            }
-            for byte in &segment[..from] {
-                push_prefix(&mut prefix, byte);
-            }
-            let window = segment
-                .get(from..limit.min(prefix_limit - base))
-                .unwrap_or_default();
-            for (offset, byte) in window.iter().enumerate() {
-                if !push_prefix(&mut prefix, byte) {
-                    prefix_stop = Some(from + offset);
-                    break;
-                }
-                if prefix.settled() {
-                    break;
-                }
-            }
+            let window_end = limit.min(prefix_limit - base);
+            prefix_stop = if self.exact_methods {
+                self.scan_exact_method_prefix(buffered, segment, from, window_end)
+            } else {
+                self.scan_prefix::<false>(buffered, segment, from, window_end)
+            };
         }
         let search_end = prefix_stop.unwrap_or(limit);
         let mut line_feeds = 0;

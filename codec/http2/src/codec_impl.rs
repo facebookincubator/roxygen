@@ -165,9 +165,13 @@ pub(crate) fn take_header_visits() -> usize {
 
 impl PreparedMessageHeaders<'_> {
     /// Visits the pseudo-headers, then each header and the date. With `MESSAGE_FIELDS_ONLY`, it
-    /// skips headers that HTTP/2 does not carry and trims their values unless they are verbatim;
-    /// without it, it visits every header untrimmed, which only suits length bounds.
-    fn visit<'a, const MESSAGE_FIELDS_ONLY: bool>(&'a self, mut visitor: impl FnMut(Header<'a>)) {
+    /// skips headers that HTTP/2 does not carry and trims their values unless `VERBATIM`, which
+    /// `for_each` sets from `verbatim_values`; without it, it visits every header untrimmed, which
+    /// only suits length bounds.
+    fn visit<'a, const MESSAGE_FIELDS_ONLY: bool, const VERBATIM: bool>(
+        &'a self,
+        mut visitor: impl FnMut(Header<'a>),
+    ) {
         match &self.pseudo {
             MessagePseudoHeaders::Request {
                 method,
@@ -207,11 +211,7 @@ impl PreparedMessageHeaders<'_> {
                     visitor(Header {
                         code,
                         name,
-                        value: if self.verbatim_values {
-                            value
-                        } else {
-                            trim_lws(value)
-                        },
+                        value: if VERBATIM { value } else { trim_lws(value) },
                     });
                 }
             }
@@ -236,12 +236,16 @@ impl HeaderInputs for PreparedMessageHeaders<'_> {
                 visitor(header);
             }
         };
-        self.visit::<true>(visitor);
+        if self.verbatim_values {
+            self.visit::<true, true>(visitor);
+        } else {
+            self.visit::<true, false>(visitor);
+        }
     }
 
     fn length_bound(&self) -> Option<usize> {
         let mut bound = Some(EMPTY_BLOCK_BOUND);
-        self.visit::<false>(|header| {
+        self.visit::<false, false>(|header| {
             bound = add_input_bound(bound, &header);
         });
         bound
@@ -1222,8 +1226,8 @@ impl Http2Codec {
                 self.validate_headers,
                 self.strict_validation,
                 false,
-            )
-            .with_options(self.field_options);
+            );
+            decode.set_options(self.field_options);
             let head = !trailers && matches!(block.kind, HeaderBlockKind::Headers { .. });
             let mut presizing = PresizingDecode {
                 decode: &mut decode,
