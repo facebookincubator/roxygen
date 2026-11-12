@@ -111,14 +111,16 @@ pub trait OwnedResponseObserver: 'static {
 }
 
 /// An owned driver's read: through the transport's [`UniplexReader`] when it offers one, else
-/// through one `UniplexTransport::read` future per read.
+/// through one `UniplexTransport::read` future per read. The reader picks the path at the call
+/// site, and each path runs out of line, so neither carries the other's code.
 pub(crate) struct ReadSlot {
     reader: Option<Box<dyn UniplexReader>>,
     timeout: Duration,
     cancellation: CancellationToken,
     read: Option<SlotRead>,
     /// The read last returned drained the transport (`UniplexReader::is_drained`): a read started
-    /// before the waker of the poll that returned it fires would pend.
+    /// before the waker of the poll that returned it fires would pend. Always false without a
+    /// reader.
     drained: bool,
 }
 
@@ -165,6 +167,7 @@ impl ReadSlot {
 
     /// Starts a read of at most `maximum` bytes that first offers `allocation_size` bytes, and
     /// polls it at once; `Ready` returns it.
+    #[inline(always)]
     pub(crate) fn poll_start(
         &mut self,
         transport: &dyn UniplexTransport,
@@ -179,40 +182,96 @@ impl ReadSlot {
         );
         // The read counts as started before its first poll, so a poll that panics leaves it
         // started, as a read started and then polled does.
-        let result = match &mut self.reader {
-            Some(reader) => {
-                self.read = Some(SlotRead::Reader);
-                ready!(reader.poll_start_read(waker, maximum, allocation_size))
-            }
-            None => {
-                self.read = Some(SlotRead::Future(transport.read(
-                    context,
-                    maximum,
-                    allocation_size,
-                    self.timeout,
-                    self.cancellation.clone(),
-                )));
-                return self.poll(waker);
-            }
-        };
-        self.read = None;
-        self.note_drained(Poll::Ready(result))
+        if self.reader.is_some() {
+            self.poll_start_reader(waker, maximum, allocation_size)
+        } else {
+            self.poll_start_future(transport, context, waker, maximum, allocation_size)
+        }
     }
 
     /// Polls the started read; `Ready` returns it.
+    #[inline(always)]
     pub(crate) fn poll(
         &mut self,
         context: &mut Context<'_>,
     ) -> Poll<Result<UniplexRead, HttpError>> {
-        let result = match self.read.as_mut().expect("a polled read was started") {
-            SlotRead::Future(future) => ready!(future.as_mut().poll(context)),
-            SlotRead::Reader => ready!(
-                self.reader
-                    .as_mut()
-                    .expect("a reader read keeps its reader")
-                    .poll_read(context)
-            ),
+        if self.reader.is_some() {
+            self.poll_reader(context)
+        } else {
+            self.poll_future(context)
+        }
+    }
+
+    /// `poll_start` without a reader.
+    #[inline(never)]
+    fn poll_start_future(
+        &mut self,
+        transport: &dyn UniplexTransport,
+        context: &WorkerContext,
+        waker: &mut Context<'_>,
+        maximum: usize,
+        allocation_size: usize,
+    ) -> Poll<Result<UniplexRead, HttpError>> {
+        self.read = Some(SlotRead::Future(transport.read(
+            context,
+            maximum,
+            allocation_size,
+            self.timeout,
+            self.cancellation.clone(),
+        )));
+        self.poll_started_future(waker)
+    }
+
+    /// `poll` without a reader.
+    #[inline(never)]
+    fn poll_future(&mut self, context: &mut Context<'_>) -> Poll<Result<UniplexRead, HttpError>> {
+        self.poll_started_future(context)
+    }
+
+    #[inline(always)]
+    fn poll_started_future(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<UniplexRead, HttpError>> {
+        let Some(SlotRead::Future(future)) = &mut self.read else {
+            panic!("a polled read was started");
         };
+        let polled = future.as_mut().poll(context);
+        if polled.is_pending() {
+            return Poll::Pending;
+        }
+        self.read = None;
+        polled
+    }
+
+    /// `poll_start` through the reader.
+    #[inline(never)]
+    fn poll_start_reader(
+        &mut self,
+        waker: &mut Context<'_>,
+        maximum: usize,
+        allocation_size: usize,
+    ) -> Poll<Result<UniplexRead, HttpError>> {
+        let reader = self
+            .reader
+            .as_mut()
+            .expect("a reader read keeps its reader");
+        self.read = Some(SlotRead::Reader);
+        let result = ready!(reader.poll_start_read(waker, maximum, allocation_size));
+        self.read = None;
+        self.note_drained(Poll::Ready(result))
+    }
+
+    /// `poll` through the reader.
+    #[inline(never)]
+    fn poll_reader(&mut self, context: &mut Context<'_>) -> Poll<Result<UniplexRead, HttpError>> {
+        assert!(self.read.is_some(), "a polled read was started");
+        let result = ready!(
+            self.reader
+                .as_mut()
+                .expect("a reader read keeps its reader")
+                .poll_read(context)
+        );
         self.read = None;
         self.note_drained(Poll::Ready(result))
     }
@@ -231,3 +290,7 @@ impl ReadSlot {
         polled
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/read_slot.rs"]
+mod read_slot_tests;
