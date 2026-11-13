@@ -460,7 +460,7 @@ impl OwnedReader {
     pub fn start_read(&mut self, maximum: usize, allocation_size: usize) -> Result<(), HttpError> {
         match self.read {
             ReaderRead::Idle => {}
-            ReaderRead::Drained => self.end_drained(),
+            ReaderRead::Drained => self.end_registered(),
             ReaderRead::Reading { .. } | ReaderRead::Finished(_) => {
                 return Err(HttpError::with_message(
                     HttpErrorCode::INVALID_STATE_TRANSITION,
@@ -514,6 +514,11 @@ impl OwnedReader {
                     self.settle_drained(context);
                 } else {
                     self.read = ReaderRead::Idle;
+                    // A cancelled read's wake releases its waker clones once
+                    // the read has ended: their drop can start a replacement.
+                    if result.is_err() && self.cancellation.token.is_cancellation_requested() {
+                        self.cancellation.listener.update_waker(context.waker());
+                    }
                 }
                 Poll::Ready(result)
             }
@@ -620,7 +625,7 @@ impl OwnedReader {
             .and_then(Weak::upgrade)
             .filter(|_| maximum != 0 && allocation_size != 0)
         else {
-            self.end_drained();
+            self.end_registered();
             return self.poll_start_read(context, maximum, allocation_size);
         };
         let maximum = maximum.min(self.limits.maximum_read_size);
@@ -651,14 +656,13 @@ impl OwnedReader {
     }
 
     /// Leaves the registered read pending, as a pending poll of a started read
-    /// does: the reader's cancellation wake follows `context`'s waker, and a
-    /// cancellation already requested fails the read. The read is started
-    /// before that update, which can unwind.
+    /// does: the reader's cancellation wake follows `context`'s waker. The read
+    /// is started before that update, which can unwind. A cancellation already
+    /// requested instead fails the read: it ends before the wake releases its
+    /// wakers, so a release that unwinds leaves the reader idle.
     fn pend(&mut self, context: &Context<'_>) -> Poll<Result<TransportRead, HttpError>> {
         self.read = ReaderRead::Reading { arm: true };
-        if self.cancellation.listener.update_waker(context.waker()) {
-            self.operation.finish(Some(HttpErrorCode::CORO_CANCELLED));
-            self.read = ReaderRead::Idle;
+        if self.follow_cancellation(context.waker()) {
             return Poll::Ready(Err(cancelled_error(b"byte-stream read cancelled")));
         }
         Poll::Pending
@@ -670,11 +674,23 @@ impl OwnedReader {
     /// requested instead ends the registration as a cancelled read ends, which
     /// releases the waker that the read's readiness poll left with the socket.
     fn settle_drained(&mut self, context: &Context<'_>) -> bool {
-        if !self.cancellation.listener.update_waker(context.waker()) {
-            return true;
+        !self.follow_cancellation(context.waker())
+    }
+
+    /// Makes the reader's cancellation wake follow `waker`, or, once a
+    /// cancellation is requested, ends the registered read as a cancelled read
+    /// ends and returns `true`. The read ends before the wake releases its
+    /// waker clones, whose drop can start a replacement read.
+    #[inline]
+    fn follow_cancellation(&mut self, waker: &Waker) -> bool {
+        if !self.cancellation.token.is_cancellation_requested()
+            && !self.cancellation.listener.update_waker(waker)
+        {
+            return false;
         }
-        self.end_drained();
-        false
+        self.end_registered();
+        self.cancellation.listener.update_waker(waker);
+        true
     }
 
     /// Registers a read that `try_read` started or drained, with `context`'s
@@ -715,10 +731,10 @@ impl OwnedReader {
         matches!(self.read, ReaderRead::Drained)
     }
 
-    /// Ends the drained read's registration as a cancelled read ends, which
-    /// releases the socket's waker.
+    /// Ends the registered read, drained or pending, as a cancelled read ends,
+    /// which releases the socket's waker.
     #[cold]
-    fn end_drained(&mut self) {
+    fn end_registered(&mut self) {
         self.operation.finish(Some(HttpErrorCode::CORO_CANCELLED));
         self.read = ReaderRead::Idle;
     }
@@ -3202,7 +3218,7 @@ impl ReadOperation {
                 }
             }
         }
-        let outcome = {
+        let mut outcome = {
             let mut state = self.state.borrow_mut();
             let active = state
                 .active_read
@@ -3228,15 +3244,11 @@ impl ReadOperation {
                     ReadPoll::new(io, wait)
                 }
                 ReadDrive::Untimed { io } => {
-                    let reader =
-                        reader.expect("an OwnedReader read polls with its reader's cancellation");
+                    let reader = reader
+                        .as_deref()
+                        .expect("an OwnedReader read polls with its reader's cancellation");
                     let io = io.poll(context, arm);
-                    let cancelled = if io.is_pending() {
-                        reader.listener.update_waker(context.waker())
-                    } else {
-                        reader.token.is_cancellation_requested()
-                    };
-                    let wait = if cancelled {
+                    let wait = if reader.token.is_cancellation_requested() {
                         Poll::Ready(WaitStatus::Cancelled)
                     } else {
                         Poll::Pending
@@ -3245,6 +3257,15 @@ impl ReadOperation {
                 }
             }
         };
+        // An `OwnedReader` read's cancellation wake follows the waker once the
+        // borrow ends: a waker that the update releases can start a
+        // replacement read.
+        if let ReadPoll::Pending = outcome
+            && let Some(reader) = reader
+            && reader.listener.update_waker(context.waker())
+        {
+            outcome = ReadPoll::Cancelled;
+        }
         let result = match outcome {
             ReadPoll::Pending => return Poll::Pending,
             ReadPoll::Cancelled => {
