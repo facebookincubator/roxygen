@@ -1779,6 +1779,9 @@ impl DriverState {
 
     fn ready_egress_work(&self, skipped: &BTreeSet<(StreamId, u64)>) -> Option<ReadyEgressWork> {
         if let Some(http2) = &self.http2 {
+            if http2.egress_order.is_empty() {
+                return None;
+            }
             let connection_credit = self.codec.connection_send_credit();
             let eligible = |work: &QueuedEgressTransfer, stream| {
                 work.transfer.cancellation_requested()
@@ -1799,6 +1802,8 @@ impl DriverState {
                                     .can_dequeue_body(http2.stream_send_credit(stream)))))
             };
             let selected = http2.scheduler.next_matching(|stream| {
+                #[cfg(test)]
+                H2_EGRESS_SCAN_EVALUATIONS.set(H2_EGRESS_SCAN_EVALUATIONS.get() + 1);
                 http2.streams.get(&stream).is_some_and(|state| {
                     state.egress_work.iter().any(|work| eligible(work, stream))
                 })
@@ -2265,12 +2270,20 @@ pub(crate) fn egress_stream_is_ready_for_test(front: StreamId, earliest: StreamI
 thread_local! {
     /// `bytes_processed` callbacks that this thread's sessions drained from their sources.
     static INGRESS_CREDIT_CALLBACKS: Cell<usize> = const { Cell::new(0) };
+    /// Streams that this thread's HTTP/2 egress scans checked for eligible work.
+    static H2_EGRESS_SCAN_EVALUATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Takes this thread's count of drained `bytes_processed` callbacks, resetting it.
 #[cfg(test)]
 pub(crate) fn take_ingress_credit_callbacks_for_test() -> usize {
     INGRESS_CREDIT_CALLBACKS.replace(0)
+}
+
+/// Takes this thread's count of HTTP/2 egress scan stream checks, resetting it.
+#[cfg(test)]
+pub(crate) fn take_h2_egress_scan_evaluations_for_test() -> usize {
+    H2_EGRESS_SCAN_EVALUATIONS.replace(0)
 }
 
 struct DetachedSessionCore<'a> {

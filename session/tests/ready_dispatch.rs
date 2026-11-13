@@ -465,6 +465,80 @@ fn ready_source_return_after_detach_retains_an_unscheduled_owner() {
 }
 
 #[test]
+fn an_empty_h2_egress_order_skips_the_stream_scan() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (session, handle) = UniplexSession::new_http2(
+                context.clone(),
+                TransportDirection::Upstream,
+                ready_dispatch_transport(),
+                None,
+                UniplexConfig::default(),
+                Http2SessionConfig::default(),
+            )
+            .expect("H2 fixture starts");
+            let cancellation = CancellationSource::new();
+            let mut responses = Vec::new();
+            for _ in 0..3 {
+                let source = ownership_source(None, Box::new(|| {}));
+                let response = handle.send_request(source, cancellation.token()).await;
+                responses.push(response.expect("request starts"));
+            }
+            drive_core_callbacks(&session.state, &handle.read_wake).expect("callbacks settle");
+            let mut queued = session.state.borrow_mut().take_egress_work();
+            assert_eq!(queued.len(), 3);
+            {
+                let state = session.state.borrow();
+                let http2 = state.http2.as_ref().expect("H2 state exists");
+                assert!(http2.egress_order.is_empty());
+                // Streams stay scheduled after their transfers leave the queue, until they end.
+                assert_eq!(http2.scheduler.urgency_queue_entries_for_test(), 3);
+            }
+            take_h2_egress_scan_evaluations_for_test();
+            assert!(
+                session
+                    .state
+                    .borrow()
+                    .ready_egress_work(&BTreeSet::new())
+                    .is_none()
+            );
+            assert_eq!(take_h2_egress_scan_evaluations_for_test(), 0);
+
+            let Some(EgressWork::Transfer {
+                stream,
+                transfer,
+                cancellation: transfer_cancellation,
+                readiness,
+            }) = queued.pop_front()
+            else {
+                panic!("requests queue transfers");
+            };
+            let key = EgressTransferKey {
+                stream,
+                generation: transfer.generation(),
+            };
+            session.state.borrow_mut().return_egress_transfer(
+                stream,
+                QueuedEgressTransfer {
+                    transfer,
+                    readiness,
+                    cancellation: transfer_cancellation,
+                },
+            );
+            assert!(matches!(
+                session.state.borrow().ready_egress_work(&BTreeSet::new()),
+                Some(ReadyEgressWork::Http2(selected)) if selected == key
+            ));
+            assert!(take_h2_egress_scan_evaluations_for_test() > 0);
+            drop(queued);
+            drop(responses);
+            let _ = session.run().await;
+            assert!(handle.is_finished());
+        })
+    });
+}
+
+#[test]
 fn stream_local_owners_preserve_global_return_and_retirement_order() {
     run_on_worker(|context| {
         Box::pin(async move {
