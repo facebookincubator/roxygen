@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::IpAddr;
@@ -1521,11 +1522,48 @@ fn strip_control_chars(value: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+struct CachedHttpDate {
+    seconds: i64,
+    formatted: String,
+}
+
+thread_local! {
+    static HTTP_DATE_CACHE: RefCell<Option<CachedHttpDate>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static DATE_FORMATS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn format_http_date(time: SystemTime) -> String {
     let seconds = time
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
+    let cached = HTTP_DATE_CACHE.try_with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|cached| cached.seconds == seconds)
+            .map(|cached| cached.formatted.clone())
+    });
+    if let Ok(Some(formatted)) = cached {
+        return formatted;
+    }
+    let formatted = format_http_date_seconds(seconds);
+    let _ = HTTP_DATE_CACHE.try_with(|cache| {
+        *cache.borrow_mut() = Some(CachedHttpDate {
+            seconds,
+            formatted: formatted.clone(),
+        });
+    });
+    formatted
+}
+
+fn format_http_date_seconds(seconds: i64) -> String {
+    #[cfg(test)]
+    DATE_FORMATS.with(|formats| formats.set(formats.get() + 1));
     let days = seconds / 86_400;
     let seconds_of_day = seconds % 86_400;
     let hour = seconds_of_day / 3_600;
@@ -1562,4 +1600,127 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
     year += if month <= 2 { 1 } else { 0 };
     (year, month, day)
+}
+
+#[cfg(test)]
+mod date_cache_tests {
+    use std::cell::Cell;
+    use std::cell::RefCell;
+    use std::time::Duration;
+    use std::time::UNIX_EPOCH;
+
+    use super::DATE_FORMATS;
+    use super::HTTP_DATE_CACHE;
+    use super::format_http_date;
+
+    #[test]
+    fn equal_second_calls_format_the_date_once() {
+        HTTP_DATE_CACHE.with(RefCell::take);
+        DATE_FORMATS.with(|formats| formats.set(0));
+        let formats = || DATE_FORMATS.with(Cell::get);
+        let time = UNIX_EPOCH + Duration::from_secs(784_111_777);
+        for time in [time, time + Duration::new(0, 999_999_999), time] {
+            assert_eq!(format_http_date(time), "Sun, 06 Nov 1994 08:49:37 GMT");
+        }
+        assert_eq!(formats(), 1);
+        format_http_date(time + Duration::from_secs(1));
+        assert_eq!(formats(), 2);
+        format_http_date(time);
+        assert_eq!(formats(), 3);
+        let wide = UNIX_EPOCH + Duration::from_secs(253_402_300_800);
+        format_http_date(wide);
+        format_http_date(wide);
+        assert_eq!(formats(), 4);
+    }
+
+    #[test]
+    fn date_cache_tracks_wall_clock_seconds_in_both_directions() {
+        HTTP_DATE_CACHE.with(RefCell::take);
+        let cases = [
+            (0, 0, "Thu, 01 Jan 1970 00:00:00 GMT"),
+            (0, 999_999_999, "Thu, 01 Jan 1970 00:00:00 GMT"),
+            (1, 0, "Thu, 01 Jan 1970 00:00:01 GMT"),
+            (86_399, 999_999_999, "Thu, 01 Jan 1970 23:59:59 GMT"),
+            (86_400, 0, "Fri, 02 Jan 1970 00:00:00 GMT"),
+            (784_111_777, 0, "Sun, 06 Nov 1994 08:49:37 GMT"),
+            (951_782_400, 0, "Tue, 29 Feb 2000 00:00:00 GMT"),
+            (951_868_799, 999_999_999, "Tue, 29 Feb 2000 23:59:59 GMT"),
+            (951_868_800, 0, "Wed, 01 Mar 2000 00:00:00 GMT"),
+            (86_400, 0, "Fri, 02 Jan 1970 00:00:00 GMT"),
+            (0, 0, "Thu, 01 Jan 1970 00:00:00 GMT"),
+        ];
+        for (seconds, nanos, expected) in cases {
+            assert_eq!(
+                format_http_date(UNIX_EPOCH + Duration::new(seconds, nanos)),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn date_cache_preserves_pre_epoch_and_extended_year_behavior() {
+        HTTP_DATE_CACHE.with(RefCell::take);
+        let epoch = "Thu, 01 Jan 1970 00:00:00 GMT";
+        assert_eq!(
+            format_http_date(UNIX_EPOCH - Duration::from_nanos(1)),
+            epoch
+        );
+        assert_eq!(format_http_date(UNIX_EPOCH), epoch);
+        for (seconds, expected) in [
+            (253_402_300_799, "Fri, 31 Dec 9999 23:59:59 GMT"),
+            (253_402_300_800, "Sat, 01 Jan 10000 00:00:00 GMT"),
+            (253_402_300_801, "Sat, 01 Jan 10000 00:00:01 GMT"),
+            (253_402_300_799, "Fri, 31 Dec 9999 23:59:59 GMT"),
+        ] {
+            let time = UNIX_EPOCH + Duration::from_secs(seconds);
+            assert_eq!(format_http_date(time), expected);
+            assert_eq!(format_http_date(time + Duration::from_nanos(1)), expected);
+        }
+        assert_eq!(format_http_date(UNIX_EPOCH - Duration::from_secs(1)), epoch);
+    }
+
+    #[test]
+    fn date_cache_returns_independent_owned_strings() {
+        HTTP_DATE_CACHE.with(RefCell::take);
+        let time = UNIX_EPOCH + Duration::from_secs(784_111_777);
+        let expected = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let mut first = format_http_date(time);
+        let retained = format_http_date(time);
+        first.replace_range(..3, "BAD");
+        assert_eq!(retained, expected);
+        assert_eq!(format_http_date(time), expected);
+        assert_eq!(
+            format_http_date(time + Duration::from_secs(1)),
+            "Sun, 06 Nov 1994 08:49:38 GMT",
+        );
+        assert_eq!(retained, expected);
+        assert_eq!(format_http_date(time), expected);
+    }
+
+    #[test]
+    fn date_cache_is_thread_local_without_a_runtime() {
+        HTTP_DATE_CACHE.with(RefCell::take);
+        let expected = "Thu, 01 Jan 1970 00:00:01 GMT";
+        assert_eq!(
+            format_http_date(UNIX_EPOCH + Duration::from_secs(1)),
+            expected
+        );
+        std::thread::spawn(|| {
+            assert!(HTTP_DATE_CACHE.with(|cache| cache.borrow().is_none()));
+            assert_eq!(
+                format_http_date(UNIX_EPOCH + Duration::from_secs(2)),
+                "Thu, 01 Jan 1970 00:00:02 GMT",
+            );
+        })
+        .join()
+        .expect("date formatting thread completes");
+        assert_eq!(
+            HTTP_DATE_CACHE.with(|cache| cache.borrow().as_ref().map(|cached| cached.seconds)),
+            Some(1),
+        );
+        assert_eq!(
+            format_http_date(UNIX_EPOCH + Duration::from_secs(1)),
+            expected
+        );
+    }
 }

@@ -2424,3 +2424,52 @@ fn a_body_frame_whose_length_overflows_fails_its_room_check_as_its_staging_queue
             );
         });
 }
+
+#[test]
+fn explicit_dates_keep_their_values_and_suppress_implicit_generation() {
+    let _ = HttpMessage::format_date_header();
+    let cases: &[(&[&[u8]], &[&[u8]], &[&str])] = &[
+        (&[b"message-date"], &[], &["Date: message-date"]),
+        (&[], &[b"extra-date"], &["Date: extra-date"]),
+        (
+            &[b"first", b"second"],
+            &[b"third"],
+            &["Date: first", "Date: second", "Date: third"],
+        ),
+        (&[b""], &[], &["Date: "]),
+        (&[b"bad\r\nInjected: value"], &[], &[]),
+        (&[], &[b"bad\nInjected: value"], &[]),
+    ];
+    for (message_dates, extra_dates, expected) in cases {
+        let mut message = HttpMessage::new();
+        message.set_status_code(200).expect("a response status");
+        message.set_http_version(1, 1);
+        message
+            .headers_mut()
+            .add(HttpHeaderCode::ContentLength, b"0");
+        for date in *message_dates {
+            message.headers_mut().add(HttpHeaderCode::Date, date);
+        }
+        let mut extra = HttpHeaders::new();
+        for date in *extra_dates {
+            extra.add(HttpHeaderCode::Date, date);
+        }
+        let mut trace = Trace::new(TransportDirection::Downstream);
+        trace.ingress(GET_REQUEST);
+        trace.headers(StreamId::new(1), &message, true, Some(&extra));
+        assert!(
+            trace
+                .lines
+                .last()
+                .expect("header generation trace")
+                .starts_with("headers ok ")
+        );
+        let wire = String::from_utf8(trace.last_output).expect("ASCII headers");
+        let dates: Vec<_> = wire
+            .split("\r\n")
+            .filter(|line| line.starts_with("Date: "))
+            .collect();
+        assert_eq!(dates.as_slice(), *expected);
+        assert!(!wire.contains("Injected:"));
+    }
+}
