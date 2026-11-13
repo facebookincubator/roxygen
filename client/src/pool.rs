@@ -1106,20 +1106,22 @@ async fn retire_idle_sessions(
 /// (`SessionList`'s classes), with lower bounds of when a member's maximum age or any idle
 /// timeout can end. While it is settled, an acquisition step selects the first busy session
 /// that can take an exchange, else the idle session at the back (most recently used) or
-/// front (least recently used) of the idle list, a release the pool hears for one session
-/// updates that session alone, and an event of a session that stopped admitting, such as a
-/// peer's close of an idle connection, removes that session alone, each without a pass over
-/// the pool's sessions, with the result of those passes. Any other step or event takes the
-/// pool's passes and unsettles the index, and the next release's passes rebuild and settle it.
+/// front (least recently used) of the idle list, a release the pool hears for one session,
+/// or a dialed session joining the back of the pool's order, updates that session alone, and
+/// an event of a session that stopped admitting, such as a peer's close of an idle
+/// connection, removes that session alone, each without a pass over the pool's sessions,
+/// with the result of those passes. Any other step or event takes the pool's passes and
+/// unsettles the index, and the next release's passes rebuild and settle it.
 ///
 /// The index is exact while every change to a session that the passes test reaches the pool
 /// as an event for that session: an owned HTTP/1.1 session becomes able to take an exchange
-/// again only when its driver returns its slot (`capacity_available`) or its slot turns
-/// returning (`DIV-029`), which its returning hook reports (`record_returning`), becomes idle
-/// only in that callback or in the idleness its run reports, stops being idle only by a
-/// reservation, and stops admitting by `admission_closed`, by the pool closing it, or by a
-/// cancellation, which sets `unsettled`. A session that stops taking exchanges without an
-/// event (its worker cancelled) stays in its list until a step meets it and drops it.
+/// when it joins the pool, and again only when its driver returns its slot
+/// (`capacity_available`) or its slot turns returning (`DIV-029`), which its returning hook
+/// reports (`record_returning`), becomes idle only in that callback or in the idleness its
+/// run reports, stops being idle only by a reservation, and stops admitting by
+/// `admission_closed`, by the pool closing it, or by a cancellation, which sets `unsettled`.
+/// A session that stops taking exchanges without an event (its worker cancelled) stays in its
+/// list until a step meets it and drops it.
 struct SessionIndex {
     /// Set while the index may not mirror the pool; `None` when the pool keeps no index.
     /// Shared with the pool's owned sessions, whose cancellation sets it.
@@ -3953,6 +3955,10 @@ async fn run_connection_attempt(
                 connected.bind_pool(Rc::downgrade(&pool), unsettled);
                 let wake_count = connected.available_transactions();
                 let max_age = sampled_max_age(pool.borrow().pool_params.max_age);
+                // An owned session records its entry's slot, so that a settled index hears it
+                // join at the back of the pool's order instead of passing over the pool (S6.9).
+                let joined =
+                    matches!(connected, PooledSession::Owned(_)).then(|| connected.clone());
                 {
                     let mut state = pool.borrow_mut();
                     state.sessions.push_back(SessionEntry::new(
@@ -3963,7 +3969,14 @@ async fn run_connection_attempt(
                     state.stats.sessions_opened += 1;
                 }
                 completion.counted = true;
-                notify_session_event(&pool, context.worker_id(), None, false, wake_count, false);
+                notify_session_event(
+                    &pool,
+                    context.worker_id(),
+                    joined.as_ref(),
+                    joined.is_some(),
+                    wake_count,
+                    false,
+                );
                 if let Some(credit) = &guard.credit {
                     let credited = {
                         let mut state = pool.borrow_mut();
