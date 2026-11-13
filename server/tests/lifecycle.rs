@@ -1366,6 +1366,29 @@ fn idle_h2_connection(address: SocketAddr) -> TcpStream {
     stream
 }
 
+/// Sends the preface on a plaintext HTTP/2 connection that the server drops abortively, and
+/// reads until it closes. The reset can surface at the connect, the write or the read.
+fn refused_h2_connection(address: SocketAddr) {
+    let reset = |error: std::io::Error| {
+        assert!(
+            matches!(
+                error.kind(),
+                ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe
+            ),
+            "the refused connection fails only by a reset: {error}"
+        );
+    };
+    let mut stream = match TcpStream::connect_timeout(&address, REQUEST_TIMEOUT) {
+        Ok(stream) => stream,
+        Err(error) => return reset(error),
+    };
+    stream.set_read_timeout(Some(REQUEST_TIMEOUT)).unwrap();
+    if let Err(error) = stream.write_all(H2_PREFACE_AND_SETTINGS) {
+        return reset(error);
+    }
+    let _ = stream.read_to_end(&mut Vec::new());
+}
+
 /// Waits up to `REQUEST_TIMEOUT` for `condition`.
 fn wait_until(condition: impl Fn() -> bool) -> bool {
     let deadline = Instant::now() + REQUEST_TIMEOUT;
@@ -1565,8 +1588,7 @@ fn owned_http2_factory_panic_is_contained() {
     let stats = Arc::new(HandlerStats::default());
     let server = start_plain(config, Arc::clone(&stats));
     let address = server.address().unwrap();
-    let mut refused = idle_h2_connection(address);
-    let _ = refused.read_to_end(&mut Vec::new());
+    refused_h2_connection(address);
     assert!(panicked.load(Ordering::Relaxed));
     assert_eq!(server.state(), HttpServerState::Running);
     assert_eq!(
