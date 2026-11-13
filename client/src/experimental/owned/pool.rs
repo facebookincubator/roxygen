@@ -322,6 +322,11 @@ impl OwnedHttpSessionPool {
     }
 
     #[cfg(test)]
+    pub(crate) fn claim_visits_for_test(&self) -> u64 {
+        self.0.claim_visits_for_test()
+    }
+
+    #[cfg(test)]
     pub(crate) fn pool_task_spawns_for_test(&self) -> u64 {
         self.0.pool_task_spawns_for_test()
     }

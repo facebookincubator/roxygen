@@ -1385,9 +1385,10 @@ fn waiters_on_a_capped_pool_are_served_in_turn_while_streams_reacquire() {
 
 /// Requests that arrive one at a time and each hold their connection, as long streamed
 /// responses do, grow a pool to `MANY` connections, each dialed on demand, with no pass over
-/// the pool's sessions (S6.9); once the peer finishes the responses, the connections serve
-/// `MANY` concurrent exchanges with no dial and no pass. (Sessions grown, the growth's passes,
-/// responses finished, exchanges served, sessions opened, the passes after the growth.)
+/// the pool's sessions and no look at a busy session in the search for a returning one (S6.9);
+/// once the peer finishes the responses, the connections serve `MANY` concurrent exchanges
+/// with no dial and no pass. (Sessions grown, the growth's passes and looks, responses
+/// finished, exchanges served, sessions opened, the passes after the growth.)
 #[test]
 fn a_pool_grows_to_thousands_of_connections_one_held_request_at_a_time() {
     let peer = Peer::start(None, PeerClose::Fin);
@@ -1400,7 +1401,7 @@ fn a_pool_grows_to_thousands_of_connections_one_held_request_at_a_time() {
             held.push(hold_gate(&pool, Reading::Source, CancellationToken::never()).await);
         }
         let grown = pool.session_count();
-        let growth = pool.pool_scans_for_test();
+        let growth = (pool.pool_scans_for_test(), pool.claim_visits_for_test());
         counters.gate_release.send_replace(true);
         let mut finished = 0;
         for (response, session) in held {
@@ -1417,10 +1418,10 @@ fn a_pool_grows_to_thousands_of_connections_one_held_request_at_a_time() {
         (
             (grown, growth),
             (finished, served, pool.stats().sessions_opened),
-            pool.pool_scans_for_test() - growth,
+            pool.pool_scans_for_test() - growth.0,
         )
     });
-    assert_eq!(observed, ((MANY, 0), (MANY, MANY, MANY as u64), 0));
+    assert_eq!(observed, ((MANY, (0, 0)), (MANY, MANY, MANY as u64), 0));
     assert_eq!(peer.finish().accepted.load(Ordering::SeqCst), MANY);
 }
 

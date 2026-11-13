@@ -1189,6 +1189,9 @@ pub(crate) struct PoolState {
     /// Searches for a session that an acquisition may wait for instead of dialing.
     #[cfg(test)]
     claim_scans: Cell<u64>,
+    /// Sessions those searches looked at.
+    #[cfg(test)]
+    claim_visits: Cell<u64>,
     /// Steps and releases take the pool's passes, as without an index.
     #[cfg(test)]
     force_scans: Cell<bool>,
@@ -1595,6 +1598,35 @@ impl PoolState {
             && (self.pooling_enabled || !release_idle)
             && !session.is_finished()
             && !session.is_draining()
+    }
+
+    /// The first session in the pool's order that an acquisition may wait for instead of
+    /// dialing (`DIV-046`). Such a session's slot is returning, so a settled index lists it as
+    /// busy (`record_returning`), and only the busy list, which holds no session with an
+    /// exchange in flight, is searched (S6.9).
+    fn claimable_session(&self) -> Option<PooledSession> {
+        let claimable = |entry: &SessionEntry| {
+            #[cfg(test)]
+            self.claim_visits.set(self.claim_visits.get() + 1);
+            entry.session.claimable()
+        };
+        let slot = if self.index_settled() {
+            std::iter::successors(self.sessions.class_front(Class::Busy), |slot| {
+                self.sessions.class_next(*slot)
+            })
+            .find(|slot| claimable(self.sessions.get(*slot)))
+        } else {
+            self.sessions.find(claimable)
+        };
+        #[cfg(debug_assertions)]
+        if self.index_settled() {
+            assert_eq!(
+                slot,
+                self.sessions.find(|entry| entry.session.claimable()),
+                "the busy list holds the first claimable session"
+            );
+        }
+        slot.map(|slot| self.sessions.get(slot).session.clone())
     }
 
     /// Whether the index can hear an event of `session` alone once the session stopped
@@ -2830,6 +2862,8 @@ impl HttpSessionPool {
                 #[cfg(test)]
                 claim_scans: Cell::default(),
                 #[cfg(test)]
+                claim_visits: Cell::default(),
+                #[cfg(test)]
                 force_scans: Cell::default(),
                 stats: OwnedPoolStats::default(),
                 next_waiter_id: 1,
@@ -3533,6 +3567,11 @@ impl HttpSessionPool {
     }
 
     #[cfg(test)]
+    pub(crate) fn claim_visits_for_test(&self) -> u64 {
+        self.state.borrow().claim_visits.get()
+    }
+
+    #[cfg(test)]
     pub(crate) fn pool_task_spawns_for_test(&self) -> u64 {
         self.state.borrow().tasks.spawned.get()
     }
@@ -4150,10 +4189,7 @@ fn next_step(
             } else {
                 #[cfg(test)]
                 pool.claim_scans.set(pool.claim_scans.get() + 1);
-                pool.sessions
-                    .iter()
-                    .find(|entry| entry.session.claimable())
-                    .map(|entry| entry.session.clone())
+                pool.claimable_session()
             };
             let credit = if !waits && pool.pending_connect_credit() > 1 {
                 let credit = Rc::new(ConnectCredit {
