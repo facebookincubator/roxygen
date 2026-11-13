@@ -1,5 +1,8 @@
 //! Protocol-neutral contracts for the owned (poll-driven) session drivers.
 
+use std::any::Any;
+#[cfg(test)]
+use std::cell::RefCell;
 use std::task::Context;
 use std::task::Poll;
 use std::task::ready;
@@ -16,6 +19,7 @@ use roxygen_core::message::HttpMessage;
 use roxygen_core::stream_source::HttpIngressBody;
 use roxygen_core::stream_source::HttpStreamSourceOwner;
 use roxygen_runtime::cancellation::CancellationToken;
+use roxygen_runtime::worker::ContainedPanicScope;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_transport::byte_stream::LocalTransportFuture;
 
@@ -108,6 +112,70 @@ pub trait OwnedResponseObserver: 'static {
 
     /// Consumes the observer before applying producer completion or deadline policy.
     fn response_complete(self: Box<Self>, completed: Result<Instant, HttpError>);
+}
+
+/// Where an owned driver contained a panic (`DIV-056`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PanicSite {
+    /// A driver turn, outside any narrower boundary.
+    DriverTurn,
+    /// A lifecycle observer.
+    LifecycleObserver,
+}
+
+impl PanicSite {
+    const fn scope(self) -> ContainedPanicScope {
+        match self {
+            Self::DriverTurn => ContainedPanicScope::Driver,
+            Self::LifecycleObserver => ContainedPanicScope::Connection,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::DriverTurn => "driver_turn",
+            Self::LifecycleObserver => "lifecycle_observer",
+        }
+    }
+}
+
+/// Reports a contained panic to the worker: its `WorkerPollStats` count and, under the runtime's
+/// `observability` feature, an error event (`DIV-056`). The caller still disposes of `payload`.
+#[cold]
+#[inline(never)]
+pub(crate) fn report_contained_panic(
+    context: &WorkerContext,
+    site: PanicSite,
+    stream: Option<StreamId>,
+    payload: &(dyn Any + Send),
+) {
+    #[cfg(test)]
+    CONTAINED_PANICS.with_borrow_mut(|reports| {
+        let message = payload
+            .downcast_ref::<&'static str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned());
+        reports.push((site, stream, message));
+    });
+    context.record_contained_panic(
+        site.scope(),
+        site.name(),
+        stream.map(StreamId::get),
+        payload,
+    );
+}
+
+#[cfg(test)]
+thread_local! {
+    static CONTAINED_PANICS: RefCell<Vec<(PanicSite, Option<StreamId>, Option<String>)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Takes the panics the owned drivers on this thread reported, in order, with each one's site,
+/// stream and message.
+#[cfg(test)]
+pub(crate) fn take_contained_panics() -> Vec<(PanicSite, Option<StreamId>, Option<String>)> {
+    CONTAINED_PANICS.take()
 }
 
 /// An owned driver's read: through the transport's [`UniplexReader`] when it offers one, else

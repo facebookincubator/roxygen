@@ -21,6 +21,8 @@ use crate::external_host_tests::panic_text;
 use crate::external_host_tests::poll_once;
 use crate::external_host_tests::run_on_host;
 use crate::external_host_tests::run_on_host_with;
+use crate::owned::PanicSite;
+use crate::owned::take_contained_panics;
 use crate::owned_h1::Http1DriverConfig;
 use crate::owned_h1::OwnedH1Options;
 use crate::owned_h1::OwnedH1UpstreamReservation;
@@ -2990,6 +2992,60 @@ impl HttpSource for GatedUpload {
     fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {
         self.body = None;
     }
+}
+
+/// `DIV-056`: a request body read that panics reaches the per-turn catch and is reported
+/// once, at Driver scope. The run still resumes it.
+#[test]
+fn owned_h1_upstream_driver_turn_panic_is_reported_once() {
+    run_on_host(|context| {
+        Box::pin(async move {
+            use futures::FutureExt;
+            // Discards reports left on this thread by an earlier test.
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let upload_gate = Arc::new(tokio::sync::Notify::new());
+            upload_gate.notify_one();
+            let (transport, _state) = ScriptedTransport::new([ReadAction::WaitDataOrCancellation(
+                Arc::new(tokio::sync::Notify::new()),
+                OK_RESPONSE.to_vec(),
+            )]);
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let submission = handle.reserve_request().unwrap().submit(
+                post_head(Some(5), false),
+                GatedUpload::held(
+                    &upload_gate,
+                    Some(Box::new(|| panic!("request body panicked"))),
+                ),
+                CancellationToken::never(),
+            );
+            let run = std::panic::AssertUnwindSafe(session.run())
+                .catch_unwind()
+                .await;
+            drop(submission);
+            let panic = run.expect_err("run resumes the request body's panic");
+            assert_eq!(panic_text(panic), "request body panicked");
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::DriverTurn,
+                    None,
+                    Some("request body panicked".to_owned())
+                )]
+            );
+            let delta = worker.poll_stats().since(&start);
+            assert_eq!(
+                (
+                    delta.contained_exchange_panics,
+                    delta.contained_connection_panics,
+                    delta.contained_driver_panics,
+                ),
+                (0, 0, 1)
+            );
+        })
+    });
 }
 
 /// A response observer whose completion cancels its request and releases the request body.

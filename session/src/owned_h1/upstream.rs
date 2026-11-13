@@ -2189,6 +2189,7 @@ impl UpstreamDriver {
         match catch_unwind(AssertUnwindSafe(|| self.poll(context))) {
             Ok(poll) => poll,
             Err(panic) => {
+                report_contained_panic(&self.context, PanicSite::DriverTurn, None, &*panic);
                 self.retain_panic(panic);
                 self.abort(failure(
                     HttpErrorCode::INTERNAL_ERROR,

@@ -1,4 +1,5 @@
-//! Bounded cleanup of panic payloads whose destructors can also panic.
+//! Bounded cleanup of panic payloads whose destructors can also panic, and
+//! the text of a payload.
 
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
@@ -21,6 +22,30 @@ pub fn discard_panic(mut payload: Box<dyn Any + Send>) {
         }
     }
     std::mem::forget(payload);
+}
+
+/// The text of a payload that `panic!` made from a message: a `&'static str`
+/// or a `String`.
+#[cfg(any(test, feature = "observability"))]
+pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> Option<&str> {
+    payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+}
+
+/// The longest prefix of `text` of at most `limit` bytes that ends at a
+/// character boundary.
+#[cfg(any(test, feature = "observability"))]
+pub(crate) fn truncated(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 #[cfg(test)]

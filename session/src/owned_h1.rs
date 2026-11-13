@@ -95,7 +95,9 @@ use roxygen_transport::byte_stream::WriteInfo;
 
 use crate::owned::OwnedApplication;
 use crate::owned::OwnedExchange;
+use crate::owned::PanicSite;
 use crate::owned::ReadSlot;
+use crate::owned::report_contained_panic;
 use crate::uniplex::UniplexConfig;
 use crate::uniplex::UniplexRunSummary;
 use crate::uniplex::UniplexTransport;
@@ -744,6 +746,7 @@ impl<A: OwnedApplication> Future for DriverRun<A> {
                 Poll::Ready(result)
             }
             Err(panic) => {
+                report_contained_panic(&driver.context, PanicSite::DriverTurn, None, &*panic);
                 driver.retain_panic(panic);
                 driver.abort(failure(
                     HttpErrorCode::INTERNAL_ERROR,

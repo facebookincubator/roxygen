@@ -23,6 +23,8 @@ use crate::external_host_tests::run_on_host;
 use crate::external_host_tests::run_on_host_with;
 use crate::owned::OwnedApplication;
 use crate::owned::OwnedExchange;
+use crate::owned::PanicSite;
+use crate::owned::take_contained_panics;
 use crate::owned_h1::Http1DriverConfig;
 use crate::owned_h1::Http1UpgradePolicy;
 use crate::owned_h1::OwnedH1Handle;
@@ -311,7 +313,8 @@ struct H1App {
     /// Once set, each exchange drains the session through this handle from the named callback:
     /// `request`, `poll_headers` or `complete`.
     drain_in: CancelIn,
-    /// The first exchange panics from this point of its retirement: `complete` or `drop`.
+    /// The first exchange panics at this point: in `poll_headers`, or at its retirement, in
+    /// `complete` or `drop`.
     panic_in: Option<&'static str>,
     /// Each exchange with a request body keeps it unread and stops it with this code, at this
     /// point.
@@ -663,6 +666,9 @@ impl OwnedExchange for H1Exchange {
         &mut self,
         context: &mut Context<'_>,
     ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        if self.panic_in == Some("poll_headers") {
+            panic!("exchange panicked polling headers");
+        }
         if let Some(interim) = self.interim.pop_front() {
             return Poll::Ready(Ok(interim));
         }
@@ -3049,6 +3055,51 @@ fn a_panic_dropping_the_exchange_fails_the_idle_connection() {
         "drop",
         b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec(),
     );
+}
+
+/// `DIV-056`: an exchange's panic that reaches the per-turn catch is reported once, at
+/// Driver scope. The run still resumes it.
+#[test]
+fn owned_h1_driver_turn_panic_is_reported_once() {
+    let (panic, reports, counts) = run_on_host(|context| {
+        Box::pin(async move {
+            // Discards reports left on this thread by an earlier test.
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let (transport, _state) = ScriptedTransport::new([ReadAction::Data(
+                b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec(),
+            )]);
+            let (mut application, _probes) = H1App::new(vec![Response::fixed(200, b"hello")]);
+            application.panic_in = Some("poll_headers");
+            let (session, _handle) =
+                OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+            let panic = futures::FutureExt::catch_unwind(AssertUnwindSafe(session.run()))
+                .await
+                .err()
+                .map(panic_text);
+            let delta = worker.poll_stats().since(&start);
+            (
+                panic,
+                take_contained_panics(),
+                (
+                    delta.contained_exchange_panics,
+                    delta.contained_connection_panics,
+                    delta.contained_driver_panics,
+                ),
+            )
+        })
+    });
+    assert_eq!(panic.as_deref(), Some("exchange panicked polling headers"));
+    assert_eq!(
+        reports,
+        [(
+            PanicSite::DriverTurn,
+            None,
+            Some("exchange panicked polling headers".to_owned())
+        )]
+    );
+    assert_eq!(counts, (0, 0, 1));
 }
 
 /// Each byte of `bytes` in its own ready read.

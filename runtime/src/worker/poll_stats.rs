@@ -4,6 +4,8 @@
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use super::ContainedPanicScope;
+
 /// How many buckets `WorkerPollStats::cleanup_polls_per_driver_poll` has.
 pub(crate) const CLEANUP_POLL_BUCKETS: usize = 8;
 
@@ -40,6 +42,17 @@ pub struct WorkerPollStats {
     pub cleanups_registered: u64,
     /// Activated cleanup tasks that have not finished.
     pub cleanups_active: u64,
+    /// Panics that Roxygen's owned HTTP drivers on this worker contained in
+    /// one exchange's callbacks (`DIV-056`). Panics that meet in one
+    /// aggregator, such as a drop that panics while another panic unwinds,
+    /// count once, so this and the next two counters are lower bounds.
+    pub contained_exchange_panics: u64,
+    /// Panics those drivers contained in a callback of a whole connection,
+    /// such as a lifecycle observer.
+    pub contained_connection_panics: u64,
+    /// Panics those drivers contained at driver scope, outside any narrower
+    /// boundary.
+    pub contained_driver_panics: u64,
 }
 
 impl WorkerPollStats {
@@ -65,6 +78,15 @@ impl WorkerPollStats {
                 .budget_exhausted_passes
                 .wrapping_sub(earlier.budget_exhausted_passes),
             cleanup_polls_per_driver_poll: histogram,
+            contained_exchange_panics: self
+                .contained_exchange_panics
+                .wrapping_sub(earlier.contained_exchange_panics),
+            contained_connection_panics: self
+                .contained_connection_panics
+                .wrapping_sub(earlier.contained_connection_panics),
+            contained_driver_panics: self
+                .contained_driver_panics
+                .wrapping_sub(earlier.contained_driver_panics),
             ..*self
         }
     }
@@ -97,6 +119,15 @@ impl WorkerPollStats {
             .cleanups_registered
             .wrapping_add(other.cleanups_registered);
         self.cleanups_active = self.cleanups_active.wrapping_add(other.cleanups_active);
+        self.contained_exchange_panics = self
+            .contained_exchange_panics
+            .wrapping_add(other.contained_exchange_panics);
+        self.contained_connection_panics = self
+            .contained_connection_panics
+            .wrapping_add(other.contained_connection_panics);
+        self.contained_driver_panics = self
+            .contained_driver_panics
+            .wrapping_add(other.contained_driver_panics);
     }
 }
 
@@ -158,6 +189,9 @@ pub(crate) struct PollCounters {
     max_ready_batch: AtomicU64,
     cleanups_registered: AtomicU64,
     cleanups_active: AtomicU64,
+    contained_exchange_panics: AtomicU64,
+    contained_connection_panics: AtomicU64,
+    contained_driver_panics: AtomicU64,
 }
 
 impl PollCounters {
@@ -210,6 +244,15 @@ impl PollCounters {
         }
     }
 
+    pub(crate) fn record_contained_panic(&self, scope: ContainedPanicScope) {
+        let counter = match scope {
+            ContainedPanicScope::Exchange => &self.contained_exchange_panics,
+            ContainedPanicScope::Connection => &self.contained_connection_panics,
+            ContainedPanicScope::Driver => &self.contained_driver_panics,
+        };
+        add(counter, 1);
+    }
+
     pub(crate) fn snapshot(&self) -> WorkerPollStats {
         WorkerPollStats {
             driver_polls: self.driver_polls.load(Ordering::Relaxed),
@@ -227,6 +270,9 @@ impl PollCounters {
             max_ready_batch: self.max_ready_batch.load(Ordering::Relaxed),
             cleanups_registered: self.cleanups_registered.load(Ordering::Relaxed),
             cleanups_active: self.cleanups_active.load(Ordering::Relaxed),
+            contained_exchange_panics: self.contained_exchange_panics.load(Ordering::Relaxed),
+            contained_connection_panics: self.contained_connection_panics.load(Ordering::Relaxed),
+            contained_driver_panics: self.contained_driver_panics.load(Ordering::Relaxed),
         }
     }
 }

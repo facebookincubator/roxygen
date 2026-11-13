@@ -96,6 +96,29 @@ pub enum CleanupRegistrationError {
     IdentifierExhausted,
 }
 
+/// The scope at which one of Roxygen's owned HTTP drivers contained a panic
+/// (`DIV-056`): which `WorkerPollStats` counter counts it.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContainedPanicScope {
+    /// One exchange's callbacks.
+    Exchange,
+    /// A callback of a whole connection.
+    Connection,
+    /// The driver, outside any narrower boundary.
+    Driver,
+}
+
+impl ContainedPanicScope {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Exchange => "exchange",
+            Self::Connection => "connection",
+            Self::Driver => "driver",
+        }
+    }
+}
+
 pub(crate) type PanicPayload = Box<dyn Any + Send + 'static>;
 pub(crate) type LocalTask = Pin<Box<dyn Future<Output = ()> + 'static>>;
 type WorkerCommandFactory = Box<dyn FnOnce(WorkerContext) -> LocalTask + Send + 'static>;
@@ -988,6 +1011,32 @@ impl WorkerContext {
         self.local.active_guards.get()
     }
 
+    /// For Roxygen's owned HTTP drivers (`DIV-056`): counts a panic contained
+    /// at `scope` in this worker's `WorkerPollStats`. Under `observability`
+    /// it also emits an error event with target `roxygen::contained_panic`
+    /// and fields `scope`, `site`, `stream` (when known) and `message`, the
+    /// payload's text truncated to 128 bytes; a panic in the subscriber is
+    /// discarded. The caller keeps, and disposes of, `payload`.
+    #[doc(hidden)]
+    #[cold]
+    #[inline(never)]
+    pub fn record_contained_panic(
+        &self,
+        scope: ContainedPanicScope,
+        site: &'static str,
+        stream: Option<u64>,
+        payload: &(dyn Any + Send),
+    ) {
+        self.handle
+            .shared
+            .poll_counters()
+            .record_contained_panic(scope);
+        #[cfg(feature = "observability")]
+        emit_contained_panic(scope, site, stream, payload);
+        #[cfg(not(feature = "observability"))]
+        let _ = (site, stream, payload);
+    }
+
     /// Registers an owner-local callback that the driver runs during shutdown.
     ///
     /// The callback may own `!Send` state. Registration succeeds only on the
@@ -1406,6 +1455,31 @@ impl WorkerContext {
             }
         }
         first_panic
+    }
+}
+
+#[cfg(feature = "observability")]
+const CONTAINED_PANIC_MESSAGE_LIMIT: usize = 128;
+
+#[cfg(feature = "observability")]
+fn emit_contained_panic(
+    scope: ContainedPanicScope,
+    site: &'static str,
+    stream: Option<u64>,
+    payload: &(dyn Any + Send),
+) {
+    let message = crate::panic::panic_message(payload)
+        .map(|text| crate::panic::truncated(text, CONTAINED_PANIC_MESSAGE_LIMIT));
+    if let Err(panic) = catch_unwind(AssertUnwindSafe(|| {
+        tracing::error!(
+            target: "roxygen::contained_panic",
+            scope = scope.name(),
+            site,
+            stream,
+            message,
+        );
+    })) {
+        discard_panic(panic);
     }
 }
 

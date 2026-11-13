@@ -2,11 +2,17 @@ mod poll_stats {
     use std::cell::Cell;
     use std::cell::RefCell;
     use std::collections::VecDeque;
+    #[cfg(feature = "observability")]
+    use std::fmt::Write as _;
     use std::future::Future;
     use std::future::pending;
+    use std::panic::catch_unwind;
+    use std::panic::panic_any;
     use std::pin::Pin;
     use std::rc::Rc;
     use std::sync::Arc;
+    #[cfg(feature = "observability")]
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use std::sync::mpsc;
@@ -22,7 +28,10 @@ mod poll_stats {
     use crate::host::Host;
     use crate::host::LocalFuture;
     use crate::host::LocalHost;
+    use crate::panic::panic_message;
+    use crate::panic::truncated;
     use crate::tokio_host::ManagedWorker;
+    use crate::worker::ContainedPanicScope;
     use crate::worker::WorkerCleanupTask;
     use crate::worker::WorkerCleanupTaskRegistration;
     use crate::worker::WorkerContext;
@@ -278,6 +287,9 @@ mod poll_stats {
             max_ready_batch: 8,
             cleanups_registered: 7,
             cleanups_active: 5,
+            contained_exchange_panics: 3,
+            contained_connection_panics: 2,
+            contained_driver_panics: 1,
         };
         let later = WorkerPollStats {
             driver_polls: 15,
@@ -291,6 +303,9 @@ mod poll_stats {
             max_ready_batch: 10,
             cleanups_registered: 2,
             cleanups_active: 1,
+            contained_exchange_panics: 8,
+            contained_connection_panics: 6,
+            contained_driver_panics: 2,
         };
         assert_eq!(
             later.since(&earlier),
@@ -306,6 +321,9 @@ mod poll_stats {
                 max_ready_batch: 10,
                 cleanups_registered: 2,
                 cleanups_active: 1,
+                contained_exchange_panics: 5,
+                contained_connection_panics: 4,
+                contained_driver_panics: 1,
             }
         );
 
@@ -325,6 +343,9 @@ mod poll_stats {
                 max_ready_batch: 10,
                 cleanups_registered: 9,
                 cleanups_active: 6,
+                contained_exchange_panics: 11,
+                contained_connection_panics: 8,
+                contained_driver_panics: 3,
             }
         );
         let hosted = WorkerPollStats {
@@ -333,6 +354,191 @@ mod poll_stats {
         };
         merged.merge(&hosted);
         assert_eq!(merged.cleanup_polls, 50);
+    }
+
+    /// `DIV-056`.
+    #[test]
+    fn contained_panics_are_counted_by_scope_and_the_message_is_read() {
+        let (handle, driver) = WorkerDriver::new(4).expect("worker starts");
+        let context = driver.context().clone();
+        #[cfg(feature = "observability")]
+        let (recorder, _subscriber) = EventRecorder::install(false);
+        let long = "x".repeat(300);
+        let start = handle.poll_stats();
+        context.record_contained_panic(
+            ContainedPanicScope::Exchange,
+            "exchange_callback",
+            Some(3),
+            &"exchange panicked",
+        );
+        context.record_contained_panic(
+            ContainedPanicScope::Exchange,
+            "exchange_callback",
+            Some(5),
+            &long,
+        );
+        context.record_contained_panic(ContainedPanicScope::Driver, "driver_turn", None, &7_i32);
+        let delta = handle.poll_stats().since(&start);
+        assert_eq!(
+            (
+                delta.contained_exchange_panics,
+                delta.contained_connection_panics,
+                delta.contained_driver_panics,
+            ),
+            (2, 0, 1)
+        );
+
+        let literal = catch_unwind(|| panic!("literal")).unwrap_err();
+        let formatted = catch_unwind(|| panic_any(String::from("formatted"))).unwrap_err();
+        let other = catch_unwind(|| panic_any(7_i32)).unwrap_err();
+        assert_eq!(panic_message(&*literal), Some("literal"));
+        assert_eq!(panic_message(&*formatted), Some("formatted"));
+        assert_eq!(panic_message(&*other), None);
+        // Byte 128 falls inside a three-byte character, so the prefix ends at 127.
+        let euros = format!("a{}", "\u{20ac}".repeat(100));
+        assert_eq!(truncated(&euros, 128), &euros[..127]);
+        assert_eq!(truncated(&long, 128).len(), 128);
+        assert_eq!(truncated("short", 128), "short");
+
+        #[cfg(feature = "observability")]
+        assert_eq!(
+            recorder.take(),
+            [
+                "ERROR roxygen::contained_panic scope=exchange site=exchange_callback stream=3 \
+                 message=exchange panicked"
+                    .to_owned(),
+                format!(
+                    "ERROR roxygen::contained_panic scope=exchange site=exchange_callback \
+                     stream=5 message={}",
+                    "x".repeat(128)
+                ),
+                "ERROR roxygen::contained_panic scope=driver site=driver_turn".to_owned(),
+            ]
+        );
+        drop(driver);
+    }
+
+    /// `DIV-056`.
+    #[cfg(feature = "observability")]
+    #[test]
+    fn a_panicking_subscriber_is_discarded() {
+        let (handle, driver) = WorkerDriver::new(4).expect("worker starts");
+        let context = driver.context().clone();
+        let (recorder, _subscriber) = EventRecorder::install(true);
+        let start = handle.poll_stats();
+        context.record_contained_panic(
+            ContainedPanicScope::Connection,
+            "lifecycle_observer",
+            None,
+            &"observer panicked",
+        );
+        assert!(
+            !recorder.panic_next.load(Ordering::Relaxed),
+            "the subscriber saw the event"
+        );
+        assert!(recorder.take().is_empty());
+        assert_eq!(
+            handle
+                .poll_stats()
+                .since(&start)
+                .contained_connection_panics,
+            1
+        );
+        // The subscriber's panic left this thread's dispatcher usable.
+        context.record_contained_panic(
+            ContainedPanicScope::Connection,
+            "lifecycle_observer",
+            Some(1),
+            &"observer panicked again",
+        );
+        assert_eq!(
+            recorder.take(),
+            [
+                "ERROR roxygen::contained_panic scope=connection site=lifecycle_observer \
+                 stream=1 message=observer panicked again"
+            ]
+        );
+        assert_eq!(
+            handle
+                .poll_stats()
+                .since(&start)
+                .contained_connection_panics,
+            2
+        );
+        drop(driver);
+    }
+
+    /// Records each `roxygen::contained_panic` event on the thread it is the default for as
+    /// one line; it panics instead on the next event while `panic_next` is set.
+    #[cfg(feature = "observability")]
+    #[derive(Clone, Default)]
+    struct EventRecorder {
+        lines: Arc<Mutex<Vec<String>>>,
+        panic_next: Arc<AtomicBool>,
+    }
+
+    #[cfg(feature = "observability")]
+    impl EventRecorder {
+        fn install(panic_next: bool) -> (Self, tracing::subscriber::DefaultGuard) {
+            let recorder = Self::default();
+            recorder.panic_next.store(panic_next, Ordering::Relaxed);
+            let guard = tracing::subscriber::set_default(recorder.clone());
+            (recorder, guard)
+        }
+
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.lines.lock().expect("recorder lock"))
+        }
+    }
+
+    #[cfg(feature = "observability")]
+    struct Line<'a>(&'a mut String);
+
+    #[cfg(feature = "observability")]
+    impl tracing::field::Visit for Line<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            let _ = write!(self.0, " {}={value}", field.name());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
+
+    #[cfg(feature = "observability")]
+    impl tracing::Subscriber for EventRecorder {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "roxygen::contained_panic"
+        }
+
+        fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if self.panic_next.swap(false, Ordering::Relaxed) {
+                panic!("subscriber panicked");
+            }
+            let metadata = event.metadata();
+            let mut line = format!("{} {}", metadata.level(), metadata.target());
+            event.record(&mut Line(&mut line));
+            self.lines.lock().expect("recorder lock").push(line);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
     }
 
     #[test]

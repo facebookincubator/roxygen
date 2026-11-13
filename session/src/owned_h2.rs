@@ -118,7 +118,9 @@ pub use crate::owned::OwnedApplication as OwnedH2Application;
 use crate::owned::OwnedApplication;
 pub use crate::owned::OwnedExchange as OwnedH2Exchange;
 use crate::owned::OwnedExchange;
+use crate::owned::PanicSite;
 use crate::owned::ReadSlot;
+use crate::owned::report_contained_panic;
 use crate::session::LifecycleEvent;
 use crate::session::LifecycleObserver;
 use crate::session::LifecycleObserverId;
@@ -1438,6 +1440,7 @@ where
                 Poll::Ready(driver.finish_run(result))
             }
             Err(panic) => {
+                report_contained_panic(&driver.context, PanicSite::DriverTurn, None, &*panic);
                 driver.poll_panicked(panic, context);
                 Poll::Pending
             }
@@ -2033,6 +2036,7 @@ where
         observation.window_transition(&self.connection.state.control);
         let lifecycle = Rc::clone(&observation.lifecycle);
         if let Err(panic) = catch_unwind(AssertUnwindSafe(|| lifecycle.flush())) {
+            report_contained_panic(&self.context, PanicSite::LifecycleObserver, None, &*panic);
             self.poll_panicked(panic, context);
         }
     }

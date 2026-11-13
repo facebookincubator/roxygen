@@ -8,6 +8,7 @@ use roxygen_codec::CodecSetting;
 use roxygen_core::ingress_completion::IngressCompletion;
 use roxygen_core::stream_source::HttpIngressBody;
 use roxygen_core::stream_source::HttpStreamSourceOwner;
+use roxygen_http2::hpack::HeaderIndexingStrategy;
 use roxygen_http2::hpack::HeaderName;
 use roxygen_http2::hpack::HpackDecoder;
 use roxygen_http2::hpack::HpackEncodeBuffer;
@@ -21,6 +22,8 @@ use crate::external_host_tests::YieldMode;
 use crate::external_host_tests::after_forced_teardown;
 use crate::external_host_tests::forced_teardown_of_scope;
 use crate::http2::StreamReceiveWindowMode;
+use crate::owned::PanicSite;
+use crate::owned::take_contained_panics;
 use crate::owned_h2::OwnedH2Application;
 use crate::owned_h2::OwnedH2Exchange;
 use crate::owned_h2::OwnedH2Handle;
@@ -3289,6 +3292,72 @@ fn application_callback_panics_cancel_once_and_join_native_io_before_resuming() 
             })
         });
     }
+}
+
+/// A header indexing strategy whose every decision panics.
+struct PanickingIndexing;
+
+impl HeaderIndexingStrategy for PanickingIndexing {
+    fn index_header(&self, _name: &HeaderName, _value: &[u8], _name_exists: bool) -> bool {
+        panic!("indexing strategy")
+    }
+
+    fn clone_box(&self) -> Box<dyn HeaderIndexingStrategy> {
+        Box::new(Self)
+    }
+}
+
+/// `DIV-056`: a panic in a user callback inside the codec, encoding the response head,
+/// reaches the per-turn catch and is reported once, at Driver scope. The run still resumes it.
+fn assert_driver_turn_panic_is_reported_once() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            // Discards reports left on this thread by an earlier test.
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let (transport, _) = FixtureTransport::new([FixtureRead::Data(input)]);
+            let (application, _) = Application::new(vec![Reply::Body(1)]);
+            let mut config = options(context, transport);
+            config.http2.header_indexing_strategy = Some(Rc::new(PanickingIndexing));
+            let (session, _) = OwnedH2Session::new(application, config).unwrap();
+            let panic = tokio::time::timeout(
+                Duration::from_secs(5),
+                eligibility_catch_unwind(session.run()),
+            )
+            .await
+            .expect("the panicked connection joins its I/O")
+            .expect_err("the run resumes the panic");
+            assert_eq!(
+                panic.downcast_ref::<&'static str>(),
+                Some(&"indexing strategy")
+            );
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::DriverTurn,
+                    None,
+                    Some("indexing strategy".to_owned())
+                )]
+            );
+            let delta = worker.poll_stats().since(&start);
+            assert_eq!(
+                (
+                    delta.contained_exchange_panics,
+                    delta.contained_connection_panics,
+                    delta.contained_driver_panics,
+                ),
+                (0, 0, 1)
+            );
+        })
+    });
+}
+
+#[test]
+fn owned_h2_driver_turn_panic_is_reported_once() {
+    assert_driver_turn_panic_is_reported_once();
+    crate::uniplex_tests::on_hosted_workers(assert_driver_turn_panic_is_reported_once);
 }
 
 #[test]
@@ -14655,6 +14724,9 @@ impl LifecycleObserver for PanicOnAttach {
 fn owned_h2_observer_panic_aborts_after_cleanup() {
     run_on_worker(|context| {
         Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
             let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
             let (transport, state) = FixtureTransport::new([FixtureRead::Data(input)]);
             let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
@@ -14682,6 +14754,23 @@ fn owned_h2_observer_panic_aborts_after_cleanup() {
             assert_eq!(
                 panic.downcast_ref::<&'static str>(),
                 Some(&"lifecycle observer")
+            );
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::LifecycleObserver,
+                    None,
+                    Some("lifecycle observer".to_owned())
+                )]
+            );
+            let delta = worker.poll_stats().since(&start);
+            assert_eq!(
+                (
+                    delta.contained_exchange_panics,
+                    delta.contained_connection_panics,
+                    delta.contained_driver_panics,
+                ),
+                (0, 1, 0)
             );
             assert_eq!(state.borrow().close, FixtureClose::Reset);
             let probes = probes.borrow();
