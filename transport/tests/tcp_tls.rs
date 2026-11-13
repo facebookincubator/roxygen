@@ -9797,11 +9797,18 @@ mod tcp_tls {
         /// Parks a first reader's read under `reader_waker`, whose release while the dropped
         /// reader cancels that read starts a second reader's read on the same transport, then
         /// panics if `panic_after_start`. The replacement read survives the old read's cleanup
-        /// and reads the next bytes.
-        fn replacement_during_reader_drop(panic_after_start: bool) {
+        /// and reads the next bytes. A `cancellable` first reader's wake registration also holds
+        /// `reader_waker` clones.
+        fn replacement_during_reader_drop(panic_after_start: bool, cancellable: bool) {
             with_accepted_tcp(limits(), move |context, transport, mut peer| async move {
+                let cancellation = CancellationSource::new();
+                let token = if cancellable {
+                    cancellation.token()
+                } else {
+                    CancellationToken::never()
+                };
                 let mut first = transport
-                    .reader(&context, Duration::ZERO, CancellationToken::never())
+                    .reader(&context, Duration::ZERO, token)
                     .unwrap()
                     .unwrap();
                 let second = Rc::new(RefCell::new(
@@ -9863,12 +9870,22 @@ mod tcp_tls {
 
         #[test]
         fn dropping_a_tcp_reader_can_admit_a_replacement_read() {
-            replacement_during_reader_drop(false);
+            replacement_during_reader_drop(false, false);
         }
 
         #[test]
         fn tcp_reader_cancellation_panic_preserves_a_replacement_read() {
-            replacement_during_reader_drop(true);
+            replacement_during_reader_drop(true, false);
+        }
+
+        #[test]
+        fn dropping_a_cancellable_tcp_reader_can_admit_a_replacement_read() {
+            replacement_during_reader_drop(false, true);
+        }
+
+        #[test]
+        fn cancellable_tcp_reader_cancellation_panic_preserves_a_replacement_read() {
+            replacement_during_reader_drop(true, true);
         }
 
         /// A read that observes its reader's cancellation in a poll cancels its socket read,

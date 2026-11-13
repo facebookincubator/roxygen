@@ -408,7 +408,6 @@ pub struct OwnedReader {
     worker: WorkerHandle,
     limits: ByteStreamLimits,
     context: WorkerContext,
-    cancellation: ReaderCancellation,
     /// The started read, until `poll_read` returns its result.
     read: ReaderRead,
     /// The backend's reader when its reads can report a drained stream, which
@@ -416,6 +415,8 @@ pub struct OwnedReader {
     polled: Option<Weak<dyn PolledReader>>,
     /// The operation slot. Every read reuses it, with its transport handles.
     operation: ReadOperation,
+    /// Drops after `operation`: a waker it releases can start a replacement read.
+    cancellation: ReaderCancellation,
 }
 
 /// The read an [`OwnedReader`] has started.
@@ -3010,7 +3011,6 @@ impl ByteStreamTransport for OwnedByteStream {
             worker: self.worker.clone(),
             limits: self.limits,
             context: context.clone(),
-            cancellation: ReaderCancellation::new(cancellation),
             read: ReaderRead::Idle,
             polled: self
                 .io
@@ -3019,6 +3019,7 @@ impl ByteStreamTransport for OwnedByteStream {
                 .filter(|reader| reader.reports_drained())
                 .map(|reader| Rc::downgrade(&reader)),
             operation: ReadOperation::idle(self.io.clone(), Rc::clone(&self.state)),
+            cancellation: ReaderCancellation::new(cancellation),
         }))
     }
 }
