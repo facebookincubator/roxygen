@@ -1106,10 +1106,11 @@ async fn retire_idle_sessions(
 /// (`SessionList`'s classes), with lower bounds of when a member's maximum age or any idle
 /// timeout can end. While it is settled, an acquisition step selects the first busy session
 /// that can take an exchange, else the idle session at the back (most recently used) or
-/// front (least recently used) of the idle list, and a release the pool hears for one
-/// session updates that session alone, each without a pass over the pool's sessions,
-/// with the result of those passes. Any other step or event takes the pool's passes and
-/// unsettles the index, and the next release's passes rebuild and settle it.
+/// front (least recently used) of the idle list, a release the pool hears for one session
+/// updates that session alone, and an event of a session that stopped admitting, such as a
+/// peer's close of an idle connection, removes that session alone, each without a pass over
+/// the pool's sessions, with the result of those passes. Any other step or event takes the
+/// pool's passes and unsettles the index, and the next release's passes rebuild and settle it.
 ///
 /// The index is exact while every change to a session that the passes test reaches the pool
 /// as an event for that session: an owned HTTP/1.1 session becomes able to take an exchange
@@ -1594,6 +1595,18 @@ impl PoolState {
             && !session.is_draining()
     }
 
+    /// Whether the index can hear an event of `session` alone once the session stopped
+    /// admitting (S6.9): it is settled, so no other session is finished, draining or changed
+    /// since the pool last looked at it; the session is finished or draining, so the pool's
+    /// passes would remove it and change nothing else; and the event drains nothing. A
+    /// draining pool's teardown removes entries without their counts, which its passes redo.
+    fn index_hears_retirement(&self, session: &PooledSession, release_idle: bool) -> bool {
+        self.index_settled()
+            && !self.draining
+            && (self.pooling_enabled || !release_idle)
+            && (session.is_finished() || session.is_draining())
+    }
+
     /// The waiter of the acquisition that waits for `session`'s returning slot, which takes
     /// the session's wake whatever it reports (`DIV-046`).
     fn take_claimer(&mut self, session: Option<&PooledSession>) -> Option<Rc<Waiter>> {
@@ -1640,6 +1653,34 @@ impl PoolState {
         #[cfg(debug_assertions)]
         self.verify_index();
         (claimer, waiters, self.idle_sessions, idle_wake)
+    }
+
+    /// `notify_session_event`'s pass for an event of a session that stopped admitting, which the
+    /// index hears (S6.9): the session's entry, if the pool still holds it, leaves the pool and
+    /// its idle count, as the passes' removal of finished and draining sessions would remove it,
+    /// then the claimer and waiters it wakes. The index stays settled: the other sessions are as
+    /// it last saw them, and its floors still bound their stamps and deadlines. Returns the
+    /// entry, for its caller to drop once the pool is released, the claimer, the waiters and
+    /// the idle count.
+    fn retire_indexed(
+        &mut self,
+        session: &PooledSession,
+        wake_count: usize,
+    ) -> (
+        Option<SessionEntry>,
+        Option<Rc<Waiter>>,
+        Vec<Rc<Waiter>>,
+        usize,
+    ) {
+        let entry = self.slot_of(session).map(|slot| self.sessions.remove(slot));
+        if entry.as_ref().is_some_and(|entry| entry.counted_idle) {
+            self.idle_sessions = self.idle_sessions.saturating_sub(1);
+        }
+        let claimer = self.take_claimer(Some(session));
+        let waiters = self.take_waiters(wake_count.saturating_sub(usize::from(claimer.is_some())));
+        #[cfg(debug_assertions)]
+        self.verify_index();
+        (entry, claimer, waiters, self.idle_sessions)
     }
 
     /// Checks that a settled index mirrors the pool: every session that can take an exchange
@@ -2175,6 +2216,7 @@ pub(crate) fn notify_session_event(
     wake_count: usize,
     release_idle: bool,
 ) {
+    let mut retired_entry = None;
     let (sessions_to_drain, claimer, waiters, idle_changed, idle_wake) = {
         let mut state = pool.borrow_mut();
         if state.context.worker_id() != worker {
@@ -2196,6 +2238,18 @@ pub(crate) fn notify_session_event(
                 waiters,
                 prior_idle.abs_diff(idle),
                 idle_wake,
+            )
+        } else if let Some(session) =
+            changed_session.filter(|session| state.index_hears_retirement(session, release_idle))
+        {
+            let (entry, claimer, waiters, idle) = state.retire_indexed(session, wake_count);
+            retired_entry = entry;
+            (
+                Vec::new(),
+                claimer,
+                waiters,
+                prior_idle.abs_diff(idle),
+                None,
             )
         } else {
             state.count_scan();
@@ -2263,6 +2317,7 @@ pub(crate) fn notify_session_event(
     }
     signal_waiters(waiters);
     drain_sessions(sessions_to_drain);
+    drop(retired_entry);
     for _ in 0..idle_changed {
         notify_idle_observer(pool);
     }

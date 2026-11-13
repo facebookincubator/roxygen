@@ -1418,8 +1418,11 @@ fn a_pool_grows_to_thousands_of_connections_one_held_request_at_a_time() {
 }
 
 /// When the peer closes half of `MANY` idle pooled connections, as uvicorn's keep-alive timeout
-/// does, the pool retires each when its driver reads the close, and the connections left serve
-/// as many concurrent exchanges with no dial.
+/// does, the pool retires each when its driver reads the close, with no pass over the pool's
+/// sessions and its selection index still settled (S6.9), and the connections left serve as
+/// many concurrent exchanges with no dial and no pass. (The index settled before the closes,
+/// the passes the closes took, the index settled after them, the sessions left, the exchanges
+/// served, sessions opened, the passes the exchanges took.)
 #[test]
 fn a_peer_closing_idle_connections_among_thousands_leaves_the_rest_serving() {
     const CLOSED: usize = MANY / 2;
@@ -1430,10 +1433,15 @@ fn a_peer_closing_idle_connections_among_thousands_leaves_the_rest_serving() {
     let observed = run_on_worker(move |context| async move {
         let pool = egress_pool(&context, address, egress_params());
         establish_many(&pool).await;
+        let settled = pool.index_settled_for_test();
+        let scans = pool.pool_scans_for_test();
         counters.close_idle(CLOSED);
         until(|| counters.idle_closed.load(Ordering::SeqCst) == CLOSED).await;
         until(|| pool.stats().sessions_closed == CLOSED as u64).await;
+        let close_scans = pool.pool_scans_for_test() - scans;
+        let settled_after = pool.index_settled_for_test();
         let left = pool.session_count();
+        let scans = pool.pool_scans_for_test();
         let next = futures::future::join_all(
             (0..MANY - CLOSED).map(|_| exchange(&pool, "/ok", Reading::Source)),
         )
@@ -1442,9 +1450,20 @@ fn a_peer_closing_idle_connections_among_thousands_leaves_the_rest_serving() {
             .iter()
             .filter(|(received, _, _)| *received == ok())
             .count();
-        (left, served, pool.stats().sessions_opened)
+        (
+            (settled, close_scans, settled_after),
+            (left, served, pool.stats().sessions_opened),
+            pool.pool_scans_for_test() - scans,
+        )
     });
-    assert_eq!(observed, (MANY - CLOSED, MANY - CLOSED, MANY as u64));
+    assert_eq!(
+        observed,
+        (
+            (true, 0, true),
+            (MANY - CLOSED, MANY - CLOSED, MANY as u64),
+            0
+        )
+    );
     assert_eq!(peer.finish().accepted.load(Ordering::SeqCst), MANY);
 }
 
