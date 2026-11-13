@@ -775,7 +775,7 @@ pub(crate) fn worker_admits(worker: &WorkerHandle) -> bool {
     worker.is_accepting()
 }
 
-fn admission_closed_error() -> HttpError {
+pub(crate) fn admission_closed_error() -> HttpError {
     client_error(HttpErrorCode::DROPPED, b"client session admission closed")
 }
 

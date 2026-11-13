@@ -128,10 +128,11 @@ impl PoolReservation for OwnedGetSessionResult {
 /// A pending [`OwnedHttpSessionPool`] acquisition. Its first poll runs the
 /// pool's first acquisition step in place: a selected session is reserved and
 /// returned with no allocation, no clock read for the acquisition's deadline
-/// and one worker admission check, and the reservation is recorded on its
-/// entry alone. A nonzero `idle_timeout` or `max_age` still reads the clock
-/// for the sessions' expiry, as `HttpSessionPool`'s step does. Only an
-/// acquisition that waits for a session or a dial continues in a boxed future.
+/// and one worker admission check, plus another after a drain the step runs
+/// (`DIV-046`), and the reservation is recorded on its entry alone. A nonzero
+/// `idle_timeout` or `max_age` still reads the clock for the sessions' expiry,
+/// as `HttpSessionPool`'s step does. Only an acquisition that waits for a
+/// session or a dial continues in a boxed future.
 /// While no acquisition waits, an HTTP/1.1 session whose slot is returning is
 /// taken at once (`DIV-046`). One that finds no session to take, below
 /// `max_connections`, waits for such a session, if no other acquisition waits
@@ -251,6 +252,11 @@ impl OwnedHttpSessionPool {
 
     pub fn worker_id(&self) -> WorkerId {
         self.0.worker_id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_sessions_for_test(&self) {
+        self.0.expire_sessions_for_test();
     }
 
     #[cfg(test)]

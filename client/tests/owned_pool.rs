@@ -22,6 +22,7 @@ use std::pin::Pin;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -45,6 +46,7 @@ use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use roxygen_core::buf_queue::BufQueue;
 use roxygen_core::connection::TransportEndpoint;
+use roxygen_core::error::HttpError;
 use roxygen_core::error::HttpErrorCode;
 use roxygen_core::events::HttpHeaderEvent;
 use roxygen_core::fixed_source::HttpFixedSource;
@@ -60,6 +62,7 @@ use roxygen_core::source_holder::HttpSourceHolder;
 use roxygen_runtime::cancellation::CancellationSource;
 use roxygen_runtime::cancellation::CancellationToken;
 use roxygen_runtime::managed::RuntimeConfig;
+use roxygen_runtime::managed::RuntimeHandle;
 use roxygen_runtime::managed::RuntimeOwner;
 use roxygen_runtime::tokio_host::HostedWorker;
 use roxygen_runtime::tokio_host::HostedWorkerJoin;
@@ -1693,6 +1696,254 @@ fn a_waker_cannot_reserve_a_session_retired_in_the_same_pass() {
         refusals,
         vec![Some(HttpErrorCode::DROPPED); 2],
         "the waker, run while the pass drains one of its sessions, reserves neither"
+    );
+}
+
+/// A waker that, once armed, begins its runtime's quiescence inside the
+/// notification that wakes it.
+struct QuiesceOnWake {
+    runtime: RuntimeHandle,
+    armed: AtomicBool,
+    wakes: AtomicUsize,
+}
+
+impl Wake for QuiesceOnWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+        if self.armed.swap(false, Ordering::SeqCst) {
+            drop(self.runtime.quiesce(TIMEOUT));
+        }
+    }
+}
+
+/// The drain, inside an acquisition's step, whose waiter wake begins the
+/// worker's quiescence.
+#[derive(Clone, Copy, Debug)]
+enum QuiescingDrain {
+    /// An aged session's, before the step reserves the session it selected.
+    MaxAge,
+    /// An idle-expired session's, after the step reserves the session it selected.
+    IdleExpiry,
+}
+
+/// Reserves two HTTP/1.1 sessions with acquisitions waiting behind them,
+/// releases both so that one acquisition still waits, and makes the first due
+/// for retirement through `drain`. A new acquisition then selects the second
+/// while the first's drain wakes the last waiter, whose waker begins the
+/// worker's quiescence. Returns the new acquisition's error.
+fn quiescing_drain_scenario(drain: QuiescingDrain) -> Result<(), Option<HttpErrorCode>> {
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let mut owner = RuntimeOwner::start(RuntimeConfig {
+        workers: 1,
+        command_capacity: 4,
+    })
+    .expect("owner starts");
+    let runtime = owner.handle();
+    let wake = Arc::new(QuiesceOnWake {
+        runtime: runtime.clone(),
+        armed: AtomicBool::new(false),
+        wakes: AtomicUsize::new(0),
+    });
+    let worker = runtime.worker(0).expect("worker exists");
+    let outcome = wait(
+        worker
+            .call_local(move |context| async move {
+                let (params, waiters) = match drain {
+                    QuiescingDrain::MaxAge => (params(2), 3),
+                    QuiescingDrain::IdleExpiry => (
+                        idle_params(
+                            2,
+                            SessionReuseOrder::MostRecentlyUsed,
+                            Duration::from_secs(90),
+                            IdleSweep::AtExpiry,
+                        ),
+                        4,
+                    ),
+                };
+                let pool = pool_with(&context, address, CodecProtocol::Http11, params, untimed());
+                let first = acquire(&pool).await;
+                if let QuiescingDrain::MaxAge = drain {
+                    pool.expire_sessions_for_test();
+                }
+                let second = acquire(&pool).await;
+                let waker = Waker::from(Arc::clone(&wake));
+                let mut waiting = Context::from_waker(&waker);
+                let mut acquisitions: Vec<_> = (0..waiters)
+                    .map(|_| pool.get_session_with_reservation(CancellationToken::never()))
+                    .collect();
+                for acquisition in &mut acquisitions {
+                    assert!(
+                        Pin::new(acquisition).poll(&mut waiting).is_pending(),
+                        "both sessions are reserved"
+                    );
+                }
+                drop(first.reservation);
+                if let QuiescingDrain::IdleExpiry = drain {
+                    settle(&first.session).await;
+                }
+                drop(second.reservation);
+                if let QuiescingDrain::IdleExpiry = drain {
+                    pool.age_idle_session_for_test(&first.session, Duration::from_secs(180));
+                }
+                assert_eq!(
+                    wake.wakes.load(Ordering::SeqCst),
+                    waiters - 1,
+                    "one acquisition still waits"
+                );
+                wake.armed.store(true, Ordering::SeqCst);
+                let mut acquisition = pool.get_session_with_reservation(CancellationToken::never());
+                let outcome = match Pin::new(&mut acquisition).poll(&mut waiting) {
+                    Poll::Ready(Ok(_)) => Ok(()),
+                    Poll::Ready(Err(PoolError::ReservationFailed { source })) => {
+                        Err(Some(source.code()))
+                    }
+                    Poll::Ready(Err(_)) => Err(None),
+                    Poll::Pending => panic!("the step selects the second session"),
+                };
+                assert!(
+                    first.session.is_draining(),
+                    "the step retired the first session"
+                );
+                assert_eq!(
+                    wake.wakes.load(Ordering::SeqCst),
+                    waiters,
+                    "its drain woke the last waiter"
+                );
+                assert!(
+                    !context.handle().is_accepting() && !context.is_cancelled(),
+                    "the worker quiesces without cancelling the scenario"
+                );
+                drop(acquisitions);
+                pool.drain_and_join().await.expect("the pool joins");
+                outcome
+            })
+            .expect("scenario admitted"),
+    )
+    .expect("scenario ends");
+    wait(runtime.quiesce(TIMEOUT)).expect("all scopes joined");
+    assert_eq!(owner.join().expect("physical join").workers_forced, 0);
+    outcome
+}
+
+/// An acquisition whose own step drains a session whose callbacks begin the
+/// worker's quiescence fails with `DROPPED`. After an aged session's drain,
+/// which precedes the reservation, it refuses as `ClientSession::reserve_request`
+/// does once the worker quiesces. After an idle-expired session's drain, which
+/// follows the reservation, it releases that reservation instead of returning
+/// one that the quiescing driver refuses at submit.
+#[test]
+fn an_acquisition_fails_when_its_own_drain_quiesces_the_worker() {
+    assert_eq!(
+        [QuiescingDrain::MaxAge, QuiescingDrain::IdleExpiry].map(quiescing_drain_scenario),
+        [Err(Some(HttpErrorCode::DROPPED)); 2],
+    );
+}
+
+/// Reserves an HTTP/1.1 session from an owned pool, or from an `HttpSessionPool`
+/// unless `owned`, begins the worker's quiescence and submits a request on the
+/// reservation with no yield in between. Returns the code and message that
+/// refused the request, unless its 200 response was read.
+fn submitted_after_quiescence(owned: bool) -> Result<(), (HttpErrorCode, String)> {
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let mut owner = RuntimeOwner::start(RuntimeConfig {
+        workers: 1,
+        command_capacity: 4,
+    })
+    .expect("owner starts");
+    let runtime = owner.handle();
+    let quiescing = runtime.clone();
+    let refusal = |error: HttpError| {
+        let message = String::from_utf8_lossy(error.message()).into_owned();
+        (error.code(), message)
+    };
+    let worker = runtime.worker(0).expect("worker exists");
+    let outcome = wait(
+        worker
+            .call_local(move |context| async move {
+                let (head, body) = request("/").await;
+                if owned {
+                    let pool = pool(&context, address, CodecProtocol::Http11, 1);
+                    let OwnedGetSessionResult { reservation, .. } = acquire(&pool).await;
+                    drop(quiescing.quiesce(TIMEOUT));
+                    let submission = reservation.submit(head, body, CancellationToken::never());
+                    let outcome = match submission.await {
+                        Ok(response) => {
+                            assert_eq!(read_body(response).await, b"ok");
+                            Ok(())
+                        }
+                        Err(error) => Err(refusal(error)),
+                    };
+                    pool.drain_and_join().await.expect("the pool joins");
+                    return outcome;
+                }
+                let pool = HttpSessionPool::new(
+                    context,
+                    socket_address(address),
+                    params(1),
+                    plaintext(CodecProtocol::Http11),
+                    untimed(),
+                );
+                let GetSessionResult {
+                    reservation,
+                    session,
+                } = pool
+                    .get_session_with_reservation(CancellationToken::never())
+                    .await
+                    .expect("acquisition succeeds");
+                drop(quiescing.quiesce(TIMEOUT));
+                let mut response = session
+                    .send_reserved_request_with_headers(
+                        head,
+                        body,
+                        reservation,
+                        CancellationToken::never(),
+                    )
+                    .map_err(refusal)?;
+                let head = response.source.read_header_event().await.map_err(refusal)?;
+                assert_eq!(head.headers().response_status(), Some(200));
+                let mut eom = head.eom();
+                while !eom {
+                    eom = response
+                        .source
+                        .read_body_event(u32::MAX)
+                        .await
+                        .map_err(refusal)?
+                        .eom();
+                }
+                Ok(())
+            })
+            .expect("scenario admitted"),
+    )
+    .expect("scenario ends");
+    wait(runtime.quiesce(TIMEOUT)).expect("all scopes joined");
+    assert_eq!(owner.join().expect("physical join").workers_forced, 0);
+    outcome
+}
+
+/// A request reserved before the worker begins its quiescence and submitted at
+/// once after it is served by an `HttpSessionPool`'s `ClientSession`, whose run
+/// has not observed the quiescence yet, and refused `REFUSED_STREAM` by an owned
+/// session, whose run drains before its driver commits the submission
+/// (`DIV-046`). The acquisition step's admission recheck after an idle-expired
+/// drain rests on that refusal: if owned sessions ever commit reservations taken
+/// before quiescence, this test fails, and that recheck should be revisited.
+#[test]
+fn a_request_reserved_before_quiescence_is_served_only_by_the_uniplex_pool() {
+    assert_eq!(
+        [false, true].map(submitted_after_quiescence),
+        [
+            Ok(()),
+            Err((
+                HttpErrorCode::REFUSED_STREAM,
+                "owned upstream connection is draining".to_owned(),
+            )),
+        ],
     );
 }
 

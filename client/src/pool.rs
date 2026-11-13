@@ -62,6 +62,7 @@ use crate::connector::SessionParams;
 use crate::experimental::owned::OwnedClientSession;
 use crate::experimental::owned::OwnedPoolStats;
 use crate::experimental::owned::OwnedSessionSelection;
+use crate::experimental::owned::admission_closed_error;
 use crate::experimental::owned::worker_admits;
 use crate::pool::session_list::Class;
 use crate::pool::session_list::Linked;
@@ -1906,8 +1907,9 @@ impl PoolState {
     }
 
     /// Whether the pool's sessions may take an acquisition: an owned pool checks
-    /// its worker's admission here, once per acquisition step, for all of its
-    /// sessions (`DIV-046`), where a `ClientSession` checks its own.
+    /// its worker's admission here, once per acquisition step and again after a
+    /// drain the step runs, for all of its sessions (`DIV-046`), where a
+    /// `ClientSession` checks its own.
     fn admits_reservations(&self) -> bool {
         !matches!(self.backend, PoolBackend::Owned { .. }) || worker_admits(self.context.handle())
     }
@@ -2551,10 +2553,12 @@ struct ConnectionAttempt {
 
 enum AcquireStep {
     /// `retired`: idle-expired sessions to drain once `session` is reserved, so
-    /// that no callback their drain runs can reserve `session` first.
+    /// that no callback their drain runs can reserve `session` first. `drained`:
+    /// the step drained aged sessions after its worker admission check.
     Session {
         session: PooledSession,
         retired: RetiredSessions,
+        drained: bool,
     },
     StartAndWait {
         attempt: ConnectionAttempt,
@@ -3606,10 +3610,24 @@ fn acquisition_step<Reservation: PoolReservation>(
     woken: bool,
 ) -> Result<Stepped<Reservation>, PoolError> {
     Ok(match next_step(state, started, woken)? {
-        AcquireStep::Session { session, retired } => {
-            let reservation = Reservation::reserve(state, session);
+        AcquireStep::Session {
+            session,
+            retired,
+            drained,
+        } => {
+            let reservation = if drained {
+                recheck_admission(state).and_then(|()| Reservation::reserve(state, session))
+            } else {
+                Reservation::reserve(state, session)
+            };
+            let retiring = !retired.is_empty();
             retired.drain_propagating_panics();
-            Stepped::Reserved(reservation?)
+            let reservation = reservation?;
+            if retiring && let Err(error) = recheck_admission(state) {
+                drop(reservation);
+                return Err(error);
+            }
+            Stepped::Reserved(reservation)
         }
         AcquireStep::StartAndWait {
             attempt,
@@ -3634,6 +3652,20 @@ fn acquisition_step<Reservation: PoolReservation>(
             wait_timeout,
         }),
     })
+}
+
+/// Fails the step with `DROPPED` once a drain it ran after its worker admission
+/// check (`DIV-046`) began the worker's quiescence: before the step reserves,
+/// as `reserve_request` would then refuse, or after it, since the owned driver
+/// would refuse the step's reservation at submit.
+fn recheck_admission(state: &Rc<RefCell<PoolState>>) -> Result<(), PoolError> {
+    if state.borrow().admits_reservations() {
+        Ok(())
+    } else {
+        Err(PoolError::ReservationFailed {
+            source: admission_closed_error(),
+        })
+    }
 }
 
 /// Waits, then steps again, until a step reserves a session or fails.
@@ -4011,6 +4043,7 @@ fn next_step(
             AcquireStep::Session {
                 session,
                 retired: RetiredSessions::default(),
+                drained: false,
             }
         } else {
             let wait_timeout = pool
@@ -4135,6 +4168,7 @@ fn next_step(
         Ok(AcquireStep::Session { session, .. }) => Ok(AcquireStep::Session {
             session,
             retired: idle_expired,
+            drained: !expired.is_empty(),
         }),
         step => {
             expired.append(&mut idle_expired);
