@@ -28,3 +28,7 @@ mod owned_client_tests;
 #[cfg(test)]
 #[path = "../tests/owned_pool.rs"]
 mod owned_pool_tests;
+
+#[cfg(test)]
+#[path = "../tests/owned_h1_egress.rs"]
+mod owned_h1_egress_tests;

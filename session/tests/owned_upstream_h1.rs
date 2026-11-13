@@ -6523,11 +6523,14 @@ enum SubmitKind {
     Plain,
     ResponseInterest,
     Exclusive,
+    /// On a session run with `run_pull_through` (`DIV-047`).
+    PullThrough,
 }
 
 enum Submitted {
     Plain(crate::owned_h1::OwnedH1UpstreamSubmission),
     Exclusive(crate::owned_h1::OwnedH1ExclusiveSubmission),
+    PullThrough(crate::owned_h1::OwnedH1PullThroughSubmission),
 }
 
 impl Submitted {
@@ -6545,6 +6548,9 @@ impl Submitted {
             SubmitKind::Exclusive => {
                 Self::Exclusive(reservation.submit_exclusive(head, body, token))
             }
+            SubmitKind::PullThrough => {
+                Self::PullThrough(reservation.submit_pull_through(head, body, token))
+            }
         }
     }
 
@@ -6556,6 +6562,10 @@ impl Submitted {
                 RequestProgress::of(error, submission)
             }
             Self::Exclusive(submission) => {
+                let error = (&mut *submission).await.err().map(|error| error.code());
+                RequestProgress::of(error, submission)
+            }
+            Self::PullThrough(submission) => {
                 let error = (&mut *submission).await.err().map(|error| error.code());
                 RequestProgress::of(error, submission)
             }
@@ -6588,7 +6598,8 @@ struct StaleOutcome {
 }
 
 /// A `GET /` answered with `OK_RESPONSE` on a keep-alive connection, then a second `GET /`
-/// submitted as `kind` around the origin's FIN, as `fin` orders them.
+/// submitted as `kind` around the origin's FIN, as `fin` orders them. A pull-through kind runs
+/// the session with `run_pull_through`.
 fn owned_stale_outcome(fin: StaleFin, kind: SubmitKind) -> StaleOutcome {
     run_on_host(move |context| {
         Box::pin(async move {
@@ -6602,46 +6613,52 @@ fn owned_stale_outcome(fin: StaleFin, kind: SubmitKind) -> StaleOutcome {
                 OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
             let log = Rc::new(AdmissionLog::default());
             handle.set_observer(log.clone()).unwrap();
-            let (run, (first, second, written_after_first)) =
-                futures::join!(session.run(), async {
-                    let (_stream, mut source, control) = handle
-                        .reserve_request()
-                        .unwrap()
-                        .submit(
-                            get_head(),
-                            HttpSourceHolder::empty(),
-                            CancellationToken::never(),
-                        )
-                        .await
-                        .unwrap()
-                        .into_source_parts();
-                    first_ready.notify_one();
-                    assert_eq!(read_response(&mut source).await.body, b"ok");
-                    drop(source);
-                    yield_until(|| handle.is_idle()).await;
-                    assert_eq!(handle.available_capacity(), 1, "the connection is reused");
-                    let first = RequestProgress::of(None, &control);
-                    let written = state.borrow().writes.concat().len();
-                    let reservation = handle.reserve_request().unwrap();
-                    match fin {
-                        StaleFin::BeforeSubmission => {
-                            fin_ready.notify_one();
-                            yield_until(|| {
-                                log.0.borrow().iter().any(|note| note == "admission_closed")
-                            })
-                            .await;
-                        }
-                        StaleFin::ReadableThenSubmitted => fin_ready.notify_one(),
-                        StaleFin::SubmittedThenReadable => {}
-                    }
-                    let mut submitted = Submitted::new(kind, reservation);
-                    if matches!(fin, StaleFin::SubmittedThenReadable) {
+            let run: Pin<
+                Box<dyn Future<Output = Result<crate::uniplex::UniplexRunSummary, HttpError>>>,
+            > = if matches!(kind, SubmitKind::PullThrough) {
+                Box::pin(session.run_pull_through())
+            } else {
+                Box::pin(session.run())
+            };
+            let (run, (first, second, written_after_first)) = futures::join!(run, async {
+                let (_stream, mut source, control) = handle
+                    .reserve_request()
+                    .unwrap()
+                    .submit(
+                        get_head(),
+                        HttpSourceHolder::empty(),
+                        CancellationToken::never(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_source_parts();
+                first_ready.notify_one();
+                assert_eq!(read_response(&mut source).await.body, b"ok");
+                drop(source);
+                yield_until(|| handle.is_idle()).await;
+                assert_eq!(handle.available_capacity(), 1, "the connection is reused");
+                let first = RequestProgress::of(None, &control);
+                let written = state.borrow().writes.concat().len();
+                let reservation = handle.reserve_request().unwrap();
+                match fin {
+                    StaleFin::BeforeSubmission => {
                         fin_ready.notify_one();
+                        yield_until(|| {
+                            log.0.borrow().iter().any(|note| note == "admission_closed")
+                        })
+                        .await;
                     }
-                    let second = submitted.progress().await;
-                    let written_after_first = state.borrow().writes.concat()[written..].to_vec();
-                    (first, second, written_after_first)
-                });
+                    StaleFin::ReadableThenSubmitted => fin_ready.notify_one(),
+                    StaleFin::SubmittedThenReadable => {}
+                }
+                let mut submitted = Submitted::new(kind, reservation);
+                if matches!(fin, StaleFin::SubmittedThenReadable) {
+                    fin_ready.notify_one();
+                }
+                let second = submitted.progress().await;
+                let written_after_first = state.borrow().writes.concat()[written..].to_vec();
+                (first, second, written_after_first)
+            });
             let close = state.borrow().close;
             StaleOutcome {
                 first,
@@ -6665,6 +6682,7 @@ fn a_stale_reused_connection_rejects_its_next_request_unprocessed_in_every_sched
             SubmitKind::Plain,
             SubmitKind::ResponseInterest,
             SubmitKind::Exclusive,
+            SubmitKind::PullThrough,
         ] {
             assert_eq!(
                 owned_stale_outcome(fin, kind),
@@ -7334,6 +7352,7 @@ fn a_read_error_received_before_commit_refuses_the_request_unprocessed() {
             SubmitKind::Plain,
             SubmitKind::ResponseInterest,
             SubmitKind::Exclusive,
+            SubmitKind::PullThrough,
         ] {
             let outcome = run_on_host(move |context| {
                 Box::pin(async move {
@@ -7344,7 +7363,18 @@ fn a_read_error_received_before_commit_refuses_the_request_unprocessed() {
                     )]);
                     let (session, handle) =
                         OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
-                    let (run, progress) = futures::join!(session.run(), async {
+                    let run: Pin<
+                        Box<
+                            dyn Future<
+                                Output = Result<crate::uniplex::UniplexRunSummary, HttpError>,
+                            >,
+                        >,
+                    > = if matches!(kind, SubmitKind::PullThrough) {
+                        Box::pin(session.run_pull_through())
+                    } else {
+                        Box::pin(session.run())
+                    };
+                    let (run, progress) = futures::join!(run, async {
                         let reservation = handle.reserve_request().unwrap();
                         match failure {
                             ReadFailure::BeforeSubmission => {

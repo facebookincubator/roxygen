@@ -325,4 +325,9 @@ impl OwnedHttpSessionPool {
     pub(crate) fn pool_task_spawns_for_test(&self) -> u64 {
         self.0.pool_task_spawns_for_test()
     }
+
+    #[cfg(test)]
+    pub(crate) fn idle_retirement_retiring_passes_for_test(&self) -> u64 {
+        self.0.idle_retirement_retiring_passes_for_test()
+    }
 }
