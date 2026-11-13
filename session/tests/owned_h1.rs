@@ -190,6 +190,53 @@ impl Drop for ResumeAfterWake {
     }
 }
 
+/// A suspension the test releases from outside the driver, and what the driver did with it.
+#[derive(Default)]
+struct ResumeProbe {
+    /// The status the resume returns once set; it pends until then.
+    status: Cell<Option<ResumeStatus>>,
+    /// The waker of the resume's last pending poll.
+    waker: RefCell<Option<Waker>>,
+    polls: Cell<usize>,
+    drops: Cell<usize>,
+    /// Cancels the session from the named callback: `resume_poll` or `resume_drop`.
+    cancel_in: CancelIn,
+}
+
+impl ResumeProbe {
+    /// Resumes the suspension with `status`, waking its pending poll.
+    fn release(&self, status: ResumeStatus) {
+        self.status.set(Some(status));
+        self.waker.borrow_mut().take().unwrap().wake();
+    }
+}
+
+/// The resume of a suspension that `ResumeProbe` releases.
+struct BodyResume(Rc<ResumeProbe>);
+
+impl Future for BodyResume {
+    type Output = ResumeStatus;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<ResumeStatus> {
+        self.0.polls.set(self.0.polls.get() + 1);
+        cancel_from(&self.0.cancel_in, "resume_poll");
+        match self.0.status.get() {
+            Some(status) => Poll::Ready(status),
+            None => {
+                *self.0.waker.borrow_mut() = Some(context.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl Drop for BodyResume {
+    fn drop(&mut self) {
+        self.0.drops.set(self.0.drops.get() + 1);
+        cancel_from(&self.0.cancel_in, "resume_drop");
+    }
+}
+
 /// What the application of one exchange observed.
 #[derive(Default)]
 struct H1Probe {
@@ -271,6 +318,8 @@ struct H1App {
     stop_request: Option<(HttpErrorCode, StopAt)>,
     /// Where each exchange keeps its request body for `StopAt::Script`.
     script_held: Rc<RefCell<Option<HttpSourceHolder>>>,
+    /// Each response body starts with a suspension that this probe releases.
+    response_resume: Option<Rc<ResumeProbe>>,
 }
 
 /// Where an exchange with `H1App::stop_request` stops its request body.
@@ -447,6 +496,7 @@ impl H1App {
                 panic_in: None,
                 stop_request: None,
                 script_held: Rc::default(),
+                response_resume: None,
             },
             probes,
         )
@@ -488,6 +538,11 @@ impl OwnedApplication for H1App {
         self.probes.borrow_mut().push(Rc::clone(&probe));
         let response = &self.responses[ordinal.min(self.responses.len() - 1)];
         let (mut header, mut body) = response.events();
+        if let Some(resume) = &self.response_resume {
+            body.push_front(HttpBodyEvent::suspend(Box::pin(BodyResume(Rc::clone(
+                resume,
+            )))));
+        }
         if self.instrument {
             let encoded = Rc::clone(&probe);
             let cancel_in = Rc::clone(&self.cancel_in);
@@ -1696,6 +1751,135 @@ fn a_suspended_response_body_is_read_after_it_resumes_as_uniplex() {
             assert_eq!(owned.close, uniplex.close, "{case}");
             assert_eq!(uniplex.error, None, "{case}");
         }
+    }
+}
+
+/// Serves one `Connection: close` GET whose response body starts with a `ResumeProbe`
+/// suspension. Once the driver has polled the resume and flushed the head, the test resumes it
+/// with `status`, or with `None` cancels the session from outside the driver. With
+/// `cancel_callback`, the resume is ready at once and the session is cancelled from that
+/// callback of it instead. Returns the wire, the exchange's observations and the resume's drops.
+fn suspended_response(
+    status: Option<ResumeStatus>,
+    cancel_callback: Option<&'static str>,
+) -> (Wire, Observed, usize) {
+    run_on_host(move |context| {
+        Box::pin(async move {
+            let (transport, state) = ScriptedTransport::new([ReadAction::Data(
+                b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n".to_vec(),
+            )]);
+            let resume = Rc::new(ResumeProbe::default());
+            let (mut application, probes) = H1App::new(vec![Response::fixed(200, b"hello")]);
+            application.response_resume = Some(Rc::clone(&resume));
+            let (session, handle) =
+                OwnedH1Session::new(application, owned_options(context.clone(), transport))
+                    .unwrap();
+            if let Some(callback) = cancel_callback {
+                resume.status.set(Some(ResumeStatus::Signalled));
+                *resume.cancel_in.borrow_mut() = Some((callback, handle.clone()));
+            }
+            let release = async {
+                if cancel_callback.is_some() {
+                    return;
+                }
+                while resume.polls.get() == 0 {
+                    assert!(
+                        probes
+                            .borrow()
+                            .iter()
+                            .all(|probe| probe.cancelled.borrow().is_empty()),
+                        "a suspended response must not fail before arming its resume"
+                    );
+                    context.host().yield_to_io().await;
+                }
+                assert_eq!(resume.drops.get(), 0, "a pending resume is kept");
+                assert_eq!(probes.borrow()[0].response_complete.get(), 0);
+                assert!(
+                    state.borrow().writes.concat().ends_with(b"\r\n\r\n"),
+                    "the head is written while the body is suspended"
+                );
+                match status {
+                    Some(status) => resume.release(status),
+                    None => handle.cancel(),
+                }
+            };
+            let (result, ()) = futures::join!(session.run(), release);
+            let observed = probes.borrow()[0].observed();
+            (wire_of(&state, result), observed, resume.drops.get())
+        })
+    })
+}
+
+/// A response body suspended until a wake from outside the driver is read again once it
+/// resumes, with any status, as Uniplex reads it: the wire matches an unsuspended response, and
+/// the resume is dropped once.
+#[test]
+fn owned_h1_resumes_a_suspended_body_without_changing_the_wire() {
+    let expected = uniplex_wire(
+        vec![ReadAction::Data(
+            b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n".to_vec(),
+        )],
+        vec![Response::fixed(200, b"hello")],
+    );
+    for status in [
+        ResumeStatus::Signalled,
+        ResumeStatus::TimedOut,
+        ResumeStatus::NotReady,
+        ResumeStatus::Cancelled,
+    ] {
+        let (wire, probe, resume_drops) = suspended_response(Some(status), None);
+        assert_eq!(wire.error, None, "{status:?}");
+        assert_eq!(wire.output, expected.output, "{status:?}");
+        assert_eq!(wire.close, expected.close, "{status:?}");
+        assert_eq!(probe.response_complete, 1, "{status:?}");
+        assert_eq!(probe.completed, 1, "{status:?}");
+        assert_eq!(probe.dropped, 1, "{status:?}");
+        assert!(probe.cancelled.is_empty(), "{status:?}");
+        assert_eq!(resume_drops, 1, "{status:?}");
+    }
+}
+
+/// A session cancelled while its response body is suspended resets the connection after the
+/// head, cancels the exchange once and drops the pending resume once.
+#[test]
+fn owned_h1_cancellation_retires_a_suspended_body_once() {
+    let (wire, probe, resume_drops) = suspended_response(None, None);
+    assert_eq!(wire.error, Some(HttpErrorCode::CORO_CANCELLED));
+    assert_eq!(wire.close, CloseKind::Reset);
+    assert!(
+        wire.output.ends_with(b"\r\n\r\n"),
+        "only the head is written"
+    );
+    assert_eq!(probe.response_complete, 0);
+    assert_eq!(probe.completed, 0);
+    assert_eq!(probe.dropped, 1);
+    assert_eq!(probe.cancelled, [(HttpErrorCode::CORO_CANCELLED, false)]);
+    assert_eq!(resume_drops, 1);
+}
+
+/// A cancel from the resume future's poll or drop stops the response before its body is sent,
+/// as a cancel from any other exchange callback does. The reset comes before any flush, so the
+/// wire is empty either way; `response_complete` shows that the body was never serialized.
+#[test]
+fn owned_h1_resume_callbacks_cannot_send_after_cancelling() {
+    for callback in ["resume_poll", "resume_drop"] {
+        let (wire, probe, resume_drops) = suspended_response(None, Some(callback));
+        assert_eq!(
+            wire.error,
+            Some(HttpErrorCode::CORO_CANCELLED),
+            "{callback}"
+        );
+        assert_eq!(wire.close, CloseKind::Reset, "{callback}");
+        assert!(wire.output.is_empty(), "{callback}");
+        assert_eq!(probe.response_complete, 0, "{callback}");
+        assert_eq!(probe.completed, 0, "{callback}");
+        assert_eq!(probe.dropped, 1, "{callback}");
+        assert_eq!(
+            probe.cancelled,
+            [(HttpErrorCode::CORO_CANCELLED, false)],
+            "{callback}"
+        );
+        assert_eq!(resume_drops, 1, "{callback}");
     }
 }
 

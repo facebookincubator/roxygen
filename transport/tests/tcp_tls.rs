@@ -9871,6 +9871,75 @@ mod tcp_tls {
             replacement_during_reader_drop(true);
         }
 
+        /// A read that observes its reader's cancellation in a poll cancels its socket read,
+        /// whose `reader_waker` release starts a second reader's read and panics. The first
+        /// reader keeps its unfinished operation; dropping it afterwards leaves the
+        /// replacement read registered, and the replacement reads the next bytes.
+        #[test]
+        fn dropping_a_reader_after_cancellation_poll_panics_preserves_its_replacement() {
+            with_accepted_tcp(limits(), |context, transport, mut peer| async move {
+                let source = CancellationSource::new();
+                let mut first = transport
+                    .reader(&context, Duration::ZERO, source.token())
+                    .unwrap()
+                    .unwrap();
+                peer.write_all(b"seed").await.unwrap();
+                first.start_read(64, 64).unwrap();
+                let read = poll_fn(|context| first.poll_read(context)).await.unwrap();
+                assert_eq!(read_bytes(read), b"seed");
+
+                let second = Rc::new(RefCell::new(
+                    transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap(),
+                ));
+                let started = Rc::new(Cell::new(false));
+                first.start_read(64, 64).unwrap();
+                source.request_cancellation();
+                let waker = reader_waker();
+                ON_READER_WAKER_DROP.with(|slot| {
+                    let second = Rc::clone(&second);
+                    let started = Rc::clone(&started);
+                    assert!(
+                        slot.replace(Some(Box::new(move || {
+                            second.borrow_mut().start_read(64, 64).unwrap();
+                            started.set(true);
+                            panic!("replacement admitted during cancellation poll");
+                        })))
+                        .is_none()
+                    );
+                });
+                let result = {
+                    let mut reading = std::pin::pin!(coop::unconstrained(poll_fn(|context| {
+                        first.poll_read(context)
+                    })));
+                    catch_unwind(AssertUnwindSafe(|| {
+                        reading.as_mut().poll(&mut Context::from_waker(&waker))
+                    }))
+                };
+                let panic = result.expect_err("the cancellation callback panics");
+                assert_eq!(
+                    panic.downcast_ref::<&'static str>(),
+                    Some(&"replacement admitted during cancellation poll")
+                );
+                assert!(started.get());
+                assert!(transport.has_pending_read(&context).unwrap());
+                drop(first);
+                assert!(
+                    transport.has_pending_read(&context).unwrap(),
+                    "the old operation's cleanup leaves the replacement read"
+                );
+                peer.write_all(b"replacement").await.unwrap();
+                let read = poll_fn(|context| second.borrow_mut().poll_read(context))
+                    .await
+                    .unwrap();
+                assert_eq!(read_bytes(read), b"replacement");
+                assert!(!transport.has_pending_read(&context).unwrap());
+                transport.close(&context).unwrap();
+            });
+        }
+
         /// `DIV-016` through a reader: the bytes queued before a TCP reset come first although
         /// the read's continuation poll met the reset, the next read reports the reset once,
         /// and the one after is EOF.
