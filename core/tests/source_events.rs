@@ -24,6 +24,7 @@ use crate::events::HttpBodyEventKind;
 use crate::events::HttpBodyEventType;
 use crate::events::HttpHeaderEvent;
 use crate::events::ResumeStatus;
+use crate::events::take_registration_drops_for_test;
 use crate::headers::HttpHeaders;
 use crate::http::HttpHeaderSize;
 use crate::ids::StreamId;
@@ -591,6 +592,57 @@ mod events {
         assert!(trailer_event.eom());
         drop(trailer_event);
         assert_eq!(callback.0.get(), 1);
+    }
+
+    #[test]
+    fn into_kind_drops_only_registration_storage_the_event_still_owns() {
+        let callback = Rc::new(CancellationCounter::default());
+        let registration = || {
+            HttpByteEventRegistration::new(
+                Some(StreamId::new(1)),
+                crate::byte_event::ByteEventType::TransportWrite.bit(),
+                &callback,
+            )
+        };
+        take_registration_drops_for_test();
+
+        // Without registrations, consuming the event skips the registration drop.
+        assert!(matches!(
+            body(b"a", false).into_kind(),
+            HttpBodyEventKind::Body(_)
+        ));
+        assert_eq!(take_registration_drops_for_test(), 0);
+
+        // Taken registrations leave nothing behind, and the taker still owns them.
+        let mut taken = body(b"b", false);
+        taken.byte_event_registrations_mut().push(registration());
+        let kept = taken.take_byte_event_registrations();
+        assert!(matches!(taken.into_kind(), HttpBodyEventKind::Body(_)));
+        assert_eq!(take_registration_drops_for_test(), 0);
+        assert_eq!(callback.0.get(), 0, "taken registrations stay pending");
+
+        // Owned registrations are cancelled once when the event is consumed.
+        let mut owned = body(b"c", true);
+        owned.byte_event_registrations_mut().push(registration());
+        assert!(matches!(owned.into_kind(), HttpBodyEventKind::Body(_)));
+        assert_eq!(take_registration_drops_for_test(), 1);
+        assert_eq!(callback.0.get(), 1);
+
+        // Emptied storage that kept its capacity is still freed.
+        let mut emptied = body(b"d", false);
+        emptied.byte_event_registrations_mut().push(registration());
+        drop(emptied.byte_event_registrations_mut().pop());
+        assert_eq!(callback.0.get(), 2);
+        assert!(matches!(emptied.into_kind(), HttpBodyEventKind::Body(_)));
+        assert_eq!(take_registration_drops_for_test(), 1);
+        assert_eq!(
+            callback.0.get(),
+            2,
+            "an emptied vector cancels nothing more"
+        );
+
+        drop(kept);
+        assert_eq!(callback.0.get(), 3);
     }
 }
 

@@ -267,7 +267,18 @@ impl HttpBodyEvent {
     }
 
     pub fn into_kind(self) -> HttpBodyEventKind {
-        self.kind
+        let Self {
+            kind,
+            byte_event_registrations,
+            ..
+        } = self;
+        if byte_event_registrations.capacity() == 0 {
+            // Without capacity the vector owns no allocation and no registrations.
+            std::mem::forget(byte_event_registrations);
+        } else {
+            drop_byte_event_registrations(byte_event_registrations);
+        }
+        kind
     }
 
     pub fn as_body(&self) -> Option<&BufQueue> {
@@ -295,6 +306,24 @@ impl HttpBodyEvent {
     pub fn take_byte_event_registrations(&mut self) -> Vec<HttpByteEventRegistration> {
         std::mem::take(&mut self.byte_event_registrations)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static REGISTRATION_DROPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_registration_drops_for_test() -> u64 {
+    REGISTRATION_DROPS.with(|drops| drops.replace(0))
+}
+
+#[cold]
+#[inline(never)]
+fn drop_byte_event_registrations(registrations: Vec<HttpByteEventRegistration>) {
+    #[cfg(test)]
+    REGISTRATION_DROPS.with(|drops| drops.set(drops.get() + 1));
+    drop(registrations);
 }
 
 /// Returns the mutable body buffer when `event` is a body event.
