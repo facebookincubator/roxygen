@@ -1,0 +1,25 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: MIT
+
+//! Native Rust output of the upstream llhttp grammar, plus its HTTP helpers.
+//!
+//! `generated` is emitted from llhttp 9.4.4 by the separate
+//! `roxygen-llhttp-tooling` generator. `runtime` ports `src/native/http.c` and
+//! the lifecycle and callback conventions in `src/native/api.c` from the same
+//! revision. See `llhttp/README.md` for provenance and regeneration.
+
+#[path = "llhttp/generated.rs"]
+mod generated;
+#[path = "llhttp/runtime.rs"]
+mod runtime;
+
+pub(crate) use generated::Error;
+pub(crate) use generated::Event;
+pub(crate) use generated::ParserType;
+pub(crate) use generated::flags;
+pub(crate) use generated::lenient_flags;
+pub(crate) use runtime::Parser;
+
+#[cfg(test)]
+#[path = "llhttp/tests.rs"]
+mod tests;
