@@ -271,6 +271,17 @@ impl Drop for Origin {
     }
 }
 
+/// A socket bound to `address` that never listens: while it lives, a dial to its port is
+/// refused and no other test's `127.0.0.1:0` listener can take the port. `reuse_address` lets
+/// it take over a port that an accepted connection still holds, but also lets another
+/// address-reusing socket bind that port by number.
+fn reserve(address: SocketAddr, reuse_address: bool) -> tokio::net::TcpSocket {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket.set_reuseaddr(reuse_address).expect("address reuse");
+    socket.bind(address).expect("the port is reserved");
+    socket
+}
+
 /// An owned pool to `address` with `params`, a 5 s connect timeout unless
 /// `params` sets another, no maximum age unless `params` sets one, and
 /// `session`'s parameters.
@@ -2941,7 +2952,8 @@ fn a_cancelled_acquisition_releases_the_returning_session_it_waited_for() {
 /// connection until the client closes it.
 struct OneConnectionOrigin {
     address: SocketAddr,
-    thread: Option<std::thread::JoinHandle<()>>,
+    /// Returns the port's reservation, which the handle keeps until the origin is dropped.
+    thread: Option<std::thread::JoinHandle<tokio::net::TcpSocket>>,
 }
 
 impl OneConnectionOrigin {
@@ -2951,11 +2963,12 @@ impl OneConnectionOrigin {
         let thread = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("origin accepts");
             drop(listener);
+            let reserved = reserve(address, true);
             let mut pending = Vec::new();
             let mut buffer = [0; 4096];
             loop {
                 let read = match std::io::Read::read(&mut stream, &mut buffer) {
-                    Ok(0) | Err(_) => return,
+                    Ok(0) | Err(_) => return reserved,
                     Ok(read) => read,
                 };
                 pending.extend_from_slice(&buffer[..read]);
@@ -2963,7 +2976,7 @@ impl OneConnectionOrigin {
                     pending.drain(..end + 4);
                     let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
                     if std::io::Write::write_all(&mut stream, response).is_err() {
-                        return;
+                        return reserved;
                     }
                 }
             }
@@ -5247,10 +5260,8 @@ fn stats_count_the_sessions_a_pool_opens_and_closes() {
 /// A dial refused three times, its attempts all retried for the one waiter.
 #[test]
 fn stats_count_connect_attempts_and_failures() {
-    let address = {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
-        listener.local_addr().expect("address")
-    };
+    let reserved = reserve(SocketAddr::from(([127, 0, 0, 1], 0)), false);
+    let address = reserved.local_addr().expect("address");
     let (error, stats) = run_on_worker(move |context| async move {
         let pool = pool_with(
             &context,

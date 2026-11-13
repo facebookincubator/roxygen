@@ -1429,9 +1429,13 @@ mod tests {
 
     #[test]
     fn resolution_and_connection_failures_use_curl_exit_codes() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback should bind");
-        let unused = listener.local_addr().expect("listener has an address");
-        drop(listener);
+        // Bound with no listener while the test runs, so no other test's listener can take
+        // the port and accept the connection.
+        let reserved = tokio::net::TcpSocket::new_v4().expect("socket should open");
+        reserved
+            .bind("127.0.0.1:0".parse().expect("address should parse"))
+            .expect("loopback should bind");
+        let unused = reserved.local_addr().expect("socket has an address");
         let (connect_code, _, _) = run(&[
             "-q".to_owned(),
             "-sS".to_owned(),
