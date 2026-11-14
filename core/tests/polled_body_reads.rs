@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
+use std::panic::panic_any;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -44,6 +45,7 @@ struct ScriptedSource {
     log: Rc<Log>,
     polls_body_events: bool,
     script: VecDeque<Poll<Result<HttpBodyEvent, HttpError>>>,
+    exhausted_panic: Option<&'static str>,
 }
 
 impl ScriptedSource {
@@ -56,10 +58,23 @@ impl ScriptedSource {
             log: Rc::clone(log),
             polls_body_events,
             script: script.into_iter().collect(),
+            exhausted_panic: None,
         })
     }
 
+    /// Makes the call after the last scripted result panic with `message`.
+    #[cfg(panic = "unwind")]
+    fn panicking_when_exhausted(mut self: Box<Self>, message: &'static str) -> Box<Self> {
+        self.exhausted_panic = Some(message);
+        self
+    }
+
     fn next(&mut self) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        if self.script.is_empty()
+            && let Some(message) = self.exhausted_panic
+        {
+            panic_any(message);
+        }
         self.script.pop_front().expect("a scripted body result")
     }
 }
@@ -1351,4 +1366,116 @@ fn an_exclusive_poll_keeps_the_forwarded_poll_guarantees_otherwise() {
         "and is woken when the generation goes away"
     );
     assert!(!probe());
+}
+
+/// `DIV-056`: an in-place read whose source poll panics consumes the
+/// generation as an error does: the source is dropped without `stop_reading`,
+/// then the task its earlier `Pending` poll registered, outside the holder's
+/// borrow, and the panic continues.
+#[cfg(panic = "unwind")]
+#[test]
+fn a_panicking_in_place_read_retires_its_source_without_stop_reading() {
+    let log = Rc::new(Log::default());
+    let mut holder = HttpSourceHolder::new(
+        ScriptedSource::new(&log, true, [Poll::Pending]).panicking_when_exhausted("in-place poll"),
+    );
+    let probe = holder.readable_probe();
+    let observation = Rc::new(Cell::new(None));
+    let on_drop_observation = Rc::clone(&observation);
+    let on_drop_log = Rc::clone(&log);
+    let waker = owner_waker(
+        None,
+        Some(Box::new(move || {
+            on_drop_observation.set(Some((probe(), on_drop_log.drops.get())));
+        })),
+    );
+    let mut read = holder.read_body_event_unboxed(7);
+    assert!(
+        Pin::new(&mut read)
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    drop(waker);
+
+    let panic =
+        catch_unwind(AssertUnwindSafe(|| drop(poll(&mut read)))).expect_err("the poll panics");
+    assert_eq!(panic.downcast_ref::<&str>(), Some(&"in-place poll"));
+    assert_eq!(
+        observation.get(),
+        Some((false, 1)),
+        "(readable, drops) when the registered task drops"
+    );
+    assert!(log.stops.borrow().is_empty());
+    assert_eq!(log.drops.get(), 1);
+    drop(read);
+    assert!(!holder.readable());
+    let Poll::Ready(Err(error)) = poll(&mut holder.read_body_event_unboxed(9)) else {
+        panic!("the consumed holder has nothing to read");
+    };
+    assert_eq!(error.code(), HttpErrorCode::DROPPED);
+    drop(holder);
+    assert!(log.stops.borrow().is_empty());
+    assert_eq!(log.drops.get(), 1);
+    assert_eq!(*log.polls.borrow(), [7, 7]);
+}
+
+#[cfg(panic = "unwind")]
+#[derive(Clone, Copy, Debug)]
+enum SourcePoll {
+    Exclusive,
+    Forwarded,
+    ThroughOuterHolder,
+}
+
+/// `DIV-056`: a source poll that panics under an exclusive poll, or
+/// under the holder polled as a source (directly, or by an outer holder's
+/// in-place read), consumes the source as a panicking read does.
+#[cfg(panic = "unwind")]
+#[test]
+fn a_panicking_exclusive_or_forwarded_poll_retires_its_source() {
+    for path in [
+        SourcePoll::Exclusive,
+        SourcePoll::Forwarded,
+        SourcePoll::ThroughOuterHolder,
+    ] {
+        let log = Rc::new(Log::default());
+        let source = ScriptedSource::new(&log, true, []).panicking_when_exhausted("source poll");
+        let mut holder = match path {
+            SourcePoll::Exclusive | SourcePoll::Forwarded => HttpSourceHolder::new(source),
+            SourcePoll::ThroughOuterHolder => {
+                HttpSourceHolder::new(Box::new(HttpSourceHolder::new(source)))
+            }
+        };
+        let poll_holder = |holder: &mut HttpSourceHolder| {
+            let mut context = Context::from_waker(Waker::noop());
+            match path {
+                SourcePoll::Exclusive => holder.poll_body_event_exclusive(&mut context, 7),
+                SourcePoll::Forwarded => holder.poll_body_event(&mut context, 7),
+                SourcePoll::ThroughOuterHolder => poll(&mut holder.read_body_event_unboxed(7)),
+            }
+        };
+
+        let panic = catch_unwind(AssertUnwindSafe(|| drop(poll_holder(&mut holder))))
+            .expect_err("the source poll panics");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"source poll"),
+            "{path:?}"
+        );
+        assert!(log.stops.borrow().is_empty(), "{path:?}");
+        assert_eq!(
+            log.drops.get(),
+            1,
+            "{path:?}: dropped before the panic continues"
+        );
+        assert!(!holder.readable(), "{path:?}");
+        let Poll::Ready(Err(error)) = poll_holder(&mut holder) else {
+            panic!("{path:?}: the next poll fails");
+        };
+        assert_eq!(error.code(), HttpErrorCode::DROPPED, "{path:?}");
+        drop(holder);
+        assert!(log.stops.borrow().is_empty(), "{path:?}");
+        assert_eq!(log.drops.get(), 1, "{path:?}");
+        assert_eq!(*log.polls.borrow(), [7], "{path:?}");
+    }
 }

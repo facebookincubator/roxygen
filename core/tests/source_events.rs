@@ -571,6 +571,235 @@ mod source_holder {
     }
 }
 
+/// A holder read that panics consumes its source generation unstopped (`DIV-056`).
+#[cfg(panic = "unwind")]
+mod panicking_reads {
+    use std::marker::PhantomData;
+    use std::panic::AssertUnwindSafe;
+    use std::panic::catch_unwind;
+    use std::panic::panic_any;
+
+    use super::*;
+
+    type Lifecycle = Rc<RefCell<Vec<&'static str>>>;
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReadPanic {
+        /// `read_header_event` or `read_body_event` panics.
+        Start,
+        /// `polls_body_events`, which a body read asks first, panics.
+        PollsBodyEvents,
+        /// The future the read returned panics when polled.
+        Poll,
+    }
+
+    struct DropProbe(Lifecycle, &'static str);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push(self.1);
+        }
+    }
+
+    struct PanickingRead<T> {
+        _probe: DropProbe,
+        output: PhantomData<T>,
+    }
+
+    impl<T> Future for PanickingRead<T> {
+        type Output = Result<T, HttpError>;
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            panic_any("read poll")
+        }
+    }
+
+    struct PanickingSource {
+        lifecycle: Lifecycle,
+        panic: ReadPanic,
+        drop_panics: bool,
+    }
+
+    impl PanickingSource {
+        fn read<T: 'static>(&mut self) -> LocalSourceFuture<Result<T, HttpError>> {
+            if matches!(self.panic, ReadPanic::Start) {
+                panic_any("read start");
+            }
+            Box::pin(PanickingRead {
+                _probe: DropProbe(Rc::clone(&self.lifecycle), "read.drop"),
+                output: PhantomData,
+            })
+        }
+    }
+
+    impl HttpSource for PanickingSource {
+        fn read_header_event(&mut self) -> LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
+            self.read()
+        }
+
+        fn read_body_event(
+            &mut self,
+            _maximum: u32,
+        ) -> LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
+            self.read()
+        }
+
+        fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {
+            self.lifecycle.borrow_mut().push("source.stop");
+        }
+
+        fn polls_body_events(&self) -> bool {
+            if matches!(self.panic, ReadPanic::PollsBodyEvents) {
+                panic_any("polls body events");
+            }
+            false
+        }
+    }
+
+    impl Drop for PanickingSource {
+        fn drop(&mut self) {
+            self.lifecycle.borrow_mut().push("source.drop");
+            if self.drop_panics {
+                panic_any("source drop");
+            }
+        }
+    }
+
+    fn panicking_holder(panic: ReadPanic, drop_panics: bool) -> (HttpSourceHolder, Lifecycle) {
+        let lifecycle = Lifecycle::default();
+        let holder = HttpSourceHolder::new(Box::new(PanickingSource {
+            lifecycle: Rc::clone(&lifecycle),
+            panic,
+            drop_panics,
+        }));
+        (holder, lifecycle)
+    }
+
+    fn panic_message(operation: impl FnOnce()) -> &'static str {
+        let payload =
+            catch_unwind(AssertUnwindSafe(operation)).expect_err("the source's panic continues");
+        payload
+            .downcast_ref::<&'static str>()
+            .copied()
+            .expect("a static message")
+    }
+
+    /// Polls `read`, which panics, and checks that the poisoned future was
+    /// dropped before its source while the read is still held.
+    fn panic_in_poll<T>(mut read: LocalSourceFuture<T>, lifecycle: &Lifecycle) -> &'static str {
+        let message = panic_message(|| drop(poll_once(&mut read)));
+        assert_eq!(*lifecycle.borrow(), ["read.drop", "source.drop"]);
+        drop(read);
+        message
+    }
+
+    fn start(holder: &mut HttpSourceHolder, header: bool) {
+        if header {
+            drop(holder.read_header_event());
+        } else {
+            drop(holder.read_body_event(16));
+        }
+    }
+
+    fn assert_consumed(holder: &mut HttpSourceHolder) {
+        assert!(!holder.readable());
+        let Err(error) = ready(holder.read_body_event(16)) else {
+            panic!("a consumed holder has nothing to read");
+        };
+        assert_eq!(error.code(), HttpErrorCode::DROPPED);
+    }
+
+    #[test]
+    fn a_panicking_read_retires_its_source_without_stop_reading() {
+        for header in [false, true] {
+            let (mut holder, lifecycle) = panicking_holder(ReadPanic::Poll, false);
+            let message = if header {
+                panic_in_poll(holder.read_header_event(), &lifecycle)
+            } else {
+                panic_in_poll(holder.read_body_event(16), &lifecycle)
+            };
+            assert_eq!(message, "read poll", "header {header}");
+            assert_consumed(&mut holder);
+            drop(holder);
+            assert_eq!(
+                *lifecycle.borrow(),
+                ["read.drop", "source.drop"],
+                "header {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_panicking_read_start_retires_its_source() {
+        for (panic, header, expected) in [
+            (ReadPanic::Start, true, "read start"),
+            (ReadPanic::Start, false, "read start"),
+            (ReadPanic::PollsBodyEvents, false, "polls body events"),
+        ] {
+            let (mut holder, lifecycle) = panicking_holder(panic, false);
+            let message = panic_message(|| start(&mut holder, header));
+            assert_eq!(message, expected, "{panic:?}, header {header}");
+            assert_eq!(
+                *lifecycle.borrow(),
+                ["source.drop"],
+                "{panic:?}, header {header}"
+            );
+            assert_consumed(&mut holder);
+            drop(holder);
+            assert_eq!(
+                *lifecycle.borrow(),
+                ["source.drop"],
+                "{panic:?}, header {header}"
+            );
+        }
+    }
+
+    /// `polls_body_events` asked of the holder itself outside a read, as an
+    /// owned exchange asks it before its body read, or as an outer holder
+    /// asks it of a nested holder when a body read starts, consumes the source
+    /// unstopped when the source's answer panics.
+    #[test]
+    fn a_panicking_polls_body_events_asked_of_the_holder_retires_its_source() {
+        for nested in [false, true] {
+            let (holder, lifecycle) = panicking_holder(ReadPanic::PollsBodyEvents, false);
+            let mut holder = if nested {
+                HttpSourceHolder::new(Box::new(holder))
+            } else {
+                holder
+            };
+            let message = panic_message(|| {
+                if nested {
+                    start(&mut holder, false);
+                } else {
+                    HttpSource::polls_body_events(&holder);
+                }
+            });
+            assert_eq!(message, "polls body events", "nested {nested}");
+            assert_eq!(*lifecycle.borrow(), ["source.drop"], "nested {nested}");
+            assert_consumed(&mut holder);
+            drop(holder);
+            assert_eq!(*lifecycle.borrow(), ["source.drop"], "nested {nested}");
+        }
+    }
+
+    /// A source whose drop also panics while it is retired keeps the
+    /// read's panic, and the process does not abort.
+    #[test]
+    fn a_panic_while_retiring_a_panicked_source_keeps_the_first() {
+        let (mut holder, lifecycle) = panicking_holder(ReadPanic::Poll, true);
+        assert_eq!(
+            panic_in_poll(holder.read_body_event(16), &lifecycle),
+            "read poll"
+        );
+        assert_consumed(&mut holder);
+
+        let (mut holder, lifecycle) = panicking_holder(ReadPanic::Start, true);
+        assert_eq!(panic_message(|| start(&mut holder, false)), "read start");
+        assert_eq!(*lifecycle.borrow(), ["source.drop"]);
+        assert_consumed(&mut holder);
+    }
+}
+
 mod events {
     use super::*;
 

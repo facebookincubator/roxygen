@@ -3135,12 +3135,9 @@ fn upload_body_poll_panic_retires_the_read_and_joins_native_io_before_resuming()
                         complete_credit_wait(|| probe.drops.get() == 1).await;
                         assert_eq!(
                             probe.lifecycle.borrow().as_slice(),
-                            ["read.drop", "source.stop", "source.drop"]
+                            ["read.drop", "source.drop"]
                         );
-                        assert_eq!(
-                            probe.stops.borrow().as_slice(),
-                            &[Some(HttpErrorCode::INTERNAL_ERROR)]
-                        );
+                        assert!(probe.stops.borrow().is_empty());
                         drop(submission);
                         assert!(!resumed.get(), "held I/O retains the source panic");
                         assert!(wire.borrow().writes.is_empty());

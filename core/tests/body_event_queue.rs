@@ -1968,8 +1968,10 @@ mod body_event_queue {
         }
     }
 
+    /// A source whose read panics is consumed as by an error (`DIV-056`), and
+    /// the failed read's admission is released before that read is dropped.
     #[test]
-    fn source_poll_panic_releases_read_admission_before_failed_future_drop() {
+    fn source_poll_panic_retires_the_source_and_releases_admission_before_failed_future_drop() {
         let observations = Rc::new(SourceObservations::default());
         let callback = Rc::new(QueueObservations::default());
         let (completion, pending) = manual_future::<()>();
@@ -1992,16 +1994,15 @@ mod body_event_queue {
         assert_eq!(panic.downcast_ref::<&str>(), Some(&"body source poll"));
         assert!(queue.empty());
         assert_eq!(observations.stops.get(), 0);
-        assert_eq!(observations.drops.get(), 0);
+        assert_eq!(observations.drops.get(), 1);
 
         let mut retry = queue.read_body_event_unboxed(100, CancellationToken::never());
-        assert!(matches!(
-            poll_once(Pin::new(&mut retry)),
-            Poll::Ready(Ok(result)) if result.eom
-        ));
-        let event = queue.dequeue_body_event(100).unwrap();
-        assert_eq!(event.as_body().unwrap().coalesce(5).unwrap(), b"retry"[..]);
-        assert!(event.eom());
+        let Poll::Ready(Err(error)) = poll_once(Pin::new(&mut retry)) else {
+            panic!("the retry finds the source retired, not a read still admitted");
+        };
+        assert_eq!(error.code(), HttpErrorCode::DROPPED);
+        assert_eq!(error.message(), b"HTTP source is no longer readable");
+        assert!(queue.empty());
         assert_eq!(observations.stops.get(), 0);
         assert_eq!(observations.drops.get(), 1);
         drop(failed);
@@ -2009,7 +2010,7 @@ mod body_event_queue {
     }
 
     #[test]
-    fn retained_transfer_releases_holder_admission_after_a_source_poll_panic() {
+    fn retained_transfer_retires_the_holder_source_after_a_source_poll_panic() {
         let observations = Rc::new(SourceObservations::default());
         let (completion, pending) = manual_future::<()>();
         let panicking: LocalSourceFuture<Result<HttpBodyEvent, HttpError>> = Box::pin(async move {
@@ -2041,14 +2042,14 @@ mod body_event_queue {
             Some(&"transfer body source poll")
         );
         assert_eq!(observations.stops.get(), 0);
-        assert_eq!(observations.drops.get(), 0);
-        let Poll::Ready(Ok(event)) =
+        assert_eq!(observations.drops.get(), 1);
+        let Poll::Ready(Err(error)) =
             transfer.poll_read_body_event(&mut context, 100, &cancellation)
         else {
-            panic!("the retry transfers its terminal event after panic releases admission");
+            panic!("the retry finds the source retired, not a read still admitted");
         };
-        assert_eq!(event.as_body().unwrap().coalesce(5).unwrap(), b"retry"[..]);
-        assert!(event.eom());
+        assert_eq!(error.code(), HttpErrorCode::DROPPED);
+        assert_eq!(error.message(), b"HTTP source is no longer readable");
         assert_eq!(observations.stops.get(), 0);
         assert_eq!(observations.drops.get(), 1);
         drop(transfer);

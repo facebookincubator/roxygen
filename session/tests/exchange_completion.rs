@@ -1778,6 +1778,10 @@ fn exchange_completion_panic_payloads_cannot_abandon_retirement() {
                             .unwrap();
                         assert!(panic.is::<PanickingPayload>());
                         roxygen_runtime::panic::discard_panic(panic);
+                        assert!(
+                            dropped.get(),
+                            "the panicking read retired its source, discarding its drop panic"
+                        );
                         drop(read);
                     } else {
                         assert!(poll_once(read.as_mut()).is_pending());
@@ -1786,9 +1790,14 @@ fn exchange_completion_panic_payloads_cannot_abandon_retirement() {
                         roxygen_runtime::panic::discard_panic(panic);
                     }
                     pending(&receipt);
-                    let panic = catch_unwind(AssertUnwindSafe(|| drop(source))).unwrap_err();
-                    assert!(panic.is::<PanickingPayload>());
-                    roxygen_runtime::panic::discard_panic(panic);
+                    let dropped_source = catch_unwind(AssertUnwindSafe(|| drop(source)));
+                    if panic_poll {
+                        assert!(dropped_source.is_ok(), "the source was already retired");
+                    } else {
+                        let panic = dropped_source.unwrap_err();
+                        assert!(panic.is::<PanickingPayload>());
+                        roxygen_runtime::panic::discard_panic(panic);
+                    }
                 }
                 assert!(dropped.get());
                 assert!(read_dropped.get());
@@ -1906,8 +1915,9 @@ fn exchange_source_polled_read_panic_preserves_exchange_failure() {
     });
 }
 
-/// A source whose `polls_body_events` capability query panics.
-struct PanickingCapabilitySource;
+/// A source whose `polls_body_events` capability query panics, logging its
+/// `stop_reading` and its drop.
+struct PanickingCapabilitySource(Rc<RefCell<Vec<&'static str>>>);
 
 impl HttpSource for PanickingCapabilitySource {
     fn read_header_event(&mut self) -> LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
@@ -1921,16 +1931,26 @@ impl HttpSource for PanickingCapabilitySource {
         Box::pin(std::future::pending())
     }
 
-    fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {}
+    fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {
+        self.0.borrow_mut().push("source.stop");
+    }
 
     fn polls_body_events(&self) -> bool {
         std::panic::panic_any(PanickingPayload)
     }
 }
 
+impl Drop for PanickingCapabilitySource {
+    fn drop(&mut self) {
+        self.0.borrow_mut().push("source.drop");
+    }
+}
+
 /// The holder asks the capability when a body read starts, before any read
 /// guard exists; a panic there must still make the exchange's cleanup
-/// unconfirmed after a caller catches it and tears down normally.
+/// unconfirmed after a caller catches it and tears down normally. The
+/// exchange's own holder, asked through the wrapper, consumes the source
+/// unstopped (`DIV-056`).
 #[test]
 fn exchange_source_polls_body_events_panic_preserves_exchange_failure() {
     run_local(async {
@@ -1938,14 +1958,19 @@ fn exchange_source_polls_body_events_panic_preserves_exchange_failure() {
         let tracker = owner.tracker();
         let receipt = owner.completion();
         tracker.mark_detached();
-        let mut source = tracker.source(HttpSourceHolder::new(Box::new(PanickingCapabilitySource)));
+        let lifecycle = Rc::new(RefCell::new(Vec::new()));
+        let mut source = tracker.source(HttpSourceHolder::new(Box::new(
+            PanickingCapabilitySource(Rc::clone(&lifecycle)),
+        )));
         let panic = catch_unwind(AssertUnwindSafe(|| {
             drop(source.read_body_event_unboxed(7));
         }))
         .expect_err("the body read's capability query panics");
         assert!(panic.is::<PanickingPayload>());
         roxygen_runtime::panic::discard_panic(panic);
+        assert_eq!(*lifecycle.borrow(), ["source.drop"]);
         drop(source);
+        assert_eq!(*lifecycle.borrow(), ["source.drop"]);
         assert!(owner.ready());
         owner.publish();
         assert_eq!(

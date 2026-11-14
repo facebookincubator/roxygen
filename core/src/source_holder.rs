@@ -229,6 +229,56 @@ fn retire_finished(entry: Option<SourceEntry>) {
     }
 }
 
+/// Consumes, as an error would, the generation `take` removes from a holder
+/// whose source call is unwinding (`DIV-056`): its source is dropped without
+/// `stop_reading`, then its cached reader. Every panic here, including one
+/// taking the generation out, is discarded, since this runs in a destructor
+/// during that unwind.
+#[cold]
+#[inline(never)]
+fn retire_panicked(take: impl FnOnce() -> Option<SourceEntry>) {
+    let retired = catch_unwind(AssertUnwindSafe(|| {
+        SourceRetirement::of(take(), None, false, false).retire()
+    }));
+    if let Err(secondary) | Ok(Err(secondary)) = retired {
+        roxygen_runtime::panic::discard_panic(secondary);
+    }
+}
+
+/// Retires the current generation if the source call it is armed around
+/// unwinds. It is declared before the holder's borrow, which the unwind
+/// therefore releases first.
+struct SourceCallGuard<'a> {
+    state: &'a RefCell<HolderState>,
+    armed: bool,
+}
+
+impl Drop for SourceCallGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            retire_panicked(|| {
+                let mut state = self.state.borrow_mut();
+                state.forwarded = ForwardedPoll::Idle;
+                state.source.take()
+            });
+        }
+    }
+}
+
+/// [`SourceCallGuard`] for a poll that owns the holder's state outright.
+struct ExclusivePollGuard<'a> {
+    source: &'a mut Option<SourceEntry>,
+    armed: bool,
+}
+
+impl Drop for ExclusivePollGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            retire_panicked(|| self.source.take());
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum SourceReleaseError {
     #[error("cannot release an HTTP source while a read is active")]
@@ -259,6 +309,8 @@ enum ReadInner<T> {
     Future(LocalSourceFuture<Result<T, HttpError>>),
     /// The source itself, polled while the holder's state is borrowed (`DIV-039`).
     InPlace { poll: InPlacePoll<T>, maximum: u32 },
+    /// A read whose poll panicked, with its future dropped (`DIV-056`).
+    Retired,
 }
 
 struct HolderReadFuture<T>
@@ -376,11 +428,14 @@ where
             !this.completed,
             "a completed holder read cannot be polled again"
         );
-        let poll = match &mut this.inner {
-            ReadInner::Future(inner) => inner.as_mut().poll(context),
-            ReadInner::InPlace { poll, maximum } => {
-                poll_in_place(&this.state, &this.source_identity, *poll, *maximum, context)
-            }
+        let poll = {
+            let mut guard = ReadPollGuard {
+                read: &mut *this,
+                armed: true,
+            };
+            let poll = guard.read.poll_inner(context);
+            guard.armed = false;
+            poll
         };
         let Poll::Ready(result) = &poll else {
             return Poll::Pending;
@@ -389,6 +444,53 @@ where
         let terminal = result.as_ref().map_or(true, TerminalEvent::is_terminal);
         retire_finished(finish_read(&this.state, &this.source_identity, terminal));
         poll
+    }
+}
+
+impl<T> HolderReadFuture<T>
+where
+    T: TerminalEvent,
+{
+    fn poll_inner(&mut self, context: &mut Context<'_>) -> Poll<Result<T, HttpError>> {
+        match &mut self.inner {
+            ReadInner::Future(inner) => inner.as_mut().poll(context),
+            ReadInner::InPlace { poll, maximum } => {
+                poll_in_place(&self.state, &self.source_identity, *poll, *maximum, context)
+            }
+            ReadInner::Retired => unreachable!("a retired holder read is completed"),
+        }
+    }
+
+    /// Completes a read whose poll is unwinding: its future is dropped before
+    /// its generation is retired, since that future may still reach the source.
+    #[cold]
+    #[inline(never)]
+    fn complete_panicked(&mut self) {
+        self.completed = true;
+        let inner = std::mem::replace(&mut self.inner, ReadInner::Retired);
+        if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(inner))) {
+            roxygen_runtime::panic::discard_panic(secondary);
+        }
+        retire_panicked(|| finish_read(&self.state, &self.source_identity, true));
+    }
+}
+
+struct ReadPollGuard<'a, T>
+where
+    T: TerminalEvent,
+{
+    read: &'a mut HolderReadFuture<T>,
+    armed: bool,
+}
+
+impl<T> Drop for ReadPollGuard<'_, T>
+where
+    T: TerminalEvent,
+{
+    fn drop(&mut self) {
+        if self.armed {
+            self.read.complete_panicked();
+        }
     }
 }
 
@@ -461,6 +563,13 @@ impl Future for HolderBodyRead {
 /// produced it. Early drop, explicit replacement, and explicit stop call
 /// `stop_reading` exactly once before destroying that source. The internal
 /// `Rc` also makes the holder and every read future owner-local.
+///
+/// A read that panics, while starting or while polled, consumes its source
+/// generation as an error does: the source is dropped without `stop_reading`,
+/// then the panic continues (`DIV-056`). So does a panicking in-place poll,
+/// through [`Self::poll_body_event_exclusive`] or of the holder polled as a
+/// source, and a panicking [`HttpSource::polls_body_events`] asked of the
+/// holder while no read is active.
 pub struct HttpSourceHolder {
     state: Rc<RefCell<HolderState>>,
 }
@@ -534,6 +643,10 @@ impl HttpSourceHolder {
     /// Admission and the underlying source call happen immediately. The returned
     /// future owns its read state and does not retain this mutable borrow.
     pub fn read_header_event_unboxed(&mut self) -> HolderHeaderRead {
+        let mut guard = SourceCallGuard {
+            state: &self.state,
+            armed: false,
+        };
         let (inner, source_identity) = {
             let Ok(mut state) = self.state.try_borrow_mut() else {
                 return HolderHeaderRead(HolderRead::Error(Some(Self::concurrent_read_error())));
@@ -544,7 +657,9 @@ impl HttpSourceHolder {
             let Some(entry) = state.source.as_mut() else {
                 return HolderHeaderRead(HolderRead::Error(Some(Self::unavailable_error())));
             };
+            guard.armed = true;
             let inner = ReadInner::Future(entry.source.read_header_event());
+            guard.armed = false;
             let source_identity = Rc::clone(&entry.identity);
             state.active_read = true;
             state.forwarded = ForwardedPoll::Idle;
@@ -571,6 +686,10 @@ impl HttpSourceHolder {
     }
 
     pub(crate) fn read_body_event_concrete(&mut self, maximum: u32) -> HolderBodyRead {
+        let mut guard = SourceCallGuard {
+            state: &self.state,
+            armed: false,
+        };
         let (inner, source_identity) = {
             let Ok(mut state) = self.state.try_borrow_mut() else {
                 return HolderBodyRead(HolderRead::Error(Some(Self::concurrent_read_error())));
@@ -581,6 +700,7 @@ impl HttpSourceHolder {
             let Some(entry) = state.source.as_mut() else {
                 return HolderBodyRead(HolderRead::Error(Some(Self::unavailable_error())));
             };
+            guard.armed = true;
             let inner = if entry.source.polls_body_events() {
                 ReadInner::InPlace {
                     poll: poll_source_body,
@@ -589,6 +709,7 @@ impl HttpSourceHolder {
             } else {
                 ReadInner::Future(entry.source.read_body_event(maximum))
             };
+            guard.armed = false;
             let source_identity = Rc::clone(&entry.identity);
             state.active_read = true;
             state.forwarded = ForwardedPoll::Idle;
@@ -626,13 +747,19 @@ impl HttpSourceHolder {
             return HttpSource::poll_body_event(self, context, maximum);
         };
         debug_assert!(!state.active_read, "an active read holds the state");
-        let Some(entry) = state.source.as_mut() else {
+        let mut guard = ExclusivePollGuard {
+            source: &mut state.source,
+            armed: false,
+        };
+        let Some(entry) = guard.source.as_mut() else {
             return Poll::Ready(Err(Self::unavailable_error()));
         };
+        guard.armed = true;
         let poll = entry.source.poll_body_event(context, maximum);
+        guard.armed = false;
         if let Poll::Ready(result) = &poll {
             if result.as_ref().map_or(true, TerminalEvent::is_terminal) {
-                retire_finished(state.source.take());
+                retire_finished(guard.source.take());
             }
         }
         poll
@@ -705,13 +832,23 @@ impl HttpSource for HttpSourceHolder {
             .and_then(|entry| entry.source.ingress_completion())
     }
 
+    /// While no read is active, a panic in the source's answer consumes its
+    /// generation unstopped, as it does when a read starts (`DIV-056`).
     fn polls_body_events(&self) -> bool {
-        self.state.try_borrow().is_ok_and(|state| {
-            state
-                .source
-                .as_ref()
-                .is_some_and(|entry| entry.source.polls_body_events())
-        })
+        let mut guard = SourceCallGuard {
+            state: &self.state,
+            armed: false,
+        };
+        let Ok(state) = self.state.try_borrow() else {
+            return false;
+        };
+        let Some(entry) = state.source.as_ref() else {
+            return false;
+        };
+        guard.armed = !state.active_read;
+        let polls = entry.source.polls_body_events();
+        guard.armed = false;
+        polls
     }
 
     /// Polls the held source in place, outside any read of this holder; a
@@ -728,6 +865,10 @@ impl HttpSource for HttpSourceHolder {
         context: &mut Context<'_>,
         maximum: u32,
     ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        let mut guard = SourceCallGuard {
+            state: &self.state,
+            armed: false,
+        };
         let (poll, retired, replaced) = {
             let Ok(mut state) = self.state.try_borrow_mut() else {
                 return Poll::Ready(Err(Self::concurrent_read_error()));
@@ -740,7 +881,9 @@ impl HttpSource for HttpSourceHolder {
             let Some(entry) = state.source.as_mut().filter(|_| !orphaned) else {
                 return Poll::Ready(Err(Self::unavailable_error()));
             };
+            guard.armed = true;
             let poll = entry.source.poll_body_event(context, maximum);
+            guard.armed = false;
             match &poll {
                 Poll::Pending => {
                     state.forwarded = ForwardedPoll::Pending;
