@@ -6,8 +6,8 @@
 // Regenerate: node fbcode/roxygen/codec/http1/generator/generate.cjs --upstream CHECKOUT --output MODULE_DIRECTORY
 
 #![allow(dead_code)]
+use super::Callbacks;
 use super::Parser;
-use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Error(pub(crate) i32);
@@ -623,9 +623,33 @@ impl Parser {
             _ => "",
         }
     }
+    #[inline(always)]
+    pub(super) fn consume_without_transition(&mut self, length: usize) -> bool {
+        match self.state {
+            State::S326 => {
+                let available = length as u64;
+                if available < self.content_length {
+                    self.content_length -= available;
+                    true
+                } else {
+                    false
+                }
+            }
+            State::S454 => {
+                let available = length as u64;
+                if available < self.content_length {
+                    self.content_length -= available;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
 #[rustfmt::skip]
     pub(super) fn run<F>(&mut self, input: &[u8], callback: &mut F) -> Result<(), usize>
-where F: FnMut(&mut Parser, Event, Range<usize>) -> i32 {
+where F: Callbacks + ?Sized {
 let mut pos = 0;
 let mut match_value: i32 = 0;
 let mut state = self.state;
@@ -1252,7 +1276,7 @@ match result {
 { // fused llhttp__n_invoke_llhttp__on_reset
 {
 let result = {
-callback(self, Event::Reset, pos..pos)
+callback.on_event(self, Event::Reset, pos..pos)
 };
 match result {
 0 => {
@@ -1295,7 +1319,7 @@ self.finish_state = (2i64) as u8; 0
 { // fused llhttp__n_invoke_llhttp__on_message_begin
 {
 let result = {
-callback(self, Event::MessageBegin, pos..pos)
+callback.on_event(self, Event::MessageBegin, pos..pos)
 };
 match result {
 0 => {
@@ -1516,7 +1540,7 @@ return Err(pos);
 // State::S122: llhttp__n_invoke_llhttp__on_method_complete
 {
 let result = {
-callback(self, Event::MethodComplete, pos..pos)
+callback.on_event(self, Event::MethodComplete, pos..pos)
 };
 match result {
 0 => {
@@ -1689,7 +1713,7 @@ break 'bb_20;
 // State::S90: llhttp__n_invoke_llhttp__on_protocol_complete_3
 {
 let result = {
-callback(self, Event::ProtocolComplete, pos..pos)
+callback.on_event(self, Event::ProtocolComplete, pos..pos)
 };
 match result {
 0 => {
@@ -2066,7 +2090,7 @@ break 'bb_34;
 // State::S177: llhttp__n_invoke_llhttp__on_version_complete_1
 {
 let result = {
-callback(self, Event::VersionComplete, pos..pos)
+callback.on_event(self, Event::VersionComplete, pos..pos)
 };
 match result {
 0 => {
@@ -2573,7 +2597,7 @@ return Err(pos);
 // State::S317: llhttp__n_invoke_llhttp__on_status_complete
 {
 let result = {
-callback(self, Event::StatusComplete, pos..pos)
+callback.on_event(self, Event::StatusComplete, pos..pos)
 };
 match result {
 0 => {
@@ -4412,7 +4436,7 @@ break 'bb_122;
 // State::S93: llhttp__n_invoke_llhttp__on_method_complete_1
 {
 let result = {
-callback(self, Event::MethodComplete, pos..pos)
+callback.on_event(self, Event::MethodComplete, pos..pos)
 };
 match result {
 0 => {
@@ -5169,7 +5193,7 @@ _ => {
 { // fused llhttp__n_invoke_llhttp__on_url_complete_1
 {
 let result = {
-callback(self, Event::UrlComplete, pos..pos)
+callback.on_event(self, Event::UrlComplete, pos..pos)
 };
 match result {
 0 => {
@@ -5289,7 +5313,7 @@ break 'bb_157;
 // State::S239: llhttp__n_invoke_llhttp__on_protocol_complete_2
 {
 let result = {
-callback(self, Event::ProtocolComplete, pos..pos)
+callback.on_event(self, Event::ProtocolComplete, pos..pos)
 };
 match result {
 0 => {
@@ -5414,7 +5438,7 @@ break 'bb_157;
 // State::S238: llhttp__n_invoke_llhttp__on_protocol_complete_1
 {
 let result = {
-callback(self, Event::ProtocolComplete, pos..pos)
+callback.on_event(self, Event::ProtocolComplete, pos..pos)
 };
 match result {
 0 => {
@@ -5519,7 +5543,7 @@ return Err(pos);
 // State::S237: llhttp__n_invoke_llhttp__on_protocol_complete
 {
 let result = {
-callback(self, Event::ProtocolComplete, pos..pos)
+callback.on_event(self, Event::ProtocolComplete, pos..pos)
 };
 match result {
 0 => {
@@ -6021,7 +6045,7 @@ break 'bb_174;
 // State::S422: llhttp__n_invoke_llhttp__on_version_complete
 {
 let result = {
-callback(self, Event::VersionComplete, pos..pos)
+callback.on_event(self, Event::VersionComplete, pos..pos)
 };
 match result {
 0 => {
@@ -6276,7 +6300,7 @@ self.http_minor = (9i64) as u8; 0
 { // fused llhttp__n_invoke_llhttp__on_url_complete
 {
 let result = {
-callback(self, Event::UrlComplete, pos..pos)
+callback.on_event(self, Event::UrlComplete, pos..pos)
 };
 match result {
 0 => {
@@ -6370,7 +6394,7 @@ match result {
 { // fused llhttp__n_invoke_llhttp__on_chunk_complete_1
 {
 let result = {
-callback(self, Event::ChunkComplete, pos..pos)
+callback.on_event(self, Event::ChunkComplete, pos..pos)
 };
 match result {
 0 => {
@@ -6406,7 +6430,7 @@ self.before_headers_complete()
 { // fused llhttp__n_invoke_llhttp__on_headers_complete
 {
 let result = {
-callback(self, Event::HeadersComplete, pos..pos)
+callback.on_event(self, Event::HeadersComplete, pos..pos)
 };
 match result {
 0 => {
@@ -6841,7 +6865,7 @@ return Err(pos);
 // State::S332: llhttp__n_invoke_llhttp__on_header_field_complete
 {
 let result = {
-callback(self, Event::HeaderFieldComplete, pos..pos)
+callback.on_event(self, Event::HeaderFieldComplete, pos..pos)
 };
 match result {
 0 => {
@@ -8213,7 +8237,7 @@ break 'bb_242;
 // State::S483: llhttp__n_invoke_llhttp__on_header_value_complete
 {
 let result = {
-callback(self, Event::HeaderValueComplete, pos..pos)
+callback.on_event(self, Event::HeaderValueComplete, pos..pos)
 };
 match result {
 0 => {
@@ -8323,7 +8347,7 @@ match result {
 { // fused llhttp__n_invoke_llhttp__on_chunk_complete_2
 {
 let result = {
-callback(self, Event::ChunkComplete, pos..pos)
+callback.on_event(self, Event::ChunkComplete, pos..pos)
 };
 match result {
 0 => {
@@ -8359,7 +8383,7 @@ self.before_headers_complete()
 { // fused llhttp__n_invoke_llhttp__on_headers_complete_1
 {
 let result = {
-callback(self, Event::HeadersComplete, pos..pos)
+callback.on_event(self, Event::HeadersComplete, pos..pos)
 };
 match result {
 0 => {
@@ -8434,7 +8458,7 @@ match result {
 { // fused llhttp__n_invoke_llhttp__on_message_complete_1
 {
 let result = {
-callback(self, Event::MessageComplete, pos..pos)
+callback.on_event(self, Event::MessageComplete, pos..pos)
 };
 match result {
 0 => {
@@ -8490,7 +8514,7 @@ _ => {
 { // fused llhttp__n_invoke_llhttp__on_message_complete
 {
 let result = {
-callback(self, Event::MessageComplete, pos..pos)
+callback.on_event(self, Event::MessageComplete, pos..pos)
 };
 match result {
 0 => {
@@ -9090,7 +9114,7 @@ self.span_callback = Some(Event::ChunkExtensionValue);
 { // fused llhttp__n_invoke_llhttp__on_chunk_extension_name_complete_3
 {
 let result = {
-callback(self, Event::ChunkExtensionNameComplete, pos..pos)
+callback.on_event(self, Event::ChunkExtensionNameComplete, pos..pos)
 };
 match result {
 0 => {
@@ -9206,7 +9230,7 @@ return Err(pos);
 // State::S549: llhttp__n_invoke_llhttp__on_chunk_extension_value_complete_3
 {
 let result = {
-callback(self, Event::ChunkExtensionValueComplete, pos..pos)
+callback.on_event(self, Event::ChunkExtensionValueComplete, pos..pos)
 };
 match result {
 0 => {
@@ -9329,7 +9353,7 @@ return Err(pos);
 // State::S561: llhttp__n_invoke_llhttp__on_chunk_extension_value_complete_2
 {
 let result = {
-callback(self, Event::ChunkExtensionValueComplete, pos..pos)
+callback.on_event(self, Event::ChunkExtensionValueComplete, pos..pos)
 };
 match result {
 0 => {
@@ -9407,7 +9431,7 @@ return Err(pos);
 // State::S545: llhttp__n_invoke_llhttp__on_chunk_extension_value_complete_1
 {
 let result = {
-callback(self, Event::ChunkExtensionValueComplete, pos..pos)
+callback.on_event(self, Event::ChunkExtensionValueComplete, pos..pos)
 };
 match result {
 0 => {
@@ -9436,7 +9460,7 @@ return Err(pos);
 // State::S544: llhttp__n_invoke_llhttp__on_chunk_extension_value_complete
 {
 let result = {
-callback(self, Event::ChunkExtensionValueComplete, pos..pos)
+callback.on_event(self, Event::ChunkExtensionValueComplete, pos..pos)
 };
 match result {
 0 => {
@@ -9485,7 +9509,7 @@ return Err(pos);
 // State::S457: llhttp__n_invoke_llhttp__on_chunk_extension_name_complete_2
 {
 let result = {
-callback(self, Event::ChunkExtensionNameComplete, pos..pos)
+callback.on_event(self, Event::ChunkExtensionNameComplete, pos..pos)
 };
 match result {
 0 => {
@@ -9515,7 +9539,7 @@ return Err(pos);
 // State::S456: llhttp__n_invoke_llhttp__on_chunk_extension_name_complete_1
 {
 let result = {
-callback(self, Event::ChunkExtensionNameComplete, pos..pos)
+callback.on_event(self, Event::ChunkExtensionNameComplete, pos..pos)
 };
 match result {
 0 => {
@@ -9544,7 +9568,7 @@ return Err(pos);
 // State::S455: llhttp__n_invoke_llhttp__on_chunk_extension_name_complete
 {
 let result = {
-callback(self, Event::ChunkExtensionNameComplete, pos..pos)
+callback.on_event(self, Event::ChunkExtensionNameComplete, pos..pos)
 };
 match result {
 0 => {
@@ -9628,7 +9652,7 @@ return Err(pos);
 // State::S388: llhttp__n_invoke_llhttp__on_chunk_header
 {
 let result = {
-callback(self, Event::ChunkHeader, pos..pos)
+callback.on_event(self, Event::ChunkHeader, pos..pos)
 };
 match result {
 0 => {
@@ -9788,7 +9812,7 @@ return Err(pos);
 // State::S541: llhttp__n_invoke_llhttp__on_chunk_complete
 {
 let result = {
-callback(self, Event::ChunkComplete, pos..pos)
+callback.on_event(self, Event::ChunkComplete, pos..pos)
 };
 match result {
 0 => {
@@ -9839,7 +9863,7 @@ return Err(pos);
 // State::S263: llhttp__n_invoke_llhttp__on_message_complete_2
 {
 let result = {
-callback(self, Event::MessageComplete, pos..pos)
+callback.on_event(self, Event::MessageComplete, pos..pos)
 };
 match result {
 0 => {

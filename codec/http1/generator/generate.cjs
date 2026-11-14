@@ -126,6 +126,15 @@ const stateIds = new Map(nodeList.map((n,i) => [n,`State::S${i}`]));
 const state = n => { assert(stateIds.has(n)); assert(!fused.has(n), 'Fused node cannot be a continuation'); return stateIds.get(n); };
 const field = n => `self.${({type:'parser_type',finish:'finish_state'})[n] || n}`;
 const type = n => { assert(expectedProperties[n] !== 'ptr'); return expectedProperties[n].replace('i','u'); };
+// Both `run` and `consume_without_transition` lower a Consume node with these.
+const consumeField = ref => {
+  const ty = type(ref.field);
+  return {
+    name: field(ref.field),
+    limit: `${field(ref.field)}${ty === 'u64' ? '' : ' as u64'}`,
+    decrement: `${field(ref.field)} -= available${ty === 'u64' ? '' : ' as ' + ty};`,
+  };
+};
 const quoted = s => JSON.stringify(s).replace(/\\u([0-9a-fA-F]{4})/g, '\\u{$1}');
 const eventName = name => {
   assert(name.startsWith('llhttp__on_'), `Unknown callback: ${name}`);
@@ -150,7 +159,7 @@ emit(`// llhttp 9.4.4 (${revision}); llparse 7.3.1, frontend 3.0.0, builder 1.5.
 emit('// Regenerate: node fbcode/roxygen/codec/http1/generator/generate.cjs --upstream CHECKOUT --output MODULE_DIRECTORY');
 emit('');
 emit('#![allow(dead_code)]');
-emit('use std::ops::Range;');
+emit('use super::Callbacks;');
 emit('use super::Parser;');
 emit('');
 emit('#[derive(Clone, Copy, Debug, Eq, PartialEq)]');
@@ -191,6 +200,19 @@ emit('impl Parser {');
 emit("pub(crate) fn method_name(&self) -> &'static str { match self.method {");
 for (const [name,value] of Object.entries(constants.METHODS)) emit(`${value} => ${quoted(name)},`);
 emit('_ => "", } }');
+// A resumed Consume state that cannot finish within the next input only
+// decrements its field before suspending again; callers may apply that
+// change without entering `run`.
+const consumeStates = dispatchNodes.filter(node => node.get('rust').kind === 'Consume');
+assert(consumeStates.length > 0, 'Expected resumable Consume states');
+emit('#[inline(always)]');
+emit('pub(super) fn consume_without_transition(&mut self, length: usize) -> bool { match self.state {');
+for (const node of consumeStates) {
+  const consume = consumeField(node.get('rust').ref);
+  emit(`${state(node)} => { let available = length as u64;`);
+  emit(`if available < ${consume.limit} { ${consume.decrement} true } else { false } }`);
+}
+emit('_ => false, } }');
 function transform(ref,value) {
   const {kind}=ref.get('rust');
   if (kind==='ID') return value;
@@ -278,14 +300,14 @@ function action(wrapped) {
       if (ref.name==='llhttp__before_headers_complete') emit('self.before_headers_complete()');
       else if(ref.name==='llhttp__after_headers_complete') emit('self.after_headers_complete()');
       else if(ref.name==='llhttp__after_message_complete') emit('self.after_message_complete()');
-      else emit(`callback(self, Event::${eventName(ref.name)}, pos..pos)`);
+      else emit(`callback.on_event(self, Event::${eventName(ref.name)}, pos..pos)`);
       break;
     default: throw new Error(`Unsupported action ${kind} (${ref.name})`);
   }
 }
 emit('#[rustfmt::skip]');
 emit('pub(super) fn run<F>(&mut self, input: &[u8], callback: &mut F) -> Result<(), usize>');
-emit('where F: FnMut(&mut Parser, Event, Range<usize>) -> i32 {');
+emit('where F: Callbacks + ?Sized {');
 emit('let mut pos = 0;');
 emit('let mut match_value: i32 = 0;');
 emit('let mut state = self.state;');
@@ -372,12 +394,14 @@ function emitNodeBody(node) {
       emit('pos += 1;');emit('}');
       emit('if pos >= input.len() {');emit('self.sequence_index = index;');suspend();emit('}');
       emit('self.sequence_index = 0;');tail(ref.otherwise);break;
-    case 'Consume':
+    case 'Consume': {
+      const consume = consumeField(ref);
       emit('let available = (input.len() - pos) as u64;');
-      emit(`if available >= ${field(ref.field)}${type(ref.field) === 'u64' ? '' : ' as u64'} {`);
-      emit(`pos += ${field(ref.field)} as usize; ${field(ref.field)} = 0;`);
+      emit(`if available >= ${consume.limit} {`);
+      emit(`pos += ${consume.name} as usize; ${consume.name} = 0;`);
       tail(ref.otherwise);emit('}');
-      emit(`${field(ref.field)} -= available${type(ref.field) === 'u64' ? '' : ' as ' + type(ref.field)};`);suspend();break;
+      emit(consume.decrement);suspend();break;
+    }
     case 'SpanStart':
       assert.equal(ref.field.index,0);prologue();emit('self.span_start = pos;');
       emit(`self.span_callback = Some(Event::${eventName(ref.callback.ref.name)});`);tail(ref.otherwise);break;
@@ -419,6 +443,6 @@ const statistics = {
   nodes: nodeList.length, dispatchArms: dispatchNodes.length, fused: fused.size,
   emittedBodies, extraBodies: 0, blockLabels: emissionOrder.length, maxFusionDepth,
   forwardEdgeSites, backwardDispatchSites, labeledLoopBodies, directBackedgeSites,
-  blockScanCopies,
+  blockScanCopies, consumeShortcuts: consumeStates.length,
 };
 console.log(JSON.stringify(statistics));

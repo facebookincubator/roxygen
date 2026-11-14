@@ -1,4 +1,5 @@
 use super::*;
+use crate::llhttp::Callbacks;
 
 #[derive(Default)]
 struct HeaderSpan {
@@ -6,13 +7,19 @@ struct HeaderSpan {
 }
 
 impl HeaderSpan {
+    #[inline(always)]
     fn append(&mut self, owned: &mut Vec<u8>, input: &Bytes, range: Range<usize>) {
         if owned.is_empty() && self.borrowed.is_none() {
             self.borrowed = Some(range);
         } else {
-            self.spill(owned, input);
-            owned.extend_from_slice(&input[range]);
+            self.append_owned(owned, input, range);
         }
+    }
+
+    #[inline(never)]
+    fn append_owned(&mut self, owned: &mut Vec<u8>, input: &Bytes, range: Range<usize>) {
+        self.spill(owned, input);
+        owned.extend_from_slice(&input[range]);
     }
 
     fn bytes<'a>(&self, input: &'a Bytes, owned: &'a [u8]) -> &'a [u8] {
@@ -35,6 +42,356 @@ struct HeaderSpans {
     value: HeaderSpan,
 }
 
+/// The codec state that parser callbacks update while the parser runs over one
+/// input slice, or at EOF.
+struct Execution<'a, C: ?Sized> {
+    codec: &'a mut Http1xCodec,
+    input: &'a Bytes,
+    metadata_cursor: usize,
+    header_spans: HeaderSpans,
+    callback: &'a mut C,
+    callback_egress: &'a mut BufQueue,
+    result: &'a mut CodecIngressResult,
+}
+
+impl<C: IngressDelivery + ?Sized> Callbacks for Execution<'_, C> {
+    #[inline(always)]
+    fn on_event(&mut self, parser: &mut Parser, event: ParserEvent, range: Range<usize>) -> i32 {
+        self.event(parser, event, range)
+    }
+}
+
+impl<C: IngressDelivery + ?Sized> Execution<'_, C> {
+    /// Parses `input` until it is consumed or a callback pauses or fails, then
+    /// moves unfinished header spans into owned storage because `input` is not
+    /// retained after this call. Returns the consumed length and parser error.
+    #[inline(always)]
+    fn execute(&mut self, parser: &mut Parser) -> (usize, ParserError) {
+        let input = self.input;
+        let parsed = parser.execute_callbacks(input, self);
+        self.header_spans
+            .name
+            .spill(&mut self.codec.header_name, input);
+        self.header_spans
+            .value
+            .spill(&mut self.codec.header_value, input);
+        (parsed.consumed, parsed.error)
+    }
+
+    fn finish(&mut self, parser: &mut Parser) -> ParserError {
+        parser.finish_callbacks(self)
+    }
+
+    /// Routes each parser event to its handler.
+    #[inline(always)]
+    fn event(&mut self, parser: &mut Parser, event: ParserEvent, range: Range<usize>) -> i32 {
+        match event {
+            ParserEvent::HeaderField => {
+                if let Err(error) = self.account(range.end) {
+                    return self.fail(error);
+                }
+                self.header_spans
+                    .name
+                    .append(&mut self.codec.header_name, self.input, range);
+                self.continuation()
+            }
+            ParserEvent::HeaderValue => {
+                if let Err(error) = self.account(range.end) {
+                    return self.fail(error);
+                }
+                self.header_spans
+                    .value
+                    .append(&mut self.codec.header_value, self.input, range);
+                self.continuation()
+            }
+            ParserEvent::HeaderFieldComplete
+            | ParserEvent::Method
+            | ParserEvent::Version
+            | ParserEvent::ProtocolComplete
+            | ParserEvent::ChunkExtensionName
+            | ParserEvent::ChunkExtensionNameComplete
+            | ParserEvent::ChunkExtensionValue
+            | ParserEvent::ChunkExtensionValueComplete
+            | ParserEvent::Reset => {
+                if let Err(error) = self.account(range.end) {
+                    return self.fail(error);
+                }
+                self.continuation()
+            }
+            ParserEvent::HeaderValueComplete => self.header_value_complete(range.end),
+            ParserEvent::Body => self.body(range),
+            ParserEvent::MessageBegin
+            | ParserEvent::Protocol
+            | ParserEvent::Url
+            | ParserEvent::MethodComplete
+            | ParserEvent::UrlComplete
+            | ParserEvent::VersionComplete
+            | ParserEvent::Status
+            | ParserEvent::StatusComplete
+            | ParserEvent::HeadersComplete
+            | ParserEvent::ChunkHeader
+            | ParserEvent::ChunkComplete
+            | ParserEvent::MessageComplete => self.parser_event(parser, event, range),
+        }
+    }
+
+    #[inline(always)]
+    fn account(&mut self, end: usize) -> Result<(), (ParseErrorKind, &'static [u8])> {
+        if !self.codec.http09_synthetic
+            && matches!(
+                self.codec.phase,
+                IngressPhase::Headers | IngressPhase::Trailers
+            )
+        {
+            self.codec
+                .track_header_bytes(end.saturating_sub(self.metadata_cursor))?;
+        }
+        self.metadata_cursor = end;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn continuation(&self) -> i32 {
+        if self.codec.parser_paused {
+            ParserError::PAUSED.0
+        } else {
+            0
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fail(&mut self, (kind, message): (ParseErrorKind, &'static [u8])) -> i32 {
+        self.codec.fail(
+            kind,
+            message,
+            self.callback,
+            self.callback_egress,
+            self.result,
+        );
+        ParserError::USER.0
+    }
+
+    #[inline(never)]
+    fn header_value_complete(&mut self, end: usize) -> i32 {
+        let outcome = self
+            .account(end)
+            .and_then(|()| self.codec.finish_header(self.input, &mut self.header_spans));
+        if let Err(error) = outcome {
+            return self.fail(error);
+        }
+        self.continuation()
+    }
+
+    /// Handles the message, start-line, header-block and chunk events that
+    /// `event` routes here.
+    #[inline(never)]
+    fn parser_event(
+        &mut self,
+        parser: &mut Parser,
+        event: ParserEvent,
+        range: Range<usize>,
+    ) -> i32 {
+        let event_end = range.end;
+        let outcome = (|| -> Result<(), (ParseErrorKind, &'static [u8])> {
+            self.account(range.end)?;
+            match event {
+                ParserEvent::MessageBegin => {
+                    self.codec.phase = IngressPhase::Headers;
+                    self.codec.header_bytes = 0;
+                    self.codec.protocol_bytes = 0;
+                    self.codec.http09_request = false;
+                    self.codec.target.clear();
+                    self.codec.parsed_target = None;
+                    self.codec.reason.clear();
+                    self.codec.header_name.clear();
+                    self.codec.header_value.clear();
+                    self.header_spans = HeaderSpans::default();
+                    self.codec.trailers = None;
+                    self.codec
+                        .begin_message(self.callback, self.callback_egress, self.result);
+                    if self.codec.header_reserve_hint != 0
+                        && let Some(message) = self.codec.current_message.as_mut()
+                    {
+                        message
+                            .headers_mut()
+                            .reserve(self.codec.header_reserve_hint);
+                    }
+                }
+                ParserEvent::Protocol => {
+                    let end = self.codec.protocol_bytes + range.len();
+                    if b"HTTP".get(self.codec.protocol_bytes..end) != Some(&self.input[range]) {
+                        return Err((ParseErrorKind::Header, b"invalid HTTP protocol"));
+                    }
+                    self.codec.protocol_bytes = end;
+                }
+                ParserEvent::Url => {
+                    self.codec.http09_request |=
+                        matches!(self.input.get(range.end), Some(b'\r' | b'\n'));
+                    self.codec.target.extend_from_slice(&self.input[range]);
+                }
+                ParserEvent::MethodComplete => {
+                    if let Some(message) = self.codec.current_message.as_mut() {
+                        let method = Method::from_exact_token(parser.method_name().as_bytes())
+                            .ok_or((
+                                ParseErrorKind::Header,
+                                b"invalid HTTP request method".as_slice(),
+                            ))?;
+                        message.set_method(method).map_err(|_| {
+                            (
+                                ParseErrorKind::Header,
+                                b"invalid HTTP request method".as_slice(),
+                            )
+                        })?;
+                    }
+                }
+                ParserEvent::UrlComplete => {
+                    if let Some(message) = self.codec.current_message.as_mut() {
+                        self.codec.parsed_target = message.set_url(&self.codec.target, true).ok();
+                        message.set_http_version(parser.http_major, parser.http_minor);
+                    }
+                    self.codec.http09_request = parser.http_major == 0 && parser.http_minor == 9;
+                }
+                ParserEvent::VersionComplete => {
+                    self.codec.http09_request = parser.http_major == 0 && parser.http_minor == 9;
+                    if let Some(message) = self.codec.current_message.as_mut() {
+                        message.set_http_version(parser.http_major, parser.http_minor);
+                    }
+                }
+                ParserEvent::Status => {
+                    self.codec.reason.extend_from_slice(&self.input[range]);
+                }
+                ParserEvent::StatusComplete => {
+                    if let Some(message) = self.codec.current_message.as_mut() {
+                        let _ = message.set_status_code(parser.status_code);
+                        let _ = message.set_status_message(&self.codec.reason);
+                    }
+                }
+                ParserEvent::HeadersComplete => {
+                    let message = self.codec.finish_headers(parser)?;
+                    self.codec.header_reserve_hint = message.headers().len().min(64);
+                    self.codec.phase = IngressPhase::Body;
+                    self.codec.dispatch(
+                        self.callback,
+                        self.callback_egress,
+                        CodecEvent::HeadersComplete {
+                            stream: self.codec.ingress_stream,
+                            message,
+                        },
+                        self.result,
+                    );
+                    if self.codec.direction.is_downstream()
+                        && (!self.codec.ingress_upgrade
+                            || self.codec.downstream_upgrade_as_ordinary)
+                        && self.codec.connect_request
+                    {
+                        parser.upgrade = 0;
+                    }
+                }
+                ParserEvent::ChunkHeader => {
+                    if parser.content_length > i64::MAX as u64 {
+                        return Err((ParseErrorKind::Body, b"HTTP chunk length overflow"));
+                    }
+                    if parser.content_length == 0 {
+                        self.codec.phase = IngressPhase::Trailers;
+                        self.codec.header_bytes = 0;
+                    } else {
+                        self.codec.dispatch(
+                            self.callback,
+                            self.callback_egress,
+                            CodecEvent::ChunkHeader {
+                                stream: self.codec.ingress_stream,
+                                length: usize::try_from(parser.content_length).map_err(|_| {
+                                    (
+                                        ParseErrorKind::Body,
+                                        b"HTTP chunk length overflow".as_slice(),
+                                    )
+                                })?,
+                            },
+                            self.result,
+                        );
+                    }
+                }
+                ParserEvent::ChunkComplete => {
+                    if self.codec.phase != IngressPhase::Trailers {
+                        self.codec.dispatch(
+                            self.callback,
+                            self.callback_egress,
+                            CodecEvent::ChunkComplete {
+                                stream: self.codec.ingress_stream,
+                            },
+                            self.result,
+                        );
+                    }
+                }
+                ParserEvent::MessageComplete => {
+                    if let Some(trailers) = self.codec.trailers.take() {
+                        let trailers = Box::new(trailers);
+                        self.codec.dispatch(
+                            self.callback,
+                            self.callback_egress,
+                            CodecEvent::TrailersComplete {
+                                stream: self.codec.ingress_stream,
+                                trailers,
+                            },
+                            self.result,
+                        );
+                        if self.codec.parser_paused {
+                            self.codec.pending_message_complete = true;
+                            return Ok(());
+                        }
+                    }
+                    self.codec.complete_message(
+                        self.callback,
+                        self.callback_egress,
+                        self.result,
+                        self.codec.ingress_upgrade,
+                    );
+                }
+                _ => {}
+            }
+            Ok(())
+        })();
+        if let Err((kind, message)) = outcome {
+            self.codec.fail(
+                kind,
+                message,
+                self.callback,
+                self.callback_egress,
+                self.result,
+            );
+            return ParserError::USER.0;
+        }
+        let metadata_boundary = event == ParserEvent::MessageBegin
+            || (event == ParserEvent::ChunkHeader && parser.content_length == 0);
+        if self.codec.parser_paused
+            || (metadata_boundary
+                && self.input.len().saturating_sub(event_end) > MAX_HEADER_BYTES + 1)
+            || (event == ParserEvent::UrlComplete
+                && self.codec.http09_request
+                && !self.codec.http09_synthetic)
+        {
+            ParserError::PAUSED.0
+        } else {
+            0
+        }
+    }
+
+    #[inline(never)]
+    fn body(&mut self, range: Range<usize>) -> i32 {
+        if let Err(error) = self.account(range.end) {
+            return self.fail(error);
+        }
+        self.codec.emit_body(
+            self.input.slice(range),
+            self.callback,
+            self.callback_egress,
+            self.result,
+        );
+        self.continuation()
+    }
+}
+
 impl Http1xCodec {
     fn track_header_bytes(&mut self, amount: usize) -> Result<(), (ParseErrorKind, &'static [u8])> {
         self.header_bytes = self.header_bytes.saturating_add(amount);
@@ -51,6 +408,7 @@ impl Http1xCodec {
         }
     }
 
+    #[inline]
     fn finish_header(
         &mut self,
         input: &Bytes,
@@ -250,203 +608,6 @@ impl Http1xCodec {
         Ok(())
     }
 
-    fn parser_event(
-        &mut self,
-        parser: &mut Parser,
-        event: ParserEvent,
-        range: Range<usize>,
-        input: &Bytes,
-        metadata_cursor: &mut usize,
-        header_spans: &mut HeaderSpans,
-        callback: &mut (impl IngressDelivery + ?Sized),
-        callback_egress: &mut BufQueue,
-        result: &mut CodecIngressResult,
-    ) -> i32 {
-        let event_end = range.end;
-        let outcome = (|| -> Result<(), (ParseErrorKind, &'static [u8])> {
-            if !self.http09_synthetic
-                && matches!(self.phase, IngressPhase::Headers | IngressPhase::Trailers)
-            {
-                self.track_header_bytes(range.end.saturating_sub(*metadata_cursor))?;
-            }
-            *metadata_cursor = range.end;
-            match event {
-                ParserEvent::MessageBegin => {
-                    self.phase = IngressPhase::Headers;
-                    self.header_bytes = 0;
-                    self.protocol_bytes = 0;
-                    self.http09_request = false;
-                    self.target.clear();
-                    self.parsed_target = None;
-                    self.reason.clear();
-                    self.header_name.clear();
-                    self.header_value.clear();
-                    *header_spans = HeaderSpans::default();
-                    self.trailers = None;
-                    self.begin_message(callback, callback_egress, result);
-                    if self.header_reserve_hint != 0
-                        && let Some(message) = self.current_message.as_mut()
-                    {
-                        message.headers_mut().reserve(self.header_reserve_hint);
-                    }
-                }
-                ParserEvent::Protocol => {
-                    let end = self.protocol_bytes + range.len();
-                    if b"HTTP".get(self.protocol_bytes..end) != Some(&input[range]) {
-                        return Err((ParseErrorKind::Header, b"invalid HTTP protocol"));
-                    }
-                    self.protocol_bytes = end;
-                }
-                ParserEvent::Url => {
-                    self.http09_request |= matches!(input.get(range.end), Some(b'\r' | b'\n'));
-                    self.target.extend_from_slice(&input[range]);
-                }
-                ParserEvent::MethodComplete => {
-                    if let Some(message) = self.current_message.as_mut() {
-                        let method = Method::from_exact_token(parser.method_name().as_bytes())
-                            .ok_or((
-                                ParseErrorKind::Header,
-                                b"invalid HTTP request method".as_slice(),
-                            ))?;
-                        message.set_method(method).map_err(|_| {
-                            (
-                                ParseErrorKind::Header,
-                                b"invalid HTTP request method".as_slice(),
-                            )
-                        })?;
-                    }
-                }
-                ParserEvent::UrlComplete => {
-                    if let Some(message) = self.current_message.as_mut() {
-                        self.parsed_target = message.set_url(&self.target, true).ok();
-                        message.set_http_version(parser.http_major, parser.http_minor);
-                    }
-                    self.http09_request = parser.http_major == 0 && parser.http_minor == 9;
-                }
-                ParserEvent::VersionComplete => {
-                    self.http09_request = parser.http_major == 0 && parser.http_minor == 9;
-                    if let Some(message) = self.current_message.as_mut() {
-                        message.set_http_version(parser.http_major, parser.http_minor);
-                    }
-                }
-                ParserEvent::Status => {
-                    self.reason.extend_from_slice(&input[range]);
-                }
-                ParserEvent::StatusComplete => {
-                    if let Some(message) = self.current_message.as_mut() {
-                        let _ = message.set_status_code(parser.status_code);
-                        let _ = message.set_status_message(&self.reason);
-                    }
-                }
-                ParserEvent::HeaderField => {
-                    header_spans
-                        .name
-                        .append(&mut self.header_name, input, range);
-                }
-                ParserEvent::HeaderValue => {
-                    header_spans
-                        .value
-                        .append(&mut self.header_value, input, range);
-                }
-                ParserEvent::HeaderValueComplete => self.finish_header(input, header_spans)?,
-                ParserEvent::HeadersComplete => {
-                    let message = self.finish_headers(parser)?;
-                    self.header_reserve_hint = message.headers().len().min(64);
-                    self.phase = IngressPhase::Body;
-                    self.dispatch(
-                        callback,
-                        callback_egress,
-                        CodecEvent::HeadersComplete {
-                            stream: self.ingress_stream,
-                            message,
-                        },
-                        result,
-                    );
-                    if self.direction.is_downstream()
-                        && (!self.ingress_upgrade || self.downstream_upgrade_as_ordinary)
-                        && self.connect_request
-                    {
-                        parser.upgrade = 0;
-                    }
-                }
-                ParserEvent::Body => {
-                    self.emit_body(input.slice(range), callback, callback_egress, result)
-                }
-                ParserEvent::ChunkHeader => {
-                    if parser.content_length > i64::MAX as u64 {
-                        return Err((ParseErrorKind::Body, b"HTTP chunk length overflow"));
-                    }
-                    if parser.content_length == 0 {
-                        self.phase = IngressPhase::Trailers;
-                        self.header_bytes = 0;
-                    } else {
-                        self.dispatch(
-                            callback,
-                            callback_egress,
-                            CodecEvent::ChunkHeader {
-                                stream: self.ingress_stream,
-                                length: usize::try_from(parser.content_length).map_err(|_| {
-                                    (
-                                        ParseErrorKind::Body,
-                                        b"HTTP chunk length overflow".as_slice(),
-                                    )
-                                })?,
-                            },
-                            result,
-                        );
-                    }
-                }
-                ParserEvent::ChunkComplete => {
-                    if self.phase != IngressPhase::Trailers {
-                        self.dispatch(
-                            callback,
-                            callback_egress,
-                            CodecEvent::ChunkComplete {
-                                stream: self.ingress_stream,
-                            },
-                            result,
-                        );
-                    }
-                }
-                ParserEvent::MessageComplete => {
-                    if let Some(trailers) = self.trailers.take() {
-                        let trailers = Box::new(trailers);
-                        self.dispatch(
-                            callback,
-                            callback_egress,
-                            CodecEvent::TrailersComplete {
-                                stream: self.ingress_stream,
-                                trailers,
-                            },
-                            result,
-                        );
-                        if self.parser_paused {
-                            self.pending_message_complete = true;
-                            return Ok(());
-                        }
-                    }
-                    self.complete_message(callback, callback_egress, result, self.ingress_upgrade);
-                }
-                _ => {}
-            }
-            Ok(())
-        })();
-        if let Err((kind, message)) = outcome {
-            self.fail(kind, message, callback, callback_egress, result);
-            return ParserError::USER.0;
-        }
-        let metadata_boundary = event == ParserEvent::MessageBegin
-            || (event == ParserEvent::ChunkHeader && parser.content_length == 0);
-        if self.parser_paused
-            || (metadata_boundary && input.len().saturating_sub(event_end) > MAX_HEADER_BYTES + 1)
-            || (event == ParserEvent::UrlComplete && self.http09_request && !self.http09_synthetic)
-        {
-            ParserError::PAUSED.0
-        } else {
-            0
-        }
-    }
-
     pub(super) fn parse_ingress(
         &mut self,
         input: &BufQueue,
@@ -484,39 +645,15 @@ impl Http1xCodec {
         if self.parser_error {
             return result;
         }
-        if self.phase == IngressPhase::Upgraded && self.ingress_upgrade {
-            self.ingress_upgrade_complete = true;
-        }
-        if self.ingress_upgrade_complete {
-            if self.parser_paused && !self.upgrade_pause {
-                return result;
-            }
-            result.consumed = input.len();
-            self.emit_body(input.clone(), callback, callback_egress, &mut result);
-            return result;
-        }
-        if self.parser_paused {
-            return result;
-        }
-        if self.pending_message_complete {
-            self.pending_message_complete = false;
-            self.complete_message(callback, callback_egress, &mut result, self.ingress_upgrade);
-            if self.parser_paused {
-                return result;
-            }
-        }
-        if self.expect_http_09_response
-            && self.direction.is_upstream()
-            && self.phase == IngressPhase::Idle
-            && !input.is_empty()
+        if self.ingress_upgrade_complete
+            || self.pending_message_complete
+            || self.expect_http_09_response
+            || matches!(self.phase, IngressPhase::Upgraded | IngressPhase::Http09)
         {
-            self.begin_http_09_response(callback, callback_egress, &mut result);
-        }
-        if self.phase == IngressPhase::Http09 {
-            if !self.parser_paused {
-                result.consumed = input.len();
-                self.emit_body(input.clone(), callback, callback_egress, &mut result);
+            if !self.segment_prelude(input, callback, callback_egress, &mut result) {
+                return result;
             }
+        } else if self.parser_paused {
             return result;
         }
         let mut parser = self
@@ -549,68 +686,34 @@ impl Http1xCodec {
                 tail = input.slice(offset..offset + length);
                 &tail
             };
-            let mut metadata_cursor = 0;
-            let mut header_spans = HeaderSpans::default();
-            let parsed = parser.execute(segment, |parser, event, range| {
-                self.parser_event(
-                    parser,
-                    event,
-                    range,
-                    segment,
-                    &mut metadata_cursor,
-                    &mut header_spans,
-                    callback,
-                    callback_egress,
-                    &mut result,
-                )
-            });
-            header_spans.name.spill(&mut self.header_name, segment);
-            header_spans.value.spill(&mut self.header_value, segment);
-            offset += parsed.consumed;
+            let mut execution = Execution {
+                codec: self,
+                input: segment,
+                metadata_cursor: 0,
+                header_spans: HeaderSpans::default(),
+                callback,
+                callback_egress,
+                result: &mut result,
+            };
+            let (consumed, parse_error) = execution.execute(&mut parser);
+            let metadata_cursor = execution.metadata_cursor;
+            offset += consumed;
             result.consumed = offset;
             if !self.parser_error
                 && matches!(self.phase, IngressPhase::Headers | IngressPhase::Trailers)
                 && let Err((kind, message)) =
-                    self.track_header_bytes(parsed.consumed.saturating_sub(metadata_cursor))
+                    self.track_header_bytes(consumed.saturating_sub(metadata_cursor))
             {
                 self.fail(kind, message, callback, callback_egress, &mut result);
             }
             let error = if self.http09_request
-                && (parsed.error == ParserError::PAUSED
-                    || (parsed.error == ParserError::OK && segment.last() == Some(&b'\n')))
+                && (parse_error == ParserError::PAUSED
+                    || (parse_error == ParserError::OK && segment.last() == Some(&b'\n')))
                 && !self.parser_error
             {
-                self.http09_synthetic = true;
-                parser.resume();
-                let empty_headers = Bytes::from_static(b"\r\n");
-                let mut metadata_cursor = 0;
-                let mut header_spans = HeaderSpans::default();
-                let error = parser
-                    .execute(&empty_headers, |parser, event, range| {
-                        self.parser_event(
-                            parser,
-                            event,
-                            range,
-                            &empty_headers,
-                            &mut metadata_cursor,
-                            &mut header_spans,
-                            callback,
-                            callback_egress,
-                            &mut result,
-                        )
-                    })
-                    .error;
-                header_spans
-                    .name
-                    .spill(&mut self.header_name, &empty_headers);
-                header_spans
-                    .value
-                    .spill(&mut self.header_value, &empty_headers);
-                self.http09_synthetic = false;
-                self.http09_request = false;
-                error
+                self.end_http09_request_head(&mut parser, callback, callback_egress, &mut result)
             } else {
-                parsed.error
+                parse_error
             };
             if error == ParserError::PAUSED_UPGRADE {
                 self.upgrade_pause |= !self.parser_paused;
@@ -628,13 +731,90 @@ impl Http1xCodec {
             if self.parser_paused
                 || self.parser_error
                 || offset == input.len()
-                || (parsed.error != ParserError::PAUSED && parsed.consumed != length)
+                || (parse_error != ParserError::PAUSED && consumed != length)
             {
                 break;
             }
         }
         self.parser = Some(parser);
         result
+    }
+
+    /// Handles the upgrade, pending completion and HTTP/0.9 states that precede
+    /// parsing, in order, including forwarding upgraded tunnel bytes and HTTP/0.9
+    /// response bodies. Returns whether the parser should run on `input`.
+    #[inline(never)]
+    fn segment_prelude(
+        &mut self,
+        input: &Bytes,
+        callback: &mut (impl IngressDelivery + ?Sized),
+        callback_egress: &mut BufQueue,
+        result: &mut CodecIngressResult,
+    ) -> bool {
+        if self.phase == IngressPhase::Upgraded && self.ingress_upgrade {
+            self.ingress_upgrade_complete = true;
+        }
+        if self.ingress_upgrade_complete {
+            if self.parser_paused && !self.upgrade_pause {
+                return false;
+            }
+            result.consumed = input.len();
+            self.emit_body(input.clone(), callback, callback_egress, result);
+            return false;
+        }
+        if self.parser_paused {
+            return false;
+        }
+        if self.pending_message_complete {
+            self.pending_message_complete = false;
+            self.complete_message(callback, callback_egress, result, self.ingress_upgrade);
+            if self.parser_paused {
+                return false;
+            }
+        }
+        if self.expect_http_09_response
+            && self.direction.is_upstream()
+            && self.phase == IngressPhase::Idle
+            && !input.is_empty()
+        {
+            self.begin_http_09_response(callback, callback_egress, result);
+        }
+        if self.phase == IngressPhase::Http09 {
+            if !self.parser_paused {
+                result.consumed = input.len();
+                self.emit_body(input.clone(), callback, callback_egress, result);
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Supplies the empty header block that ends an HTTP/0.9 request line.
+    #[cold]
+    #[inline(never)]
+    fn end_http09_request_head(
+        &mut self,
+        parser: &mut Parser,
+        callback: &mut (impl IngressDelivery + ?Sized),
+        callback_egress: &mut BufQueue,
+        result: &mut CodecIngressResult,
+    ) -> ParserError {
+        self.http09_synthetic = true;
+        parser.resume();
+        let empty_headers = Bytes::from_static(b"\r\n");
+        let (_, error) = Execution {
+            codec: self,
+            input: &empty_headers,
+            metadata_cursor: 0,
+            header_spans: HeaderSpans::default(),
+            callback,
+            callback_egress,
+            result,
+        }
+        .execute(parser);
+        self.http09_synthetic = false;
+        self.http09_request = false;
+        error
     }
 
     pub(super) fn finish_parser(
@@ -670,43 +850,22 @@ impl Http1xCodec {
                 .take()
                 .expect("parser is installed outside its callbacks");
             parser.resume();
-            let mut metadata_cursor = 0;
-            let mut header_spans = HeaderSpans::default();
-            let mut error = parser
-                .execute(&[], |parser, event, range| {
-                    self.parser_event(
-                        parser,
-                        event,
-                        range,
-                        &Bytes::new(),
-                        &mut metadata_cursor,
-                        &mut header_spans,
-                        callback,
-                        callback_egress,
-                        &mut result,
-                    )
-                })
-                .error;
-            header_spans
-                .name
-                .spill(&mut self.header_name, &Bytes::new());
-            header_spans
-                .value
-                .spill(&mut self.header_value, &Bytes::new());
-            if error == ParserError::OK && self.phase != IngressPhase::Idle && !self.parser_paused {
-                error = parser.finish(|parser, event, range| {
-                    self.parser_event(
-                        parser,
-                        event,
-                        range,
-                        &Bytes::new(),
-                        &mut metadata_cursor,
-                        &mut header_spans,
-                        callback,
-                        callback_egress,
-                        &mut result,
-                    )
-                });
+            let empty = Bytes::new();
+            let mut execution = Execution {
+                codec: self,
+                input: &empty,
+                metadata_cursor: 0,
+                header_spans: HeaderSpans::default(),
+                callback,
+                callback_egress,
+                result: &mut result,
+            };
+            let (_, mut error) = execution.execute(&mut parser);
+            if error == ParserError::OK
+                && execution.codec.phase != IngressPhase::Idle
+                && !execution.codec.parser_paused
+            {
+                error = execution.finish(&mut parser);
             }
             self.parser = Some(parser);
             if error == ParserError::PAUSED_UPGRADE {

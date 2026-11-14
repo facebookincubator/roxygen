@@ -18,6 +18,7 @@ pub(crate) use generated::Event;
 pub(crate) use generated::ParserType;
 pub(crate) use generated::flags;
 pub(crate) use generated::lenient_flags;
+pub(crate) use runtime::Callbacks;
 pub(crate) use runtime::Parser;
 
 #[cfg(test)]

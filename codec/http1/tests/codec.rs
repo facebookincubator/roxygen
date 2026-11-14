@@ -9476,3 +9476,135 @@ fn llhttp_header_spans_preserve_fragmented_and_pipelined_fields() {
         }
     }
 }
+
+#[test]
+fn llhttp_fixed_bodies_continue_across_reads_and_body_pauses() {
+    #[derive(Default)]
+    struct PauseOnBody {
+        bodies: Vec<Vec<u8>>,
+        completions: usize,
+        errors: usize,
+    }
+    impl HttpCodecCallback for PauseOnBody {
+        fn on_event(&mut self, _event: CodecEvent<'_>) {}
+
+        fn on_ingress_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
+            match event {
+                CodecEvent::Body { body, .. } => {
+                    self.bodies
+                        .push(body.segments().flatten().copied().collect());
+                    return vec![CodecCallbackAction::SetParserPaused(true)].into();
+                }
+                CodecEvent::MessageComplete { .. } => self.completions += 1,
+                CodecEvent::Error { .. } => self.errors += 1,
+                _ => {}
+            }
+            CodecCallbackActions::new()
+        }
+    }
+
+    let first = b"POST /first HTTP/1.1\r\nContent-Length: 10\r\n\r\n";
+    let second = b"POST /second HTTP/1.1\r\nContent-Length: 3\r\n\r\n";
+    let wire = [first.as_slice(), b"0123456789", second, b"abc"].concat();
+    let body_ranges = [first.len()..first.len() + 10, wire.len() - 3..wire.len()];
+    for dispatch in CallbackDispatch::ALL {
+        for width in [1, 2, 3, 7, 16, wire.len()] {
+            let chunks: Vec<Range<usize>> = (0..wire.len())
+                .step_by(width)
+                .map(|start| start..(start + width).min(wire.len()))
+                .collect();
+            // Each body callback carries the body bytes of exactly one read.
+            let expected: Vec<Vec<u8>> = chunks
+                .iter()
+                .flat_map(|chunk| {
+                    body_ranges.iter().filter_map(|body| {
+                        let start = chunk.start.max(body.start);
+                        let end = chunk.end.min(body.end);
+                        (start < end).then(|| wire[start..end].to_vec())
+                    })
+                })
+                .collect();
+
+            let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+            let mut recorder = Recorder::default();
+            let mut egress = BufQueue::new(QUEUE_LIMIT);
+            let mut segmented = BufQueue::new(wire.len());
+            for chunk in &chunks {
+                segmented
+                    .push_bytes(Bytes::copy_from_slice(&wire[chunk.clone()]))
+                    .expect("segment fits the exact queue limit");
+            }
+            let result = dispatch.ingress(&mut codec, &segmented, &mut recorder, &mut egress);
+            assert_eq!(result.consumed, wire.len(), "{dispatch:?}, width={width}");
+            assert!(recorder.errors.is_empty(), "{dispatch:?}, width={width}");
+            assert_eq!(
+                recorder.bodies, b"0123456789abc",
+                "{dispatch:?}, width={width}"
+            );
+            assert_eq!(
+                recorder
+                    .events
+                    .iter()
+                    .filter(|event| **event == "body")
+                    .count(),
+                expected.len(),
+                "one body callback per segment holding body bytes: {dispatch:?}, width={width}"
+            );
+            assert_eq!(recorder.completions, [false, false]);
+
+            let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+            let mut recorder = Recorder::default();
+            for chunk in &chunks {
+                let input = ingress_queue(&wire[chunk.clone()]);
+                assert_eq!(
+                    dispatch
+                        .ingress(&mut codec, &input, &mut recorder, &mut egress)
+                        .consumed,
+                    chunk.len(),
+                );
+                assert_eq!(
+                    recorder.completions.len(),
+                    body_ranges
+                        .iter()
+                        .filter(|body| body.end <= chunk.end)
+                        .count(),
+                    "a message completes in the read holding its last body byte: {dispatch:?}, width={width}"
+                );
+            }
+            assert_eq!(
+                recorder.bodies, b"0123456789abc",
+                "{dispatch:?}, width={width}"
+            );
+
+            let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+            let mut callback = PauseOnBody::default();
+            for chunk in &chunks {
+                let mut offset = chunk.start;
+                while offset < chunk.end {
+                    let input = ingress_queue(&wire[offset..chunk.end]);
+                    offset += dispatch
+                        .ingress(&mut codec, &input, &mut callback, &mut egress)
+                        .consumed;
+                    assert!(
+                        offset == chunk.end || codec.is_parser_paused(),
+                        "a read stops early only at a body pause: {dispatch:?}, width={width}"
+                    );
+                    codec.set_parser_paused(false);
+                }
+            }
+            let resumed = dispatch.ingress(
+                &mut codec,
+                &BufQueue::new(QUEUE_LIMIT),
+                &mut callback,
+                &mut egress,
+            );
+            assert_eq!(resumed.consumed, 0, "an empty read only resumes");
+            assert_eq!(callback.errors, 0, "{dispatch:?}, width={width}");
+            assert_eq!(callback.bodies, expected, "{dispatch:?}, width={width}");
+            assert_eq!(
+                callback.completions, 2,
+                "both messages complete after the final resume: {dispatch:?}, width={width}"
+            );
+        }
+    }
+}

@@ -172,7 +172,7 @@ pub struct Http1xCodec {
     /// `upstream_upgrade_as_ordinary`, so its response is read as an ordinary response.
     ordinary_request_sent: bool,
     release_egress_after_request: bool,
-    parser: Option<Parser>,
+    parser: Option<Box<Parser>>,
     phase: IngressPhase,
     header_name: Vec<u8>,
     header_value: Vec<u8>,
@@ -262,11 +262,11 @@ impl Http1xCodec {
             upstream_upgrade_as_ordinary: false,
             ordinary_request_sent: false,
             release_egress_after_request: false,
-            parser: Some(Parser::new(if direction.is_downstream() {
+            parser: Some(Box::new(Parser::new(if direction.is_downstream() {
                 ParserType::Request
             } else {
                 ParserType::Response
-            })),
+            }))),
             phase: IngressPhase::Idle,
             header_name: Vec::new(),
             header_value: Vec::new(),

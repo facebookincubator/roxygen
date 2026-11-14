@@ -14,6 +14,22 @@ use super::generated::finish;
 use super::generated::methods;
 use super::lenient_flags;
 
+/// Receives parser callbacks. A callback returns an llhttp callback code; in
+/// particular, `Error::PAUSED.0` suspends execution at a callback boundary.
+pub(crate) trait Callbacks {
+    fn on_event(&mut self, parser: &mut Parser, event: Event, range: Range<usize>) -> i32;
+}
+
+impl<F> Callbacks for F
+where
+    F: FnMut(&mut Parser, Event, Range<usize>) -> i32,
+{
+    #[inline(always)]
+    fn on_event(&mut self, parser: &mut Parser, event: Event, range: Range<usize>) -> i32 {
+        self(parser, event, range)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ExecuteResult {
     pub(crate) consumed: usize,
@@ -70,11 +86,24 @@ impl Parser {
         }
     }
 
-    /// Callbacks return llhttp callback codes. In particular, return
-    /// `Error::PAUSED.0` to suspend execution at a callback boundary.
+    /// Closure form of [`Parser::execute_callbacks`].
+    #[allow(
+        dead_code,
+        reason = "Closure entry point for tests and the standalone upstream comparison harness"
+    )]
     pub(crate) fn execute<F>(&mut self, input: &[u8], mut callback: F) -> ExecuteResult
     where
         F: FnMut(&mut Parser, Event, Range<usize>) -> i32,
+    {
+        self.execute_callbacks(input, &mut callback)
+    }
+
+    /// Parses `input` until it is consumed or a callback pauses or fails. After
+    /// a pause, resume and pass the unconsumed suffix.
+    #[inline(always)]
+    pub(crate) fn execute_callbacks<C>(&mut self, input: &[u8], callbacks: &mut C) -> ExecuteResult
+    where
+        C: Callbacks + ?Sized,
     {
         if self.error != Error::OK {
             return ExecuteResult {
@@ -85,7 +114,9 @@ impl Parser {
         if self.span_callback.is_some() {
             self.span_start = 0;
         }
-        if let Err(consumed) = self.run(input, &mut callback) {
+        if !self.consume_without_transition(input.len())
+            && let Err(consumed) = self.run(input, callbacks)
+        {
             self.error_pos = consumed;
             return ExecuteResult {
                 consumed,
@@ -93,7 +124,7 @@ impl Parser {
             };
         }
         if let Some(event) = self.span_callback {
-            let error = self.span(&mut callback, event, self.span_start..input.len());
+            let error = self.span(callbacks, event, self.span_start..input.len());
             if error != 0 {
                 self.error = Error(error);
                 self.error_pos = input.len();
@@ -112,9 +143,9 @@ impl Parser {
     #[inline(always)]
     pub(super) fn span<F>(&mut self, callback: &mut F, event: Event, range: Range<usize>) -> i32
     where
-        F: FnMut(&mut Parser, Event, Range<usize>) -> i32,
+        F: Callbacks + ?Sized,
     {
-        let result = callback(self, event, range);
+        let result = callback.on_event(self, event, range);
         if result == -1 {
             self.reason = event.span_error_reason();
             Error::USER.0
@@ -123,17 +154,26 @@ impl Parser {
         }
     }
 
-    /// End-of-input is separate from executing an empty slice, which resumes
-    /// transitions left pending by a callback pause at the end of a segment.
+    /// Closure form of [`Parser::finish_callbacks`].
+    #[allow(
+        dead_code,
+        reason = "Closure entry point for tests and the standalone upstream comparison harness"
+    )]
     pub(crate) fn finish<F>(&mut self, mut callback: F) -> Error
     where
         F: FnMut(&mut Parser, Event, Range<usize>) -> i32,
     {
+        self.finish_callbacks(&mut callback)
+    }
+
+    /// End-of-input is separate from executing an empty slice, which resumes
+    /// transitions left pending by a callback pause at the end of a segment.
+    pub(crate) fn finish_callbacks<C: Callbacks + ?Sized>(&mut self, callbacks: &mut C) -> Error {
         if self.error != Error::OK {
             return Error::OK;
         }
         match self.finish_state {
-            finish::SAFE_WITH_CB => Error(callback(self, Event::MessageComplete, 0..0)),
+            finish::SAFE_WITH_CB => Error(callbacks.on_event(self, Event::MessageComplete, 0..0)),
             finish::SAFE => Error::OK,
             _ => {
                 self.reason = "Invalid EOF state";
