@@ -109,6 +109,7 @@ impl Parser {
         }
     }
 
+    #[inline(always)]
     pub(super) fn span<F>(&mut self, callback: &mut F, event: Event, range: Range<usize>) -> i32
     where
         F: FnMut(&mut Parser, Event, Range<usize>) -> i32,
