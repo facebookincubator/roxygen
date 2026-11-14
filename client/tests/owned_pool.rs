@@ -998,6 +998,62 @@ fn a_waiter_dials_a_replacement_when_the_only_session_closes_admission() {
     );
 }
 
+/// A reservation reports whether the pool dialed its connection for the acquisition that
+/// returned it (`DIV-046`), as hyper-util tells a new connection from a reused one: the first
+/// acquisition's, handed its own dial's session, was dialed for it; one that took that session
+/// idle, one taken on the session's handle, and one whose acquisition waited at
+/// `max_connections` for a session dialed for an acquisition dropped before its dial
+/// completed, were not.
+#[test]
+fn a_reservation_reports_whether_its_connection_was_dialed_for_its_acquisition() {
+    for protocol in PROTOCOLS {
+        let origin = Origin::start(protocol);
+        let address = origin.address;
+        let reported = run_on_worker(move |context| async move {
+            let pool = pool_with(&context, address, protocol, params(1), one_stream(protocol));
+            let first = acquire(&pool).await;
+            let dialed = first.reservation.dialed_for_acquisition();
+            let session = first.session.clone();
+            assert_eq!(exchange(first.reservation, "/").await, b"ok");
+            settle(&session).await;
+            let idle = acquire(&pool).await;
+            let taken_idle = idle.reservation.dialed_for_acquisition();
+            drop(idle);
+            settle(&session).await;
+            let direct = session
+                .reserve_request()
+                .expect("the idle session admits a reservation")
+                .dialed_for_acquisition();
+
+            let capped = pool_with(&context, address, protocol, params(1), one_stream(protocol));
+            let mut dropped =
+                Box::pin(capped.get_session_with_reservation(CancellationToken::never()));
+            let mut waiting = pin!(capped.get_session_with_reservation(CancellationToken::never()));
+            assert!(
+                poll_once(dropped.as_mut()).await.is_pending(),
+                "the empty pool dials"
+            );
+            assert!(
+                poll_once(waiting.as_mut()).await.is_pending(),
+                "the pending dial holds the pool's one connection"
+            );
+            drop(dropped);
+            let other = waiting
+                .await
+                .expect("the waiter takes the dropped acquisition's session")
+                .reservation
+                .dialed_for_acquisition();
+            (dialed, taken_idle, direct, other)
+        });
+        assert_eq!(
+            (reported, origin.accepted()),
+            ((true, false, false, false), 2),
+            "{protocol:?}: ((handed its own dial's session, taken idle, taken on the handle, \
+             dialed for a dropped acquisition), connections)"
+        );
+    }
+}
+
 #[test]
 fn a_connection_close_response_retires_its_session() {
     let origin = Origin::start(CodecProtocol::Http11);

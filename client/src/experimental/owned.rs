@@ -59,9 +59,10 @@
 //! and one that would dial waits instead for an HTTP/1.1 session whose driver returns its
 //! slot at its next turn. An acquisition that dials is handed its dial's session, reserved for
 //! it when the dial completes, if it still waits then, as hyper-util sends a request on the
-//! connection it dialed for it. In an HTTP/1.1 pool a dial that fails after its attempts
-//! fails it with the dial's error, as hyper-util fails a request whose connect fails; an
-//! HTTP/2 pool's fails waiters as `HttpSessionPool`'s does.
+//! connection it dialed for it, which [`OwnedClientReservation::dialed_for_acquisition`]
+//! reports. In an HTTP/1.1 pool a dial that fails after its attempts fails it with the dial's
+//! error, as hyper-util fails a request whose connect fails; an HTTP/2 pool's fails waiters
+//! as `HttpSessionPool`'s does.
 //! [`OwnedHttpSessionPool::set_session_selection`] opts into taking the least loaded of the
 //! sessions that can take an exchange (`DIV-048`). A reservation
 //! taken on a pooled session's handle reaches its pool as one the pool's acquisition made,
@@ -576,10 +577,13 @@ impl OwnedClientSession {
     }
 
     fn reserve_upstream(&self) -> Result<OwnedClientReservation, HttpError> {
-        Ok(OwnedClientReservation(match &self.inner.upstream {
-            Upstream::Http1(handle) => Reservation::Http1(handle.reserve_request()?),
-            Upstream::Http2(handle) => Reservation::Http2(handle.reserve_request()?),
-        }))
+        Ok(OwnedClientReservation {
+            upstream: match &self.inner.upstream {
+                Upstream::Http1(handle) => Reservation::Http1(handle.reserve_request()?),
+                Upstream::Http2(handle) => Reservation::Http2(handle.reserve_request()?),
+            },
+            dialed_for_acquisition: false,
+        })
     }
 
     /// Closes admission and closes the connection once its exchanges retire.
@@ -1062,7 +1066,10 @@ fn drain(upstream: &Upstream) -> Option<HttpError> {
 
 /// One admission slot of an [`OwnedClientSession`], returned exactly once if
 /// it is not submitted.
-pub struct OwnedClientReservation(Reservation);
+pub struct OwnedClientReservation {
+    upstream: Reservation,
+    dialed_for_acquisition: bool,
+}
 
 enum Reservation {
     Http1(OwnedH1UpstreamReservation),
@@ -1070,6 +1077,22 @@ enum Reservation {
 }
 
 impl OwnedClientReservation {
+    /// Whether an [`OwnedHttpSessionPool`] dialed this reservation's connection for the
+    /// acquisition that returned the reservation, and reserved it when the dial completed
+    /// (`DIV-046`). hyper-util's legacy pool calls such a connection new and every connection
+    /// its checkout takes reused, one dialed for another request included, and resends a
+    /// request refused before it was written only on a reused one. A reservation an
+    /// acquisition took on a session it selected, idle, returning or dialed for another
+    /// acquisition, or one taken with [`OwnedClientSession::reserve_request`], was not dialed
+    /// for its acquisition.
+    pub fn dialed_for_acquisition(&self) -> bool {
+        self.dialed_for_acquisition
+    }
+
+    pub(crate) fn mark_dialed_for_acquisition(&mut self) {
+        self.dialed_for_acquisition = true;
+    }
+
     /// Submits an already-read request head and its body source. The
     /// submission resolves at the driver's commitment, with the response's
     /// fresh source.
@@ -1079,7 +1102,7 @@ impl OwnedClientReservation {
         source: impl Into<HttpBodySource>,
         cancellation: CancellationToken,
     ) -> OwnedClientSubmission {
-        OwnedClientSubmission(match self.0 {
+        OwnedClientSubmission(match self.upstream {
             Reservation::Http1(reservation) => {
                 Submission::Http1(reservation.submit_exclusive(headers, source, cancellation))
             }
@@ -1100,7 +1123,7 @@ impl OwnedClientReservation {
         cancellation: CancellationToken,
         producer_completion: Option<IngressCompletion>,
     ) -> OwnedClientSubmission {
-        OwnedClientSubmission(match self.0 {
+        OwnedClientSubmission(match self.upstream {
             Reservation::Http1(reservation) => {
                 Submission::Http1(reservation.submit_with_response_interest(
                     headers,
@@ -1131,7 +1154,7 @@ impl OwnedClientReservation {
         source: impl Into<HttpBodySource>,
         cancellation: CancellationToken,
     ) -> OwnedClientPullThroughSubmission {
-        OwnedClientPullThroughSubmission(match self.0 {
+        OwnedClientPullThroughSubmission(match self.upstream {
             Reservation::Http1(reservation) => PullThroughSubmission::Http1(
                 reservation.submit_pull_through(headers, source, cancellation),
             ),

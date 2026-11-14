@@ -1335,8 +1335,9 @@ impl Drop for HangUpPeer {
 /// connection: the pool reserves the dialed session for that acquisition at the dial
 /// (`DIV-046`), so the peer's close, which the session's driver reads before the acquisition
 /// next runs, refuses the acquisition's request unprocessed instead of retiring the session
-/// and drawing another dial. (The acquisition's outcome, dials, sessions opened, the peer's
-/// connections.)
+/// and drawing another dial. The reservation reports that it was dialed for its acquisition,
+/// so a caller following hyper-util does not resend the request. (The acquisition's outcome,
+/// dials, sessions opened, the peer's connections.)
 #[test]
 fn a_fresh_connection_the_peer_drops_at_once_is_dialed_once_for_its_acquisition() {
     let peer = HangUpPeer::start();
@@ -1350,17 +1351,19 @@ fn a_fresh_connection_the_peer_drops_at_once_is_dialed_once_for_its_acquisition(
         until(|| pool.stats().sessions_opened == 1 && pool.session_count() == 0).await;
         let outcome = match acquisition.await {
             Ok(OwnedGetSessionResult { reservation, .. }) => {
+                let dialed = reservation.dialed_for_acquisition();
                 let (head, body) = get("/ok").await;
                 let mut submission =
                     Box::pin(reservation.submit(head, body, CancellationToken::never()));
-                match submission.as_mut().await {
+                let submitted = match submission.as_mut().await {
                     Ok(_) => "committed".to_owned(),
                     Err(error) => format!(
                         "refused {:?}, unprocessed: {}",
                         error.code(),
                         submission.request_unprocessed()
                     ),
-                }
+                };
+                format!("dialed for it: {dialed}, {submitted}")
             }
             Err(error) => format!("{error:?}"),
         };
@@ -1373,7 +1376,7 @@ fn a_fresh_connection_the_peer_drops_at_once_is_dialed_once_for_its_acquisition(
         (
             (
                 format!(
-                    "refused {:?}, unprocessed: true",
+                    "dialed for it: true, refused {:?}, unprocessed: true",
                     HttpErrorCode::TRANSPORT_EOF
                 ),
                 1,

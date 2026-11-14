@@ -4149,7 +4149,10 @@ fn hand_over_session(
     };
     let reserved = OwnedGetSessionResult::reserve(pool, session.clone());
     let _ = catch_callback(|| match reserved {
-        Ok(reservation) => waiter.hand_over(reservation),
+        Ok(mut handed) => {
+            handed.reservation.mark_dialed_for_acquisition();
+            waiter.hand_over(handed);
+        }
         Err(error) => waiter.cancel(error),
     });
     true
