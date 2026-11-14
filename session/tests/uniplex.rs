@@ -5645,7 +5645,7 @@ async fn selected_close_wait<
 async fn selected_close_operation(context: WorkerContext, state: Rc<SelectedCloseState>) {
     let _release = SelectedCloseRelease(Rc::clone(&state));
     let request = if state.case == SelectedCloseCase::OtherUpgrade {
-        b"GET /one HTTP/1.1\r\nHost: example\r\nConnection: Upgrade\r\nUpgrade: future-protocol\r\n\r\nGET /two HTTP/1.1\r\nHost: example\r\n\r\n".as_slice()
+        b"GET /one HTTP/1.1\r\nHost: example\r\nUpgrade: future-protocol\r\n\r\nGET /two HTTP/1.1\r\nHost: example\r\n\r\n".as_slice()
     } else if state.case == SelectedCloseCase::OrdinaryError {
         b"GET /one HTTP/1.1\r\nHost: example\r\n\r\n".as_slice()
     } else {
@@ -5901,7 +5901,7 @@ fn selected_close_case(case: SelectedCloseCase) {
         assert!(!state.wrong_owner.get());
         assert!(
             matches!(state.stage.borrow().as_ref(), Some(Ok(()))),
-            "phase outcome: {:?}",
+            "{case:?} phase outcome: {:?}",
             state.stage.borrow()
         );
         let panic_case = matches!(
@@ -8074,10 +8074,10 @@ fn callback_error_trims_consumed_prefix_with_buffered_suffix() {
         Box::pin(async move {
             let prefix_drops = Arc::new(AtomicUsize::new(0));
             let prefix = Bytes::from_owner(DropTrackedBytes {
-                bytes: b"GET / HTTP/1.1\r\nMalformed\r\n\r\n".to_vec(),
+                bytes: b"GET / HTTP/1.1\r\nMalformed".to_vec(),
                 drops: Arc::clone(&prefix_drops),
             });
-            let suffix = Bytes::from_static(b"GET /later HTTP/1.1\r\n\r\n");
+            let suffix = Bytes::from_static(b"\r\n\r\nGET /later HTTP/1.1\r\n\r\n");
             let mut input = BufQueue::new(prefix.len() + suffix.len());
             input.push_bytes(prefix).expect("malformed prefix fits");
             input.push_bytes(suffix).expect("buffered suffix fits");
@@ -8157,7 +8157,7 @@ impl H1IngressFailureCase {
         } else {
             Some((
                 HttpErrorCode::BODY_PARSE_ERROR,
-                b"invalid HTTP chunk length",
+                b"Invalid character in chunk size",
             ))
         }
     }

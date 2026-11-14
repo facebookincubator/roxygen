@@ -566,15 +566,9 @@ pub struct UniplexConfig {
     /// its unflushed buffer and the I/O, instead of draining that output to a peer that
     /// may have stopped reading. HTTP/2 sessions and the owned drivers ignore it.
     pub non_abortive_close: bool,
-    /// Roxygen-only, default off (`DIV-040`): a downstream session's codec reads each
-    /// request's method as RFC 9110 section 9.1 defines methods, and as hyper reads them:
-    /// any token, case-sensitive and kept byte for byte, so `post`, `Post` and `PURGE` are
-    /// extension methods the application reads as sent and only `POST` is
-    /// `HttpMethod::Post` (`Http1xCodec::set_exact_methods`,
-    /// `Http2Codec::set_exact_methods`). Off, HTTP/1.1 accepts only the frozen method table
-    /// and HTTP/2 canonicalizes the methods it recognizes without regard to case. Upstream
-    /// sessions ignore it. The owned downstream drivers (`OwnedH1Session`, `OwnedH2Session`)
-    /// apply it as a downstream session does; the owned upstream drivers refuse it.
+    /// Roxygen-only, default off (`DIV-040`): HTTP/2 request methods are kept as
+    /// exact, case-sensitive RFC tokens. HTTP/1 always uses llhttp's recognized
+    /// method table (`DIV-057`), independently of this option.
     pub exact_method_tokens: bool,
     /// Roxygen-only, default off (`DIV-041`): an HTTP/2 session's codec stores every
     /// decoded field value exactly as decoded, surrounding spaces and tabs included, as h2
@@ -4131,7 +4125,6 @@ impl UniplexSession {
         } else {
             let mut codec = Http1xCodec::new(direction);
             codec.set_unframed_bodiless_requests(config.unframed_bodiless_http1_requests);
-            codec.set_exact_methods(config.exact_method_tokens && direction.is_downstream());
             (DriverCodec::Http1(codec), None)
         };
         let http2_state = http2_config.clone().map(|config| {

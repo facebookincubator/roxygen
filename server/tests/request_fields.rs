@@ -1,5 +1,5 @@
-//! Opt-in exact method tokens (`DIV-040`) and verbatim HTTP/2 field values
-//! (`DIV-041`) over `serve_transport` and loopback TCP, on a `RuntimeOwner`
+//! llhttp HTTP/1 methods, opt-in exact HTTP/2 method tokens (`DIV-040`), and
+//! verbatim HTTP/2 field values (`DIV-041`) over `serve_transport` and loopback TCP, on a `RuntimeOwner`
 //! worker and a `HostedWorker`, for HTTP/1.1 and h2c, next to hyper's server
 //! answering the same bytes.
 
@@ -472,11 +472,11 @@ fn exact_method_tokens_are_off_by_default() {
 }
 
 #[test]
-fn exact_method_tokens_reach_the_application_byte_for_byte_over_http1_when_enabled() {
+fn http2_method_option_does_not_broaden_http1_methods() {
     on_worker(|context| async move {
         let (methods, statuses) = serve_methods(context, CodecProtocol::Http11, true).await;
-        assert_eq!(methods, ["POST", "post", "Post", "PURGE"]);
-        assert_eq!(statuses, [200, 200, 200, 200]);
+        assert_eq!(methods, ["POST", "PURGE"]);
+        assert_eq!(statuses, [200, 400, 400, 200]);
     });
     assert_eq!(
         hyper_methods(CodecProtocol::Http11),
@@ -497,11 +497,11 @@ fn exact_method_tokens_reach_the_application_byte_for_byte_over_h2c_when_enabled
 }
 
 #[test]
-fn http1_requests_with_a_method_outside_the_frozen_table_get_400_by_default() {
+fn http1_requests_with_a_method_outside_llhttp_table_get_400_by_default() {
     on_worker(|context| async move {
         let (methods, statuses) = serve_methods(context, CodecProtocol::Http11, false).await;
-        assert_eq!(methods, ["POST"]);
-        assert_eq!(statuses, [200, 400, 400, 400]);
+        assert_eq!(methods, ["POST", "PURGE"]);
+        assert_eq!(statuses, [200, 400, 400, 200]);
     });
 }
 
@@ -514,27 +514,27 @@ fn h2c_request_methods_are_canonicalized_by_default() {
 }
 
 #[test]
-fn owned_http1_accepts_exact_method_tokens() {
+fn owned_http1_configuration_accepts_the_http2_method_option() {
     assert_eq!(owned_session(true).check_owned_http1(), Ok(()));
 }
 
 #[test]
-fn exact_method_tokens_reach_the_application_byte_for_byte_over_owned_http1_when_enabled() {
+fn http2_method_option_does_not_broaden_owned_http1_methods() {
     on_worker(|context| async move {
         let (methods, statuses) =
             serve_methods_with(context, CodecProtocol::Http11, owned_session(true)).await;
-        assert_eq!(methods, ["POST", "post", "Post", "PURGE"]);
-        assert_eq!(statuses, [200, 200, 200, 200]);
+        assert_eq!(methods, ["POST", "PURGE"]);
+        assert_eq!(statuses, [200, 400, 400, 200]);
     });
 }
 
 #[test]
-fn owned_http1_requests_with_a_method_outside_the_frozen_table_get_400_by_default() {
+fn owned_http1_requests_with_a_method_outside_llhttp_table_get_400_by_default() {
     on_worker(|context| async move {
         let (methods, statuses) =
             serve_methods_with(context, CodecProtocol::Http11, owned_session(false)).await;
-        assert_eq!(methods, ["POST"]);
-        assert_eq!(statuses, [200, 400, 400, 400]);
+        assert_eq!(methods, ["POST", "PURGE"]);
+        assert_eq!(statuses, [200, 400, 400, 200]);
     });
 }
 

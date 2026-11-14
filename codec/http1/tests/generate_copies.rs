@@ -1,12 +1,12 @@
-//! HTTP/1 header generation keeps the bytes, sizes, errors, and codec state
-//! recorded from the codec before `repair.session_message_copies`
-//! (expectation-349). Each case drives one codec through its headers, a body,
-//! an EOM, and the next exchange, and records every result with a snapshot of
-//! the egress state. Readable traces pin each base message's header block and
-//! the error, message-kind, CR/LF, and websocket cases; FNV-1a digests of the
-//! full traces pin every base message under every header variant. A request
-//! and a response with many Connection tokens also check that generation
-//! sizes its output buffer once.
+//! HTTP/1 header generation preserves the header bytes, sizes and errors
+//! recorded before `repair.session_message_copies` (expectation-349).
+//! Each case drives one codec through its headers, a body, an EOM and the next
+//! exchange. The full traces also record egress state and llhttp ingress
+//! lifecycle: a closed connection rejects another request, and an accepted
+//! upgrade delivers subsequent bytes as tunnel data. Readable traces pin each
+//! base message's header block and the error, message-kind, CR/LF and websocket
+//! cases; FNV-1a digests pin every header variant. A request and a response with
+//! many Connection tokens also check that generation sizes its output once.
 //!
 //! The framing frames (body, chunk header and terminator, trailers, and EOM)
 //! keep the chunk-size prefixes of a frozen `format!` reference and the traces
@@ -18,6 +18,7 @@
 
 use std::fmt::Write as _;
 
+use bytes::Bytes;
 use roxygen_codec::CodecEvent;
 use roxygen_codec::EgressFrame;
 use roxygen_codec::GeneratedFrame;
@@ -875,6 +876,76 @@ fn generated_responses_match_the_recorded_baseline() {
     );
 }
 
+#[test]
+fn generated_close_response_keeps_nonpersistent_ingress_terminal() {
+    for case in [
+        ResponseCase::Http10KeepAliveNotRequested,
+        ResponseCase::Http09Request,
+    ] {
+        let mut trace = Trace::new(TransportDirection::Downstream);
+        trace.ingress(case.request());
+        let mut message = response(200, Some(b"OK"), (1, 1));
+        message
+            .headers_mut()
+            .add(HttpHeaderCode::ContentLength, b"0");
+        trace.headers(StreamId::new(1), &message, true, None);
+        assert!(contains(&trace.last_output, b"Connection: close\r\n"));
+        trace.ingress(GET_REQUEST);
+        assert_eq!(
+            trace
+                .lines
+                .last()
+                .expect("the followup ingress was recorded"),
+            "ingress consumed=1 [error 1 \"Data after `Connection: close`\"]",
+            "{case:?}",
+        );
+        assert_eq!(trace.codec.ingress_stream, StreamId::new(1));
+        assert!(!trace.codec.is_reusable());
+    }
+}
+
+#[test]
+fn generated_upgrade_response_delivers_followup_bytes_as_shared_tunnel_body() {
+    #[derive(Default)]
+    struct TunnelBody(Option<BufQueue>);
+
+    impl HttpCodecCallback for TunnelBody {
+        fn on_event(&mut self, event: CodecEvent<'_>) {
+            let CodecEvent::Body { stream, body, .. } = event else {
+                panic!("expected only tunnel body after the upgrade response");
+            };
+            assert_eq!(stream, StreamId::new(1));
+            assert!(self.0.replace(body).is_none());
+        }
+    }
+
+    for case in [
+        ResponseCase::SwitchingProtocols,
+        ResponseCase::WebSocketAccept,
+    ] {
+        let mut trace = Trace::new(TransportDirection::Downstream);
+        trace.ingress(case.request());
+        trace.headers(StreamId::new(1), &case.message(), false, None);
+        assert!(trace.last_output.starts_with(b"HTTP/1.1 101 "));
+        let wire = Bytes::from(GET_REQUEST.to_vec());
+        let address = wire.as_ptr();
+        let input = BufQueue::from_bytes(wire, QUEUE_LIMIT).expect("tunnel bytes fit");
+        let mut body = TunnelBody::default();
+        let result = trace
+            .codec
+            .on_ingress(&input, &mut body, &mut BufQueue::new(QUEUE_LIMIT));
+        assert_eq!(result.consumed, GET_REQUEST.len(), "{case:?}");
+        assert_eq!(trace.codec.ingress_stream, StreamId::new(1));
+        drop(input);
+        let body = body.0.expect("a tunnel body callback");
+        assert_eq!(queue_bytes(&body), GET_REQUEST);
+        assert_eq!(
+            body.segments().next().expect("a body segment").as_ptr(),
+            address
+        );
+    }
+}
+
 fn error_traces() -> Vec<String> {
     let mut traces = Vec::new();
 
@@ -1602,18 +1673,18 @@ const RESPONSE_DIGESTS: &[(&str, u64)] = &[
     ("Continue/EmptyContentLength", 0xbd3e3dc15d52763c),
     ("Continue/EmptyTokens", 0x8aec001893b9bc74),
     ("Continue/EmptyConnection", 0xca0c9b47de4dff47),
-    ("SwitchingProtocols/Plain", 0x3d2621ee1295e41b),
-    ("SwitchingProtocols/Close", 0x8150d798de58e187),
-    ("SwitchingProtocols/KeepAlive", 0xbf3b702357847ffa),
-    ("SwitchingProtocols/UpgradeToken", 0xd7537f6ee0570825),
-    ("SwitchingProtocols/CustomTokens", 0xe9e47f244cac660e),
-    ("SwitchingProtocols/ContentLength", 0xd2b2b96b4844a8c4),
-    ("SwitchingProtocols/Chunked", 0x4ff6508bed8565f6),
-    ("SwitchingProtocols/NotChunked", 0x3d2621ee1295e41b),
-    ("SwitchingProtocols/ExtraHeaders", 0xb735aaee7d23166d),
-    ("SwitchingProtocols/EmptyContentLength", 0xee5deb3a5f74f0b4),
-    ("SwitchingProtocols/EmptyTokens", 0x2a682a215c7f8d17),
-    ("SwitchingProtocols/EmptyConnection", 0x1e32de46d08ac1a4),
+    ("SwitchingProtocols/Plain", 0x5cacc586406a51ba),
+    ("SwitchingProtocols/Close", 0x2fdae3e8f4731226),
+    ("SwitchingProtocols/KeepAlive", 0x536ec6f06d100d59),
+    ("SwitchingProtocols/UpgradeToken", 0x9d453a259b4f5698),
+    ("SwitchingProtocols/CustomTokens", 0x6caf44f1bc12d86d),
+    ("SwitchingProtocols/ContentLength", 0x99bbc48fc75a672f),
+    ("SwitchingProtocols/Chunked", 0x7f114a082cf0a135),
+    ("SwitchingProtocols/NotChunked", 0x5cacc586406a51ba),
+    ("SwitchingProtocols/ExtraHeaders", 0x1a71e2a86789c4a0),
+    ("SwitchingProtocols/EmptyContentLength", 0xf068441ea6bdbb1f),
+    ("SwitchingProtocols/EmptyTokens", 0x775c52846ae5d3b6),
+    ("SwitchingProtocols/EmptyConnection", 0x1a2feb5fc158210f),
     ("NoContent/Plain", 0x5d0f2b7737c75ca0),
     ("NoContent/Close", 0x30a1bef90cf3da38),
     ("NoContent/KeepAlive", 0x5d0f2b7737c75ca0),
@@ -1680,38 +1751,38 @@ const RESPONSE_DIGESTS: &[(&str, u64)] = &[
         "Http10KeepAliveRequested/EmptyConnection",
         0x67a95dbf3158b88c,
     ),
-    ("Http10KeepAliveNotRequested/Plain", 0x287eace1d92523e6),
-    ("Http10KeepAliveNotRequested/Close", 0x287eace1d92523e6),
-    ("Http10KeepAliveNotRequested/KeepAlive", 0x287eace1d92523e6),
+    ("Http10KeepAliveNotRequested/Plain", 0x01a075c31c67259f),
+    ("Http10KeepAliveNotRequested/Close", 0x01a075c31c67259f),
+    ("Http10KeepAliveNotRequested/KeepAlive", 0x01a075c31c67259f),
     (
         "Http10KeepAliveNotRequested/UpgradeToken",
-        0x5058a1f0fc097080,
+        0xa0256c1978913e69,
     ),
     (
         "Http10KeepAliveNotRequested/CustomTokens",
-        0x01b971574164458f,
+        0x3dcfd26ae30b8a90,
     ),
     (
         "Http10KeepAliveNotRequested/ContentLength",
-        0x93d64f9d19aae26a,
+        0x95679807cbc99deb,
     ),
-    ("Http10KeepAliveNotRequested/Chunked", 0x287eace1d92523e6),
-    ("Http10KeepAliveNotRequested/NotChunked", 0x287eace1d92523e6),
+    ("Http10KeepAliveNotRequested/Chunked", 0x01a075c31c67259f),
+    ("Http10KeepAliveNotRequested/NotChunked", 0x01a075c31c67259f),
     (
         "Http10KeepAliveNotRequested/ExtraHeaders",
-        0xe5da6a9c78e21c43,
+        0x7eb56c08e773603c,
     ),
     (
         "Http10KeepAliveNotRequested/EmptyContentLength",
-        0xeae35ec8d8785008,
+        0x5bd489bbbdbb6c31,
     ),
     (
         "Http10KeepAliveNotRequested/EmptyTokens",
-        0x01b971574164458f,
+        0x3dcfd26ae30b8a90,
     ),
     (
         "Http10KeepAliveNotRequested/EmptyConnection",
-        0x287eace1d92523e6,
+        0x01a075c31c67259f,
     ),
     ("Http0Dot10/Plain", 0xd76a0a0a1363905e),
     ("Http0Dot10/Close", 0xd76a0a0a1363905e),
@@ -1785,18 +1856,18 @@ const RESPONSE_DIGESTS: &[(&str, u64)] = &[
     ("FiveDigitStatus/EmptyContentLength", 0xf96ceecf4b4e5585),
     ("FiveDigitStatus/EmptyTokens", 0x8abc55cfb91bbcbd),
     ("FiveDigitStatus/EmptyConnection", 0x3fffbc6599a1580a),
-    ("WebSocketAccept/Plain", 0x06acfae18a958baa),
-    ("WebSocketAccept/Close", 0x06acfae18a958baa),
-    ("WebSocketAccept/KeepAlive", 0x06acfae18a958baa),
-    ("WebSocketAccept/UpgradeToken", 0x06acfae18a958baa),
-    ("WebSocketAccept/CustomTokens", 0xc740001573cd84db),
-    ("WebSocketAccept/ContentLength", 0x6cb0caf8a4c5c732),
-    ("WebSocketAccept/Chunked", 0xab91eb9593f00fbe),
-    ("WebSocketAccept/NotChunked", 0x06acfae18a958baa),
-    ("WebSocketAccept/ExtraHeaders", 0x451575457550100d),
-    ("WebSocketAccept/EmptyContentLength", 0x85acb4d0ec97cf94),
-    ("WebSocketAccept/EmptyTokens", 0xc740001573cd84db),
-    ("WebSocketAccept/EmptyConnection", 0x06acfae18a958baa),
+    ("WebSocketAccept/Plain", 0xd47b2223985c7358),
+    ("WebSocketAccept/Close", 0xd47b2223985c7358),
+    ("WebSocketAccept/KeepAlive", 0xd47b2223985c7358),
+    ("WebSocketAccept/UpgradeToken", 0xd47b2223985c7358),
+    ("WebSocketAccept/CustomTokens", 0xd534f6aefe6e5cc3),
+    ("WebSocketAccept/ContentLength", 0x4a0a398170894a00),
+    ("WebSocketAccept/Chunked", 0xd42531333751ed7c),
+    ("WebSocketAccept/NotChunked", 0xd47b2223985c7358),
+    ("WebSocketAccept/ExtraHeaders", 0x73b603a0fd7a8f21),
+    ("WebSocketAccept/EmptyContentLength", 0x7aeadab80d2e23be),
+    ("WebSocketAccept/EmptyTokens", 0xd534f6aefe6e5cc3),
+    ("WebSocketAccept/EmptyConnection", 0xd47b2223985c7358),
     ("CustomReason/Plain", 0x73eddde4df9950d4),
     ("CustomReason/Close", 0x183c896c8ae450fa),
     ("CustomReason/KeepAlive", 0x73eddde4df9950d4),
@@ -1821,18 +1892,18 @@ const RESPONSE_DIGESTS: &[(&str, u64)] = &[
     ("EmptyReason/EmptyContentLength", 0x7d7b4a866ccb57a5),
     ("EmptyReason/EmptyTokens", 0xe4bcad5c379714e5),
     ("EmptyReason/EmptyConnection", 0xd07865d305ae54ba),
-    ("Http09Request/Plain", 0xd8680379a3f1a897),
-    ("Http09Request/Close", 0xd8680379a3f1a897),
-    ("Http09Request/KeepAlive", 0xd8680379a3f1a897),
-    ("Http09Request/UpgradeToken", 0xc89d3894bdd9954b),
-    ("Http09Request/CustomTokens", 0xd72f3873a161705e),
-    ("Http09Request/ContentLength", 0xa7a5406b07ec70d9),
-    ("Http09Request/Chunked", 0xd8680379a3f1a897),
-    ("Http09Request/NotChunked", 0xd8680379a3f1a897),
-    ("Http09Request/ExtraHeaders", 0x610fdf47d4743976),
-    ("Http09Request/EmptyContentLength", 0xbef12fb5a1d33405),
-    ("Http09Request/EmptyTokens", 0xd72f3873a161705e),
-    ("Http09Request/EmptyConnection", 0xd8680379a3f1a897),
+    ("Http09Request/Plain", 0xe013d74c87d34b38),
+    ("Http09Request/Close", 0xe013d74c87d34b38),
+    ("Http09Request/KeepAlive", 0xe013d74c87d34b38),
+    ("Http09Request/UpgradeToken", 0x3e2269b8a12e6504),
+    ("Http09Request/CustomTokens", 0xc48d1bb41bb24077),
+    ("Http09Request/ContentLength", 0xa283eefc5ef912b2),
+    ("Http09Request/Chunked", 0xe013d74c87d34b38),
+    ("Http09Request/NotChunked", 0xe013d74c87d34b38),
+    ("Http09Request/ExtraHeaders", 0x637b48fa3321708f),
+    ("Http09Request/EmptyContentLength", 0x62439e6385035e06),
+    ("Http09Request/EmptyTokens", 0xc48d1bb41bb24077),
+    ("Http09Request/EmptyConnection", 0xe013d74c87d34b38),
 ];
 
 // Framing frames (`repair.http1_head_egress`): the chunk-size prefix against a

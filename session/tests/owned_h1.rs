@@ -4811,13 +4811,10 @@ fn method_vector(method: &[u8]) -> Vector {
     )
 }
 
-/// Under `exact_method_tokens` (`DIV-040`), the owned driver hands each token method to its
-/// exchange as sent: `post`, `Post` and `PURGE` as extension methods, and only `POST` as
-/// `HttpMethod::Post`. Whole, in 7-byte reads and one byte at a time, the run equals
-/// `UniplexSession`'s under the option.
+/// Both drivers preserve llhttp-recognized method tokens across read boundaries.
 #[test]
-fn exact_method_tokens_reach_the_exchange_as_sent_as_uniplex() {
-    for method in [&b"POST"[..], b"post", b"Post", b"PURGE"] {
+fn llhttp_methods_reach_the_exchange_as_sent_as_uniplex() {
+    for method in [&b"POST"[..], b"PURGE", b"M-SEARCH"] {
         let vector = method_vector(method);
         for split in [Split::Whole, Split::Every7, Split::OneByte] {
             let label = format!("{} {split:?}", vector.name);
@@ -4849,12 +4846,18 @@ fn exact_method_tokens_reach_the_exchange_as_sent_as_uniplex() {
     }
 }
 
-/// Under `exact_method_tokens`, a request line whose method is not a token is still malformed:
-/// the owned driver writes the codec's 400 and resets, no exchange reads a request, and the run
-/// equals `UniplexSession`'s under the option.
+/// The HTTP/2 method option does not broaden HTTP/1 grammar. Unsupported or
+/// malformed method tokens fail before an exchange is delivered.
 #[test]
-fn exact_method_tokens_still_reject_a_non_token_method_as_uniplex() {
-    for method in [&b"P@ST"[..], b"(GET)", b"PO\x7fST"] {
+fn http2_method_option_does_not_broaden_http1_methods() {
+    for method in [
+        &b"P@ST"[..],
+        b"(GET)",
+        b"PO\x7fST",
+        b"post",
+        b"Post",
+        b"CUSTOM",
+    ] {
         let vector = method_vector(method);
         for split in [Split::Whole, Split::Every7, Split::OneByte] {
             let label = format!("{} {split:?}", vector.name.escape_debug());
@@ -4885,11 +4888,10 @@ fn exact_method_tokens_still_reject_a_non_token_method_as_uniplex() {
     }
 }
 
-/// Without `exact_method_tokens`, the owned driver keeps the frozen method table, as
-/// `UniplexSession` does: `post`, `Post` and `PURGE` get the codec's 400.
+/// Unsupported and incorrectly cased methods fail under both drivers.
 #[test]
-fn methods_outside_the_frozen_table_get_400_by_default_as_uniplex() {
-    for method in [&b"post"[..], b"Post", b"PURGE"] {
+fn methods_outside_llhttp_table_get_400_by_default_as_uniplex() {
+    for method in [&b"post"[..], b"Post", b"CUSTOM"] {
         let vector = method_vector(method);
         for split in [Split::Whole, Split::Every7, Split::OneByte] {
             let label = format!("{} {split:?}", vector.name);
@@ -5238,15 +5240,13 @@ fn eof_behind_a_pipelined_request_answers_the_first_and_aborts_the_second_as_uni
 }
 
 #[test]
-fn eof_inside_a_head_behind_a_request_differs_from_uniplex() {
+fn malformed_head_behind_a_request_fails_as_uniplex() {
     const OK: &str =
         "HTTP/1.1 200 \r\nDate: <date>\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nok";
-    const OK_CLOSE: &str =
-        "HTTP/1.1 200 \r\nDate: <date>\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok";
     const BAD_REQUEST: &str = "HTTP/1.1 400 Bad Request\r\nDate: <date>\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
-    for (behind, differs) in [
-        (b"tunnel bytes".as_slice(), true),
-        (b"GET/ HTTP/1.1\r\nHost: a\r\n\r\n".as_slice(), false),
+    for behind in [
+        b"tunnel bytes".as_slice(),
+        b"GET/ HTTP/1.1\r\nHost: a\r\n\r\n".as_slice(),
     ] {
         let vector = Vector::new(
             "malformed_behind",
@@ -5264,12 +5264,7 @@ fn eof_inside_a_head_behind_a_request_differs_from_uniplex() {
             assert_eq!(owned.error, uniplex.error, "{label}");
             assert_eq!(owned.output, format!("{OK}{BAD_REQUEST}"), "{label}: owned");
             assert_eq!(owned.close, CloseKind::Reset, "{label}: owned");
-            if differs {
-                assert_eq!(uniplex.output, OK_CLOSE, "{label}: uniplex");
-                assert_eq!(uniplex.close, CloseKind::ShutdownWrite, "{label}: uniplex");
-            } else {
-                assert_eq!(uniplex, owned, "{label}");
-            }
+            assert_eq!(uniplex, owned, "{label}");
         }
     }
 }
@@ -7471,11 +7466,8 @@ fn unsaturated_pipelined_writes() -> Vec<usize> {
     })
 }
 
-/// The owned driver writes in the same pieces as it did before its turns skipped phases with
-/// nothing to do (recorded from the driver at `48eb3af27ed4`): a write starts no earlier than
-/// the turn in which no phase before it has work left, so egress is split as before. Covers
-/// every corpus vector and split, a body polled in pieces, retirement at serialization, and
-/// pushed body events.
+/// Exact write boundaries for every corpus vector and split, a body polled in pieces,
+/// retirement at serialization, and pushed body events.
 #[test]
 fn owned_h1_writes_in_the_recorded_pieces() {
     let recorded_corpus: &[(&str, [&[usize]; 3])] = &[
@@ -7499,7 +7491,7 @@ fn owned_h1_writes_in_the_recorded_pieces() {
         ),
         ("content_length_and_chunked", [&[103], &[103], &[103]]),
         ("duplicate_content_length", [&[103], &[103], &[103]]),
-        ("obs_fold", [&[99], &[99], &[99]]),
+        ("obs_fold", [&[103], &[103], &[103]]),
         ("absolute_form_with_host", [&[99], &[99], &[99]]),
         ("connect", [&[73, 12], &[73, 12], &[73, 12]]),
         ("websocket_upgrade", [&[166, 11], &[166, 11], &[166, 11]]),

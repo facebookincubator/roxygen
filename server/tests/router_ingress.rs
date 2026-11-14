@@ -364,15 +364,15 @@ fn http1_request(method: &[u8]) -> Vec<u8> {
     .concat()
 }
 
-/// HTTP/1.1, one connection per method (`POST`, `post`, `PURGE`): the handler
+/// HTTP/1.1, one connection per recognized method (`POST`, `PURGE`): the handler
 /// reads each method as its exact token and the request id trimmed (as
 /// `httparse` trims it), and the response head carries each value byte for byte
 /// as inserted, as hyper writes a `HeaderValue` (`name: value\r\n`).
 #[test]
-fn router_ingress_reads_exact_methods_and_writes_verbatim_response_values_over_http1() {
+fn router_ingress_reads_llhttp_methods_and_writes_verbatim_response_values_over_http1() {
     on_worker(move |context| async move {
         let script = Rc::new(Script::default());
-        for method in [b"POST".as_slice(), b"post", b"PURGE"] {
+        for method in [b"POST".as_slice(), b"PURGE"] {
             let (_connection, mut client) =
                 serve_router_connection(&context, &script, CodecProtocol::Http11).await;
             client
@@ -397,7 +397,6 @@ fn router_ingress_reads_exact_methods_and_writes_verbatim_response_values_over_h
             *script.requests.borrow(),
             [
                 ("POST".to_owned(), Some(b"rid-7".to_vec())),
-                ("post".to_owned(), Some(b"rid-7".to_vec())),
                 ("PURGE".to_owned(), Some(b"rid-7".to_vec())),
             ],
         );

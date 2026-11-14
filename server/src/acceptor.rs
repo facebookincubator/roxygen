@@ -202,14 +202,9 @@ pub struct ServerSessionConfig {
     /// Everything else about the reset is unchanged. Plaintext only: `HttpServer` refuses
     /// it with TLS credentials, and `serve_transport` for a transport declared TLS.
     pub non_abortive_close: bool,
-    /// Roxygen-only, default off (`DIV-040`): each request's method reaches the application
-    /// as RFC 9110 section 9.1 defines methods and as hyper's server reads them, on HTTP/1.1
-    /// and HTTP/2 alike: any token, case-sensitive and kept byte for byte, so `post`, `Post`
-    /// and `PURGE` are extension methods that `HttpMessage::request_method` returns as sent
-    /// and only `POST` is `HttpMethod::Post`. Off, an HTTP/1.1 request whose method is not in
-    /// the frozen method table gets 400, and HTTP/2 canonicalizes recognized methods without
-    /// regard to case and uppercases extension methods. A method that is not a token is still
-    /// a malformed request. `owned_http1` and `owned_http2` apply it.
+    /// Roxygen-only, default off (`DIV-040`): downstream HTTP/2 request methods
+    /// are kept as exact, case-sensitive RFC tokens. HTTP/1 always uses llhttp's
+    /// recognized method table (`DIV-057`), independently of this option.
     pub exact_method_tokens: bool,
     /// Roxygen-only, default off (`DIV-041`): an HTTP/2 connection hands the application
     /// each request field value exactly as decoded, surrounding spaces and tabs included,

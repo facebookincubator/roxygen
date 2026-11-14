@@ -721,30 +721,46 @@ fn rejection_exposes_status_head_and_core_message() {
             proxy.shutdown().await;
 
             let proxy = RawH1Proxy::start().await;
-            let (session, mut socket) = proxy.connect(&context).await;
-            let mut connect = start_connect(
-                Ownership::Unique,
-                &context,
-                &session,
-                headers(&[("Foo", "Bar")]),
-                CONNECT_TIMEOUT,
-                CancellationToken::never(),
-            );
-            poll_until_parked(&mut connect).await;
-            read_h1_head(&mut socket).await;
-            socket
-                .write_all(&[H1_FWDPROXY_ERROR, b"Content-Length: 0\r\n\r\n"].concat())
-                .await
-                .expect("proxy response");
-            let error = connect.await.err().expect("a 500 is rejected");
-            let mut h1_expected = owned(&FWDPROXY_ERROR_FIELDS);
-            h1_expected.push(("Content-Length".to_owned(), "0".to_owned()));
-            assert_eq!(fields(rejected_head(&error, "H1")), h1_expected);
-            assert_eq!(
-                read_until_close(&mut socket).await,
-                PeerClose::Reset(Vec::new()),
-                "the egress abort resets the proxy connection"
-            );
+            for (tail, framing) in [
+                (
+                    b"Content-Length: 0\r\n\r\n".as_slice(),
+                    ("Content-Length", "0"),
+                ),
+                (
+                    b"Content-Length: 19\r\n\r\nfwdproxy error body".as_slice(),
+                    ("Content-Length", "19"),
+                ),
+                (
+                    b"Transfer-Encoding: chunked\r\n\r\n13\r\nfwdproxy error body\r\n0\r\n\r\n"
+                        .as_slice(),
+                    ("Transfer-Encoding", "chunked"),
+                ),
+            ] {
+                let (session, mut socket) = proxy.connect(&context).await;
+                let mut connect = start_connect(
+                    Ownership::Unique,
+                    &context,
+                    &session,
+                    headers(&[("Foo", "Bar")]),
+                    CONNECT_TIMEOUT,
+                    CancellationToken::never(),
+                );
+                poll_until_parked(&mut connect).await;
+                read_h1_head(&mut socket).await;
+                socket
+                    .write_all(&[H1_FWDPROXY_ERROR, tail].concat())
+                    .await
+                    .expect("proxy response");
+                let error = connect.await.err().expect("a 500 is rejected");
+                let mut h1_expected = owned(&FWDPROXY_ERROR_FIELDS);
+                h1_expected.push((framing.0.to_owned(), framing.1.to_owned()));
+                assert_eq!(fields(rejected_head(&error, "H1")), h1_expected);
+                assert_eq!(
+                    read_until_close(&mut socket).await,
+                    PeerClose::Reset(Vec::new()),
+                    "the egress abort resets the proxy connection"
+                );
+            }
         })
     });
 }
@@ -770,9 +786,8 @@ fn timeout_cancellation_and_peer_reset_carry_no_rejection() {
             assert_eq!(error.code(), HttpErrorCode::READ_TIMEOUT);
             assert!(connect_rejection(&error).is_none());
 
-            // An H1 non-2xx with a non-zero `Content-Length` fails before the
-            // status check, because the codec ignores every CONNECT response
-            // body (`DIV-011`'s limit).
+            // A malformed H1 non-2xx head fails before the status check.
+            // llhttp rejects duplicate Content-Length, even with equal values.
             let (session, mut socket) = proxy.connect(&context).await;
             let mut connect = start_connect(
                 Ownership::Unique,
@@ -788,7 +803,7 @@ fn timeout_cancellation_and_peer_reset_carry_no_rejection() {
                 .write_all(
                     &[
                         H1_FWDPROXY_ERROR,
-                        b"Content-Length: 19\r\n\r\nfwdproxy error body",
+                        b"Content-Length: 19\r\nContent-Length: 19\r\n\r\nfwdproxy error body",
                     ]
                     .concat(),
                 )
@@ -797,8 +812,8 @@ fn timeout_cancellation_and_peer_reset_carry_no_rejection() {
             let error = connect
                 .await
                 .err()
-                .expect("the ignored body mismatches its length");
-            assert_eq!(error.code(), HttpErrorCode::CONTENT_LENGTH_MISMATCH);
+                .expect("duplicate Content-Length fails parsing");
+            assert_eq!(error.code(), HttpErrorCode::HEADER_PARSE_ERROR);
             assert_eq!(
                 error.http_message().and_then(HttpMessage::response_status),
                 Some(500),

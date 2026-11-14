@@ -15,9 +15,8 @@
 //! `maximum_read_size`, `read_allocation_size` and `maximum_write_size` (each write, and
 //! each response body poll together with the output already queued and its chunk framing),
 //! `abort_exchanges_on_eof` (`DIV-053`: a peer EOF, judged where `UniplexSession` would see
-//! it, fails the connection while the live exchange is open, as `UniplexSession`'s does), and
-//! `exact_method_tokens` (`DIV-040`, as `UniplexSession` applies it: the codec reads each
-//! request method as an exact token).
+//! it, fails the connection while the live exchange is open, as `UniplexSession`'s does).
+//! HTTP/1 uses llhttp's method table (`DIV-057`); `exact_method_tokens` affects only HTTP/2.
 //! It fails with `INVALID_STATE_TRANSITION` for anything else: a nonzero `read_timeout`,
 //! `stream_read_timeout` or `write_timeout` (the driver is untimed; the caller keeps timeout
 //! responsibility), `drain_request_body_on_drop` false, `wait_for_http1_response_on_drain`
@@ -1096,7 +1095,6 @@ impl<A: OwnedApplication> Driver<A> {
         codec.set_downstream_upgrade_as_ordinary(
             http1.upgrade_policy == Http1UpgradePolicy::AsOrdinaryRequest,
         );
-        codec.set_exact_methods(io.exact_method_tokens);
         Ok((
             Self {
                 context,

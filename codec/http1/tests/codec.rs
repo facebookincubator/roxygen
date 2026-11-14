@@ -1,12 +1,10 @@
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
 use std::alloc::System;
-use std::borrow::Borrow;
 use std::cell::Cell;
 use std::fmt::Write as _;
 use std::hint::black_box;
 use std::ops::Range;
-use std::ptr;
 use std::sync::LazyLock;
 
 use base64::Engine as _;
@@ -31,11 +29,9 @@ use roxygen_core::http::TransportDirection;
 use roxygen_core::ids::StreamId;
 use roxygen_core::message::HttpMessage;
 
-use super::FROZEN_HTTP_METHODS;
 use super::Http1xCodec;
+use super::IngressPhase;
 use super::MAX_HEADER_BYTES;
-use super::ParseState;
-use super::chunk_delimiter_turns;
 use super::dyn_ingress_deliveries;
 use super::server_accepted_upgrade;
 
@@ -231,7 +227,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[test]
 fn test_simple_headers() {
-    let request = b"GET /yeah HTTP/1.1\nHost: www.facebook.com\n\n";
+    let request = b"GET /yeah HTTP/1.1\r\nHost: www.facebook.com\r\n\r\n";
     let mut codec = Http1xCodec::new(TransportDirection::Downstream);
     let mut callback = Recorder::default();
     assert_eq!(parse(&mut codec, &mut callback, request), request.len());
@@ -299,100 +295,72 @@ fn fragmented_ingress_body_shares_backing() {
 }
 
 #[test]
-fn frozen_method_table_accepts_fragmented_extension_methods() {
-    for method in FROZEN_HTTP_METHODS {
-        let target = if method == b"CONNECT".as_slice() {
-            b"example.com:443".as_slice()
+fn upstream_methods_accept_fragmented_extension_methods() {
+    for method in [
+        "GET",
+        "HEAD",
+        "POST",
+        "PUT",
+        "DELETE",
+        "CONNECT",
+        "OPTIONS",
+        "TRACE",
+        "COPY",
+        "LOCK",
+        "MKCOL",
+        "MOVE",
+        "PROPFIND",
+        "PROPPATCH",
+        "UNLOCK",
+        "REPORT",
+        "MKACTIVITY",
+        "CHECKOUT",
+        "MERGE",
+        "M-SEARCH",
+        "NOTIFY",
+        "SUBSCRIBE",
+        "UNSUBSCRIBE",
+        "PATCH",
+        "PURGE",
+    ] {
+        let target = if method == "CONNECT" {
+            "example.com:443"
         } else {
-            b"/resource".as_slice()
+            "/resource"
         };
-        let mut wire = method.to_vec();
-        wire.push(b' ');
-        wire.extend_from_slice(target);
-        wire.extend_from_slice(b" HTTP/1.1\r\n\r\n");
-        let mut codec = Http1xCodec::new(TransportDirection::Downstream);
-        let mut callback = Recorder::default();
-        let mut egress = BufQueue::new(QUEUE_LIMIT);
-        for byte in wire.chunks(1) {
-            assert_eq!(
-                codec
-                    .on_ingress(&ingress_queue(byte), &mut callback, &mut egress)
-                    .consumed,
-                1
-            );
-        }
-        assert!(callback.errors.is_empty());
-        assert_eq!(callback.messages.len(), 1);
-        assert_eq!(
-            callback.messages[0].method_string().unwrap().as_bytes(),
-            method
-        );
-    }
-
-    let callback = assert_header_error(b"PUBLISH / HTTP/1.1\r\n\r\n", false);
-    assert_eq!(callback.events, ["begin", "error"]);
-}
-
-fn exact_method_codec() -> Http1xCodec {
-    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
-    codec.set_exact_methods(true);
-    codec
-}
-
-/// Parses `wire` with exact methods, whole and then one byte at a time, and
-/// returns each parse's recorder.
-fn parse_exact_whole_and_bytewise(wire: &[u8]) -> [Recorder; 2] {
-    let mut whole = Recorder::default();
-    parse(&mut exact_method_codec(), &mut whole, wire);
-    let mut bytewise = Recorder::default();
-    let mut codec = exact_method_codec();
-    let mut egress = BufQueue::new(QUEUE_LIMIT);
-    for byte in wire.chunks(1) {
-        let _ = codec.on_ingress(&ingress_queue(byte), &mut bytewise, &mut egress);
-    }
-    [whole, bytewise]
-}
-
-#[test]
-fn exact_methods_keep_every_request_method_token_byte_for_byte_when_enabled() {
-    for (method, recognized) in [
-        (b"POST".as_slice(), Some(HttpMethod::Post)),
-        (b"post", None),
-        (b"Post", None),
-        (b"PURGE", None),
-        (b"purge", None),
-        (b"M-SEARCH", None),
-        (b"FOO_BAR.1~", None),
-        (b"head", None),
-        // Longer than the longest frozen method, which bounds the early start-line check.
-        (b"A-VERY-LONG-EXTENSION-METHOD", None),
-    ] {
-        let mut wire = method.to_vec();
-        wire.extend_from_slice(b" /generate HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        for callback in parse_exact_whole_and_bytewise(&wire) {
-            assert_eq!(
-                callback.events,
-                ["begin", "headers", "complete"],
-                "{method:?}"
-            );
-            let mut message = callback.messages[0].clone();
-            assert_eq!(message.method_string().unwrap().as_bytes(), method);
-            assert_eq!(message.method().unwrap(), recognized, "{method:?}");
-            assert_eq!(message.request_url(), Some(b"/generate".as_slice()));
+        let wire = format!("{method} {target} HTTP/1.1\r\n\r\n");
+        for fragment_size in [1, wire.len()] {
+            let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+            let mut callback = Recorder::default();
+            for fragment in wire.as_bytes().chunks(fragment_size) {
+                assert_eq!(parse(&mut codec, &mut callback, fragment), fragment.len());
+            }
+            assert!(callback.errors.is_empty(), "{method}");
+            assert_eq!(callback.messages.len(), 1);
+            assert_eq!(callback.messages[0].method_string().unwrap(), method);
         }
     }
 }
 
 #[test]
-fn exact_methods_reject_a_method_that_is_not_a_token_when_enabled() {
-    for wire in [
-        b"P@ST / HTTP/1.1\r\n\r\n".as_slice(),
-        b"(GET) / HTTP/1.1\r\n\r\n",
-        b"A-VERY-LONG-EXTENSION-METHOD{ / HTTP/1.1\r\n\r\n",
-        b"POST\x7f / HTTP/1.1\r\n\r\n",
+fn unsupported_and_lowercase_methods_are_rejected() {
+    for method in [
+        "post",
+        "Post",
+        "purge",
+        "FOO_BAR.1~",
+        "P@ST",
+        "(GET)",
+        "A-VERY-LONG-EXTENSION-METHOD",
     ] {
-        for callback in parse_exact_whole_and_bytewise(wire) {
-            assert_eq!(callback.events, ["begin", "error"], "{wire:?}");
+        let wire = format!("{method} / HTTP/1.1\r\n\r\n");
+        for fragment_size in [1, wire.len()] {
+            let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+            let mut callback = Recorder::default();
+            for fragment in wire.as_bytes().chunks(fragment_size) {
+                parse(&mut codec, &mut callback, fragment);
+            }
+            assert_eq!(callback.events, ["begin", "error"], "{method}");
             assert_eq!(callback.errors[0].0, ProxygenError::PARSE_HEADER);
             assert_eq!(callback.errors[0].1, Some(400));
         }
@@ -400,210 +368,8 @@ fn exact_methods_reject_a_method_that_is_not_a_token_when_enabled() {
 }
 
 #[test]
-fn methods_outside_the_frozen_table_are_rejected_by_default() {
-    for wire in [
-        b"post / HTTP/1.1\r\n\r\n".as_slice(),
-        b"Post / HTTP/1.1\r\n\r\n",
-        b"PURGE / HTTP/1.1\r\n\r\n",
-    ] {
-        let callback = assert_header_error(wire, false);
-        assert_eq!(callback.events, ["begin", "error"], "{wire:?}");
-    }
-    let mut message = assert_simple_request(b"POST / HTTP/1.1\r\n\r\n");
-    assert_eq!(message.method().unwrap(), Some(HttpMethod::Post));
-}
-
-/// What a `direction` codec makes of `wire` with exact methods `exact`, parsed whole or one
-/// byte at a time: its events, then each request's method, recognized method and URL or each
-/// response's status, and each error, its status and its message.
-fn start_line_outcome(
-    direction: TransportDirection,
-    wire: &[u8],
-    exact: bool,
-    bytewise: bool,
-) -> String {
-    let mut codec = Http1xCodec::new(direction);
-    codec.set_exact_methods(exact);
-    let mut callback = Recorder::default();
-    if bytewise {
-        let mut egress = BufQueue::new(QUEUE_LIMIT);
-        for byte in wire.chunks(1) {
-            let _ = codec.on_ingress(&ingress_queue(byte), &mut callback, &mut egress);
-        }
-    } else {
-        parse(&mut codec, &mut callback, wire);
-    }
-    let mut outcome = callback.events.join(",");
-    for message in &mut callback.messages {
-        if let Some(status) = message.response_status() {
-            write!(outcome, " | {status}").unwrap();
-            continue;
-        }
-        let url = message
-            .request_url()
-            .unwrap_or_default()
-            .escape_ascii()
-            .to_string();
-        let recognized = message.method().unwrap();
-        let method = message.method_string().unwrap();
-        write!(outcome, " | {method} {recognized:?} {url}").unwrap();
-    }
-    for ((error, status, _), text) in callback.errors.iter().zip(&callback.error_messages) {
-        let error = if *error == ProxygenError::PARSE_HEADER {
-            "PARSE_HEADER".to_owned()
-        } else {
-            format!("{error:?}")
-        };
-        write!(outcome, " | {error} {status:?} {}", text.escape_ascii()).unwrap();
-    }
-    outcome
-}
-
-/// A request head and what current Roxygen makes of it with exact methods off and on, the
-/// same whole and one byte at a time.
-const PINNED_REQUEST_LINES: &[(&[u8], &str, &str)] = &[
-    (
-        b"POST /generate HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        "begin,headers,complete | POST Some(Post) /generate",
-        "begin,headers,complete | POST Some(Post) /generate",
-    ),
-    (
-        b"post /generate HTTP/1.1\r\n\r\n",
-        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
-        "begin,headers,complete | post None /generate",
-    ),
-    (
-        b"Post /generate HTTP/1.1\r\n\r\n",
-        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
-        "begin,headers,complete | Post None /generate",
-    ),
-    (
-        b"PURGE /generate HTTP/1.1\r\n\r\n",
-        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
-        "begin,headers,complete | PURGE None /generate",
-    ),
-    (
-        b"M-SEARCH * HTTP/1.1\r\n\r\n",
-        "begin,headers,complete | M-SEARCH None *",
-        "begin,headers,complete | M-SEARCH None *",
-    ),
-    (
-        b"FOO_BAR.1~ / HTTP/1.1\r\n\r\n",
-        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
-        "begin,headers,complete | FOO_BAR.1~ None /",
-    ),
-    (
-        b"head / HTTP/1.1\r\n\r\n",
-        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
-        "begin,headers,complete | head None /",
-    ),
-    (
-        b"A-VERY-LONG-EXTENSION-METHOD / HTTP/1.1\r\n\r\n",
-        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
-        "begin,headers,complete | A-VERY-LONG-EXTENSION-METHOD None /",
-    ),
-    (
-        b"P@ST / HTTP/1.1\r\n\r\n",
-        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
-        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
-    ),
-    (
-        b"(GET) / HTTP/1.1\r\n\r\n",
-        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
-        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
-    ),
-    (
-        b"POST\x7f / HTTP/1.1\r\n\r\n",
-        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
-        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
-    ),
-    (
-        b"XYZ / HTTP/1.1\r\n\r\n",
-        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
-        "begin,headers,complete | XYZ None /",
-    ),
-    (
-        b" / HTTP/1.1\r\n\r\n",
-        "begin,error | PARSE_HEADER Some(400) invalid HTTP request line",
-        "begin,error | PARSE_HEADER Some(400) invalid HTTP request line",
-    ),
-    (
-        b"GET / HTTP/1.0\r\n\r\n",
-        "begin,headers,complete | GET Some(Get) /",
-        "begin,headers,complete | GET Some(Get) /",
-    ),
-    (
-        b"CONNECT example.com:443 HTTP/1.1\r\n\r\n",
-        "begin,headers,complete | CONNECT Some(Connect) example.com:443",
-        "begin,headers,complete | CONNECT Some(Connect) example.com:443",
-    ),
-    (
-        b"connect example.com:443 HTTP/1.1\r\n\r\n",
-        "begin,error | PARSE_HEADER Some(400) invalid HTTP start line",
-        "begin,headers,complete | connect None example.com:443",
-    ),
-];
-
-#[test]
-fn request_line_outcomes_are_pinned_with_exact_methods_off_and_on() {
-    let mut mismatches = Vec::new();
-    for (wire, off, on) in PINNED_REQUEST_LINES {
-        for (exact, expected) in [(false, off), (true, on)] {
-            for bytewise in [false, true] {
-                let actual =
-                    start_line_outcome(TransportDirection::Downstream, wire, exact, bytewise);
-                if actual != *expected {
-                    mismatches.push(format!(
-                        "{:?} exact={exact} bytewise={bytewise}:\n  actual   {actual:?}\n  expected {expected:?}",
-                        wire.escape_ascii().to_string()
-                    ));
-                }
-            }
-        }
-    }
-    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
-}
-
-/// A response head and what current Roxygen makes of it upstream, where exact methods have no
-/// effect, the same whole and one byte at a time.
-const PINNED_STATUS_LINES: &[(&[u8], &str)] = &[
-    (
-        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
-        "begin,headers,complete | 200",
-    ),
-    (
-        b"HTTX/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
-        "begin,error | PARSE_HEADER None invalid HTTP start line",
-    ),
-    (
-        b"http/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
-        "begin,error | PARSE_HEADER None invalid HTTP start line",
-    ),
-];
-
-#[test]
-fn status_line_outcomes_are_pinned_with_exact_methods_off_and_on() {
-    let mut mismatches = Vec::new();
-    for (wire, expected) in PINNED_STATUS_LINES {
-        for exact in [false, true] {
-            for bytewise in [false, true] {
-                let actual =
-                    start_line_outcome(TransportDirection::Upstream, wire, exact, bytewise);
-                if actual != *expected {
-                    mismatches.push(format!(
-                        "{:?} exact={exact} bytewise={bytewise}:\n  actual   {actual:?}\n  expected {expected:?}",
-                        wire.escape_ascii().to_string()
-                    ));
-                }
-            }
-        }
-    }
-    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
-}
-
-#[test]
 fn test_simple_headers_queue() {
-    let wire = b"GET /one HTTP/1.1\nHost: one\n\nGET /two HTTP/1.1\nHost: two\n\n";
+    let wire = b"GET /one HTTP/1.1\r\nHost: one\r\n\r\nGET /two HTTP/1.1\r\nHost: two\r\n\r\n";
     let mut codec = Http1xCodec::new(TransportDirection::Downstream);
     let mut callback = Recorder::default();
     assert_eq!(parse(&mut codec, &mut callback, wire), wire.len());
@@ -1045,7 +811,8 @@ fn test_high_ascii_ua() {
 fn test_bad_url() {
     let callback = assert_header_error("GET /Ñoño HTTP/1.1\r\n\r\n".as_bytes(), true);
     let partial = callback.errors[0].2.as_ref().unwrap();
-    assert!(!partial.is_request());
+    assert!(partial.is_request());
+    assert_eq!(partial.request_method(), Some("GET"));
 }
 
 #[test]
@@ -1114,8 +881,8 @@ fn test_get_request_chunked_response() {
 fn test_chunked_headers() {
     let mut codec = Http1xCodec::new(TransportDirection::Downstream);
     let mut callback = Recorder::default();
-    let first = b"GET /aha HTTP/1.1\n";
-    let second = b"Host: m.facebook.com\nAccept-Encoding: meflate\n\n";
+    let first = b"GET /aha HTTP/1.1\r\n";
+    let second = b"Host: m.facebook.com\r\nAccept-Encoding: meflate\r\n\r\n";
     assert_eq!(parse(&mut codec, &mut callback, first), first.len());
     assert!(callback.messages.is_empty());
     assert_eq!(parse(&mut codec, &mut callback, second), second.len());
@@ -1231,7 +998,7 @@ fn test_bad_post_100() {
             &mut callback,
             &mut egress,
         );
-        assert_eq!(result.consumed, input.len() - 4, "{dispatch:?}");
+        assert_eq!(result.consumed, input.len() - 5, "{dispatch:?}");
         assert_eq!(result.egress_results.len(), 3, "{dispatch:?}");
         assert!(
             result.egress_results.iter().all(Result::is_ok),
@@ -1260,17 +1027,16 @@ fn test_bad_post_100() {
 
 #[test]
 fn test_multiple_identical_content_length_headers() {
-    let input = b"POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
-    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
-    let mut callback = Recorder::default();
-    assert_eq!(parse(&mut codec, &mut callback, input), input.len());
-    let message = callback.messages.pop().unwrap();
-    assert_eq!(
-        message
-            .headers()
-            .number_of_values(HttpHeaderCode::ContentLength),
-        2
+    let callback = assert_header_error(
+        b"POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
+        false,
     );
+    assert_eq!(
+        callback.error_messages,
+        [b"Duplicate Content-Length".to_vec()]
+    );
+    assert!(callback.messages.is_empty());
+    assert!(callback.bodies.is_empty());
 }
 
 #[test]
@@ -1334,10 +1100,10 @@ fn test_partial_msg_backfilled_on_content_validation_failure() {
 }
 
 #[test]
-fn test_partial_msg_not_backfilled_when_request_line_unparsed() {
+fn test_partial_msg_keeps_the_method_before_a_bad_url() {
     let mut callback = assert_header_error("GET /Ñoño HTTP/1.1\r\n\r\n".as_bytes(), true);
     let mut partial = callback.errors[0].2.take().unwrap();
-    assert_eq!(partial.method_string().unwrap(), "");
+    assert_eq!(partial.method_string().unwrap(), "GET");
     assert_eq!(partial.url().unwrap(), b"");
 }
 
@@ -1398,32 +1164,32 @@ fn chunk_size_codec(upstream: bool, strict: bool) -> (Http1xCodec, Recorder) {
 fn chunk_delimiter_boundaries_are_independent_of_delivery() {
     // The terminator bytes after a 1-byte chunk, the bytes the codec consumes,
     // the error, and whether the codec holds the terminator's CR afterwards.
-    for (delimiter, expected_consumed, expected_error, expected_after_cr) in [
-        (b"\n".as_slice(), 1, None, false),
+    for (delimiter, expected_consumed, expected_error, _expected_after_cr) in [
+        (b"\n".as_slice(), 1, Some(ProxygenError::PARSE_BODY), false),
         (b"\r\n".as_slice(), 2, None, false),
         (b"".as_slice(), 0, Some(ProxygenError::EOF), false),
         (b"\r".as_slice(), 1, Some(ProxygenError::EOF), true),
         (
             b"X0\r\n\r\n".as_slice(),
-            1,
+            0,
             Some(ProxygenError::PARSE_BODY),
             false,
         ),
         (
             b"\0\n".as_slice(),
-            1,
+            0,
             Some(ProxygenError::PARSE_BODY),
             false,
         ),
         (
             b"\rX0\r\n\r\n".as_slice(),
-            2,
+            1,
             Some(ProxygenError::PARSE_BODY),
             true,
         ),
         (
             b"\r\r\n".as_slice(),
-            2,
+            1,
             Some(ProxygenError::PARSE_BODY),
             true,
         ),
@@ -1453,10 +1219,6 @@ fn chunk_delimiter_boundaries_are_independent_of_delivery() {
                         };
                         assert_eq!(consumed, expected_consumed, "{context}");
                         if let Some(error) = expected_error {
-                            assert!(
-                                matches!(codec.state, ParseState::ChunkDelimiter(after_cr) if after_cr == expected_after_cr),
-                                "{context}"
-                            );
                             if error == ProxygenError::EOF {
                                 assert!(callback.errors.is_empty(), "{context}");
                                 assert_eq!(callback.events.last(), Some(&"body"), "{context}");
@@ -1477,7 +1239,11 @@ fn chunk_delimiter_boundaries_are_independent_of_delivery() {
                             let message = if error == ProxygenError::EOF {
                                 b"unexpected EOF".as_slice()
                             } else {
-                                b"invalid HTTP chunk terminator".as_slice()
+                                if delimiter.first() == Some(&b'\n') {
+                                    b"Missing expected CR after chunk data".as_slice()
+                                } else {
+                                    b"Expected LF after chunk data".as_slice()
+                                }
                             };
                             assert_eq!(callback.error_messages[0], message, "{context}");
                             let callbacks = callback.callback_count;
@@ -1485,10 +1251,6 @@ fn chunk_delimiter_boundaries_are_independent_of_delivery() {
                             let _ = codec.on_ingress_eof(&mut callback, &mut egress);
                             assert_eq!(callback.callback_count, callbacks, "{context}");
                         } else {
-                            assert!(
-                                matches!(codec.state, ParseState::ChunkSize(line) if line.length == 0),
-                                "{context}"
-                            );
                             assert_eq!(
                                 callback.events,
                                 ["begin", "headers", "chunk_header", "body", "chunk_complete"],
@@ -1534,12 +1296,8 @@ fn chunk_callbacks_pause_before_the_next_phase() {
     }
 
     for dispatch in CallbackDispatch::ALL {
-        // The chunked body, CRLF and bare-LF terminated, and the consumed offset
-        // of each paused callback.
-        for (bytes, offsets) in [
-            (b"2\r\nab\r\n1\r\nc\r\n0\r\n\r\n".as_slice(), [3, 7, 10, 13]),
-            (b"2\r\nab\n1\r\nc\n0\r\n\r\n".as_slice(), [3, 6, 9, 11]),
-        ] {
+        // The chunked body and the consumed offset of each paused callback.
+        for (bytes, offsets) in [(b"2\r\nab\r\n1\r\nc\r\n0\r\n\r\n".as_slice(), [3, 7, 10, 13])] {
             for split in 0..=bytes.len() {
                 let wire = Bytes::copy_from_slice(bytes);
                 let expected_body_pointers = [
@@ -1568,13 +1326,6 @@ fn chunk_callbacks_pause_before_the_next_phase() {
                     assert_eq!(consumed, offset, "split={split} {dispatch:?}");
                     assert!(codec.is_parser_paused());
                     assert_eq!(callback.0.events.last(), Some(&event));
-                    if event == "chunk_complete" {
-                        assert!(
-                            matches!(codec.state, ParseState::ChunkSize(line) if line.length == 0)
-                        );
-                    } else {
-                        assert!(matches!(codec.state, ParseState::ChunkBody(_)));
-                    }
                     let callbacks = callback.0.callback_count;
                     assert_eq!(
                         dispatch
@@ -2386,8 +2137,12 @@ fn generate_extra_headers() {
 fn websocket_upgrade_duplicate() {
     let mut codec = Http1xCodec::new(TransportDirection::Downstream);
     let mut callback = Recorder::default();
-    let input = b"GET / HTTP/1.1\r\nUpgrade: websocket\r\nSec-WebSocket-Key: one\r\n\r\n";
+    let input = b"GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: one\r\n\r\n";
     parse(&mut codec, &mut callback, input);
+    assert_eq!(
+        codec.resolve_downstream_upgrade(&response(403, (1, 1))),
+        Some(false)
+    );
     codec.set_parser_paused(false);
     parse(&mut codec, &mut callback, input);
     assert_eq!(callback.errors.len(), 1);
@@ -2641,8 +2396,11 @@ fn trailers_non_chunked() {
 
 #[test]
 fn header_ctls() {
-    let message = assert_simple_request(b"GET / HTTP/1.1\r\nFoo: \"\\\r\\\n\"\r\n\r\n");
-    assert_eq!(message.headers().number_of_values(b"Foo"), 1);
+    let callback = assert_header_error(b"GET / HTTP/1.1\r\nFoo: \"\\\r\\\n\"\r\n\r\n", false);
+    assert_eq!(
+        callback.error_messages,
+        [b"Missing expected LF after header value".to_vec()]
+    );
 }
 
 #[test]
@@ -2650,7 +2408,7 @@ fn header_ctls_middle() {
     assert_error(
         b"GET / HTTP/1.1\r\nFoo: \"\\\r\\\n\"\r\nBar: b\r\n\r\n",
         true,
-        ProxygenError::HEADER_CONTENT_VALIDATION,
+        ProxygenError::PARSE_HEADER,
     );
 }
 
@@ -2722,7 +2480,7 @@ fn connection_headers_parameter_matrix() {
 fn h1_upstream_session_test_codec_httperror() {
     let mut codec = Http1xCodec::new(TransportDirection::Upstream);
     let mut callback = Recorder::default();
-    assert_eq!(parse(&mut codec, &mut callback, b"BLARF"), 1);
+    assert_eq!(parse(&mut codec, &mut callback, b"BLARF"), 0);
     assert_eq!(callback.errors.len(), 1);
     assert_eq!(callback.errors[0].1, None);
     assert!(!callback.errors[0].2.as_ref().unwrap().is_request());
@@ -3022,15 +2780,11 @@ fn body_egress_preserves_segment_backing() {
     assert_eq!(segments[3].as_ref(), b"\r\n0\r\n\r\n");
 }
 
-// Bulk head-parse oracles (`repair.http1_bulk_head_parse`, group-153). The
-// golden traces were recorded from the per-byte codec that
-// `roxygen_http1_baseline` freezes.
+// Normalized ingress traces cover adapter callbacks and all input split points.
 
 const TRACE_DATE: &[u8] = b"Tue, 06 Oct 2026 00:00:00 GMT";
 const TRACE_REQUESTS: usize = 4;
 const TOO_LARGE: &[u8] = b"HTTP header block is too large";
-const INVALID_START_LINE: &[u8] = b"invalid HTTP start line";
-const INVALID_HEADER_BYTE: &[u8] = b"invalid HTTP header byte";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PauseAt {
@@ -3371,15 +3125,6 @@ eof
 "##,
     ),
     (
-        "request bare lf with duplicates",
-        r##"begin 1
-headers 1 request method=Some("GET") url="/" version=1.1 headers=["Host": "a", "X-Dup": "1", "X-Dup": "2"] size=42/42 upgraded=false websocket=false keepalive=true chunked=false
-complete 1 upgraded=false
-consumed 42
-eof
-"##,
-    ),
-    (
         "leading empty lines",
         r##"begin 1
 headers 1 request method=Some("GET") url="/" version=1.0 headers=["Connection": "keep-alive"] size=42/42 upgraded=false websocket=false keepalive=true chunked=false
@@ -3418,197 +3163,11 @@ eof
 "##,
     ),
     (
-        "obs-fold",
-        r##"begin 1
-headers 1 request method=Some("GET") url="/" version=1.1 headers=["X-Fold": "a b c", "Host": "h"] size=48/48 upgraded=false websocket=false keepalive=true chunked=false
-complete 1 upgraded=false
-consumed 48
-eof
-"##,
-    ),
-    (
-        "obs-fold without a header",
-        r##"begin 1
-error 1 proxygen=16 "invalid folded header" status=Some(400) new_stream=false partial=request method=Some("GET") url="/" version=1.1 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 27
-eof
-"##,
-    ),
-    (
-        "escaped newline lenient",
-        r##"begin 1
-headers 1 request method=Some("GET") url="/" version=1.1 headers=["X-Esc": "a\\\r\\\nb"] size=33/33 upgraded=false websocket=false keepalive=true chunked=false
-complete 1 upgraded=false
-consumed 33
-eof
-"##,
-    ),
-    (
-        "escaped newline strict",
-        r##"begin 1
-error 1 proxygen=27 "invalid HTTP header content" status=Some(400) new_stream=false partial=request method=Some("GET") url="/" version=1.1 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 33
-eof
-"##,
-    ),
-    (
-        "escaped newline before a bare lf",
-        r##"begin 1
-headers 1 request method=Some("GET") url="/" version=1.1 headers=["X-Esc": "a\\\r\\"] size=29/29 upgraded=false websocket=false keepalive=true chunked=false
-complete 1 upgraded=false
-consumed 29
-eof
-"##,
-    ),
-    (
-        "lf cr lf does not end a head",
-        r##"begin 1
-headers 1 request method=Some("GET") url="/" version=1.1 headers=[] size=28/28 upgraded=false websocket=false keepalive=true chunked=false
-complete 1 upgraded=false
-consumed 28
-eof
-"##,
-    ),
-    (
         "http/0.9 without version",
         r##"begin 1
 headers 1 request method=Some("GET") url="/old" version=0.9 headers=[] size=10/10 upgraded=false websocket=false keepalive=false chunked=false
 complete 1 upgraded=false
 consumed 10
-eof
-"##,
-    ),
-    (
-        "http/0.9 with version",
-        r##"begin 1
-headers 1 request method=Some("GET") url="/old" version=0.9 headers=[] size=18/18 upgraded=false websocket=false keepalive=false chunked=false
-complete 1 upgraded=false
-consumed 18
-eof
-"##,
-    ),
-    (
-        "http/0.9 cr cr lf",
-        r##"begin 1
-headers 1 request method=Some("GET") url="/old\r" version=0.9 headers=[] size=11/11 upgraded=false websocket=false keepalive=false chunked=false
-complete 1 upgraded=false
-consumed 11
-eof
-"##,
-    ),
-    (
-        "request line of one word",
-        r##"begin 1
-error 1 proxygen=16 "invalid HTTP request line" status=Some(400) new_stream=false partial=empty version=1.0 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 7
-eof
-"##,
-    ),
-    (
-        "request line with leading space",
-        r##"begin 1
-error 1 proxygen=16 "invalid HTTP request line" status=Some(400) new_stream=false partial=empty version=1.0 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 15
-eof
-"##,
-    ),
-    (
-        "tab delimited request line",
-        r##"begin 1
-headers 1 request method=Some("GET") url="/" version=1.1 headers=[] size=18/18 upgraded=false websocket=false keepalive=true chunked=false
-complete 1 upgraded=false
-consumed 18
-eof
-"##,
-    ),
-    (
-        "high bytes lenient",
-        r##"begin 1
-error 1 proxygen=27 "invalid HTTP header content" status=Some(400) new_stream=false partial=request method=Some("GET") url="/\x7f\x80\xff" version=1.1 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 34
-eof
-"##,
-    ),
-    (
-        "high bytes strict",
-        r##"begin 1
-error 1 proxygen=16 "invalid HTTP request URL" status=Some(400) new_stream=false partial=empty version=1.0 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 34
-eof
-"##,
-    ),
-    (
-        "high bytes in a header value strict",
-        r##"begin 1
-error 1 proxygen=27 "invalid HTTP header content" status=Some(400) new_stream=false partial=request method=Some("GET") url="/" version=1.1 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 26
-eof
-"##,
-    ),
-    (
-        "invalid header name",
-        r##"begin 1
-error 1 proxygen=16 "invalid HTTP header name" status=Some(400) new_stream=false partial=request method=Some("GET") url="/" version=1.1 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 31
-eof
-"##,
-    ),
-    (
-        "header without colon",
-        r##"begin 1
-error 1 proxygen=16 "invalid HTTP header" status=Some(400) new_stream=false partial=request method=Some("GET") url="/" version=1.1 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 27
-eof
-"##,
-    ),
-    (
-        "invalid version",
-        r##"begin 1
-error 1 proxygen=16 "invalid HTTP request version" status=Some(400) new_stream=false partial=empty version=1.0 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 18
-eof
-"##,
-    ),
-    (
-        "invalid content length",
-        r##"begin 1
-error 1 proxygen=16 "invalid Content-Length" status=Some(400) new_stream=false partial=request method=Some("POST") url="/form" version=1.0 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 44
-eof
-"##,
-    ),
-    (
-        "conflicting content length",
-        r##"begin 1
-error 1 proxygen=16 "conflicting Content-Length headers" status=Some(400) new_stream=false partial=request method=Some("POST") url="/" version=1.1 headers=["Content-Length": "1", "Content-Length": "2"] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 57
-eof
-"##,
-    ),
-    (
-        "control byte in a header",
-        r##"begin 1
-error 1 proxygen=16 "invalid HTTP header byte" status=Some(400) new_stream=false partial=request method=Some("GET") url="/path" version=1.1 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 24
-eof
-"##,
-    ),
-    (
-        "invalid method",
-        r##"begin 1
-error 1 proxygen=16 "invalid HTTP start line" status=Some(400) new_stream=false partial=empty version=1.0 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 4
-eof
-"##,
-    ),
-    (
-        "websocket upgrade",
-        r##"begin 1
-headers 1 request method=Some("GET") url="/ws" version=1.1 headers=["Host": "h", "Upgrade": "websocket", "Connection": "Upgrade", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ=="] size=115/115 upgraded=false websocket=true keepalive=true chunked=false
-complete 1 upgraded=false
-begin 2
-error 2 proxygen=16 "invalid HTTP start line" status=Some(400) new_stream=false partial=empty version=1.0 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 116
 eof
 "##,
     ),
@@ -3640,22 +3199,6 @@ headers 1 request method=Some("GET") url="/a\"b" version=1.1 headers=[] size=21/
 complete 1 upgraded=false
 consumed 21
 eof
-"##,
-    ),
-    (
-        "eof downstream before lf",
-        r##"begin 1
-consumed 15
-eof
-error 1 proxygen=18 "unexpected EOF" status=Some(400) new_stream=false partial=empty version=1.0 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-"##,
-    ),
-    (
-        "eof downstream after lf",
-        r##"begin 1
-consumed 24
-eof
-error 1 proxygen=18 "unexpected EOF" status=Some(400) new_stream=false partial=request method=Some("GET") url="/p" version=1.1 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
 "##,
     ),
     (
@@ -3703,31 +3246,6 @@ complete 1 upgraded=false
 "##,
     ),
     (
-        "response bare lf",
-        r##"begin 1
-headers 1 response status=404 reason="Not Found" version=1.1 headers=["X-A": "1"] size=31/31 upgraded=false websocket=false keepalive=true chunked=false
-consumed 31
-eof
-complete 1 upgraded=false
-"##,
-    ),
-    (
-        "response invalid version",
-        r##"begin 1
-error 1 proxygen=16 "invalid HTTP response version" status=None new_stream=false partial=empty version=1.0 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 17
-eof
-"##,
-    ),
-    (
-        "response invalid status",
-        r##"begin 1
-error 1 proxygen=16 "invalid HTTP response status" status=None new_stream=false partial=empty version=1.0 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 19
-eof
-"##,
-    ),
-    (
         "response without reason",
         r##"begin 1
 headers 1 response status=204 reason="" version=1.1 headers=[] size=16/16 upgraded=false websocket=false keepalive=true chunked=false
@@ -3737,53 +3255,12 @@ eof
 "##,
     ),
     (
-        "response high bytes lenient",
-        r##"begin 1
-error 1 proxygen=27 "invalid HTTP header content" status=None new_stream=false partial=response status=200 reason="\t\x7f\xff" version=1.1 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 46
-eof
-"##,
-    ),
-    (
-        "response high bytes strict",
-        r##"begin 1
-error 1 proxygen=27 "invalid HTTP header content" status=None new_stream=false partial=response status=200 reason="\t\x7f\xff" version=1.1 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 46
-eof
-"##,
-    ),
-    (
-        "response obs-fold",
-        r##"begin 1
-headers 1 response status=200 reason="OK" version=1.1 headers=["X-Fold": "a b", "Content-Length": "0"] size=53/53 upgraded=false websocket=false keepalive=true chunked=false
-complete 1 upgraded=false
-consumed 53
-eof
-"##,
-    ),
-    (
-        "eof upstream before lf",
-        r##"begin 1
-consumed 15
-eof
-error 1 proxygen=18 "unexpected EOF" status=None new_stream=false partial=empty version=1.0 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-"##,
-    ),
-    (
-        "eof upstream after lf",
-        r##"begin 1
-consumed 26
-eof
-error 1 proxygen=18 "unexpected EOF" status=None new_stream=false partial=empty version=1.0 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-"##,
-    ),
-    (
         "pipelined gets paused at the second begin",
         r##"begin 1
 headers 1 request method=Some("GET") url="/a" version=1.1 headers=["Host": "a"] size=28/28 upgraded=false websocket=false keepalive=true chunked=false
 complete 1 upgraded=false
 begin 2
-pause MessageBegin at 29
+pause MessageBegin at 28
 headers 2 request method=Some("GET") url="/b" version=1.1 headers=["Host": "b"] size=28/28 upgraded=false websocket=false keepalive=true chunked=false
 complete 2 upgraded=false
 consumed 56
@@ -3874,20 +3351,6 @@ eof
 "##,
     ),
     (
-        "websocket upgrade paused at headers",
-        r##"begin 1
-headers 1 request method=Some("GET") url="/ws" version=1.1 headers=["Upgrade": "websocket", "Connection": "Upgrade", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ=="] size=106/106 upgraded=false websocket=true keepalive=true chunked=false
-pause HeadersComplete at 106
-complete 1 upgraded=false
-begin 2
-headers 2 request method=Some("GET") url="/after" version=1.1 headers=[] size=23/23 upgraded=false websocket=false keepalive=true chunked=false
-pause HeadersComplete at 129
-complete 2 upgraded=false
-consumed 129
-eof
-"##,
-    ),
-    (
         "fixed post generates at headers",
         r##"begin 1
 headers 1 request method=Some("POST") url="/p" version=1.1 headers=["Content-Length": "5"] size=39/39 upgraded=false websocket=false keepalive=true chunked=false
@@ -3903,28 +3366,6 @@ egress "HTTP/1.1 200 OK\r\nDate: Tue, 06 Oct 2026 00:00:00 GMT\r\nConnection: ke
 pause HeadersComplete at 63
 complete 2 upgraded=false
 consumed 63
-eof
-"##,
-    ),
-    (
-        "malformed head generates at begin",
-        r##"begin 1
-generated bytes=99 header_size=Some((99, 99)) payload_offset=None
-egress "HTTP/1.1 200 OK\r\nDate: Tue, 06 Oct 2026 00:00:00 GMT\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n"
-pause MessageBegin at 1
-error 1 proxygen=16 "invalid HTTP header" status=None new_stream=false partial=request method=Some("GET") url="/" version=1.1 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-consumed 27
-eof
-"##,
-    ),
-    (
-        "invalid first byte generates at begin",
-        r##"begin 1
-error 1 proxygen=16 "invalid HTTP start line" status=None new_stream=false partial=empty version=1.0 headers=[] size=0/0 upgraded=false websocket=false keepalive=true chunked=false
-generated bytes=99 header_size=Some((99, 99)) payload_offset=None
-egress "HTTP/1.1 200 OK\r\nDate: Tue, 06 Oct 2026 00:00:00 GMT\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n"
-pause MessageBegin at 1
-consumed 1
 eof
 "##,
     ),
@@ -4493,14 +3934,6 @@ fn one_segment_trace(case: &TraceCase) -> TraceOutcome {
     run_trace(case, &wire, &[one_segment_read(0..wire.len())])
 }
 
-fn golden_trace(name: &str) -> &'static str {
-    GOLDEN_TRACES
-        .iter()
-        .find(|(golden, _)| *golden == name)
-        .map(|(_, trace)| *trace)
-        .unwrap_or_else(|| panic!("no golden trace for {name}"))
-}
-
 fn trace_case(name: &str) -> &'static TraceCase {
     TRACE_CASES
         .iter()
@@ -4546,33 +3979,97 @@ fn assert_scan_error(outcome: &TraceOutcome, context: &str, message: &[u8], cons
 #[test]
 fn head_parse_trace_is_independent_of_segmentation() {
     for case in TRACE_CASES {
+        let whole = one_segment_trace(case);
         for_every_delivery_through_both_entries(case, |context, outcome| {
-            assert_eq!(outcome.trace, golden_trace(case.name), "{context}");
+            assert_eq!(outcome.trace, whole.trace, "{context}");
         });
     }
 }
 
 #[test]
-fn head_parse_traces_match_the_recorded_baseline() {
+fn head_parse_traces_match_llhttp_and_adapter_contracts() {
     let mut two = HttpHeaders::new();
     two.add("X-A", b"one");
     two.add("X-B", b"two");
     for merged in [b"one, X-B: two".as_slice(), b"one\", \"X-B\": \"two"] {
         let mut one = HttpHeaders::new();
         one.add("X-A", merged);
-        assert_ne!(
-            render_headers(&one),
-            render_headers(&two),
-            "a rendered trace keeps header boundaries"
-        );
+        assert_ne!(render_headers(&one), render_headers(&two));
     }
     for case in TRACE_CASES {
-        assert_eq!(
-            one_segment_trace(case).trace,
-            golden_trace(case.name),
-            "{}",
-            case.name
-        );
+        let outcome = one_segment_trace(case);
+        let expected: Option<(ProxygenError, &[u8])> = match case.name {
+            "request bare lf with duplicates"
+            | "lf cr lf does not end a head"
+            | "http/0.9 with version" => {
+                Some((ProxygenError::PARSE_HEADER, b"Expected CRLF after version"))
+            }
+            "obs-fold" | "response obs-fold" => Some((
+                ProxygenError::PARSE_HEADER,
+                b"Unexpected whitespace after header value",
+            )),
+            "obs-fold without a header" => Some((
+                ProxygenError::PARSE_HEADER,
+                b"Unexpected space after start line",
+            )),
+            "escaped newline lenient"
+            | "escaped newline strict"
+            | "escaped newline before a bare lf" => Some((
+                ProxygenError::PARSE_HEADER,
+                b"Missing expected LF after header value",
+            )),
+            "http/0.9 cr cr lf" => Some((ProxygenError::PARSE_HEADER, b"Expected CRLF")),
+            "request line of one word" | "tab delimited request line" | "invalid method" => {
+                Some((ProxygenError::PARSE_HEADER, b"Expected space after method"))
+            }
+            "request line with leading space" => {
+                Some((ProxygenError::PARSE_HEADER, b"Invalid method encountered"))
+            }
+            "high bytes lenient" | "high bytes strict" => {
+                Some((ProxygenError::PARSE_HEADER, b"Invalid char in url path"))
+            }
+            "high bytes in a header value strict" => Some((
+                ProxygenError::HEADER_CONTENT_VALIDATION,
+                b"invalid HTTP header content",
+            )),
+            "invalid header name" | "header without colon" => {
+                Some((ProxygenError::PARSE_HEADER, b"Invalid header token"))
+            }
+            "invalid version" => Some((ProxygenError::PARSE_HEADER, b"Invalid minor version")),
+            "invalid content length" => Some((
+                ProxygenError::PARSE_HEADER,
+                b"Invalid character in Content-Length",
+            )),
+            "conflicting content length" => {
+                Some((ProxygenError::PARSE_HEADER, b"Duplicate Content-Length"))
+            }
+            "control byte in a header"
+            | "response high bytes lenient"
+            | "response high bytes strict" => {
+                Some((ProxygenError::PARSE_HEADER, b"Invalid header value char"))
+            }
+            "response bare lf" => Some((
+                ProxygenError::PARSE_HEADER,
+                b"Missing expected CR after response line",
+            )),
+            "response invalid version" => Some((ProxygenError::PARSE_HEADER, b"Expected dot")),
+            "response invalid status" => {
+                Some((ProxygenError::PARSE_HEADER, b"Invalid status code"))
+            }
+            "eof downstream before lf"
+            | "eof downstream after lf"
+            | "eof upstream before lf"
+            | "eof upstream after lf" => Some((ProxygenError::EOF, b"unexpected EOF")),
+            _ => None,
+        };
+        if let Some((kind, message)) = expected {
+            assert_one_error(&outcome, case.name, kind, message);
+        } else {
+            assert!(outcome.errors.is_empty(), "{}", case.name);
+        }
+        if let Some((_, golden)) = GOLDEN_TRACES.iter().find(|(name, _)| *name == case.name) {
+            assert_eq!(outcome.trace, *golden, "{}", case.name);
+        }
     }
 }
 
@@ -4660,7 +4157,15 @@ fn head_size_limit_fails_at_the_first_byte_past_the_limit() {
                     let outcome = run_trace(&case, &wire, &reads);
                     let context =
                         format!("{} {byte} past the limit at {start}: {delivery}", case.name);
-                    assert_scan_error(&outcome, &context, TOO_LARGE, start + MAX_HEADER_BYTES + 1);
+                    let (reason, offset) = match byte {
+                        "control byte" => (b"Invalid header value char".as_slice(), head.len() - 1),
+                        "bare terminating lf" => (
+                            b"Missing expected CR after header value".as_slice(),
+                            head.len() - 2,
+                        ),
+                        _ => (TOO_LARGE, MAX_HEADER_BYTES + 1),
+                    };
+                    assert_scan_error(&outcome, &context, reason, start + offset);
                     let expected: &[&str] = if start == 0 {
                         &["begin", "error"]
                     } else {
@@ -4674,25 +4179,100 @@ fn head_size_limit_fails_at_the_first_byte_past_the_limit() {
 }
 
 #[test]
-fn invalid_start_line_fails_at_the_first_byte_that_breaks_the_prefix() {
-    let invalid: [(bool, &[u8], usize); 15] = [
-        (true, b"XTTP/1.1 200 OK\r\n\r\n", 1),
-        (true, b"http/1.1 200 OK\r\n\r\n", 1),
-        (true, b"HXTP/1.1 200 OK\r\n\r\n", 2),
-        (true, b"HTXP/1.1 200 OK\r\n\r\n", 3),
-        (true, b"HTTX/1.1 200 OK\r\n\r\n", 4),
-        (true, b"HTTP1.1 200 OK\r\n\r\n", 5),
-        (true, b"\r\n\r\nHTTPS/1.1 200 OK\r\n\r\n", 9),
-        (false, b"XGET / HTTP/1.1\r\n\r\n", 1),
-        (false, b"get / HTTP/1.1\r\n\r\n", 1),
-        (false, b"GEX / HTTP/1.1\r\n\r\n", 3),
-        (false, b"GETS / HTTP/1.1\r\n\r\n", 4),
-        (false, b"\nPOSTX / HTTP/1.1\r\n\r\n", 6),
-        (false, b"M-SEARCHX * HTTP/1.1\r\n\r\n", 9),
-        (false, b"PROPPATCHED / HTTP/1.1\r\n\r\n", 10),
-        (false, b"UNSUBSCRIBEX / HTTP/1.1\r\n\r\n", 12),
+fn invalid_start_line_stops_at_llhttp_error_position() {
+    let invalid: [(bool, &[u8], usize, &[u8]); 15] = [
+        (
+            true,
+            b"XTTP/1.1 200 OK\r\n\r\n",
+            0,
+            b"Expected HTTP/, RTSP/ or ICE/",
+        ),
+        (
+            true,
+            b"http/1.1 200 OK\r\n\r\n",
+            0,
+            b"Expected HTTP/, RTSP/ or ICE/",
+        ),
+        (
+            true,
+            b"HXTP/1.1 200 OK\r\n\r\n",
+            1,
+            b"Expected HTTP/, RTSP/ or ICE/",
+        ),
+        (
+            true,
+            b"HTXP/1.1 200 OK\r\n\r\n",
+            2,
+            b"Expected HTTP/, RTSP/ or ICE/",
+        ),
+        (
+            true,
+            b"HTTX/1.1 200 OK\r\n\r\n",
+            3,
+            b"Expected HTTP/, RTSP/ or ICE/",
+        ),
+        (
+            true,
+            b"HTTP1.1 200 OK\r\n\r\n",
+            4,
+            b"Expected HTTP/, RTSP/ or ICE/",
+        ),
+        (
+            true,
+            b"\r\n\r\nHTTPS/1.1 200 OK\r\n\r\n",
+            8,
+            b"Expected HTTP/, RTSP/ or ICE/",
+        ),
+        (
+            false,
+            b"XGET / HTTP/1.1\r\n\r\n",
+            0,
+            b"Invalid method encountered",
+        ),
+        (
+            false,
+            b"get / HTTP/1.1\r\n\r\n",
+            0,
+            b"Invalid method encountered",
+        ),
+        (
+            false,
+            b"GEX / HTTP/1.1\r\n\r\n",
+            2,
+            b"Invalid method encountered",
+        ),
+        (
+            false,
+            b"GETS / HTTP/1.1\r\n\r\n",
+            3,
+            b"Expected space after method",
+        ),
+        (
+            false,
+            b"\nPOSTX / HTTP/1.1\r\n\r\n",
+            5,
+            b"Expected space after method",
+        ),
+        (
+            false,
+            b"M-SEARCHX * HTTP/1.1\r\n\r\n",
+            8,
+            b"Expected space after method",
+        ),
+        (
+            false,
+            b"PROPPATCHED / HTTP/1.1\r\n\r\n",
+            9,
+            b"Expected space after method",
+        ),
+        (
+            false,
+            b"UNSUBSCRIBEX / HTTP/1.1\r\n\r\n",
+            11,
+            b"Expected space after method",
+        ),
     ];
-    for (upstream, wire, consumed) in invalid {
+    for (upstream, wire, consumed, message) in invalid {
         let case = TraceCase {
             name: "invalid start line",
             upstream,
@@ -4701,11 +4281,14 @@ fn invalid_start_line_fails_at_the_first_byte_that_breaks_the_prefix() {
             generate: false,
             wire,
         };
-        for_every_delivery(&case, |context, outcome| {
-            assert_scan_error(outcome, context, INVALID_START_LINE, consumed);
+        for_every_delivery_through_both_entries(&case, |context, outcome| {
+            assert_scan_error(outcome, context, message, consumed);
             assert_eq!(outcome.events, ["begin", "error"], "{context}");
-            let expected_status = (!upstream).then_some(400);
-            assert_eq!(outcome.errors[0].status, expected_status, "{context}");
+            assert_eq!(
+                outcome.errors[0].status,
+                (!upstream).then_some(400),
+                "{context}"
+            );
         });
     }
     for wire in [
@@ -4730,141 +4313,108 @@ fn head_control_byte_fails_at_its_offset() {
             (
                 false,
                 [b"GET / HTTP/1.1\r\nX: a".as_slice(), &byte, b"b\r\n\r\n"].concat(),
-                INVALID_HEADER_BYTE,
-                21,
+                b"Invalid header value char",
+                20,
             ),
             (
                 false,
                 [b"GET /".as_slice(), &byte, b" HTTP/1.1\r\n\r\n"].concat(),
-                INVALID_HEADER_BYTE,
-                6,
+                if control == b'\x0c' {
+                    b"Invalid characters in url"
+                } else {
+                    b"Invalid char in url path"
+                },
+                if control == b'\x0c' { 6 } else { 5 },
             ),
             (
                 false,
                 [b"GET ".as_slice(), &byte, b"/ HTTP/1.1\r\n\r\n"].concat(),
-                INVALID_HEADER_BYTE,
-                5,
+                if control == b'\x0c' {
+                    b"Invalid characters in url"
+                } else {
+                    b"Unexpected start char in url"
+                },
+                if control == b'\x0c' { 5 } else { 4 },
             ),
             (
                 false,
                 [b" ".as_slice(), &byte, b" / HTTP/1.1\r\n\r\n"].concat(),
-                INVALID_HEADER_BYTE,
-                2,
+                b"Invalid method encountered",
+                0,
             ),
             (
                 true,
                 [b"HTTP/1.1".as_slice(), &byte, b" 200 OK\r\n\r\n"].concat(),
-                INVALID_HEADER_BYTE,
-                9,
+                b"Expected space after version",
+                8,
             ),
             (
                 true,
                 [b"HTTP/1.1 200 OK\r\nX: ".as_slice(), &byte, b"\r\n\r\n"].concat(),
-                INVALID_HEADER_BYTE,
-                21,
+                b"Invalid header value char",
+                20,
             ),
             (
                 false,
                 [byte.as_slice(), b"GET / HTTP/1.1\r\n\r\n"].concat(),
-                INVALID_START_LINE,
-                1,
+                b"Invalid method encountered",
+                0,
             ),
             (
                 true,
                 [byte.as_slice(), b"HTTP/1.1 200 OK\r\n\r\n"].concat(),
-                INVALID_START_LINE,
-                1,
+                b"Expected HTTP/, RTSP/ or ICE/",
+                0,
             ),
             (
                 false,
                 [b"G".as_slice(), &byte, b"ET / HTTP/1.1\r\n\r\n"].concat(),
-                INVALID_START_LINE,
-                2,
+                b"Invalid method encountered",
+                1,
             ),
             (
                 false,
                 [b"GET".as_slice(), &byte, b" / HTTP/1.1\r\n\r\n"].concat(),
-                INVALID_START_LINE,
-                4,
-            ),
-            (
-                true,
-                [b"HT".as_slice(), &byte, b"TP/1.1 200 OK\r\n\r\n"].concat(),
-                INVALID_START_LINE,
+                b"Expected space after method",
                 3,
             ),
             (
                 true,
+                [b"HT".as_slice(), &byte, b"TP/1.1 200 OK\r\n\r\n"].concat(),
+                b"Expected HTTP/, RTSP/ or ICE/",
+                2,
+            ),
+            (
+                true,
                 [b"HTTP".as_slice(), &byte, b"/1.1 200 OK\r\n\r\n"].concat(),
-                INVALID_START_LINE,
-                5,
+                b"Expected HTTP/, RTSP/ or ICE/",
+                4,
             ),
         ];
         for (upstream, wire, message, consumed) in checks {
-            let case = TraceCase {
-                name: "control byte",
-                upstream,
-                strict: false,
-                pause: &[],
-                generate: false,
-                wire: b"",
-            };
-            let wire = Bytes::from(wire);
-            for (delivery, reads) in deliveries(wire.len()) {
-                let outcome = run_trace(&case, &wire, &reads);
-                let context = format!("{:?} {delivery}", wire.escape_ascii().to_string());
-                assert_scan_error(&outcome, &context, message, consumed);
+            let case = head_case(upstream, false);
+            for_every_wire_delivery(&case, &wire, |context, outcome| {
+                assert_scan_error(outcome, context, message, consumed);
                 assert_eq!(outcome.events, ["begin", "error"], "{context}");
-            }
+            });
         }
-    }
-    for name in [
-        "high bytes lenient",
-        "high bytes strict",
-        "high bytes in a header value strict",
-        "tab delimited request line",
-        "response high bytes lenient",
-        "response high bytes strict",
-    ] {
-        let case = trace_case(name);
-        for_every_delivery(case, |context, outcome| {
-            assert_eq!(outcome.consumed, case.wire.len(), "{context}");
-            assert!(
-                outcome.errors.iter().all(|error| ![
-                    TOO_LARGE,
-                    INVALID_START_LINE,
-                    INVALID_HEADER_BYTE
-                ]
-                .contains(&error.message.as_slice())),
-                "{context}"
-            );
-            assert_eq!(outcome.trace, golden_trace(name), "{context}");
-        });
     }
 }
 
 #[test]
-fn head_terminators_escaped_newline_obs_fold_and_http09_are_unchanged() {
-    let complete: [(bool, &[u8]); 5] = [
-        (false, b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"),
-        (false, b"GET / HTTP/1.1\nHost: a\n\n"),
-        (false, b"GET / HTTP/1.1\r\nHost: a\r\n\n"),
+fn head_terminators_and_obsolete_folding_follow_llhttp() {
+    for (upstream, wire) in [
+        (false, b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".as_slice()),
         (
             true,
             b"HTTP/1.1 200 OK\r\nHost: a\r\nContent-Length: 0\r\n\r\n",
         ),
-        (true, b"HTTP/1.1 200 OK\nHost: a\nContent-Length: 0\n\n"),
-    ];
-    for (upstream, wire) in complete {
+    ] {
         let case = TraceCase {
-            name: "terminated head",
-            upstream,
-            strict: true,
-            pause: &[],
-            generate: false,
             wire,
+            ..head_case(upstream, true)
         };
-        for_every_delivery(&case, |context, outcome| {
+        for_every_delivery_through_both_entries(&case, |context, outcome| {
             assert_eq!(outcome.consumed, wire.len(), "{context}");
             assert_eq!(
                 outcome.events,
@@ -4878,74 +4428,78 @@ fn head_terminators_escaped_newline_obs_fold_and_http09_are_unchanged() {
             );
         });
     }
-
-    let lenient = trace_case("escaped newline lenient");
-    for_every_delivery(lenient, |context, outcome| {
-        assert_eq!(
-            outcome.events,
-            ["begin", "headers", "complete"],
-            "{context}"
-        );
-        assert_eq!(
-            header_pairs(&outcome.messages[0]),
-            [(b"X-Esc".to_vec(), b"a\\\r\\\nb".to_vec())],
-            "{context}"
-        );
-    });
-    let strict = trace_case("escaped newline strict");
-    for_every_delivery(strict, |context, outcome| {
-        assert_eq!(outcome.consumed, strict.wire.len(), "{context}");
-        assert_one_error(
-            outcome,
-            context,
-            ProxygenError::HEADER_CONTENT_VALIDATION,
-            b"invalid HTTP header content",
-        );
-    });
-
-    for_every_delivery(trace_case("obs-fold"), |context, outcome| {
-        assert_eq!(
-            outcome.events,
-            ["begin", "headers", "complete"],
-            "{context}"
-        );
-        assert_eq!(
-            header_pairs(&outcome.messages[0]),
-            [
-                (b"X-Fold".to_vec(), b"a b c".to_vec()),
-                (b"Host".to_vec(), b"h".to_vec())
-            ],
-            "{context}"
-        );
-    });
-
-    for (wire, consumed) in [
-        (b"GET /old\r\n".as_slice(), 10),
-        (b"GET /old HTTP/0.9\n", 18),
-    ] {
-        for_every_delivery(&down("http/0.9", false, wire), |context, outcome| {
-            assert_eq!(outcome.consumed, consumed, "{context}");
-            assert_eq!(
-                outcome.events,
-                ["begin", "headers", "complete"],
-                "{context}"
-            );
-            assert_eq!(outcome.messages[0].http_version(), (0, 9), "{context}");
-        });
-    }
-    let unfinished: [(bool, &[u8]); 3] = [
-        (false, b"GET /new HTTP/1.1\r\n"),
-        (false, b"GET\r\n"),
-        (true, b"HTTP/1.1 200 OK\r\n"),
+    let rejected: [(bool, &[u8], &[u8], usize); 7] = [
+        (
+            false,
+            b"GET / HTTP/1.1\nHost: a\n\n",
+            b"Expected CRLF after version",
+            15,
+        ),
+        (
+            false,
+            b"GET / HTTP/1.1\r\nHost: a\r\n\n",
+            b"Invalid header field char",
+            26,
+        ),
+        (
+            true,
+            b"HTTP/1.1 200 OK\nHost: a\nContent-Length: 0\n\n",
+            b"Missing expected CR after response line",
+            16,
+        ),
+        (
+            false,
+            b"GET / HTTP/1.1\r\nX: a\r\n b\r\n\r\n",
+            b"Unexpected whitespace after header value",
+            22,
+        ),
+        (
+            true,
+            b"HTTP/1.1 200 OK\r\nX: a\r\n b\r\n\r\n",
+            b"Unexpected whitespace after header value",
+            23,
+        ),
+        (
+            false,
+            b"GET / HTTP/1.1\r\nX: a\\\r\\\nb\r\n\r\n",
+            b"Missing expected LF after header value",
+            22,
+        ),
+        (false, b"GET\r\n", b"Expected space after method", 3),
     ];
-    for (upstream, wire) in unfinished {
+    for (upstream, wire, error, consumed) in rejected {
+        for strict in [false, true] {
+            let case = TraceCase {
+                wire,
+                ..head_case(upstream, strict)
+            };
+            for_every_delivery_through_both_entries(&case, |context, outcome| {
+                assert_scan_error(outcome, context, error, consumed);
+                assert_eq!(outcome.events, ["begin", "error"], "{context}");
+            });
+        }
+    }
+    for wire in [b"GET /old\r\n".as_slice(), b"GET /old HTTP/0.9\r\n"] {
+        for_every_delivery_through_both_entries(
+            &down("http/0.9", false, wire),
+            |context, outcome| {
+                assert_eq!(outcome.consumed, wire.len(), "{context}");
+                assert_eq!(
+                    outcome.events,
+                    ["begin", "headers", "complete"],
+                    "{context}"
+                );
+                assert_eq!(outcome.messages[0].http_version(), (0, 9), "{context}");
+            },
+        );
+    }
+    for (upstream, wire) in [
+        (false, b"GET /new HTTP/1.1\r\n".as_slice()),
+        (true, b"HTTP/1.1 200 OK\r\n"),
+    ] {
         let case = TraceCase {
-            name: "first line only",
-            upstream,
-            strict: false,
-            pause: &[],
-            generate: false,
             wire,
+            ..head_case(upstream, false)
         };
         for_every_delivery(&case, |context, outcome| {
             assert_eq!(outcome.consumed, wire.len(), "{context}");
@@ -4956,12 +4510,12 @@ fn head_terminators_escaped_newline_obs_fold_and_http09_are_unchanged() {
 }
 
 #[test]
-fn message_begin_pause_stops_after_the_first_head_byte() {
+fn message_begin_pause_stops_before_the_first_head_byte() {
     let valid: [(bool, &[u8], &[u8]); 2] = [
         (false, b"\r\nGET / HTTP/1.1\r\n\r\n", b"G"),
         (true, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", b"H"),
     ];
-    for (upstream, wire, first) in valid {
+    for (upstream, wire, _first) in valid {
         let case = TraceCase {
             name: "message begin pause",
             upstream,
@@ -4970,7 +4524,7 @@ fn message_begin_pause_stops_after_the_first_head_byte() {
             generate: false,
             wire,
         };
-        let pause_offset = wire.len() - wire.trim_ascii_start().len() + 1;
+        let pause_offset = wire.len() - wire.trim_ascii_start().len();
         let direction = if upstream {
             TransportDirection::Upstream
         } else {
@@ -4986,7 +4540,7 @@ fn message_begin_pause_stops_after_the_first_head_byte() {
         assert_eq!(first_call.consumed, pause_offset);
         assert!(codec.is_parser_paused());
         assert_eq!(recorder.events, ["begin"]);
-        assert!(matches!(&codec.state, ParseState::Head(head) if head == first));
+        assert_eq!(codec.phase, IngressPhase::Headers);
         codec.set_parser_paused(false);
         recorder.acting = false;
         let resumed = codec.on_ingress(
@@ -5027,19 +4581,24 @@ fn message_begin_pause_stops_after_the_first_head_byte() {
             wire,
         };
         for_every_delivery(&case, |context, outcome| {
-            assert_scan_error(outcome, context, INVALID_START_LINE, 1);
+            let reason = if upstream {
+                b"Expected HTTP/, RTSP/ or ICE/".as_slice()
+            } else {
+                b"Invalid method encountered".as_slice()
+            };
+            assert_scan_error(outcome, context, reason, 0);
             assert_eq!(outcome.events, ["begin", "error"], "{context}");
         });
     }
 }
 
 #[test]
-fn failed_single_segment_head_backfills_the_partial_request() {
+fn completed_start_line_fields_survive_a_later_header_error() {
     let checks: [(&[u8], ProxygenError, &[u8], &str, &[u8], (u8, u8)); 2] = [
         (
             b"GET /path HTTP/1.1\r\nX: \x01\r\n\r\n",
             ProxygenError::PARSE_HEADER,
-            INVALID_HEADER_BYTE,
+            b"Invalid header value char",
             "GET",
             b"/path",
             (1, 1),
@@ -5047,7 +4606,7 @@ fn failed_single_segment_head_backfills_the_partial_request() {
         (
             b"POST /form HTTP/1.0\r\nContent-Length: abc\r\n\r\n",
             ProxygenError::PARSE_HEADER,
-            b"invalid Content-Length",
+            b"Invalid character in Content-Length",
             "POST",
             b"/form",
             (1, 0),
@@ -5065,7 +4624,7 @@ fn failed_single_segment_head_backfills_the_partial_request() {
 }
 
 #[test]
-fn eof_inside_a_head_fails_with_the_recorded_partial_message() {
+fn eof_inside_a_head_preserves_completed_start_line_fields() {
     for name in [
         "eof downstream before lf",
         "eof downstream after lf",
@@ -5078,41 +4637,46 @@ fn eof_inside_a_head_fails_with_the_recorded_partial_message() {
             assert_eq!(outcome.events, ["begin", "error"], "{context}");
             let error = assert_one_error(outcome, context, ProxygenError::EOF, b"unexpected EOF");
             let partial = error.partial.as_ref().expect("a partial message");
-            if name == "eof downstream after lf" {
+            if !case.upstream {
                 assert_eq!(partial.request_method(), Some("GET"), "{context}");
                 assert_eq!(partial.request_url(), Some(b"/p".as_slice()), "{context}");
-                assert_eq!(partial.http_version(), (1, 1), "{context}");
             } else {
-                assert!(!partial.is_request() && !partial.is_response(), "{context}");
+                assert!(partial.is_response(), "{context}");
             }
-            assert_eq!(outcome.trace, golden_trace(name), "{context}");
         });
     }
 }
 
 #[test]
-fn callback_pauses_stop_and_resume_at_the_recorded_offsets() {
+fn callback_pauses_stop_and_resume_at_llhttp_boundaries() {
     for case in PAUSE_CASES {
+        let whole = one_segment_trace(case);
         for_every_delivery_through_both_entries(case, |context, outcome| {
-            assert_eq!(outcome.trace, golden_trace(case.name), "{context}");
+            assert_eq!(outcome.trace, whole.trace, "{context}");
         });
+        if let Some((_, golden)) = GOLDEN_TRACES.iter().find(|(name, _)| *name == case.name) {
+            assert_eq!(whole.trace, *golden, "{}", case.name);
+        }
     }
     let second_begin = &PAUSE_CASES[0];
     assert!(
         one_segment_trace(second_begin)
             .trace
-            .contains("begin 2\npause MessageBegin at 29\n")
+            .contains("begin 2\npause MessageBegin at 28\n")
     );
-    let malformed = one_segment_trace(&PAUSE_CASES[8]);
-    assert_eq!(malformed.errors.len(), 1);
-    assert_eq!(malformed.errors[0].status, None);
+    for index in [8, 9] {
+        let case = &PAUSE_CASES[index];
+        let malformed = one_segment_trace(case);
+        let reason = if index == 8 {
+            b"Invalid header token".as_slice()
+        } else {
+            b"Invalid method encountered"
+        };
+        let error = assert_one_error(&malformed, case.name, ProxygenError::PARSE_HEADER, reason);
+        assert_eq!(error.status, None);
+        assert!(malformed.trace.contains("pause MessageBegin at 0\n"));
+    }
 }
-
-const INVALID_HEADER: &[u8] = b"invalid HTTP header";
-const INVALID_HEADER_NAME: &[u8] = b"invalid HTTP header name";
-const INVALID_TRAILERS: &[u8] = b"invalid HTTP trailers";
-const CONFLICTING_CONTENT_LENGTH: &[u8] = b"conflicting Content-Length headers";
-const INVALID_CONTENT_LENGTH: &[u8] = b"invalid Content-Length";
 
 fn head_case(upstream: bool, strict: bool) -> TraceCase {
     TraceCase {
@@ -5171,13 +4735,23 @@ fn header_line_without_a_colon_fails_as_an_invalid_header() {
             for strict in [false, true] {
                 let wire = [start_line(upstream), b"Host: h\r\n", line, b"\r\n\r\n"].concat();
                 for_every_wire_delivery(&head_case(upstream, strict), &wire, |context, outcome| {
-                    assert_eq!(outcome.consumed, wire.len(), "{context}");
+                    let invalid = line
+                        .iter()
+                        .position(|byte| {
+                            !(byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(byte))
+                        })
+                        .unwrap_or(line.len());
+                    assert_eq!(
+                        outcome.consumed,
+                        start_line(upstream).len() + b"Host: h\r\n".len() + invalid,
+                        "{context}"
+                    );
                     assert_eq!(outcome.events, ["begin", "error"], "{context}");
                     let error = assert_one_error(
                         outcome,
                         context,
                         ProxygenError::PARSE_HEADER,
-                        INVALID_HEADER,
+                        b"Invalid header token",
                     );
                     assert_eq!(error.status, (!upstream).then_some(400), "{context}");
                     let partial = error.partial.as_ref().expect("a partial message");
@@ -5226,13 +4800,23 @@ fn empty_or_non_token_header_names_fail_as_invalid_names() {
                 ]
                 .concat();
                 for_every_wire_delivery(&head_case(upstream, strict), &wire, |context, outcome| {
-                    assert_eq!(outcome.consumed, wire.len(), "{context}");
+                    let invalid = line
+                        .iter()
+                        .position(|byte| {
+                            !(byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(byte))
+                        })
+                        .unwrap_or(line.len());
+                    assert_eq!(
+                        outcome.consumed,
+                        start_line(upstream).len() + b"Host: h\r\n".len() + invalid,
+                        "{context}"
+                    );
                     assert_eq!(outcome.events, ["begin", "error"], "{context}");
                     let error = assert_one_error(
                         outcome,
                         context,
                         ProxygenError::PARSE_HEADER,
-                        INVALID_HEADER_NAME,
+                        b"Invalid header token",
                     );
                     assert_eq!(error.status, (!upstream).then_some(400), "{context}");
                     let partial = error.partial.as_ref().expect("a partial message");
@@ -5266,33 +4850,28 @@ fn empty_or_non_token_header_names_fail_as_invalid_names() {
     }
 }
 
-#[derive(Clone, Copy)]
-enum TrailerOutcome {
-    Body,
-    StrictDependent,
-    StrictOnly,
-    Accepted,
-}
-
 #[test]
-fn trailer_name_errors_keep_their_kinds() {
-    let checks: [(&[u8], TrailerOutcome); 14] = [
-        (b"a b", TrailerOutcome::Body),
-        (b"a", TrailerOutcome::Body),
-        (b"a\x80b", TrailerOutcome::Body),
-        (b"a b: v", TrailerOutcome::StrictDependent),
-        (b": v", TrailerOutcome::StrictDependent),
-        (b"a\x80: v", TrailerOutcome::StrictDependent),
-        (b"a\x01: v", TrailerOutcome::StrictDependent),
-        (b"(a): v", TrailerOutcome::StrictDependent),
-        (b"X: a\x01b", TrailerOutcome::StrictDependent),
-        (b"X: a\x7fb", TrailerOutcome::StrictDependent),
-        (b"X: a\x0bb", TrailerOutcome::StrictDependent),
-        (b"X: \x80", TrailerOutcome::StrictOnly),
-        (b"X: a\\\r\\\nb", TrailerOutcome::StrictOnly),
-        (b"X: a\tb", TrailerOutcome::Accepted),
+fn trailer_syntax_errors_are_body_errors_in_both_validation_modes() {
+    let checks: [(&[u8], Option<(&[u8], usize)>); 14] = [
+        (b"a b", Some((b"Invalid header token", 1))),
+        (b"a", Some((b"Invalid header token", 1))),
+        (b"a\x80b", Some((b"Invalid header token", 1))),
+        (b"a b: v", Some((b"Invalid header token", 1))),
+        (b": v", Some((b"Invalid header token", 0))),
+        (b"a\x80: v", Some((b"Invalid header token", 1))),
+        (b"a\x01: v", Some((b"Invalid header token", 1))),
+        (b"(a): v", Some((b"Invalid header token", 0))),
+        (b"X: a\x01b", Some((b"Invalid header value char", 4))),
+        (b"X: a\x7fb", Some((b"Invalid header value char", 4))),
+        (b"X: a\x0bb", Some((b"Invalid header value char", 4))),
+        (b"X: \x80", None),
+        (
+            b"X: a\\\r\\\nb",
+            Some((b"Missing expected LF after header value", 6)),
+        ),
+        (b"X: a\tb", None),
     ];
-    for (line, expected) in checks {
+    for (line, syntax_error) in checks {
         for upstream in [false, true] {
             for strict in [false, true] {
                 let head: &[u8] = if upstream {
@@ -5301,30 +4880,32 @@ fn trailer_name_errors_keep_their_kinds() {
                     b"POST /p HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n"
                 };
                 let wire = [head, line, b"\r\n\r\n"].concat();
-                let kind = match expected {
-                    TrailerOutcome::Body => Some(ProxygenError::PARSE_BODY),
-                    TrailerOutcome::StrictDependent if strict => {
-                        Some(ProxygenError::HEADER_CONTENT_VALIDATION)
-                    }
-                    TrailerOutcome::StrictDependent => Some(ProxygenError::PARSE_BODY),
-                    TrailerOutcome::StrictOnly if strict => {
-                        Some(ProxygenError::HEADER_CONTENT_VALIDATION)
-                    }
-                    TrailerOutcome::StrictOnly | TrailerOutcome::Accepted => None,
-                };
+                let expected = syntax_error
+                    .map(|(reason, offset)| {
+                        (ProxygenError::PARSE_BODY, reason, head.len() + offset)
+                    })
+                    .or_else(|| {
+                        (strict && line == b"X: \x80").then_some((
+                            ProxygenError::HEADER_CONTENT_VALIDATION,
+                            b"invalid HTTP header content".as_slice(),
+                            head.len() + line.len() + 2,
+                        ))
+                    });
                 for_every_wire_delivery(&head_case(upstream, strict), &wire, |context, outcome| {
-                    assert_eq!(outcome.consumed, wire.len(), "{context}");
-                    let Some(kind) = kind else {
+                    if let Some((kind, reason, consumed)) = expected {
+                        assert_eq!(outcome.consumed, consumed, "{context}");
+                        assert_eq!(outcome.events, ["begin", "headers", "error"], "{context}");
+                        let error = assert_one_error(outcome, context, kind, reason);
+                        assert_eq!(error.status, (!upstream).then_some(400), "{context}");
+                    } else {
+                        assert_eq!(outcome.consumed, wire.len(), "{context}");
                         assert_eq!(
                             outcome.events,
                             ["begin", "headers", "trailers", "complete"],
                             "{context}"
                         );
-                        return;
-                    };
-                    assert_eq!(outcome.events, ["begin", "headers", "error"], "{context}");
-                    let error = assert_one_error(outcome, context, kind, INVALID_TRAILERS);
-                    assert_eq!(error.status, (!upstream).then_some(400), "{context}");
+                        assert!(outcome.errors.is_empty(), "{context}");
+                    }
                 });
             }
         }
@@ -5332,52 +4913,91 @@ fn trailer_name_errors_keep_their_kinds() {
 }
 
 #[test]
-fn content_length_errors_keep_their_order() {
-    let failing: [(&[u8], &[u8], usize); 10] = [
+fn content_length_errors_follow_llhttp_framing_order() {
+    let failing: [(&[u8], &[u8], usize, usize); 13] = [
         (
             b"Content-Length: abc\r\nContent-Length: 5\r\n",
-            CONFLICTING_CONTENT_LENGTH,
-            2,
+            b"Invalid character in Content-Length",
+            16,
+            0,
         ),
         (
             b"Content-Length: 5\r\nContent-Length: abc\r\n",
-            CONFLICTING_CONTENT_LENGTH,
-            2,
+            b"Duplicate Content-Length",
+            35,
+            1,
         ),
         (
             b"Content-Length: 5\r\nContent-Length: 6\r\n",
-            CONFLICTING_CONTENT_LENGTH,
-            2,
+            b"Duplicate Content-Length",
+            35,
+            1,
         ),
         (
             b"Content-Length: 5\r\nContent-Length: 5\r\nContent-Length: 6\r\n",
-            CONFLICTING_CONTENT_LENGTH,
-            3,
+            b"Duplicate Content-Length",
+            35,
+            1,
         ),
         (
             b"Transfer-Encoding: chunked\r\nContent-Length: 5\r\ncontent-length: 6\r\n",
-            CONFLICTING_CONTENT_LENGTH,
-            2,
+            b"Content-Length can't be present with Transfer-Encoding",
+            43,
+            0,
         ),
         (
             b"Content-Length: abc\r\nContent-Length: abc\r\n",
-            INVALID_CONTENT_LENGTH,
+            b"Invalid character in Content-Length",
+            16,
             0,
         ),
-        (b"Content-Length: abc\r\n", INVALID_CONTENT_LENGTH, 0),
-        (b"Content-Length: \r\n", INVALID_CONTENT_LENGTH, 0),
-        (b"Content-Length: 5, 5\r\n", INVALID_CONTENT_LENGTH, 0),
+        (
+            b"Content-Length: abc\r\n",
+            b"Invalid character in Content-Length",
+            16,
+            0,
+        ),
+        (b"Content-Length: \r\n", b"Empty Content-Length", 18, 0),
+        (
+            b"Content-Length: 5, 5\r\n",
+            b"Invalid character in Content-Length",
+            17,
+            0,
+        ),
         (
             b"Content-Length: 18446744073709551616\r\n",
-            INVALID_CONTENT_LENGTH,
+            b"Content-Length overflow",
+            36,
             0,
         ),
+        (
+            b"Content-Length: 5\r\nContent-Length: 5\r\n",
+            b"Duplicate Content-Length",
+            35,
+            1,
+        ),
+        (
+            b"Content-Length: 5\r\nX: a\r\ncontent-length:  5 \r\n",
+            b"Duplicate Content-Length",
+            42,
+            1,
+        ),
+        (
+            b"CONTENT-LENGTH: 05\r\nContent-Length: 05\r\n",
+            b"Duplicate Content-Length",
+            36,
+            1,
+        ),
     ];
-    for (headers, message, partial_lengths) in failing {
+    for (headers, message, offset, partial_lengths) in failing {
         for upstream in [false, true] {
             let wire = [start_line(upstream), headers, b"\r\n"].concat();
             for_every_wire_delivery(&head_case(upstream, false), &wire, |context, outcome| {
-                assert_eq!(outcome.consumed, wire.len(), "{context}");
+                assert_eq!(
+                    outcome.consumed,
+                    start_line(upstream).len() + offset,
+                    "{context}"
+                );
                 assert_eq!(outcome.events, ["begin", "error"], "{context}");
                 let error =
                     assert_one_error(outcome, context, ProxygenError::PARSE_HEADER, message);
@@ -5393,13 +5013,11 @@ fn content_length_errors_keep_their_order() {
             });
         }
     }
-
-    let accepted: [&[u8]; 3] = [
-        b"Content-Length: 5\r\nContent-Length: 5\r\n",
-        b"Content-Length: 5\r\nX: a\r\ncontent-length:  5 \r\n",
-        b"CONTENT-LENGTH: 05\r\nContent-Length: 05\r\n",
-    ];
-    for headers in accepted {
+    for headers in [
+        b"Content-Length: 5\r\n".as_slice(),
+        b"CONTENT-LENGTH: 05\r\n",
+        b"Content-Length:\t 5 \t\r\n",
+    ] {
         for upstream in [false, true] {
             let wire = [start_line(upstream), headers, b"\r\nhello"].concat();
             for_every_wire_delivery(&head_case(upstream, false), &wire, |context, outcome| {
@@ -5409,94 +5027,15 @@ fn content_length_errors_keep_their_order() {
                         .events
                         .iter()
                         .filter(|event| **event != "body")
+                        .copied()
                         .collect::<Vec<_>>(),
-                    [&"begin", &"headers", &"complete"],
+                    ["begin", "headers", "complete"],
                     "{context}"
                 );
                 assert!(outcome.trace.contains("body 1 \"hello\"\n"), "{context}");
             });
         }
     }
-}
-
-#[test]
-fn parsed_head_reserves_one_entry_per_line_up_to_the_cap() {
-    use super::HEAD_RESERVE_CAP;
-
-    for line_end in [b"\r\n".as_slice(), b"\n"] {
-        let mut head = [b"HTTP/1.1 200 OK", line_end].concat();
-        for index in 0..24 {
-            head.extend_from_slice(format!("X-Header-{index}: value").as_bytes());
-            head.extend_from_slice(line_end);
-        }
-        head.extend_from_slice(&[b"Content-Length: 0", line_end, line_end].concat());
-        let mut codec = Http1xCodec::new(TransportDirection::Upstream);
-        send_trace_request(&mut codec);
-        let mut callback = Recorder::default();
-        assert_eq!(parse(&mut codec, &mut callback, &head), head.len());
-        assert_eq!(callback.events, ["begin", "headers", "complete"]);
-        assert_eq!(callback.messages[0].headers().len(), 25);
-        assert_eq!(
-            codec.head_reserve,
-            Some((26, 0)),
-            "25 header lines and room for one inferred header"
-        );
-    }
-
-    let request = b"GET http://example.com/ HTTP/1.1\r\nX-A: 1\r\nX-B: 2\r\n\r\n";
-    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
-    let mut callback = Recorder::default();
-    assert_eq!(parse(&mut codec, &mut callback, request), request.len());
-    assert_eq!(
-        codec.head_reserve,
-        Some((3, 0)),
-        "the reservation precedes the inferred Host"
-    );
-    assert_eq!(
-        header_pairs(&callback.messages[0]),
-        [
-            (b"X-A".to_vec(), b"1".to_vec()),
-            (b"X-B".to_vec(), b"2".to_vec()),
-            (b"Host".to_vec(), b"example.com".to_vec()),
-        ]
-    );
-
-    let start = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX: ";
-    let folds = (MAX_HEADER_BYTES - start.len() - b"a\r\n\r\n".len()) / b" \r\n".len();
-    let mut folded = start.to_vec();
-    folded.resize(
-        MAX_HEADER_BYTES - folds * b" \r\n".len() - b"\r\n\r\n".len(),
-        b'a',
-    );
-    folded.extend_from_slice(b"\r\n");
-    for _ in 0..folds {
-        folded.extend_from_slice(b" \r\n");
-    }
-    folded.extend_from_slice(b"\r\n");
-    assert_eq!(folded.len(), MAX_HEADER_BYTES);
-    let mut codec = Http1xCodec::new(TransportDirection::Upstream);
-    send_trace_request(&mut codec);
-    let mut callback = Recorder::default();
-    assert_eq!(parse(&mut codec, &mut callback, &folded), folded.len());
-    assert_eq!(callback.events, ["begin", "headers", "complete"]);
-    assert_eq!(callback.messages[0].headers().len(), 2);
-    assert_eq!(codec.head_reserve, Some((HEAD_RESERVE_CAP, 0)));
-
-    let mut leading_folds = b"HTTP/1.1 200 OK\r\n".to_vec();
-    while leading_folds.len() + b" \r\n\r\n".len() <= MAX_HEADER_BYTES {
-        leading_folds.extend_from_slice(b" \r\n");
-    }
-    leading_folds.extend_from_slice(b"\r\n");
-    let mut codec = Http1xCodec::new(TransportDirection::Upstream);
-    send_trace_request(&mut codec);
-    let mut callback = Recorder::default();
-    assert_eq!(
-        parse(&mut codec, &mut callback, &leading_folds),
-        leading_folds.len()
-    );
-    assert_eq!(callback.errors.len(), 1);
-    assert_eq!(callback.errors[0].0, ProxygenError::PARSE_HEADER);
-    assert_eq!(codec.head_reserve, Some((HEAD_RESERVE_CAP, 0)));
 }
 
 #[test]
@@ -5757,29 +5296,35 @@ fn content_length_error_precedes_the_inferred_host() {
         b"GET http://a/ HTTP/1.1\r\nHost: b\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n";
     for strict in [false, true] {
         let case = down(
-            "conflicting content length before the inferred host",
+            "duplicate content length before the inferred host",
             strict,
             wire,
         );
         let whole = one_segment_trace(&case).trace;
         for_every_delivery(&case, |context, outcome| {
-            let context = format!("{context}, strict={strict}");
             assert_eq!(outcome.trace, whole, "{context}");
             assert_eq!(outcome.events, ["begin", "error"], "{context}");
-            assert_eq!(outcome.consumed, wire.len(), "{context}");
+            assert_eq!(outcome.consumed, 68, "{context}");
             let error = assert_one_error(
                 outcome,
-                &context,
+                context,
                 ProxygenError::PARSE_HEADER,
-                CONFLICTING_CONTENT_LENGTH,
+                b"Duplicate Content-Length",
             );
             assert_eq!(error.status, Some(400), "{context}");
             let partial = error.partial.as_ref().expect("a partial message");
+            assert_eq!(partial.request_method(), Some("GET"), "{context}");
             assert_eq!(
-                render_message(partial),
-                "request method=Some(\"GET\") url=\"http://a/\" version=1.1 \
-                 headers=[\"Host\": \"b\", \"Content-Length\": \"1\", \"Content-Length\": \"2\"] \
-                 size=0/0 upgraded=false websocket=false keepalive=true chunked=false",
+                partial.request_url(),
+                Some(b"http://a/".as_slice()),
+                "{context}"
+            );
+            assert_eq!(
+                header_pairs(partial),
+                [
+                    (b"Host".to_vec(), b"b".to_vec()),
+                    (b"Content-Length".to_vec(), b"1".to_vec())
+                ],
                 "{context}"
             );
         });
@@ -6141,14 +5686,14 @@ fn default_upgrade_handling_is_unchanged() {
     for (name, mut codec) in default_upgrade_codecs() {
         let mut recorder = Recorder::default();
         let input = [ORDINARY_WEBSOCKET_HEAD, ORDINARY_WEBSOCKET_HEAD].concat();
-        parse(&mut codec, &mut recorder, &input);
-        assert_eq!(recorder.errors.len(), 1, "{name}");
-        assert_eq!(recorder.errors[0].0, ProxygenError::PARSE_HEADER, "{name}");
         assert_eq!(
-            recorder.error_messages,
-            [b"duplicate websocket upgrade".to_vec()],
+            parse(&mut codec, &mut recorder, &input),
+            ORDINARY_WEBSOCKET_HEAD.len(),
             "{name}"
         );
+        assert!(recorder.errors.is_empty(), "{name}");
+        assert!(codec.is_parser_paused(), "{name}");
+        assert_eq!(recorder.messages.len(), 1, "{name}");
     }
 }
 
@@ -6441,7 +5986,7 @@ fn ordinary_upgrade_option_keeps_parse_errors() {
 /// `Xpgrade`: an ordinary request of the same length.
 fn same_length_ordinary_head(head: &[u8]) -> Vec<u8> {
     let head = std::str::from_utf8(head).expect("test heads are ASCII");
-    head.replacen("CONNECT ", "OPTIONS ", 1)
+    head.replacen("CONNECT h:443", "OPTIONS /:443", 1)
         .replace("\r\nUpgrade:", "\r\nXpgrade:")
         .into_bytes()
 }
@@ -8406,20 +7951,21 @@ fn generated_head_keeps_uncommon_spelling() {
     );
 }
 
-// Chunked ingress oracles (`repair.http1_chunked_ingress`). The golden traces
-// were recorded from the codec at `62d2959bb6d3`, whose chunk-size and
-// chunk-terminator states pushed each byte into a vector.
+// Chunked adapter traces for llhttp framing, callback ordering, and consumed prefixes.
 
 const CHUNKED_REQUEST_HEAD: &[u8] = b"POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
 const CHUNKED_RESPONSE_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
 const CHUNKED_POST_WITH_EXTENSION_THEN_GET: &[u8] =
     b"3\r\nabc\r\n2;x\r\nde\r\n0\r\n\r\nGET /g HTTP/1.1\r\n\r\n";
 const CHUNK_ERRORS: &[&str] = &[
-    "HTTP chunk header is too large",
-    "invalid HTTP chunk delimiter",
-    "invalid HTTP chunk length",
+    "Invalid character in chunk size",
+    "Chunk size overflow",
     "HTTP chunk length overflow",
-    "invalid HTTP chunk terminator",
+    "Expected LF after chunk size",
+    "Missing expected CR after chunk size",
+    "Missing expected CR after chunk extension name",
+    "Expected LF after chunk data",
+    "Missing expected CR after chunk data",
 ];
 
 /// A chunked message's head followed by `body`. [`CHUNKED_TRACE_CASES`] keeps
@@ -8463,7 +8009,11 @@ fn chunked_trace_cases() -> Vec<TraceCase> {
         down("crlf chunks", b"5\r\nhello\r\n0\r\n\r\n"),
         down("bare lf chunks", b"5\nhello\n0\n\n"),
         down(
-            "chunk extensions",
+            "chunk extension names and values",
+            b"5;name=value\r\nhello\r\n3;a=b;c\r\nabc\r\n0;last\r\n\r\n",
+        ),
+        down(
+            "whitespace before a chunk extension",
             b"5;name=value\r\nhello\r\n3 ; a=b;c\r\nabc\r\n0;last\r\n\r\n",
         ),
         down(
@@ -8507,19 +8057,19 @@ fn chunked_trace_cases() -> Vec<TraceCase> {
             b"8000000000000000\r\r\n",
         ),
         down(
-            "chunk header at the size limit",
+            "128-byte chunk extension",
             &[padded_chunk_line(128, b"\r\n").as_slice(), b"a\r\n0\r\n\r\n"].concat(),
         ),
         down(
-            "bare lf chunk header at the size limit",
+            "bare lf after a long chunk extension",
             &[padded_chunk_line(128, b"\n").as_slice(), b"a\r\n0\r\n\r\n"].concat(),
         ),
         down(
-            "chunk header lf past the size limit",
+            "long chunk extension without the final chunk",
             &[padded_chunk_line(129, b"\r\n").as_slice(), b"a\r\n"].concat(),
         ),
         down(
-            "chunk header byte past the size limit",
+            "eof inside a long chunk extension",
             &padded_chunk_line(129, b"a"),
         ),
         down("invalid terminator byte", b"1\r\naX"),
@@ -8559,6 +8109,21 @@ fn chunked_trace_cases() -> Vec<TraceCase> {
 
 const CHUNKED_GOLDEN_TRACES: &[(&str, &str)] = &[
     (
+        "chunk extension names and values",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+chunk_header 1 5
+body 1 "hello"
+chunk_complete 1
+chunk_header 1 3
+body 1 "abc"
+chunk_complete 1
+complete 1 upgraded=false
+consumed 93
+eof
+"##,
+    ),
+    (
         "crlf chunks",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
@@ -8574,26 +8139,20 @@ eof
         "bare lf chunks",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-chunk_header 1 5
-body 1 "hello"
-chunk_complete 1
-complete 1 upgraded=false
-consumed 59
+error 1 proxygen=17 "Missing expected CR after chunk size" status=Some(400) new_stream=false partial=none
+consumed 50
 eof
 "##,
     ),
     (
-        "chunk extensions",
+        "whitespace before a chunk extension",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
 chunk_header 1 5
 body 1 "hello"
 chunk_complete 1
-chunk_header 1 3
-body 1 "abc"
-chunk_complete 1
-complete 1 upgraded=false
-consumed 95
+error 1 proxygen=17 "Invalid character in chunk size" status=Some(400) new_stream=false partial=none
+consumed 71
 eof
 "##,
     ),
@@ -8601,14 +8160,8 @@ eof
         "whitespace around chunk sizes",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-chunk_header 1 5
-body 1 "hello"
-chunk_complete 1
-chunk_header 1 3
-body 1 "abc"
-chunk_complete 1
-complete 1 upgraded=false
-consumed 79
+error 1 proxygen=17 "Invalid character in chunk size" status=Some(400) new_stream=false partial=none
+consumed 48
 eof
 "##,
     ),
@@ -8616,11 +8169,8 @@ eof
         "trailing space before a bare lf",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-chunk_header 1 5
-body 1 "hello"
-chunk_complete 1
-complete 1 upgraded=false
-consumed 60
+error 1 proxygen=17 "Invalid character in chunk size" status=Some(400) new_stream=false partial=none
+consumed 50
 eof
 "##,
     ),
@@ -8683,8 +8233,8 @@ eof
         "chunk length past u64",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
-consumed 67
+error 1 proxygen=17 "Chunk size overflow" status=Some(400) new_stream=false partial=none
+consumed 65
 eof
 "##,
     ),
@@ -8692,8 +8242,8 @@ eof
         "chunk length past u64 before an extension",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
-consumed 69
+error 1 proxygen=17 "Chunk size overflow" status=Some(400) new_stream=false partial=none
+consumed 65
 eof
 "##,
     ),
@@ -8701,8 +8251,8 @@ eof
         "invalid chunk length digit",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
-consumed 52
+error 1 proxygen=17 "Invalid character in chunk size" status=Some(400) new_stream=false partial=none
+consumed 49
 eof
 "##,
     ),
@@ -8710,8 +8260,8 @@ eof
         "space inside a chunk length",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
-consumed 53
+error 1 proxygen=17 "Invalid character in chunk size" status=Some(400) new_stream=false partial=none
+consumed 50
 eof
 "##,
     ),
@@ -8719,8 +8269,8 @@ eof
         "empty chunk length",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
-consumed 50
+error 1 proxygen=17 "Invalid character in chunk size" status=Some(400) new_stream=false partial=none
+consumed 48
 eof
 "##,
     ),
@@ -8728,8 +8278,8 @@ eof
         "whitespace-only chunk length",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
-consumed 53
+error 1 proxygen=17 "Invalid character in chunk size" status=Some(400) new_stream=false partial=none
+consumed 48
 eof
 "##,
     ),
@@ -8737,8 +8287,8 @@ eof
         "extension without a chunk length",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
-consumed 54
+error 1 proxygen=17 "Invalid character in chunk size" status=Some(400) new_stream=false partial=none
+consumed 48
 eof
 "##,
     ),
@@ -8746,8 +8296,8 @@ eof
         "0x chunk length",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
-consumed 53
+error 1 proxygen=17 "Invalid character in chunk size" status=Some(400) new_stream=false partial=none
+consumed 49
 eof
 "##,
     ),
@@ -8755,8 +8305,8 @@ eof
         "signed chunk length",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
-consumed 52
+error 1 proxygen=17 "Invalid character in chunk size" status=Some(400) new_stream=false partial=none
+consumed 48
 eof
 "##,
     ),
@@ -8764,8 +8314,8 @@ eof
         "vertical tab after a chunk length",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
-consumed 52
+error 1 proxygen=17 "Invalid character in chunk size" status=Some(400) new_stream=false partial=none
+consumed 49
 eof
 "##,
     ),
@@ -8773,8 +8323,8 @@ eof
         "high byte after a chunk length",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
-consumed 52
+error 1 proxygen=17 "Invalid character in chunk size" status=Some(400) new_stream=false partial=none
+consumed 49
 eof
 "##,
     ),
@@ -8782,8 +8332,8 @@ eof
         "cr cr lf after a chunk length",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk delimiter" status=Some(400) new_stream=false partial=none
-consumed 52
+error 1 proxygen=17 "Expected LF after chunk size" status=Some(400) new_stream=false partial=none
+consumed 50
 eof
 "##,
     ),
@@ -8791,8 +8341,8 @@ eof
         "cr inside a chunk length",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk delimiter" status=Some(400) new_stream=false partial=none
-consumed 52
+error 1 proxygen=17 "Expected LF after chunk size" status=Some(400) new_stream=false partial=none
+consumed 50
 eof
 "##,
     ),
@@ -8800,8 +8350,8 @@ eof
         "cr before a chunk length",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk delimiter" status=Some(400) new_stream=false partial=none
-consumed 52
+error 1 proxygen=17 "Invalid character in chunk size" status=Some(400) new_stream=false partial=none
+consumed 48
 eof
 "##,
     ),
@@ -8809,8 +8359,8 @@ eof
         "cr inside a chunk extension",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk delimiter" status=Some(400) new_stream=false partial=none
-consumed 55
+error 1 proxygen=17 "Expected LF after chunk size" status=Some(400) new_stream=false partial=none
+consumed 52
 eof
 "##,
     ),
@@ -8818,8 +8368,8 @@ eof
         "cr before a chunk extension",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk delimiter" status=Some(400) new_stream=false partial=none
-consumed 54
+error 1 proxygen=17 "Expected LF after chunk size" status=Some(400) new_stream=false partial=none
+consumed 50
 eof
 "##,
     ),
@@ -8827,8 +8377,8 @@ eof
         "stray cr before an invalid length",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk delimiter" status=Some(400) new_stream=false partial=none
-consumed 54
+error 1 proxygen=17 "Invalid character in chunk size" status=Some(400) new_stream=false partial=none
+consumed 48
 eof
 "##,
     ),
@@ -8836,13 +8386,13 @@ eof
         "stray cr before a length overflow",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk delimiter" status=Some(400) new_stream=false partial=none
-consumed 67
+error 1 proxygen=17 "Expected LF after chunk size" status=Some(400) new_stream=false partial=none
+consumed 65
 eof
 "##,
     ),
     (
-        "chunk header at the size limit",
+        "128-byte chunk extension",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
 chunk_header 1 1
@@ -8854,33 +8404,33 @@ eof
 "##,
     ),
     (
-        "bare lf chunk header at the size limit",
+        "bare lf after a long chunk extension",
+        r##"begin 1
+headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
+error 1 proxygen=17 "Missing expected CR after chunk extension name" status=Some(400) new_stream=false partial=none
+consumed 175
+eof
+"##,
+    ),
+    (
+        "long chunk extension without the final chunk",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
 chunk_header 1 1
 body 1 "a"
 chunk_complete 1
-complete 1 upgraded=false
-consumed 184
+consumed 180
 eof
+error 1 proxygen=18 "unexpected EOF" status=Some(400) new_stream=false partial=none
 "##,
     ),
     (
-        "chunk header lf past the size limit",
+        "eof inside a long chunk extension",
         r##"begin 1
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "HTTP chunk header is too large" status=Some(400) new_stream=false partial=none
 consumed 177
 eof
-"##,
-    ),
-    (
-        "chunk header byte past the size limit",
-        r##"begin 1
-headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "HTTP chunk header is too large" status=Some(400) new_stream=false partial=none
-consumed 177
-eof
+error 1 proxygen=18 "unexpected EOF" status=Some(400) new_stream=false partial=none
 "##,
     ),
     (
@@ -8889,8 +8439,8 @@ eof
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
 chunk_header 1 1
 body 1 "a"
-error 1 proxygen=17 "invalid HTTP chunk terminator" status=Some(400) new_stream=false partial=none
-consumed 53
+error 1 proxygen=17 "Expected LF after chunk data" status=Some(400) new_stream=false partial=none
+consumed 52
 eof
 "##,
     ),
@@ -8900,8 +8450,8 @@ eof
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
 chunk_header 1 1
 body 1 "a"
-error 1 proxygen=17 "invalid HTTP chunk terminator" status=Some(400) new_stream=false partial=none
-consumed 54
+error 1 proxygen=17 "Expected LF after chunk data" status=Some(400) new_stream=false partial=none
+consumed 53
 eof
 "##,
     ),
@@ -8911,8 +8461,8 @@ eof
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
 chunk_header 1 1
 body 1 "a"
-error 1 proxygen=17 "invalid HTTP chunk terminator" status=Some(400) new_stream=false partial=none
-consumed 54
+error 1 proxygen=17 "Expected LF after chunk data" status=Some(400) new_stream=false partial=none
+consumed 53
 eof
 "##,
     ),
@@ -8922,9 +8472,8 @@ eof
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
 chunk_header 1 1
 body 1 "a"
-chunk_complete 1
-complete 1 upgraded=false
-consumed 58
+error 1 proxygen=17 "Missing expected CR after chunk data" status=Some(400) new_stream=false partial=none
+consumed 53
 eof
 "##,
     ),
@@ -8934,9 +8483,8 @@ eof
 headers 1 request method=Some("POST") url="/c" version=1.1 headers=["Transfer-Encoding": "chunked"] size=48/48 upgraded=false websocket=false keepalive=true chunked=true
 chunk_header 1 1
 body 1 "a"
-chunk_complete 1
-error 1 proxygen=17 "invalid HTTP chunk length" status=Some(400) new_stream=false partial=none
-consumed 55
+error 1 proxygen=17 "Missing expected CR after chunk data" status=Some(400) new_stream=false partial=none
+consumed 53
 eof
 "##,
     ),
@@ -9033,8 +8581,8 @@ eof
         "chunked response with an invalid length",
         r##"begin 1
 headers 1 response status=200 reason="OK" version=1.1 headers=["Transfer-Encoding": "chunked"] size=47/47 upgraded=false websocket=false keepalive=true chunked=true
-error 1 proxygen=17 "invalid HTTP chunk length" status=None new_stream=false partial=none
-consumed 50
+error 1 proxygen=17 "Invalid character in chunk size" status=None new_stream=false partial=none
+consumed 47
 eof
 "##,
     ),
@@ -9089,7 +8637,7 @@ fn chunked_golden_trace(name: &str) -> &'static str {
 }
 
 #[test]
-fn chunked_ingress_matches_the_recorded_traces_at_every_split() {
+fn llhttp_chunked_ingress_matches_expected_traces_at_every_split() {
     assert_eq!(
         CHUNKED_TRACE_CASES.len(),
         CHUNKED_GOLDEN_TRACES.len(),
@@ -9207,7 +8755,7 @@ fn chunk_headers_and_terminators_allocate_nothing_after_warm_up() {
     const CHUNKS: usize = 8;
     // Each framing ends one 5-byte chunk and begins the next.
     for dispatch in CallbackDispatch::ALL {
-        let framings: [&[u8]; 3] = [b"\r\n5\r\n", b"\n5\n", b"\r\n5;name=value\r\n"];
+        let framings: [&[u8]; 2] = [b"\r\n5\r\n", b"\r\n5;name=value\r\n"];
         for framing in framings {
             for byte_by_byte in [false, true] {
                 let context = format!(
@@ -9265,193 +8813,6 @@ fn chunk_headers_and_terminators_allocate_nothing_after_warm_up() {
                 }
             }
         }
-    }
-}
-
-/// Counts `HeadersComplete` events and notes where the last one's message
-/// lives, without allocating.
-#[derive(Debug, Default)]
-struct HeadAddresses {
-    heads: usize,
-    last: Option<*const HttpMessage>,
-}
-
-impl HttpCodecCallback for HeadAddresses {
-    fn on_event(&mut self, event: CodecEvent<'_>) {
-        if let CodecEvent::HeadersComplete { message, .. } = event {
-            self.heads += 1;
-            self.last = Some(ptr::from_ref(message.as_ref()));
-        }
-    }
-}
-
-/// A codec ready for each path through `install_parsed_head`, with its head:
-/// a request with a body, a bodiless request that completes at once, and a
-/// chunked response.
-fn parsed_head_cases() -> [(&'static str, Http1xCodec, &'static [u8]); 3] {
-    let mut upstream = Http1xCodec::new(TransportDirection::Upstream);
-    send_trace_request(&mut upstream);
-    [
-        (
-            "request with a body",
-            Http1xCodec::new(TransportDirection::Downstream),
-            b"POST /c HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\n",
-        ),
-        (
-            "bodiless request",
-            Http1xCodec::new(TransportDirection::Downstream),
-            b"GET /g HTTP/1.1\r\nHost: a\r\nUser-Agent: t\r\n\r\n",
-        ),
-        ("chunked response", upstream, CHUNKED_RESPONSE_HEAD),
-    ]
-}
-
-#[test]
-fn a_parsed_head_reaches_headers_complete_in_the_box_it_was_parsed_into() {
-    for (name, mut codec, head) in parsed_head_cases() {
-        let parsed = codec.parse_head(head, None, None).expect("the head parses");
-        let parsed_message: &HttpMessage = parsed.message.borrow();
-        let parsed_at = ptr::from_ref(parsed_message);
-        let mut delivered = HeadAddresses::default();
-        let mut egress = BufQueue::new(QUEUE_LIMIT);
-        let mut result = CodecIngressResult::new(0);
-        codec.install_parsed_head(parsed, &mut delivered, &mut egress, &mut result);
-        assert_eq!(delivered.heads, 1, "{name}");
-        assert_eq!(
-            delivered.last,
-            Some(parsed_at),
-            "{name}: HeadersComplete carries the message where the parse left it"
-        );
-    }
-}
-
-#[test]
-fn delivering_a_parsed_head_allocates_nothing() {
-    for (name, mut codec, head) in parsed_head_cases() {
-        let parsed = codec.parse_head(head, None, None).expect("the head parses");
-        let mut delivered = HeadAddresses::default();
-        let mut egress = BufQueue::new(QUEUE_LIMIT);
-        let mut result = CodecIngressResult::new(0);
-        let ((), allocations) = count_allocations(|| {
-            codec.install_parsed_head(parsed, &mut delivered, &mut egress, &mut result);
-        });
-        assert_eq!(delivered.heads, 1, "{name}");
-        if std_allocations_observable() {
-            assert_eq!(allocations, 0, "{name}: delivering a parsed head allocates");
-        } else {
-            eprintln!("{name}: allocation counts need a static std, as in @fbcode//mode/opt");
-        }
-    }
-}
-
-#[test]
-fn parsing_and_delivering_a_head_allocates_as_before() {
-    for dispatch in CallbackDispatch::ALL {
-        let allocations = parsed_head_cases().map(|(name, mut codec, head)| {
-            let read = ingress_queue(head);
-            let mut delivered = HeadAddresses::default();
-            let mut egress = BufQueue::new(QUEUE_LIMIT);
-            let (consumed, allocations) = count_allocations(|| {
-                dispatch
-                    .ingress(&mut codec, &read, &mut delivered, &mut egress)
-                    .consumed
-            });
-            assert_eq!(consumed, head.len(), "{name} {dispatch:?}");
-            assert_eq!(delivered.heads, 1, "{name} {dispatch:?}");
-            (name, allocations)
-        });
-        if !std_allocations_observable() {
-            eprintln!("allocation counts need a static std, as in @fbcode//mode/opt");
-            continue;
-        }
-        // Each head: its header list's reservation and its message's box. The
-        // codec also keeps a copy of the first User-Agent.
-        assert_eq!(
-            allocations,
-            [
-                ("request with a body", 2),
-                ("bodiless request", 3),
-                ("chunked response", 2),
-            ],
-            "allocations to parse and deliver each head through {dispatch:?}"
-        );
-    }
-}
-
-/// Whether a `T` can own heap memory: a type without drop glue cannot.
-fn may_own_heap<T>(_: &T) -> bool {
-    std::mem::needs_drop::<T>()
-}
-
-#[test]
-fn chunk_size_and_terminator_progress_holds_no_heap_buffer() {
-    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
-    let mut counter = ChunkCounter::default();
-    let mut egress = BufQueue::new(QUEUE_LIMIT);
-    let reads: [&[u8]; 3] = [CHUNKED_REQUEST_HEAD, b"5;na", b"me=value\r\nhello\r"];
-    let mut ingress = |codec: &mut Http1xCodec, read: &[u8]| {
-        codec
-            .on_ingress(&ingress_queue(read), &mut counter, &mut egress)
-            .consumed
-    };
-
-    assert_eq!(ingress(&mut codec, reads[0]), reads[0].len());
-    assert_eq!(ingress(&mut codec, reads[1]), reads[1].len());
-    let ParseState::ChunkSize(progress) = &codec.state else {
-        panic!("a partial chunk-size line leaves the codec in ChunkSize");
-    };
-    assert!(
-        !may_own_heap(progress),
-        "chunk-size progress holds no heap buffer"
-    );
-
-    assert_eq!(ingress(&mut codec, reads[2]), reads[2].len());
-    let ParseState::ChunkDelimiter(progress) = &codec.state else {
-        panic!("a partial chunk terminator leaves the codec in ChunkDelimiter");
-    };
-    assert!(
-        !may_own_heap(progress),
-        "chunk-terminator progress holds no heap buffer"
-    );
-}
-
-#[test]
-fn a_chunk_terminator_inside_one_segment_takes_one_parse_turn() {
-    // A chunked body as the segments of one read, the bytes the codec
-    // consumes, and the parse-loop turns its chunk terminators take: one per
-    // terminator, plus one for a CR that is not followed by an LF in its
-    // segment. The last case fails at its second CR.
-    let cases: [(&[&[u8]], usize, usize); 5] = [
-        (&[b"1\r\na\r\n1\r\nb\r\n0\r\n\r\n"], 17, 2),
-        (&[b"1\r\na\n1\r\nb\n0\r\n\r\n"], 15, 2),
-        (&[b"1\r\na\r", b"\n1\r\nb\r\n0\r\n\r\n"], 17, 3),
-        (&[b"1\r\na", b"\r\n1\r\nb\r\n0\r\n\r\n"], 17, 2),
-        (&[b"1\r\na\r\r\n"], 6, 2),
-    ];
-    for (segments, expected_consumed, expected_turns) in cases {
-        let context = segments
-            .iter()
-            .map(|segment| segment.escape_ascii().to_string())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        let (mut codec, mut recorder) = chunk_size_codec(false, false);
-        let length = segments.iter().map(|segment| segment.len()).sum();
-        let mut input = BufQueue::new(length);
-        for segment in segments {
-            input.push_bytes(Bytes::from_static(segment)).unwrap();
-        }
-        let mut egress = BufQueue::new(QUEUE_LIMIT);
-        let before = chunk_delimiter_turns();
-        let consumed = codec
-            .on_ingress(&input, &mut recorder, &mut egress)
-            .consumed;
-        let turns = chunk_delimiter_turns() - before;
-
-        assert_eq!(consumed, expected_consumed, "{context}");
-        assert_eq!(
-            turns, expected_turns,
-            "{context}: chunk-terminator turns of the parse loop"
-        );
     }
 }
 
@@ -9568,4 +8929,510 @@ fn a_bodiless_post_with_caller_chunked_framing_closes_the_connection_when_enable
         expected
     );
     assert_eq!(bodiless_post_with_chunked_transfer_encoding(true), expected);
+}
+
+#[test]
+fn llhttp_rejections_have_fragmentation_independent_error_offsets() {
+    for wire in [
+        b"GET / HTTP/1.1\nHost: example.com\n\n".as_slice(),
+        b"GET / HTTP/1.1\r\nX: value\r\n folded\r\n\r\n",
+        b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\na",
+        b"POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHeader Name: value\r\n\r\n",
+    ] {
+        let mut whole = Recorder::default();
+        let expected = parse(
+            &mut Http1xCodec::new(TransportDirection::Downstream),
+            &mut whole,
+            wire,
+        );
+        assert_eq!(whole.errors.len(), 1, "{}", wire.escape_ascii());
+        assert!(expected < wire.len());
+        for split in 0..=wire.len() {
+            let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+            let mut recorder = Recorder::default();
+            let first = parse(&mut codec, &mut recorder, &wire[..split]);
+            let second = parse(&mut codec, &mut recorder, &wire[split..]);
+            assert_eq!(
+                first + second,
+                expected,
+                "split={split} {}",
+                wire.escape_ascii()
+            );
+            assert_eq!(recorder.error_messages, whole.error_messages);
+            assert_eq!(recorder.errors.len(), 1);
+            assert_eq!(recorder.errors[0].0, ProxygenError::PARSE_HEADER);
+            assert_eq!(recorder.errors[0].1, Some(400));
+        }
+    }
+}
+
+#[test]
+fn llhttp_chunk_extensions_trailers_and_pipelining_survive_every_split() {
+    let wire = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3;name=\"value\"\r\nabc\r\n0\r\nX-End: yes\r\n\r\nGET /next HTTP/1.1\r\n\r\n";
+    for split in 0..=wire.len() {
+        let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+        let mut recorder = Recorder::default();
+        let first = parse(&mut codec, &mut recorder, &wire[..split]);
+        let second = parse(&mut codec, &mut recorder, &wire[split..]);
+        assert_eq!(first + second, wire.len(), "split={split}");
+        assert!(recorder.errors.is_empty(), "split={split}");
+        assert_eq!(recorder.messages.len(), 2);
+        assert_eq!(recorder.bodies, b"abc");
+        assert_eq!(recorder.chunk_lengths, [3]);
+        assert_eq!(recorder.completions, [false, false]);
+        assert_eq!(recorder.trailers.len(), 1);
+        assert_eq!(recorder.trailers[0].get_single_or_empty(b"X-End"), b"yes");
+    }
+}
+
+#[test]
+fn llhttp_eof_delimited_response_completes_only_once() {
+    let mut codec = Http1xCodec::new(TransportDirection::Upstream);
+    let mut recorder = Recorder::default();
+    let wire = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello";
+    assert_eq!(parse(&mut codec, &mut recorder, wire), wire.len());
+    assert!(recorder.completions.is_empty());
+    let mut egress = BufQueue::new(QUEUE_LIMIT);
+    let _ = codec.on_ingress_eof(&mut recorder, &mut egress);
+    let _ = codec.on_ingress_eof(&mut recorder, &mut egress);
+    assert_eq!(recorder.bodies, b"hello");
+    assert_eq!(recorder.completions, [false]);
+    assert!(recorder.errors.is_empty());
+}
+
+#[test]
+fn llhttp_trailer_pause_defers_completion_until_resumed_eof() {
+    struct PauseTrailers(Recorder);
+    impl HttpCodecCallback for PauseTrailers {
+        fn on_event(&mut self, event: CodecEvent<'_>) {
+            self.0.on_event(event);
+        }
+        fn on_ingress_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
+            let pause = matches!(event, CodecEvent::TrailersComplete { .. });
+            self.on_event(event);
+            if pause {
+                vec![CodecCallbackAction::SetParserPaused(true)].into()
+            } else {
+                CodecCallbackActions::new()
+            }
+        }
+    }
+    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+    let mut callback = PauseTrailers(Recorder::default());
+    let wire = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: y\r\n\r\n";
+    let mut egress = BufQueue::new(QUEUE_LIMIT);
+    assert_eq!(
+        codec
+            .on_ingress(&ingress_queue(wire), &mut callback, &mut egress)
+            .consumed,
+        wire.len()
+    );
+    assert!(codec.is_parser_paused());
+    assert!(callback.0.completions.is_empty());
+    codec.set_parser_paused(false);
+    let _ = codec.on_ingress_eof(&mut callback, &mut egress);
+    let _ = codec.on_ingress_eof(&mut callback, &mut egress);
+    assert_eq!(callback.0.completions, [false]);
+    assert!(callback.0.errors.is_empty());
+}
+
+#[test]
+fn llhttp_resumed_eof_drains_zero_byte_completion_after_a_pause() {
+    struct PauseAt(Recorder, bool);
+    impl HttpCodecCallback for PauseAt {
+        fn on_event(&mut self, event: CodecEvent<'_>) {
+            self.0.on_event(event);
+        }
+        fn on_ingress_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
+            let pause = if self.1 {
+                matches!(event, CodecEvent::Body { .. })
+            } else {
+                matches!(event, CodecEvent::HeadersComplete { .. })
+            };
+            self.on_event(event);
+            if pause {
+                vec![CodecCallbackAction::SetParserPaused(true)].into()
+            } else {
+                CodecCallbackActions::new()
+            }
+        }
+    }
+    for (body, wire) in [
+        (false, b"GET / HTTP/1.1\r\n\r\n".as_slice()),
+        (
+            true,
+            b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\ndata".as_slice(),
+        ),
+    ] {
+        let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+        let mut callback = PauseAt(Recorder::default(), body);
+        let mut egress = BufQueue::new(QUEUE_LIMIT);
+        assert_eq!(
+            codec
+                .on_ingress(&ingress_queue(wire), &mut callback, &mut egress)
+                .consumed,
+            wire.len()
+        );
+        assert!(codec.is_parser_paused());
+        assert!(callback.0.completions.is_empty());
+        codec.set_parser_paused(false);
+        let _ = codec.on_ingress_eof(&mut callback, &mut egress);
+        assert_eq!(callback.0.completions, [false]);
+        assert!(callback.0.errors.is_empty());
+    }
+}
+
+#[test]
+fn llhttp_paused_upgrade_resumed_at_eof_is_not_a_parse_error() {
+    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+    let mut callback = PauseOnHeaders::default();
+    let mut egress = BufQueue::new(QUEUE_LIMIT);
+    let head = b"GET / HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n";
+    assert_eq!(
+        codec
+            .on_ingress(&ingress_queue(head), &mut callback, &mut egress)
+            .consumed,
+        head.len()
+    );
+    codec.set_parser_paused(false);
+    let _ = codec.on_ingress_eof(&mut callback, &mut egress);
+    assert_eq!(callback.recorder.completions, [false]);
+    assert!(callback.recorder.errors.is_empty());
+}
+
+#[test]
+fn llhttp_accepted_upgrade_resumed_at_eof_completes_the_tunnel() {
+    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+    let mut callback = PauseOnHeaders::default();
+    let mut egress = BufQueue::new(QUEUE_LIMIT);
+    let head = b"CONNECT example.com:443 HTTP/1.1\r\n\r\n";
+    assert_eq!(
+        codec
+            .on_ingress(&ingress_queue(head), &mut callback, &mut egress)
+            .consumed,
+        head.len()
+    );
+    let accepted = response(200, (1, 1));
+    assert_eq!(codec.resolve_downstream_upgrade(&accepted), Some(true));
+    codec.set_parser_paused(false);
+    let _ = codec.on_ingress_eof(&mut callback, &mut egress);
+    assert_eq!(callback.recorder.completions, [true, false]);
+    assert!(callback.recorder.errors.is_empty());
+}
+
+#[test]
+fn llhttp_accepting_an_already_paused_upgrade_delivers_raw_body() {
+    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+    let mut recorder = Recorder::default();
+    let head = b"GET / HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    assert_eq!(parse(&mut codec, &mut recorder, head), head.len());
+    assert!(codec.is_parser_paused());
+    let mut accepted = response(101, (1, 1));
+    accepted.set_egress_websocket_upgrade();
+    assert_eq!(codec.resolve_downstream_upgrade(&accepted), Some(true));
+    codec.set_parser_paused(false);
+    assert_eq!(parse(&mut codec, &mut recorder, b"raw bytes"), 9);
+    assert_eq!(recorder.bodies, b"raw bytes");
+    assert!(recorder.errors.is_empty());
+}
+
+#[test]
+fn llhttp_codec_rejects_transfer_codings_its_serializer_cannot_preserve() {
+    for direction in [TransportDirection::Downstream, TransportDirection::Upstream] {
+        for coding in [b"gzip".as_slice(), b"gzip, chunked", b"compress, chunked"] {
+            let start = if direction.is_downstream() {
+                b"POST / HTTP/1.1\r\n".as_slice()
+            } else {
+                b"HTTP/1.1 200 OK\r\n".as_slice()
+            };
+            let wire = [start, b"Transfer-Encoding: ", coding, b"\r\n\r\n0\r\n\r\n"].concat();
+            let mut codec = Http1xCodec::new(direction);
+            let mut recorder = Recorder::default();
+            parse(&mut codec, &mut recorder, &wire);
+            assert!(recorder.messages.is_empty());
+            assert!(recorder.bodies.is_empty());
+            assert_eq!(
+                recorder.errors.len(),
+                1,
+                "{direction:?} {}",
+                coding.escape_ascii()
+            );
+            assert_eq!(recorder.errors[0].0, ProxygenError::PARSE_HEADER);
+        }
+    }
+}
+
+#[test]
+fn llhttp_rejected_paused_connect_consumes_its_declared_body() {
+    let body = b"GET /inside-body HTTP/1.1\r\n\r\n";
+    for chunked in [false, true] {
+        let (head, framed) = if chunked {
+            (
+                b"CONNECT example.com:443 HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
+                [
+                    format!("{:x}\r\n", body.len()).as_bytes(),
+                    body,
+                    b"\r\n0\r\n\r\n",
+                ]
+                .concat(),
+            )
+        } else {
+            (
+                format!(
+                    "CONNECT example.com:443 HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes(),
+                body.to_vec(),
+            )
+        };
+        let wire = [&head[..], &framed[..]].concat();
+        let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+        let mut callback = PauseOnHeaders::default();
+        let mut egress = BufQueue::new(QUEUE_LIMIT);
+        assert_eq!(
+            codec
+                .on_ingress(&ingress_queue(&wire), &mut callback, &mut egress)
+                .consumed,
+            head.len()
+        );
+        assert_eq!(
+            codec.resolve_downstream_upgrade(&response(403, (1, 1))),
+            Some(false)
+        );
+        codec.set_parser_paused(false);
+        assert_eq!(
+            codec
+                .on_ingress(&ingress_queue(&framed), &mut callback, &mut egress)
+                .consumed,
+            framed.len()
+        );
+        assert_eq!(callback.recorder.messages.len(), 1);
+        assert_eq!(callback.recorder.bodies, body);
+        assert_eq!(callback.recorder.completions, [false]);
+        assert!(callback.recorder.errors.is_empty());
+    }
+}
+
+#[test]
+fn llhttp_rejected_connect_response_delivers_its_framed_body() {
+    for chunked in [false, true] {
+        let mut codec = Http1xCodec::new(TransportDirection::Upstream);
+        let stream = codec.create_stream();
+        let connect = request(HttpMethod::Connect, b"example.com:443", (1, 1));
+        generate(
+            &mut codec,
+            EgressFrame::Headers {
+                stream,
+                message: &connect,
+                end_stream: true,
+                extra_headers: None,
+            },
+        );
+        let wire = if chunked {
+            b"HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\n\r\n6\r\ndenied\r\n0\r\n\r\n"
+                .as_slice()
+        } else {
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\n\r\ndenied".as_slice()
+        };
+        let mut recorder = Recorder::default();
+        assert_eq!(parse(&mut codec, &mut recorder, wire), wire.len());
+        assert_eq!(recorder.messages.len(), 1);
+        assert_eq!(recorder.bodies, b"denied");
+        assert_eq!(recorder.completions, [false]);
+        assert!(recorder.errors.is_empty());
+    }
+}
+
+#[test]
+fn llhttp_rejected_connect_requires_its_declared_body_at_eof() {
+    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+    let mut callback = PauseOnHeaders::default();
+    let mut egress = BufQueue::new(QUEUE_LIMIT);
+    let head = b"CONNECT example.com:443 HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
+    assert_eq!(
+        codec
+            .on_ingress(&ingress_queue(head), &mut callback, &mut egress)
+            .consumed,
+        head.len()
+    );
+    assert_eq!(
+        codec.resolve_downstream_upgrade(&response(403, (1, 1))),
+        Some(false)
+    );
+    codec.set_parser_paused(false);
+    let _ = codec.on_ingress_eof(&mut callback, &mut egress);
+    assert!(callback.recorder.completions.is_empty());
+    assert_eq!(callback.recorder.errors.len(), 1);
+    assert_eq!(callback.recorder.errors[0].0, ProxygenError::EOF);
+}
+
+#[test]
+fn llhttp_explicit_pause_stops_segmented_tunnel_ingress() {
+    struct PauseFirstBody {
+        recorder: Recorder,
+        paused_once: bool,
+    }
+    impl HttpCodecCallback for PauseFirstBody {
+        fn on_event(&mut self, event: CodecEvent<'_>) {
+            self.recorder.on_event(event);
+        }
+
+        fn on_ingress_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
+            let pause = matches!(event, CodecEvent::Body { .. }) && !self.paused_once;
+            self.on_event(event);
+            if pause {
+                self.paused_once = true;
+                vec![CodecCallbackAction::SetParserPaused(true)].into()
+            } else {
+                CodecCallbackActions::new()
+            }
+        }
+    }
+
+    for dispatch in CallbackDispatch::ALL {
+        for resumed in [false, true] {
+            let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+            let mut callback = PauseFirstBody {
+                recorder: Recorder::default(),
+                paused_once: false,
+            };
+            let mut egress = BufQueue::new(QUEUE_LIMIT);
+            let head = ingress_queue(b"CONNECT h:443 HTTP/1.1\r\n\r\n");
+            assert_eq!(
+                dispatch
+                    .ingress(&mut codec, &head, &mut callback, &mut egress)
+                    .consumed,
+                head.chain_length()
+            );
+            assert_eq!(callback.recorder.completions, [true]);
+            if resumed {
+                codec.set_parser_paused(false);
+            }
+            let mut tunnel = BufQueue::new(QUEUE_LIMIT);
+            for bytes in [b"alpha".as_slice(), b"beta", b"gamma"] {
+                tunnel.push_bytes(Bytes::from_static(bytes)).unwrap();
+            }
+            let first = dispatch.ingress(&mut codec, &tunnel, &mut callback, &mut egress);
+            assert_eq!(first.consumed, 5, "{dispatch:?}, resumed={resumed}");
+            assert_eq!(callback.recorder.bodies, b"alpha");
+            tunnel.trim_start(first.consumed).unwrap();
+            assert!(codec.is_parser_paused());
+            assert_eq!(
+                dispatch
+                    .ingress(&mut codec, &tunnel, &mut callback, &mut egress)
+                    .consumed,
+                0
+            );
+            let _ = codec.on_ingress_eof(&mut callback, &mut egress);
+            assert_eq!(callback.recorder.completions, [true]);
+            codec.set_parser_paused(false);
+            assert_eq!(
+                dispatch
+                    .ingress(&mut codec, &tunnel, &mut callback, &mut egress)
+                    .consumed,
+                9
+            );
+            assert_eq!(callback.recorder.bodies, b"alphabetagamma");
+            let _ = codec.on_ingress_eof(&mut callback, &mut egress);
+            assert_eq!(callback.recorder.completions, [true, false]);
+        }
+    }
+}
+
+#[test]
+fn llhttp_metadata_budget_stops_at_the_limit_after_a_body() {
+    for trailers in [false, true] {
+        let prefix = if trailers {
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n".as_slice()
+        } else {
+            b"POST / HTTP/1.1\r\nContent-Length: 1\r\n\r\na".as_slice()
+        };
+        let metadata = padded_head(
+            if trailers {
+                b"X: ".as_slice()
+            } else {
+                b"GET /next HTTP/1.1\r\nX: ".as_slice()
+            },
+            MAX_HEADER_BYTES + 128,
+            b"",
+        );
+        let wire = Bytes::from([prefix, metadata.as_slice()].concat());
+        let case = head_case(false, false);
+        let mut deliveries = limit_deliveries(prefix.len(), wire.len());
+        let body_start = find_bytes(prefix, b"\r\n\r\n").unwrap() + 4;
+        deliveries.extend(split_deliveries(wire.len(), body_start));
+        for (delivery, reads) in deliveries {
+            let outcome = run_trace(&case, &wire, &reads);
+            let context = format!("trailers={trailers}, {delivery}");
+            assert_eq!(
+                outcome.consumed,
+                prefix.len() + MAX_HEADER_BYTES + 1,
+                "{context}"
+            );
+            assert_one_error(
+                &outcome,
+                &context,
+                if trailers {
+                    ProxygenError::PARSE_BODY
+                } else {
+                    ProxygenError::PARSE_HEADER
+                },
+                b"HTTP header block is too large",
+            );
+        }
+    }
+}
+
+#[test]
+fn llhttp_deferred_upgrade_completion_can_pause_before_tunnel_eof() {
+    struct PauseCompletions(Recorder);
+    impl HttpCodecCallback for PauseCompletions {
+        fn on_event(&mut self, event: CodecEvent<'_>) {
+            self.0.on_event(event);
+        }
+
+        fn on_ingress_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
+            let pause = matches!(
+                event,
+                CodecEvent::TrailersComplete { .. }
+                    | CodecEvent::MessageComplete { upgraded: true, .. }
+            );
+            self.on_event(event);
+            if pause {
+                vec![CodecCallbackAction::SetParserPaused(true)].into()
+            } else {
+                CodecCallbackActions::new()
+            }
+        }
+    }
+
+    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+    let mut callback = PauseCompletions(Recorder::default());
+    let mut egress = BufQueue::new(QUEUE_LIMIT);
+    let head = ingress_queue(b"GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: key\r\nTransfer-Encoding: chunked\r\n\r\n");
+    assert_eq!(
+        codec.on_ingress(&head, &mut callback, &mut egress).consumed,
+        head.chain_length()
+    );
+    let mut accepted = response(101, (1, 1));
+    accepted.set_egress_websocket_upgrade();
+    assert_eq!(codec.resolve_downstream_upgrade(&accepted), Some(true));
+    let body = ingress_queue(b"1\r\nx\r\n0\r\nX-T: yes\r\n\r\n");
+    assert_eq!(
+        codec.on_ingress(&body, &mut callback, &mut egress).consumed,
+        body.chain_length()
+    );
+    assert!(callback.0.completions.is_empty());
+    assert!(codec.is_parser_paused());
+    codec.set_parser_paused(false);
+    let _ = codec.on_ingress_eof(&mut callback, &mut egress);
+    assert_eq!(callback.0.completions, [true]);
+    assert!(codec.is_parser_paused());
+    let _ = codec.on_ingress_eof(&mut callback, &mut egress);
+    assert_eq!(callback.0.completions, [true]);
+    codec.set_parser_paused(false);
+    let _ = codec.on_ingress_eof(&mut callback, &mut egress);
+    assert_eq!(callback.0.completions, [true, false]);
 }

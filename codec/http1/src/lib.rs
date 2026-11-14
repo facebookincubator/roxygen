@@ -4,10 +4,17 @@ use std::borrow::Cow;
 #[cfg(test)]
 use std::cell::Cell;
 use std::marker::PhantomData;
+use std::ops::Range;
 use std::rc::Rc;
 
+mod ingress;
+mod llhttp;
 use base64::Engine as _;
 use bytes::Bytes;
+use llhttp::Error as ParserError;
+use llhttp::Event as ParserEvent;
+use llhttp::Parser;
+use llhttp::ParserType;
 use rand::Rng as _;
 use roxygen_codec::CodecCallbackResult;
 use roxygen_codec::CodecCapabilities;
@@ -32,10 +39,10 @@ use roxygen_core::http::HttpHeaderSize;
 use roxygen_core::http::HttpMethod;
 use roxygen_core::http::Method;
 use roxygen_core::http::TransportDirection;
-use roxygen_core::http::is_tchar;
 use roxygen_core::ids::StreamId;
 use roxygen_core::message::HttpMessage;
 use roxygen_core::rfc2616;
+use roxygen_core::url::ParseUrl;
 use sha1::Digest as _;
 use sha1::Sha1;
 
@@ -57,67 +64,6 @@ const MAX_WEBSOCKET_LINES: usize = b"Upgrade: websocket\r\n".len()
     + b"Sec-WebSocket-Accept: \r\n".len()
     + b"Sec-WebSocket-Key: 0123456789012345678901==\r\n".len()
     + b", Upgrade".len();
-const FROZEN_HTTP_METHODS: [&[u8]; 24] = [
-    b"DELETE",
-    b"GET",
-    b"HEAD",
-    b"POST",
-    b"PUT",
-    b"CONNECT",
-    b"OPTIONS",
-    b"TRACE",
-    b"COPY",
-    b"LOCK",
-    b"MKCOL",
-    b"MOVE",
-    b"PROPFIND",
-    b"PROPPATCH",
-    b"UNLOCK",
-    b"REPORT",
-    b"MKACTIVITY",
-    b"CHECKOUT",
-    b"MERGE",
-    b"M-SEARCH",
-    b"NOTIFY",
-    b"SUBSCRIBE",
-    b"UNSUBSCRIBE",
-    b"PATCH",
-];
-/// `valid_initial_prefix` can fail only within this many head bytes: an
-/// upstream head that passes at five bytes starts with `HTTP/`, and a
-/// downstream head that passes at one byte more than the longest frozen method
-/// holds the delimiter that ends its method token.
-const INITIAL_PREFIX_LIMIT: usize = longest_frozen_method() + 1;
-/// The upstream share of `INITIAL_PREFIX_LIMIT`: an upstream head that passes
-/// at `HTTP/`'s five bytes passes at every longer length, so its prefix can
-/// change only while the head has at most this many bytes.
-const UPSTREAM_PREFIX_LIMIT: usize = b"HTTP/".len();
-/// The most header entries `parse_head` reserves before it adds a head's
-/// headers. The reservation is a hint: peer bytes never size it beyond this
-/// constant, and a head with more header lines grows its entries as it adds
-/// them.
-const HEAD_RESERVE_CAP: usize = 64;
-
-/// One bit per entry of `FROZEN_HTTP_METHODS`.
-const ALL_FROZEN_HTTP_METHODS: u32 = (1 << FROZEN_HTTP_METHODS.len()) - 1;
-
-const _: () = assert!(
-    UPSTREAM_PREFIX_LIMIT < INITIAL_PREFIX_LIMIT && INITIAL_PREFIX_LIMIT < MAX_HEADER_BYTES
-);
-const _: () = assert!(FROZEN_HTTP_METHODS.len() < u32::BITS as usize);
-
-const fn longest_frozen_method() -> usize {
-    let mut longest = 0;
-    let mut index = 0;
-    while index < FROZEN_HTTP_METHODS.len() {
-        if FROZEN_HTTP_METHODS[index].len() > longest {
-            longest = FROZEN_HTTP_METHODS[index].len();
-        }
-        index += 1;
-    }
-    longest
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum KeepaliveRequested {
     #[default]
@@ -126,135 +72,15 @@ enum KeepaliveRequested {
     Disabled,
 }
 
-#[derive(Clone, Debug, Default)]
-enum ParseState {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum IngressPhase {
     #[default]
     Idle,
-    Head(Vec<u8>),
-    FixedBody(u64),
-    ChunkSize(ChunkSizeLine),
-    ChunkBody(u64),
-    /// Whether the chunk terminator's CR has been read.
-    ChunkDelimiter(bool),
-    Trailers(Vec<u8>),
-    UntilEof,
+    Headers,
+    Body,
+    Trailers,
+    Http09,
     Upgraded,
-    MessageComplete(bool),
-}
-
-/// The longest chunk-size line, its LF included.
-const MAX_CHUNK_HEADER_BYTES: u8 = 128;
-
-/// A chunk-size line read so far, kept as what its parse needs once its LF
-/// arrives.
-#[derive(Clone, Copy, Debug, Default)]
-struct ChunkSizeLine {
-    /// Bytes read, the LF included.
-    length: u8,
-    size: ChunkSizeToken,
-    /// Whether the last byte read was a CR.
-    after_cr: bool,
-    /// Whether a CR was followed by a byte other than the line's LF, so that the
-    /// line holds a CR besides one just before its LF.
-    stray_cr: bool,
-}
-
-/// Why [`ChunkSizeLine::read`] stopped before the end of its input.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ChunkSizeLineEnd {
-    /// The line's LF was read.
-    Lf,
-    /// The last byte read took the line past `MAX_CHUNK_HEADER_BYTES`.
-    TooLarge,
-}
-
-impl ChunkSizeLine {
-    /// Reads `input` up to and including the line's LF, or up to the byte that
-    /// takes the line past `MAX_CHUNK_HEADER_BYTES`, LF or not. Returns the
-    /// bytes read and why reading stopped, or `None` when the input ran out.
-    fn read(&mut self, input: &[u8]) -> (usize, Option<ChunkSizeLineEnd>) {
-        for (index, byte) in input.iter().enumerate() {
-            self.length += 1;
-            if self.length > MAX_CHUNK_HEADER_BYTES {
-                return (index + 1, Some(ChunkSizeLineEnd::TooLarge));
-            }
-            if *byte == b'\n' {
-                return (index + 1, Some(ChunkSizeLineEnd::Lf));
-            }
-            self.stray_cr |= self.after_cr;
-            self.after_cr = *byte == b'\r';
-            self.size = self.size.push(*byte);
-        }
-        (input.len(), None)
-    }
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static CHUNK_DELIMITER_TURNS: Cell<usize> = const { Cell::new(0) };
-}
-
-/// Turns of the ingress parse loop in `ParseState::ChunkDelimiter` on this
-/// thread, read by the count oracles.
-#[cfg(test)]
-fn chunk_delimiter_turns() -> usize {
-    CHUNK_DELIMITER_TURNS.with(Cell::get)
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static DYN_INGRESS_DELIVERIES: Cell<usize> = const { Cell::new(0) };
-}
-
-/// Ingress callbacks delivered through `dyn HttpCodecCallback` on this thread,
-/// read by the count oracles.
-#[cfg(test)]
-fn dyn_ingress_deliveries() -> usize {
-    DYN_INGRESS_DELIVERIES.with(Cell::get)
-}
-
-/// The chunk size read so far, from the line's bytes before its first `;`
-/// with HTTP whitespace trimmed from both ends: nonempty hex digits whose value
-/// fits a `u64`, or invalid. A CR counts as whitespace, as the trim treats it;
-/// the line is rejected for any CR but one just before its LF.
-#[derive(Clone, Copy, Debug, Default)]
-enum ChunkSizeToken {
-    /// Whitespace only.
-    #[default]
-    Leading,
-    /// Hex digits after any leading whitespace.
-    Digits(u64),
-    /// Hex digits followed by whitespace.
-    Trailing(u64),
-    /// Not a hex number that fits a `u64`.
-    Invalid,
-    /// The size as it stood at the first `;`.
-    Ended(Option<u64>),
-}
-
-impl ChunkSizeToken {
-    fn push(self, byte: u8) -> Self {
-        let whitespace = matches!(byte, b' ' | b'\t' | b'\r' | b'\n');
-        match self {
-            Self::Ended(_) => self,
-            _ if byte == b';' => Self::Ended(self.value()),
-            Self::Digits(size) if whitespace => Self::Trailing(size),
-            Self::Leading | Self::Trailing(_) | Self::Invalid if whitespace => self,
-            Self::Leading => hex_digit(byte).map_or(Self::Invalid, Self::Digits),
-            Self::Digits(size) => hex_digit(byte)
-                .and_then(|digit| size.checked_mul(16)?.checked_add(digit))
-                .map_or(Self::Invalid, Self::Digits),
-            Self::Trailing(_) | Self::Invalid => Self::Invalid,
-        }
-    }
-
-    fn value(self) -> Option<u64> {
-        match self {
-            Self::Digits(size) | Self::Trailing(size) => Some(size),
-            Self::Ended(size) => size,
-            Self::Leading | Self::Invalid => None,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,198 +90,14 @@ enum ParseErrorKind {
     Body,
 }
 
-/// Why a head scan stopped before the end of its segment.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HeadScanStop {
-    Complete,
-    TooLarge,
-    InvalidStartLine,
-    InvalidHeaderByte,
-}
-
-/// The first `end` bytes of a scanned segment belong to the head, the stopping
-/// byte included.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HeadScan {
-    end: usize,
-    stop: Option<HeadScanStop>,
-}
-
-/// The most LF positions a head scan records.
-const RECORDED_LINE_FEEDS: usize = 32;
-
-const _: () = assert!(MAX_HEADER_BYTES <= u32::MAX as usize);
-
-/// The positions of the LFs a head scan reads, the first
-/// `RECORDED_LINE_FEEDS` of them, so that a head parsed in place is split into
-/// lines without another search.
-struct LineFeedPositions {
-    positions: [u32; RECORDED_LINE_FEEDS],
-    count: usize,
-}
-
-impl LineFeedPositions {
-    fn new() -> Self {
-        Self {
-            positions: [0; RECORDED_LINE_FEEDS],
-            count: 0,
-        }
-    }
-
-    /// Records the next LF, at `index`, which is inside a head and so below
-    /// `MAX_HEADER_BYTES`.
-    #[inline]
-    fn record(&mut self, index: usize) {
-        if let Some(position) = self.positions.get_mut(self.count) {
-            *position = index as u32;
-        }
-        self.count += 1;
-    }
-
-    /// The recorded LFs of a head of `length` bytes whose LFs this recorded,
-    /// each of them in order.
-    fn known(&self, length: usize) -> KnownLineFeeds<'_> {
-        match self.positions.get(..self.count) {
-            Some(positions) => KnownLineFeeds {
-                positions,
-                searched_to: length,
-            },
-            None => KnownLineFeeds {
-                positions: &self.positions,
-                searched_to: self.positions[RECORDED_LINE_FEEDS - 1] as usize + 1,
-            },
-        }
-    }
-}
-
-/// LF positions in a head: every LF before `searched_to`, in order.
-#[derive(Clone, Copy, Debug)]
-struct KnownLineFeeds<'a> {
-    positions: &'a [u32],
-    searched_to: usize,
-}
-
-/// The slot of `byte` in a [`METHOD_BYTE_MASKS`] row. Every byte of a frozen
-/// method name is an uppercase letter or `-`.
-const fn method_byte_slot(byte: u8) -> Option<usize> {
-    match byte {
-        b'A'..=b'Z' => Some((byte - b'A') as usize),
-        b'-' => Some(26),
-        _ => None,
-    }
-}
-
-/// For each index into a frozen method name and each byte slot, the methods,
-/// one bit per entry of `FROZEN_HTTP_METHODS`, whose name holds that byte at
-/// that index.
-static METHOD_BYTE_MASKS: [[u32; 27]; INITIAL_PREFIX_LIMIT - 1] = {
-    let mut masks = [[0; 27]; INITIAL_PREFIX_LIMIT - 1];
-    let mut method = 0;
-    while method < FROZEN_HTTP_METHODS.len() {
-        let name = FROZEN_HTTP_METHODS[method];
-        let mut index = 0;
-        while index < name.len() {
-            let Some(slot) = method_byte_slot(name[index]) else {
-                panic!("a frozen method name holds a byte without a slot");
-            };
-            masks[index][slot] |= 1 << method;
-            index += 1;
-        }
-        method += 1;
-    }
-    masks
-};
-
-/// `valid_initial_prefix` of a head that grows one byte at a time, with each
-/// byte read once. Downstream it keeps the frozen methods that the method token
-/// still prefixes (with `EXACT_METHODS`, that every byte so far is a `tchar`)
-/// and whether a delimiter has ended the token; upstream, which byte of `HTTP/`
-/// comes next. A prefix that fails stays failed: every longer head holds the
-/// same mismatch.
-struct PrefixMatch<const EXACT_METHODS: bool> {
-    upstream: bool,
-    length: usize,
-    candidates: u32,
-    delimited: bool,
-    valid: bool,
-}
-
-impl<const EXACT_METHODS: bool> PrefixMatch<EXACT_METHODS> {
-    fn new(upstream: bool) -> Self {
-        Self {
-            upstream,
-            length: 0,
-            candidates: ALL_FROZEN_HTTP_METHODS,
-            delimited: false,
-            valid: true,
-        }
-    }
-
-    /// Whether every longer head passes as well: the head passes, and
-    /// downstream a delimiter has ended the method token, or upstream the head
-    /// holds all of `HTTP/`.
-    #[inline]
-    fn settled(&self) -> bool {
-        self.valid
-            && if self.upstream {
-                self.length >= b"HTTP/".len()
-            } else {
-                self.delimited
-            }
-    }
-
-    /// Appends `byte` to the head, and returns whether the head passes
-    /// `valid_initial_prefix`.
-    #[inline]
-    fn push(&mut self, byte: u8) -> bool {
-        let index = self.length;
-        self.length += 1;
-        if !self.valid {
-            return false;
-        }
-        if self.upstream {
-            self.valid = b"HTTP/".get(index).is_none_or(|expected| *expected == byte);
-        } else if !self.delimited {
-            if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
-                self.delimited = true;
-            } else if EXACT_METHODS {
-                self.valid = is_tchar(byte);
-            } else {
-                #[cfg(test)]
-                count_helper_work(|work| &work.prefix_method_steps, 1);
-                let matching = match (METHOD_BYTE_MASKS.get(index), method_byte_slot(byte)) {
-                    (Some(row), Some(slot)) => row[slot],
-                    _ => 0,
-                };
-                self.candidates &= matching;
-                self.valid = self.candidates != 0;
-            }
-        }
-        self.valid
-    }
-}
-
-/// Work counts of the head path, read by the count oracles.
 #[cfg(test)]
-#[derive(Debug, Default)]
-struct HeadWork {
-    /// Head bytes the start-line prefix check reads.
-    prefix_reads: Cell<usize>,
-    /// Head bytes the start-line prefix check reads from outside the scan's
-    /// `buffered` and `segment`, that is, from a copy.
-    prefix_copies: Cell<usize>,
-    /// `word_scan::count_lf` passes over a parsed head.
-    line_feed_counts: Cell<usize>,
-    /// Steps of the head scan's main loop: a byte checked on its own, or a
-    /// search for the next control byte.
-    scan_steps: Cell<usize>,
-    /// Owned copies of a parsed request's method name.
-    method_copies: Cell<usize>,
-    /// Nonempty Upgrade values that `parse_head` reads from anywhere but the
-    /// message's header, that is, from a copy.
-    upgrade_copies: Cell<usize>,
-    /// Owned copies of a nonempty User-Agent value.
-    user_agent_copies: Cell<usize>,
+std::thread_local! {
+    static DYN_INGRESS_DELIVERIES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn dyn_ingress_deliveries() -> usize {
+    DYN_INGRESS_DELIVERIES.with(Cell::get)
 }
 
 /// Work counts of the egress path, read by the count oracles.
@@ -484,43 +126,6 @@ fn formatted_strings() -> usize {
 #[cfg(test)]
 fn count_work(counter: &Cell<usize>, amount: usize) {
     counter.set(counter.get() + amount);
-}
-
-/// Work counts of the head-path helpers that run without a codec, read by the
-/// count oracles.
-#[cfg(test)]
-#[derive(Debug, Default)]
-struct HelperWork {
-    /// Frozen methods that `PrefixMatch::push` matches a byte against.
-    prefix_method_steps: Cell<usize>,
-    /// Request-line bytes that `request_line_is_http_09` checks for a
-    /// delimiter.
-    http_09_delimiter_reads: Cell<usize>,
-    /// Bytes that `HeaderLines` searches for an LF.
-    line_search_bytes: Cell<usize>,
-    /// Header-value bytes that `valid_header_value` checks one at a time.
-    value_byte_checks: Cell<usize>,
-    /// Version numbers that `parse_version` parses as decimal digits.
-    version_number_parses: Cell<usize>,
-    /// Loads that `generate_headers` makes to check header values for a CR or
-    /// an LF: a byte, or a word of eight.
-    egress_cr_lf_loads: Cell<usize>,
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static HELPER_WORK: HelperWork = HelperWork::default();
-}
-
-/// The count `counter` selects from this thread's `HelperWork`.
-#[cfg(test)]
-fn helper_work(counter: fn(&HelperWork) -> &Cell<usize>) -> usize {
-    HELPER_WORK.with(|work| counter(work).get())
-}
-
-#[cfg(test)]
-fn count_helper_work(counter: fn(&HelperWork) -> &Cell<usize>, amount: usize) {
-    HELPER_WORK.with(|work| count_work(counter(work), amount));
 }
 
 /// The bytes that end an egress message: none, or for chunked egress the final
@@ -552,22 +157,6 @@ impl MessageEnd {
     }
 }
 
-#[derive(Debug)]
-struct ParsedHead {
-    message: Box<HttpMessage>,
-    body: IngressBody,
-    informational: bool,
-    upgrade: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum IngressBody {
-    None,
-    Fixed(u64),
-    Chunked,
-    UntilEof,
-}
-
 /// A worker-local, incremental HTTP/1 codec.
 pub struct Http1xCodec {
     direction: TransportDirection,
@@ -576,9 +165,6 @@ pub struct Http1xCodec {
     downstream_upgrade_as_ordinary: bool,
     /// Roxygen-only (`DIV-036`): a request head that ends its message gets no body framing.
     unframed_bodiless_requests: bool,
-    /// Roxygen-only (`DIV-040`): a downstream request's method is any RFC 9110 token,
-    /// kept byte for byte, instead of one of `FROZEN_HTTP_METHODS`.
-    exact_methods: bool,
     /// The last request stream parsed under `downstream_upgrade_as_ordinary`, or unspecified.
     last_ordinary_request: StreamId,
     upstream_upgrade_as_ordinary: bool,
@@ -586,11 +172,24 @@ pub struct Http1xCodec {
     /// `upstream_upgrade_as_ordinary`, so its response is read as an ordinary response.
     ordinary_request_sent: bool,
     release_egress_after_request: bool,
-    state: ParseState,
+    parser: Option<Parser>,
+    phase: IngressPhase,
+    header_name: Vec<u8>,
+    header_value: Vec<u8>,
+    target: Vec<u8>,
+    parsed_target: Option<ParseUrl>,
+    reason: Vec<u8>,
+    trailers: HttpHeaders,
+    header_bytes: usize,
+    protocol_bytes: usize,
+    http09_request: bool,
+    http09_synthetic: bool,
+    pending_message_complete: bool,
     current_message: Option<HttpMessage>,
     ingress_stream: StreamId,
     egress_stream: StreamId,
     parser_paused: bool,
+    upgrade_pause: bool,
     parser_error: bool,
     request_pending: bool,
     response_pending: bool,
@@ -612,12 +211,6 @@ pub struct Http1xCodec {
     websocket_accept_key: Vec<u8>,
     user_agent: Vec<u8>,
     expect_http_09_response: bool,
-    /// The last head reservation: the entries reserved, and the entries the
-    /// message already held.
-    #[cfg(test)]
-    head_reserve: Option<(usize, usize)>,
-    #[cfg(test)]
-    head_work: HeadWork,
     #[cfg(test)]
     egress_work: EgressWork,
     _worker_local: PhantomData<Rc<()>>,
@@ -647,7 +240,7 @@ struct EgressRollback {
 }
 
 impl Http1xCodec {
-    /// Creates a codec using the reference codec's compatibility validation.
+    /// Creates a codec using llhttp's HTTP/1 parsing rules.
     pub fn new(direction: TransportDirection) -> Self {
         Self::with_options(direction, false, false)
     }
@@ -664,16 +257,32 @@ impl Http1xCodec {
             strict_validation,
             downstream_upgrade_as_ordinary: false,
             unframed_bodiless_requests: false,
-            exact_methods: false,
             last_ordinary_request: StreamId::UNSPECIFIED,
             upstream_upgrade_as_ordinary: false,
             ordinary_request_sent: false,
             release_egress_after_request: false,
-            state: ParseState::Idle,
+            parser: Some(Parser::new(if direction.is_downstream() {
+                ParserType::Request
+            } else {
+                ParserType::Response
+            })),
+            phase: IngressPhase::Idle,
+            header_name: Vec::new(),
+            header_value: Vec::new(),
+            target: Vec::new(),
+            parsed_target: None,
+            reason: Vec::new(),
+            trailers: HttpHeaders::new(),
+            header_bytes: 0,
+            protocol_bytes: 0,
+            http09_request: false,
+            http09_synthetic: false,
+            pending_message_complete: false,
             current_message: None,
             ingress_stream: StreamId::UNSPECIFIED,
             egress_stream: StreamId::UNSPECIFIED,
             parser_paused: false,
+            upgrade_pause: false,
             parser_error: false,
             request_pending: false,
             response_pending: false,
@@ -696,10 +305,6 @@ impl Http1xCodec {
             user_agent: Vec::new(),
             expect_http_09_response: false,
             #[cfg(test)]
-            head_reserve: None,
-            #[cfg(test)]
-            head_work: HeadWork::default(),
-            #[cfg(test)]
             egress_work: EgressWork::default(),
             _worker_local: PhantomData,
         }
@@ -712,7 +317,7 @@ impl Http1xCodec {
         codec
     }
 
-    /// Changes header and URL validation for subsequent messages.
+    /// Additionally restricts header values to ASCII for subsequent messages.
     pub fn set_strict_validation(&mut self, strict: bool) {
         self.strict_validation = strict;
     }
@@ -745,17 +350,6 @@ impl Http1xCodec {
         self.unframed_bodiless_requests = enabled;
     }
 
-    /// Roxygen-only (`DIV-040`): a downstream request's method is read as RFC 9110 section 9.1
-    /// defines methods, and as hyper (`httparse` and `http::Method::from_bytes`) reads them:
-    /// any token, case-sensitive and kept byte for byte (`Method::from_exact_token`), so
-    /// `post`, `Post` and `PURGE` are extension methods and only `POST` is `HttpMethod::Post`,
-    /// instead of only the reference codec's frozen method table, matched byte for byte.
-    /// A request line whose method is not a token is still a 400 parse error. Off by
-    /// default. It has no effect on an upstream codec.
-    pub fn set_exact_methods(&mut self, enabled: bool) {
-        self.exact_methods = enabled;
-    }
-
     /// Releases upstream egress ownership as soon as the request completes.
     pub fn set_release_egress_after_request(&mut self, release: bool) {
         self.release_egress_after_request = release;
@@ -779,18 +373,20 @@ impl Http1xCodec {
         };
         self.ingress_upgrade = accepted;
         self.ingress_upgrade_complete = false;
-        match self.state {
-            ParseState::MessageComplete(_) => {
-                self.state = ParseState::MessageComplete(accepted);
-                Some(accepted)
-            }
-            ParseState::Upgraded if accepted => Some(true),
-            ParseState::Upgraded => {
-                self.state = ParseState::Idle;
-                Some(false)
-            }
-            _ => None,
+        if let Some(parser) = self.parser.as_mut() {
+            parser.upgrade = u8::from(accepted);
         }
+        if self.phase == IngressPhase::Upgraded {
+            self.ingress_upgrade_complete = accepted;
+            if !accepted {
+                self.phase = IngressPhase::Idle;
+                if let Some(parser) = self.parser.as_mut() {
+                    parser.resume_after_upgrade();
+                }
+            }
+            return Some(accepted);
+        }
+        matches!(self.phase, IngressPhase::Body).then_some(accepted)
     }
 
     /// Whether `stream` is a request parsed under `downstream_upgrade_as_ordinary`, or one before
@@ -856,6 +452,9 @@ impl Http1xCodec {
             self.response_pending = true;
         }
         let mut message = HttpMessage::new();
+        if self.direction.is_upstream() {
+            let _ = message.set_status_code(0);
+        }
         self.dispatch(
             callback,
             callback_egress,
@@ -874,7 +473,9 @@ impl Http1xCodec {
         callback_egress: &mut BufQueue,
         result: &mut CodecIngressResult,
     ) {
-        self.begin_message(callback, callback_egress, result);
+        if self.current_message.is_none() {
+            self.begin_message(callback, callback_egress, result);
+        }
         if self.parser_paused {
             return;
         }
@@ -891,7 +492,7 @@ impl Http1xCodec {
             },
             result,
         );
-        self.state = ParseState::UntilEof;
+        self.phase = IngressPhase::Http09;
     }
 
     fn complete_message(
@@ -906,7 +507,7 @@ impl Http1xCodec {
         } else {
             self.response_pending = self.informational_response;
             if self.informational_response && !self.ingress_upgrade {
-                self.state = ParseState::Idle;
+                self.phase = IngressPhase::Idle;
                 return;
             }
         }
@@ -921,34 +522,12 @@ impl Http1xCodec {
         );
         if upgraded {
             self.ingress_upgrade_complete = true;
+            self.upgrade_pause |= !self.parser_paused;
             self.parser_paused = true;
-            self.state = ParseState::Upgraded;
+            self.phase = IngressPhase::Upgraded;
         } else {
-            self.state = ParseState::Idle;
+            self.phase = IngressPhase::Idle;
         }
-    }
-
-    fn complete_message_eof(
-        &mut self,
-        callback: &mut dyn HttpCodecCallback,
-        callback_egress: &mut BufQueue,
-        result: &mut CodecCallbackResult,
-    ) {
-        if self.direction.is_downstream() {
-            self.request_pending = false;
-        } else {
-            self.response_pending = false;
-        }
-        self.dispatch_eof(
-            callback,
-            callback_egress,
-            CodecEvent::MessageComplete {
-                stream: self.ingress_stream,
-                upgraded: self.ingress_upgrade,
-            },
-            result,
-        );
-        self.state = ParseState::Idle;
     }
 
     fn fail(
@@ -964,7 +543,6 @@ impl Http1xCodec {
         }
         self.parser_error = true;
         self.parser_paused = true;
-        self.backfill_partial_request();
         let mut error = HttpException::new(HttpExceptionDirection::Ingress, message);
         error.set_proxygen_error(match kind {
             ParseErrorKind::Header => ProxygenError::PARSE_HEADER,
@@ -998,7 +576,6 @@ impl Http1xCodec {
         }
         self.parser_error = true;
         self.parser_paused = true;
-        self.backfill_partial_request();
         let mut error = HttpException::new(HttpExceptionDirection::Ingress, b"unexpected EOF");
         error.set_proxygen_error(ProxygenError::EOF);
         if self.direction.is_downstream() && self.egress_stream < self.ingress_stream {
@@ -1015,733 +592,6 @@ impl Http1xCodec {
             },
             result,
         );
-    }
-
-    fn headers_terminated(bytes: &[u8]) -> bool {
-        bytes.ends_with(b"\r\n\r\n") || bytes.ends_with(b"\n\n")
-    }
-
-    fn backfill_partial_request(&mut self) {
-        if self.direction.is_upstream() {
-            return;
-        }
-        let exact_methods = self.exact_methods;
-        let Some(message) = self.current_message.as_mut() else {
-            return;
-        };
-        if message.is_request() {
-            return;
-        }
-        let ParseState::Head(head) = &self.state else {
-            return;
-        };
-        let Some(newline) = head.iter().position(|byte| *byte == b'\n') else {
-            return;
-        };
-        let line = trim_trailing_cr(&head[..newline]);
-        let mut words = line.split(|byte| matches!(*byte, b' ' | b'\t'));
-        let (Some(method), Some(url)) = (words.next(), words.next()) else {
-            return;
-        };
-        let version = match words.next() {
-            None => (0, 9),
-            Some(version) => match parse_version(version) {
-                Some(version) => version,
-                None => return,
-            },
-        };
-        if words.next().is_some() || !accepts_method(exact_methods, method) {
-            return;
-        }
-        let parsed =
-            roxygen_core::url::ParseUrl::parse_url_maybe_invalid(url, self.strict_validation);
-        if !parsed.valid() {
-            return;
-        }
-        let method = match Method::from_exact_token(method).filter(|_| exact_methods) {
-            Some(method) => method,
-            None => Method::from_name(String::from_utf8_lossy(method).into_owned()),
-        };
-        let _ = message.set_method(method);
-        let _ = message.set_url(url, self.strict_validation);
-        message.set_http_version(version.0, version.1);
-    }
-
-    #[inline]
-    fn valid_initial_prefix(&self, head: &[u8]) -> bool {
-        if self.direction.is_upstream() {
-            #[cfg(test)]
-            count_work(&self.head_work.prefix_reads, head.len().min(5));
-            return b"HTTP/".starts_with(head) || head.starts_with(b"HTTP/");
-        }
-        let token_end = head
-            .iter()
-            .position(|byte| matches!(*byte, b' ' | b'\t' | b'\r' | b'\n'))
-            .unwrap_or(head.len());
-        #[cfg(test)]
-        count_work(
-            &self.head_work.prefix_reads,
-            (token_end + 1).min(head.len()),
-        );
-        let token = &head[..token_end];
-        if self.exact_methods {
-            return token.iter().copied().all(is_tchar);
-        }
-        FROZEN_HTTP_METHODS
-            .iter()
-            .any(|method| method.starts_with(token))
-    }
-
-    /// The start-line prefix check of `scan_head_counting_line_feeds`: the
-    /// position in `segment` of the first byte of `segment[from..window_end]`
-    /// that fails it, after the head's earlier bytes, `buffered` and then
-    /// `segment[..from]`. It stops at the first byte after which every longer
-    /// head passes.
-    #[inline(always)]
-    fn scan_prefix<const EXACT_METHODS: bool>(
-        &self,
-        buffered: &[u8],
-        segment: &[u8],
-        from: usize,
-        window_end: usize,
-    ) -> Option<usize> {
-        let push_prefix = |prefix: &mut PrefixMatch<EXACT_METHODS>, byte: &u8| {
-            #[cfg(test)]
-            {
-                count_work(&self.head_work.prefix_reads, 1);
-                let address = std::ptr::from_ref(byte);
-                let in_place = buffered.as_ptr_range().contains(&address)
-                    || segment.as_ptr_range().contains(&address);
-                count_work(&self.head_work.prefix_copies, usize::from(!in_place));
-            }
-            prefix.push(*byte)
-        };
-        let mut prefix = PrefixMatch::<EXACT_METHODS>::new(self.direction.is_upstream());
-        for byte in buffered {
-            push_prefix(&mut prefix, byte);
-        }
-        for byte in &segment[..from] {
-            push_prefix(&mut prefix, byte);
-        }
-        let window = segment.get(from..window_end).unwrap_or_default();
-        for (offset, byte) in window.iter().enumerate() {
-            if !push_prefix(&mut prefix, byte) {
-                return Some(from + offset);
-            }
-            if prefix.settled() {
-                break;
-            }
-        }
-        None
-    }
-
-    /// `scan_prefix` with `exact_methods`, out of line so that the scan keeps
-    /// the frozen-method check's registers.
-    #[inline(never)]
-    fn scan_exact_method_prefix(
-        &self,
-        buffered: &[u8],
-        segment: &[u8],
-        from: usize,
-        window_end: usize,
-    ) -> Option<usize> {
-        self.scan_prefix::<true>(buffered, segment, from, window_end)
-    }
-
-    /// The scan of `scan_head_counting_line_feeds`, without its count.
-    #[cfg(test)]
-    fn scan_head(&self, buffered: &[u8], segment: &[u8], from: usize) -> HeadScan {
-        self.scan_head_counting_line_feeds(buffered, segment, from, &mut LineFeedPositions::new())
-            .0
-    }
-
-    /// Scans `segment[from..]` as the continuation of a head whose first
-    /// bytes, at least one, are `buffered` and then `segment[..from]`. Each
-    /// byte gets the `ParseState::Head` checks in order: the size limit, the
-    /// start-line prefix, the terminator at an LF, and then control bytes. The
-    /// terminator is CRLFCRLF or LFLF, or downstream an HTTP/0.9 request line,
-    /// which can first hold at the head's first LF.
-    ///
-    /// The prefix check reads each head byte inside its window once per call,
-    /// the bytes before `from` included. The scan also returns the number of
-    /// LFs in `segment[from..end]`, each of which it visits, and records their
-    /// positions in `segment` in `line_feed_positions`.
-    fn scan_head_counting_line_feeds(
-        &self,
-        buffered: &[u8],
-        segment: &[u8],
-        from: usize,
-        line_feed_positions: &mut LineFeedPositions,
-    ) -> (HeadScan, usize) {
-        let base = buffered.len();
-        let head_byte = |index: usize| {
-            if index < base {
-                buffered[index]
-            } else {
-                segment[index - base]
-            }
-        };
-        let limit = segment.len().min(MAX_HEADER_BYTES.saturating_sub(base));
-        let prefix_limit = if self.direction.is_upstream() {
-            UPSTREAM_PREFIX_LIMIT
-        } else {
-            INITIAL_PREFIX_LIMIT
-        };
-        // The position of the first byte this call reaches that fails the
-        // start-line prefix check. Bytes past it are not scanned.
-        let mut prefix_stop = None;
-        if base + from < prefix_limit {
-            let window_end = limit.min(prefix_limit - base);
-            prefix_stop = if self.exact_methods {
-                self.scan_exact_method_prefix(buffered, segment, from, window_end)
-            } else {
-                self.scan_prefix::<false>(buffered, segment, from, window_end)
-            };
-        }
-        let search_end = prefix_stop.unwrap_or(limit);
-        let mut line_feeds = 0;
-        let mut earlier_newline = None;
-        let mut position = from;
-        while position < search_end {
-            #[cfg(test)]
-            count_work(&self.head_work.scan_steps, 1);
-            let Some(offset) = word_scan::find_control(&segment[position..search_end]) else {
-                position = search_end;
-                break;
-            };
-            let mut index = position + offset;
-            // A CR passes every check, so the LF of a CRLF is checked at once.
-            if segment[index] == b'\r' && index + 1 < search_end && segment[index + 1] == b'\n' {
-                index += 1;
-            }
-            position = index + 1;
-            let stop = match segment[index] {
-                b'\n' => {
-                    line_feeds += 1;
-                    line_feed_positions.record(index);
-                    let length = base + position;
-                    let terminated = if index >= 3 {
-                        let end = &segment[index - 3..index];
-                        end[2] == b'\n' || *end == *b"\r\n\r"
-                    } else {
-                        (length >= 2 && head_byte(length - 2) == b'\n')
-                            || (length >= 4
-                                && head_byte(length - 4) == b'\r'
-                                && head_byte(length - 3) == b'\n'
-                                && head_byte(length - 2) == b'\r')
-                    };
-                    let http_09 = self.direction.is_downstream()
-                        && !earlier_newline.replace(true).unwrap_or_else(|| {
-                            buffered.contains(&b'\n') || segment[..from].contains(&b'\n')
-                        })
-                        && request_line_is_http_09(buffered, &segment[..index]);
-                    (terminated || http_09).then_some(HeadScanStop::Complete)
-                }
-                b'\r' | b'\t' => None,
-                byte if byte < b' ' => Some(HeadScanStop::InvalidHeaderByte),
-                _ => None,
-            };
-            if stop.is_some() {
-                let scan = HeadScan {
-                    end: position,
-                    stop,
-                };
-                return (scan, line_feeds);
-            }
-        }
-        if let Some(stop) = prefix_stop {
-            let scan = HeadScan {
-                end: stop + 1,
-                stop: Some(HeadScanStop::InvalidStartLine),
-            };
-            return (scan, line_feeds);
-        }
-        if position < segment.len() {
-            let scan = HeadScan {
-                end: position + 1,
-                stop: Some(HeadScanStop::TooLarge),
-            };
-            return (scan, line_feeds);
-        }
-        let scan = HeadScan {
-            end: segment.len(),
-            stop: None,
-        };
-        (scan, line_feeds)
-    }
-
-    /// Continues the head that `buffered` holds, or that begins at
-    /// `input[head_start]` when `buffered` is empty, through the rest of
-    /// `input`. The head's bytes before `result.consumed` are already taken. A
-    /// head that lies wholly in `input` is parsed in place.
-    fn ingress_head(
-        &mut self,
-        mut buffered: Vec<u8>,
-        input: &[u8],
-        head_start: usize,
-        callback: &mut (impl IngressDelivery + ?Sized),
-        callback_egress: &mut BufQueue,
-        result: &mut CodecIngressResult,
-    ) {
-        let segment = &input[head_start..];
-        let from = result.consumed - head_start;
-        let mut line_feed_positions = LineFeedPositions::new();
-        let (scan, scanned_line_feeds) =
-            self.scan_head_counting_line_feeds(&buffered, segment, from, &mut line_feed_positions);
-        result.consumed = head_start + scan.end;
-        let accepted = &segment[..scan.end];
-        let message: &'static [u8] = match scan.stop {
-            None => {
-                buffered.extend_from_slice(accepted);
-                self.state = ParseState::Head(buffered);
-                return;
-            }
-            Some(HeadScanStop::Complete) => {
-                let parsed = if buffered.is_empty() {
-                    let earlier_line_feeds = segment[..from]
-                        .iter()
-                        .filter(|byte| **byte == b'\n')
-                        .count();
-                    let known = (earlier_line_feeds == 0)
-                        .then(|| line_feed_positions.known(accepted.len()));
-                    self.parse_head(
-                        accepted,
-                        Some(scanned_line_feeds + earlier_line_feeds),
-                        known,
-                    )
-                } else {
-                    buffered.extend_from_slice(accepted);
-                    self.parse_head(&buffered, None, None)
-                };
-                match parsed {
-                    Ok(parsed) => {
-                        self.install_parsed_head(parsed, callback, callback_egress, result);
-                    }
-                    Err((kind, message)) => {
-                        if buffered.is_empty() {
-                            buffered = accepted.to_vec();
-                        }
-                        self.state = ParseState::Head(buffered);
-                        if self.current_message.is_none() {
-                            self.current_message = Some(HttpMessage::new());
-                        }
-                        self.fail(kind, message, callback, callback_egress, result);
-                    }
-                }
-                return;
-            }
-            Some(HeadScanStop::TooLarge) => b"HTTP header block is too large",
-            Some(HeadScanStop::InvalidStartLine) => b"invalid HTTP start line",
-            Some(HeadScanStop::InvalidHeaderByte) => b"invalid HTTP header byte",
-        };
-        buffered.extend_from_slice(accepted);
-        self.state = ParseState::Head(buffered);
-        self.fail(
-            ParseErrorKind::Header,
-            message,
-            callback,
-            callback_egress,
-            result,
-        );
-    }
-
-    /// Parses the complete head `raw`, which holds `line_feeds` LFs when the
-    /// scan counted them, at `known` when the scan recorded them.
-    fn parse_head(
-        &mut self,
-        raw: &[u8],
-        line_feeds: Option<usize>,
-        known: Option<KnownLineFeeds<'_>>,
-    ) -> Result<ParsedHead, (ParseErrorKind, &'static [u8])> {
-        let mut message = self.current_message.take().unwrap_or_default();
-        let line_feeds = line_feeds.unwrap_or_else(|| {
-            #[cfg(test)]
-            count_work(&self.head_work.line_feed_counts, 1);
-            word_scan::count_lf(raw)
-        });
-        // A head with N header lines has N + 2 LFs, so this leaves room for its
-        // headers and an inferred Host. Folds and escaped newlines only
-        // over-count, up to the cap.
-        let reserve = line_feeds.saturating_sub(1).min(HEAD_RESERVE_CAP);
-        #[cfg(test)]
-        {
-            self.head_reserve = Some((reserve, message.headers().len()));
-        }
-        message.headers_mut().reserve(reserve);
-        let mut lines = match known {
-            Some(known) => HeaderLines::with_known(raw, known),
-            None => header_lines(raw),
-        };
-        let start_line = trim_trailing_cr(lines.next().unwrap_or_default());
-        let mut inferred_host = None;
-        let (version, informational) = if self.direction.is_downstream() {
-            let mut words = start_line.split(|byte| matches!(*byte, b' ' | b'\t'));
-            let method = words.next().filter(|word| !word.is_empty()).ok_or((
-                ParseErrorKind::Header,
-                b"invalid HTTP request line".as_slice(),
-            ))?;
-            let url = words.next().filter(|word| !word.is_empty()).ok_or((
-                ParseErrorKind::Header,
-                b"invalid HTTP request line".as_slice(),
-            ))?;
-            let version = match words.next() {
-                None => (0, 9),
-                Some(version) => parse_version(version).ok_or((
-                    ParseErrorKind::Header,
-                    b"invalid HTTP request version".as_slice(),
-                ))?,
-            };
-            if words.next().is_some() || !accepts_method(self.exact_methods, method) {
-                self.current_message = Some(message);
-                return Err((ParseErrorKind::Header, b"invalid HTTP request line"));
-            }
-            let method = if self.exact_methods {
-                Method::from_exact_token(method).ok_or((
-                    ParseErrorKind::Header,
-                    b"invalid HTTP request method".as_slice(),
-                ))?
-            } else {
-                match HttpMethod::from_bytes(method) {
-                    Some(method) => Method::from(method),
-                    None => {
-                        #[cfg(test)]
-                        count_work(&self.head_work.method_copies, 1);
-                        Method::from_name(String::from_utf8_lossy(method).into_owned())
-                    }
-                }
-            };
-            message.set_method(method).map_err(|_| {
-                (
-                    ParseErrorKind::Header,
-                    b"invalid HTTP request method".as_slice(),
-                )
-            })?;
-            let parsed = message.set_url(url, self.strict_validation).map_err(|_| {
-                (
-                    ParseErrorKind::Header,
-                    b"invalid HTTP request URL".as_slice(),
-                )
-            })?;
-            if self.strict_validation && !parsed.valid() {
-                self.current_message = Some(HttpMessage::new());
-                return Err((ParseErrorKind::Header, b"invalid HTTP request URL"));
-            }
-            if parsed.has_host() {
-                inferred_host = Some(parsed.host_and_port());
-            }
-            (version, false)
-        } else {
-            let mut words = start_line.splitn(3, |byte| *byte == b' ');
-            let version = parse_version(words.next().unwrap_or_default()).ok_or((
-                ParseErrorKind::Header,
-                b"invalid HTTP response version".as_slice(),
-            ))?;
-            let status = parse_decimal_u64(words.next().unwrap_or_default())
-                .filter(|status| *status <= 999)
-                .ok_or((
-                    ParseErrorKind::Header,
-                    b"invalid HTTP response status".as_slice(),
-                ))? as u16;
-            message
-                .set_status_code(status)
-                .map_err(|_| (ParseErrorKind::Header, b"invalid HTTP response".as_slice()))?;
-            message
-                .set_status_message(words.next().unwrap_or_default())
-                .map_err(|_| (ParseErrorKind::Header, b"invalid HTTP response".as_slice()))?;
-            (version, status / 100 == 1)
-        };
-        message.set_http_version(version.0, version.1);
-
-        let mut previous: Option<(&[u8], Cow<'_, [u8]>)> = None;
-        for raw_line in lines {
-            let line = trim_trailing_cr(raw_line);
-            if line.is_empty() {
-                break;
-            }
-            if matches!(line.first(), Some(b' ' | b'\t')) {
-                let Some((_, value)) = previous.as_mut() else {
-                    self.current_message = Some(message);
-                    return Err((ParseErrorKind::Header, b"invalid folded header"));
-                };
-                let value = value.to_mut();
-                value.push(b' ');
-                value.extend_from_slice(trim_http_whitespace(line));
-                continue;
-            }
-            if let Some((name, value)) = previous.take() {
-                self.add_validated_header(&mut message, name, &value)?;
-            }
-            let Some((colon, valid_name)) = header_name_end(line) else {
-                self.current_message = Some(message);
-                return Err((ParseErrorKind::Header, b"invalid HTTP header"));
-            };
-            if !valid_name {
-                self.current_message = Some(message);
-                return Err((ParseErrorKind::Header, b"invalid HTTP header name"));
-            }
-            previous = Some((
-                &line[..colon],
-                Cow::Borrowed(trim_http_whitespace(&line[colon + 1..])),
-            ));
-        }
-        if let Some((name, value)) = previous {
-            self.add_validated_header(&mut message, name, &value)?;
-        }
-
-        let mut first: Option<&[u8]> = None;
-        let mut valid = true;
-        if message.headers().exists(HttpHeaderCode::ContentLength) {
-            for (code, _, value) in message.headers().iter() {
-                if code != HttpHeaderCode::ContentLength {
-                    continue;
-                }
-                if first.is_some_and(|existing| existing != value) {
-                    valid = false;
-                    break;
-                }
-                first = Some(value);
-            }
-        }
-        if !valid {
-            self.current_message = Some(message);
-            return Err((
-                ParseErrorKind::Header,
-                b"conflicting Content-Length headers",
-            ));
-        }
-        let content_length = first
-            .map(|value| {
-                parse_decimal_u64(value)
-                    .ok_or((ParseErrorKind::Header, b"invalid Content-Length".as_slice()))
-            })
-            .transpose()?;
-        let mut chunked = false;
-        let mut valid_transfer_encoding = true;
-        message
-            .headers()
-            .for_each_value(HttpHeaderCode::TransferEncoding, |value| {
-                if value.eq_ignore_ascii_case(b"chunked") {
-                    chunked = true;
-                    false
-                } else {
-                    valid_transfer_encoding = false;
-                    true
-                }
-            });
-        if !valid_transfer_encoding || (chunked && content_length.is_some()) {
-            self.current_message = Some(message);
-            return Err((ParseErrorKind::Header, b"invalid Transfer-Encoding"));
-        }
-        message.set_chunked(chunked);
-        // As frozen `onHeadersComplete`: after the last wire header and the
-        // Content-Length and Transfer-Encoding checks, replacing every wire Host.
-        if let Some(host) = inferred_host {
-            message.headers_mut().set(HttpHeaderCode::Host, host);
-        }
-
-        let status = if self.direction.is_upstream() {
-            message.status_code().unwrap_or_default()
-        } else {
-            0
-        };
-        // `DIV-030`: under the option a downstream CONNECT is an ordinary request, with no
-        // tunnel and no keep-alive change.
-        let ordinary = self.downstream_upgrade_as_ordinary && self.direction.is_downstream();
-        if ordinary {
-            self.last_ordinary_request = self.ingress_stream;
-        }
-        self.connect_request = if self.direction.is_downstream() {
-            !ordinary && message.method().ok().flatten() == Some(HttpMethod::Connect)
-        } else {
-            self.connect_request
-        };
-        self.head_request = if self.direction.is_downstream() {
-            message.method().ok().flatten() == Some(HttpMethod::Head)
-        } else {
-            self.head_request
-        };
-        if self.direction.is_downstream() {
-            self.may_chunk_egress = version.0 == 1 && version.1 >= 1;
-        }
-
-        let upgrade = message
-            .headers()
-            .get_single_or_empty(HttpHeaderCode::Upgrade);
-        #[cfg(test)]
-        count_work(
-            &self.head_work.upgrade_copies,
-            usize::from(
-                !upgrade.is_empty()
-                    && upgrade.as_ptr()
-                        != message
-                            .headers()
-                            .get_single_or_empty(HttpHeaderCode::Upgrade)
-                            .as_ptr(),
-            ),
-        );
-        // `DIV-031`: a response to a request an upstream codec sent under the option is read as
-        // an ordinary response.
-        let ordinary_response = self.direction.is_upstream() && self.ordinary_request_sent;
-        // `DIV-030`, `DIV-031`: so is its `Upgrade` header an ordinary header.
-        let websocket =
-            !(ordinary || ordinary_response) && upgrade.eq_ignore_ascii_case(b"websocket");
-        self.keepalive &= ordinary || ordinary_response || upgrade.is_empty();
-        self.keepalive &= !self.connect_request;
-        if websocket {
-            message.set_ingress_websocket_upgrade();
-            if self.direction.is_upstream() {
-                let accept = message
-                    .headers()
-                    .get_single_or_empty(HttpHeaderCode::SecWebSocketAccept);
-                if accept != self.websocket_accept_key.as_slice() {
-                    self.current_message = Some(message);
-                    return Err((ParseErrorKind::Header, b"invalid websocket accept key"));
-                }
-            } else {
-                if !self.websocket_accept_key.is_empty() {
-                    self.current_message = Some(message);
-                    return Err((ParseErrorKind::Header, b"duplicate websocket upgrade"));
-                }
-                let key = message
-                    .headers()
-                    .get_single_or_empty(HttpHeaderCode::SecWebSocketKey);
-                self.websocket_accept_key = websocket_accept(key);
-            }
-        }
-
-        if self.direction.is_upstream() {
-            if self.connect_request && (200..300).contains(&status) {
-                self.ingress_upgrade = true;
-            } else if status == 101 {
-                // `DIV-031`: the request was sent as ordinary, so nothing can switch.
-                if ordinary_response {
-                    self.current_message = Some(message);
-                    return Err((
-                        ParseErrorKind::Header,
-                        b"switching protocols refused for an ordinary request",
-                    ));
-                }
-                let server_upgrade = message
-                    .headers()
-                    .get_single_or_empty(HttpHeaderCode::Upgrade);
-                if !server_accepted_upgrade(&self.upgrade_header, server_upgrade) {
-                    self.current_message = Some(message);
-                    return Err((ParseErrorKind::Header, b"upgrade protocol mismatch"));
-                }
-                self.ingress_upgrade = true;
-                self.egress_upgrade = true;
-            }
-            if status != 100 {
-                self.upgrade_header.clear();
-            }
-        } else if self.connect_request {
-            self.ingress_upgrade = true;
-        }
-        message.set_upgraded(self.ingress_upgrade);
-
-        let message_keepalive = message.compute_keepalive();
-        message.set_wants_keepalive(message_keepalive);
-        self.keepalive &= message_keepalive;
-        if self.direction.is_downstream() {
-            self.keepalive_requested = if message_keepalive
-                && version == (1, 0)
-                && matches!(
-                    self.keepalive_requested,
-                    KeepaliveRequested::Unset | KeepaliveRequested::Enabled
-                ) {
-                KeepaliveRequested::Enabled
-            } else {
-                KeepaliveRequested::Disabled
-            };
-        }
-        if self.user_agent.is_empty() {
-            self.user_agent = message
-                .headers()
-                .get_single_or_empty(HttpHeaderCode::UserAgent)
-                .to_vec();
-            #[cfg(test)]
-            count_work(
-                &self.head_work.user_agent_copies,
-                usize::from(!self.user_agent.is_empty()),
-            );
-        }
-        message.set_ingress_header_size(HttpHeaderSize {
-            compressed: u32::try_from(raw.len()).unwrap_or(u32::MAX),
-            uncompressed: u32::try_from(raw.len()).unwrap_or(u32::MAX),
-            compressed_block: 0,
-        });
-
-        self.informational_response = informational;
-        let ignore_body = self.direction.is_upstream()
-            && (self.expect_no_response_body
-                || rfc2616::response_body_must_be_empty(u32::from(status)));
-        let body = if self.ingress_upgrade || ignore_body {
-            IngressBody::None
-        } else if chunked {
-            IngressBody::Chunked
-        } else if let Some(length) = content_length {
-            if length == 0 {
-                IngressBody::None
-            } else {
-                IngressBody::Fixed(length)
-            }
-        } else if self.direction.is_upstream() {
-            IngressBody::UntilEof
-        } else {
-            IngressBody::None
-        };
-        Ok(ParsedHead {
-            message: Box::new(message),
-            body,
-            informational,
-            upgrade: self.ingress_upgrade,
-        })
-    }
-
-    fn add_validated_header(
-        &mut self,
-        message: &mut HttpMessage,
-        name: &[u8],
-        value: &[u8],
-    ) -> Result<(), (ParseErrorKind, &'static [u8])> {
-        if !valid_header_value(value, self.strict_validation) {
-            self.current_message = Some(message.clone());
-            return Err((
-                ParseErrorKind::HeaderContent,
-                b"invalid HTTP header content",
-            ));
-        }
-        message.headers_mut().add(name, value);
-        Ok(())
-    }
-
-    fn install_parsed_head(
-        &mut self,
-        parsed: ParsedHead,
-        callback: &mut (impl IngressDelivery + ?Sized),
-        callback_egress: &mut BufQueue,
-        result: &mut CodecIngressResult,
-    ) {
-        let stream = self.ingress_stream;
-        self.informational_response = parsed.informational;
-        self.dispatch(
-            callback,
-            callback_egress,
-            CodecEvent::HeadersComplete {
-                stream,
-                message: parsed.message,
-            },
-            result,
-        );
-        self.state = match parsed.body {
-            IngressBody::None => ParseState::MessageComplete(parsed.upgrade),
-            IngressBody::Fixed(length) => ParseState::FixedBody(length),
-            IngressBody::Chunked => ParseState::ChunkSize(ChunkSizeLine::default()),
-            IngressBody::UntilEof => ParseState::UntilEof,
-        };
-        if parsed.body == IngressBody::None && !self.parser_paused {
-            self.complete_message(callback, callback_egress, result, parsed.upgrade);
-        }
     }
 
     fn emit_body(
@@ -1767,30 +617,6 @@ impl Http1xCodec {
             },
             result,
         );
-    }
-
-    fn parse_trailers(raw: &[u8], strict: bool) -> Result<HttpHeaders, ParseErrorKind> {
-        let mut trailers = HttpHeaders::new();
-        for raw_line in header_lines(raw) {
-            let line = trim_trailing_cr(raw_line);
-            if line.is_empty() {
-                continue;
-            }
-            let Some((colon, valid_name)) = header_name_end(line) else {
-                return Err(ParseErrorKind::Body);
-            };
-            let name = &line[..colon];
-            let value = trim_http_whitespace(&line[colon + 1..]);
-            if !valid_name || !valid_header_value(value, strict) {
-                return Err(if strict {
-                    ParseErrorKind::HeaderContent
-                } else {
-                    ParseErrorKind::Body
-                });
-            }
-            trailers.add(name, value);
-        }
-        Ok(trailers)
     }
 
     fn is_egress_busy(&self) -> bool {
@@ -2486,340 +1312,6 @@ impl Http1xCodec {
     ) -> CodecIngressResult {
         self.parse_ingress(input, callback, callback_egress)
     }
-
-    #[inline]
-    fn parse_ingress(
-        &mut self,
-        input: &BufQueue,
-        callback: &mut (impl IngressDelivery + ?Sized),
-        callback_egress: &mut BufQueue,
-    ) -> CodecIngressResult {
-        let mut parse_segment = |input: &Bytes| {
-            let mut result = CodecIngressResult::new(0);
-            if self.parser_error {
-                return result;
-            }
-            if self.ingress_upgrade_complete {
-                if !input.is_empty() {
-                    result.consumed = input.len();
-                    self.state = ParseState::Upgraded;
-                    self.emit_body(input.clone(), callback, callback_egress, &mut result);
-                }
-                return result;
-            }
-            if self.parser_paused {
-                return result;
-            }
-            if input.is_empty() {
-                if let ParseState::MessageComplete(upgraded) = &self.state {
-                    let upgraded = *upgraded;
-                    self.complete_message(callback, callback_egress, &mut result, upgraded);
-                }
-                return result;
-            }
-            if self.direction.is_upstream()
-                && self.expect_http_09_response
-                && matches!(&self.state, ParseState::Idle)
-            {
-                self.begin_http_09_response(callback, callback_egress, &mut result);
-                if self.parser_paused {
-                    return result;
-                }
-            }
-
-            while result.consumed < input.len() && !self.parser_paused && !self.parser_error {
-                let state = std::mem::take(&mut self.state);
-                match state {
-                    ParseState::Idle => {
-                        let Some(skipped) = input[result.consumed..]
-                            .iter()
-                            .position(|byte| !matches!(*byte, b'\r' | b'\n'))
-                        else {
-                            result.consumed = input.len();
-                            continue;
-                        };
-                        let head_start = result.consumed + skipped;
-                        let byte = input[head_start];
-                        result.consumed = head_start + 1;
-                        self.begin_message(callback, callback_egress, &mut result);
-                        if !self.valid_initial_prefix(&[byte]) {
-                            self.state = ParseState::Head(vec![byte]);
-                            self.fail(
-                                ParseErrorKind::Header,
-                                b"invalid HTTP start line",
-                                callback,
-                                callback_egress,
-                                &mut result,
-                            );
-                        } else if self.parser_paused {
-                            self.state = ParseState::Head(vec![byte]);
-                        } else {
-                            self.ingress_head(
-                                Vec::new(),
-                                input,
-                                head_start,
-                                callback,
-                                callback_egress,
-                                &mut result,
-                            );
-                        }
-                    }
-                    ParseState::Head(head) => {
-                        let head_start = result.consumed;
-                        self.ingress_head(
-                            head,
-                            input,
-                            head_start,
-                            callback,
-                            callback_egress,
-                            &mut result,
-                        );
-                    }
-                    ParseState::FixedBody(mut remaining) => {
-                        let available = input.len() - result.consumed;
-                        let amount =
-                            usize::try_from(remaining.min(available as u64)).unwrap_or(available);
-                        let start = result.consumed;
-                        result.consumed += amount;
-                        remaining -= amount as u64;
-                        self.state = if remaining == 0 {
-                            ParseState::MessageComplete(self.ingress_upgrade)
-                        } else {
-                            ParseState::FixedBody(remaining)
-                        };
-                        self.emit_body(
-                            input.slice(start..start + amount),
-                            callback,
-                            callback_egress,
-                            &mut result,
-                        );
-                        if remaining == 0 && !self.parser_paused {
-                            self.complete_message(
-                                callback,
-                                callback_egress,
-                                &mut result,
-                                self.ingress_upgrade,
-                            );
-                        }
-                    }
-                    ParseState::ChunkSize(mut line) => {
-                        let (read, end) = line.read(&input[result.consumed..]);
-                        result.consumed += read;
-                        let Some(end) = end else {
-                            self.state = ParseState::ChunkSize(line);
-                            continue;
-                        };
-                        if end == ChunkSizeLineEnd::TooLarge {
-                            self.state = ParseState::ChunkSize(line);
-                            self.fail(
-                                ParseErrorKind::Body,
-                                b"HTTP chunk header is too large",
-                                callback,
-                                callback_egress,
-                                &mut result,
-                            );
-                            continue;
-                        }
-                        if line.stray_cr {
-                            self.state = ParseState::ChunkSize(line);
-                            self.fail(
-                                ParseErrorKind::Body,
-                                b"invalid HTTP chunk delimiter",
-                                callback,
-                                callback_egress,
-                                &mut result,
-                            );
-                            continue;
-                        }
-                        let Some(size) = line.size.value() else {
-                            self.state = ParseState::ChunkSize(line);
-                            self.fail(
-                                ParseErrorKind::Body,
-                                b"invalid HTTP chunk length",
-                                callback,
-                                callback_egress,
-                                &mut result,
-                            );
-                            continue;
-                        };
-                        if size > i64::MAX as u64 {
-                            self.state = ParseState::ChunkSize(line);
-                            self.fail(
-                                ParseErrorKind::Body,
-                                b"HTTP chunk length overflow",
-                                callback,
-                                callback_egress,
-                                &mut result,
-                            );
-                        } else if size == 0 {
-                            self.state = ParseState::Trailers(Vec::new());
-                        } else {
-                            self.state = ParseState::ChunkBody(size);
-                            self.dispatch(
-                                callback,
-                                callback_egress,
-                                CodecEvent::ChunkHeader {
-                                    stream: self.ingress_stream,
-                                    length: size as usize,
-                                },
-                                &mut result,
-                            );
-                        }
-                    }
-                    ParseState::ChunkBody(mut remaining) => {
-                        let available = input.len() - result.consumed;
-                        let amount =
-                            usize::try_from(remaining.min(available as u64)).unwrap_or(available);
-                        let start = result.consumed;
-                        result.consumed += amount;
-                        remaining -= amount as u64;
-                        self.state = if remaining == 0 {
-                            ParseState::ChunkDelimiter(false)
-                        } else {
-                            ParseState::ChunkBody(remaining)
-                        };
-                        self.emit_body(
-                            input.slice(start..start + amount),
-                            callback,
-                            callback_egress,
-                            &mut result,
-                        );
-                    }
-                    ParseState::ChunkDelimiter(after_cr) => {
-                        #[cfg(test)]
-                        CHUNK_DELIMITER_TURNS.with(|turns| count_work(turns, 1));
-                        let mut byte = input[result.consumed];
-                        result.consumed += 1;
-                        if byte == b'\r' && !after_cr && input.get(result.consumed) == Some(&b'\n')
-                        {
-                            byte = b'\n';
-                            result.consumed += 1;
-                        }
-                        if byte == b'\n' {
-                            self.state = ParseState::ChunkSize(ChunkSizeLine::default());
-                            self.dispatch(
-                                callback,
-                                callback_egress,
-                                CodecEvent::ChunkComplete {
-                                    stream: self.ingress_stream,
-                                },
-                                &mut result,
-                            );
-                        } else if byte == b'\r' && !after_cr {
-                            self.state = ParseState::ChunkDelimiter(true);
-                        } else {
-                            self.state = ParseState::ChunkDelimiter(after_cr);
-                            self.fail(
-                                ParseErrorKind::Body,
-                                b"invalid HTTP chunk terminator",
-                                callback,
-                                callback_egress,
-                                &mut result,
-                            );
-                        }
-                    }
-                    ParseState::Trailers(mut trailers) => {
-                        let byte = input[result.consumed];
-                        result.consumed += 1;
-                        trailers.push(byte);
-                        if trailers.len() > MAX_HEADER_BYTES {
-                            self.state = ParseState::Trailers(trailers);
-                            self.fail(
-                                ParseErrorKind::Body,
-                                b"HTTP trailers are too large",
-                                callback,
-                                callback_egress,
-                                &mut result,
-                            );
-                        } else if Self::headers_terminated(&trailers)
-                            || trailers == b"\r\n"
-                            || trailers == b"\n"
-                        {
-                            match Self::parse_trailers(&trailers, self.strict_validation) {
-                                Ok(parsed) => {
-                                    self.state = ParseState::MessageComplete(self.ingress_upgrade);
-                                    if !parsed.is_empty() {
-                                        self.dispatch(
-                                            callback,
-                                            callback_egress,
-                                            CodecEvent::TrailersComplete {
-                                                stream: self.ingress_stream,
-                                                trailers: Box::new(parsed),
-                                            },
-                                            &mut result,
-                                        );
-                                    }
-                                    if !self.parser_paused {
-                                        self.complete_message(
-                                            callback,
-                                            callback_egress,
-                                            &mut result,
-                                            self.ingress_upgrade,
-                                        );
-                                    }
-                                }
-                                Err(kind) => {
-                                    self.state = ParseState::Trailers(trailers);
-                                    self.fail(
-                                        kind,
-                                        b"invalid HTTP trailers",
-                                        callback,
-                                        callback_egress,
-                                        &mut result,
-                                    );
-                                }
-                            }
-                        } else {
-                            self.state = ParseState::Trailers(trailers);
-                        }
-                    }
-                    ParseState::UntilEof => {
-                        let start = result.consumed;
-                        result.consumed = input.len();
-                        self.state = ParseState::UntilEof;
-                        self.emit_body(
-                            input.slice(start..),
-                            callback,
-                            callback_egress,
-                            &mut result,
-                        );
-                    }
-                    ParseState::Upgraded => {
-                        let start = result.consumed;
-                        result.consumed = input.len();
-                        self.state = ParseState::Upgraded;
-                        self.emit_body(
-                            input.slice(start..),
-                            callback,
-                            callback_egress,
-                            &mut result,
-                        );
-                    }
-                    ParseState::MessageComplete(upgraded) => {
-                        self.state = ParseState::Idle;
-                        self.complete_message(callback, callback_egress, &mut result, upgraded);
-                    }
-                }
-            }
-            result
-        };
-
-        if input.is_empty() {
-            return parse_segment(&Bytes::new());
-        }
-
-        let mut result = CodecIngressResult::default();
-        for segment in input.segments() {
-            let segment_result = parse_segment(segment);
-            let consumed = segment_result.consumed;
-            result.consumed += consumed;
-            result.egress_results.extend(segment_result.egress_results);
-            if consumed != segment.len() {
-                break;
-            }
-        }
-        result
-    }
 }
 
 impl HttpCodec for Http1xCodec {
@@ -2852,6 +1344,7 @@ impl HttpCodec for Http1xCodec {
     fn set_parser_paused(&mut self, paused: bool) {
         if !self.parser_error {
             self.parser_paused = paused;
+            self.upgrade_pause = false;
         }
     }
 
@@ -2873,63 +1366,15 @@ impl HttpCodec for Http1xCodec {
         callback: &mut dyn HttpCodecCallback,
         callback_egress: &mut BufQueue,
     ) -> CodecCallbackResult {
-        let mut result = CodecCallbackResult::default();
-        if self.parser_error {
-            return result;
+        if self.phase == IngressPhase::Upgraded && self.ingress_upgrade {
+            self.ingress_upgrade_complete = true;
         }
-        if self.parser_paused && !self.ingress_upgrade_complete {
-            return result;
+        if self.parser_error
+            || (self.parser_paused && !(self.ingress_upgrade_complete && self.upgrade_pause))
+        {
+            return CodecCallbackResult::default();
         }
-        let state = std::mem::take(&mut self.state);
-        match state {
-            ParseState::Idle => {}
-            ParseState::Upgraded => {
-                self.dispatch_eof(
-                    callback,
-                    callback_egress,
-                    CodecEvent::MessageComplete {
-                        stream: self.ingress_stream,
-                        upgraded: false,
-                    },
-                    &mut result,
-                );
-                self.state = ParseState::Upgraded;
-            }
-            ParseState::UntilEof => {
-                self.complete_message_eof(callback, callback_egress, &mut result);
-            }
-            ParseState::MessageComplete(upgraded) => {
-                if self.direction.is_upstream() && self.informational_response {
-                    self.response_pending = true;
-                    self.state = ParseState::Idle;
-                } else {
-                    if self.direction.is_downstream() {
-                        self.request_pending = false;
-                    } else {
-                        self.response_pending = false;
-                    }
-                    self.dispatch_eof(
-                        callback,
-                        callback_egress,
-                        CodecEvent::MessageComplete {
-                            stream: self.ingress_stream,
-                            upgraded,
-                        },
-                        &mut result,
-                    );
-                    self.state = if upgraded {
-                        ParseState::Upgraded
-                    } else {
-                        ParseState::Idle
-                    };
-                }
-            }
-            unfinished => {
-                self.state = unfinished;
-                self.fail_eof(callback, callback_egress, &mut result);
-            }
-        }
-        result
+        self.finish_parser(callback, callback_egress)
     }
 
     fn is_reusable(&self) -> bool {
@@ -3155,41 +1600,6 @@ pub fn server_accepted_upgrade(client: &[u8], server: &[u8]) -> bool {
         })
 }
 
-fn is_frozen_http_method(method: &[u8]) -> bool {
-    FROZEN_HTTP_METHODS.contains(&method)
-}
-
-/// Whether a downstream request line may carry `method`: with `exact_methods`
-/// any token, otherwise a frozen method.
-fn accepts_method(exact_methods: bool, method: &[u8]) -> bool {
-    if exact_methods {
-        !method.is_empty() && method.iter().copied().all(is_tchar)
-    } else {
-        is_frozen_http_method(method)
-    }
-}
-
-fn parse_version(value: &[u8]) -> Option<(u8, u8)> {
-    const HTTP_1_1: u64 = u64::from_le_bytes(*b"HTTP/1.1");
-    const HTTP_1_0: u64 = u64::from_le_bytes(*b"HTTP/1.0");
-    if let Ok(word) = <[u8; 8]>::try_from(value) {
-        match u64::from_le_bytes(word) {
-            HTTP_1_1 => return Some((1, 1)),
-            HTTP_1_0 => return Some((1, 0)),
-            _ => {}
-        }
-    }
-    let value = value.strip_prefix(b"HTTP/")?;
-    let separator = value.iter().position(|byte| *byte == b'.')?;
-    let (major, minor_with_separator) = value.split_at(separator);
-    let minor = minor_with_separator.get(1..)?;
-    #[cfg(test)]
-    count_helper_work(|work| &work.version_number_parses, 2);
-    let major = parse_decimal_u64(major)?;
-    let minor = parse_decimal_u64(minor)?;
-    Some((u8::try_from(major).ok()?, u8::try_from(minor).ok()?))
-}
-
 fn parse_decimal_u64(value: &[u8]) -> Option<u64> {
     if value.is_empty() {
         return None;
@@ -3199,167 +1609,6 @@ fn parse_decimal_u64(value: &[u8]) -> Option<u64> {
             byte.checked_sub(b'0').filter(|digit| *digit <= 9)?,
         ))
     })
-}
-
-fn hex_digit(byte: u8) -> Option<u64> {
-    match byte {
-        b'0'..=b'9' => Some(u64::from(byte - b'0')),
-        b'a'..=b'f' => Some(u64::from(byte - b'a' + 10)),
-        b'A'..=b'F' => Some(u64::from(byte - b'A' + 10)),
-        _ => None,
-    }
-}
-
-fn trim_trailing_cr(value: &[u8]) -> &[u8] {
-    value.strip_suffix(b"\r").unwrap_or(value)
-}
-
-/// Splits a header block at each LF except an escaped newline, an LF after
-/// backslash, CR, backslash, which stays in its line. It yields at least one
-/// line, and an empty line after a final LF.
-fn header_lines(value: &[u8]) -> HeaderLines<'_> {
-    HeaderLines::with_known(
-        value,
-        KnownLineFeeds {
-            positions: &[],
-            searched_to: 0,
-        },
-    )
-}
-
-struct HeaderLines<'a> {
-    value: &'a [u8],
-    start: usize,
-    finished: bool,
-    /// LF positions not yet split at or skipped, which hold every LF from
-    /// `start` to `searched_to`.
-    known: &'a [u32],
-    searched_to: usize,
-}
-
-impl<'a> HeaderLines<'a> {
-    /// The lines of `value`, whose LFs before `known.searched_to` are
-    /// `known.positions`.
-    fn with_known(value: &'a [u8], known: KnownLineFeeds<'a>) -> Self {
-        Self {
-            value,
-            start: 0,
-            finished: false,
-            known: known.positions,
-            searched_to: known.searched_to,
-        }
-    }
-
-    /// Whether the LF at `index` ends a line rather than an escaped newline.
-    #[inline]
-    fn ends_line(&self, index: usize) -> bool {
-        !(index >= 3
-            && self.value[index - 1] == b'\\'
-            && self.value[index - 2] == b'\r'
-            && self.value[index - 3] == b'\\')
-    }
-
-    /// The offset of the first LF in `value[search..]`.
-    #[inline]
-    fn find_lf_from(&self, search: usize) -> Option<usize> {
-        #[cfg(test)]
-        count_helper_work(|work| &work.line_search_bytes, self.value.len() - search);
-        word_scan::find_lf(&self.value[search..])
-    }
-
-    /// The next line, past the known LFs.
-    fn search(&mut self) -> Option<&'a [u8]> {
-        let value = self.value;
-        let mut search = self.start.max(self.searched_to);
-        while let Some(offset) = self.find_lf_from(search) {
-            let index = search + offset;
-            search = index + 1;
-            if self.ends_line(index) {
-                let line = &value[self.start..index];
-                self.start = search;
-                return Some(line);
-            }
-        }
-        self.finished = true;
-        Some(&value[self.start..])
-    }
-}
-
-impl<'a> Iterator for HeaderLines<'a> {
-    type Item = &'a [u8];
-
-    #[inline]
-    fn next(&mut self) -> Option<&'a [u8]> {
-        if self.finished {
-            return None;
-        }
-        while let Some((&index, known)) = self.known.split_first() {
-            self.known = known;
-            let index = index as usize;
-            if self.ends_line(index) {
-                let line = &self.value[self.start..index];
-                self.start = index + 1;
-                return Some(line);
-            }
-        }
-        self.search()
-    }
-}
-
-/// Whether the request line that ends a head at its first LF, `first` followed
-/// by `second`, is HTTP/0.9. Split at each SP and TAB after one trailing CR is
-/// trimmed, it holds two words, the first nonempty, or three, the last
-/// `HTTP/0.9`. A last word equal to `HTTP/0.9` holds no SP or TAB, so the
-/// split stops at the second delimiter.
-fn request_line_is_http_09(first: &[u8], second: &[u8]) -> bool {
-    if first.is_empty() {
-        return line_is_http_09(second);
-    }
-    let byte = |index: usize| {
-        if index < first.len() {
-            first[index]
-        } else {
-            second[index - first.len()]
-        }
-    };
-    let mut length = first.len() + second.len();
-    if length > 0 && byte(length - 1) == b'\r' {
-        length -= 1;
-    }
-    let mut delimiters = (0..length).filter(|index| {
-        #[cfg(test)]
-        count_helper_work(|work| &work.http_09_delimiter_reads, 1);
-        matches!(byte(*index), b' ' | b'\t')
-    });
-    let Some(method_end) = delimiters.next() else {
-        return false;
-    };
-    let Some(url_end) = delimiters.next() else {
-        return method_end > 0;
-    };
-    let version = url_end + 1..length;
-    version.len() == b"HTTP/0.9".len()
-        && version
-            .zip(b"HTTP/0.9")
-            .all(|(index, expected)| byte(index) == *expected)
-}
-
-/// [`request_line_is_http_09`] of a request line in one slice.
-fn line_is_http_09(line: &[u8]) -> bool {
-    let line = trim_trailing_cr(line);
-    let delimiter = |byte: &u8| {
-        #[cfg(test)]
-        count_helper_work(|work| &work.http_09_delimiter_reads, 1);
-        matches!(*byte, b' ' | b'\t')
-    };
-    let Some(method_end) = line.iter().position(delimiter) else {
-        return false;
-    };
-    let words = &line[method_end + 1..];
-    let Some(url_length) = words.iter().position(delimiter) else {
-        return method_end > 0;
-    };
-    words[url_length + 1..] == *b"HTTP/0.9"
 }
 
 fn trim_http_whitespace(value: &[u8]) -> &[u8] {
@@ -3374,100 +1623,15 @@ fn trim_http_whitespace(value: &[u8]) -> &[u8] {
     &value[start..end]
 }
 
-/// Finds the colon that ends a header line's name, and whether the name before
-/// it is a nonempty token. The search continues past a byte that is not a
-/// token byte, so a line with no colon is told apart from an invalid name.
-#[inline]
-fn header_name_end(line: &[u8]) -> Option<(usize, bool)> {
-    let token_end = line
-        .iter()
-        .position(|byte| !header_name_byte(*byte))
-        .unwrap_or(line.len());
-    if line.get(token_end) == Some(&b':') {
-        return Some((token_end, token_end != 0));
-    }
-    let colon = token_end + line[token_end..].iter().position(|byte| *byte == b':')?;
-    Some((colon, false))
-}
-
-static HEADER_NAME_BYTE: [bool; 256] = {
-    let mut table = [false; 256];
-    let mut byte = 0;
-    while byte < table.len() {
-        table[byte] = is_header_name_byte(byte as u8);
-        byte += 1;
-    }
-    table
-};
-
-#[inline]
-fn header_name_byte(byte: u8) -> bool {
-    HEADER_NAME_BYTE[usize::from(byte)]
-}
-
-const fn is_header_name_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric()
-        || matches!(
-            byte,
-            b'!' | b'#'
-                | b'$'
-                | b'%'
-                | b'&'
-                | b'\''
-                | b'*'
-                | b'+'
-                | b'-'
-                | b'.'
-                | b'^'
-                | b'_'
-                | b'`'
-                | b'|'
-                | b'~'
-        )
-}
-
-/// Whether `value` passes `valid_header_value_exact`. A value of only visible
-/// ASCII and spaces passes in both modes without the per-byte check.
-#[inline]
-fn valid_header_value(value: &[u8], strict: bool) -> bool {
-    let visible = word_scan::all_words(value, |word| {
-        (word_scan::has_less(word, b' ')
-            | (word & word_scan::HIGH)
-            | word_scan::has_zero(word ^ word_scan::repeat(0x7f)))
-            == 0
-    });
-    visible || valid_header_value_exact(value, strict)
-}
-
 /// Whether `value` holds a CR or an LF.
 #[inline]
 fn holds_cr_or_lf(value: &[u8]) -> bool {
     !word_scan::all_words(value, |word| {
-        #[cfg(test)]
-        count_helper_work(|work| &work.egress_cr_lf_loads, 1);
         // CR and LF are below 0x0e: most words hold no such byte.
         word_scan::has_less(word, 0x0e) == 0
             || (word_scan::has_zero(word ^ word_scan::repeat(b'\r'))
                 | word_scan::has_zero(word ^ word_scan::repeat(b'\n')))
                 == 0
-    })
-}
-
-fn valid_header_value_exact(value: &[u8], strict: bool) -> bool {
-    #[cfg(test)]
-    count_helper_work(|work| &work.value_byte_checks, value.len());
-    value.iter().enumerate().all(|(index, byte)| {
-        if *byte >= 0x80 {
-            return !strict;
-        }
-        match *byte {
-            b'\t' | b' '..=b'~' => true,
-            b'\r' if !strict => {
-                index != 0 && value[index - 1] == b'\\' && value.get(index + 1) == Some(&b'\\')
-            }
-            b'\n' if !strict => index != 0 && value[index - 1] == b'\\',
-            _ => false,
-        }
     })
 }
 
@@ -3598,7 +1762,6 @@ fn header_size(length: usize) -> HttpHeaderSize {
 mod word_scan {
     pub(super) const HIGH: u64 = u64::from_ne_bytes([0x80; 8]);
     const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
-    const LOW: u64 = u64::from_ne_bytes([0x7f; 8]);
 
     pub(super) const fn repeat(byte: u8) -> u64 {
         ONES * byte as u64
@@ -3612,26 +1775,6 @@ mod word_scan {
     /// Marks the bytes of `word` below `bound`, which is at most 0x80.
     pub(super) const fn has_less(word: u64, bound: u8) -> u64 {
         word.wrapping_sub(repeat(bound)) & !word & HIGH
-    }
-
-    /// The index of the first byte of `bytes` whose word `class` marks at its
-    /// lowest mark, or, past the last whole word, that `matches` accepts.
-    #[inline]
-    fn position(
-        bytes: &[u8],
-        class: impl Fn(u64) -> u64,
-        matches: impl Fn(u8) -> bool,
-    ) -> Option<usize> {
-        let (words, tail) = bytes.as_chunks::<8>();
-        for (index, word) in words.iter().enumerate() {
-            let marks = class(u64::from_le_bytes(*word));
-            if marks != 0 {
-                return Some(index * 8 + (marks.trailing_zeros() / 8) as usize);
-            }
-        }
-        tail.iter()
-            .position(|byte| matches(*byte))
-            .map(|offset| words.len() * 8 + offset)
     }
 
     /// Whether `test` holds for each of a set of words that covers every
@@ -3662,37 +1805,6 @@ mod word_scan {
             }
         }
     }
-
-    /// The index of the first LF in `bytes`.
-    #[inline]
-    pub(super) fn find_lf(bytes: &[u8]) -> Option<usize> {
-        position(
-            bytes,
-            |word| has_zero(word ^ repeat(b'\n')),
-            |byte| byte == b'\n',
-        )
-    }
-
-    /// The index of the first byte below 0x20 in `bytes`.
-    #[inline]
-    pub(super) fn find_control(bytes: &[u8]) -> Option<usize> {
-        position(bytes, |word| has_less(word, b' '), |byte| byte < b' ')
-    }
-
-    /// The number of LFs in `bytes`. Each word's LFs are marked without a
-    /// borrow between bytes, so every mark is exact.
-    pub(super) fn count_lf(bytes: &[u8]) -> usize {
-        let (words, tail) = bytes.as_chunks::<8>();
-        let in_words: usize = words
-            .iter()
-            .map(|word| {
-                let word = u64::from_le_bytes(*word) ^ repeat(b'\n');
-                let marks = !(((word & LOW) + LOW) | word | LOW);
-                ((marks >> 7).wrapping_mul(ONES) >> 56) as usize
-            })
-            .sum();
-        in_words + tail.iter().filter(|byte| **byte == b'\n').count()
-    }
 }
 
 #[cfg(test)]
@@ -3700,13 +1812,5 @@ mod word_scan {
 mod codec_http1;
 
 #[cfg(test)]
-#[path = "../tests/head_scan.rs"]
-mod head_scan;
-
-#[cfg(test)]
 #[path = "../tests/generate_copies.rs"]
 mod generate_copies;
-
-#[cfg(test)]
-#[path = "../tests/head_equivalence.rs"]
-mod head_equivalence;
