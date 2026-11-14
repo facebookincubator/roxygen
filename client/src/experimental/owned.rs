@@ -10,7 +10,10 @@
 //! [`OwnedClientSession::wait_closed`] observes the run's outcome. Either closes admission at
 //! once, before the run observes it; the attachment's cancellation wins over quiescence and is
 //! observed until the run's cleanup completes, and a panic in the quiescence drain cancels the
-//! session and fails it `INTERNAL_ERROR`, as for a `ClientSession`. A reservation's submission
+//! session and fails it `INTERNAL_ERROR`, as for a `ClientSession`, and is counted in the worker's
+//! `WorkerPollStats` (`DIV-056`). On HTTP/2 a panic the driver contains, also counted there, fails
+//! only its request, drains the session, or ends the session with `Err(INTERNAL_ERROR)`, which
+//! `wait_closed` reports; the worker keeps serving. A reservation's submission
 //! resolves at the driver's commitment, or at the first response head, with the response's
 //! fresh [`HttpResponseSource`]; submissions and requests report `OwnedRequestProgressExt`
 //! progress (`DIV-035`).
@@ -100,6 +103,7 @@ use roxygen_core::stream_source::HttpResponseSource;
 use roxygen_runtime::cancellation::CancellationToken;
 use roxygen_runtime::cancellation::CancellationWakeRegistration;
 use roxygen_runtime::panic::discard_panic;
+use roxygen_runtime::worker::ContainedPanicScope;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_runtime::worker::WorkerHandle;
 use roxygen_runtime::worker::WorkerId;
@@ -893,6 +897,7 @@ fn start(
 ) -> Result<OwnedClientSession, HttpError> {
     let completion = SessionCompletion::default();
     let scope = RunScope {
+        worker: context.clone(),
         attachment: attachment.wake_registration(),
         quiescing: context.quiescing(),
         completed: SessionCompletionPublisher::new(&completion),
@@ -960,6 +965,7 @@ fn start(
 /// attachment's cancellation cancels the session, and worker quiescence
 /// closes its admission, so it closes once its exchanges retire.
 struct RunScope {
+    worker: WorkerContext,
     attachment: CancellationWakeRegistration,
     quiescing: WorkerQuiescing,
     completed: SessionCompletionPublisher,
@@ -1023,7 +1029,7 @@ impl RunScope {
         }
         if !self.draining && Pin::new(&mut self.quiescing).poll(context).is_ready() {
             self.draining = true;
-            if let Some(failure) = drain(upstream) {
+            if let Some(failure) = drain(&self.worker, upstream) {
                 self.fail_drain(failure);
             }
         }
@@ -1047,12 +1053,19 @@ impl RunScope {
 /// Closes admission for worker quiescence, as `ClientSessionOwner::stop` does:
 /// a failure, or a panic of a callback the close runs (a refused request's
 /// source cleanup), cancels the session, whose run then completes its I/O
-/// cleanup, and is returned.
-fn drain(upstream: &Upstream) -> Option<HttpError> {
+/// cleanup, and is returned. The panic is counted at connection scope on
+/// `worker` (`DIV-056`).
+fn drain(worker: &WorkerContext, upstream: &Upstream) -> Option<HttpError> {
     let failure = match catch_unwind(AssertUnwindSafe(|| upstream.close_when_idle())) {
         Ok(Ok(_)) => return None,
         Ok(Err(error)) => error,
         Err(payload) => {
+            worker.record_contained_panic(
+                ContainedPanicScope::Connection,
+                "session_drain",
+                None,
+                &*payload,
+            );
             discard_panic(payload);
             client_error(
                 HttpErrorCode::INTERNAL_ERROR,

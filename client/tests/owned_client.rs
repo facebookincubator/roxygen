@@ -53,6 +53,8 @@ use roxygen_runtime::managed::RuntimeConfig;
 use roxygen_runtime::managed::RuntimeHandle;
 use roxygen_runtime::managed::RuntimeOwner;
 use roxygen_runtime::worker::WorkerContext;
+use roxygen_runtime::worker::WorkerHandle;
+use roxygen_runtime::worker::WorkerPollStats;
 use roxygen_session::experimental::OwnedRequestProgressExt;
 use roxygen_session::experimental::PingProbeConfig;
 use roxygen_session::http2::stats::Http2SessionStats;
@@ -1910,6 +1912,17 @@ fn worker_quiescence_closes_admission_before_the_run_observes_it() {
     }
 }
 
+/// The contained panics `worker` counted since `start`, by scope: exchange,
+/// connection, driver (`DIV-056`).
+fn contained_panic_counts(worker: &WorkerHandle, start: &WorkerPollStats) -> (u64, u64, u64) {
+    let delta = worker.poll_stats().since(start);
+    (
+        delta.contained_exchange_panics,
+        delta.contained_connection_panics,
+        delta.contained_driver_panics,
+    )
+}
+
 /// A request body that panics when dropped, after requesting `cancel`'s
 /// cancellation when it has one.
 struct PanicOnDrop {
@@ -1972,15 +1985,18 @@ async fn queue_a_panicking_upload_then_quiesce(
 /// A body that panics as worker quiescence's drain refuses its queued request
 /// is contained as `ClientSession` contains a drain callback's panic: the
 /// session is cancelled, its run's I/O cleanup completes without a forced
-/// worker, and `wait_closed` fails `INTERNAL_ERROR`: (the exchange's status,
-/// the refused submission's error, `wait_closed`'s error and message,
-/// `is_finished`).
+/// worker, and `wait_closed` fails `INTERNAL_ERROR`. The run scope counts the
+/// panic at connection scope (`DIV-056`): (the exchange's status, the refused
+/// submission's error, `wait_closed`'s error and message, `is_finished`, the
+/// worker's contained panics by scope).
 #[test]
 fn a_panic_in_the_quiescence_drain_cancels_the_session_and_completes_its_cleanup() {
     for protocol in [CodecProtocol::Http11, CodecProtocol::Http2] {
         let origin = Origin::start(protocol);
         let address = origin.address;
         let observed = run_on_quiescing_worker(move |context, runtime| async move {
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
             let session = connect_owned(&context, address, protocol, untimed()).await;
             let status = exchange(&session, Exchange::Fixed).await.status;
             let refused = queue_a_panicking_upload_then_quiesce(&session, &runtime, None).await;
@@ -1989,7 +2005,13 @@ fn a_panic_in_the_quiescence_drain_cancels_the_session_and_completes_its_cleanup
                 .await
                 .err()
                 .map(|error| (error.code(), error.message().to_vec()));
-            (status, refused, closed, session.is_finished())
+            (
+                status,
+                refused,
+                closed,
+                session.is_finished(),
+                contained_panic_counts(&worker, &start),
+            )
         });
         assert_eq!(
             observed,
@@ -2000,7 +2022,8 @@ fn a_panic_in_the_quiescence_drain_cancels_the_session_and_completes_its_cleanup
                     HttpErrorCode::INTERNAL_ERROR,
                     b"session drain callback panicked".to_vec()
                 )),
-                true
+                true,
+                (0, 1, 0)
             ),
             "{protocol:?}"
         );
@@ -2173,6 +2196,232 @@ fn an_attachment_cancellation_during_the_run_s_final_poll_fails_wait_closed() {
     assert_eq!(
         observed,
         (Some(200), false, true, Some(HttpErrorCode::CORO_CANCELLED))
+    );
+}
+
+/// The request header whose HPACK encoding [`PanicsOnHeader`] panics on.
+#[cfg(panic = "unwind")]
+const PANIC_HEADER: &str = "x-panic";
+
+/// A header indexing strategy that panics when the owned HTTP/2 driver's
+/// encoder asks about [`PANIC_HEADER`], outside any narrower boundary than the
+/// driver's turn (`DIV-056`).
+#[cfg(panic = "unwind")]
+#[derive(Clone)]
+struct PanicsOnHeader;
+
+#[cfg(panic = "unwind")]
+impl HeaderIndexingStrategy for PanicsOnHeader {
+    fn index_header(&self, name: &HeaderName, _value: &[u8], _name_exists: bool) -> bool {
+        if name.as_bytes() == PANIC_HEADER.as_bytes() {
+            panic!("the header indexing strategy panics");
+        }
+        false
+    }
+
+    fn clone_box(&self) -> Box<dyn HeaderIndexingStrategy> {
+        Box::new(self.clone())
+    }
+}
+
+/// `DIV-056`: a panic in an owned HTTP/2 session's driver, outside
+/// any narrower boundary, ends that session alone. Its run returns
+/// `Err(INTERNAL_ERROR)` once its teardown has joined native I/O, the run
+/// scope publishes that to `wait_closed` without panicking, the panic is
+/// counted at driver scope, and the worker serves a second session and
+/// quiesces without forcing: (the first exchange's status, the panicking
+/// request's error, `wait_closed`'s error and message, `is_finished`, the
+/// worker's contained panics by scope, the second session's status).
+#[cfg(panic = "unwind")]
+#[test]
+fn owned_client_session_driver_panic_does_not_fail_the_worker() {
+    let origin = Origin::start(CodecProtocol::Http2);
+    let address = origin.address;
+    let observed = run_on_worker(move |context| async move {
+        let worker = context.handle().clone();
+        let start = worker.poll_stats();
+        let params = SessionParams {
+            header_indexing_strategy: Some(Rc::new(PanicsOnHeader)),
+            ..untimed()
+        };
+        let session = connect_owned(&context, address, CodecProtocol::Http2, params).await;
+        let status = exchange(&session, Exchange::Fixed).await.status;
+        let (mut head, body) = Exchange::Fixed.request().await;
+        head.headers_mut().headers_mut().add(PANIC_HEADER, "1");
+        let failed = reserve_owned(&session)
+            .await
+            .submit(head, body, CancellationToken::never())
+            .await
+            .err()
+            .map(|error| error.code());
+        let closed = session
+            .wait_closed()
+            .await
+            .err()
+            .map(|error| (error.code(), error.message().to_vec()));
+        let counts = contained_panic_counts(&worker, &start);
+        let next = connect_owned(&context, address, CodecProtocol::Http2, untimed()).await;
+        let served = exchange(&next, Exchange::Fixed).await.status;
+        close(&next).await;
+        (
+            status,
+            failed,
+            closed,
+            session.is_finished(),
+            counts,
+            served,
+        )
+    });
+    assert_eq!(
+        observed,
+        (
+            Some(200),
+            Some(HttpErrorCode::INTERNAL_ERROR),
+            Some((
+                HttpErrorCode::INTERNAL_ERROR,
+                b"owned H2 callback panicked".to_vec()
+            )),
+            true,
+            (0, 0, 1),
+            Some(200)
+        )
+    );
+}
+
+/// An upload whose first body read panics, counting its `stop_reading` calls
+/// and drops.
+#[cfg(panic = "unwind")]
+struct PanickingUpload {
+    stops: Rc<Cell<u32>>,
+    drops: Rc<Cell<u32>>,
+}
+
+#[cfg(panic = "unwind")]
+impl HttpSource for PanickingUpload {
+    fn read_header_event(&mut self) -> LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
+        Box::pin(std::future::ready(Err(HttpError::with_message(
+            HttpErrorCode::INTERNAL_ERROR,
+            "an upload's head is submitted apart from it",
+        ))))
+    }
+
+    fn read_body_event(
+        &mut self,
+        _maximum: u32,
+    ) -> LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
+        panic!("the upload read panics");
+    }
+
+    fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {
+        self.stops.set(self.stops.get() + 1);
+    }
+}
+
+#[cfg(panic = "unwind")]
+impl Drop for PanickingUpload {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+    }
+}
+
+/// `DIV-056`: a pooled owned HTTP/2 session outlives a request whose
+/// upload panics. The request is written, then its upload's first read panics:
+/// its response fails `CORO_CANCELLED` as for a failed upload, its source is
+/// dropped without `stop_reading`, the panic is counted at exchange scope, and
+/// the pool's next acquisition takes the same session, which serves it, with
+/// no other dial. `/hang` never answers, so only the upload's failure ends the
+/// first response: (the first response's error, the upload's stops and drops,
+/// whether the session finished, whether the next acquisition took the same
+/// connection, its response's status, the pool's sessions, dial attempts and
+/// closed sessions, the worker's contained panics by scope).
+#[cfg(panic = "unwind")]
+#[test]
+fn owned_pool_keeps_a_session_after_an_h2_upload_panic() {
+    let origin = Origin::start(CodecProtocol::Http2);
+    let address = origin.address;
+    let observed = run_on_worker(move |context| async move {
+        let worker = context.handle().clone();
+        let start = worker.poll_stats();
+        let pool = OwnedHttpSessionPool::new(
+            context.clone(),
+            socket_address(address),
+            PoolParams {
+                max_connections: 4,
+                ..one_connection()
+            },
+            plaintext(CodecProtocol::Http2),
+            untimed(),
+        )
+        .expect("the pool accepts its parameters");
+        let first = pool
+            .get_session_with_reservation(CancellationToken::never())
+            .await
+            .expect("first acquisition");
+        let upload = BufQueue::copy_from_slice(b"upload", 6).expect("bounded upload");
+        let mut request = HttpSourceHolder::new(Box::new(
+            HttpFixedSource::make_fixed_request("/hang", HttpMethod::Post, Some(upload))
+                .expect("valid request"),
+        ));
+        let mut head = request.read_header_event().await.expect("request head");
+        head.headers_mut()
+            .headers_mut()
+            .add("host", "origin.example");
+        assert!(!head.eom(), "the request has an upload");
+        let stops = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let upload = HttpSourceHolder::new(Box::new(PanickingUpload {
+            stops: Rc::clone(&stops),
+            drops: Rc::clone(&drops),
+        }));
+        let response = first
+            .reservation
+            .submit(head, upload, CancellationToken::never())
+            .await
+            .expect("the request head is written before its upload is read");
+        let mut source = response.source.into_source_owner().into_source_holder();
+        let failed = read(&mut source).await.error;
+        until(|| first.session.is_idle() || first.session.is_finished()).await;
+        let finished = first.session.is_finished();
+        let second = pool
+            .get_session_with_reservation(CancellationToken::never())
+            .await
+            .expect("second acquisition");
+        let same = second.session.connection_context().local_endpoint()
+            == first.session.connection_context().local_endpoint();
+        let (head, body) = Exchange::Fixed.request().await;
+        let response = second
+            .reservation
+            .submit(head, body, CancellationToken::never())
+            .await
+            .expect("request is committed");
+        let mut source = response.source.into_source_owner().into_source_holder();
+        let served = read(&mut source).await.status;
+        let stats = pool.stats();
+        (
+            failed,
+            (stops.get(), drops.get()),
+            finished,
+            same,
+            served,
+            (
+                pool.session_count(),
+                stats.connect_attempts,
+                stats.sessions_closed,
+            ),
+            contained_panic_counts(&worker, &start),
+        )
+    });
+    assert_eq!(
+        observed,
+        (
+            Some(HttpErrorCode::CORO_CANCELLED),
+            (0, 1),
+            false,
+            true,
+            Some(200),
+            (1, 1, 0),
+            (1, 0, 0)
+        )
     );
 }
 
