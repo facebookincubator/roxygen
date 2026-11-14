@@ -129,6 +129,8 @@ pub(crate) enum PanicSite {
     ExchangeRetirement,
     /// A byte-event callback.
     ByteEvent,
+    /// A request head's encoded-headers callback, or the head event's destructor.
+    HeadersEncoded,
     /// A client request's upload: its source, resume or ingress-body callback.
     UploadBody,
     /// A client request's `OwnedResponseObserver`.
@@ -150,6 +152,7 @@ impl PanicSite {
         match self {
             Self::ExchangeRetirement
             | Self::ByteEvent
+            | Self::HeadersEncoded
             | Self::UploadBody
             | Self::ResponseObserver
             | Self::Submission => ContainedPanicScope::Exchange,
@@ -167,6 +170,7 @@ impl PanicSite {
             Self::UpstreamObserver => "upstream_observer",
             Self::ExchangeRetirement => "exchange_retirement",
             Self::ByteEvent => "byte_event",
+            Self::HeadersEncoded => "headers_encoded",
             Self::UploadBody => "upload_body",
             Self::ResponseObserver => "response_observer",
             Self::Submission => "submission",

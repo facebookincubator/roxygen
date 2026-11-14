@@ -2425,6 +2425,107 @@ fn owned_pool_keeps_a_session_after_an_h2_upload_panic() {
     );
 }
 
+/// `DIV-056`: a pooled owned HTTP/1.1 session ends with its
+/// request when that request's upload panics: HTTP/1.1 cannot drop half a
+/// message, so the request fails as a failed upload does, its source is dropped
+/// without `stop_reading`, and its connection resets with `Err(INTERNAL_ERROR)`
+/// instead of the panic failing the worker. The panic is counted at exchange
+/// scope, and the pool's next acquisition dials a new session, which serves it.
+/// `/hang` never answers, so only the upload's failure ends the first response:
+/// (the first response's error, the upload's stops and drops, whether the
+/// session finished, whether the next acquisition took another connection, its
+/// response's status, the pool's sessions, dial attempts and closed sessions,
+/// the worker's contained panics by scope).
+#[cfg(panic = "unwind")]
+#[test]
+fn owned_pool_replaces_a_session_after_an_h1_upload_panic() {
+    let origin = Origin::start(CodecProtocol::Http11);
+    let address = origin.address;
+    let observed = run_on_worker(move |context| async move {
+        let worker = context.handle().clone();
+        let start = worker.poll_stats();
+        let pool = OwnedHttpSessionPool::new(
+            context.clone(),
+            socket_address(address),
+            PoolParams {
+                max_connections: 4,
+                ..one_connection()
+            },
+            plaintext(CodecProtocol::Http11),
+            untimed(),
+        )
+        .expect("the pool accepts its parameters");
+        let first = pool
+            .get_session_with_reservation(CancellationToken::never())
+            .await
+            .expect("first acquisition");
+        let upload = BufQueue::copy_from_slice(b"upload", 6).expect("bounded upload");
+        let mut request = HttpSourceHolder::new(Box::new(
+            HttpFixedSource::make_fixed_request("/hang", HttpMethod::Post, Some(upload))
+                .expect("valid request"),
+        ));
+        let mut head = request.read_header_event().await.expect("request head");
+        head.headers_mut()
+            .headers_mut()
+            .add("host", "origin.example");
+        assert!(!head.eom(), "the request has an upload");
+        let stops = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let upload = HttpSourceHolder::new(Box::new(PanickingUpload {
+            stops: Rc::clone(&stops),
+            drops: Rc::clone(&drops),
+        }));
+        let response = first
+            .reservation
+            .submit(head, upload, CancellationToken::never())
+            .await
+            .expect("the request is committed before its upload is read");
+        let mut source = response.source.into_source_owner().into_source_holder();
+        let failed = read(&mut source).await.error;
+        until(|| first.session.is_finished()).await;
+        let second = pool
+            .get_session_with_reservation(CancellationToken::never())
+            .await
+            .expect("second acquisition");
+        let other = second.session.connection_context().local_endpoint()
+            != first.session.connection_context().local_endpoint();
+        let (head, body) = Exchange::Fixed.request().await;
+        let response = second
+            .reservation
+            .submit(head, body, CancellationToken::never())
+            .await
+            .expect("request is committed");
+        let mut source = response.source.into_source_owner().into_source_holder();
+        let served = read(&mut source).await.status;
+        let stats = pool.stats();
+        (
+            failed,
+            (stops.get(), drops.get()),
+            first.session.is_finished(),
+            other,
+            served,
+            (
+                pool.session_count(),
+                stats.connect_attempts,
+                stats.sessions_closed,
+            ),
+            contained_panic_counts(&worker, &start),
+        )
+    });
+    assert_eq!(
+        observed,
+        (
+            Some(HttpErrorCode::CORO_CANCELLED),
+            (0, 1),
+            true,
+            true,
+            Some(200),
+            (1, 2, 1),
+            (1, 0, 0)
+        )
+    );
+}
+
 /// On HTTP/2, which has no pull-through exchanges, a pull-through submission
 /// is refused with `INVALID_STATE_TRANSITION` before it reaches the driver,
 /// and reports no `request_unprocessed`, so a stale-connection retry would not

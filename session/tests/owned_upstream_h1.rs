@@ -11,6 +11,7 @@ use roxygen_core::ids::StreamId;
 use roxygen_core::source::LocalSourceFuture;
 use roxygen_core::stream_source::FlowControlState;
 use roxygen_runtime::tokio_host::ManagedWorkerError;
+use roxygen_runtime::worker::WorkerPollStats;
 use thiserror::Error;
 
 use super::*;
@@ -2911,11 +2912,29 @@ impl crate::owned::OwnedUpstreamObserver for PanickingObserver {
     }
 }
 
+/// The contained panics `worker` counted since `start`, by scope: exchange, connection, driver
+/// (`DIV-056`).
+fn contained_panic_counts(worker: &WorkerHandle, start: &WorkerPollStats) -> (u64, u64, u64) {
+    let delta = worker.poll_stats().since(start);
+    (
+        delta.contained_exchange_panics,
+        delta.contained_connection_panics,
+        delta.contained_driver_panics,
+    )
+}
+
+/// `DIV-056`: the observer's panic while the driver polls is counted at connection scope and
+/// drains the connection. Admission closes with `REFUSED_STREAM`, the exchange in flight
+/// completes, and the run ends `Ok` once the connection is idle. The drain records no caller
+/// drain request, so a later `close_when_idle` still reports a change.
+#[cfg(panic = "unwind")]
 #[test]
-fn observer_panic_resets_the_connection_and_resumes_from_run() {
+fn an_upstream_observer_panic_drains_the_connection() {
     run_on_host(|context| {
         Box::pin(async move {
-            use futures::FutureExt;
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
             let gate = Arc::new(tokio::sync::Notify::new());
             let (transport, state) = ScriptedTransport::new([ReadAction::WaitData(
                 Arc::clone(&gate),
@@ -2929,18 +2948,30 @@ fn observer_panic_resets_the_connection_and_resumes_from_run() {
                 HttpSourceHolder::empty(),
                 CancellationToken::never(),
             );
-            let (run, ()) = futures::join!(
-                std::panic::AssertUnwindSafe(session.run()).catch_unwind(),
-                async {
-                    let (_stream, _source, _control) =
-                        submission.await.unwrap().into_source_parts();
-                    gate.notify_one();
-                }
-            );
-            let panic = run.expect_err("run resumes the observer's panic");
-            assert_eq!(panic.downcast_ref::<&str>(), Some(&"observer panicked"));
-            assert_eq!(state.borrow().close, CloseKind::Reset);
+            let (run, (read, refused, changed)) = futures::join!(session.run(), async {
+                let (_stream, mut source, _control) = submission.await.unwrap().into_source_parts();
+                gate.notify_one();
+                let read = read_response(&mut source).await;
+                let refused = handle.reserve_request().err().map(|error| error.code());
+                let changed = handle.close_when_idle().unwrap();
+                drop(source);
+                (read, refused, changed)
+            });
+            run.unwrap();
+            assert_eq!((read.body.as_slice(), read.eom), (b"ok".as_slice(), true));
+            assert_eq!(refused, Some(HttpErrorCode::REFUSED_STREAM));
+            assert!(changed, "the drain is not the caller's");
+            assert_eq!(state.borrow().close, CloseKind::ShutdownWrite);
             assert!(handle.is_finished());
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::UpstreamObserver,
+                    Some(StreamId::new(1)),
+                    Some("observer panicked".to_owned())
+                )]
+            );
+            assert_eq!(contained_panic_counts(&worker, &start), (0, 1, 0));
         })
     });
 }
@@ -2994,20 +3025,22 @@ impl HttpSource for GatedUpload {
     }
 }
 
-/// `DIV-056`: a request body read that panics reaches the per-turn catch and is reported
-/// once, at Driver scope. The run still resumes it.
+/// `DIV-056`: a request body read that panics fails its request as a failed upload
+/// does. The response fails with `CORO_CANCELLED` ("egress source failed"), the connection
+/// resets, the run returns `Err(INTERNAL_ERROR)`, and the panic is counted once, at exchange
+/// scope.
+#[cfg(panic = "unwind")]
 #[test]
-fn owned_h1_upstream_driver_turn_panic_is_reported_once() {
+fn owned_h1_upstream_upload_panic_fails_the_request_and_resets() {
     run_on_host(|context| {
         Box::pin(async move {
-            use futures::FutureExt;
             // Discards reports left on this thread by an earlier test.
             take_contained_panics();
             let worker = context.handle().clone();
             let start = worker.poll_stats();
             let upload_gate = Arc::new(tokio::sync::Notify::new());
             upload_gate.notify_one();
-            let (transport, _state) = ScriptedTransport::new([ReadAction::WaitDataOrCancellation(
+            let (transport, state) = ScriptedTransport::new([ReadAction::WaitDataOrCancellation(
                 Arc::new(tokio::sync::Notify::new()),
                 OK_RESPONSE.to_vec(),
             )]);
@@ -3021,29 +3054,26 @@ fn owned_h1_upstream_driver_turn_panic_is_reported_once() {
                 ),
                 CancellationToken::never(),
             );
-            let run = std::panic::AssertUnwindSafe(session.run())
-                .catch_unwind()
-                .await;
-            drop(submission);
-            let panic = run.expect_err("run resumes the request body's panic");
-            assert_eq!(panic_text(panic), "request body panicked");
+            let (run, read) = futures::join!(session.run(), async {
+                let (_stream, mut source, _control) = submission.await.unwrap().into_source_parts();
+                read_response(&mut source).await.error
+            });
+            assert_eq!(read, Some(HttpErrorCode::CORO_CANCELLED));
+            assert_eq!(
+                run.err().map(|error| error.code()),
+                Some(HttpErrorCode::INTERNAL_ERROR)
+            );
+            assert_eq!(state.borrow().close, CloseKind::Reset);
+            assert!(handle.is_finished());
             assert_eq!(
                 take_contained_panics(),
                 [(
-                    PanicSite::DriverTurn,
-                    None,
+                    PanicSite::UploadBody,
+                    Some(StreamId::new(1)),
                     Some("request body panicked".to_owned())
                 )]
             );
-            let delta = worker.poll_stats().since(&start);
-            assert_eq!(
-                (
-                    delta.contained_exchange_panics,
-                    delta.contained_connection_panics,
-                    delta.contained_driver_panics,
-                ),
-                (0, 0, 1)
-            );
+            assert_eq!(contained_panic_counts(&worker, &start), (1, 0, 0));
         })
     });
 }
@@ -5047,11 +5077,16 @@ impl Drop for PanicOnRetirement {
     }
 }
 
+/// `DIV-056`: a panic as a finished exchange retires is counted at exchange scope, and its
+/// keep-alive connection still returns its slot and serves the next request.
+#[cfg(panic = "unwind")]
 #[test]
-fn retirement_panic_fails_a_reusable_connection() {
+fn a_retirement_panic_keeps_a_reusable_connection() {
     run_on_host(|context| {
         Box::pin(async move {
-            use futures::FutureExt;
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
             let first_ready = Arc::new(tokio::sync::Notify::new());
             let second_ready = Arc::new(tokio::sync::Notify::new());
             // A keep-alive origin that keeps the connection open.
@@ -5070,28 +5105,51 @@ fn retirement_panic_fails_a_reusable_connection() {
                 HttpSourceHolder::new(Box::new(PanicOnRetirement)),
                 CancellationToken::never(),
             );
-            let (run, read) = futures::join!(
-                std::panic::AssertUnwindSafe(session.run()).catch_unwind(),
-                async {
-                    let (_stream, mut source, _control) =
-                        submission.await.unwrap().into_source_parts();
-                    first_ready.notify_one();
-                    read_response(&mut source).await
-                }
-            );
-            assert_eq!((read.body.as_slice(), read.eom), (b"ok".as_slice(), true));
-            let panic = run.expect_err("run resumes the retirement panic");
+            let (run, (first, second)) = futures::join!(session.run(), async {
+                let (_stream, mut source, _control) = submission.await.unwrap().into_source_parts();
+                first_ready.notify_one();
+                let first = read_response(&mut source).await;
+                drop(source);
+                yield_until(|| handle.is_idle()).await;
+                let submission = handle.reserve_request().unwrap().submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                let (_stream, mut source, _control) = submission.await.unwrap().into_source_parts();
+                second_ready.notify_one();
+                let second = read_response(&mut source).await;
+                drop(source);
+                close_once_idle(&handle).await;
+                (first, second)
+            });
+            run.unwrap();
+            assert_eq!((first.body.as_slice(), first.eom), (b"ok".as_slice(), true));
             assert_eq!(
-                panic.downcast_ref::<&str>(),
-                Some(&"request source panicked at retirement")
+                (second.body.as_slice(), second.eom),
+                (b"ok".as_slice(), true)
             );
             assert_eq!(
                 *log.0.borrow(),
-                ["capacity_released(1)", "admission_closed"],
-                "the slot is not returned"
+                [
+                    "capacity_released(1)",
+                    "capacity_available",
+                    "capacity_released(2)",
+                    "capacity_available",
+                    "admission_closed"
+                ],
+                "the slot is returned after the retirement panic"
             );
-            assert_eq!(state.borrow().close, CloseKind::Reset);
-            assert!(handle.is_finished());
+            assert_eq!(state.borrow().close, CloseKind::ShutdownWrite);
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::ExchangeRetirement,
+                    Some(StreamId::new(1)),
+                    Some("request source panicked at retirement".to_owned())
+                )]
+            );
+            assert_eq!(contained_panic_counts(&worker, &start), (1, 0, 0));
         })
     });
 }
@@ -7473,15 +7531,19 @@ fn a_read_error_received_before_commit_refuses_the_request_unprocessed() {
     }
 }
 
-/// A panic in the teardown of a failed read (here the observer's capacity release as the live
-/// exchange is cancelled) resets the transport at once, without waiting for the outstanding
-/// request write, and `run` resumes it, as a teardown panic in any other abort does.
+/// `DIV-056`: a panic as a failed read cancels the live exchange (here the observer's capacity
+/// release) is counted at connection scope, and the failed read keeps its path: the transport
+/// resets only once the outstanding request write completes, and the run fails with the read's
+/// error.
+#[cfg(panic = "unwind")]
 #[test]
-fn a_teardown_panic_on_a_read_error_during_a_request_write_resets_at_once() {
+fn an_observer_panic_on_a_read_error_during_a_request_write_waits_for_the_write() {
     for queued in [false, true] {
         let outcome = run_on_host(move |context| {
             Box::pin(async move {
-                use futures::FutureExt;
+                take_contained_panics();
+                let worker = context.handle().clone();
+                let start = worker.poll_stats();
                 let failed = Arc::new(tokio::sync::Notify::new());
                 let (inner, state) = ScriptedTransport::new([ReadAction::WaitError(
                     Arc::clone(&failed),
@@ -7519,7 +7581,7 @@ fn a_teardown_panic_on_a_read_error_during_a_request_write_resets_at_once() {
                     held_close
                 };
                 let (run, response, held_close) = futures::join!(
-                    std::panic::AssertUnwindSafe(session.run()).catch_unwind(),
+                    session.run(),
                     async {
                         match submission.await {
                             Ok(response) => {
@@ -7531,28 +7593,690 @@ fn a_teardown_panic_on_a_read_error_during_a_request_write_resets_at_once() {
                     },
                     script
                 );
-                let panic = run.expect_err("run resumes the observer's panic");
                 (
                     held_close,
-                    panic.downcast_ref::<&str>().copied(),
+                    run.err().map(|error| error.code()),
                     response,
                     state.borrow().close,
                     handle.is_finished(),
+                    take_contained_panics(),
+                    contained_panic_counts(&worker, &start),
                 )
             })
         });
         assert_eq!(
             outcome,
             (
-                CloseKind::Reset,
-                Some("observer panicked"),
+                CloseKind::Open,
+                Some(HttpErrorCode::TRANSPORT_READ_ERROR),
                 Some(HttpErrorCode::TRANSPORT_READ_ERROR),
                 CloseKind::Reset,
                 true,
+                vec![(
+                    PanicSite::UpstreamObserver,
+                    Some(StreamId::new(1)),
+                    Some("observer panicked".to_owned())
+                )],
+                (0, 1, 0),
             ),
             "queued {queued}"
         );
     }
+}
+
+/// How the read futures of a [`PoisonedReads`] transport poll once it is armed.
+#[derive(Clone, Copy, Debug)]
+enum ReadPanics {
+    /// Every poll panics.
+    Always,
+    /// A panic, then a pending poll that wakes itself, in turn.
+    Alternate,
+}
+
+/// Writes and closes through a [`ScriptedTransport`]. Its reads stay pending until it is armed,
+/// then poll as `mode` says, counting each armed poll in `polls` and each read future's drop in
+/// `drops`.
+struct PoisonedReads {
+    inner: Rc<ScriptedTransport>,
+    mode: ReadPanics,
+    armed: Rc<Cell<bool>>,
+    waker: Rc<RefCell<Option<Waker>>>,
+    polls: Rc<Cell<usize>>,
+    drops: Rc<Cell<usize>>,
+}
+
+/// Counts its drop.
+struct CountsDrop(Rc<Cell<usize>>);
+
+impl Drop for CountsDrop {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
+impl PoisonedReads {
+    fn new(mode: ReadPanics, armed: bool) -> (Rc<Self>, Rc<RefCell<TransportState>>) {
+        let (inner, state) = ScriptedTransport::new([]);
+        let transport = Rc::new(Self {
+            inner,
+            mode,
+            armed: Rc::new(Cell::new(armed)),
+            waker: Rc::default(),
+            polls: Rc::default(),
+            drops: Rc::default(),
+        });
+        (transport, state)
+    }
+
+    /// Lets the read in flight panic from its next poll.
+    fn arm(&self) {
+        self.armed.set(true);
+        let waker = self.waker.borrow_mut().take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+impl UniplexTransport for PoisonedReads {
+    fn read(
+        &self,
+        _context: &WorkerContext,
+        _maximum: usize,
+        _allocation_size: usize,
+        _timeout: Duration,
+        _cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        let mode = self.mode;
+        let armed = Rc::clone(&self.armed);
+        let waker = Rc::clone(&self.waker);
+        let polls = Rc::clone(&self.polls);
+        let dropped = CountsDrop(Rc::clone(&self.drops));
+        Box::pin(poll_fn(move |context| {
+            let _dropped = &dropped;
+            if !armed.get() {
+                *waker.borrow_mut() = Some(context.waker().clone());
+                return Poll::Pending;
+            }
+            let poll = polls.get() + 1;
+            polls.set(poll);
+            if matches!(mode, ReadPanics::Alternate) && poll.is_multiple_of(2) {
+                context.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            std::panic::panic_any(format!("native read poll {poll}"))
+        }))
+    }
+
+    fn write(
+        &self,
+        context: &WorkerContext,
+        data: BufQueue,
+        flags: ByteEventWriteFlags,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        self.inner
+            .write(context, data, flags, timeout, cancellation)
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.shutdown_write(context)
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close_with_reset(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.inner.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.inner.register_byte_event(context, registration)
+    }
+}
+
+/// The reports a run whose read panicked on every poll from its first makes: the turn's, then one
+/// for each of the three panicking teardown polls that drop the read, with the polls that
+/// panicked.
+fn poisoned_read_reports(
+    panicked: [usize; 4],
+) -> Vec<(PanicSite, Option<StreamId>, Option<String>)> {
+    let message = |poll: usize| Some(format!("native read poll {poll}"));
+    vec![
+        (PanicSite::DriverTurn, None, message(panicked[0])),
+        (PanicSite::Teardown, None, message(panicked[1])),
+        (PanicSite::Teardown, None, message(panicked[2])),
+        (PanicSite::Teardown, None, message(panicked[3])),
+    ]
+}
+
+/// `DIV-056`: a native read whose every poll panics is dropped unfinished at its third panicking
+/// teardown poll, and the run fails within its deadline; so is one whose panics alternate with
+/// self-woken pending polls, since teardown panics count in total. The read is not polled
+/// again, so its panics add exactly four reports. The deadline leaves room for each panic's
+/// backtrace under ASan.
+#[cfg(panic = "unwind")]
+#[test]
+fn owned_h1_upstream_poisoned_read_is_abandoned_after_bounded_teardown_polls() {
+    // (which polls panic, the read's polls, the polls that panicked)
+    for (mode, polls, panicked) in [
+        (ReadPanics::Always, 4, [1, 2, 3, 4]),
+        (ReadPanics::Alternate, 7, [1, 3, 5, 7]),
+    ] {
+        run_on_worker(move |context| {
+            Box::pin(async move {
+                take_contained_panics();
+                let worker = context.handle().clone();
+                let start = worker.poll_stats();
+                let (transport, state) = PoisonedReads::new(mode, true);
+                let (session, handle) =
+                    OwnedH1UpstreamSession::new(upstream_options(context, transport.clone()))
+                        .unwrap();
+                let error = tokio::time::timeout(Duration::from_secs(30), session.run())
+                    .await
+                    .expect("a poisoned read is dropped within the deadline")
+                    .expect_err("a Driver-scope panic fails the run");
+                assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR, "{mode:?}");
+                assert_eq!(transport.polls.get(), polls, "{mode:?}");
+                assert_eq!(transport.drops.get(), 1, "{mode:?}");
+                assert_eq!(
+                    take_contained_panics(),
+                    poisoned_read_reports(panicked),
+                    "{mode:?}: dropping the read adds no report of its own"
+                );
+                assert_eq!(contained_panic_counts(&worker, &start), (0, 0, 4));
+                assert_eq!(state.borrow().close, CloseKind::Reset);
+                assert!(handle.is_finished());
+            })
+        });
+    }
+}
+
+/// `DIV-056`: after a Driver-scope panic the run joins its native I/O before it fails. With the
+/// request's write held, a read whose polls panic is dropped at its third panicking teardown
+/// poll, and the run stays pending until the write completes, then returns
+/// `Err(INTERNAL_ERROR)`.
+#[cfg(panic = "unwind")]
+#[test]
+fn owned_h1_upstream_driver_panic_joins_a_held_write_before_failing_the_run() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let (transport, state) = PoisonedReads::new(ReadPanics::Always, false);
+            let release = Rc::new(tokio::sync::Notify::new());
+            state.borrow_mut().write_gate = Some((b"GET ".to_vec(), Rc::clone(&release)));
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport.clone())).unwrap();
+            let _submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            let mut run = Box::pin(session.run());
+            assert!(
+                poll_fn(|context| Poll::Ready(run.as_mut().poll(context)))
+                    .await
+                    .is_pending()
+            );
+            assert_eq!(
+                state.borrow().writes.len(),
+                1,
+                "the request's write is held"
+            );
+            transport.arm();
+            // The turn's read poll panics, then each teardown poll polls the read once; three more
+            // polls drop it, and later ones wait for the write.
+            for poll in 0..6 {
+                assert!(
+                    poll_fn(|context| Poll::Ready(run.as_mut().poll(context)))
+                        .await
+                        .is_pending(),
+                    "poll {poll}: the held write keeps the run pending"
+                );
+            }
+            assert_eq!(transport.polls.get(), 4, "the read is polled no more");
+            assert_eq!(transport.drops.get(), 1, "the read is dropped unfinished");
+            assert_eq!(state.borrow().close, CloseKind::Reset);
+            assert!(!handle.is_finished());
+            release.notify_one();
+            let error = tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the run completes once the write does")
+                .expect_err("a Driver-scope panic fails the run");
+            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+            assert!(handle.is_finished());
+            assert_eq!(take_contained_panics(), poisoned_read_reports([1, 2, 3, 4]));
+            assert_eq!(contained_panic_counts(&worker, &start), (0, 0, 4));
+        })
+    });
+}
+
+/// `DIV-056`: a panic committing a request, where only Roxygen code runs, is counted once at
+/// Driver scope: the submission fails with `INTERNAL_ERROR`, nothing is written, and the
+/// connection tears down and fails the run without counting the panic again.
+#[cfg(panic = "unwind")]
+#[test]
+fn owned_h1_upstream_commit_panic_tears_down_with_one_report() {
+    run_on_host(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let (transport, state) = ScriptedTransport::new([]);
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            crate::owned_h1::fault_next_upstream_commit();
+            let (run, submitted) = futures::join!(session.run(), submission);
+            assert_eq!(
+                submitted
+                    .err()
+                    .map(|error| (error.code(), error.message().to_vec())),
+                Some((
+                    HttpErrorCode::INTERNAL_ERROR,
+                    b"upstream request commitment panicked".to_vec()
+                ))
+            );
+            assert_eq!(
+                run.err().map(|error| error.code()),
+                Some(HttpErrorCode::INTERNAL_ERROR)
+            );
+            assert!(state.borrow().writes.is_empty());
+            assert_eq!(state.borrow().close, CloseKind::Reset);
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::Commit,
+                    None,
+                    Some("owned H1 upstream commit fault".to_owned())
+                )]
+            );
+            assert_eq!(contained_panic_counts(&worker, &start), (0, 0, 1));
+        })
+    });
+}
+
+/// A response observer whose deadline panics, logging each call with the error code of its
+/// outcome.
+struct PanickingDeadline(Rc<RefCell<Vec<(&'static str, Option<HttpErrorCode>)>>>);
+
+impl crate::owned::OwnedResponseObserver for PanickingDeadline {
+    fn poll_deadline(&mut self, _context: &mut Context<'_>) -> Poll<HttpError> {
+        self.0.borrow_mut().push(("poll_deadline", None));
+        panic!("deadline panicked");
+    }
+
+    fn response_complete(self: Box<Self>, completed: Result<std::time::Instant, HttpError>) {
+        let code = completed.err().map(|error| error.code());
+        self.0.borrow_mut().push(("response_complete", code));
+    }
+}
+
+/// `DIV-056`: a panic in a request's response-observer deadline fails the request, which closes
+/// its connection, and the observer is not polled again; it gets `response_complete` once,
+/// with `INTERNAL_ERROR`. The panic is counted once, at exchange scope.
+#[cfg(panic = "unwind")]
+#[test]
+fn owned_h1_upstream_response_observer_deadline_panic_fails_its_request_once() {
+    run_on_host(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let (transport, state) = ScriptedTransport::new([ReadAction::WaitDataOrCancellation(
+                Arc::new(tokio::sync::Notify::new()),
+                OK_RESPONSE.to_vec(),
+            )]);
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let submission = handle.reserve_request().unwrap().submit(
+                get_head(),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let observed = Rc::clone(&log);
+            let (run, read) = futures::join!(session.run(), async move {
+                let (_stream, mut source, control) = submission.await.unwrap().into_source_parts();
+                control
+                    .observe_response(Box::new(PanickingDeadline(observed)))
+                    .unwrap();
+                read_response(&mut source).await.error
+            });
+            assert_eq!(read, Some(HttpErrorCode::INTERNAL_ERROR));
+            assert_eq!(
+                run.err().map(|error| error.code()),
+                Some(HttpErrorCode::INTERNAL_ERROR)
+            );
+            assert_eq!(
+                *log.borrow(),
+                [
+                    ("poll_deadline", None),
+                    ("response_complete", Some(HttpErrorCode::INTERNAL_ERROR))
+                ]
+            );
+            assert_eq!(state.borrow().close, CloseKind::Reset);
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::ResponseObserver,
+                    Some(StreamId::new(1)),
+                    Some("deadline panicked".to_owned())
+                )]
+            );
+            assert_eq!(contained_panic_counts(&worker, &start), (1, 0, 0));
+        })
+    });
+}
+
+/// Records each byte-event cancellation's code and message, then panics.
+#[derive(Default)]
+struct PanickingCancels(RefCell<Vec<(HttpErrorCode, Vec<u8>)>>);
+
+impl HttpByteEventCallback for PanickingCancels {
+    fn on_byte_event(&self, _event: HttpByteEvent) {
+        unreachable!("owned H1 fires no byte event");
+    }
+
+    fn on_byte_event_cancelled(&self, _event: HttpByteEvent, error: HttpError) {
+        self.0
+            .borrow_mut()
+            .push((error.code(), error.message().to_vec()));
+        panic!("byte event cancel panicked");
+    }
+}
+
+/// `DIV-056`: each request byte-event registration, of the head and of a body event, is cancelled
+/// under its own unwind boundary. Every one gets the driver's refusal, even after another's
+/// callback panicked, each panic is counted at exchange scope, and the exchange completes.
+#[cfg(panic = "unwind")]
+#[test]
+fn owned_h1_upstream_byte_event_cancel_panics_are_contained_per_registration() {
+    run_on_host(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let log = Rc::new(PanickingCancels::default());
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (transport, _state) = ScriptedTransport::new([ReadAction::WaitData(
+                Arc::clone(&gate),
+                OK_RESPONSE.to_vec(),
+            )]);
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            let write = ByteEventType::TransportWrite.bit();
+            let (mut head, mut body) = scripted_request(false);
+            for _ in 0..2 {
+                head.byte_event_registrations_mut()
+                    .push(HttpByteEventRegistration::new(None, write, &log));
+                body[0]
+                    .byte_event_registrations_mut()
+                    .push(HttpByteEventRegistration::new(None, write, &log));
+            }
+            let submission = handle.reserve_request().unwrap().submit(
+                head,
+                RequestSource::held(None, body),
+                CancellationToken::never(),
+            );
+            let (run, read) = futures::join!(session.run(), async {
+                let (_stream, mut source, _control) = submission.await.unwrap().into_source_parts();
+                gate.notify_one();
+                let read = read_response(&mut source).await;
+                drop(source);
+                close_once_idle(&handle).await;
+                read
+            });
+            run.unwrap();
+            assert_eq!((read.body.as_slice(), read.eom), (b"ok".as_slice(), true));
+            let refusal = (
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"owned H1 delivers no byte events".to_vec(),
+            );
+            assert_eq!(*log.0.borrow(), vec![refusal; 4]);
+            let report = (
+                PanicSite::ByteEvent,
+                Some(StreamId::new(1)),
+                Some("byte event cancel panicked".to_owned()),
+            );
+            assert_eq!(take_contained_panics(), vec![report; 4]);
+            assert_eq!(contained_panic_counts(&worker, &start), (4, 0, 0));
+        })
+    });
+}
+
+/// `DIV-056`: a request head's encoded-headers callback that panics is counted at exchange
+/// scope. On a head that ends its request the exchange continues and completes; on a head with
+/// a body to follow the request fails with `INTERNAL_ERROR` before any byte is written, and the
+/// connection resets: (the submission's error, the response's body, the run's error, the bytes
+/// written, the close, the worker's contained panics by scope).
+#[cfg(panic = "unwind")]
+#[test]
+fn owned_h1_upstream_encoded_headers_panic_fails_only_a_request_with_a_body() {
+    type Outcome = (
+        Option<HttpErrorCode>,
+        Vec<u8>,
+        Option<HttpErrorCode>,
+        bool,
+        CloseKind,
+        (u64, u64, u64),
+    );
+    for ends_request in [true, false] {
+        let outcome: Outcome = run_on_host(move |context| {
+            Box::pin(async move {
+                take_contained_panics();
+                let worker = context.handle().clone();
+                let start = worker.poll_stats();
+                let gate = Arc::new(tokio::sync::Notify::new());
+                let (transport, state) =
+                    ScriptedTransport::new([ReadAction::WaitDataOrCancellation(
+                        Arc::clone(&gate),
+                        OK_RESPONSE.to_vec(),
+                    )]);
+                let (session, handle) =
+                    OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+                let (mut head, body) = if ends_request {
+                    (get_head(), Vec::new())
+                } else {
+                    scripted_request(false)
+                };
+                head.set_egress_headers_callback(|_size| panic!("encoded headers panicked"));
+                let submission = handle.reserve_request().unwrap().submit(
+                    head,
+                    RequestSource::held(None, body),
+                    CancellationToken::never(),
+                );
+                let (run, (submitted, body)) = futures::join!(session.run(), async {
+                    match submission.await {
+                        Ok(response) => {
+                            let (_stream, mut source, _control) = response.into_source_parts();
+                            gate.notify_one();
+                            let read = read_response(&mut source).await;
+                            drop(source);
+                            close_once_idle(&handle).await;
+                            (None, read.body)
+                        }
+                        Err(error) => (Some(error.code()), Vec::new()),
+                    }
+                });
+                let reports = take_contained_panics();
+                assert_eq!(
+                    reports,
+                    [(
+                        PanicSite::HeadersEncoded,
+                        Some(StreamId::new(1)),
+                        Some("encoded headers panicked".to_owned())
+                    )],
+                    "ends request: {ends_request}"
+                );
+                let state = state.borrow();
+                (
+                    submitted,
+                    body,
+                    run.err().map(|error| error.code()),
+                    state.writes.is_empty(),
+                    state.close,
+                    contained_panic_counts(&worker, &start),
+                )
+            })
+        });
+        let expected: Outcome = if ends_request {
+            (
+                None,
+                b"ok".to_vec(),
+                None,
+                false,
+                CloseKind::ShutdownWrite,
+                (1, 0, 0),
+            )
+        } else {
+            (
+                Some(HttpErrorCode::INTERNAL_ERROR),
+                Vec::new(),
+                Some(HttpErrorCode::INTERNAL_ERROR),
+                true,
+                CloseKind::Reset,
+                (1, 0, 0),
+            )
+        };
+        assert_eq!(outcome, expected, "ends request: {ends_request}");
+    }
+}
+
+/// `DIV-056`: a run whose poll unwinds, which only a fault in the run's own code can cause, is
+/// poisoned, under `run` and `run_pull_through` alike. Its next poll returns
+/// `Err(INTERNAL_ERROR)` without polling the driver, and dropping it abandons the driver,
+/// resetting the transport and releasing it, without the join assertion and without a report.
+#[cfg(panic = "unwind")]
+#[test]
+fn owned_h1_upstream_run_whose_poll_unwinds_is_poisoned() {
+    for mode in [n8::Mode::Run, n8::Mode::PullThrough] {
+        run_on_host(move |context| {
+            Box::pin(async move {
+                take_contained_panics();
+                let mut fixture = n8::Fixture::new(context, mode, |_| {});
+                crate::owned_h1::fault_next_upstream_run_poll();
+                let unwound = catch_unwind(AssertUnwindSafe(|| fixture.poll_run()));
+                let Err(panic) = unwound else {
+                    panic!("{mode:?}: the faulted poll unwinds");
+                };
+                assert_eq!(panic_text(panic), "owned H1 upstream run fault");
+                let starts = fixture.origin.starts.get();
+                assert_eq!(starts, 1, "{mode:?}: the faulted poll started the read");
+                let Poll::Ready(Err(error)) = fixture.poll_run() else {
+                    panic!("{mode:?}: a poisoned run is ready with an error");
+                };
+                assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+                assert_eq!(
+                    fixture.origin.starts.get(),
+                    starts,
+                    "{mode:?}: the poisoned poll ran no driver code"
+                );
+                assert_eq!(fixture.state.borrow().close, CloseKind::Open);
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| fixture.drop_run())).is_ok(),
+                    "{mode:?}: a poisoned run's abandonment does not assert its join"
+                );
+                assert_eq!(fixture.state.borrow().close, CloseKind::Reset);
+                assert!(
+                    fixture.origin.dropped.get(),
+                    "{mode:?}: the driver is released"
+                );
+                assert!(take_contained_panics().is_empty());
+            })
+        });
+    }
+}
+
+/// `DIV-056`: polling a run after it completed returns `Err(INVALID_STATE_TRANSITION)`, under
+/// `run` and `run_pull_through` alike.
+#[test]
+fn polling_a_finished_owned_upstream_run_returns_an_error() {
+    for mode in [n8::Mode::Run, n8::Mode::PullThrough] {
+        run_on_host(move |context| {
+            Box::pin(async move {
+                let mut fixture = n8::Fixture::new(context, mode, |_| {});
+                assert!(fixture.poll_run().is_pending());
+                assert!(fixture.handle.close_when_idle().unwrap());
+                fixture
+                    .settle_run()
+                    .expect("the idle connection closes")
+                    .unwrap();
+                let Poll::Ready(Err(error)) = fixture.poll_run() else {
+                    panic!("{mode:?}: a finished run is ready with an error");
+                };
+                assert_eq!(
+                    error.code(),
+                    HttpErrorCode::INVALID_STATE_TRANSITION,
+                    "{mode:?}"
+                );
+            })
+        });
+    }
+}
+
+/// An upstream observer whose drop panics.
+struct PanicsOnDrop;
+
+impl crate::owned::OwnedUpstreamObserver for PanicsOnDrop {}
+
+impl Drop for PanicsOnDrop {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            panic!("observer drop panicked");
+        }
+    }
+}
+
+/// `DIV-056`: a run that completes releases the driver field by field. A destructor that panics
+/// there, here the observer's as the driver drops the connection's last reference, is counted as
+/// a teardown step, and the run still returns its result.
+#[cfg(panic = "unwind")]
+#[test]
+fn a_panicking_drop_after_owned_upstream_completion_is_reported() {
+    run_on_host(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let (transport, state) = ScriptedTransport::new([]);
+            let (session, handle) =
+                OwnedH1UpstreamSession::new(upstream_options(context, transport)).unwrap();
+            handle.set_observer(Rc::new(PanicsOnDrop)).unwrap();
+            assert!(handle.close_when_idle().unwrap());
+            drop(handle);
+            session.run().await.unwrap();
+            assert_eq!(state.borrow().close, CloseKind::ShutdownWrite);
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::Teardown,
+                    None,
+                    Some("observer drop panicked".to_owned())
+                )]
+            );
+            assert_eq!(contained_panic_counts(&worker, &start), (0, 0, 1));
+        })
+    });
 }
 
 /// Bytes, or read failures, pushed by the test, which `PushedReadTransport` reads deliver as they
@@ -10317,6 +11041,7 @@ mod n8 {
     fn n8_a_fatal_abort_while_held_and_unread_completes_the_run() {
         run_on_host(|context| {
             Box::pin(async move {
+                take_contained_panics();
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |config| {
                     config.deliver_ingress_before_abort = true;
                 });
@@ -10336,10 +11061,23 @@ mod n8 {
                     panic!("the holder's read neither panics nor waits");
                 };
                 assert_eq!(body_bytes(&event.unwrap()), b"cd", "a kept event");
-                // The holder stalls. The run finishes on its own wakes and resumes the panic.
-                let run = catch_unwind(AssertUnwindSafe(|| fixture.settle_run()));
-                let panic = run.expect_err("the run resumes the callback panic");
-                assert_eq!(panic_text(panic), "read start panicked");
+                // The holder stalls. The run finishes its teardown on its own wakes and fails
+                // (`DIV-056`).
+                let run = fixture
+                    .settle_run()
+                    .expect("the run completes on its wakes");
+                assert_eq!(
+                    run.err().map(|error| error.code()),
+                    Some(HttpErrorCode::INTERNAL_ERROR)
+                );
+                assert_eq!(
+                    take_contained_panics(),
+                    [(
+                        PanicSite::DriverTurn,
+                        None,
+                        Some("read start panicked".to_owned())
+                    )]
+                );
                 assert!(fixture.handle.is_finished());
                 assert_eq!(fixture.state.borrow().close, CloseKind::Reset);
                 let event = fixture.next_event(&mut response, 2).unwrap();
@@ -11133,11 +11871,15 @@ mod n8 {
         );
     }
 
+    /// Dropping the run future with a completion an inline drive stashed finishes the run: no
+    /// abort, no join assertion, and a panic the driver contained in that drive (here the
+    /// transport's reset) is counted, not resumed (`DIV-056`).
     #[test]
     fn n8_dropping_the_run_with_a_stashed_completion_neither_aborts_nor_asserts() {
         for panics in [false, true] {
-            let dropped = run_on_host(move |context| {
+            let (dropped, reports) = run_on_host(move |context| {
                 Box::pin(async move {
+                    take_contained_panics();
                     let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
                     let mut response = fixture.held();
                     if panics {
@@ -11157,18 +11899,20 @@ mod n8 {
                     );
                     assert!(fixture.origin.dropped.get(), "and dropped the driver");
                     assert_eq!(fixture.state.borrow().close, CloseKind::Reset);
-                    dropped
+                    (dropped, take_contained_panics())
                 })
             });
-            if panics {
-                assert_eq!(
-                    dropped.as_deref(),
-                    Some("reset panicked"),
-                    "the drop resumes the stashed panic"
-                );
+            assert_eq!(dropped, None, "the drop neither aborts nor asserts");
+            let expected = if panics {
+                vec![(
+                    PanicSite::Transport,
+                    None,
+                    Some("reset panicked".to_owned()),
+                )]
             } else {
-                assert_eq!(dropped, None, "the drop neither aborts nor asserts");
-            }
+                Vec::new()
+            };
+            assert_eq!(reports, expected, "panics {panics}");
         }
     }
 
@@ -11650,10 +12394,14 @@ mod n8 {
         });
     }
 
+    /// A Driver-scope panic inside an inline drive tears the connection down; the run future
+    /// finishes the teardown and fails with `INTERNAL_ERROR`, and the panic is counted once
+    /// (`DIV-056`).
     #[test]
-    fn n8_a_callback_panic_in_an_inline_drive_is_resumed_by_the_run() {
+    fn n8_a_callback_panic_in_an_inline_drive_fails_the_run() {
         run_on_host(|context| {
             Box::pin(async move {
+                take_contained_panics();
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
                 let mut response = fixture.held();
                 *fixture.origin.on_read_start.borrow_mut() =
@@ -11668,10 +12416,20 @@ mod n8 {
                     Some(HttpErrorCode::INTERNAL_ERROR),
                     "the holder reads the connection's error"
                 );
-                let run = catch_unwind(AssertUnwindSafe(|| fixture.settle_run()));
+                let run = fixture
+                    .settle_run()
+                    .expect("the run completes on its wakes");
                 assert_eq!(
-                    panic_text(run.expect_err("the run resumes the panic")),
-                    "read start panicked"
+                    run.err().map(|error| error.code()),
+                    Some(HttpErrorCode::INTERNAL_ERROR)
+                );
+                assert_eq!(
+                    take_contained_panics(),
+                    [(
+                        PanicSite::DriverTurn,
+                        None,
+                        Some("read start panicked".to_owned())
+                    )]
                 );
                 assert!(fixture.handle.is_finished());
                 assert_eq!(fixture.state.borrow().close, CloseKind::Reset);

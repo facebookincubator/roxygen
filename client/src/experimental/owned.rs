@@ -11,9 +11,10 @@
 //! once, before the run observes it; the attachment's cancellation wins over quiescence and is
 //! observed until the run's cleanup completes, and a panic in the quiescence drain cancels the
 //! session and fails it `INTERNAL_ERROR`, as for a `ClientSession`, and is counted in the worker's
-//! `WorkerPollStats` (`DIV-056`). On HTTP/2 a panic the driver contains, also counted there, fails
-//! only its request, drains the session, or ends the session with `Err(INTERNAL_ERROR)`, which
-//! `wait_closed` reports; the worker keeps serving. A reservation's submission
+//! `WorkerPollStats` (`DIV-056`). A panic the driver contains, also counted there, fails only its
+//! request (on HTTP/1.1, which cannot drop half a message, it also ends the session), drains the
+//! session, or ends the session with `Err(INTERNAL_ERROR)`, which `wait_closed` reports; the
+//! worker keeps serving. A reservation's submission
 //! resolves at the driver's commitment, or at the first response head, with the response's
 //! fresh [`HttpResponseSource`]; submissions and requests report `OwnedRequestProgressExt`
 //! progress (`DIV-035`).

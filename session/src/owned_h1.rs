@@ -138,6 +138,22 @@ thread_local! {
     static SIGNAL_TAKES: Cell<usize> = const { Cell::new(0) };
     static AFTER_BODY_EVENT_SERIALIZED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static UPSTREAM_RUN_FAULT: Cell<bool> = const { Cell::new(false) };
+    static UPSTREAM_COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes the next pending poll of an owned HTTP/1.1 upstream run on this thread panic outside the
+/// driver's boundaries, where only a fault in the run's own code could.
+#[cfg(test)]
+pub(crate) fn fault_next_upstream_run_poll() {
+    UPSTREAM_RUN_FAULT.set(true);
+}
+
+/// Makes the next request commitment of an owned HTTP/1.1 upstream on this thread panic midway,
+/// where only a fault in Roxygen's commit code could.
+#[cfg(test)]
+pub(crate) fn fault_next_upstream_commit() {
+    UPSTREAM_COMMIT_FAULT.set(true);
 }
 
 /// How many turns the owned HTTP/1.1 drivers on this thread have run.

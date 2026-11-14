@@ -44,6 +44,16 @@
 //! commits once its next turn has retired the exchange, and that retirement announces no
 //! capacity once the slot is taken.
 //!
+//! The driver contains the panics of the code it runs and counts each in its worker's
+//! `WorkerPollStats` (`DIV-056`). A panic in a request's upload or response observer, or in the
+//! encoded-headers callback of a head with a body to follow, fails that request, which closes its
+//! connection as a failed upload does; one in a byte-event callback, the encoded-headers
+//! callback of a head that ends its request, or a retiring exchange is only counted. One in the
+//! connection's observer while the driver polls closes admission, so the connection closes once
+//! idle. Any other panic in the driver's poll tears the connection down: its native read and
+//! writes are cancelled and joined, one whose teardown polls panic three times in total is
+//! dropped unfinished, and the run returns `Err(INTERNAL_ERROR)`. A run never resumes a panic.
+//!
 //! Pull-through exchanges (`DIV-047`, experimental): under
 //! [`OwnedH1UpstreamSession::run_pull_through`], the body of a
 //! [`OwnedH1UpstreamReservation::submit_pull_through`] exchange holds the driver's drive from its
@@ -70,6 +80,7 @@ use roxygen_core::events::HttpBodyEvent;
 use roxygen_core::events::ResumeFuture;
 use roxygen_core::events::ResumeStatus;
 use roxygen_core::headers::HttpHeaderCode;
+use roxygen_core::http::HttpHeaderSize;
 use roxygen_core::http::HttpMethod;
 use roxygen_core::ingress_completion::IngressCompletion;
 use roxygen_core::source_holder::HttpSourceHolder;
@@ -109,6 +120,11 @@ struct Shared {
     closed: RefCell<Option<HttpError>>,
     observer: RefCell<Option<Rc<dyn OwnedUpstreamObserver>>>,
     queued: RefCell<Option<Submission>>,
+    /// Set while the driver polls. A callback that panics then is contained and reported
+    /// (`DIV-056`); otherwise its panic reaches the caller.
+    polling: Cell<bool>,
+    /// The observer panicked while the driver polled, which drains the connection (`DIV-056`).
+    escalate_drain: Cell<bool>,
     /// Who polls the driver of a session run with `run_pull_through` (`DIV-047`).
     drive: Drive,
 }
@@ -241,6 +257,46 @@ impl Shared {
         }
     }
 
+    /// Runs one admission callback at `site`. While the driver polls, a panic is reported and
+    /// disposed of, and an observer's or the returning hook's also drains the connection
+    /// (`DIV-056`); otherwise the first panic is kept in `first` for `finish_panic` to raise to
+    /// the caller.
+    #[inline(always)]
+    fn contain_callback(
+        &self,
+        first: &mut Option<PanicPayload>,
+        site: PanicSite,
+        stream: Option<StreamId>,
+        callback: impl FnOnce(),
+    ) {
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(callback)) {
+            self.callback_panicked(first, site, stream, panic);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn callback_panicked(
+        &self,
+        first: &mut Option<PanicPayload>,
+        site: PanicSite,
+        stream: Option<StreamId>,
+        panic: PanicPayload,
+    ) {
+        if !self.polling.get() {
+            if first.is_none() {
+                *first = Some(panic);
+            } else {
+                discard_panic(panic);
+            }
+            return;
+        }
+        report_panic(&self.context, site, stream, panic);
+        if site == PanicSite::UpstreamObserver {
+            self.escalate_drain.set(true);
+        }
+    }
+
     fn release(&self, stream: Option<StreamId>, undelivered: Option<&Cell<bool>>) {
         self.used.set(
             self.used
@@ -250,26 +306,33 @@ impl Shared {
         );
         let observer = self.observer.borrow().clone();
         let mut panic = None;
+        let site = PanicSite::UpstreamObserver;
         if let Some(observer) = observer {
             if let Some(undelivered) = undelivered {
                 undelivered.set(true);
-                capture(&mut panic, || observer.capacity_released_before_delivery());
+                self.contain_callback(&mut panic, site, stream, || {
+                    observer.capacity_released_before_delivery()
+                });
             }
             if let Some(stream) = stream {
-                capture(&mut panic, || observer.capacity_released(stream));
+                self.contain_callback(&mut panic, site, Some(stream), || {
+                    observer.capacity_released(stream)
+                });
             }
             if self.available() != 0 {
-                capture(&mut panic, || observer.capacity_available());
+                self.contain_callback(&mut panic, site, stream, || observer.capacity_available());
             }
         }
         // The slot is returning again, which nothing announces.
         if self.available() == 0 && self.admits() != 0 {
             let hook = self.returning_hook.borrow().clone();
             if let Some(hook) = hook {
-                capture(&mut panic, || hook());
+                self.contain_callback(&mut panic, site, stream, || hook());
             }
         }
-        capture(&mut panic, || self.wake.wake_by_ref());
+        self.contain_callback(&mut panic, PanicSite::Transport, None, || {
+            self.wake.wake_by_ref()
+        });
         finish_panic(panic);
     }
 
@@ -280,7 +343,11 @@ impl Shared {
             .then(|| self.observer.borrow().clone())
             .flatten();
         if let Some(observer) = observer {
-            observer.capacity_available();
+            let mut panic = None;
+            self.contain_callback(&mut panic, PanicSite::UpstreamObserver, None, || {
+                observer.capacity_available()
+            });
+            finish_panic(panic);
         }
     }
 
@@ -302,12 +369,18 @@ impl Shared {
         }
         let mut panic = None;
         if let Some(mut submission) = queued {
-            capture(&mut panic, || submission.refuse(error.clone()));
+            self.contain_callback(&mut panic, PanicSite::Submission, None, || {
+                submission.refuse(error.clone())
+            });
         }
         if let Some(observer) = observer {
-            capture(&mut panic, || observer.admission_closed());
+            self.contain_callback(&mut panic, PanicSite::UpstreamObserver, None, || {
+                observer.admission_closed()
+            });
         }
-        capture(&mut panic, || self.wake.wake_by_ref());
+        self.contain_callback(&mut panic, PanicSite::Transport, None, || {
+            self.wake.wake_by_ref()
+        });
         finish_panic(panic);
     }
 }
@@ -320,6 +393,175 @@ fn finish_panic(panic: Option<PanicPayload>) {
             resume_unwind(panic);
         }
     }
+}
+
+#[inline(always)]
+fn guarded<T>(action: impl FnOnce() -> T) -> Result<T, PanicPayload> {
+    catch_unwind(AssertUnwindSafe(action))
+}
+
+/// Reports a panic contained at `site` and disposes of it.
+#[cold]
+#[inline(never)]
+fn report_panic(
+    context: &WorkerContext,
+    site: PanicSite,
+    stream: Option<StreamId>,
+    panic: PanicPayload,
+) {
+    report_contained_panic(context, site, stream, &*panic);
+    discard_panic(panic);
+}
+
+/// Reports a panic in a teardown step or a released field, and disposes of it.
+#[cold]
+#[inline(never)]
+fn teardown_panicked(context: &WorkerContext, panic: PanicPayload) {
+    report_panic(context, PanicSite::Teardown, None, panic);
+}
+
+/// Reports a panic contained at an Exchange-scope `site` of the exchange `id`, disposes of it,
+/// and returns the error that fails that exchange, and with it the connection (`DIV-056`).
+#[cold]
+#[inline(never)]
+fn exchange_panicked(
+    context: &WorkerContext,
+    site: PanicSite,
+    id: StreamId,
+    panic: PanicPayload,
+) -> HttpError {
+    report_panic(context, site, Some(id), panic);
+    failure(
+        HttpErrorCode::INTERNAL_ERROR,
+        b"owned H1 upstream exchange callback panicked",
+    )
+}
+
+/// Drops `field` under its own unwind boundary, reporting a panic as a teardown step's.
+#[inline(always)]
+fn release_field<T>(context: &WorkerContext, field: T) {
+    if let Err(panic) = guarded(|| drop(field)) {
+        teardown_panicked(context, panic);
+    }
+}
+
+/// Unwinds to the per-turn catch after a Driver-scope panic its site already reported, so the
+/// catch starts the teardown without reporting it again (`DIV-056`).
+struct ReportedPanic;
+
+/// Reports a panic that reached the per-turn catch, unless its site already did.
+#[cold]
+#[inline(never)]
+fn report_turn_panic(context: &WorkerContext, panic: &PanicPayload) {
+    if !panic.is::<ReportedPanic>() {
+        report_contained_panic(context, PanicSite::DriverTurn, None, &**panic);
+    }
+}
+
+/// The panicking teardown polls of each native operation, counted in total (`DIV-056`).
+#[derive(Default)]
+struct TeardownState {
+    read_panics: u8,
+    write_panics: u8,
+    queue_panics: u8,
+}
+
+/// The panicking teardown polls after which a native operation is dropped unfinished.
+const TEARDOWN_PANIC_LIMIT: u8 = 3;
+
+/// Marks the connection as polled by its driver while the guard lives, then restores the
+/// previous mark. It holds the connection's state weakly, so it never drops the last reference
+/// to it (`DIV-056`).
+struct SharedPolling(Weak<Shared>, bool);
+
+impl SharedPolling {
+    #[inline(always)]
+    fn enter(shared: &Rc<Shared>) -> Self {
+        Self(Rc::downgrade(shared), shared.polling.replace(true))
+    }
+}
+
+impl Drop for SharedPolling {
+    fn drop(&mut self) {
+        if let Some(shared) = self.0.upgrade() {
+            shared.polling.set(self.1);
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn poisoned_run() -> HttpError {
+    failure(
+        HttpErrorCode::INTERNAL_ERROR,
+        b"owned H1 upstream runner unwound out of an earlier poll",
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn polled_after_completion() -> HttpError {
+    failure(
+        HttpErrorCode::INVALID_STATE_TRANSITION,
+        b"owned H1 upstream runner polled after completion",
+    )
+}
+
+/// Cancels each request byte-event registration of the exchange `id` with
+/// `INVALID_STATE_TRANSITION`, as `cancel_byte_events` does, each under its own unwind boundary:
+/// a panicking callback is reported, and the other registrations still get that error
+/// (`DIV-056`).
+fn refuse_request_byte_events(
+    context: &WorkerContext,
+    id: StreamId,
+    registrations: Vec<HttpByteEventRegistration>,
+) {
+    if registrations.is_empty() {
+        return;
+    }
+    #[cfg(test)]
+    count(&BYTE_EVENT_REFUSALS);
+    let error = failure(
+        HttpErrorCode::INVALID_STATE_TRANSITION,
+        b"owned H1 delivers no byte events",
+    );
+    for mut registration in registrations {
+        if let Err(panic) = guarded(|| registration.cancel(&error, None)) {
+            report_panic(context, PanicSite::ByteEvent, Some(id), panic);
+        }
+    }
+}
+
+/// Runs the request head's encoded-headers callback with the head's encoded size, then drops
+/// the head event, under one unwind boundary when it carries a callback. A panic is reported; it
+/// fails the request only when the head leaves a body to follow (`DIV-056`).
+fn finish_head_event(
+    context: &WorkerContext,
+    id: StreamId,
+    mut headers: HttpHeaderEvent,
+    size: Option<HttpHeaderSize>,
+    eom: bool,
+) -> Result<(), HttpError> {
+    if !headers.has_egress_headers_callback() {
+        drop(headers);
+        return Ok(());
+    }
+    let Err(panic) = guarded(move || {
+        if let Some(size) = size {
+            headers.on_headers_encoded(size);
+        }
+        drop(headers);
+    }) else {
+        return Ok(());
+    };
+    report_panic(context, PanicSite::HeadersEncoded, Some(id), panic);
+    if eom {
+        return Ok(());
+    }
+    Err(failure(
+        HttpErrorCode::INTERNAL_ERROR,
+        b"owned H1 upstream exchange callback panicked",
+    ))
 }
 
 /// Owner-local upstream admission and connection lifetime controls.
@@ -1664,17 +1906,29 @@ fn resume_cancelled() -> HttpError {
 }
 
 /// A poll-driven HTTP/1.1 upstream connection with one exchange at a time.
-pub struct OwnedH1UpstreamSession(UpstreamDriver);
+pub struct OwnedH1UpstreamSession(Option<UpstreamDriver>);
+
+/// A session dropped unrun is abandoned as a run would be.
+impl Drop for OwnedH1UpstreamSession {
+    fn drop(&mut self) {
+        if let Some(driver) = self.0.take() {
+            driver.abandon(false);
+        }
+    }
+}
 
 impl OwnedH1UpstreamSession {
     pub fn new(options: OwnedH1Options) -> Result<(Self, OwnedH1UpstreamHandle), HttpError> {
         let (driver, handle) = UpstreamDriver::new(options)?;
-        Ok((Self(driver), handle))
+        Ok((Self(Some(driver)), handle))
     }
 
     /// Runs inside the caller's registered worker cleanup scope, as `OwnedH2Session::run`.
-    pub fn run(self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
-        UpstreamRun(Some(self.0))
+    pub fn run(mut self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
+        UpstreamRun {
+            driver: self.0.take(),
+            poisoned: false,
+        }
     }
 
     /// Roxygen-only (`DIV-047`): [`Self::run`] for a connection whose
@@ -1682,16 +1936,18 @@ impl OwnedH1UpstreamSession {
     /// rooted as `run` is, and is `run` while no pull-through exchange holds the drive; plain
     /// submissions behave as under `run`. While a body holds the drive, this future does not
     /// poll the driver; a cancel input, a connection failure or this future's drop takes the
-    /// drive back, after which it polls the driver at once. A run that completes, or a callback
-    /// panic the driver retains, inside a body's read is left to this future, which marks the
-    /// run finished, drops the driver and returns the result or resumes the panic.
+    /// drive back, after which it polls the driver at once. A run that completes inside a body's
+    /// read is left to this future, which marks the run finished, releases the driver and
+    /// returns the result.
     ///
     /// Worker cancellation is not one of the driver's wake sources, as under `run`. Its root
     /// must therefore poll this future at worker quiescence, and poll or drop it at worker
     /// cancellation, as `RunScope` does: a held drive is otherwise taken back only at the
     /// body's next read.
-    pub fn run_pull_through(self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
-        let mut driver = self.0;
+    pub fn run_pull_through(
+        mut self,
+    ) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
+        let mut driver = self.0.take().expect("an unrun session holds its driver");
         let shared = Rc::clone(&driver.shared);
         let task = Arc::clone(&driver.task);
         PullThroughRun(Rc::new_cyclic(|run| {
@@ -1701,30 +1957,28 @@ impl OwnedH1UpstreamSession {
                 task,
                 driver: RefCell::new(Some(driver)),
                 outcome: RefCell::new(None),
+                poisoned: Cell::new(false),
             }
         }))
     }
 }
 
-/// A pull-through connection's driver, and the outcome an inline poll reached, which only the
+/// A pull-through connection's driver, and the result an inline poll reached, which only the
 /// run future takes (`DIV-047`).
 struct PullThrough {
     shared: Rc<Shared>,
     task: Arc<TaskWaker>,
     driver: RefCell<Option<UpstreamDriver>>,
-    outcome: RefCell<Option<RunOutcome>>,
-}
-
-/// A run's result and its retained callback panic.
-struct RunOutcome {
-    result: Result<UniplexRunSummary, HttpError>,
-    panic: Option<PanicPayload>,
+    outcome: RefCell<Option<Result<UniplexRunSummary, HttpError>>>,
+    /// Set while a poll of the driver runs and cleared as it returns, as `UpstreamRun`'s
+    /// (`DIV-056`).
+    poisoned: Cell<bool>,
 }
 
 impl PullThrough {
     /// Polls the driver from the holder's read, with its context; a read nested in a callback
     /// of that poll skips. A completion is stashed for the run future, which it wakes: only the
-    /// run future marks the run finished and drops the driver.
+    /// run future marks the run finished and releases the driver.
     fn drive(&self, context: &mut Context<'_>) {
         let Ok(mut cell) = self.driver.try_borrow_mut() else {
             return;
@@ -1732,17 +1986,24 @@ impl PullThrough {
         let Some(driver) = cell.as_mut() else {
             return;
         };
+        if self.poisoned.get() {
+            return;
+        }
         let drive = &self.shared.drive;
+        self.poisoned.set(true);
         drive.driving.set(true);
-        let poll = driver.poll_isolated(context);
+        let poll = {
+            let _polling = SharedPolling::enter(&driver.shared);
+            driver.poll_contained(context)
+        };
         drive.driving.set(false);
         drive.yield_pending.set(driver.budget_yield.is_some());
+        self.poisoned.set(false);
         let Poll::Ready(result) = poll else {
             return;
         };
-        let panic = driver.panic.take();
         drop(cell);
-        *self.outcome.borrow_mut() = Some(RunOutcome { result, panic });
+        *self.outcome.borrow_mut() = Some(result);
         let run = drive.run_waker.borrow().clone();
         if let Some(run) = run {
             run.wake();
@@ -1759,6 +2020,9 @@ impl Future for PullThroughRun {
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let run = &self.0;
+        if run.poisoned.get() {
+            return Poll::Ready(Err(poisoned_run()));
+        }
         let drive = &run.shared.drive;
         let previous = {
             let mut waker = drive.run_waker.borrow_mut();
@@ -1773,14 +2037,14 @@ impl Future for PullThroughRun {
         };
         drop(previous);
         let outcome = run.outcome.borrow_mut().take();
-        if let Some(RunOutcome { result, panic }) = outcome {
-            let mut driver = run
+        if let Some(result) = outcome {
+            let driver = run
                 .driver
                 .borrow_mut()
                 .take()
                 .expect("a stashed completion leaves its driver to the run");
-            driver.panic = panic;
-            return finish_run(driver, result);
+            let _polling = SharedPolling::enter(&run.shared);
+            return Poll::Ready(driver.finish_run(result));
         }
         // While a body holds the drive, the run future revokes for the inputs that reach it
         // instead of the holder: the held exchange's token and worker cancellation.
@@ -1796,72 +2060,106 @@ impl Future for PullThroughRun {
             run.shared.revoke(None);
         }
         let mut cell = run.driver.borrow_mut();
-        let driver = cell
-            .as_mut()
-            .expect("owned H1 upstream runner polled after completion");
-        let Poll::Ready(result) = driver.poll_isolated(context) else {
-            return Poll::Pending;
+        let Some(driver) = cell.as_mut() else {
+            return Poll::Ready(Err(polled_after_completion()));
         };
-        let driver = cell
-            .take()
-            .expect("owned H1 upstream runner completes once");
-        drop(cell);
-        finish_run(driver, result)
+        run.poisoned.set(true);
+        let polling = SharedPolling::enter(&driver.shared);
+        let polled = match driver.poll_contained(context) {
+            Poll::Pending => {
+                drop(cell);
+                Poll::Pending
+            }
+            Poll::Ready(result) => {
+                let driver = cell
+                    .take()
+                    .expect("owned H1 upstream runner completes once");
+                drop(cell);
+                Poll::Ready(driver.finish_run(result))
+            }
+        };
+        drop(polling);
+        #[cfg(test)]
+        fault_upstream_run_poll(&polled);
+        run.poisoned.set(false);
+        polled
     }
 }
 
 impl Drop for PullThroughRun {
     fn drop(&mut self) {
         let run = &self.0;
-        run.shared.revoke(None);
+        if let Err(panic) = guarded(|| run.shared.revoke(None)) {
+            report_panic(&run.shared.context, PanicSite::Transport, None, panic);
+        }
         let outcome = run.outcome.borrow_mut().take();
-        let driver = run.driver.borrow_mut().take();
-        let Some(outcome) = outcome else {
-            // As `run`'s future drops its driver: an unfinished one aborts.
-            drop(driver);
+        let Some(driver) = run.driver.borrow_mut().take() else {
             return;
         };
-        // A stashed completion proves the cleanup joined: the driver drops as a finished
-        // run's does, and its panic resumes unless this drop is already unwinding.
-        run.shared.complete.set(true);
-        drop(driver);
-        finish_panic(outcome.panic);
+        let Some(result) = outcome else {
+            driver.abandon(run.poisoned.get());
+            return;
+        };
+        // A stashed completion proves the cleanup joined: the driver finishes as a completed
+        // run's does.
+        let _polling = SharedPolling::enter(&run.shared);
+        drop(driver.finish_run(result));
     }
 }
 
-/// Marks a run whose driver completed finished, then resumes a retained panic or returns its
-/// result; the driver drops after that.
-fn finish_run(
-    mut driver: UpstreamDriver,
-    result: Result<UniplexRunSummary, HttpError>,
-) -> Poll<Result<UniplexRunSummary, HttpError>> {
-    driver.shared.complete.set(true);
-    if let Some(panic) = driver.panic.take() {
-        resume_unwind(panic);
+/// Makes the poll of a run panic outside the driver's boundaries when the test asked for it.
+#[cfg(test)]
+fn fault_upstream_run_poll(polled: &Poll<Result<UniplexRunSummary, HttpError>>) {
+    if polled.is_pending() && UPSTREAM_RUN_FAULT.take() {
+        panic!("owned H1 upstream run fault");
     }
-    Poll::Ready(result)
 }
 
-/// Drives an [`UpstreamDriver`] to completion, isolating callback panics in every poll.
-struct UpstreamRun(Option<UpstreamDriver>);
+/// Drives an [`UpstreamDriver`] to completion (`DIV-056`). No poll unwinds out of driver code: a
+/// panic that reaches the per-turn boundary is reported and starts a teardown that joins native
+/// I/O, after which the run returns `Err`. Completion publishes `complete` and releases the
+/// driver before returning. A run dropped unfinished is abandoned.
+struct UpstreamRun {
+    driver: Option<UpstreamDriver>,
+    /// Set while a poll runs and cleared as it returns, so it stays set only after a poll that
+    /// unwound. Such a run returns `Err` without touching its driver again, and its abandonment
+    /// does not assert that its cleanup joined.
+    poisoned: bool,
+}
+
+impl Drop for UpstreamRun {
+    fn drop(&mut self) {
+        if let Some(driver) = self.driver.take() {
+            driver.abandon(self.poisoned);
+        }
+    }
+}
 
 impl Future for UpstreamRun {
     type Output = Result<UniplexRunSummary, HttpError>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let driver = this
-            .0
-            .as_mut()
-            .expect("owned H1 upstream runner polled after completion");
-        let Poll::Ready(result) = driver.poll_isolated(context) else {
-            return Poll::Pending;
+        if this.poisoned {
+            return Poll::Ready(Err(poisoned_run()));
+        }
+        let Some(driver) = this.driver.as_mut() else {
+            return Poll::Ready(Err(polled_after_completion()));
         };
-        let driver = this
-            .0
-            .take()
-            .expect("owned H1 upstream runner completes once");
-        finish_run(driver, result)
+        this.poisoned = true;
+        let polled = {
+            let _polling = SharedPolling::enter(&driver.shared);
+            driver.poll_contained(context).map(|result| {
+                this.driver
+                    .take()
+                    .expect("owned H1 upstream runner completes once")
+                    .finish_run(result)
+            })
+        };
+        #[cfg(test)]
+        fault_upstream_run_poll(&polled);
+        this.poisoned = false;
+        polled
     }
 }
 
@@ -1900,7 +2198,6 @@ struct UpstreamDriver {
     /// The request body was not polled because the next write must make room for it.
     body_awaits_egress: bool,
     fatal: Option<HttpError>,
-    panic: Option<PanicPayload>,
     transport_reset: bool,
     write_end: u64,
     summary: UniplexRunSummary,
@@ -1911,6 +2208,19 @@ struct UpstreamDriver {
     ordinary_upgrades: bool,
     /// The run of a session run with `run_pull_through` (`DIV-047`).
     pull_through: Weak<PullThrough>,
+    /// Set once a Driver-scope panic started the teardown (`DIV-056`).
+    teardown: Option<Box<TeardownState>>,
+}
+
+/// What a commitment leaves to run outside its unwind boundary, because it runs caller code:
+/// the request head's callbacks and the submitter's acknowledgment (`DIV-056`).
+struct Committed {
+    headers: HttpHeaderEvent,
+    header_size: Option<HttpHeaderSize>,
+    eom: bool,
+    status: Rc<RequestStatus>,
+    source: HttpResponseSource,
+    id: StreamId,
 }
 
 /// The codec callback: borrows what one response `on_ingress_with_callback` call may change.
@@ -2106,6 +2416,8 @@ impl UpstreamDriver {
             closed: RefCell::new(None),
             observer: RefCell::new(None),
             queued: RefCell::new(None),
+            polling: Cell::new(false),
+            escalate_drain: Cell::new(false),
             drive: Drive::default(),
         });
         let cancellation = CancellationSource::new();
@@ -2157,7 +2469,6 @@ impl UpstreamDriver {
                 response_pause: false,
                 body_awaits_egress: false,
                 fatal: None,
-                panic: None,
                 transport_reset: false,
                 write_end: 0,
                 summary: UniplexRunSummary::default(),
@@ -2165,41 +2476,269 @@ impl UpstreamDriver {
                 started: false,
                 ordinary_upgrades,
                 pull_through: Weak::new(),
+                teardown: None,
             },
             OwnedH1UpstreamHandle(shared),
         ))
     }
 
-    fn retain_panic(&mut self, panic: PanicPayload) {
-        if self.panic.is_none() {
-            self.panic = Some(panic);
-        } else {
-            discard_panic(panic);
-        }
-    }
-
-    /// Polls the driver, isolating a callback panic: the panic is retained, the connection
-    /// aborts, and the driver is woken to finish its cleanup.
+    /// Polls the driver (`DIV-056`): in its teardown, native I/O only; otherwise a turn, whose
+    /// panic is reported and starts the teardown.
     #[inline(always)]
-    fn poll_isolated(
+    fn poll_contained(
         &mut self,
         context: &mut Context<'_>,
     ) -> Poll<Result<UniplexRunSummary, HttpError>> {
+        if self.teardown.is_some() {
+            return self.poll_teardown(context);
+        }
         self.started = true;
         match catch_unwind(AssertUnwindSafe(|| self.poll(context))) {
             Ok(poll) => poll,
             Err(panic) => {
-                report_contained_panic(&self.context, PanicSite::DriverTurn, None, &*panic);
-                self.retain_panic(panic);
-                self.abort(failure(
-                    HttpErrorCode::INTERNAL_ERROR,
-                    b"owned H1 upstream callback panicked",
-                ));
-                // Through the task waker, as every wake of the driver goes (`DIV-047`).
-                self.task.wake();
+                report_turn_panic(&self.context, &panic);
+                self.poll_panicked(panic);
                 Poll::Pending
             }
         }
+    }
+
+    /// Starts the teardown after a Driver-scope panic that the caller reported (`DIV-056`): the
+    /// connection aborts, and the run's next polls join native I/O.
+    #[cold]
+    #[inline(never)]
+    fn poll_panicked(&mut self, panic: PanicPayload) {
+        discard_panic(panic);
+        self.teardown = Some(Box::default());
+        if let Err(panic) = guarded(|| {
+            self.abort(failure(
+                HttpErrorCode::INTERNAL_ERROR,
+                b"owned H1 upstream callback panicked",
+            ))
+        }) {
+            teardown_panicked(&self.context, panic);
+        }
+        self.read_wake.mark();
+        self.write_wake.mark();
+        self.wake_teardown();
+    }
+
+    /// Wakes the run for its next teardown poll, through the task waker, as every wake of the
+    /// driver goes (`DIV-047`).
+    fn wake_teardown(&self) {
+        if let Err(panic) = guarded(|| self.task.wake()) {
+            teardown_panicked(&self.context, panic);
+        }
+    }
+
+    /// One poll of the teardown (`DIV-056`). Native I/O is polled until it completes; the codec,
+    /// the exchange and admission are not. A teardown poll that panics is polled again on the
+    /// next wake, and an operation whose teardown polls panicked `TEARDOWN_PANIC_LIMIT` times in
+    /// total is dropped unfinished. Once no native operation is pending, the run fails with the
+    /// connection's first error. Every step runs under its own unwind boundary.
+    #[cold]
+    #[inline(never)]
+    fn poll_teardown(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<UniplexRunSummary, HttpError>> {
+        let task = &self.task;
+        if let Err(panic) = guarded(|| task.register(context.waker())) {
+            teardown_panicked(&self.context, panic);
+        }
+        if !self.transport_reset
+            && let Err(panic) = guarded(|| self.reset_transport())
+        {
+            teardown_panicked(&self.context, panic);
+        }
+        let mut teardown = self.teardown.take().unwrap_or_default();
+        self.poll_teardown_read(&mut teardown);
+        self.poll_teardown_write(&mut teardown);
+        self.teardown = Some(teardown);
+        if self.read.is_reading() || self.writes_pending() {
+            return Poll::Pending;
+        }
+        Poll::Ready(Err(self.fatal.take().unwrap_or_else(|| {
+            failure(
+                HttpErrorCode::INTERNAL_ERROR,
+                b"owned H1 upstream callback panicked",
+            )
+        })))
+    }
+
+    fn poll_teardown_read(&mut self, teardown: &mut TeardownState) {
+        if !self.read.is_reading() || !self.read_wake.take_ready() {
+            return;
+        }
+        let read = &mut self.read;
+        let waker = &self.read_waker;
+        let polled = guarded(|| read.poll(&mut Context::from_waker(waker)).map(drop));
+        if let Err(panic) = polled
+            && self.teardown_poll_panicked(&mut teardown.read_panics, &self.read_wake, panic)
+            && let Err(panic) = guarded(|| self.read.abandon())
+        {
+            teardown_panicked(&self.context, panic);
+        }
+    }
+
+    fn poll_teardown_write(&mut self, teardown: &mut TeardownState) {
+        if !self.write_wake.take_ready() {
+            return;
+        }
+        if let Some(write) = &mut self.write {
+            let waker = &self.write_waker;
+            let polled = guarded(|| {
+                write
+                    .as_mut()
+                    .poll(&mut Context::from_waker(waker))
+                    .map(drop)
+            });
+            let finished = match polled {
+                Ok(polled) => polled.is_ready(),
+                Err(panic) => {
+                    self.teardown_poll_panicked(&mut teardown.write_panics, &self.write_wake, panic)
+                }
+            };
+            if finished {
+                release_field(&self.context, self.write.take());
+            }
+        }
+        if let Some(queue) = &mut self.write_queue {
+            let waker = &self.write_waker;
+            let polled = guarded(|| {
+                let mut context = Context::from_waker(waker);
+                while !queue.is_idle() && queue.poll_complete(&mut context).is_ready() {}
+            });
+            if let Err(panic) = polled
+                && self.teardown_poll_panicked(&mut teardown.queue_panics, &self.write_wake, panic)
+            {
+                release_field(&self.context, self.write_queue.take());
+            }
+        }
+    }
+
+    /// Reports a teardown poll of a native operation that panicked and counts it in `panics`.
+    /// Returns whether the operation reached the limit and must be dropped; otherwise `wake` is
+    /// marked, so the next teardown poll polls it again.
+    #[cold]
+    #[inline(never)]
+    fn teardown_poll_panicked(&self, panics: &mut u8, wake: &Signal, panic: PanicPayload) -> bool {
+        teardown_panicked(&self.context, panic);
+        *panics += 1;
+        if *panics >= TEARDOWN_PANIC_LIMIT {
+            return true;
+        }
+        wake.mark();
+        self.wake_teardown();
+        false
+    }
+
+    /// Completes a run: the session is finished, and the driver is released (`DIV-056`).
+    #[cold]
+    #[inline(never)]
+    fn finish_run(
+        self,
+        result: Result<UniplexRunSummary, HttpError>,
+    ) -> Result<UniplexRunSummary, HttpError> {
+        self.shared.complete.set(true);
+        self.release();
+        result
+    }
+
+    /// Abandons a run dropped unfinished, or a session dropped unrun (`DIV-056`): the connection
+    /// aborts with `CORO_CANCELLED`, which closes admission, cancels and drops the exchange and
+    /// resets the transport, and the driver's fields are dropped, each step under its own unwind
+    /// boundary. A started run then panics, because its owner dropped it before its cleanup
+    /// joined, unless its poll unwound (`poisoned`), its thread is unwinding, or the worker is in
+    /// a forced teardown.
+    #[cold]
+    #[inline(never)]
+    fn abandon(mut self, poisoned: bool) {
+        let polling = SharedPolling::enter(&self.shared);
+        if let Err(panic) = guarded(|| {
+            self.abort(failure(
+                HttpErrorCode::CORO_CANCELLED,
+                b"owned H1 upstream runner abandoned before cleanup completed",
+            ))
+        }) {
+            teardown_panicked(&self.context, panic);
+        }
+        let started = self.started;
+        self.release();
+        drop(polling);
+        assert!(
+            !started || poisoned || std::thread::panicking() || in_forced_teardown(),
+            "started owned H1 upstream runner dropped before native I/O cleanup joined"
+        );
+    }
+
+    /// Drops every field, in declaration order, each that can run foreign code under its own
+    /// unwind boundary, and last the worker context those boundaries report to.
+    #[cold]
+    #[inline(never)]
+    fn release(self) {
+        let Self {
+            context,
+            transport,
+            shared,
+            config: _,
+            codec,
+            exchange,
+            ingress,
+            egress,
+            read,
+            write,
+            write_queue,
+            task,
+            read_wake,
+            read_waker,
+            write_wake,
+            write_waker,
+            stream_wake,
+            stream_waker,
+            cancellation,
+            write_cancellation,
+            eof: _,
+            eof_processed: _,
+            read_error,
+            failed_read,
+            flow_pause: _,
+            response_pause: _,
+            body_awaits_egress: _,
+            fatal,
+            transport_reset: _,
+            write_end: _,
+            summary: _,
+            budget_yield,
+            started: _,
+            ordinary_upgrades: _,
+            pull_through,
+            teardown: _,
+        } = self;
+        release_field(&context, transport);
+        release_field(&context, shared);
+        release_field(&context, codec);
+        release_field(&context, exchange);
+        release_field(&context, ingress);
+        release_field(&context, egress);
+        release_field(&context, read);
+        release_field(&context, write);
+        release_field(&context, write_queue);
+        release_field(&context, task);
+        release_field(&context, read_wake);
+        release_field(&context, read_waker);
+        release_field(&context, write_wake);
+        release_field(&context, write_waker);
+        release_field(&context, stream_wake);
+        release_field(&context, stream_waker);
+        release_field(&context, cancellation);
+        release_field(&context, write_cancellation);
+        release_field(&context, read_error);
+        release_field(&context, failed_read);
+        release_field(&context, fatal);
+        release_field(&context, budget_yield);
+        drop(pull_through);
+        drop(context);
     }
 
     fn poll(&mut self, context: &mut Context<'_>) -> Poll<Result<UniplexRunSummary, HttpError>> {
@@ -2403,9 +2942,11 @@ impl UpstreamDriver {
             || (self.fatal.is_none() && self.settle_due())
     }
 
-    /// Whether `poll_admission` acts: EOF closes admission, or a queued submission can commit.
+    /// Whether `poll_admission` acts: a drain an observer's panic requested or EOF closes
+    /// admission, or a queued submission can commit.
     fn admission_due(&self) -> bool {
-        (self.eof && self.shared.closed.borrow().is_none())
+        self.shared.escalate_drain.get()
+            || (self.eof && self.shared.closed.borrow().is_none())
             || (self.exchange.is_none()
                 && self.ingress.is_empty()
                 && self.shared.queued.borrow().is_some())
@@ -2466,6 +3007,10 @@ impl UpstreamDriver {
     /// Closes admission once the connection can take no request, and otherwise commits a
     /// queued submission when no exchange is live. Returns whether either happened.
     fn poll_admission(&mut self) -> bool {
+        if self.shared.escalate_drain.get() {
+            self.drain_after_observer_panic();
+            return true;
+        }
         if self.eof && self.shared.closed.borrow().is_none() {
             self.shared
                 .close(failure(HttpErrorCode::TRANSPORT_EOF, b"transport EOF"));
@@ -2479,25 +3024,76 @@ impl UpstreamDriver {
         let Some(mut submission) = self.shared.queued.borrow_mut().take() else {
             return false;
         };
-        let result = catch_unwind(AssertUnwindSafe(|| self.commit(&mut submission)));
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => submission.reject(error),
-            Err(panic) => {
-                let mut first = Some(panic);
-                capture(&mut first, || {
-                    submission.reject(failure(
-                        HttpErrorCode::INTERNAL_ERROR,
-                        b"upstream request commitment panicked",
-                    ))
-                });
-                finish_panic(first);
-            }
+        match catch_unwind(AssertUnwindSafe(|| self.commit(&mut submission))) {
+            Ok(Ok(committed)) => self.finish_commit(committed),
+            Ok(Err(error)) => self.reject_uncommitted(&mut submission, error),
+            Err(panic) => self.commit_panicked(&mut submission, panic),
         }
         true
     }
 
-    fn commit(&mut self, submission: &mut Submission) -> Result<(), HttpError> {
+    /// Closes admission after an observer panicked inside the driver's poll, as
+    /// `close_when_idle` closes it, without recording a caller's drain request (`DIV-056`).
+    #[cold]
+    #[inline(never)]
+    fn drain_after_observer_panic(&self) {
+        self.shared.escalate_drain.set(false);
+        self.shared.close(failure(
+            HttpErrorCode::REFUSED_STREAM,
+            b"owned upstream connection is draining",
+        ));
+    }
+
+    /// Rejects a submission the driver did not commit, under its own unwind boundary
+    /// (`DIV-056`).
+    #[cold]
+    #[inline(never)]
+    fn reject_uncommitted(&self, submission: &mut Submission, error: HttpError) {
+        if let Err(panic) = guarded(|| submission.reject(error)) {
+            report_panic(&self.context, PanicSite::Submission, None, panic);
+        }
+    }
+
+    /// Reports a panic committing a request, which runs only Roxygen code and can leave the
+    /// connection's state half updated, rejects the submission, then unwinds to the per-turn
+    /// catch, which tears the connection down without reporting the panic again (`DIV-056`).
+    #[cold]
+    #[inline(never)]
+    fn commit_panicked(&self, submission: &mut Submission, panic: PanicPayload) -> ! {
+        report_panic(&self.context, PanicSite::Commit, None, panic);
+        self.reject_uncommitted(
+            submission,
+            failure(
+                HttpErrorCode::INTERNAL_ERROR,
+                b"upstream request commitment panicked",
+            ),
+        );
+        resume_unwind(Box::new(ReportedPanic));
+    }
+
+    /// Runs what a commitment left: the head's byte-event refusals and its encoded-headers
+    /// callback, each under its own unwind boundary, then the acknowledgment, which wakes the
+    /// submitter (`DIV-056`). A head with a body to follow whose callback panicked fails the
+    /// request, and the connection with it.
+    fn finish_commit(&mut self, committed: Committed) {
+        let Committed {
+            mut headers,
+            header_size,
+            eom,
+            status,
+            source,
+            id,
+        } = committed;
+        refuse_request_byte_events(&self.context, id, headers.take_byte_event_registrations());
+        if let Err(error) = finish_head_event(&self.context, id, headers, header_size, eom) {
+            self.abort(error);
+            return;
+        }
+        status.acknowledge(id, source);
+        self.stream_wake.mark();
+    }
+
+    fn commit(&mut self, submission: &mut Submission) -> Result<Committed, HttpError> {
         if let Some(error) = submission.status.selected_error() {
             return Err(error);
         }
@@ -2613,15 +3209,10 @@ impl UpstreamDriver {
             },
             &mut NoopCallback,
         )?;
-        let mut headers = submission
-            .headers
-            .take()
-            .expect("queued request headers are owned");
-        cancel_byte_events(headers.take_byte_event_registrations());
-        if let Some(size) = generated.header_size {
-            headers.on_headers_encoded(size);
+        #[cfg(test)]
+        if UPSTREAM_COMMIT_FAULT.take() {
+            panic!("owned H1 upstream commit fault");
         }
-        drop(headers);
         let upload = submission
             .source
             .take()
@@ -2681,9 +3272,17 @@ impl UpstreamDriver {
             let signals = Rc::clone(&self.exchange.as_ref().expect("just committed").signals);
             status.link.set(Some(PullThroughLink { run, signals }));
         }
-        status.acknowledge(id, source);
-        self.stream_wake.mark();
-        Ok(())
+        Ok(Committed {
+            headers: submission
+                .headers
+                .take()
+                .expect("queued request headers are owned"),
+            header_size: generated.header_size,
+            eom,
+            status,
+            source,
+            id,
+        })
     }
 
     fn parse_input(&mut self) -> Result<bool, HttpError> {
@@ -2780,7 +3379,11 @@ impl UpstreamDriver {
             return Err(error);
         }
         let mut context = Context::from_waker(&self.stream_waker);
-        exchange.poll_response_observer(&mut context);
+        if let Err(panic) = guarded(|| exchange.poll_response_observer(&mut context))
+            && let Some(error) = response_observer_panicked(&self.context, exchange, panic)
+        {
+            return Err(error);
+        }
         // The observer's callbacks may cancel the request.
         if let Some(error) = exchange.cancel_error() {
             return Err(error);
@@ -2813,7 +3416,16 @@ impl UpstreamDriver {
             self.body_awaits_egress = true;
             return Ok(());
         }
-        let mut event = match exchange.poll_upload(&mut context, room as u32) {
+        let polled = match guarded(|| exchange.poll_upload(&mut context, room as u32)) {
+            Ok(polled) => polled,
+            Err(panic) => Err(exchange_panicked(
+                &self.context,
+                PanicSite::UploadBody,
+                exchange.id,
+                panic,
+            )),
+        };
+        let mut event = match polled {
             Ok(Some(event)) => event,
             Ok(None) => return Ok(()),
             // As OwnedH2, a cancel selected during the failed read is the first cause.
@@ -2823,7 +3435,11 @@ impl UpstreamDriver {
                     .unwrap_or_else(|| exchange.upload_failed(error)));
             }
         };
-        cancel_byte_events(event.take_byte_event_registrations());
+        refuse_request_byte_events(
+            &self.context,
+            exchange.id,
+            event.take_byte_event_registrations(),
+        );
         // As OwnedH2, the source's read may cancel the request: its event is not serialized.
         if let Some(error) = exchange.cancel_error() {
             return Err(error);
@@ -2972,14 +3588,14 @@ impl UpstreamDriver {
         }
         self.shared.retiring.take();
         let exchange = self.exchange.take().expect("the exchange was present");
-        capture(&mut self.panic, || drop(exchange));
-        // As OwnedH2: a retirement panic fails the connection, and `run` resumes it.
-        if self.panic.is_some() {
-            self.abort(failure(
-                HttpErrorCode::INTERNAL_ERROR,
-                b"owned H1 upstream retirement panicked",
-            ));
-            return true;
+        let id = exchange.id;
+        if let Err(panic) = guarded(|| drop(exchange)) {
+            report_panic(
+                &self.context,
+                PanicSite::ExchangeRetirement,
+                Some(id),
+                panic,
+            );
         }
         self.shared.idle.set(true);
         // A codec that still holds a message open cannot start the next one.
@@ -3211,22 +3827,27 @@ impl UpstreamDriver {
         if !self.transport_reset {
             self.transport_reset = true;
             self.summary.reset = true;
-            capture(&mut self.panic, || self.cancellation.request_cancellation());
-            capture(&mut self.panic, || {
-                self.write_cancellation.request_cancellation()
-            });
-            if let Some(Err(error)) = capture(&mut self.panic, || {
-                self.transport.close_with_reset(&self.context)
-            }) {
-                self.fatal.get_or_insert(error);
+            let site = PanicSite::Transport;
+            if let Err(panic) = guarded(|| self.cancellation.request_cancellation()) {
+                report_panic(&self.context, site, None, panic);
+            }
+            if let Err(panic) = guarded(|| self.write_cancellation.request_cancellation()) {
+                report_panic(&self.context, site, None, panic);
+            }
+            match guarded(|| self.transport.close_with_reset(&self.context)) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    self.fatal.get_or_insert(error);
+                }
+                Err(panic) => report_panic(&self.context, site, None, panic),
             }
         }
     }
 
     /// Fails the connection for a failed read. As `UniplexSession`, admission closes and the
     /// live exchange is cancelled at once, nothing more is read, and the transport resets once
-    /// the request bytes already serialized are written. A panic in that teardown resets it at
-    /// once, and `run` resumes the panic.
+    /// the request bytes already serialized are written, even when a callback panics on the
+    /// way (`DIV-056`).
     #[cold]
     fn fail_read(&mut self, error: HttpError) {
         if self.fatal.is_some() || (self.egress.is_empty() && !self.writes_pending()) {
@@ -3235,9 +3856,6 @@ impl UpstreamDriver {
         }
         self.failed_read = Some(error.clone());
         self.close_and_cancel(&error);
-        if self.panic.is_some() {
-            self.abort(error);
-        }
     }
 
     /// Fails the connection: the live exchange is cancelled and dropped, admission closes,
@@ -3253,45 +3871,48 @@ impl UpstreamDriver {
         self.reset_transport();
     }
 
-    /// Closes admission with `error`, then cancels and drops the live exchange with it.
+    /// Closes admission with `error`, then cancels and drops the live exchange with it. Each
+    /// step runs under its own unwind boundary (`DIV-056`).
     #[cold]
     fn close_and_cancel(&mut self, error: &HttpError) {
         // A held drive returns to the run future first: the polls the run still needs must not
         // wait for the holder's reads, and the wakes below reach only the run (`DIV-047`).
         if let Some(exchange) = &self.exchange {
             let stream = exchange.id;
-            capture(&mut self.panic, || self.shared.revoke(Some(stream)));
+            if let Err(panic) = guarded(|| self.shared.revoke(Some(stream))) {
+                report_panic(&self.context, PanicSite::Transport, None, panic);
+            }
         }
         // Admission closes first, so the exchange's capacity release announces no capacity.
-        capture(&mut self.panic, || self.shared.close(error.clone()));
+        if let Err(panic) = guarded(|| self.shared.close(error.clone())) {
+            report_panic(&self.context, PanicSite::UpstreamObserver, None, panic);
+        }
         if let Some(signals) = self.shared.retiring.take() {
             signals.returning.take();
         }
         if let Some(mut exchange) = self.exchange.take() {
-            capture(&mut self.panic, || exchange.cancel(error));
-            capture(&mut self.panic, || drop(exchange));
+            let id = Some(exchange.id);
+            let site = PanicSite::ExchangeRetirement;
+            if let Err(panic) = guarded(|| exchange.cancel(error)) {
+                report_panic(&self.context, site, id, panic);
+            }
+            if let Err(panic) = guarded(|| drop(exchange)) {
+                report_panic(&self.context, site, id, panic);
+            }
         }
     }
 }
 
-impl Drop for UpstreamDriver {
-    fn drop(&mut self) {
-        if !self.shared.complete.get() {
-            self.abort(failure(
-                HttpErrorCode::CORO_CANCELLED,
-                b"owned H1 upstream runner abandoned before cleanup completed",
-            ));
-            if let Some(panic) = self.panic.take() {
-                if std::thread::panicking() {
-                    discard_panic(panic);
-                } else {
-                    resume_unwind(panic);
-                }
-            }
-            assert!(
-                !self.started || std::thread::panicking() || in_forced_teardown(),
-                "started owned H1 upstream runner dropped before native I/O cleanup joined"
-            );
-        }
-    }
+/// Reports a panic in a request's response observer and returns the error that fails the
+/// request, unless both of its messages ended: a finished exchange keeps its readable response,
+/// as it does a request cancel (`DIV-056`).
+#[cold]
+#[inline(never)]
+fn response_observer_panicked(
+    context: &WorkerContext,
+    exchange: &Exchange,
+    panic: PanicPayload,
+) -> Option<HttpError> {
+    let error = exchange_panicked(context, PanicSite::ResponseObserver, exchange.id, panic);
+    (!(exchange.request_complete && exchange.response_complete)).then_some(error)
 }
