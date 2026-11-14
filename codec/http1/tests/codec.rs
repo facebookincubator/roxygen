@@ -9436,3 +9436,43 @@ fn llhttp_deferred_upgrade_completion_can_pause_before_tunnel_eof() {
     let _ = codec.on_ingress_eof(&mut callback, &mut egress);
     assert_eq!(callback.0.completions, [true, false]);
 }
+
+#[test]
+fn llhttp_header_spans_preserve_fragmented_and_pipelined_fields() {
+    let wire = b"POST /first HTTP/1.1\r\nHost: example.test\r\nX-Long-Name: first-value\r\nX-Empty:\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\nX-Trailer: trailer-value\r\n\r\nGET /next HTTP/1.1\r\nX-Long-Name: second-value\r\nX-Empty: \t\r\n\r\n";
+    for dispatch in CallbackDispatch::ALL {
+        for width in [1, 2, 7, 16, wire.len()] {
+            let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+            let mut recorder = Recorder::default();
+            let mut egress = BufQueue::new(QUEUE_LIMIT);
+            for chunk in wire.chunks(width) {
+                let input = ingress_queue(chunk);
+                assert_eq!(
+                    dispatch
+                        .ingress(&mut codec, &input, &mut recorder, &mut egress)
+                        .consumed,
+                    chunk.len(),
+                );
+            }
+            drop(codec);
+            assert!(recorder.errors.is_empty(), "{dispatch:?}, width={width}");
+            assert_eq!(recorder.messages.len(), 2);
+            for (message, value) in recorder
+                .messages
+                .iter()
+                .zip([b"first-value".as_slice(), b"second-value"])
+            {
+                assert_eq!(message.headers().get_single_or_empty(b"X-Long-Name"), value);
+                assert!(message.headers().exists(b"X-Empty"));
+                assert_eq!(message.headers().get_single_or_empty(b"X-Empty"), b"");
+            }
+            assert_eq!(recorder.bodies, b"x");
+            assert_eq!(recorder.trailers.len(), 1);
+            assert_eq!(
+                recorder.trailers[0].get_single_or_empty(b"X-Trailer"),
+                b"trailer-value"
+            );
+            assert_eq!(recorder.completions, [false, false]);
+        }
+    }
+}

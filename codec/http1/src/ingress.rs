@@ -1,5 +1,40 @@
 use super::*;
 
+#[derive(Default)]
+struct HeaderSpan {
+    borrowed: Option<Range<usize>>,
+}
+
+impl HeaderSpan {
+    fn append(&mut self, owned: &mut Vec<u8>, input: &Bytes, range: Range<usize>) {
+        if owned.is_empty() && self.borrowed.is_none() {
+            self.borrowed = Some(range);
+        } else {
+            self.spill(owned, input);
+            owned.extend_from_slice(&input[range]);
+        }
+    }
+
+    fn bytes<'a>(&self, input: &'a Bytes, owned: &'a [u8]) -> &'a [u8] {
+        match &self.borrowed {
+            Some(range) => &input[range.clone()],
+            None => owned,
+        }
+    }
+
+    fn spill(&mut self, owned: &mut Vec<u8>, input: &Bytes) {
+        if let Some(range) = self.borrowed.take() {
+            owned.extend_from_slice(&input[range]);
+        }
+    }
+}
+
+#[derive(Default)]
+struct HeaderSpans {
+    name: HeaderSpan,
+    value: HeaderSpan,
+}
+
 impl Http1xCodec {
     fn track_header_bytes(&mut self, amount: usize) -> Result<(), (ParseErrorKind, &'static [u8])> {
         self.header_bytes = self.header_bytes.saturating_add(amount);
@@ -16,8 +51,13 @@ impl Http1xCodec {
         }
     }
 
-    fn finish_header(&mut self) -> Result<(), (ParseErrorKind, &'static [u8])> {
-        let value = trim_http_whitespace(&self.header_value);
+    fn finish_header(
+        &mut self,
+        input: &Bytes,
+        spans: &mut HeaderSpans,
+    ) -> Result<(), (ParseErrorKind, &'static [u8])> {
+        let name = spans.name.bytes(input, &self.header_name);
+        let value = trim_http_whitespace(spans.value.bytes(input, &self.header_value));
         if self.strict_validation && value.iter().any(|byte| *byte >= 0x7f) {
             return Err((
                 ParseErrorKind::HeaderContent,
@@ -25,12 +65,15 @@ impl Http1xCodec {
             ));
         }
         if self.phase == IngressPhase::Trailers {
-            self.trailers.add(&self.header_name, value);
+            self.trailers
+                .get_or_insert_with(HttpHeaders::new)
+                .add(name, value);
         } else if let Some(message) = self.current_message.as_mut() {
-            message.headers_mut().add(&self.header_name, value);
+            message.headers_mut().add(name, value);
         }
         self.header_name.clear();
         self.header_value.clear();
+        *spans = HeaderSpans::default();
         Ok(())
     }
 
@@ -214,6 +257,7 @@ impl Http1xCodec {
         range: Range<usize>,
         input: &Bytes,
         metadata_cursor: &mut usize,
+        header_spans: &mut HeaderSpans,
         callback: &mut (impl IngressDelivery + ?Sized),
         callback_egress: &mut BufQueue,
         result: &mut CodecIngressResult,
@@ -237,8 +281,14 @@ impl Http1xCodec {
                     self.reason.clear();
                     self.header_name.clear();
                     self.header_value.clear();
-                    self.trailers = HttpHeaders::new();
+                    *header_spans = HeaderSpans::default();
+                    self.trailers = None;
                     self.begin_message(callback, callback_egress, result);
+                    if self.header_reserve_hint != 0
+                        && let Some(message) = self.current_message.as_mut()
+                    {
+                        message.headers_mut().reserve(self.header_reserve_hint);
+                    }
                 }
                 ParserEvent::Protocol => {
                     let end = self.protocol_bytes + range.len();
@@ -289,14 +339,19 @@ impl Http1xCodec {
                     }
                 }
                 ParserEvent::HeaderField => {
-                    self.header_name.extend_from_slice(&input[range]);
+                    header_spans
+                        .name
+                        .append(&mut self.header_name, input, range);
                 }
                 ParserEvent::HeaderValue => {
-                    self.header_value.extend_from_slice(&input[range]);
+                    header_spans
+                        .value
+                        .append(&mut self.header_value, input, range);
                 }
-                ParserEvent::HeaderValueComplete => self.finish_header()?,
+                ParserEvent::HeaderValueComplete => self.finish_header(input, header_spans)?,
                 ParserEvent::HeadersComplete => {
                     let message = self.finish_headers(parser)?;
+                    self.header_reserve_hint = message.headers().len().min(64);
                     self.phase = IngressPhase::Body;
                     self.dispatch(
                         callback,
@@ -354,8 +409,8 @@ impl Http1xCodec {
                     }
                 }
                 ParserEvent::MessageComplete => {
-                    if !self.trailers.is_empty() {
-                        let trailers = Box::new(std::mem::take(&mut self.trailers));
+                    if let Some(trailers) = self.trailers.take() {
+                        let trailers = Box::new(trailers);
                         self.dispatch(
                             callback,
                             callback_egress,
@@ -495,6 +550,7 @@ impl Http1xCodec {
                 &tail
             };
             let mut metadata_cursor = 0;
+            let mut header_spans = HeaderSpans::default();
             let parsed = parser.execute(segment, |parser, event, range| {
                 self.parser_event(
                     parser,
@@ -502,11 +558,14 @@ impl Http1xCodec {
                     range,
                     segment,
                     &mut metadata_cursor,
+                    &mut header_spans,
                     callback,
                     callback_egress,
                     &mut result,
                 )
             });
+            header_spans.name.spill(&mut self.header_name, segment);
+            header_spans.value.spill(&mut self.header_value, segment);
             offset += parsed.consumed;
             result.consumed = offset;
             if !self.parser_error
@@ -525,6 +584,7 @@ impl Http1xCodec {
                 parser.resume();
                 let empty_headers = Bytes::from_static(b"\r\n");
                 let mut metadata_cursor = 0;
+                let mut header_spans = HeaderSpans::default();
                 let error = parser
                     .execute(&empty_headers, |parser, event, range| {
                         self.parser_event(
@@ -533,12 +593,19 @@ impl Http1xCodec {
                             range,
                             &empty_headers,
                             &mut metadata_cursor,
+                            &mut header_spans,
                             callback,
                             callback_egress,
                             &mut result,
                         )
                     })
                     .error;
+                header_spans
+                    .name
+                    .spill(&mut self.header_name, &empty_headers);
+                header_spans
+                    .value
+                    .spill(&mut self.header_value, &empty_headers);
                 self.http09_synthetic = false;
                 self.http09_request = false;
                 error
@@ -604,6 +671,7 @@ impl Http1xCodec {
                 .expect("parser is installed outside its callbacks");
             parser.resume();
             let mut metadata_cursor = 0;
+            let mut header_spans = HeaderSpans::default();
             let mut error = parser
                 .execute(&[], |parser, event, range| {
                     self.parser_event(
@@ -612,12 +680,19 @@ impl Http1xCodec {
                         range,
                         &Bytes::new(),
                         &mut metadata_cursor,
+                        &mut header_spans,
                         callback,
                         callback_egress,
                         &mut result,
                     )
                 })
                 .error;
+            header_spans
+                .name
+                .spill(&mut self.header_name, &Bytes::new());
+            header_spans
+                .value
+                .spill(&mut self.header_value, &Bytes::new());
             if error == ParserError::OK && self.phase != IngressPhase::Idle && !self.parser_paused {
                 error = parser.finish(|parser, event, range| {
                     self.parser_event(
@@ -626,6 +701,7 @@ impl Http1xCodec {
                         range,
                         &Bytes::new(),
                         &mut metadata_cursor,
+                        &mut header_spans,
                         callback,
                         callback_egress,
                         &mut result,
