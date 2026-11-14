@@ -1070,6 +1070,49 @@ fn teardown_panicked(context: &WorkerContext, panic: PanicPayload) {
     discard_panic(panic);
 }
 
+/// Reports a panic contained at `site` and disposes of it, leaving the connection running.
+#[cold]
+#[inline(never)]
+fn report_panic(
+    context: &WorkerContext,
+    site: PanicSite,
+    stream: Option<StreamId>,
+    panic: PanicPayload,
+) {
+    report_contained_panic(context, site, stream, &*panic);
+    discard_panic(panic);
+}
+
+/// Reports a panic contained at an Exchange-scope `site` of stream `id`, disposes of it, and
+/// returns the error that fails that exchange alone (`DIV-056`).
+#[cold]
+#[inline(never)]
+fn exchange_panicked(
+    context: &WorkerContext,
+    site: PanicSite,
+    id: StreamId,
+    panic: PanicPayload,
+) -> HttpError {
+    report_panic(context, site, Some(id), panic);
+    failure(
+        HttpErrorCode::INTERNAL_ERROR,
+        b"owned H2 exchange callback panicked",
+    )
+}
+
+/// Unwinds to the per-turn catch after a Driver-scope panic its site already reported, so the
+/// catch starts the teardown without reporting it again (`DIV-056`).
+struct ReportedPanic;
+
+/// Reports a panic that reached the per-turn catch, unless its site already did.
+#[cold]
+#[inline(never)]
+fn report_turn_panic(context: &WorkerContext, panic: &PanicPayload) {
+    if !panic.is::<ReportedPanic>() {
+        report_contained_panic(context, PanicSite::DriverTurn, None, &**panic);
+    }
+}
+
 /// Drops `field` under its own unwind boundary, reporting a panic as a teardown step's.
 #[inline(always)]
 fn release_field<T>(context: &WorkerContext, field: T) {
@@ -1408,6 +1451,7 @@ thread_local! {
     static READ_START_CHECKS: Cell<usize> = const { Cell::new(0) };
     static INLINE_POLLS: Cell<usize> = const { Cell::new(0) };
     static RUN_FAULT: Cell<bool> = const { Cell::new(false) };
+    static COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Makes the next pending poll of an owned H2 run on this thread panic outside the driver's
@@ -1415,6 +1459,13 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn fault_next_run_poll() {
     RUN_FAULT.set(true);
+}
+
+/// Makes the next request commitment of an owned H2 upstream on this thread panic midway, where
+/// only a fault in Roxygen's commit code could.
+#[cfg(test)]
+pub(crate) fn fault_next_commit() {
+    COMMIT_FAULT.set(true);
 }
 
 /// How many times stream-owner code on this thread has evaluated whether writes are pending.
@@ -1577,12 +1628,7 @@ where
                 match catch_unwind(AssertUnwindSafe(|| driver.poll(context))) {
                     Ok(polled) => polled,
                     Err(panic) => {
-                        report_contained_panic(
-                            &driver.context,
-                            PanicSite::DriverTurn,
-                            None,
-                            &*panic,
-                        );
+                        report_turn_panic(&driver.context, &panic);
                         driver.poll_panicked(panic, context);
                         Poll::Pending
                     }
@@ -4589,14 +4635,9 @@ where
         };
         if let Some(mut stream) = retired {
             self.debug_assert_stream_counts();
+            // Admission contains its observer's panics while the driver polls.
             if let Some(exchange) = stream.upstream() {
-                contain(
-                    &self.context,
-                    &mut self.failure,
-                    PanicSite::UpstreamObserver,
-                    Some(id),
-                    || exchange.status.release(),
-                );
+                exchange.status.release();
             }
             self.connection
                 .state
@@ -4680,8 +4721,9 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
                 .application
                 .as_mut()
                 .and_then(<E as ExchangeStorage<UPSTREAM>>::upstream_mut)
+                && let Err(panic) = guarded(|| exchange.poll_response_observer(&mut context))
             {
-                exchange.poll_response_observer(&mut context);
+                return self.response_observer_panicked(id, stream, panic);
             }
         }
         self.take_completion(id, stream, None);

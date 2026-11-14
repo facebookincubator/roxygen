@@ -29,10 +29,13 @@ pub(super) struct Admission {
     peer_goaway: Cell<Option<HttpErrorCode>>,
     observer: RefCell<Option<Rc<dyn OwnedUpstreamObserver>>>,
     queued: RefCell<VecDeque<Submission>>,
-    /// Set while the owning driver is polling.
+    /// Set while the owning driver is polling. A callback that panics then is contained and
+    /// reported (`DIV-056`); otherwise its panic reaches the caller.
     pub(super) polling: Cell<bool>,
     /// A release inside the owning driver's poll, which the turn loop takes instead of a wake.
     release_pending: Cell<bool>,
+    /// The observer panicked while the driver polled, which drains the session (`DIV-056`).
+    escalate_drain: Cell<bool>,
 }
 
 impl Admission {
@@ -52,6 +55,42 @@ impl Admission {
             queued: RefCell::new(VecDeque::new()),
             polling: Cell::new(false),
             release_pending: Cell::new(false),
+            escalate_drain: Cell::new(false),
+        }
+    }
+
+    /// Runs one admission callback at `site`. While the driver polls, a panic is reported and
+    /// disposed of, and the observer's also drains the session (`DIV-056`); otherwise the first
+    /// panic is kept in `first` for `finish_panic` to raise to the caller.
+    #[inline(always)]
+    fn contain_callback(
+        &self,
+        first: &mut Option<PanicPayload>,
+        site: PanicSite,
+        stream: Option<StreamId>,
+        callback: impl FnOnce(),
+    ) {
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(callback)) {
+            self.callback_panicked(first, site, stream, panic);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn callback_panicked(
+        &self,
+        first: &mut Option<PanicPayload>,
+        site: PanicSite,
+        stream: Option<StreamId>,
+        panic: PanicPayload,
+    ) {
+        if !self.polling.get() {
+            retain_panic(first, panic);
+            return;
+        }
+        report_panic(&self.context, site, stream, panic);
+        if site == PanicSite::UpstreamObserver {
+            self.escalate_drain.set(true);
         }
     }
 
@@ -75,15 +114,20 @@ impl Admission {
         let observer = self.observer.borrow().clone();
         let mut panic = None;
         if let Some(observer) = observer {
+            let site = PanicSite::UpstreamObserver;
             if let Some(undelivered) = undelivered {
                 undelivered.set(true);
-                capture(&mut panic, || observer.capacity_released_before_delivery());
+                self.contain_callback(&mut panic, site, stream, || {
+                    observer.capacity_released_before_delivery()
+                });
             }
             if let Some(stream) = stream {
-                capture(&mut panic, || observer.capacity_released(stream));
+                self.contain_callback(&mut panic, site, Some(stream), || {
+                    observer.capacity_released(stream)
+                });
             }
             if self.available() != 0 {
-                capture(&mut panic, || observer.capacity_available());
+                self.contain_callback(&mut panic, site, stream, || observer.capacity_available());
             }
         }
         if self.polling.get() {
@@ -101,7 +145,9 @@ impl Admission {
             let observer = self.observer.borrow().clone();
             let mut panic = None;
             if let Some(observer) = observer {
-                capture(&mut panic, || observer.capacity_available());
+                self.contain_callback(&mut panic, PanicSite::UpstreamObserver, None, || {
+                    observer.capacity_available()
+                });
             }
             finish_panic(panic);
         }
@@ -123,7 +169,9 @@ impl Admission {
         let observer = self.observer.borrow().clone();
         let mut panic = None;
         if let Some(observer) = observer {
-            capture(&mut panic, || observer.peer_reset(code));
+            self.contain_callback(&mut panic, PanicSite::UpstreamObserver, None, || {
+                observer.peer_reset(code)
+            });
         }
         finish_panic(panic);
     }
@@ -145,12 +193,16 @@ impl Admission {
         }
         let mut panic = None;
         for mut submission in queued {
-            capture(&mut panic, || submission.refuse(error.clone()));
+            self.contain_callback(&mut panic, PanicSite::Submission, None, || {
+                submission.refuse(error.clone())
+            });
         }
         if let Some(observer) = observer {
-            capture(&mut panic, || observer.admission_closed());
+            self.contain_callback(&mut panic, PanicSite::UpstreamObserver, None, || {
+                observer.admission_closed()
+            });
         }
-        capture(&mut panic, || self.ready.wake());
+        self.contain_callback(&mut panic, PanicSite::Transport, None, || self.ready.wake());
         finish_panic(panic);
     }
 }
@@ -1241,6 +1293,17 @@ where
     /// `None` when admission stayed open and no queued submission was taken.
     #[inline]
     pub(super) fn poll_upstream_submission(&mut self) -> Option<bool> {
+        let escalate = self
+            .connection
+            .state
+            .control
+            .upstream
+            .as_ref()?
+            .escalate_drain
+            .get();
+        if escalate {
+            self.drain_after_observer_panic();
+        }
         let admission = self.connection.state.control.upstream.as_ref()?;
         // A release inside this poll replaced its wake with this turn's progress.
         let released = admission.release_pending.replace(false);
@@ -1256,6 +1319,20 @@ where
             return released.then_some(true);
         }
         (self.submit_upstream() || released).then_some(true)
+    }
+
+    /// Drains the session after its observer panicked inside the driver's poll (`DIV-056`), as a
+    /// caller's drain does, but leaves the caller's `close_when_idle` request unset, so that call
+    /// still reports a change.
+    #[cold]
+    #[inline(never)]
+    fn drain_after_observer_panic(&mut self) {
+        if let Some(admission) = &self.connection.state.control.upstream {
+            admission.escalate_drain.set(false);
+        }
+        if !self.connection.state.draining && self.failure.fatal.is_none() {
+            self.start_drain(DrainTrigger::Local);
+        }
     }
 
     #[cold]
@@ -1302,19 +1379,40 @@ where
         let result = catch_unwind(AssertUnwindSafe(|| self.commit_upstream(&mut submission)));
         match result {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => submission.reject(error),
-            Err(panic) => {
-                let mut first = Some(panic);
-                capture(&mut first, || {
-                    submission.reject(failure(
-                        HttpErrorCode::INTERNAL_ERROR,
-                        b"upstream request commitment panicked",
-                    ))
-                });
-                finish_panic(first);
-            }
+            Ok(Err(error)) => self.refuse_submission(submission, error),
+            Err(panic) => self.commit_panicked(submission, panic),
         }
         true
+    }
+
+    /// Refuses a submission the driver did not commit; a panic in its callbacks is reported at
+    /// `Submission` (`DIV-056`).
+    #[cold]
+    #[inline(never)]
+    fn refuse_submission(&self, mut submission: Submission, error: HttpError) {
+        if let Err(panic) = guarded(|| {
+            submission.reject(error);
+            drop(submission);
+        }) {
+            report_panic(&self.context, PanicSite::Submission, None, panic);
+        }
+    }
+
+    /// A commit runs only Roxygen code and can leave the connection's stream accounting half
+    /// updated, so its panic is Driver scope (`DIV-056`): the per-turn catch tears the session
+    /// down without reporting the panic a second time.
+    #[cold]
+    #[inline(never)]
+    fn commit_panicked(&self, submission: Submission, panic: PanicPayload) -> ! {
+        report_panic(&self.context, PanicSite::Commit, None, panic);
+        self.refuse_submission(
+            submission,
+            failure(
+                HttpErrorCode::INTERNAL_ERROR,
+                b"upstream request commitment panicked",
+            ),
+        );
+        resume_unwind(Box::new(ReportedPanic))
     }
 
     fn commit_upstream(&mut self, submission: &mut Submission) -> Result<(), HttpError> {
@@ -1387,6 +1485,10 @@ where
         status.admission.committed.set(committed + 1);
         *status.ingress.borrow_mut() = source.ingress_completion();
         *status.wake.borrow_mut() = Some(Arc::clone(&wake));
+        #[cfg(test)]
+        if COMMIT_FAULT.take() {
+            panic!("owned H2 commit fault");
+        }
         let headers = submission
             .headers
             .take()
@@ -1529,7 +1631,15 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
             if !stream.response_headers || stream.pending.is_some() {
                 return Ok(());
             }
-            exchange.poll_upload(&mut context, &self.connection.state.control)
+            let control = &self.connection.state.control;
+            guarded(|| exchange.poll_upload(&mut context, control)).unwrap_or_else(|panic| {
+                Err(exchange_panicked(
+                    self.context,
+                    PanicSite::UploadBody,
+                    id,
+                    panic,
+                ))
+            })
         };
         let progress = progress.map(|event| {
             let Some(event) = event else {
@@ -1567,6 +1677,26 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
                 .scheduler
                 .enqueue(id, &mut stream.scheduling);
         }
+        Ok(())
+    }
+
+    /// Fails the request whose response observer panicked (`DIV-056`). The caller's error path
+    /// resets the stream; a stream already closed both ways is cancelled without a reset, as
+    /// `egress_failed` decides.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn response_observer_panicked<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        id: StreamId,
+        stream: &mut Stream<E, UPSTREAM>,
+        panic: PanicPayload,
+    ) -> Result<(), HttpError> {
+        let error = exchange_panicked(self.context, PanicSite::ResponseObserver, id, panic);
+        if stream.reset || !stream.response_complete || !stream.wire_ingress_complete {
+            return Err(error);
+        }
+        self.cancel_owner(id, stream, &error, false);
+        self.fence_reset(id, stream);
         Ok(())
     }
 

@@ -129,8 +129,17 @@ pub(crate) enum PanicSite {
     ExchangeRetirement,
     /// A byte-event callback.
     ByteEvent,
+    /// A client request's upload: its source, resume or ingress-body callback.
+    UploadBody,
+    /// A client request's `OwnedResponseObserver`.
+    ResponseObserver,
+    /// The refusal of a client submission the driver has not committed: its source's
+    /// `stop_reading` or destructor, its submitter's waker, or a value it owned.
+    Submission,
     /// The transport's close or a cancellation waker.
     Transport,
+    /// A client request's commitment, which runs only Roxygen code.
+    Commit,
     /// A step of the teardown that follows a Driver-scope panic, or a field dropped as the
     /// driver is released.
     Teardown,
@@ -139,9 +148,15 @@ pub(crate) enum PanicSite {
 impl PanicSite {
     const fn scope(self) -> ContainedPanicScope {
         match self {
-            Self::ExchangeRetirement | Self::ByteEvent => ContainedPanicScope::Exchange,
+            Self::ExchangeRetirement
+            | Self::ByteEvent
+            | Self::UploadBody
+            | Self::ResponseObserver
+            | Self::Submission => ContainedPanicScope::Exchange,
             Self::LifecycleObserver | Self::UpstreamObserver => ContainedPanicScope::Connection,
-            Self::DriverTurn | Self::Transport | Self::Teardown => ContainedPanicScope::Driver,
+            Self::DriverTurn | Self::Transport | Self::Commit | Self::Teardown => {
+                ContainedPanicScope::Driver
+            }
         }
     }
 
@@ -152,7 +167,11 @@ impl PanicSite {
             Self::UpstreamObserver => "upstream_observer",
             Self::ExchangeRetirement => "exchange_retirement",
             Self::ByteEvent => "byte_event",
+            Self::UploadBody => "upload_body",
+            Self::ResponseObserver => "response_observer",
+            Self::Submission => "submission",
             Self::Transport => "transport",
+            Self::Commit => "commit",
             Self::Teardown => "teardown",
         }
     }

@@ -9,6 +9,8 @@ use roxygen_core::stream_source::HttpResponseReader;
 use roxygen_core::stream_source::HttpResponseSourceOwner;
 use roxygen_core::stream_source::HttpStreamSourceCallback;
 use roxygen_core::stream_source::HttpStreamSourceProducer;
+use roxygen_http2::hpack::HeaderIndexingStrategy;
+use roxygen_http2::hpack::HeaderName;
 use roxygen_runtime::host::Host;
 use roxygen_runtime::tokio_host::ManagedWorkerError;
 
@@ -3090,13 +3092,16 @@ fn upload_pending_token_cancellation_and_explicit_status_keep_their_retirement_o
 }
 
 /// `DIV-056`: an upload source whose read panics is retired unstopped, and the panic, contained
-/// at Driver scope, aborts the session, whose run joins its native I/O and then fails.
+/// at Exchange scope, fails only its request: the response fails as an upload error fails it, the
+/// stream is reset behind its write fence, and the session keeps running until the peer's EOF.
 #[cfg(panic = "unwind")]
 #[test]
-fn upload_body_poll_panic_retires_the_read_and_joins_native_io_before_failing_the_run() {
+fn upload_body_poll_panic_retires_the_read_and_fails_only_its_request() {
     run_on_worker(|context| {
         Box::pin(async move {
             take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
             let release_callback = Arc::new(tokio::sync::Notify::new());
             let release_write = Arc::new(tokio::sync::Notify::new());
             let release_read = Arc::new(tokio::sync::Notify::new());
@@ -3121,15 +3126,16 @@ fn upload_body_poll_panic_retires_the_read_and_joins_native_io_before_failing_th
                 upload,
                 CancellationToken::never(),
             );
-            let resumed = Cell::new(false);
+            let finished = Cell::new(false);
             let run = async {
-                let result = eligibility_catch_unwind(session.run()).await;
-                resumed.set(true);
+                let result = session.run().await;
+                finished.set(true);
                 result
             };
             let scenario = async {
                 let outcome =
                     eligibility_catch_unwind(tokio::time::timeout(Duration::from_secs(5), async {
+                        let mut response = submission.await.unwrap().into_source_parts();
                         complete_credit_wait(|| {
                             let wire = wire.borrow();
                             wire.write_gate_pending.is_some_and(|length| length > 0)
@@ -3144,12 +3150,28 @@ fn upload_body_poll_panic_retires_the_read_and_joins_native_io_before_failing_th
                             ["read.drop", "source.drop"]
                         );
                         assert!(probe.stops.borrow().is_empty());
-                        drop(submission);
-                        assert!(!resumed.get(), "held I/O keeps the run pending");
+                        let Err(error) = response.1.read_header_event().await else {
+                            panic!("the upload panic fails the response");
+                        };
+                        assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+                        drop(response);
+                        assert!(
+                            !handle.is_idle(),
+                            "the reset stream waits for its write fence"
+                        );
                         assert!(wire.borrow().writes.is_empty());
                         release_write.notify_one();
-                        complete_credit_wait(|| wire.borrow().writes.len() == 1).await;
-                        assert!(!resumed.get(), "the admitted read must also finish");
+                        complete_credit_wait(|| handle.is_idle()).await;
+                        let decoded = decode_client_frames(&wire.borrow().writes.concat());
+                        assert_eq!(decoded.header_streams, [StreamId::new(1)]);
+                        assert_eq!(
+                            decoded.resets,
+                            [(StreamId::new(1), H2ErrorCode::INTERNAL_ERROR)]
+                        );
+                        assert!(decoded.goaways.is_empty());
+                        assert_eq!(decoded.body_bytes, 0);
+                        assert_eq!(handle.available_capacity(), 1);
+                        assert!(!finished.get(), "the session outlives the failed request");
                     }))
                     .await;
                 release_callback.notify_one();
@@ -3164,13 +3186,136 @@ fn upload_body_poll_panic_retires_the_read_and_joins_native_io_before_failing_th
                 tokio::join!(run, scenario)
             })
             .await
-            .expect("source unwind joins the admitted read and write");
+            .expect("the session ends at the peer's EOF");
             match outcome {
-                Ok(result) => result.expect("source panic reaches joined cleanup"),
+                Ok(result) => result.expect("the upload panic fails only its request"),
+                Err(payload) => resume_unwind(payload),
+            }
+            let summary = result.expect("the session ends cleanly at the peer's EOF");
+            assert!(!summary.reset);
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::UploadBody,
+                    Some(StreamId::new(1)),
+                    Some("upstream body poll".to_owned())
+                )]
+            );
+            assert_eq!(
+                super::owned::contained_panic_counts(&worker, &start),
+                (1, 0, 0)
+            );
+            assert_eq!(probe.reads.get(), 1);
+            assert_eq!(probe.produced.get(), 0);
+            assert_eq!(probe.drops.get(), 1);
+            assert_eq!(wire.borrow().close, FixtureClose::Closed);
+        })
+    });
+}
+
+/// A header indexing strategy that panics once armed.
+struct ArmedIndexing(Rc<Cell<bool>>);
+
+impl HeaderIndexingStrategy for ArmedIndexing {
+    fn index_header(&self, _name: &HeaderName, _value: &[u8], _name_exists: bool) -> bool {
+        if self.0.get() {
+            panic!("indexing strategy");
+        }
+        false
+    }
+
+    fn clone_box(&self) -> Box<dyn HeaderIndexingStrategy> {
+        Box::new(Self(Rc::clone(&self.0)))
+    }
+}
+
+/// `DIV-056`: a Driver-scope panic, here in the codec's header indexing strategy as a second
+/// request's head is encoded, aborts the session while the first request's upload, its write and
+/// the native read are held; the run joins that native I/O before it fails.
+#[cfg(panic = "unwind")]
+#[test]
+fn a_driver_panic_beside_a_held_upload_joins_native_io_before_failing_the_run() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let release_write = Arc::new(tokio::sync::Notify::new());
+            let release_read = Arc::new(tokio::sync::Notify::new());
+            let (transport, wire) = FixtureTransport::new([
+                FixtureRead::Data(server_settings_bytes(2)),
+                FixtureRead::WaitDataEof(Arc::clone(&release_read), Vec::new()),
+            ]);
+            wire.borrow_mut().write_gate = Some(Arc::clone(&release_write));
+            let armed = Rc::new(Cell::new(false));
+            let mut config = options(context, transport);
+            config.http2.header_indexing_strategy = Some(Rc::new(ArmedIndexing(Rc::clone(&armed))));
+            let (session, handle) = OwnedH2UpstreamSession::new(config).unwrap();
+            let (upload, probe) = Upload::new(0, 1).held();
+            let submission = handle.reserve_request().unwrap().submit(
+                request_head(HttpMethod::Post, false, None),
+                upload,
+                CancellationToken::never(),
+            );
+            let resumed = Cell::new(false);
+            let run = async {
+                let result = eligibility_catch_unwind(session.run()).await;
+                resumed.set(true);
+                result
+            };
+            let scenario = async {
+                let outcome =
+                    eligibility_catch_unwind(tokio::time::timeout(Duration::from_secs(5), async {
+                        let mut response = submission.await.unwrap().into_source_parts();
+                        complete_credit_wait(|| {
+                            let wire = wire.borrow();
+                            wire.write_gate_pending.is_some_and(|length| length > 0)
+                                && wire.reads.is_empty()
+                                && probe.reads.get() == 1
+                                && handle.available_capacity() == 1
+                        })
+                        .await;
+                        armed.set(true);
+                        let second = handle.reserve_request().unwrap().submit(
+                            request_head(HttpMethod::Get, true, None),
+                            HttpSourceHolder::empty(),
+                            CancellationToken::never(),
+                        );
+                        let Err(error) = second.await else {
+                            panic!("the Driver-scope panic fails the second request");
+                        };
+                        assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+                        let Err(error) = response.1.read_header_event().await else {
+                            panic!("the teardown fails the first response");
+                        };
+                        assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+                        drop(response);
+                        assert_eq!(probe.drops.get(), 1);
+                        assert!(!resumed.get(), "held I/O keeps the run pending");
+                        assert!(wire.borrow().writes.is_empty());
+                        release_write.notify_one();
+                        complete_credit_wait(|| wire.borrow().writes.len() == 1).await;
+                        assert!(!resumed.get(), "the admitted read must also finish");
+                    }))
+                    .await;
+                release_write.notify_one();
+                release_read.notify_one();
+                if !matches!(&outcome, Ok(Ok(()))) {
+                    handle.cancel();
+                }
+                outcome
+            };
+            let (result, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(run, scenario)
+            })
+            .await
+            .expect("the teardown joins the held write and read");
+            match outcome {
+                Ok(result) => result.expect("the Driver-scope panic reaches joined cleanup"),
                 Err(payload) => resume_unwind(payload),
             }
             let error = result
-                .expect("the run contains the source panic")
+                .expect("the run contains the panic")
                 .expect_err("a Driver-scope panic fails the run");
             assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
             assert_eq!(
@@ -3178,12 +3323,20 @@ fn upload_body_poll_panic_retires_the_read_and_joins_native_io_before_failing_th
                 [(
                     PanicSite::DriverTurn,
                     None,
-                    Some("upstream body poll".to_owned())
+                    Some("indexing strategy".to_owned())
                 )]
+            );
+            assert_eq!(
+                super::owned::contained_panic_counts(&worker, &start),
+                (0, 0, 1)
             );
             assert_eq!(probe.reads.get(), 1);
             assert_eq!(probe.produced.get(), 0);
             assert_eq!(probe.drops.get(), 1);
+            assert_eq!(
+                probe.stops.borrow().as_slice(),
+                [Some(HttpErrorCode::INTERNAL_ERROR)]
+            );
             let wire = wire.borrow();
             assert_eq!(wire.writes.len(), 1);
             assert_eq!(Some(wire.writes[0].len()), wire.write_gate_pending);
@@ -3809,11 +3962,12 @@ fn fresh_upload_wait_preserves_control_early_response_and_resume_cancellation() 
     }
 }
 
-/// `DIV-056`: a fresh upload's credit callback panic, contained at Driver scope, aborts the
-/// session, whose run joins its native I/O and then fails.
+/// `DIV-056`: a fresh upload's credit callback panic, contained at Exchange scope, fails only its
+/// request: the response fails as an upload error fails it, the stream is reset behind its write
+/// fence, and the session keeps running until the peer's EOF.
 #[cfg(panic = "unwind")]
 #[test]
-fn fresh_upload_callback_panic_joins_native_io_before_failing_the_run() {
+fn fresh_upload_callback_panic_fails_only_its_request() {
     struct Callback {
         probe: Rc<FreshUploadProbe>,
         producer: Rc<RefCell<Option<HttpStreamSourceProducer>>>,
@@ -3849,6 +4003,8 @@ fn fresh_upload_callback_panic_joins_native_io_before_failing_the_run() {
     run_on_worker(|context| {
         Box::pin(async move {
             take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
             let release_write = Arc::new(tokio::sync::Notify::new());
             let release_read = Arc::new(tokio::sync::Notify::new());
             let (transport, wire) = FixtureTransport::new([
@@ -3881,15 +4037,16 @@ fn fresh_upload_callback_panic_joins_native_io_before_failing_the_run() {
                     .reserve_request()
                     .unwrap()
                     .submit(head, upload, CancellationToken::never());
-            let resumed = Cell::new(false);
+            let finished = Cell::new(false);
             let run = async {
-                let result = eligibility_catch_unwind(session.run()).await;
-                resumed.set(true);
+                let result = session.run().await;
+                finished.set(true);
                 result
             };
             let scenario = async {
                 let outcome =
                     eligibility_catch_unwind(tokio::time::timeout(Duration::from_secs(5), async {
+                        let mut response = submission.await.unwrap().into_source_parts();
                         complete_credit_wait(|| {
                             wire.borrow()
                                 .write_gate_pending
@@ -3909,12 +4066,25 @@ fn fresh_upload_callback_panic_joins_native_io_before_failing_the_run() {
                             HttpErrorCode::READ_TIMEOUT
                         );
                         assert!(!producer.is_live());
-                        drop(submission);
-                        assert!(!resumed.get(), "held native I/O keeps the run pending");
+                        let Err(error) = response.1.read_header_event().await else {
+                            panic!("the upload panic fails the response");
+                        };
+                        assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+                        drop(response);
+                        assert!(
+                            !handle.is_idle(),
+                            "the reset stream waits for its write fence"
+                        );
                         assert!(wire.borrow().writes.is_empty());
                         release_write.notify_one();
-                        complete_credit_wait(|| wire.borrow().writes.len() == 1).await;
-                        assert!(!resumed.get(), "the admitted native read must also finish");
+                        complete_credit_wait(|| handle.is_idle()).await;
+                        let decoded = decode_client_frames(&wire.borrow().writes.concat());
+                        assert_eq!(
+                            decoded.resets,
+                            [(StreamId::new(1), H2ErrorCode::INTERNAL_ERROR)]
+                        );
+                        assert!(decoded.goaways.is_empty());
+                        assert!(!finished.get(), "the session outlives the failed request");
                     }))
                     .await;
                 release_write.notify_one();
@@ -3928,30 +4098,28 @@ fn fresh_upload_callback_panic_joins_native_io_before_failing_the_run() {
                 tokio::join!(run, scenario)
             })
             .await
-            .expect("fresh callback unwind joins both native operations");
+            .expect("the session ends at the peer's EOF");
             match outcome {
-                Ok(result) => result.expect("fresh callback panic reaches joined cleanup"),
+                Ok(result) => result.expect("the callback panic fails only its request"),
                 Err(payload) => resume_unwind(payload),
             }
-            let error = result
-                .expect("the run contains the callback panic")
-                .expect_err("a Driver-scope panic fails the run");
-            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+            let summary = result.expect("the session ends cleanly at the peer's EOF");
+            assert!(!summary.reset);
             assert_eq!(
                 take_contained_panics(),
                 [(
-                    PanicSite::DriverTurn,
-                    None,
+                    PanicSite::UploadBody,
+                    Some(StreamId::new(1)),
                     Some("fresh upload credit".to_owned())
                 )]
             );
+            assert_eq!(
+                super::owned::contained_panic_counts(&worker, &start),
+                (1, 0, 0)
+            );
             assert_eq!(probe.completed.borrow().len(), 1);
             assert_eq!(probe.drops.get(), 1);
-            let wire = wire.borrow();
-            assert_eq!(wire.writes.len(), 1);
-            assert_eq!(Some(wire.writes[0].len()), wire.write_gate_pending);
-            assert!(wire.transport_dropped);
-            assert_eq!(wire.close, FixtureClose::Reset);
+            assert_eq!(wire.borrow().close, FixtureClose::Closed);
         })
     });
 }
@@ -4270,9 +4438,10 @@ fn completed_upload_keeps_cancellation_wake_while_write_is_held(direct_control: 
     });
 }
 
-/// `DIV-056` for the panicking cases: a deadline poll panic is contained at Driver scope, and a
-/// completion panic while the observer is retired at Exchange scope; either way the session
-/// aborts, joins its native I/O, and the run fails.
+/// `DIV-056` for the panicking cases: a deadline poll panic is contained at Exchange scope and
+/// fails its request, and a completion panic while the observer is retired is contained at
+/// Exchange scope too. The completion panic still aborts the session, which joins its native I/O,
+/// and the run fails.
 #[cfg(panic = "unwind")]
 #[test]
 fn response_observer_terminal_cleanup_joins_held_native_io() {
@@ -4492,14 +4661,14 @@ fn response_observer_terminal_cleanup_joins_held_native_io() {
                 );
                 match terminal {
                     Terminal::PollPanic => {
-                        let error = result.expect_err("the deadline panic fails the run");
+                        let error = result.expect_err("the completion panic fails the run");
                         assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
                         assert_eq!(
                             take_contained_panics(),
                             [
                                 (
-                                    PanicSite::DriverTurn,
-                                    None,
+                                    PanicSite::ResponseObserver,
+                                    Some(stream),
                                     Some("response observer deadline".to_owned())
                                 ),
                                 completion,
@@ -4520,6 +4689,589 @@ fn response_observer_terminal_cleanup_joins_held_native_io() {
                 assert_eq!(dropped.get(), 1);
                 assert!(wire.borrow().transport_dropped);
                 assert_eq!(wire.borrow().close, FixtureClose::Reset);
+            })
+        });
+    }
+}
+
+/// `DIV-056`: an upload read that panics fails only its request. Its response fails as
+/// an upload error fails it, its stream alone is reset, and the session keeps serving.
+#[cfg(panic = "unwind")]
+fn assert_an_upload_panic_fails_only_its_request() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let mut peer = Http2Codec::new(TransportDirection::Downstream);
+            let respond = Arc::new(tokio::sync::Notify::new());
+            let respond_again = Arc::new(tokio::sync::Notify::new());
+            let (transport, wire) = FixtureTransport::new([
+                FixtureRead::Data(server_settings_bytes(10)),
+                FixtureRead::WaitData(
+                    Arc::clone(&respond),
+                    response_head(&mut peer, StreamId::new(3), 200, true, Some(0)),
+                ),
+                FixtureRead::WaitData(
+                    Arc::clone(&respond_again),
+                    response_head(&mut peer, StreamId::new(5), 200, true, Some(0)),
+                ),
+            ]);
+            let (session, handle) =
+                OwnedH2UpstreamSession::new(options(context, transport)).unwrap();
+            let fail_upload = Arc::new(tokio::sync::Notify::new());
+            let mut upload = Upload::new(0, 1);
+            let ready = Arc::clone(&fail_upload);
+            upload.body_read = Some(Box::pin(async move {
+                ready.notified().await;
+                panic_any("upload read");
+            }));
+            let (upload, probe) = upload.held();
+            let gates = [
+                Arc::clone(&fail_upload),
+                Arc::clone(&respond),
+                Arc::clone(&respond_again),
+            ];
+            cancelled(
+                drive(session, &handle, &gates, async {
+                    let first = handle.reserve_request().unwrap().submit(
+                        request_head(HttpMethod::Post, false, None),
+                        upload,
+                        CancellationToken::never(),
+                    );
+                    let second = handle.reserve_request().unwrap().submit(
+                        request_head(HttpMethod::Get, true, None),
+                        HttpSourceHolder::empty(),
+                        CancellationToken::never(),
+                    );
+                    let mut first = first.await.unwrap().into_source_parts();
+                    let mut second = second.await.unwrap().into_source_parts();
+                    complete_credit_wait(|| probe.reads.get() == 1).await;
+                    fail_upload.notify_one();
+                    let Err(error) = first.1.read_header_event().await else {
+                        panic!("the upload panic fails its response");
+                    };
+                    assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+                    assert_eq!(probe.drops.get(), 1);
+                    assert!(probe.stops.borrow().is_empty());
+                    respond.notify_one();
+                    let mut head = second.1.read_header_event().await.unwrap();
+                    assert_eq!(head.headers_mut().status_code().unwrap(), 200);
+                    assert!(head.eom());
+                    let mut third = handle
+                        .reserve_request()
+                        .unwrap()
+                        .submit(
+                            request_head(HttpMethod::Get, true, None),
+                            HttpSourceHolder::empty(),
+                            CancellationToken::never(),
+                        )
+                        .await
+                        .unwrap()
+                        .into_source_parts();
+                    assert_eq!(third.0, StreamId::new(5));
+                    respond_again.notify_one();
+                    let mut head = third.1.read_header_event().await.unwrap();
+                    assert_eq!(head.headers_mut().status_code().unwrap(), 200);
+                    drop((first, second, third));
+                    complete_credit_wait(|| handle.is_idle()).await;
+                    let decoded = decode_client_frames(&wire.borrow().writes.concat());
+                    assert_eq!(
+                        decoded.header_streams,
+                        [StreamId::new(1), StreamId::new(3), StreamId::new(5)]
+                    );
+                    assert_eq!(
+                        decoded.resets,
+                        [(StreamId::new(1), H2ErrorCode::INTERNAL_ERROR)]
+                    );
+                    assert!(decoded.goaways.is_empty());
+                    assert!(decoded.errors.is_empty());
+                    assert_eq!(
+                        take_contained_panics(),
+                        [(
+                            PanicSite::UploadBody,
+                            Some(StreamId::new(1)),
+                            Some("upload read".to_owned())
+                        )]
+                    );
+                    assert_eq!(
+                        super::owned::contained_panic_counts(&worker, &start),
+                        (1, 0, 0)
+                    );
+                })
+                .await,
+            );
+        })
+    });
+}
+
+#[cfg(panic = "unwind")]
+#[test]
+fn an_upload_panic_fails_only_its_request() {
+    assert_an_upload_panic_fails_only_its_request();
+}
+
+#[cfg(panic = "unwind")]
+#[test]
+fn an_upload_panic_fails_only_its_request_on_a_hosted_worker() {
+    crate::uniplex_tests::on_hosted_workers(assert_an_upload_panic_fails_only_its_request);
+}
+
+/// `DIV-056`: a response observer whose deadline poll panics fails only its request:
+/// the stream is reset, the observer is not polled again and completes once, with the failure,
+/// and the session keeps serving.
+#[cfg(panic = "unwind")]
+#[test]
+fn a_response_observer_deadline_panic_fails_its_request_once() {
+    use std::task::Context;
+    use std::time::Instant;
+
+    use crate::owned_h2::OwnedH2ResponseObserver;
+
+    struct Observer {
+        polled: Rc<Cell<usize>>,
+        completed: Rc<RefCell<Vec<Result<Instant, HttpErrorCode>>>>,
+        dropped: Rc<Cell<usize>>,
+    }
+    impl OwnedH2ResponseObserver for Observer {
+        fn poll_deadline(&mut self, _: &mut Context<'_>) -> Poll<HttpError> {
+            self.polled.set(self.polled.get() + 1);
+            panic_any("response observer deadline");
+        }
+
+        fn response_complete(self: Box<Self>, completed: Result<Instant, HttpError>) {
+            self.completed
+                .borrow_mut()
+                .push(completed.map_err(|error| error.code()));
+        }
+    }
+    impl Drop for Observer {
+        fn drop(&mut self) {
+            self.dropped.set(self.dropped.get() + 1);
+        }
+    }
+
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let mut peer = Http2Codec::new(TransportDirection::Downstream);
+            let respond = Arc::new(tokio::sync::Notify::new());
+            let (transport, wire) = FixtureTransport::new([
+                FixtureRead::Data(server_settings_bytes(10)),
+                FixtureRead::WaitData(
+                    Arc::clone(&respond),
+                    response_head(&mut peer, StreamId::new(3), 200, true, Some(0)),
+                ),
+            ]);
+            let (session, handle) =
+                OwnedH2UpstreamSession::new(options(context, transport)).unwrap();
+            let polled = Rc::new(Cell::new(0));
+            let completed = Rc::new(RefCell::new(Vec::new()));
+            let dropped = Rc::new(Cell::new(0));
+            cancelled(
+                drive(session, &handle, &[Arc::clone(&respond)], async {
+                    let submit = || {
+                        handle.reserve_request().unwrap().submit(
+                            request_head(HttpMethod::Get, true, None),
+                            HttpSourceHolder::empty(),
+                            CancellationToken::never(),
+                        )
+                    };
+                    let (first, second) = (submit(), submit());
+                    let mut first = first.await.unwrap().into_source_parts();
+                    let mut second = second.await.unwrap().into_source_parts();
+                    first
+                        .2
+                        .observe_response(Box::new(Observer {
+                            polled: Rc::clone(&polled),
+                            completed: Rc::clone(&completed),
+                            dropped: Rc::clone(&dropped),
+                        }))
+                        .unwrap();
+                    complete_credit_wait(|| dropped.get() == 1).await;
+                    assert_eq!(polled.get(), 1, "a panicked deadline is not polled again");
+                    assert_eq!(
+                        completed.borrow().as_slice(),
+                        [Err(HttpErrorCode::INTERNAL_ERROR)]
+                    );
+                    let Err(error) = first.1.read_header_event().await else {
+                        panic!("the panic fails the observed request");
+                    };
+                    assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+                    respond.notify_one();
+                    let mut head = second.1.read_header_event().await.unwrap();
+                    assert_eq!(head.headers_mut().status_code().unwrap(), 200);
+                    assert!(head.eom());
+                    drop((first, second));
+                    complete_credit_wait(|| handle.is_idle()).await;
+                    let decoded = decode_client_frames(&wire.borrow().writes.concat());
+                    assert_eq!(decoded.header_streams, [StreamId::new(1), StreamId::new(3)]);
+                    assert_eq!(
+                        decoded.resets,
+                        [(StreamId::new(1), H2ErrorCode::INTERNAL_ERROR)]
+                    );
+                    assert!(decoded.goaways.is_empty());
+                    assert_eq!(
+                        take_contained_panics(),
+                        [(
+                            PanicSite::ResponseObserver,
+                            Some(StreamId::new(1)),
+                            Some("response observer deadline".to_owned())
+                        )]
+                    );
+                    assert_eq!(
+                        super::owned::contained_panic_counts(&worker, &start),
+                        (1, 0, 0)
+                    );
+                })
+                .await,
+            );
+        })
+    });
+}
+
+/// `DIV-056`: an upstream observer that panics inside the driver's poll drains the
+/// session: the request in flight completes, admission refuses new requests, the caller's own
+/// drain request still reports a change, and the run ends `Ok` once idle.
+#[cfg(panic = "unwind")]
+fn assert_an_upstream_observer_panic_drains_the_session() {
+    #[derive(Default)]
+    struct PanicOnRelease {
+        released: RefCell<Vec<StreamId>>,
+        closed: Cell<usize>,
+    }
+    impl OwnedH2UpstreamObserver for PanicOnRelease {
+        fn capacity_released(&self, stream: StreamId) {
+            self.released.borrow_mut().push(stream);
+            if stream == StreamId::new(1) {
+                panic_any("capacity released");
+            }
+        }
+
+        fn admission_closed(&self) {
+            self.closed.set(self.closed.get() + 1);
+        }
+    }
+
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let mut peer = Http2Codec::new(TransportDirection::Downstream);
+            let first_response = Arc::new(tokio::sync::Notify::new());
+            let second_response = Arc::new(tokio::sync::Notify::new());
+            let (transport, wire) = FixtureTransport::new([
+                FixtureRead::Data(server_settings_bytes(10)),
+                FixtureRead::WaitData(
+                    Arc::clone(&first_response),
+                    response_head(&mut peer, StreamId::new(1), 200, true, Some(0)),
+                ),
+                FixtureRead::WaitData(
+                    Arc::clone(&second_response),
+                    response_head(&mut peer, StreamId::new(3), 200, true, Some(0)),
+                ),
+            ]);
+            let (session, handle) =
+                OwnedH2UpstreamSession::new(options(context, transport)).unwrap();
+            let observer = Rc::new(PanicOnRelease::default());
+            handle.set_observer(observer.clone()).unwrap();
+            let finished = Cell::new(false);
+            let run = async {
+                let result = session.run().await;
+                finished.set(true);
+                result
+            };
+            let scenario = async {
+                let outcome =
+                    eligibility_catch_unwind(tokio::time::timeout(Duration::from_secs(5), async {
+                        let submit = || {
+                            handle.reserve_request().unwrap().submit(
+                                request_head(HttpMethod::Get, true, None),
+                                HttpSourceHolder::empty(),
+                                CancellationToken::never(),
+                            )
+                        };
+                        let (first, second) = (submit(), submit());
+                        let mut first = first.await.unwrap().into_source_parts();
+                        let mut second = second.await.unwrap().into_source_parts();
+                        first_response.notify_one();
+                        assert!(first.1.read_header_event().await.unwrap().eom());
+                        complete_credit_wait(|| observer.closed.get() == 1).await;
+                        assert!(first.2.capacity_released());
+                        let refused = match handle.reserve_request() {
+                            Ok(_) => panic!("a draining session refuses new requests"),
+                            Err(error) => error,
+                        };
+                        assert_eq!(refused.code(), HttpErrorCode::REFUSED_STREAM);
+                        assert!(
+                            handle.close_when_idle().unwrap(),
+                            "the caller had not requested a drain"
+                        );
+                        assert!(!finished.get(), "the request in flight keeps the session");
+                        second_response.notify_one();
+                        let mut head = second.1.read_header_event().await.unwrap();
+                        assert_eq!(head.headers_mut().status_code().unwrap(), 200);
+                        drop((first, second));
+                    }))
+                    .await;
+                first_response.notify_one();
+                second_response.notify_one();
+                if !matches!(&outcome, Ok(Ok(()))) {
+                    handle.cancel();
+                }
+                outcome
+            };
+            let (result, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(run, scenario)
+            })
+            .await
+            .expect("the drained session ends once idle");
+            match outcome {
+                Ok(result) => result.expect("the observer panic drains the session"),
+                Err(payload) => resume_unwind(payload),
+            }
+            let summary = result.expect("a drained session ends cleanly");
+            assert!(!summary.reset);
+            let decoded = decode_client_frames(&wire.borrow().writes.concat());
+            assert_eq!(
+                decoded.goaways,
+                [(StreamId::UNSPECIFIED, H2ErrorCode::NO_ERROR)]
+            );
+            assert!(decoded.resets.is_empty());
+            assert_eq!(
+                observer.released.borrow().as_slice(),
+                [StreamId::new(1), StreamId::new(3)]
+            );
+            assert_eq!(observer.closed.get(), 1);
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::UpstreamObserver,
+                    Some(StreamId::new(1)),
+                    Some("capacity released".to_owned())
+                )]
+            );
+            assert_eq!(
+                super::owned::contained_panic_counts(&worker, &start),
+                (0, 1, 0)
+            );
+            assert_eq!(wire.borrow().close, FixtureClose::Closed);
+        })
+    });
+}
+
+#[cfg(panic = "unwind")]
+#[test]
+fn an_upstream_observer_panic_drains_the_session() {
+    assert_an_upstream_observer_panic_drains_the_session();
+}
+
+#[cfg(panic = "unwind")]
+#[test]
+fn an_upstream_observer_panic_drains_the_session_on_a_hosted_worker() {
+    crate::uniplex_tests::on_hosted_workers(assert_an_upstream_observer_panic_drains_the_session);
+}
+
+/// `DIV-056`: a panic in a request's commit, which runs only Roxygen code, tears the
+/// session down at Driver scope with one report: the submission and the run fail with
+/// `INTERNAL_ERROR`.
+#[cfg(panic = "unwind")]
+#[test]
+fn a_commit_panic_tears_down_with_one_report() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let (transport, wire) =
+                FixtureTransport::new([FixtureRead::Data(server_settings_bytes(1))]);
+            let (session, handle) =
+                OwnedH2UpstreamSession::new(options(context, transport)).unwrap();
+            let (upload, probe) = Upload::new(1, 1).held();
+            crate::owned_h2::fault_next_commit();
+            let submission = handle.reserve_request().unwrap().submit(
+                request_head(HttpMethod::Post, false, Some(1)),
+                upload,
+                CancellationToken::never(),
+            );
+            let (result, submitted) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(session.run(), submission)
+            })
+            .await
+            .expect("the session tears down");
+            let error = result.expect_err("a commit panic fails the run");
+            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+            let Err(error) = submitted else {
+                panic!("the submission fails");
+            };
+            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+            assert_eq!(error.message(), b"upstream request commitment panicked");
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::Commit,
+                    None,
+                    Some("owned H2 commit fault".to_owned())
+                )]
+            );
+            assert_eq!(
+                super::owned::contained_panic_counts(&worker, &start),
+                (0, 0, 1)
+            );
+            assert_eq!(probe.reads.get(), 0);
+            assert_eq!(probe.drops.get(), 1);
+            assert_eq!(
+                probe.stops.borrow().as_slice(),
+                [Some(HttpErrorCode::INTERNAL_ERROR)]
+            );
+            assert!(handle.is_finished());
+            assert!(
+                decode_client_frames(&wire.borrow().writes.concat())
+                    .header_streams
+                    .is_empty()
+            );
+            assert_eq!(wire.borrow().close, FixtureClose::Reset);
+        })
+    });
+}
+
+/// `DIV-056`: admission callbacks that a caller's own call triggers still raise their
+/// panic to that caller, unreported: between polls of a live session, and once its run finished,
+/// normally or after a Driver-scope teardown.
+#[cfg(panic = "unwind")]
+#[test]
+fn caller_triggered_admission_panics_still_reach_the_caller() {
+    use std::sync::atomic::AtomicBool;
+    use std::task::Context;
+    use std::task::Waker;
+
+    struct PanickingAdmission;
+    impl OwnedH2UpstreamObserver for PanickingAdmission {
+        fn capacity_available(&self) {
+            panic_any("capacity available");
+        }
+
+        fn admission_closed(&self) {
+            panic_any("admission closed");
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Moment {
+        BetweenPolls,
+        AfterCompletion,
+        AfterTeardown,
+    }
+
+    fn raised(call: impl FnOnce()) -> &'static str {
+        let panic = catch_unwind(AssertUnwindSafe(call))
+            .expect_err("the callback's panic reaches the caller");
+        panic
+            .downcast_ref::<&'static str>()
+            .copied()
+            .expect("the panic carries its message")
+    }
+
+    async fn finish<Run: Future + Unpin>(run: &mut Run, waker: &Waker) -> Run::Output {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Poll::Ready(result) =
+                    Pin::new(&mut *run).poll(&mut Context::from_waker(waker))
+                {
+                    return result;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the run finishes")
+    }
+
+    for moment in [
+        Moment::BetweenPolls,
+        Moment::AfterCompletion,
+        Moment::AfterTeardown,
+    ] {
+        run_on_worker(move |context| {
+            Box::pin(async move {
+                take_contained_panics();
+                let mut reads = vec![FixtureRead::Data(server_settings_bytes(10))];
+                if matches!(moment, Moment::AfterCompletion) {
+                    reads.push(FixtureRead::DataEof(Vec::new()));
+                }
+                let (transport, _wire) = FixtureTransport::new(reads);
+                let mut config = options(context, transport);
+                if matches!(moment, Moment::AfterTeardown) {
+                    config.http2.header_indexing_strategy =
+                        Some(Rc::new(super::owned::PanickingIndexing));
+                }
+                let (session, handle) = OwnedH2UpstreamSession::new(config).unwrap();
+                let wake = Arc::new(OncePanicWake {
+                    armed: AtomicBool::new(false),
+                    message: "run waker",
+                });
+                let waker = Waker::from(Arc::clone(&wake));
+                let mut run = Box::pin(session.run());
+                assert!(
+                    run.as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                match moment {
+                    Moment::BetweenPolls => {
+                        handle.set_observer(Rc::new(PanickingAdmission)).unwrap();
+                        assert_eq!(
+                            raised(|| drop(handle.reserve_request().unwrap())),
+                            "capacity available"
+                        );
+                        assert_eq!(
+                            raised(|| {
+                                let _ = handle.close_when_idle();
+                            }),
+                            "admission closed"
+                        );
+                        let summary = finish(&mut run, &waker)
+                            .await
+                            .expect("the drained session ends cleanly");
+                        assert!(!summary.reset);
+                    }
+                    Moment::AfterCompletion => {
+                        let reservation = handle.reserve_request().unwrap();
+                        let summary = finish(&mut run, &waker)
+                            .await
+                            .expect("the peer's EOF ends the run");
+                        assert!(!summary.reset);
+                        wake.armed.store(true, Ordering::SeqCst);
+                        assert_eq!(raised(|| drop(reservation)), "run waker");
+                    }
+                    Moment::AfterTeardown => {
+                        let reservation = handle.reserve_request().unwrap();
+                        let submission = handle.reserve_request().unwrap().submit(
+                            request_head(HttpMethod::Get, true, None),
+                            HttpSourceHolder::empty(),
+                            CancellationToken::never(),
+                        );
+                        let error = finish(&mut run, &waker)
+                            .await
+                            .expect_err("the Driver-scope panic fails the run");
+                        assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+                        drop(submission);
+                        wake.armed.store(true, Ordering::SeqCst);
+                        assert_eq!(raised(|| drop(reservation)), "run waker");
+                    }
+                }
+                let expected = match moment {
+                    Moment::AfterTeardown => vec![(
+                        PanicSite::DriverTurn,
+                        None,
+                        Some("indexing strategy".to_owned()),
+                    )],
+                    Moment::BetweenPolls | Moment::AfterCompletion => Vec::new(),
+                };
+                assert_eq!(take_contained_panics(), expected);
             })
         });
     }
