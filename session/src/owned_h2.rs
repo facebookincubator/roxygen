@@ -18,6 +18,7 @@ use std::panic::catch_unwind;
 use std::panic::resume_unwind;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::rc::Weak;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
@@ -260,9 +261,10 @@ impl IoWake {
     /// `TimedBaton::drop`, a write's `CompletionWake`), and this saves the session poll that wake
     /// would cost. A pending operation's wake goes out as it would have. A poll that panics leaves
     /// the state polling or woken, and until the next `poll_inline` resets it, every wake is held
-    /// rather than sent. Nothing is lost meanwhile: the session aborts, `reset_transport` stores
-    /// both `ready` flags directly, and `poll_panicked` wakes the session through its own
-    /// context's waker. Without `completion_wakes` it only polls: there is no wake to save.
+    /// rather than sent. Nothing is lost meanwhile: the session tears down, `poll_panicked` stores
+    /// both `ready` flags and wakes the session through its own context's waker, and a teardown
+    /// poll that panics does the same for its operation (`DIV-056`). Without `completion_wakes` it
+    /// only polls: there is no wake to save.
     #[inline]
     fn poll_inline<T>(
         self: &Arc<Self>,
@@ -1022,6 +1024,60 @@ fn capture<T>(first: &mut Option<PanicPayload>, action: impl FnOnce() -> T) -> O
     }
 }
 
+#[inline(always)]
+fn guarded<T>(action: impl FnOnce() -> T) -> Result<T, PanicPayload> {
+    catch_unwind(AssertUnwindSafe(action))
+}
+
+/// Runs `action` under its own unwind boundary (`DIV-056`). A panic is reported at `site` with
+/// `stream`, disposed of, and marks `failure` panicked.
+#[inline(always)]
+fn contain<T>(
+    context: &WorkerContext,
+    failure: &mut DriverFailure,
+    site: PanicSite,
+    stream: Option<StreamId>,
+    action: impl FnOnce() -> T,
+) -> Option<T> {
+    match guarded(action) {
+        Ok(result) => Some(result),
+        Err(panic) => {
+            contained(context, failure, site, stream, panic);
+            None
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn contained(
+    context: &WorkerContext,
+    failure: &mut DriverFailure,
+    site: PanicSite,
+    stream: Option<StreamId>,
+    panic: PanicPayload,
+) {
+    report_contained_panic(context, site, stream, &*panic);
+    discard_panic(panic);
+    failure.panicked = true;
+}
+
+/// Reports a panic in a teardown step or a released field, and disposes of it.
+#[cold]
+#[inline(never)]
+fn teardown_panicked(context: &WorkerContext, panic: PanicPayload) {
+    report_contained_panic(context, PanicSite::Teardown, None, &*panic);
+    discard_panic(panic);
+}
+
+/// Drops `field` under its own unwind boundary, reporting a panic as a teardown step's.
+#[inline(always)]
+fn release_field<T>(context: &WorkerContext, field: T) {
+    if let Err(panic) = guarded(|| drop(field)) {
+        teardown_panicked(context, panic);
+    }
+}
+
 impl<E, const UPSTREAM: bool> Drop for Stream<E, UPSTREAM>
 where
     E: ExchangeStorage<UPSTREAM>,
@@ -1351,6 +1407,14 @@ thread_local! {
     static OWNER_WRITE_STATE_READS: Cell<usize> = const { Cell::new(0) };
     static READ_START_CHECKS: Cell<usize> = const { Cell::new(0) };
     static INLINE_POLLS: Cell<usize> = const { Cell::new(0) };
+    static RUN_FAULT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes the next pending poll of an owned H2 run on this thread panic outside the driver's
+/// boundaries, where only a fault in the run's own code could.
+#[cfg(test)]
+pub(crate) fn fault_next_run_poll() {
+    RUN_FAULT.set(true);
 }
 
 /// How many times stream-owner code on this thread has evaluated whether writes are pending.
@@ -1390,14 +1454,94 @@ pub(crate) fn inline_polls() -> usize {
 /// Policy and body futures are children owned directly by each stream. No
 /// application task is spawned; cancelling a stream retires those futures before
 /// the stream's ingress-source and physical-write fences can complete.
-pub struct OwnedH2Session<A: OwnedApplication>(Driver<A, false>);
+pub struct OwnedH2Session<A: OwnedApplication>(Option<Driver<A, false>>);
 
-/// Drives a [`Driver`] to completion. Every poll isolates callback panics, and completion
-/// closes admission, publishes `complete` and drops the driver before returning.
-struct DriverRun<A, const UPSTREAM: bool>(Option<Driver<A, UPSTREAM>>)
+/// A session dropped unrun is abandoned as a run would be.
+impl<A: OwnedApplication> Drop for OwnedH2Session<A> {
+    fn drop(&mut self) {
+        if let Some(driver) = self.0.take() {
+            driver.abandon(false);
+        }
+    }
+}
+
+/// Drives a [`Driver`] to completion (`DIV-056`). No poll unwinds out of driver code: a panic
+/// that reaches the per-turn boundary is reported and starts a teardown that joins native I/O,
+/// after which the run returns `Err`. Completion closes admission, publishes `complete` and
+/// releases the driver before returning. A run dropped unfinished is abandoned.
+struct DriverRun<A, const UPSTREAM: bool>
 where
     A: OwnedApplication,
-    A::Exchange: ExchangeStorage<UPSTREAM>;
+    A::Exchange: ExchangeStorage<UPSTREAM>,
+{
+    driver: Option<Driver<A, UPSTREAM>>,
+    /// Set while a poll runs and cleared as it returns, so it stays set only after a poll that
+    /// unwound. Such a run returns `Err` without touching its driver again, and its
+    /// abandonment does not assert that its cleanup joined.
+    poisoned: bool,
+}
+
+impl<A, const UPSTREAM: bool> Drop for DriverRun<A, UPSTREAM>
+where
+    A: OwnedApplication,
+    A::Exchange: ExchangeStorage<UPSTREAM>,
+{
+    fn drop(&mut self) {
+        if let Some(driver) = self.driver.take() {
+            driver.abandon(self.poisoned);
+        }
+    }
+}
+
+/// Marks the upstream admission as polled by its driver while the guard lives, then restores
+/// the previous mark. It holds the admission weakly, so it never drops the last reference to
+/// it; downstream it holds nothing.
+struct AdmissionPolling(Option<(Weak<upstream::Admission>, bool)>);
+
+impl AdmissionPolling {
+    #[inline(always)]
+    fn enter<A, const UPSTREAM: bool>(driver: &Driver<A, UPSTREAM>) -> Self
+    where
+        A: OwnedApplication,
+        A::Exchange: ExchangeStorage<UPSTREAM>,
+    {
+        match &driver.connection.state.control.upstream {
+            Some(admission) if UPSTREAM => Self(Some((
+                Rc::downgrade(admission),
+                admission.polling.replace(true),
+            ))),
+            _ => Self(None),
+        }
+    }
+}
+
+impl Drop for AdmissionPolling {
+    fn drop(&mut self) {
+        if let Some((admission, previous)) = &self.0
+            && let Some(admission) = admission.upgrade()
+        {
+            admission.polling.set(*previous);
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn poisoned_run() -> HttpError {
+    failure(
+        HttpErrorCode::INTERNAL_ERROR,
+        b"owned H2 runner unwound out of an earlier poll",
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn polled_after_completion() -> HttpError {
+    failure(
+        HttpErrorCode::INVALID_STATE_TRANSITION,
+        b"owned H2 runner polled after completion",
+    )
+}
 
 // The driver is only ever accessed through `&mut`; nothing pins it.
 impl<A, const UPSTREAM: bool> Unpin for DriverRun<A, UPSTREAM>
@@ -1417,34 +1561,57 @@ where
     #[inline(always)]
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let driver = this
-            .0
-            .as_mut()
-            .expect("owned H2 runner polled after completion");
-        driver.started = true;
-        driver.set_admission_polling(true);
-        let polled = catch_unwind(AssertUnwindSafe(|| driver.poll(context)));
-        driver.set_admission_polling(false);
-        match polled {
-            Ok(Poll::Pending) => {
-                // Every step a session test drives ends with a pending poll.
-                #[cfg(test)]
-                driver.debug_assert_stream_counts();
-                if driver.connection.state.observation.is_some() {
-                    driver.flush_observation(context);
+        if this.poisoned {
+            return Poll::Ready(Err(poisoned_run()));
+        }
+        let Some(driver) = this.driver.as_mut() else {
+            return Poll::Ready(Err(polled_after_completion()));
+        };
+        this.poisoned = true;
+        let polled = {
+            let _polling = AdmissionPolling::enter(driver);
+            let polled = if driver.teardown.is_some() {
+                driver.poll_teardown(context)
+            } else {
+                driver.started = true;
+                match catch_unwind(AssertUnwindSafe(|| driver.poll(context))) {
+                    Ok(polled) => polled,
+                    Err(panic) => {
+                        report_contained_panic(
+                            &driver.context,
+                            PanicSite::DriverTurn,
+                            None,
+                            &*panic,
+                        );
+                        driver.poll_panicked(panic, context);
+                        Poll::Pending
+                    }
                 }
-                Poll::Pending
+            };
+            polled.map(|result| {
+                this.driver
+                    .take()
+                    .expect("owned H2 runner completes once")
+                    .finish_run(result)
+            })
+        };
+        if polled.is_pending()
+            && let Some(driver) = this.driver.as_mut()
+            && driver.teardown.is_none()
+        {
+            #[cfg(test)]
+            if RUN_FAULT.take() {
+                panic!("owned H2 run fault");
             }
-            Ok(Poll::Ready(result)) => {
-                let driver = this.0.take().expect("owned H2 runner completes once");
-                Poll::Ready(driver.finish_run(result))
-            }
-            Err(panic) => {
-                report_contained_panic(&driver.context, PanicSite::DriverTurn, None, &*panic);
-                driver.poll_panicked(panic, context);
-                Poll::Pending
+            // Every step a session test drives ends with a pending poll.
+            #[cfg(test)]
+            driver.debug_assert_stream_counts();
+            if driver.connection.state.observation.is_some() {
+                driver.flush_observation(context);
             }
         }
+        this.poisoned = false;
+        polled
     }
 }
 
@@ -1488,7 +1655,20 @@ where
     /// A queued write started without arming the writer, and no `poll_complete` has since
     /// registered its waker or found the queue idle.
     unarmed_write: bool,
+    /// Set once a Driver-scope panic started the teardown (`DIV-056`).
+    teardown: Option<Box<TeardownState>>,
 }
+
+/// The panicking teardown polls of each native operation, counted in total (`DIV-056`).
+#[derive(Default)]
+struct TeardownState {
+    read_panics: u8,
+    write_panics: u8,
+    queue_panics: u8,
+}
+
+/// The panicking teardown polls after which a native operation is dropped unfinished.
+const TEARDOWN_PANIC_LIMIT: u8 = 3;
 
 struct OwnedConnection {
     codec: FlowControlledCodec,
@@ -1527,7 +1707,9 @@ struct ConnectionState {
 struct DriverFailure {
     failures: VecDeque<Failure>,
     fatal: Option<HttpError>,
-    panic: Option<PanicPayload>,
+    /// A boundary contained a panic, which aborts the connection where it would otherwise
+    /// continue (`DIV-056`).
+    panicked: bool,
 }
 
 impl ConnectionState {
@@ -1703,18 +1885,24 @@ impl<A: OwnedApplication> OwnedH2Session<A> {
         options: OwnedH2Options,
     ) -> Result<(Self, OwnedH2Handle), HttpError> {
         let (driver, handle) = Driver::<A, false>::new(application, options)?;
-        Ok((Self(driver), handle))
+        Ok((Self(Some(driver)), handle))
     }
 
     /// Replaces the per-session random stream-table seed with a fixed one.
     #[cfg(test)]
-    pub(crate) fn with_stream_seed(self, seed: u64) -> Self {
-        Self(self.0.with_stream_seed(seed))
+    pub(crate) fn with_stream_seed(mut self, seed: u64) -> Self {
+        let driver = self.0.take().expect("an unrun session holds its driver");
+        Self(Some(driver.with_stream_seed(seed)))
     }
 
-    /// Runs inside the caller's registered worker cleanup scope.
-    pub fn run(self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
-        self.0.run()
+    /// Runs inside the caller's registered worker cleanup scope. The run never resumes a
+    /// callback panic: one that aborts the connection is counted in the worker's
+    /// `WorkerPollStats`, and the run returns `Err` once native I/O has joined (`DIV-056`).
+    pub fn run(mut self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
+        self.0
+            .take()
+            .expect("an unrun session holds its driver")
+            .run()
     }
 
     /// Adds an owner-local lifecycle observer, as `UniplexSession::add_lifecycle_observer`
@@ -1725,7 +1913,7 @@ impl<A: OwnedApplication> OwnedH2Session<A> {
         &mut self,
         observer: Rc<dyn LifecycleObserver>,
     ) -> Result<LifecycleObserverId, HttpError> {
-        let driver = &mut self.0;
+        let driver = self.0.as_mut().expect("an unrun session holds its driver");
         let lifecycle = match &driver.connection.state.observation {
             Some(observation) => Rc::clone(&observation.lifecycle),
             None => {
@@ -1742,13 +1930,15 @@ impl<A: OwnedApplication> OwnedH2Session<A> {
     /// Whether the session observes its lifecycle.
     #[cfg(test)]
     pub(crate) fn observed(&self) -> bool {
-        self.0.connection.state.observation.is_some()
+        self.0
+            .as_ref()
+            .is_some_and(|driver| driver.connection.state.observation.is_some())
     }
 
     /// Whether the session built a flood-limit counter.
     #[cfg(test)]
     pub(crate) fn limits_rates(&self) -> bool {
-        self.0.limits_rates()
+        self.0.as_ref().is_some_and(Driver::limits_rates)
     }
 }
 
@@ -1986,7 +2176,7 @@ where
                 failure: DriverFailure {
                     failures: VecDeque::new(),
                     fatal: None,
-                    panic: None,
+                    panicked: false,
                 },
                 started: false,
                 eof: false,
@@ -1998,35 +2188,286 @@ where
                 read_parked: false,
                 ready_waker: None,
                 unarmed_write: false,
+                teardown: None,
             },
             OwnedH2Handle(control),
         ))
     }
 
     fn run(self) -> DriverRun<A, UPSTREAM> {
-        DriverRun(Some(self))
-    }
-
-    #[inline(always)]
-    fn set_admission_polling(&self, polling: bool) {
-        if UPSTREAM && let Some(admission) = &self.connection.state.control.upstream {
-            admission.polling.set(polling);
+        DriverRun {
+            driver: Some(self),
+            poisoned: false,
         }
     }
 
+    /// Starts the teardown after a Driver-scope panic that the caller reported (`DIV-056`): the
+    /// connection aborts, and the run's next polls join native I/O.
     #[cold]
     #[inline(never)]
     fn poll_panicked(&mut self, panic: PanicPayload, context: &Context<'_>) {
-        retain_panic(&mut self.failure.panic, panic);
-        self.abort(failure(
-            HttpErrorCode::INTERNAL_ERROR,
-            b"owned H2 callback panicked",
-        ));
-        context.waker().wake_by_ref();
+        discard_panic(panic);
+        self.teardown = Some(Box::default());
+        if let Err(panic) = guarded(|| {
+            self.abort(failure(
+                HttpErrorCode::INTERNAL_ERROR,
+                b"owned H2 callback panicked",
+            ))
+        }) {
+            teardown_panicked(&self.context, panic);
+        }
+        self.read_wake.ready.store(true, Ordering::Release);
+        self.write_wake.ready.store(true, Ordering::Release);
+        self.wake_teardown(context);
     }
 
-    /// Delivers the queued lifecycle events. An observer panic aborts the connection as a
-    /// callback panic does.
+    fn wake_teardown(&self, context: &Context<'_>) {
+        if let Err(panic) = guarded(|| context.waker().wake_by_ref()) {
+            teardown_panicked(&self.context, panic);
+        }
+    }
+
+    /// One poll of the teardown (`DIV-056`). Native I/O is polled until it completes, timers and
+    /// the codec are not. A teardown poll that panics is polled again, and an operation whose
+    /// teardown polls panicked `TEARDOWN_PANIC_LIMIT` times in total is dropped unfinished. Once
+    /// no native operation is pending, the observers receive `Destroy`, and each stream is
+    /// cancelled, unless its exchange was, and dropped. Every step runs under its own unwind
+    /// boundary.
+    #[cold]
+    #[inline(never)]
+    fn poll_teardown(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<UniplexRunSummary, HttpError>> {
+        let control = &self.connection.state.control;
+        let ready_waker = &mut self.ready_waker;
+        if let Err(panic) = guarded(|| control.ready.register(ready_waker, context)) {
+            teardown_panicked(&self.context, panic);
+        }
+        if !self.transport_reset
+            && let Err(panic) = guarded(|| self.reset_transport())
+        {
+            teardown_panicked(&self.context, panic);
+        }
+        let mut teardown = self.teardown.take().unwrap_or_default();
+        self.poll_teardown_read(&mut teardown, context);
+        self.poll_teardown_write(&mut teardown, context);
+        self.teardown = Some(teardown);
+        if self.read.is_reading() || self.writes_pending() {
+            return Poll::Pending;
+        }
+        self.observe_destroy();
+        let error = failure(HttpErrorCode::INTERNAL_ERROR, b"owned H2 callback panicked");
+        self.drop_streams(&error);
+        Poll::Ready(Err(self.failure.fatal.take().unwrap_or(error)))
+    }
+
+    fn poll_teardown_read(&mut self, teardown: &mut TeardownState, context: &Context<'_>) {
+        if !self.read.is_reading() || !self.read_wake.take_ready() {
+            return;
+        }
+        let polled = guarded(|| {
+            self.read_wake
+                .poll_inline(&self.read_waker, |context| self.read.poll(context))
+                .map(drop)
+        });
+        if let Err(panic) = polled
+            && self.teardown_poll_panicked(
+                &mut teardown.read_panics,
+                &self.read_wake,
+                context,
+                panic,
+            )
+            && let Err(panic) = guarded(|| self.read.abandon())
+        {
+            teardown_panicked(&self.context, panic);
+        }
+    }
+
+    fn poll_teardown_write(&mut self, teardown: &mut TeardownState, context: &Context<'_>) {
+        if !self.write_wake.take_ready() {
+            return;
+        }
+        if let Some(write) = &mut self.write {
+            let polled = guarded(|| {
+                self.write_wake
+                    .poll_inline(&self.write_waker, |context| write.as_mut().poll(context))
+                    .map(drop)
+            });
+            let finished = match polled {
+                Ok(polled) => polled.is_ready(),
+                Err(panic) => self.teardown_poll_panicked(
+                    &mut teardown.write_panics,
+                    &self.write_wake,
+                    context,
+                    panic,
+                ),
+            };
+            if finished {
+                release_field(&self.context, self.write.take());
+            }
+        }
+        if let Some(queue) = &mut self.write_queue {
+            let waker = &self.write_waker;
+            let polled = guarded(|| {
+                let mut context = Context::from_waker(waker);
+                while !queue.is_idle() && queue.poll_complete(&mut context).is_ready() {}
+            });
+            if let Err(panic) = polled
+                && self.teardown_poll_panicked(
+                    &mut teardown.queue_panics,
+                    &self.write_wake,
+                    context,
+                    panic,
+                )
+            {
+                release_field(&self.context, self.write_queue.take());
+            }
+        }
+    }
+
+    /// Reports a teardown poll of a native operation that panicked and counts it in `panics`.
+    /// Returns whether the operation reached the limit and must be dropped; otherwise `wake` is
+    /// marked, so the next teardown poll polls it again.
+    #[cold]
+    #[inline(never)]
+    fn teardown_poll_panicked(
+        &self,
+        panics: &mut u8,
+        wake: &IoWake,
+        context: &Context<'_>,
+        panic: PanicPayload,
+    ) -> bool {
+        teardown_panicked(&self.context, panic);
+        *panics += 1;
+        if *panics >= TEARDOWN_PANIC_LIMIT {
+            return true;
+        }
+        wake.ready.store(true, Ordering::Release);
+        self.wake_teardown(context);
+        false
+    }
+
+    /// Cancels each stream left with `error`, unless its exchange was cancelled, then drops it,
+    /// in id order, each under its own unwind boundary.
+    #[cold]
+    #[inline(never)]
+    fn drop_streams(&mut self, error: &HttpError) {
+        for id in self.streams.ids_in_order() {
+            let Some(mut stream) = self.streams.remove(&id) else {
+                continue;
+            };
+            if !stream.reset
+                && let Err(panic) = guarded(|| {
+                    self.stream_connection()
+                        .1
+                        .cancel_owner(id, &mut stream, error, false)
+                })
+            {
+                teardown_panicked(&self.context, panic);
+            }
+            contain(
+                &self.context,
+                &mut self.failure,
+                PanicSite::ExchangeRetirement,
+                Some(id),
+                || drop(stream),
+            );
+        }
+    }
+
+    /// Abandons a run dropped unfinished, or a session dropped unrun (`DIV-056`): the observers
+    /// receive `Destroy`, the connection aborts with `CORO_CANCELLED`, which cancels every
+    /// exchange and resets the transport, and the streams and then the driver's fields are
+    /// dropped, each under its own unwind boundary. A started run then panics, because its
+    /// owner dropped it before its cleanup joined, unless its poll unwound (`poisoned`), its
+    /// thread is unwinding, or the worker is in a forced teardown.
+    #[cold]
+    #[inline(never)]
+    fn abandon(mut self, poisoned: bool) {
+        let polling = AdmissionPolling::enter(&self);
+        self.observe_destroy();
+        let error = failure(
+            HttpErrorCode::CORO_CANCELLED,
+            b"owned H2 runner abandoned before cleanup completed",
+        );
+        if let Err(panic) = guarded(|| self.abort(error.clone())) {
+            teardown_panicked(&self.context, panic);
+        }
+        self.drop_streams(&error);
+        let started = self.started;
+        self.release();
+        drop(polling);
+        assert!(
+            !started || poisoned || std::thread::panicking() || in_forced_teardown(),
+            "started owned H2 runner dropped before application and native I/O cleanup joined"
+        );
+    }
+
+    /// Drops every field, in declaration order, each that can run foreign code under its own
+    /// unwind boundary, and last the worker context those boundaries report to.
+    #[cold]
+    #[inline(never)]
+    fn release(self) {
+        let Self {
+            context,
+            transport,
+            application,
+            h2,
+            connection,
+            streams,
+            ingress,
+            egress,
+            read,
+            write,
+            write_queue,
+            read_wake,
+            read_waker,
+            write_wake,
+            write_waker,
+            cancellation,
+            write_cancellation,
+            transport_reset: _,
+            write_end: _,
+            eof_processed: _,
+            failure,
+            started: _,
+            eof: _,
+            sent_initial_goaway: _,
+            sent_final_goaway: _,
+            goaway_deadline: _,
+            budget_yield,
+            timers,
+            read_parked: _,
+            ready_waker,
+            unarmed_write: _,
+            teardown: _,
+        } = self;
+        release_field(&context, transport);
+        release_field(&context, application);
+        release_field(&context, h2);
+        release_field(&context, connection);
+        release_field(&context, streams);
+        release_field(&context, ingress);
+        release_field(&context, egress);
+        release_field(&context, read);
+        release_field(&context, write);
+        release_field(&context, write_queue);
+        release_field(&context, read_wake);
+        release_field(&context, read_waker);
+        release_field(&context, write_wake);
+        release_field(&context, write_waker);
+        release_field(&context, cancellation);
+        release_field(&context, write_cancellation);
+        release_field(&context, failure);
+        release_field(&context, budget_yield);
+        release_field(&context, timers);
+        release_field(&context, ready_waker);
+        drop(context);
+    }
+
+    /// Delivers the queued lifecycle events. An observer panic aborts the connection and starts
+    /// the teardown, as a Driver-scope panic does (`DIV-056`).
     #[cold]
     #[inline(never)]
     fn flush_observation(&mut self, context: &Context<'_>) {
@@ -2042,7 +2483,7 @@ where
     }
 
     /// Reports the end of the session once: detaches the streams it still holds, then
-    /// `Destroy`, delivers everything queued and drops the observers. Panics are retained.
+    /// `Destroy`, delivers everything queued and drops the observers. Panics are contained.
     #[cold]
     #[inline(never)]
     fn observe_destroy(&mut self) {
@@ -2059,28 +2500,51 @@ where
         }
         observation.push(LifecycleEvent::Destroy);
         let lifecycle = &observation.lifecycle;
-        capture(&mut self.failure.panic, || lifecycle.flush());
-        capture(&mut self.failure.panic, || lifecycle.clear());
+        let site = PanicSite::LifecycleObserver;
+        contain(&self.context, &mut self.failure, site, None, || {
+            lifecycle.flush()
+        });
+        contain(&self.context, &mut self.failure, site, None, || {
+            lifecycle.clear()
+        });
+        contain(&self.context, &mut self.failure, site, None, || {
+            drop(observation)
+        });
     }
 
+    /// A panic contained while the completion closes admission or delivers the last lifecycle
+    /// events fails a run that would have succeeded, as one at the end of a poll does
+    /// (`DIV-056`).
     #[cold]
     #[inline(never)]
     fn finish_run(
         mut self,
         result: Result<UniplexRunSummary, HttpError>,
     ) -> Result<UniplexRunSummary, HttpError> {
+        let panicked = self.failure.panicked;
         if let Some(admission) = &self.connection.state.control.upstream {
-            capture(&mut self.failure.panic, || {
-                admission.close(failure(
-                    HttpErrorCode::TRANSPORT_EOF,
-                    b"owned upstream H2 session finished",
-                ))
-            });
+            contain(
+                &self.context,
+                &mut self.failure,
+                PanicSite::UpstreamObserver,
+                None,
+                || {
+                    admission.close(failure(
+                        HttpErrorCode::TRANSPORT_EOF,
+                        b"owned upstream H2 session finished",
+                    ))
+                },
+            );
         }
         self.observe_destroy();
         self.connection.state.control.complete.set(true);
-        if let Some(panic) = self.failure.panic.take() {
-            resume_unwind(panic);
+        let completion_panicked = self.failure.panicked && !panicked;
+        self.release();
+        if completion_panicked && result.is_ok() {
+            return Err(failure(
+                HttpErrorCode::INTERNAL_ERROR,
+                b"owned H2 callback panicked",
+            ));
         }
         result
     }
@@ -3030,23 +3494,29 @@ where
                 .summary
                 .bytes_written
                 .saturating_add(bytes as u64);
-            let observed = capture(&mut self.failure.panic, || {
-                self.connection
-                    .state
-                    .observer
-                    .socket_byte_event(
-                        &self.context,
-                        SocketByteEventType::Write,
-                        self.connection.state.summary.bytes_written,
-                    )
-                    .and_then(|_| {
-                        self.connection.state.observer.transport_write_complete(
+            let observed = contain(
+                &self.context,
+                &mut self.failure,
+                PanicSite::ByteEvent,
+                None,
+                || {
+                    self.connection
+                        .state
+                        .observer
+                        .socket_byte_event(
                             &self.context,
+                            SocketByteEventType::Write,
                             self.connection.state.summary.bytes_written,
-                            None,
                         )
-                    })
-            });
+                        .and_then(|_| {
+                            self.connection.state.observer.transport_write_complete(
+                                &self.context,
+                                self.connection.state.summary.bytes_written,
+                                None,
+                            )
+                        })
+                },
+            );
             match observed {
                 Some(Ok(_)) => {}
                 observed => retain_observer_failure(&mut failed, observed),
@@ -4079,7 +4549,7 @@ where
             let stream = entry.get_mut();
             stream.wake.queued.swap(false, Ordering::AcqRel);
             if let Err(error) = connection.poll_stream_owner(id, stream) {
-                if self.failure.panic.is_some() && self.failure.fatal.is_none() {
+                if self.failure.panicked && self.failure.fatal.is_none() {
                     self.abort_retirement_panic();
                 }
                 return Err(error);
@@ -4120,26 +4590,35 @@ where
         if let Some(mut stream) = retired {
             self.debug_assert_stream_counts();
             if let Some(exchange) = stream.upstream() {
-                capture(&mut self.failure.panic, || exchange.status.release());
+                contain(
+                    &self.context,
+                    &mut self.failure,
+                    PanicSite::UpstreamObserver,
+                    Some(id),
+                    || exchange.status.release(),
+                );
             }
             self.connection
                 .state
                 .scheduler
                 .dequeue(id, &mut stream.scheduling);
             stream.wake.live.store(false, Ordering::Release);
+            let site = PanicSite::ExchangeRetirement;
             if !stream.reset {
-                capture(&mut self.failure.panic, || {
+                contain(&self.context, &mut self.failure, site, Some(id), || {
                     <A::Exchange as ExchangeStorage<UPSTREAM>>::complete_stored(
                         &mut stream.application,
                     )
                 });
             }
-            capture(&mut self.failure.panic, || drop(stream));
+            contain(&self.context, &mut self.failure, site, Some(id), || {
+                drop(stream)
+            });
             if let Some(observation) = self.connection.state.observation.as_deref() {
                 observation.retired(id, self.streams.is_empty());
             }
         }
-        if serialized.is_none() && self.failure.panic.is_some() && self.failure.fatal.is_none() {
+        if serialized.is_none() && self.failure.panicked && self.failure.fatal.is_none() {
             self.abort_retirement_panic();
         }
         Ok(serialized.map_or(OwnerPollResult::Polled, OwnerPollResult::Serialized))
@@ -4536,6 +5015,7 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
 
     fn discard_pending<E: ExchangeStorage<UPSTREAM>>(
         &mut self,
+        id: StreamId,
         stream: &mut Stream<E, UPSTREAM>,
         error: &HttpError,
     ) {
@@ -4545,10 +5025,22 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
                 PendingEgress::Body(body) => body.byte_event_registrations_mut(),
             };
             for registration in registrations {
-                capture(&mut self.failure.panic, || registration.cancel(error, None));
+                contain(
+                    self.context,
+                    self.failure,
+                    PanicSite::ByteEvent,
+                    Some(id),
+                    || registration.cancel(error, None),
+                );
             }
         }
-        capture(&mut self.failure.panic, || drop(stream.pending.take()));
+        contain(
+            self.context,
+            self.failure,
+            PanicSite::ExchangeRetirement,
+            Some(id),
+            || drop(stream.pending.take()),
+        );
     }
 
     #[cold]
@@ -4578,7 +5070,8 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
         let discard = stream
             .upstream()
             .is_some_and(|exchange| exchange.status.cause_selected());
-        capture(&mut self.failure.panic, || {
+        let (context, site) = (self.context, PanicSite::ExchangeRetirement);
+        contain(context, self.failure, site, Some(id), || {
             let details = b"owned H2 stream cancelled";
             if discard {
                 stream
@@ -4589,30 +5082,46 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
             }
         });
         if let Some(application) = &mut stream.application {
-            if capture(&mut self.failure.panic, || {
+            if contain(context, self.failure, site, Some(id), || {
                 <E as ExchangeStorage<UPSTREAM>>::cancel_stored(application, error, peer)
             })
             .is_none()
             {
-                capture(&mut self.failure.panic, || drop(stream.application.take()));
+                contain(context, self.failure, site, Some(id), || {
+                    drop(stream.application.take())
+                });
             }
         }
-        capture(&mut self.failure.panic, || drop(stream.resume.take()));
-        self.discard_pending(stream, error);
-        capture(&mut self.failure.panic, || drop(stream.head.take()));
+        contain(context, self.failure, site, Some(id), || {
+            drop(stream.resume.take())
+        });
+        self.discard_pending(id, stream, error);
+        contain(context, self.failure, site, Some(id), || {
+            drop(stream.head.take())
+        });
         if !UPSTREAM {
-            capture(&mut self.failure.panic, || {
+            contain(context, self.failure, site, Some(id), || {
                 stream.producer.stop_reading(Some(error.code()))
             });
         }
-        capture(&mut self.failure.panic, || drop(stream.source.take()));
-        capture(&mut self.failure.panic, || {
-            self.connection
-                .state
-                .observer
-                .cancel_stream_events(self.context, id, error)
+        contain(context, self.failure, site, Some(id), || {
+            drop(stream.source.take())
         });
-        capture(&mut self.failure.panic, || stream.wake.schedule());
+        contain(
+            context,
+            self.failure,
+            PanicSite::ByteEvent,
+            Some(id),
+            || {
+                self.connection
+                    .state
+                    .observer
+                    .cancel_stream_events(context, id, error)
+            },
+        );
+        contain(context, self.failure, site, Some(id), || {
+            stream.wake.schedule()
+        });
     }
 
     /// Cancels the owner with `error` and answers with a bodiless `status` that ends the stream,
@@ -4759,16 +5268,20 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
         }
         if stream.reset && peer {
             if let Some(application) = &mut stream.application {
-                capture(&mut self.failure.panic, || {
-                    <E as ExchangeStorage<UPSTREAM>>::cancel_stored(application, error, true)
-                });
+                contain(
+                    self.context,
+                    self.failure,
+                    PanicSite::ExchangeRetirement,
+                    Some(id),
+                    || <E as ExchangeStorage<UPSTREAM>>::cancel_stored(application, error, true),
+                );
             }
             if !stream.response_complete || stream.pending.is_some() {
                 self.connection
                     .state
                     .scheduler
                     .dequeue(id, &mut stream.scheduling);
-                self.discard_pending(stream, error);
+                self.discard_pending(id, stream, error);
                 stream.response_complete = true;
                 stream.signals.response_complete();
                 let offset = self
@@ -4834,22 +5347,25 @@ where
     fn reset_transport(&mut self) {
         self.read_wake.ready.store(true, Ordering::Release);
         self.write_wake.ready.store(true, Ordering::Release);
+        let site = PanicSite::Transport;
         if !self.transport_reset {
             self.transport_reset = true;
             self.connection.state.summary.reset = true;
-            capture(&mut self.failure.panic, || {
+            contain(&self.context, &mut self.failure, site, None, || {
                 self.cancellation.request_cancellation()
             });
-            capture(&mut self.failure.panic, || {
+            contain(&self.context, &mut self.failure, site, None, || {
                 self.write_cancellation.request_cancellation()
             });
-            capture(&mut self.failure.panic, || {
+            contain(&self.context, &mut self.failure, site, None, || {
                 self.transport.close_with_reset(&self.context)
             });
         }
         for id in self.streams.ids_in_order() {
             let stream = &self.streams[&id];
-            capture(&mut self.failure.panic, || stream.wake.schedule());
+            contain(&self.context, &mut self.failure, site, None, || {
+                stream.wake.schedule()
+            });
         }
     }
 
@@ -4863,24 +5379,40 @@ where
             observation.drain(DrainTrigger::ConnectionError);
         }
         if let Some(admission) = &self.connection.state.control.upstream {
-            capture(&mut self.failure.panic, || admission.close(error.clone()));
+            contain(
+                &self.context,
+                &mut self.failure,
+                PanicSite::UpstreamObserver,
+                None,
+                || admission.close(error.clone()),
+            );
         }
         self.failure.failures.clear();
         self.read_wake.ready.store(true, Ordering::Release);
-        capture(&mut self.failure.panic, || {
-            self.cancellation.request_cancellation()
-        });
+        contain(
+            &self.context,
+            &mut self.failure,
+            PanicSite::Transport,
+            None,
+            || self.cancellation.request_cancellation(),
+        );
         let wire = http_error_code_to_h2_error_code(error.code(), false);
         let generated = self.generate_goaway(wire);
         for id in self.streams.ids_in_order() {
             self.reset_stream(id, error.clone(), false, None);
         }
-        capture(&mut self.failure.panic, || {
-            self.connection
-                .state
-                .observer
-                .cancel_events(&self.context, &error)
-        });
+        contain(
+            &self.context,
+            &mut self.failure,
+            PanicSite::ByteEvent,
+            None,
+            || {
+                self.connection
+                    .state
+                    .observer
+                    .cancel_events(&self.context, &error)
+            },
+        );
         if generated.is_err() {
             self.abort(error);
         }
@@ -4895,7 +5427,13 @@ where
             }
         }
         if let Some(admission) = &self.connection.state.control.upstream {
-            capture(&mut self.failure.panic, || admission.close(error.clone()));
+            contain(
+                &self.context,
+                &mut self.failure,
+                PanicSite::UpstreamObserver,
+                None,
+                || admission.close(error.clone()),
+            );
         }
         self.failure.failures.clear();
         self.reset_transport();
@@ -4904,12 +5442,18 @@ where
         }
         self.egress = BufQueue::new(self.connection.state.config.buffer_limit);
         self.connection.state.zero_write_pending = false;
-        capture(&mut self.failure.panic, || {
-            self.connection
-                .state
-                .observer
-                .cancel_events(&self.context, &error)
-        });
+        contain(
+            &self.context,
+            &mut self.failure,
+            PanicSite::ByteEvent,
+            None,
+            || {
+                self.connection
+                    .state
+                    .observer
+                    .cancel_events(&self.context, &error)
+            },
+        );
     }
 
     #[cold]
@@ -5030,7 +5574,7 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
     ) -> Option<Result<(), HttpError>> {
         // Cancellation and retirement retain their checkpoint before serialization.
         if self.failure.fatal.is_some()
-            || self.failure.panic.is_some()
+            || self.failure.panicked
             || self.cancelled()
             || self.connection.state.scheduler.head() != Some(id)
         {
@@ -5366,33 +5910,6 @@ fn completion_cancelled(registrations: &mut [HttpByteEventRegistration]) -> Http
     );
     cancel_registrations(registrations, &error);
     error
-}
-
-impl<A, const UPSTREAM: bool> Drop for Driver<A, UPSTREAM>
-where
-    A: OwnedApplication,
-    A::Exchange: ExchangeStorage<UPSTREAM>,
-{
-    fn drop(&mut self) {
-        if !self.connection.state.control.complete.get() {
-            self.observe_destroy();
-            self.abort(failure(
-                HttpErrorCode::CORO_CANCELLED,
-                b"owned H2 runner abandoned before cleanup completed",
-            ));
-            if let Some(panic) = self.failure.panic.take() {
-                if std::thread::panicking() {
-                    discard_panic(panic);
-                } else {
-                    resume_unwind(panic);
-                }
-            }
-            assert!(
-                !self.started || std::thread::panicking() || in_forced_teardown(),
-                "started owned H2 runner dropped before application and native I/O cleanup joined"
-            );
-        }
-    }
 }
 
 #[cfg(test)]

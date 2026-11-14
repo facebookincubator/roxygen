@@ -121,13 +121,27 @@ pub(crate) enum PanicSite {
     DriverTurn,
     /// A lifecycle observer.
     LifecycleObserver,
+    /// An upstream session's admission callbacks: its `OwnedUpstreamObserver` and the
+    /// refusals of queued submissions.
+    UpstreamObserver,
+    /// A retiring or cancelled exchange: its `complete`, `cancel` or destructor, its source's
+    /// `stop_reading` or destructor, or a value it owned.
+    ExchangeRetirement,
+    /// A byte-event callback.
+    ByteEvent,
+    /// The transport's close or a cancellation waker.
+    Transport,
+    /// A step of the teardown that follows a Driver-scope panic, or a field dropped as the
+    /// driver is released.
+    Teardown,
 }
 
 impl PanicSite {
     const fn scope(self) -> ContainedPanicScope {
         match self {
-            Self::DriverTurn => ContainedPanicScope::Driver,
-            Self::LifecycleObserver => ContainedPanicScope::Connection,
+            Self::ExchangeRetirement | Self::ByteEvent => ContainedPanicScope::Exchange,
+            Self::LifecycleObserver | Self::UpstreamObserver => ContainedPanicScope::Connection,
+            Self::DriverTurn | Self::Transport | Self::Teardown => ContainedPanicScope::Driver,
         }
     }
 
@@ -135,6 +149,11 @@ impl PanicSite {
         match self {
             Self::DriverTurn => "driver_turn",
             Self::LifecycleObserver => "lifecycle_observer",
+            Self::UpstreamObserver => "upstream_observer",
+            Self::ExchangeRetirement => "exchange_retirement",
+            Self::ByteEvent => "byte_event",
+            Self::Transport => "transport",
+            Self::Teardown => "teardown",
         }
     }
 }
@@ -342,6 +361,13 @@ impl ReadSlot {
         );
         self.read = None;
         self.note_drained(Poll::Ready(result))
+    }
+
+    /// Drops the started read unfinished after its polls panicked (`DIV-056`): its future, or the
+    /// reader that holds it, so no later poll reaches it.
+    pub(crate) fn abandon(&mut self) {
+        self.read = None;
+        drop(self.reader.take());
     }
 
     fn note_drained(

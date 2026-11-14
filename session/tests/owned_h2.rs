@@ -15,6 +15,8 @@ use roxygen_http2::hpack::HpackEncodeBuffer;
 use roxygen_http2::hpack::HpackEncoder;
 use roxygen_http2::hpack::HpackHeader;
 use roxygen_runtime::tokio_host::ManagedWorkerError;
+use roxygen_runtime::worker::WorkerHandle;
+use roxygen_runtime::worker::WorkerPollStats;
 
 use super::*;
 use crate::external_host_tests::ManualHost;
@@ -33,8 +35,10 @@ use crate::owned_h2::OwnedH2UpstreamHandle;
 use crate::owned_h2::OwnedH2UpstreamRequest;
 use crate::owned_h2::OwnedH2UpstreamSession;
 use crate::owned_h2::OwnedH2UpstreamSubmission;
+use crate::owned_h2::fault_next_run_poll;
 use crate::owned_h2::stream_seed_order;
 use crate::owned_h2::take_discarded_streams;
+use crate::uniplex::UniplexReader;
 use crate::uniplex::UniplexRunSummary;
 use crate::uniplex_tests::ParkedEnd;
 
@@ -827,26 +831,63 @@ fn connection_cancellation_keeps_stream_order_after_retirement() {
     });
 }
 
+/// The contained panics a worker counted since `start`, by scope: exchange, connection, driver
+/// (`DIV-056`).
+pub(super) fn contained_panic_counts(
+    worker: &WorkerHandle,
+    start: &WorkerPollStats,
+) -> (u64, u64, u64) {
+    let delta = worker.poll_stats().since(start);
+    (
+        delta.contained_exchange_panics,
+        delta.contained_connection_panics,
+        delta.contained_driver_panics,
+    )
+}
+
+/// `DIV-056`: abandoning a started run cancels its streams in id order and drops each
+/// under its own boundary, outside any unwind, reporting every panic; the drop still reports the
+/// join its owner skipped.
+#[cfg(panic = "unwind")]
 #[test]
-fn abandoned_streams_drop_in_order_and_preserve_first_panic() {
+fn abandoned_streams_drop_in_order_and_report_each_panic() {
     run_on_worker(|context| {
         Box::pin(async move {
+            let worker = context.handle().clone();
             let order = Rc::new(StreamOrderProbe::default());
             let (run, handle) =
                 pending_owners_after_low_stream_retirement(context, Rc::clone(&order)).await;
             drop(handle);
+            take_contained_panics();
+            let start = worker.poll_stats();
             order.panic.set(true);
             let panic = catch_unwind(AssertUnwindSafe(|| drop(run)))
-                .expect_err("the first cancellation panic survives owner destruction");
+                .expect_err("dropping a started run reports the skipped join");
             assert_eq!(
-                panic.downcast_ref::<(&'static str, u64)>(),
-                Some(&("ordered owner cancellation", 7))
+                panic.downcast_ref::<&'static str>(),
+                Some(
+                    &"started owned H2 runner dropped before application and native I/O cleanup \
+                      joined"
+                )
             );
             assert_eq!(order.cancelled.borrow().as_slice(), &[3, 5, 7]);
             assert_eq!(
                 order.dropped.borrow().as_slice(),
-                &[(7, false), (3, true), (5, true)]
+                &[(7, false), (3, false), (5, false)],
+                "stream 7's exchange drops where its cancel panicked, then the rest in order"
             );
+            let site = PanicSite::ExchangeRetirement;
+            assert_eq!(
+                take_contained_panics(),
+                [
+                    (site, Some(StreamId::new(7)), None),
+                    (site, Some(StreamId::new(7)), None),
+                    (site, Some(StreamId::new(3)), None),
+                    (site, Some(StreamId::new(5)), None),
+                ],
+                "stream 7's cancel and drop, then the drops of streams 3 and 5"
+            );
+            assert_eq!(contained_panic_counts(&worker, &start), (4, 0, 0));
         })
     });
 }
@@ -3193,8 +3234,12 @@ fn reentrant_cancellation_stops_writes_before_returning_from_the_driver_turn() {
     }
 }
 
+/// `DIV-056`: an application callback panic is contained at Driver scope: the connection aborts,
+/// the run joins its native I/O and then returns `Err(INTERNAL_ERROR)` instead of resuming the
+/// panic, which is reported once.
+#[cfg(panic = "unwind")]
 #[test]
-fn application_callback_panics_cancel_once_and_join_native_io_before_resuming() {
+fn application_callback_panics_cancel_once_and_join_native_io_before_failing_the_run() {
     for (at, expected_panic) in [
         (CallbackPanicAt::HeaderPoll, "application header poll"),
         (
@@ -3204,6 +3249,9 @@ fn application_callback_panics_cancel_once_and_join_native_io_before_resuming() 
     ] {
         run_on_worker(move |context| {
             Box::pin(async move {
+                take_contained_panics();
+                let worker = context.handle().clone();
+                let start = worker.poll_stats();
                 let release_callback = Arc::new(tokio::sync::Notify::new());
                 let release_write = Arc::new(tokio::sync::Notify::new());
                 let release_read = Arc::new(tokio::sync::Notify::new());
@@ -3242,7 +3290,7 @@ fn application_callback_panics_cancel_once_and_join_native_io_before_resuming() 
                                 probe.cancelled.borrow().as_slice(),
                                 &[(HttpErrorCode::INTERNAL_ERROR, false)]
                             );
-                            assert!(!resumed.get(), "held I/O retains the original panic");
+                            assert!(!resumed.get(), "held I/O keeps the run pending");
                             assert!(state.borrow().writes.is_empty());
                             release_write.notify_one();
                             complete_credit_wait(|| state.borrow().writes.len() == 1).await;
@@ -3270,8 +3318,15 @@ fn application_callback_panics_cancel_once_and_join_native_io_before_resuming() 
                     Ok(result) => result.expect("callback panic reaches joined cleanup"),
                     Err(payload) => resume_unwind(payload),
                 }
-                let panic = result.expect_err("the original application panic is resumed");
-                assert_eq!(panic.downcast_ref::<&str>(), Some(&expected_panic));
+                let error = result
+                    .expect("the run contains the application panic")
+                    .expect_err("a Driver-scope panic fails the run");
+                assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+                assert_eq!(
+                    take_contained_panics(),
+                    [(PanicSite::DriverTurn, None, Some(expected_panic.to_owned()))]
+                );
+                assert_eq!(contained_panic_counts(&worker, &start), (0, 0, 1));
                 let probes = probes.borrow();
                 assert_eq!(probes.len(), 1);
                 let probe = &probes[0];
@@ -3295,7 +3350,7 @@ fn application_callback_panics_cancel_once_and_join_native_io_before_resuming() 
 }
 
 /// A header indexing strategy whose every decision panics.
-struct PanickingIndexing;
+pub(super) struct PanickingIndexing;
 
 impl HeaderIndexingStrategy for PanickingIndexing {
     fn index_header(&self, _name: &HeaderName, _value: &[u8], _name_exists: bool) -> bool {
@@ -3308,7 +3363,8 @@ impl HeaderIndexingStrategy for PanickingIndexing {
 }
 
 /// `DIV-056`: a panic in a user callback inside the codec, encoding the response head,
-/// reaches the per-turn catch and is reported once, at Driver scope. The run still resumes it.
+/// reaches the per-turn catch and is reported once, at Driver scope, and the run returns
+/// `Err(INTERNAL_ERROR)`.
 fn assert_driver_turn_panic_is_reported_once() {
     run_on_worker(|context| {
         Box::pin(async move {
@@ -3322,16 +3378,246 @@ fn assert_driver_turn_panic_is_reported_once() {
             let mut config = options(context, transport);
             config.http2.header_indexing_strategy = Some(Rc::new(PanickingIndexing));
             let (session, _) = OwnedH2Session::new(application, config).unwrap();
-            let panic = tokio::time::timeout(
-                Duration::from_secs(5),
-                eligibility_catch_unwind(session.run()),
-            )
-            .await
-            .expect("the panicked connection joins its I/O")
-            .expect_err("the run resumes the panic");
+            let error = tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .expect("the panicked connection joins its I/O")
+                .expect_err("a Driver-scope panic fails the run");
+            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
             assert_eq!(
-                panic.downcast_ref::<&'static str>(),
-                Some(&"indexing strategy")
+                take_contained_panics(),
+                [(
+                    PanicSite::DriverTurn,
+                    None,
+                    Some("indexing strategy".to_owned())
+                )]
+            );
+            assert_eq!(contained_panic_counts(&worker, &start), (0, 0, 1));
+        })
+    });
+}
+
+#[cfg(panic = "unwind")]
+#[test]
+fn owned_h2_driver_turn_panic_is_reported_once() {
+    assert_driver_turn_panic_is_reported_once();
+    crate::uniplex_tests::on_hosted_workers(assert_driver_turn_panic_is_reported_once);
+}
+
+/// A header indexing strategy that panics when asked about one header name.
+struct PanicOnHeader(&'static [u8]);
+
+impl HeaderIndexingStrategy for PanicOnHeader {
+    fn index_header(&self, name: &HeaderName, _value: &[u8], _name_exists: bool) -> bool {
+        if name.as_bytes() == self.0 {
+            panic!("indexing strategy");
+        }
+        false
+    }
+
+    fn clone_box(&self) -> Box<dyn HeaderIndexingStrategy> {
+        Box::new(Self(self.0))
+    }
+}
+
+/// The native reads and writes a `DropCountingTransport` started and dropped.
+#[derive(Default)]
+struct NativeIoCounts {
+    reads_started: Cell<usize>,
+    reads_dropped: Cell<usize>,
+    writes_started: Cell<usize>,
+    writes_dropped: Cell<usize>,
+}
+
+/// Counts the native reads and writes of `inner` as they start and drop.
+struct DropCountingTransport {
+    inner: Rc<FixtureTransport>,
+    counts: Rc<NativeIoCounts>,
+}
+
+struct CountDrop(Rc<NativeIoCounts>, fn(&NativeIoCounts) -> &Cell<usize>);
+
+impl Drop for CountDrop {
+    fn drop(&mut self) {
+        let count = (self.1)(&self.0);
+        count.set(count.get() + 1);
+    }
+}
+
+fn count_drop<T: 'static>(
+    counts: &Rc<NativeIoCounts>,
+    dropped: fn(&NativeIoCounts) -> &Cell<usize>,
+    operation: LocalTransportFuture<T>,
+) -> LocalTransportFuture<T> {
+    let guard = CountDrop(Rc::clone(counts), dropped);
+    Box::pin(async move {
+        let _guard = guard;
+        operation.await
+    })
+}
+
+impl UniplexTransport for DropCountingTransport {
+    fn read(
+        &self,
+        context: &WorkerContext,
+        maximum: usize,
+        allocation_size: usize,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        let started = &self.counts.reads_started;
+        started.set(started.get() + 1);
+        count_drop(
+            &self.counts,
+            |counts| &counts.reads_dropped,
+            self.inner
+                .read(context, maximum, allocation_size, timeout, cancellation),
+        )
+    }
+
+    fn write(
+        &self,
+        context: &WorkerContext,
+        data: BufQueue,
+        flags: ByteEventWriteFlags,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        let started = &self.counts.writes_started;
+        started.set(started.get() + 1);
+        count_drop(
+            &self.counts,
+            |counts| &counts.writes_dropped,
+            self.inner
+                .write(context, data, flags, timeout, cancellation),
+        )
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.shutdown_write(context)
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close_with_reset(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.inner.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.inner.register_byte_event(context, registration)
+    }
+}
+
+/// `DIV-056`: after a Driver-scope panic, here in the codec's header indexing
+/// strategy, the run stays pending while its native read and write are held, and returns
+/// `Err(INTERNAL_ERROR)` once both completed and dropped.
+#[cfg(panic = "unwind")]
+#[test]
+fn a_driver_panic_returns_err_after_joining_native_io() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let release_write = Arc::new(tokio::sync::Notify::new());
+            let release_read = Arc::new(tokio::sync::Notify::new());
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let (inner, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitDataEof(Arc::clone(&release_read), Vec::new()),
+            ]);
+            state.borrow_mut().write_gate = Some(Arc::clone(&release_write));
+            let counts = Rc::new(NativeIoCounts::default());
+            let transport = Rc::new(DropCountingTransport {
+                inner,
+                counts: Rc::clone(&counts),
+            });
+            let gate = Rc::new(OwnerPollGate::default());
+            let (mut application, probes) = Application::new(vec![Reply::Body(1)]);
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            application.response_date = Some(b"Thu, 12 Nov 2026 00:00:00 GMT");
+            let mut config = options(context, transport);
+            config.http2.header_indexing_strategy = Some(Rc::new(PanicOnHeader(b"date")));
+            let (session, handle) = OwnedH2Session::new(application, config).unwrap();
+            let finished = Cell::new(false);
+            let run = async {
+                let result = session.run().await;
+                finished.set(true);
+                result
+            };
+            let io = |counts: &NativeIoCounts| {
+                (
+                    counts.reads_started.get(),
+                    counts.reads_dropped.get(),
+                    counts.writes_started.get(),
+                    counts.writes_dropped.get(),
+                )
+            };
+            let scenario = async {
+                let outcome =
+                    eligibility_catch_unwind(tokio::time::timeout(Duration::from_secs(5), async {
+                        complete_credit_wait(|| {
+                            let state = state.borrow();
+                            state.write_gate_pending.is_some()
+                                && state.reads.is_empty()
+                                && gate.wakers.borrow().first().is_some_and(Option::is_some)
+                        })
+                        .await;
+                        gate.release();
+                        complete_credit_wait(|| {
+                            probes
+                                .borrow()
+                                .first()
+                                .is_some_and(|probe| !probe.cancelled.borrow().is_empty())
+                        })
+                        .await;
+                        settle_turns(16).await;
+                        assert!(!finished.get(), "held I/O keeps the run pending");
+                        assert_eq!(io(&counts), (2, 1, 1, 0), "the held read and write live");
+                        release_write.notify_one();
+                        complete_credit_wait(|| counts.writes_dropped.get() == 1).await;
+                        settle_turns(16).await;
+                        assert!(
+                            !finished.get(),
+                            "write completion alone cannot finish the run"
+                        );
+                        release_read.notify_one();
+                    }))
+                    .await;
+                release_write.notify_one();
+                release_read.notify_one();
+                if !matches!(&outcome, Ok(Ok(()))) {
+                    handle.cancel();
+                }
+                outcome
+            };
+            let (result, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(run, scenario)
+            })
+            .await
+            .expect("the panicked connection joins its read and write");
+            match outcome {
+                Ok(result) => result.expect("the Driver-scope panic reaches joined cleanup"),
+                Err(payload) => resume_unwind(payload),
+            }
+            let error = result.expect_err("a Driver-scope panic fails the run");
+            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+            assert_eq!(
+                io(&counts),
+                (2, 2, 1, 1),
+                "each native operation dropped once"
             );
             assert_eq!(
                 take_contained_panics(),
@@ -3341,29 +3627,703 @@ fn assert_driver_turn_panic_is_reported_once() {
                     Some("indexing strategy".to_owned())
                 )]
             );
-            let delta = worker.poll_stats().since(&start);
+            assert_eq!(contained_panic_counts(&worker, &start), (0, 0, 1));
+            let probe = Rc::clone(&probes.borrow()[0]);
             assert_eq!(
-                (
-                    delta.contained_exchange_panics,
-                    delta.contained_connection_panics,
-                    delta.contained_driver_panics,
-                ),
-                (0, 0, 1)
+                probe.cancelled.borrow().as_slice(),
+                &[(HttpErrorCode::INTERNAL_ERROR, false)]
             );
+            assert_eq!(probe.completed.get(), 0);
+            assert_eq!(probe.dropped.get(), 1);
+            let state = state.borrow();
+            assert_eq!(state.writes.len(), 1);
+            assert!(state.transport_dropped);
+            assert_eq!(state.close, FixtureClose::Reset);
         })
     });
 }
 
-#[test]
-fn owned_h2_driver_turn_panic_is_reported_once() {
-    assert_driver_turn_panic_is_reported_once();
-    crate::uniplex_tests::on_hosted_workers(assert_driver_turn_panic_is_reported_once);
+/// How a `ScriptedExchange` answers.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Script {
+    /// Holds its response head.
+    Hold,
+    /// Answers a head carrying a `KernelWrite` byte event, which fires once the head's write
+    /// completes, and whose cancellation panics; then holds its body.
+    PanickingByteEventCancel,
+    /// Answers a head, a 4 KiB body whose bytes' owner panics when dropped, then trailers with
+    /// an `x-panic` field.
+    PanickingBodyOwner,
 }
 
+/// What `ScriptedExchange`s do and what happened to them.
+#[derive(Default)]
+struct ScriptProbe {
+    /// The streams that follow a script other than `Script::Hold`.
+    scripts: Vec<(u64, Script)>,
+    /// The stream whose exchange's `cancel` panics.
+    cancel_panics: Option<u64>,
+    opened: Cell<usize>,
+    cancelled: RefCell<Vec<(u64, HttpErrorCode)>>,
+    dropped: RefCell<Vec<u64>>,
+    byte_event_cancels: RefCell<Vec<HttpErrorCode>>,
+    owner_drops: Arc<AtomicUsize>,
+}
+
+impl HttpByteEventCallback for ScriptProbe {
+    fn on_byte_event(&self, _event: HttpByteEvent) {}
+
+    fn on_byte_event_cancelled(&self, _event: HttpByteEvent, error: HttpError) {
+        self.byte_event_cancels.borrow_mut().push(error.code());
+        panic_any("byte event cancellation");
+    }
+}
+
+/// Body bytes whose owner panics when dropped.
+struct PanickingOwner {
+    bytes: Vec<u8>,
+    drops: Arc<AtomicUsize>,
+}
+
+impl AsRef<[u8]> for PanickingOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for PanickingOwner {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+        panic_any("body owner drop");
+    }
+}
+
+struct ScriptedApplication(Rc<ScriptProbe>);
+
+impl OwnedH2Application for ScriptedApplication {
+    type Exchange = ScriptedExchange;
+
+    fn new_exchange(&self, stream: StreamId, _ingress: IngressCompletion) -> ScriptedExchange {
+        self.0.opened.set(self.0.opened.get() + 1);
+        let script = self
+            .0
+            .scripts
+            .iter()
+            .find(|(scripted, _)| *scripted == stream.get())
+            .map_or(Script::Hold, |(_, script)| *script);
+        ScriptedExchange {
+            stream: stream.get(),
+            script,
+            body_events: 0,
+            probe: Rc::clone(&self.0),
+        }
+    }
+}
+
+struct ScriptedExchange {
+    stream: u64,
+    script: Script,
+    body_events: usize,
+    probe: Rc<ScriptProbe>,
+}
+
+impl OwnedH2Exchange for ScriptedExchange {
+    fn request(&mut self, _head: Box<HttpMessage>, _body: HttpStreamSourceOwner, _eom: bool) {}
+
+    fn poll_headers(
+        &mut self,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        if self.script == Script::Hold {
+            return Poll::Pending;
+        }
+        let mut response = HttpMessage::new();
+        response.set_status_code(200).unwrap();
+        response.set_http_version(1, 1);
+        let mut headers = HttpHeaderEvent::new(response, false).unwrap();
+        if self.script == Script::PanickingByteEventCancel {
+            headers
+                .byte_event_registrations_mut()
+                .push(HttpByteEventRegistration::new(
+                    None,
+                    ByteEventType::KernelWrite.bit(),
+                    &self.probe,
+                ));
+        }
+        Poll::Ready(Ok(headers))
+    }
+
+    fn poll_body(
+        &mut self,
+        _context: &mut Context<'_>,
+        _maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        if self.script != Script::PanickingBodyOwner {
+            return Poll::Pending;
+        }
+        self.body_events += 1;
+        match self.body_events {
+            1 => {
+                let owner = PanickingOwner {
+                    bytes: vec![b'o'; 4096],
+                    drops: Arc::clone(&self.probe.owner_drops),
+                };
+                let mut body = BufQueue::new(4096);
+                body.push_bytes(Bytes::from_owner(owner)).unwrap();
+                Poll::Ready(Ok(HttpBodyEvent::body(body, false)))
+            }
+            2 => {
+                let mut trailers = HttpHeaders::new();
+                trailers.add("x-panic", "1");
+                Poll::Ready(Ok(HttpBodyEvent::trailers(trailers)))
+            }
+            _ => Poll::Pending,
+        }
+    }
+
+    fn cancel(&mut self, error: &HttpError, _peer_reset: bool) {
+        self.probe
+            .cancelled
+            .borrow_mut()
+            .push((self.stream, error.code()));
+        if self.probe.cancel_panics == Some(self.stream) {
+            panic_any(format!("stream {} cancel", self.stream));
+        }
+    }
+
+    fn response_complete(&mut self) {}
+
+    fn complete(self) {}
+}
+
+impl Drop for ScriptedExchange {
+    fn drop(&mut self) {
+        self.probe.dropped.borrow_mut().push(self.stream);
+    }
+}
+
+/// `DIV-056`: a panic inside the abort that a Driver-scope panic starts, here from the
+/// owner of body bytes the abort discards, is contained: the run still joins its held read and
+/// then fails, and its drop does not assert.
+#[cfg(panic = "unwind")]
+#[test]
+fn an_abort_panic_still_joins_native_io_and_completes() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let release_read = Arc::new(tokio::sync::Notify::new());
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitDataEof(Arc::clone(&release_read), Vec::new()),
+            ]);
+            let probe = Rc::new(ScriptProbe {
+                scripts: vec![(1, Script::PanickingBodyOwner)],
+                ..ScriptProbe::default()
+            });
+            let mut config = options(context, transport);
+            config.http2.header_indexing_strategy = Some(Rc::new(PanicOnHeader(b"x-panic")));
+            let (session, handle) =
+                OwnedH2Session::new(ScriptedApplication(Rc::clone(&probe)), config).unwrap();
+            let finished = Cell::new(false);
+            let run = async {
+                let result = session.run().await;
+                finished.set(true);
+                result
+            };
+            let scenario = async {
+                let outcome =
+                    eligibility_catch_unwind(tokio::time::timeout(Duration::from_secs(5), async {
+                        complete_credit_wait(|| probe.owner_drops.load(Ordering::SeqCst) == 1)
+                            .await;
+                        settle_turns(16).await;
+                        assert!(!finished.get(), "the held read keeps the run pending");
+                        release_read.notify_one();
+                    }))
+                    .await;
+                release_read.notify_one();
+                if !matches!(&outcome, Ok(Ok(()))) {
+                    handle.cancel();
+                }
+                outcome
+            };
+            let (result, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(run, scenario)
+            })
+            .await
+            .expect("the aborted connection joins its read");
+            match outcome {
+                Ok(result) => result.expect("the abort's panic is contained"),
+                Err(payload) => resume_unwind(payload),
+            }
+            let error = result.expect_err("a Driver-scope panic fails the run");
+            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+            assert_eq!(
+                take_contained_panics(),
+                [
+                    (
+                        PanicSite::DriverTurn,
+                        None,
+                        Some("indexing strategy".to_owned())
+                    ),
+                    (
+                        PanicSite::Teardown,
+                        None,
+                        Some("body owner drop".to_owned())
+                    ),
+                ]
+            );
+            assert_eq!(contained_panic_counts(&worker, &start), (0, 0, 2));
+            assert_eq!(
+                probe.cancelled.borrow().as_slice(),
+                &[(1, HttpErrorCode::INTERNAL_ERROR)]
+            );
+            assert_eq!(probe.dropped.borrow().as_slice(), &[1]);
+            assert_eq!(probe.owner_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(state.borrow().close, FixtureClose::Reset);
+        })
+    });
+}
+
+/// An application whose drop panics.
+struct PanickingDropApplication(Application);
+
+impl OwnedH2Application for PanickingDropApplication {
+    type Exchange = Exchange;
+
+    fn new_exchange(&self, stream: StreamId, ingress: IngressCompletion) -> Exchange {
+        self.0.new_exchange(stream, ingress)
+    }
+}
+
+impl Drop for PanickingDropApplication {
+    fn drop(&mut self) {
+        panic_any("application drop");
+    }
+}
+
+/// `DIV-056`: a panic while the driver's fields drop after completion is reported at
+/// Driver scope, and the run still returns its result.
+#[cfg(panic = "unwind")]
+#[test]
+fn a_panicking_application_drop_after_completion_is_reported() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let (transport, state) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+            let (application, probes) = Application::new(vec![Reply::Body(1)]);
+            let (session, _) = OwnedH2Session::new(
+                PanickingDropApplication(application),
+                options(context, transport),
+            )
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .expect("the connection finishes")
+                .expect("the run returns its result");
+            assert_eq!(probes.borrow()[0].completed.get(), 1);
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::Teardown,
+                    None,
+                    Some("application drop".to_owned())
+                )]
+            );
+            assert_eq!(contained_panic_counts(&worker, &start), (0, 0, 1));
+            assert_eq!(state.borrow().close, FixtureClose::Closed);
+        })
+    });
+}
+
+/// `DIV-056`: polling a run after it completed returns an error.
+#[test]
+fn polling_a_finished_run_returns_an_error() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let (transport, _) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+            let (application, _) = Application::new(vec![Reply::Body(1)]);
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let mut run = Box::pin(session.run());
+            tokio::time::timeout(Duration::from_secs(5), run.as_mut())
+                .await
+                .expect("the connection finishes")
+                .expect("the run succeeds");
+            let polled = poll_fn(|context| Poll::Ready(run.as_mut().poll(context))).await;
+            let Poll::Ready(Err(error)) = polled else {
+                panic!("a finished run is ready with an error");
+            };
+            assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+        })
+    });
+}
+
+/// Three GETs, on streams 1, 3 and 5, then a DATA frame on stream 0, which the codec rejects as
+/// a connection PROTOCOL_ERROR, released by `release`.
+fn requests_then_connection_error(release: &Arc<tokio::sync::Notify>) -> [FixtureRead; 2] {
+    let (_, requests) = ready_owner_requests(3);
+    [
+        FixtureRead::SegmentedData(queue(&requests)),
+        FixtureRead::WaitData(Arc::clone(release), vec![0, 0, 0, 0, 0, 0, 0, 0, 0]),
+    ]
+}
+
+/// A second session on the worker that serves a GET to completion.
+async fn assert_worker_serves(context: WorkerContext) {
+    let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+    let (transport, _) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+    let (application, probes) = Application::new(vec![Reply::Body(1)]);
+    let (session, _) = OwnedH2Session::new(application, options(context, transport)).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), session.run())
+        .await
+        .expect("the second session finishes")
+        .expect("the second session serves its request");
+    assert_eq!(probes.borrow()[0].completed.get(), 1);
+}
+
+/// `DIV-056`: a panic while a connection error cancels every stream is contained
+/// without replacing the connection's error: `run` returns the PROTOCOL_ERROR, its one GOAWAY is
+/// written, every other stream is still cancelled once, the panic is reported once at Exchange
+/// scope with its stream, and a second session on the worker serves. The panic comes from
+/// stream 3's `cancel`, or, in the byte-event variant, from a byte event of stream 3 that the
+/// stream's cancellation cancels.
+fn assert_a_cancel_all_panic_keeps_the_original_error(byte_event: bool) {
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let release_error = Arc::new(tokio::sync::Notify::new());
+            let release_write = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) =
+                FixtureTransport::new(requests_then_connection_error(&release_error));
+            let probe = Rc::new(if byte_event {
+                // The held write keeps the byte event registered.
+                state.borrow_mut().write_gate = Some(Arc::clone(&release_write));
+                ScriptProbe {
+                    scripts: vec![(3, Script::PanickingByteEventCancel)],
+                    ..ScriptProbe::default()
+                }
+            } else {
+                ScriptProbe {
+                    cancel_panics: Some(3),
+                    ..ScriptProbe::default()
+                }
+            });
+            let (session, handle) = OwnedH2Session::new(
+                ScriptedApplication(Rc::clone(&probe)),
+                options(context.clone(), transport),
+            )
+            .unwrap();
+            let script = async {
+                let outcome =
+                    eligibility_catch_unwind(tokio::time::timeout(Duration::from_secs(5), async {
+                        complete_credit_wait(|| {
+                            probe.opened.get() == 3
+                                && (!byte_event || state.borrow().write_gate_pending.is_some())
+                        })
+                        .await;
+                        release_error.notify_one();
+                        complete_credit_wait(|| probe.cancelled.borrow().len() == 3).await;
+                        release_write.notify_one();
+                    }))
+                    .await;
+                release_error.notify_one();
+                release_write.notify_one();
+                if !matches!(&outcome, Ok(Ok(()))) {
+                    handle.cancel();
+                }
+                outcome
+            };
+            let (result, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(session.run(), script)
+            })
+            .await
+            .expect("the failed connection finishes");
+            match outcome {
+                Ok(result) => result.expect("the connection error reaches every stream"),
+                Err(payload) => resume_unwind(payload),
+            }
+            let error = result.expect_err("the connection error fails the run");
+            assert_eq!(
+                error.code(),
+                HttpErrorCode::PROTOCOL_ERROR,
+                "the contained panic does not replace the connection's error"
+            );
+            let goaways = written_frames(&state, 3).goaways;
+            assert_eq!(goaways.len(), 1, "{goaways:?}");
+            assert_eq!(goaways[0].1, H2ErrorCode::PROTOCOL_ERROR);
+            assert_eq!(
+                probe.cancelled.borrow().as_slice(),
+                &[
+                    (1, HttpErrorCode::PROTOCOL_ERROR),
+                    (3, HttpErrorCode::PROTOCOL_ERROR),
+                    (5, HttpErrorCode::PROTOCOL_ERROR),
+                ],
+                "the cancels after the panicking one still run, once each"
+            );
+            let (site, message) = if byte_event {
+                assert_eq!(
+                    probe.byte_event_cancels.borrow().as_slice(),
+                    &[HttpErrorCode::PROTOCOL_ERROR]
+                );
+                (PanicSite::ByteEvent, "byte event cancellation")
+            } else {
+                (PanicSite::ExchangeRetirement, "stream 3 cancel")
+            };
+            assert_eq!(
+                take_contained_panics(),
+                [(site, Some(StreamId::new(3)), Some(message.to_owned()))]
+            );
+            assert_eq!(contained_panic_counts(&worker, &start), (1, 0, 0));
+            let mut dropped = probe.dropped.borrow().clone();
+            dropped.sort_unstable();
+            assert_eq!(dropped, [1, 3, 5]);
+            assert_eq!(state.borrow().close, FixtureClose::Reset);
+            assert_worker_serves(context).await;
+        })
+    });
+}
+
+#[cfg(panic = "unwind")]
+#[test]
+fn fail_connection_cancel_panic_keeps_the_original_error() {
+    for byte_event in [false, true] {
+        assert_a_cancel_all_panic_keeps_the_original_error(byte_event);
+        crate::uniplex_tests::on_hosted_workers(|| {
+            assert_a_cancel_all_panic_keeps_the_original_error(byte_event)
+        });
+    }
+}
+
+/// `DIV-055` with `DIV-056`: as `assert_a_cancel_all_panic_keeps_the_original_error`, for the
+/// connection failure of a peer EOF that aborts open streams: `run` returns `TRANSPORT_EOF`, its
+/// GOAWAY carries INTERNAL_ERROR, and stream 3's panicking `cancel` is reported once without
+/// replacing the error.
+fn assert_an_eof_abort_cancel_panic_keeps_transport_eof() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let release_eof = Arc::new(tokio::sync::Notify::new());
+            let (_, requests) = ready_owner_requests(3);
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&requests)),
+                FixtureRead::WaitDataEof(Arc::clone(&release_eof), Vec::new()),
+            ]);
+            let probe = Rc::new(ScriptProbe {
+                cancel_panics: Some(3),
+                ..ScriptProbe::default()
+            });
+            let mut config = options(context.clone(), transport);
+            config.http2.abort_streams_on_eof = true;
+            let (session, handle) =
+                OwnedH2Session::new(ScriptedApplication(Rc::clone(&probe)), config).unwrap();
+            let script = async {
+                let outcome =
+                    eligibility_catch_unwind(tokio::time::timeout(Duration::from_secs(5), async {
+                        complete_credit_wait(|| probe.opened.get() == 3).await;
+                        release_eof.notify_one();
+                    }))
+                    .await;
+                release_eof.notify_one();
+                if !matches!(&outcome, Ok(Ok(()))) {
+                    handle.cancel();
+                }
+                outcome
+            };
+            let (result, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(session.run(), script)
+            })
+            .await
+            .expect("the aborted connection finishes");
+            match outcome {
+                Ok(result) => result.expect("the EOF reaches every stream"),
+                Err(payload) => resume_unwind(payload),
+            }
+            let error = result.expect_err("the EOF abort fails the run");
+            assert_eq!(error.code(), HttpErrorCode::TRANSPORT_EOF);
+            let goaways = written_frames(&state, 3).goaways;
+            assert_eq!(goaways.len(), 1, "{goaways:?}");
+            assert_eq!(goaways[0].1, H2ErrorCode::INTERNAL_ERROR);
+            assert_eq!(
+                probe.cancelled.borrow().as_slice(),
+                &[
+                    (1, HttpErrorCode::TRANSPORT_EOF),
+                    (3, HttpErrorCode::TRANSPORT_EOF),
+                    (5, HttpErrorCode::TRANSPORT_EOF),
+                ]
+            );
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::ExchangeRetirement,
+                    Some(StreamId::new(3)),
+                    Some("stream 3 cancel".to_owned())
+                )]
+            );
+            assert_eq!(contained_panic_counts(&worker, &start), (1, 0, 0));
+            assert_eq!(state.borrow().close, FixtureClose::Reset);
+            assert_worker_serves(context).await;
+        })
+    });
+}
+
+#[cfg(panic = "unwind")]
+#[test]
+fn eof_abort_cancel_panic_keeps_transport_eof() {
+    assert_an_eof_abort_cancel_panic_keeps_transport_eof();
+    crate::uniplex_tests::on_hosted_workers(assert_an_eof_abort_cancel_panic_keeps_transport_eof);
+}
+
+/// `DIV-056`: a run whose poll unwinds, which only a fault in the run's own code can
+/// cause, is poisoned. Its next poll returns `Err(INTERNAL_ERROR)` without running the driver,
+/// and dropping it abandons the driver, cancelling its read, resetting the transport once and
+/// reporting `Destroy`, without the join assertion.
+#[cfg(panic = "unwind")]
+#[test]
+fn a_run_whose_poll_unwinds_is_poisoned() {
+    struct ObserveIo {
+        inner: Rc<FixtureTransport>,
+        reads: Cell<usize>,
+        read_token: RefCell<Option<CancellationToken>>,
+        resets: Cell<usize>,
+    }
+
+    impl UniplexTransport for ObserveIo {
+        fn read(
+            &self,
+            context: &WorkerContext,
+            maximum: usize,
+            allocation_size: usize,
+            timeout: Duration,
+            cancellation: CancellationToken,
+        ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+            self.reads.set(self.reads.get() + 1);
+            *self.read_token.borrow_mut() = Some(cancellation.clone());
+            self.inner
+                .read(context, maximum, allocation_size, timeout, cancellation)
+        }
+
+        fn write(
+            &self,
+            context: &WorkerContext,
+            data: BufQueue,
+            flags: ByteEventWriteFlags,
+            timeout: Duration,
+            cancellation: CancellationToken,
+        ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+            self.inner
+                .write(context, data, flags, timeout, cancellation)
+        }
+
+        fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+            self.inner.shutdown_write(context)
+        }
+
+        fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+            self.inner.close(context)
+        }
+
+        fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+            self.resets.set(self.resets.get() + 1);
+            self.inner.close_with_reset(context)
+        }
+
+        fn byte_event_capability(
+            &self,
+            context: &WorkerContext,
+        ) -> Result<ByteEventCapability, HttpError> {
+            self.inner.byte_event_capability(context)
+        }
+
+        fn register_byte_event(
+            &self,
+            context: &WorkerContext,
+            registration: HttpByteEventRegistration,
+        ) -> Result<(), ByteEventRegistrationError> {
+            self.inner.register_byte_event(context, registration)
+        }
+    }
+
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let (inner, state) = FixtureTransport::new([]);
+            let transport = Rc::new(ObserveIo {
+                inner,
+                reads: Cell::new(0),
+                read_token: RefCell::new(None),
+                resets: Cell::new(0),
+            });
+            let (application, _) = Application::new(Vec::new());
+            let (mut session, _) =
+                OwnedH2Session::new(application, options(context, transport.clone())).unwrap();
+            let events = Rc::new(RefCell::new(Vec::new()));
+            session
+                .add_lifecycle_observer(Rc::new(LifecycleProbe {
+                    events: Rc::clone(&events),
+                }))
+                .unwrap();
+            let mut run = Box::pin(session.run());
+            fault_next_run_poll();
+            let unwound = poll_fn(|context| {
+                Poll::Ready(catch_unwind(AssertUnwindSafe(|| {
+                    run.as_mut().poll(context)
+                })))
+            })
+            .await;
+            let panic = unwound.expect_err("the faulted poll unwinds");
+            assert_eq!(panic.downcast_ref::<&str>(), Some(&"owned H2 run fault"));
+            assert_eq!(
+                transport.reads.get(),
+                1,
+                "the faulted poll started the read"
+            );
+            let token = transport.read_token.borrow().clone().unwrap();
+            let polled = poll_fn(|context| Poll::Ready(run.as_mut().poll(context))).await;
+            let Poll::Ready(Err(error)) = polled else {
+                panic!("a poisoned run is ready with an error");
+            };
+            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+            assert_eq!(
+                transport.reads.get(),
+                1,
+                "the poisoned poll ran no driver code"
+            );
+            assert!(!token.is_cancellation_requested());
+            assert_eq!(transport.resets.get(), 0);
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| drop(run))).is_ok(),
+                "a poisoned run's abandonment does not assert its join"
+            );
+            assert!(token.is_cancellation_requested());
+            assert_eq!(transport.resets.get(), 1);
+            assert_eq!(state.borrow().close, FixtureClose::Reset);
+            assert_eq!(events.borrow().last(), Some(&LifecycleEvent::Destroy));
+            assert!(take_contained_panics().is_empty());
+        })
+    });
+}
+
+/// `DIV-056`: a Driver-scope panic in a batch of ready owners cancels every owner once, joins
+/// native I/O and fails the run with `Err(INTERNAL_ERROR)`.
+#[cfg(panic = "unwind")]
 #[test]
 fn batched_owner_panic_preserves_unvisited_wakes_and_joins_native_io() {
     run_on_worker(|context| {
         Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
             let release_write = Arc::new(tokio::sync::Notify::new());
             let release_read = Arc::new(tokio::sync::Notify::new());
             let gate = Rc::new(OwnerPollGate {
@@ -3413,7 +4373,7 @@ fn batched_owner_panic_preserves_unvisited_wakes_and_joins_native_io() {
                                 &[(HttpErrorCode::INTERNAL_ERROR, false)]
                             );
                         }
-                        assert!(!resumed.get(), "held I/O retains the original panic");
+                        assert!(!resumed.get(), "held I/O keeps the run pending");
                         assert!(state.borrow().writes.is_empty());
                         release_write.notify_one();
                         complete_credit_wait(|| state.borrow().writes.len() == 1).await;
@@ -3439,8 +4399,19 @@ fn batched_owner_panic_preserves_unvisited_wakes_and_joins_native_io() {
                 Ok(result) => result.expect("ready owner panic reaches joined cleanup"),
                 Err(payload) => resume_unwind(payload),
             }
-            let panic = result.expect_err("the original owner panic is resumed");
-            assert_eq!(panic.downcast_ref::<&str>(), Some(&"first ready owner"));
+            let error = result
+                .expect("the run contains the owner panic")
+                .expect_err("a Driver-scope panic fails the run");
+            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::DriverTurn,
+                    None,
+                    Some("first ready owner".to_owned())
+                )]
+            );
+            assert_eq!(contained_panic_counts(&worker, &start), (0, 0, 1));
             let probes = probes.borrow();
             assert_eq!(probes.len(), 17);
             for probe in probes.iter() {
@@ -4715,6 +5686,10 @@ fn peer_reset_discards_a_malformed_head_response_parked_behind_a_held_write() {
     });
 }
 
+/// `DIV-056`: a panic in a native operation's cancellation waker, as the connection's
+/// cancellation resets the transport, is reported at Driver scope; the run still waits for both
+/// native operations to complete and returns the cancellation.
+#[cfg(panic = "unwind")]
 #[test]
 fn cancellation_waker_panic_waits_for_both_native_io_completions() {
     use std::task::Wake;
@@ -4892,6 +5867,9 @@ fn cancellation_waker_panic_waits_for_both_native_io_completions() {
 
     run_on_worker(|context| {
         Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
             let (inner, state) = FixtureTransport::new([]);
             let receipt = Rc::new(IoReceipt::default());
             let wakes = Arc::new(WakeReceipt::default());
@@ -4924,11 +5902,19 @@ fn cancellation_waker_panic_waits_for_both_native_io_completions() {
             })
             .await
             .expect("panicking cancellation still joins both real IO futures");
-            let panic = result.expect_err("the original cancellation waker panic is resumed");
+            let error = result
+                .expect("the run contains the cancellation waker's panic")
+                .expect_err("the cancelled run fails");
+            assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
             assert_eq!(
-                panic.downcast_ref::<&str>(),
-                Some(&"first native cancellation waker")
+                take_contained_panics(),
+                [(
+                    PanicSite::Transport,
+                    None,
+                    Some("first native cancellation waker".to_owned())
+                )]
             );
+            assert_eq!(contained_panic_counts(&worker, &start), (0, 0, 1));
             assert!(receipt.completed.iter().all(Cell::get));
             assert_eq!([receipt.dropped[0].get(), receipt.dropped[1].get()], [1, 1]);
             assert_eq!(
@@ -5009,6 +5995,7 @@ fn abandoning_a_started_run_signals_io_and_reports_the_missing_join() {
 
     run_on_worker(|context| {
         Box::pin(async move {
+            take_contained_panics();
             let (inner, state) = FixtureTransport::new([]);
             state.borrow_mut().write_gate = Some(Arc::new(tokio::sync::Notify::new()));
             let transport = Rc::new(ObserveCancellation {
@@ -5047,6 +6034,10 @@ fn abandoning_a_started_run_signals_io_and_reports_the_missing_join() {
             assert_eq!(state.borrow().close, FixtureClose::Reset);
             assert!(state.borrow().writes.is_empty());
             assert!(probes.borrow().is_empty());
+            assert!(
+                take_contained_panics().is_empty(),
+                "the skipped join is the owner's misuse, not a contained panic (`DIV-056`)"
+            );
 
             let (transport, _) = FixtureTransport::new([]);
             let (application, _) = Application::new(vec![]);
@@ -5743,6 +6734,19 @@ struct ReadPollPanic {
     token: RefCell<Option<CancellationToken>>,
     completed: Cell<bool>,
     drops: Cell<usize>,
+    mode: ReadPanicMode,
+}
+
+/// Which polls of a `ReadPollPanic` read panic.
+#[derive(Clone, Copy, Default)]
+enum ReadPanicMode {
+    /// The first two, then the read completes.
+    #[default]
+    FirstTwo,
+    /// Every poll.
+    Always,
+    /// Every odd poll; every even poll wakes its waker and stays pending.
+    Alternate,
 }
 
 struct ReadPollDrop(Rc<ReadPollPanic>);
@@ -5771,11 +6775,18 @@ impl PollCountingTransport {
                 counts[index] += 1;
                 counts[index]
             };
-            if read_panic.is_some() {
-                match ordinal {
-                    1 => panic_any("first native read poll"),
-                    2 => panic_any("second native read poll"),
-                    _ => {}
+            if let Some(probe) = &read_panic {
+                match (probe.0.mode, ordinal) {
+                    (ReadPanicMode::FirstTwo, 1) => panic_any("first native read poll"),
+                    (ReadPanicMode::FirstTwo, 2) => panic_any("second native read poll"),
+                    (ReadPanicMode::FirstTwo, _) => {}
+                    (ReadPanicMode::Alternate, ordinal) if ordinal % 2 == 0 => {
+                        context.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                    (ReadPanicMode::Always | ReadPanicMode::Alternate, ordinal) => {
+                        panic_any(format!("native read poll {ordinal}"))
+                    }
                 }
             }
             if wake_first && ordinal == 1 {
@@ -5982,10 +6993,16 @@ fn native_io_wake_during_poll_preserves_same_turn_progress_and_new_operations() 
     });
 }
 
+/// `DIV-056`: a native read that panics in the turn and again in the teardown, then completes,
+/// is joined, and the run returns `Err(INTERNAL_ERROR)`.
+#[cfg(panic = "unwind")]
 #[test]
-fn repeated_native_read_poll_panics_still_join_before_resuming_the_first_panic() {
+fn repeated_native_read_poll_panics_still_join_before_failing_the_run() {
     run_on_worker(|context| {
         Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
             let (inner, wire) = FixtureTransport::new([]);
             let reads = Rc::new(RefCell::new(Vec::new()));
             let probe = Rc::new(ReadPollPanic::default());
@@ -5999,17 +7016,27 @@ fn repeated_native_read_poll_panics_still_join_before_resuming_the_first_panic()
             let (application, streams) = Application::new(Vec::new());
             let (session, handle) =
                 OwnedH2Session::new(application, options(context, transport)).unwrap();
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
-                eligibility_catch_unwind(session.run()),
-            )
-            .await
-            .expect("repeated pre-registration read panics still join cancellation");
-            let panic = result.expect_err("the first transport poll panic is resumed");
+            let error = tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .expect("repeated pre-registration read panics still join cancellation")
+                .expect_err("a Driver-scope panic fails the run");
+            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
             assert_eq!(
-                panic.downcast_ref::<&str>(),
-                Some(&"first native read poll")
+                take_contained_panics(),
+                [
+                    (
+                        PanicSite::DriverTurn,
+                        None,
+                        Some("first native read poll".to_owned())
+                    ),
+                    (
+                        PanicSite::Teardown,
+                        None,
+                        Some("second native read poll".to_owned())
+                    ),
+                ]
             );
+            assert_eq!(contained_panic_counts(&worker, &start), (0, 0, 2));
             assert_eq!(&*reads.borrow(), &[3]);
             assert!(
                 probe
@@ -6024,6 +7051,226 @@ fn repeated_native_read_poll_panics_still_join_before_resuming_the_first_panic()
             assert!(!handle.initiate_drain().unwrap());
             assert_eq!(wire.borrow().close, FixtureClose::Reset);
             assert!(streams.borrow().is_empty());
+        })
+    });
+}
+
+/// `DIV-056`: a native read whose every poll panics is dropped unfinished at its third
+/// panicking teardown poll, and the run fails within its deadline. So is one whose panics
+/// alternate with self-woken pending polls: teardown panics are counted in total.
+#[cfg(panic = "unwind")]
+#[test]
+fn a_poisoned_native_read_is_abandoned_after_bounded_teardown_polls() {
+    // (which polls panic, the read's polls, the polls that panicked)
+    for (mode, polls, panicked) in [
+        (ReadPanicMode::Always, 4, [1, 2, 3, 4]),
+        (ReadPanicMode::Alternate, 7, [1, 3, 5, 7]),
+    ] {
+        run_on_worker(move |context| {
+            Box::pin(async move {
+                take_contained_panics();
+                let worker = context.handle().clone();
+                let start = worker.poll_stats();
+                let (inner, wire) = FixtureTransport::new([]);
+                let reads = Rc::new(RefCell::new(Vec::new()));
+                let probe = Rc::new(ReadPollPanic {
+                    mode,
+                    ..ReadPollPanic::default()
+                });
+                let transport = Rc::new(PollCountingTransport {
+                    inner,
+                    reads: Rc::clone(&reads),
+                    writes: Rc::new(RefCell::new(Vec::new())),
+                    wake_first: false,
+                    read_panic: Some(Rc::clone(&probe)),
+                });
+                let (application, streams) = Application::new(Vec::new());
+                let (session, _) =
+                    OwnedH2Session::new(application, options(context, transport)).unwrap();
+                let error = tokio::time::timeout(Duration::from_secs(5), session.run())
+                    .await
+                    .expect("a poisoned read is dropped within the deadline")
+                    .expect_err("a Driver-scope panic fails the run");
+                assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+                assert_eq!(&*reads.borrow(), &[polls]);
+                assert!(!probe.completed.get());
+                assert_eq!(probe.drops.get(), 1);
+                let message = |poll: usize| Some(format!("native read poll {poll}"));
+                assert_eq!(
+                    take_contained_panics(),
+                    [
+                        (PanicSite::DriverTurn, None, message(panicked[0])),
+                        (PanicSite::Teardown, None, message(panicked[1])),
+                        (PanicSite::Teardown, None, message(panicked[2])),
+                        (PanicSite::Teardown, None, message(panicked[3])),
+                    ],
+                    "dropping the read adds no report of its own"
+                );
+                assert_eq!(contained_panic_counts(&worker, &start), (0, 0, 4));
+                assert_eq!(wire.borrow().close, FixtureClose::Reset);
+                assert!(streams.borrow().is_empty());
+            })
+        });
+    }
+}
+
+/// A transport whose reader panics on every poll. The reader logs its polls and its drop.
+struct PanickingReaderTransport {
+    inner: Rc<FixtureTransport>,
+    log: Rc<RefCell<Vec<String>>>,
+}
+
+struct PanickingReader {
+    log: Rc<RefCell<Vec<String>>>,
+    polls: usize,
+}
+
+impl UniplexReader for PanickingReader {
+    fn start_read(&mut self, _maximum: usize, _allocation_size: usize) -> Result<(), HttpError> {
+        Ok(())
+    }
+
+    fn poll_read(&mut self, _context: &mut Context<'_>) -> Poll<Result<UniplexRead, HttpError>> {
+        self.polls += 1;
+        let poll = format!("reader poll {}", self.polls);
+        self.log.borrow_mut().push(poll.clone());
+        panic_any(poll)
+    }
+}
+
+impl Drop for PanickingReader {
+    fn drop(&mut self) {
+        self.log.borrow_mut().push("reader drop".to_owned());
+    }
+}
+
+impl UniplexTransport for PanickingReaderTransport {
+    fn try_reader(
+        &self,
+        _context: &WorkerContext,
+        _timeout: Duration,
+        _cancellation: CancellationToken,
+    ) -> Result<Option<Box<dyn UniplexReader>>, HttpError> {
+        Ok(Some(Box::new(PanickingReader {
+            log: Rc::clone(&self.log),
+            polls: 0,
+        })))
+    }
+
+    fn read(
+        &self,
+        _context: &WorkerContext,
+        _maximum: usize,
+        _allocation_size: usize,
+        _timeout: Duration,
+        _cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<UniplexRead, HttpError>> {
+        unreachable!("the driver reads through the reader")
+    }
+
+    fn write(
+        &self,
+        context: &WorkerContext,
+        data: BufQueue,
+        flags: ByteEventWriteFlags,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> LocalTransportFuture<Result<WriteInfo, TransportWriteError>> {
+        self.inner
+            .write(context, data, flags, timeout, cancellation)
+    }
+
+    fn shutdown_write(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.shutdown_write(context)
+    }
+
+    fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close(context)
+    }
+
+    fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.inner.close_with_reset(context)
+    }
+
+    fn byte_event_capability(
+        &self,
+        context: &WorkerContext,
+    ) -> Result<ByteEventCapability, HttpError> {
+        self.inner.byte_event_capability(context)
+    }
+
+    fn register_byte_event(
+        &self,
+        context: &WorkerContext,
+        registration: HttpByteEventRegistration,
+    ) -> Result<(), ByteEventRegistrationError> {
+        self.inner.register_byte_event(context, registration)
+    }
+}
+
+/// Logs `Destroy`.
+struct LogDestroy(Rc<RefCell<Vec<String>>>);
+
+impl LifecycleObserver for LogDestroy {
+    fn on_event(&self, event: LifecycleEvent) {
+        if event == LifecycleEvent::Destroy {
+            self.0.borrow_mut().push("destroy".to_owned());
+        }
+    }
+}
+
+/// `DIV-056`: a reader whose every poll panics is dropped, with the read it holds, at
+/// its third panicking teardown poll, before the observers receive `Destroy`, and the run fails
+/// within its deadline.
+#[cfg(panic = "unwind")]
+#[test]
+fn a_poisoned_reader_is_dropped_after_bounded_teardown_polls() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let (inner, wire) = FixtureTransport::new([]);
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let transport = Rc::new(PanickingReaderTransport {
+                inner,
+                log: Rc::clone(&log),
+            });
+            let (application, _) = Application::new(Vec::new());
+            let (mut session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            session
+                .add_lifecycle_observer(Rc::new(LogDestroy(Rc::clone(&log))))
+                .unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .expect("a poisoned reader is dropped within the deadline")
+                .expect_err("a Driver-scope panic fails the run");
+            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+            assert_eq!(
+                *log.borrow(),
+                [
+                    "reader poll 1",
+                    "reader poll 2",
+                    "reader poll 3",
+                    "reader poll 4",
+                    "reader drop",
+                    "destroy",
+                ],
+                "the third panicking teardown poll drops the reader"
+            );
+            let message = |poll: usize| Some(format!("reader poll {poll}"));
+            assert_eq!(
+                take_contained_panics(),
+                [
+                    (PanicSite::DriverTurn, None, message(1)),
+                    (PanicSite::Teardown, None, message(2)),
+                    (PanicSite::Teardown, None, message(3)),
+                    (PanicSite::Teardown, None, message(4)),
+                ]
+            );
+            assert_eq!(contained_panic_counts(&worker, &start), (0, 0, 4));
+            assert_eq!(wire.borrow().close, FixtureClose::Reset);
         })
     });
 }
@@ -14720,6 +15967,9 @@ impl LifecycleObserver for PanicOnAttach {
     }
 }
 
+/// `DIV-051`, `DIV-056`: a lifecycle observer panic aborts the connection, and once cleanup has
+/// joined the run returns `Err(INTERNAL_ERROR)`; the panic is reported at Connection scope.
+#[cfg(panic = "unwind")]
 #[test]
 fn owned_h2_observer_panic_aborts_after_cleanup() {
     run_on_worker(|context| {
@@ -14744,17 +15994,11 @@ fn owned_h2_observer_panic_aborts_after_cleanup() {
                     panicked: Cell::new(false),
                 }))
                 .unwrap();
-            let panic = tokio::time::timeout(
-                Duration::from_secs(5),
-                eligibility_catch_unwind(session.run()),
-            )
-            .await
-            .expect("the panicked connection joins its I/O")
-            .expect_err("the run resumes the observer's panic after cleanup");
-            assert_eq!(
-                panic.downcast_ref::<&'static str>(),
-                Some(&"lifecycle observer")
-            );
+            let error = tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .expect("the panicked connection joins its I/O")
+                .expect_err("the observer's panic fails the run after cleanup");
+            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
             assert_eq!(
                 take_contained_panics(),
                 [(
@@ -14763,15 +16007,7 @@ fn owned_h2_observer_panic_aborts_after_cleanup() {
                     Some("lifecycle observer".to_owned())
                 )]
             );
-            let delta = worker.poll_stats().since(&start);
-            assert_eq!(
-                (
-                    delta.contained_exchange_panics,
-                    delta.contained_connection_panics,
-                    delta.contained_driver_panics,
-                ),
-                (0, 1, 0)
-            );
+            assert_eq!(contained_panic_counts(&worker, &start), (0, 1, 0));
             assert_eq!(state.borrow().close, FixtureClose::Reset);
             let probes = probes.borrow();
             assert_eq!(
@@ -14798,6 +16034,74 @@ fn owned_h2_observer_panic_aborts_after_cleanup() {
             );
         })
     });
+}
+
+/// Panics the first time it sees `event`.
+struct PanicOnEvent {
+    event: LifecycleEvent,
+    panicked: Cell<bool>,
+}
+
+impl LifecycleObserver for PanicOnEvent {
+    fn on_event(&self, event: LifecycleEvent) {
+        if event == self.event && !self.panicked.replace(true) {
+            panic_any("lifecycle observer");
+        }
+    }
+}
+
+/// `DIV-051`, `DIV-056`: the peer's EOF retires the one stream and closes the connection in the
+/// poll that completes the run, so its last events reach the observers only as the run
+/// completes. An observer panic on one of them still fails the run with `INTERNAL_ERROR`, as one
+/// at the end of a poll does, and is reported once at Connection scope.
+#[cfg(panic = "unwind")]
+#[test]
+fn owned_h2_observer_panic_at_completion_fails_the_run() {
+    for event in [
+        LifecycleEvent::TransactionDetached {
+            stream: Some(StreamId::new(1)),
+        },
+        LifecycleEvent::DrainStarted(DrainTrigger::CloseWhenIdle),
+        LifecycleEvent::Destroy,
+    ] {
+        let (outcome, panics, counts) = run_on_worker(move |context| {
+            Box::pin(async move {
+                take_contained_panics();
+                let worker = context.handle().clone();
+                let start = worker.poll_stats();
+                let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+                let (transport, _) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+                let (application, _) = Application::new(vec![Reply::Body(0)]);
+                let (mut session, _) =
+                    OwnedH2Session::new(application, options(context, transport)).unwrap();
+                session
+                    .add_lifecycle_observer(Rc::new(PanicOnEvent {
+                        event,
+                        panicked: Cell::new(false),
+                    }))
+                    .unwrap();
+                let run = tokio::time::timeout(Duration::from_secs(5), session.run())
+                    .await
+                    .expect("the connection finishes");
+                (
+                    run.map(drop).map_err(|error| error.code()),
+                    take_contained_panics(),
+                    contained_panic_counts(&worker, &start),
+                )
+            })
+        });
+        assert_eq!(outcome, Err(HttpErrorCode::INTERNAL_ERROR), "{event:?}");
+        assert_eq!(
+            panics,
+            [(
+                PanicSite::LifecycleObserver,
+                None,
+                Some("lifecycle observer".to_owned())
+            )],
+            "{event:?}"
+        );
+        assert_eq!(counts, (0, 1, 0), "{event:?}");
+    }
 }
 
 /// Records each event it sees, tagged with its own number.
@@ -19696,12 +21000,14 @@ impl UniplexTransport for PanickingInlineWrite {
 }
 
 /// A write poll that wakes the session and panics leaves the session to abort, keep polling the
-/// write until it completes, and only then resume the panic; the wake its pending re-poll asks for
-/// from inside still reaches the session.
+/// write until it completes, and only then fail the run (`DIV-056`); the wake its pending re-poll
+/// asks for from inside still reaches the session.
+#[cfg(panic = "unwind")]
 #[test]
 fn inline_waking_write_poll_panic_still_joins_the_write() {
     run_on_worker(|context| {
         Box::pin(async move {
+            take_contained_panics();
             let (_, preface) = ready_owner_requests(0);
             let (inner, wire) = FixtureTransport::new([FixtureRead::Data(preface)]);
             let polls = Rc::new(Cell::new(0));
@@ -19712,16 +21018,18 @@ fn inline_waking_write_poll_panic_still_joins_the_write() {
             let (application, _probes) = Application::new(Vec::new());
             let (session, _handle) =
                 OwnedH2Session::new(application, options(context, transport)).unwrap();
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
-                eligibility_catch_unwind(session.run()),
-            )
-            .await
-            .expect("the panicked session joins its write");
-            let panic = result.expect_err("the write poll's panic is resumed");
+            let error = tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .expect("the panicked session joins its write")
+                .expect_err("a Driver-scope panic fails the run");
+            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
             assert_eq!(
-                panic.downcast_ref::<&str>(),
-                Some(&"first inline-waking write poll")
+                take_contained_panics(),
+                [(
+                    PanicSite::DriverTurn,
+                    None,
+                    Some("first inline-waking write poll".to_owned())
+                )]
             );
             assert_eq!(polls.get(), 3, "the write was polled until it completed");
             assert_eq!(wire.borrow().close, FixtureClose::Reset);

@@ -16,6 +16,8 @@ use super::*;
 use crate::experimental::OwnedRequestProgressExt;
 use crate::external_host_tests::after_forced_teardown;
 use crate::external_host_tests::forced_teardown_of_scope;
+use crate::owned::PanicSite;
+use crate::owned::take_contained_panics;
 use crate::owned_h2::OwnedH2ExclusiveSubmission;
 use crate::owned_h2::OwnedH2Options;
 use crate::owned_h2::OwnedH2UpstreamHandle;
@@ -3087,10 +3089,14 @@ fn upload_pending_token_cancellation_and_explicit_status_keep_their_retirement_o
     }
 }
 
+/// `DIV-056`: an upload source whose read panics is retired unstopped, and the panic, contained
+/// at Driver scope, aborts the session, whose run joins its native I/O and then fails.
+#[cfg(panic = "unwind")]
 #[test]
-fn upload_body_poll_panic_retires_the_read_and_joins_native_io_before_resuming() {
+fn upload_body_poll_panic_retires_the_read_and_joins_native_io_before_failing_the_run() {
     run_on_worker(|context| {
         Box::pin(async move {
+            take_contained_panics();
             let release_callback = Arc::new(tokio::sync::Notify::new());
             let release_write = Arc::new(tokio::sync::Notify::new());
             let release_read = Arc::new(tokio::sync::Notify::new());
@@ -3139,7 +3145,7 @@ fn upload_body_poll_panic_retires_the_read_and_joins_native_io_before_resuming()
                         );
                         assert!(probe.stops.borrow().is_empty());
                         drop(submission);
-                        assert!(!resumed.get(), "held I/O retains the source panic");
+                        assert!(!resumed.get(), "held I/O keeps the run pending");
                         assert!(wire.borrow().writes.is_empty());
                         release_write.notify_one();
                         complete_credit_wait(|| wire.borrow().writes.len() == 1).await;
@@ -3163,8 +3169,18 @@ fn upload_body_poll_panic_retires_the_read_and_joins_native_io_before_resuming()
                 Ok(result) => result.expect("source panic reaches joined cleanup"),
                 Err(payload) => resume_unwind(payload),
             }
-            let panic = result.expect_err("the original source panic is resumed");
-            assert_eq!(panic.downcast_ref::<&str>(), Some(&"upstream body poll"));
+            let error = result
+                .expect("the run contains the source panic")
+                .expect_err("a Driver-scope panic fails the run");
+            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::DriverTurn,
+                    None,
+                    Some("upstream body poll".to_owned())
+                )]
+            );
             assert_eq!(probe.reads.get(), 1);
             assert_eq!(probe.produced.get(), 0);
             assert_eq!(probe.drops.get(), 1);
@@ -3173,6 +3189,56 @@ fn upload_body_poll_panic_retires_the_read_and_joins_native_io_before_resuming()
             assert_eq!(Some(wire.writes[0].len()), wire.write_gate_pending);
             assert!(wire.transport_dropped);
             assert_eq!(wire.close, FixtureClose::Reset);
+        })
+    });
+}
+
+/// `DIV-056`: a Driver-scope panic in an owned HTTP/2 client, here in the codec's
+/// header indexing strategy as the request head is encoded, fails the pending submission and
+/// the run with `INTERNAL_ERROR`, and is reported once.
+#[cfg(panic = "unwind")]
+#[test]
+fn upstream_driver_panic_returns_err() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let (transport, wire) =
+                FixtureTransport::new([FixtureRead::Data(server_settings_bytes(1))]);
+            let mut config = options(context, transport);
+            config.http2.header_indexing_strategy = Some(Rc::new(super::owned::PanickingIndexing));
+            let (session, handle) = OwnedH2UpstreamSession::new(config).unwrap();
+            let submission = handle.reserve_request().unwrap().submit(
+                request_head(HttpMethod::Get, true, None),
+                HttpSourceHolder::empty(),
+                CancellationToken::never(),
+            );
+            let (result, submitted) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(session.run(), submission)
+            })
+            .await
+            .expect("the panicked session finishes");
+            let error = result.expect_err("a Driver-scope panic fails the run");
+            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+            let Err(error) = submitted else {
+                panic!("the pending submission fails");
+            };
+            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::DriverTurn,
+                    None,
+                    Some("indexing strategy".to_owned())
+                )]
+            );
+            assert_eq!(
+                super::owned::contained_panic_counts(&worker, &start),
+                (0, 0, 1)
+            );
+            assert!(handle.is_finished());
+            assert_eq!(wire.borrow().close, FixtureClose::Reset);
         })
     });
 }
@@ -3743,8 +3809,11 @@ fn fresh_upload_wait_preserves_control_early_response_and_resume_cancellation() 
     }
 }
 
+/// `DIV-056`: a fresh upload's credit callback panic, contained at Driver scope, aborts the
+/// session, whose run joins its native I/O and then fails.
+#[cfg(panic = "unwind")]
 #[test]
-fn fresh_upload_callback_panic_joins_native_io_before_resuming() {
+fn fresh_upload_callback_panic_joins_native_io_before_failing_the_run() {
     struct Callback {
         probe: Rc<FreshUploadProbe>,
         producer: Rc<RefCell<Option<HttpStreamSourceProducer>>>,
@@ -3779,6 +3848,7 @@ fn fresh_upload_callback_panic_joins_native_io_before_resuming() {
 
     run_on_worker(|context| {
         Box::pin(async move {
+            take_contained_panics();
             let release_write = Arc::new(tokio::sync::Notify::new());
             let release_read = Arc::new(tokio::sync::Notify::new());
             let (transport, wire) = FixtureTransport::new([
@@ -3840,7 +3910,7 @@ fn fresh_upload_callback_panic_joins_native_io_before_resuming() {
                         );
                         assert!(!producer.is_live());
                         drop(submission);
-                        assert!(!resumed.get(), "held native I/O retains the callback panic");
+                        assert!(!resumed.get(), "held native I/O keeps the run pending");
                         assert!(wire.borrow().writes.is_empty());
                         release_write.notify_one();
                         complete_credit_wait(|| wire.borrow().writes.len() == 1).await;
@@ -3863,8 +3933,18 @@ fn fresh_upload_callback_panic_joins_native_io_before_resuming() {
                 Ok(result) => result.expect("fresh callback panic reaches joined cleanup"),
                 Err(payload) => resume_unwind(payload),
             }
-            let panic = result.expect_err("the original fresh callback panic is resumed");
-            assert_eq!(panic.downcast_ref::<&str>(), Some(&"fresh upload credit"));
+            let error = result
+                .expect("the run contains the callback panic")
+                .expect_err("a Driver-scope panic fails the run");
+            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::DriverTurn,
+                    None,
+                    Some("fresh upload credit".to_owned())
+                )]
+            );
             assert_eq!(probe.completed.borrow().len(), 1);
             assert_eq!(probe.drops.get(), 1);
             let wire = wire.borrow();
@@ -4190,6 +4270,10 @@ fn completed_upload_keeps_cancellation_wake_while_write_is_held(direct_control: 
     });
 }
 
+/// `DIV-056` for the panicking cases: a deadline poll panic is contained at Driver scope, and a
+/// completion panic while the observer is retired at Exchange scope; either way the session
+/// aborts, joins its native I/O, and the run fails.
+#[cfg(panic = "unwind")]
 #[test]
 fn response_observer_terminal_cleanup_joins_held_native_io() {
     use std::task::Context;
@@ -4246,6 +4330,7 @@ fn response_observer_terminal_cleanup_joins_held_native_io() {
     ] {
         run_on_worker(move |context| {
             Box::pin(async move {
+                take_contained_panics();
                 let stream = StreamId::new(1);
                 let release_write = Arc::new(tokio::sync::Notify::new());
                 let release_read = Arc::new(tokio::sync::Notify::new());
@@ -4399,17 +4484,37 @@ fn response_observer_terminal_cleanup_joins_held_native_io() {
                     Ok(result) => result.expect("terminal observation makes progress"),
                     Err(panic) => resume_unwind(panic),
                 }
-                if matches!(terminal, Terminal::RequestCancel | Terminal::PollPanic) {
-                    let panic =
-                        result.expect_err("the original observer panic is resumed after joining");
-                    let expected = if matches!(terminal, Terminal::PollPanic) {
-                        "response observer deadline"
-                    } else {
-                        "response observer completion"
-                    };
-                    assert_eq!(panic.downcast_ref::<&str>(), Some(&expected));
-                } else {
-                    cancelled(result.expect("ordinary terminal observation does not panic"));
+                let result = result.expect("the run contains the observer's panics");
+                let completion = (
+                    PanicSite::ExchangeRetirement,
+                    Some(stream),
+                    Some("response observer completion".to_owned()),
+                );
+                match terminal {
+                    Terminal::PollPanic => {
+                        let error = result.expect_err("the deadline panic fails the run");
+                        assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+                        assert_eq!(
+                            take_contained_panics(),
+                            [
+                                (
+                                    PanicSite::DriverTurn,
+                                    None,
+                                    Some("response observer deadline".to_owned())
+                                ),
+                                completion,
+                            ]
+                        );
+                    }
+                    Terminal::RequestCancel => {
+                        let error = result.expect_err("the completion panic fails the run");
+                        assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+                        assert_eq!(take_contained_panics(), [completion]);
+                    }
+                    Terminal::PeerReset | Terminal::Shutdown => {
+                        cancelled(result);
+                        assert!(take_contained_panics().is_empty());
+                    }
                 }
                 assert_eq!(completed.borrow().len(), 1);
                 assert_eq!(dropped.get(), 1);

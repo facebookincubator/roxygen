@@ -1173,7 +1173,16 @@ impl OwnedExchange for NoExchange {
 /// events for its reader, before the error, unless the request's consumer cancelled it (a
 /// cancel, a dropped submission or the cancellation token), which discards them, as
 /// `UniplexStreamAbort` does.
-pub struct OwnedH2UpstreamSession(Driver<UpstreamApplication, true>);
+pub struct OwnedH2UpstreamSession(Option<Driver<UpstreamApplication, true>>);
+
+/// A session dropped unrun is abandoned as a run would be.
+impl Drop for OwnedH2UpstreamSession {
+    fn drop(&mut self) {
+        if let Some(driver) = self.0.take() {
+            driver.abandon(false);
+        }
+    }
+}
 
 impl OwnedH2UpstreamSession {
     /// Creates the experimental upstream session. It honors `read_timeout`, whose expiry drains
@@ -1192,7 +1201,7 @@ impl OwnedH2UpstreamSession {
                 .expect("upstream session has admission"),
         );
         Ok((
-            Self(session),
+            Self(Some(session)),
             OwnedH2UpstreamHandle {
                 control: handle.0,
                 admission,
@@ -1200,20 +1209,27 @@ impl OwnedH2UpstreamSession {
         ))
     }
 
-    pub fn run(self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
-        self.0.run()
+    /// The run never resumes a callback panic: one that aborts the connection is counted in the
+    /// worker's `WorkerPollStats`, and the run returns `Err` once native I/O has joined
+    /// (`DIV-056`).
+    pub fn run(mut self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
+        self.0
+            .take()
+            .expect("an unrun session holds its driver")
+            .run()
     }
 
     /// Replaces the per-session random stream-table seed with a fixed one.
     #[cfg(test)]
-    pub(crate) fn with_stream_seed(self, seed: u64) -> Self {
-        Self(self.0.with_stream_seed(seed))
+    pub(crate) fn with_stream_seed(mut self, seed: u64) -> Self {
+        let driver = self.0.take().expect("an unrun session holds its driver");
+        Self(Some(driver.with_stream_seed(seed)))
     }
 
     /// Whether the session built a flood-limit counter.
     #[cfg(test)]
     pub(crate) fn limits_rates(&self) -> bool {
-        self.0.limits_rates()
+        self.0.as_ref().is_some_and(Driver::limits_rates)
     }
 }
 

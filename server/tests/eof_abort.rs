@@ -2072,6 +2072,128 @@ fn http2_eof_with_a_serialized_response_and_a_held_stream_writes_the_first_and_a
     });
 }
 
+#[derive(Default)]
+struct StopProbe {
+    reading: Cell<bool>,
+    stopped: Cell<bool>,
+}
+
+/// A response whose head never arrives and whose `stop_reading` panics.
+struct PanickingStop(Rc<StopProbe>);
+
+impl HttpSource for PanickingStop {
+    fn read_header_event(&mut self) -> LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
+        self.0.reading.set(true);
+        Box::pin(std::future::pending())
+    }
+
+    fn read_body_event(
+        &mut self,
+        _maximum: u32,
+    ) -> LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {
+        self.0.stopped.set(true);
+        panic!("response source stop");
+    }
+}
+
+struct PanickingStopHandler(Rc<StopProbe>);
+
+impl HttpHandler for PanickingStopHandler {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        _request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        let source = PanickingStop(Rc::clone(&self.0));
+        Box::pin(std::future::ready(Ok(HttpSourceHolder::new(Box::new(
+            source,
+        )))))
+    }
+}
+
+/// `DIV-055` with `DIV-056`: on the owned driver, the EOF abort's cancellation reaches a
+/// response source whose `stop_reading` panics. The driver contains and counts the panic as an
+/// exchange's, and the abort still writes its one GOAWAY and closes with a FIN under
+/// `non_abortive_close`, failing the connection with `TRANSPORT_EOF`. The worker serves the next
+/// connection.
+#[cfg(panic = "unwind")]
+#[test]
+fn owned_http2_eof_abort_contains_a_stop_panic_and_ends_with_a_fin_under_non_abortive_close() {
+    on_worker(|context| async move {
+        let probe = Rc::new(StopProbe::default());
+        let session = ServerSessionConfig {
+            non_abortive_close: true,
+            ..h2_session(true, true)
+        };
+        let (connection, mut client) = serve_loopback(
+            &context,
+            CodecProtocol::Http2,
+            session,
+            Rc::new(PanickingStopHandler(Rc::clone(&probe))),
+        )
+        .await;
+        let mut wire = h2_preface();
+        wire.extend(h2_head(1, b"/stop", true));
+        client.write_all(&wire).await.expect("request written");
+        until(|| probe.reading.get()).await;
+        let start = context.handle().poll_stats();
+        client.shutdown().await.expect("client half-closes");
+        let error = connection
+            .wait_closed()
+            .await
+            .expect_err("the EOF fails the connection");
+        assert_eq!(error.code(), HttpErrorCode::TRANSPORT_EOF);
+        assert!(probe.stopped.get(), "the abort stops the response source");
+        let delta = context.handle().poll_stats().since(&start);
+        assert_eq!(
+            (
+                delta.contained_exchange_panics,
+                delta.contained_connection_panics,
+                delta.contained_driver_panics,
+            ),
+            (1, 0, 0),
+            "the stop panic is contained as the exchange's"
+        );
+        let (wire, reset) = read_until_closed(&mut client).await;
+        assert!(!reset, "non_abortive_close ends the connection with a FIN");
+        assert_eq!(h2_goaways(&wire), [(1, INTERNAL_ERROR)]);
+
+        let held = Rc::new(Held::default());
+        held.release.notify_one();
+        let (next, mut client) = serve_loopback(
+            &context,
+            CodecProtocol::Http2,
+            h2_session(true, true),
+            Rc::new(HeldHandler(Rc::clone(&held))),
+        )
+        .await;
+        client
+            .write_all(&h2_request())
+            .await
+            .expect("request written");
+        let mut wire = Vec::new();
+        read_h2_until(&mut client, &mut wire, |wire| {
+            h2_stream_frames(&wire[..h2_whole_prefix(wire)], 1)
+                .expect("whole frames")
+                .iter()
+                .any(|frame| frame.flags & END_STREAM != 0)
+        })
+        .await;
+        assert_whole_h2_response(&wire[..h2_whole_prefix(&wire)], 1, b"held");
+        client
+            .shutdown()
+            .await
+            .expect("client closes the idle connection");
+        next.wait_closed()
+            .await
+            .expect("the next connection closes cleanly");
+    });
+}
+
 /// The stream and kind of each whole frame in `wire`, in order.
 fn h2_frames_in_order(wire: &[u8]) -> Vec<(u32, u8)> {
     let mut frames = Vec::new();
