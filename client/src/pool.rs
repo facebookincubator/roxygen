@@ -60,6 +60,7 @@ use crate::connector::ResolvedHost;
 use crate::connector::SessionConnector;
 use crate::connector::SessionParams;
 use crate::experimental::owned::OwnedClientSession;
+use crate::experimental::owned::OwnedGetSessionResult;
 use crate::experimental::owned::OwnedPoolStats;
 use crate::experimental::owned::OwnedSessionSelection;
 use crate::experimental::owned::admission_closed_error;
@@ -468,6 +469,10 @@ pub struct GetSessionResult {
 pub(crate) trait PoolReservation: Sized + 'static {
     /// Reserves `session`, which `state`'s pool selected.
     fn reserve(state: &Rc<RefCell<PoolState>>, session: PooledSession) -> Result<Self, PoolError>;
+
+    /// The reservation an owned pool's dial made for the acquisition that started the dial
+    /// (`DIV-046`).
+    fn handed_over(reservation: OwnedGetSessionResult) -> Result<Self, PoolError>;
 }
 
 impl PoolReservation for GetSessionResult {
@@ -482,6 +487,11 @@ impl PoolReservation for GetSessionResult {
             }),
             Err(source) => Err(PoolError::ReservationFailed { source }),
         }
+    }
+
+    /// Native and attached pools hand over no owned session.
+    fn handed_over(_reservation: OwnedGetSessionResult) -> Result<Self, PoolError> {
+        Err(PoolError::InvalidSessionState)
     }
 }
 
@@ -854,6 +864,8 @@ struct Waiter {
     id: u64,
     baton: Rc<CancellableBaton>,
     error: RefCell<Option<PoolError>>,
+    /// The reservation an owned pool's dial made for this waiter's acquisition (`DIV-046`).
+    handoff: RefCell<Option<OwnedGetSessionResult>>,
     credit: Option<Rc<ConnectCredit>>,
 }
 
@@ -864,6 +876,11 @@ impl Waiter {
 
     fn cancel(&self, error: PoolError) {
         self.error.replace(Some(error));
+        self.baton.signal();
+    }
+
+    fn hand_over(&self, reservation: OwnedGetSessionResult) {
+        self.handoff.replace(Some(reservation));
         self.baton.signal();
     }
 }
@@ -1925,6 +1942,15 @@ impl PoolState {
         self.waiters.drain(..).collect()
     }
 
+    /// Removes `waiter` from the queue, if it still waits there.
+    fn take_waiter(&mut self, waiter: &Rc<Waiter>) -> Option<Rc<Waiter>> {
+        let index = self
+            .waiters
+            .iter()
+            .position(|queued| Rc::ptr_eq(queued, waiter))?;
+        self.waiters.remove(index)
+    }
+
     /// Stamps when each session lost its last active or reserved exchange, for idle
     /// retirement and the most-recently-used order, and reports whether idle retirement
     /// must wake for a session that became idle: at expiry while it waits without a
@@ -2638,6 +2664,9 @@ struct ConnectionAttempt {
     factory: ConnectionFactory,
     ownership: Option<OwnershipGuard>,
     guard: ConnectingGuard,
+    /// An owned pool's: the waiter of the acquisition step that started the attempt
+    /// (`DIV-046`).
+    dialer: Option<Rc<Waiter>>,
 }
 
 enum AcquireStep {
@@ -3778,7 +3807,7 @@ async fn acquire_after_wait<Reservation: PoolReservation>(
             registration,
             wait_timeout,
         } = wait;
-        wait_for_wakeup(
+        let handoff = wait_for_wakeup(
             &state,
             waiter,
             registration,
@@ -3788,6 +3817,9 @@ async fn acquire_after_wait<Reservation: PoolReservation>(
         .await?;
         if cancellation.is_cancellation_requested() {
             return Err(PoolError::Cancelled);
+        }
+        if let Some(reservation) = handoff {
+            return Reservation::handed_over(reservation);
         }
         wait = match acquisition_step(&state, &mut started, true)? {
             Stepped::Reserved(reservation) => return Ok(reservation),
@@ -3808,13 +3840,15 @@ pub(crate) fn take_waits_for_wakeup_for_test() -> u64 {
     WAITS_FOR_WAKEUP.replace(0)
 }
 
+/// Waits for the waiter's wake; returns the reservation an owned pool's dial handed it, if
+/// any.
 async fn wait_for_wakeup(
     state: &RefCell<PoolState>,
     waiter: Rc<Waiter>,
     registration: WaiterRegistration,
     wait_timeout: Duration,
     cancellation: CancellationToken,
-) -> Result<(), PoolError> {
+) -> Result<Option<OwnedGetSessionResult>, PoolError> {
     #[cfg(test)]
     WAITS_FOR_WAKEUP.set(WAITS_FOR_WAKEUP.get() + 1);
     let status = waiter.baton.timed_wait(wait_timeout, cancellation).await;
@@ -3822,8 +3856,11 @@ async fn wait_for_wakeup(
     if let Some(error) = waiter.error.borrow_mut().take() {
         return Err(error);
     }
+    if let Some(reservation) = waiter.handoff.borrow_mut().take() {
+        return Ok(Some(reservation));
+    }
     match status {
-        WaitStatus::Signalled => Ok(()),
+        WaitStatus::Signalled => Ok(None),
         WaitStatus::TimedOut => {
             state.borrow_mut().stats.acquisition_timeouts += 1;
             Err(PoolError::Timeout)
@@ -3876,6 +3913,7 @@ async fn run_connection_attempt(
         factory,
         ownership,
         guard,
+        dialer,
     } = attempt;
     let ownership = &ownership
         .as_ref()
@@ -3992,7 +4030,7 @@ async fn run_connection_attempt(
                 }
                 let unsettled = pool.borrow().index.unsettled.clone();
                 connected.bind_pool(Rc::downgrade(&pool), unsettled);
-                let wake_count = connected.available_transactions();
+                let mut wake_count = connected.available_transactions();
                 let max_age = sampled_max_age(pool.borrow().pool_params.max_age);
                 // An owned session records its entry's slot, so that a settled index hears it
                 // join at the back of the pool's order instead of passing over the pool (S6.9).
@@ -4008,6 +4046,12 @@ async fn run_connection_attempt(
                     state.stats.sessions_opened += 1;
                 }
                 completion.counted = true;
+                if let Some(session) = &joined
+                    && let Some(dialer) = dialer.take()
+                    && hand_over_session(&pool, session, &dialer)
+                {
+                    wake_count = session.available_transactions();
+                }
                 notify_session_event(
                     &pool,
                     context.worker_id(),
@@ -4069,6 +4113,34 @@ async fn run_connection_attempt(
     }
     guard.release(false);
     None
+}
+
+/// Hands `session`, which an owned pool's dial established and pooled, to `dialer`, the waiter
+/// of the acquisition step that started the dial, while that waiter still waits and the worker
+/// admits reservations (`DIV-046`): the waiter leaves the queue with a reservation on the
+/// session, made as its next step would make one on a session it selected, or with the error
+/// that refused it. Returns whether the session was handed over.
+fn hand_over_session(
+    pool: &Rc<RefCell<PoolState>>,
+    session: &PooledSession,
+    dialer: &Rc<Waiter>,
+) -> bool {
+    let waiter = {
+        let mut state = pool.borrow_mut();
+        if !state.admits_reservations() {
+            return false;
+        }
+        state.take_waiter(dialer)
+    };
+    let Some(waiter) = waiter else {
+        return false;
+    };
+    let reserved = OwnedGetSessionResult::reserve(pool, session.clone());
+    let _ = catch_callback(|| match reserved {
+        Ok(reservation) => waiter.hand_over(reservation),
+        Err(error) => waiter.cancel(error),
+    });
+    true
 }
 
 /// `started` anchors the acquisition's deadline; a first step without one
@@ -4204,6 +4276,7 @@ fn next_step(
                 id: pool.next_waiter_id,
                 baton: Rc::new(CancellableBaton::new()),
                 error: RefCell::new(None),
+                handoff: RefCell::new(None),
                 credit: credit.clone(),
             });
             pool.next_waiter_id = pool.next_waiter_id.wrapping_add(1);
@@ -4249,6 +4322,8 @@ fn next_step(
                         address: address.clone(),
                     },
                 };
+                let dialer =
+                    matches!(factory, ConnectionFactory::Owned { .. }).then(|| Rc::clone(&waiter));
                 AcquireStep::StartAndWait {
                     attempt: ConnectionAttempt {
                         context: pool.context.clone(),
@@ -4259,6 +4334,7 @@ fn next_step(
                             observer: pool.observer.clone(),
                             credit,
                         },
+                        dialer,
                     },
                     registration,
                     waiter,

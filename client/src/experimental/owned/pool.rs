@@ -123,6 +123,10 @@ impl PoolReservation for OwnedGetSessionResult {
             session,
         })
     }
+
+    fn handed_over(reservation: OwnedGetSessionResult) -> Result<Self, PoolError> {
+        Ok(reservation)
+    }
 }
 
 /// A pending [`OwnedHttpSessionPool`] acquisition. Its first poll runs the
@@ -137,7 +141,11 @@ impl PoolReservation for OwnedGetSessionResult {
 /// taken at once (`DIV-046`). One that finds no session to take, below
 /// `max_connections`, waits for such a session, if no other acquisition waits
 /// for it, instead of starting a connection attempt; that session's next
-/// notification wakes it ahead of earlier waiters (`DIV-046`).
+/// notification wakes it ahead of earlier waiters (`DIV-046`). One that starts a
+/// connection attempt and still waits when the attempt establishes a session is
+/// handed that session, reserved for it then, so that a peer's close the session
+/// reads before the acquisition runs refuses its request, unprocessed, instead of
+/// drawing another dial (`DIV-046`).
 /// Dropping it before it resolves abandons the acquisition, as dropping
 /// `HttpSessionPool`'s does, and leaves a returning session it waited for to
 /// the next acquisition.

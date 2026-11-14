@@ -2,9 +2,10 @@
 //! over loopback TCP against a scripted peer, under API Proxy's pool parameters: a connection
 //! the peer closes while it is idle (uvicorn closes a keep-alive connection after 5 s, scaled
 //! down here), thousands of connections, responses that close their connection or delimit
-//! their body by it, chunked responses, and a cancel in the middle of a response. Each scenario
-//! runs on a `RuntimeOwner` worker that must quiesce without forcing, except the close race,
-//! which runs on a `ManagedWorker` and a `HostedWorker`.
+//! their body by it, chunked responses, a cancel in the middle of a response, and a peer that
+//! closes each connection as soon as it accepts it. Each scenario runs on a `RuntimeOwner`
+//! worker that must quiesce without forcing, except the close race, which runs on a
+//! `ManagedWorker` and a `HostedWorker`.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -19,9 +20,11 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
+use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -1274,6 +1277,111 @@ fn a_cancel_mid_response_closes_only_its_connection() {
             "{cancel:?} {reading:?}: (connections, responses the client cut)"
         );
     }
+}
+
+/// A peer that closes each connection as soon as it accepts it, counting them, until dropped.
+struct HangUpPeer {
+    address: SocketAddr,
+    accepted: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HangUpPeer {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("peer binds");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let address = listener.local_addr().expect("peer address");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let accepted = Arc::clone(&accepted);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            accepted.fetch_add(1, Ordering::SeqCst);
+                            drop(stream);
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(1)),
+                    }
+                }
+            })
+        };
+        Self {
+            address,
+            accepted,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for HangUpPeer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A connection the peer closes as soon as it accepts it is dialed once for the acquisition
+/// that started the dial, as hyper-util dials once for a request and sends it on that
+/// connection: the pool reserves the dialed session for that acquisition at the dial
+/// (`DIV-046`), so the peer's close, which the session's driver reads before the acquisition
+/// next runs, refuses the acquisition's request unprocessed instead of retiring the session
+/// and drawing another dial. (The acquisition's outcome, dials, sessions opened, the peer's
+/// connections.)
+#[test]
+fn a_fresh_connection_the_peer_drops_at_once_is_dialed_once_for_its_acquisition() {
+    let peer = HangUpPeer::start();
+    let address = peer.address;
+    let observed = run_on_worker(move |context| async move {
+        let pool = egress_pool(&context, address, egress_params());
+        let mut acquisition =
+            Box::pin(pool.get_session_with_reservation(CancellationToken::never()));
+        let first = poll_fn(|cx| Poll::Ready(acquisition.as_mut().poll(cx))).await;
+        assert!(first.is_pending(), "the empty pool dials");
+        until(|| pool.stats().sessions_opened == 1 && pool.session_count() == 0).await;
+        let outcome = match acquisition.await {
+            Ok(OwnedGetSessionResult { reservation, .. }) => {
+                let (head, body) = get("/ok").await;
+                let mut submission =
+                    Box::pin(reservation.submit(head, body, CancellationToken::never()));
+                match submission.as_mut().await {
+                    Ok(_) => "committed".to_owned(),
+                    Err(error) => format!(
+                        "refused {:?}, unprocessed: {}",
+                        error.code(),
+                        submission.request_unprocessed()
+                    ),
+                }
+            }
+            Err(error) => format!("{error:?}"),
+        };
+        let stats = pool.stats();
+        (outcome, stats.connect_attempts, stats.sessions_opened)
+    });
+    let accepted = peer.accepted.load(Ordering::SeqCst);
+    assert_eq!(
+        (observed, accepted),
+        (
+            (
+                format!(
+                    "refused {:?}, unprocessed: true",
+                    HttpErrorCode::TRANSPORT_EOF
+                ),
+                1,
+                1
+            ),
+            1
+        ),
+        "((the acquisition's outcome, dials, sessions opened), the peer's connections)"
+    );
 }
 
 /// `MANY` concurrent exchanges on an empty pool with no connection cap dial `MANY` connections

@@ -57,7 +57,9 @@
 //! allocation and no clock read for their deadline ([`OwnedSessionAcquisition`]), an
 //! HTTP/1.1 session whose slot is returning included while no acquisition waits (`DIV-046`),
 //! and one that would dial waits instead for an HTTP/1.1 session whose driver returns its
-//! slot at its next turn. [`OwnedHttpSessionPool::set_session_selection`] opts into taking
+//! slot at its next turn. An acquisition that dials is handed its dial's session, reserved for
+//! it when the dial completes, if it still waits then, as hyper-util sends a request on the
+//! connection it dialed for it. [`OwnedHttpSessionPool::set_session_selection`] opts into taking
 //! the least loaded of the sessions that can take an exchange (`DIV-048`). A reservation
 //! taken on a pooled session's handle reaches its pool as one the pool's acquisition made,
 //! and the admission the pool closes on a session it retires or drains refuses the handle's

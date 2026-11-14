@@ -4173,9 +4173,11 @@ fn least_loaded_selection_takes_an_idle_http1_session_before_one_not_yet_idle() 
 
 /// Of equally loaded sessions a least-loaded acquisition (`DIV-048`) takes a busy one first,
 /// as `FirstAvailable` does: an HTTP/1.1 session the pool dialed for an acquisition dropped
-/// before it took it has no exchange in flight, as an idle session has, and counts as busy
-/// until its first reservation (`DIV-046`), so the next acquisition takes it before the idle
-/// session, under either selection.
+/// before its dial completed has no exchange in flight, as an idle session has, and counts as
+/// busy until its first reservation (`DIV-046`), so the next acquisition takes it before the
+/// idle session, under either selection. Two acquisitions dial, and the first is dropped before
+/// either attempt runs, so the second keeps the attempts dialing and the first's dial completes
+/// with no dialer to hand its session to.
 #[test]
 fn least_loaded_selection_takes_a_dialed_session_no_acquisition_took_before_an_idle_one() {
     let configs = [
@@ -4196,12 +4198,17 @@ fn least_loaded_selection_takes_a_dialed_session_no_acquisition_took_before_an_i
                 let held = acquire(&pool).await;
                 {
                     let mut abandoned =
+                        Box::pin(pool.get_session_with_reservation(CancellationToken::never()));
+                    let mut keeping =
                         pin!(pool.get_session_with_reservation(CancellationToken::never()));
-                    assert!(
-                        poll_once(abandoned.as_mut()).await.is_pending(),
-                        "a reserved HTTP/1.1 session makes the acquisition dial"
-                    );
-                    until(|| pool.session_count() == 2).await;
+                    for acquisition in [abandoned.as_mut(), keeping.as_mut()] {
+                        assert!(
+                            poll_once(acquisition).await.is_pending(),
+                            "a reserved HTTP/1.1 session makes the acquisition dial"
+                        );
+                    }
+                    drop(abandoned);
+                    until(|| pool.session_count() == 3).await;
                 }
                 assert_eq!(exchange(held.reservation, "/").await, b"ok");
                 settle(&held.session).await;
@@ -4213,8 +4220,8 @@ fn least_loaded_selection_takes_a_dialed_session_no_acquisition_took_before_an_i
             });
             assert_eq!(
                 (dialed, sessions, origin.accepted()),
-                (true, 2, 2),
-                "{selection:?}, {name}: (the dialed session was taken, sessions, connections)"
+                (true, 3, 3),
+                "{selection:?}, {name}: (a dialed session was taken, sessions, connections)"
             );
         }
     }
