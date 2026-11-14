@@ -142,10 +142,15 @@ impl PoolReservation for OwnedGetSessionResult {
 /// `max_connections`, waits for such a session, if no other acquisition waits
 /// for it, instead of starting a connection attempt; that session's next
 /// notification wakes it ahead of earlier waiters (`DIV-046`). One that starts a
-/// connection attempt and still waits when the attempt establishes a session is
-/// handed that session, reserved for it then, so that a peer's close the session
+/// connection attempt and still waits when the attempt ends takes the attempt's
+/// outcome (`DIV-046`): the session the attempt established, reserved for it then
+/// while its worker admits reservations, so that a peer's close that the session
 /// reads before the acquisition runs refuses its request, unprocessed, instead of
-/// drawing another dial (`DIV-046`).
+/// drawing another dial; or, in an HTTP/1.1 pool, the attempt's
+/// [`PoolError::ConnectFailed`], whatever other
+/// sessions or attempts the pool has. In an HTTP/2 pool a failed attempt fails it
+/// only with every waiter, as the last pending attempt of a pool with no session,
+/// as `HttpSessionPool`'s does.
 /// Dropping it before it resolves abandons the acquisition, as dropping
 /// `HttpSessionPool`'s does, and leaves a returning session it waited for to
 /// the next acquisition.

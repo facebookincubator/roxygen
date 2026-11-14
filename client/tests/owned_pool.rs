@@ -859,6 +859,120 @@ fn a_dial_stays_bounded_by_the_connect_timeout() {
     );
 }
 
+/// A hyper HTTP/2 origin that accepts one connection, then closes its listener, so that later
+/// dials are refused, and serves that connection until the client closes it. While that
+/// connection is open it holds the port, so no other test's `127.0.0.1:0` listener can take it.
+struct OneConnectionHttp2Origin {
+    address: SocketAddr,
+    /// 1 once the listener is closed.
+    closed: Arc<AtomicUsize>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OneConnectionHttp2Origin {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("origin binds");
+        let address = listener.local_addr().expect("origin address");
+        let closed = Arc::new(AtomicUsize::new(0));
+        let thread = {
+            let closed = Arc::clone(&closed);
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("origin accepts");
+                drop(listener);
+                closed.store(1, Ordering::SeqCst);
+                stream
+                    .set_nonblocking(true)
+                    .expect("nonblocking connection");
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("origin runtime")
+                    .block_on(async move {
+                        let stream =
+                            tokio::net::TcpStream::from_std(stream).expect("origin connection");
+                        serve(stream, CodecProtocol::Http2).await;
+                    });
+            })
+        };
+        Self {
+            address,
+            closed,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for OneConnectionHttp2Origin {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A dial refused beside an HTTP/2 session whose only stream is reserved leaves the acquisition
+/// that started it waiting, as `HttpSessionPool`'s does (`DIV-025`), and the session's freed
+/// stream then serves it; only an owned HTTP/1.1 pool fails such an acquisition at once
+/// (`DIV-046`). (The acquisition's outcome, and the pool's dials, failed dials and waiters
+/// after the refused dials.)
+#[test]
+fn an_http2_dial_refused_beside_a_full_session_waits_for_its_stream() {
+    let origin = OneConnectionHttp2Origin::start();
+    let address = origin.address;
+    let closed = Arc::clone(&origin.closed);
+    let observed = run_on_worker(move |context| async move {
+        let pool = pool_with(
+            &context,
+            address,
+            CodecProtocol::Http2,
+            params(2),
+            one_stream(CodecProtocol::Http2),
+        );
+        let first = acquire(&pool).await;
+        until(|| closed.load(Ordering::SeqCst) == 1).await;
+        let mut second = pin!(pool.get_session_with_reservation(CancellationToken::never()));
+        assert!(
+            poll_once(second.as_mut()).await.is_pending(),
+            "the full session makes the acquisition dial"
+        );
+        until(|| pool.stats().connect_failures == 3).await;
+        let refused = poll_once(second.as_mut()).await;
+        let stats = pool.stats();
+        drop(first.reservation);
+        let outcome = match refused {
+            Poll::Ready(Err(PoolError::ConnectFailed { .. })) => "connect failed".to_owned(),
+            Poll::Ready(Err(error)) => format!("{error:?}"),
+            Poll::Ready(Ok(_)) => "served before the stream was freed".to_owned(),
+            Poll::Pending => {
+                let second = second.await.expect("the freed stream serves the waiter");
+                let session = if local(&first.session) == local(&second.session) {
+                    "the first acquisition's session"
+                } else {
+                    "another session"
+                };
+                let body = exchange(second.reservation, "/").await;
+                format!("{} on {session}", String::from_utf8_lossy(&body))
+            }
+        };
+        (
+            outcome,
+            (
+                stats.connect_attempts,
+                stats.connect_failures,
+                stats.waiters,
+            ),
+        )
+    });
+    assert_eq!(
+        observed,
+        (
+            "ok on the first acquisition's session".to_owned(),
+            (4, 3, 1)
+        ),
+        "(the acquisition's outcome, (dials, failed dials, waiters) after the refused dials)"
+    );
+}
+
 #[test]
 fn a_waiter_dials_a_replacement_when_the_only_session_closes_admission() {
     let origin = Origin::start(CodecProtocol::Http11);

@@ -60,6 +60,7 @@ use crate::experimental::owned::OwnedClientSession;
 use crate::experimental::owned::OwnedGetSessionResult;
 use crate::experimental::owned::OwnedHttpSessionPool;
 use crate::pool::IdleSweep;
+use crate::pool::PoolError;
 use crate::pool::PoolParams;
 use crate::pool::SessionReuseOrder;
 
@@ -1381,6 +1382,95 @@ fn a_fresh_connection_the_peer_drops_at_once_is_dialed_once_for_its_acquisition(
             1
         ),
         "((the acquisition's outcome, dials, sessions opened), the peer's connections)"
+    );
+}
+
+/// A peer whose listener accepts one connection and then closes, so that later dials to its
+/// address are refused, and that answers `OK` to each request on that connection until the
+/// client closes it. While that connection is open it holds the port, so no other test's
+/// `127.0.0.1:0` listener can take it.
+struct OneConnectionPeer {
+    address: SocketAddr,
+    closed: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OneConnectionPeer {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("peer binds");
+        let address = listener.local_addr().expect("peer address");
+        let closed = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let closed = Arc::clone(&closed);
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("peer accepts");
+                drop(listener);
+                closed.store(true, Ordering::SeqCst);
+                serve_blocking(&mut stream, usize::MAX);
+            })
+        };
+        Self {
+            address,
+            closed,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for OneConnectionPeer {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A dial refused while another connection of the pool is busy fails the acquisition that
+/// started it at once, with the dial's `ConnectFailed` after its attempts, as hyper-util fails
+/// a request whose connect fails (`DIV-046`), where frozen `addNewConnection` fails waiters
+/// only when no other connect is pending and no session exists, so the acquisition waited for
+/// the busy exchange to end. The busy connection serves on. (The acquisition's outcome, dials
+/// and failed dials, waiters left, and the busy connection's response.)
+#[test]
+fn a_dial_refused_beside_a_busy_connection_fails_its_acquisition_at_once() {
+    let peer = OneConnectionPeer::start();
+    let address = peer.address;
+    let closed = Arc::clone(&peer.closed);
+    let observed = run_on_worker(move |context| async move {
+        let pool = egress_pool(&context, address, egress_params());
+        let busy = pool
+            .get_session_with_reservation(CancellationToken::never())
+            .await
+            .expect("the first acquisition dials");
+        until(|| closed.load(Ordering::SeqCst)).await;
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            pool.get_session_with_reservation(CancellationToken::never()),
+        )
+        .await;
+        let outcome = match refused {
+            Err(_) => "still waiting after 5 s".to_owned(),
+            Ok(Err(PoolError::ConnectFailed { .. })) => "connect failed".to_owned(),
+            Ok(Err(error)) => format!("{error:?}"),
+            Ok(Ok(_)) => "served".to_owned(),
+        };
+        let stats = pool.stats();
+        let (received, _) = exchange_on(busy.reservation, "/ok", Reading::Source).await;
+        (
+            outcome,
+            (
+                stats.connect_attempts,
+                stats.connect_failures,
+                stats.waiters,
+            ),
+            received,
+        )
+    });
+    assert_eq!(
+        observed,
+        ("connect failed".to_owned(), (4, 3, 0), ok()),
+        "(the acquisition's outcome, (dials, failed dials, waiters left), the busy connection's \
+         response)"
     );
 }
 

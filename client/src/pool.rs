@@ -450,6 +450,15 @@ impl PoolBackend {
             Self::Attached { security, .. } => *security == TransportSecurity::Tls,
         }
     }
+
+    /// Only an owned HTTP/1.1 pool indexes its sessions (S6.9) and fails a failed attempt's
+    /// dialer (`DIV-046`).
+    fn is_owned_http1(&self) -> bool {
+        matches!(
+            self,
+            Self::Owned { connection, .. } if connection.plaintext_protocol == CodecProtocol::Http11
+        )
+    }
 }
 
 pub trait PoolObserver: 'static {
@@ -2664,8 +2673,9 @@ struct ConnectionAttempt {
     factory: ConnectionFactory,
     ownership: Option<OwnershipGuard>,
     guard: ConnectingGuard,
-    /// An owned pool's: the waiter of the acquisition step that started the attempt
-    /// (`DIV-046`).
+    /// An owned pool's: the waiter of the acquisition step that started the attempt, which the
+    /// attempt's session is handed to while it waits, and which, in an HTTP/1.1 pool, the
+    /// attempt's failure fails (`DIV-046`).
     dialer: Option<Rc<Waiter>>,
 }
 
@@ -2841,11 +2851,7 @@ impl HttpSessionPool {
 
     fn build(context: WorkerContext, mut pool_params: PoolParams, backend: PoolBackend) -> Self {
         let pooling_enabled = pool_params.max_connections != 0;
-        let indexed = matches!(
-            &backend,
-            PoolBackend::Owned { connection, .. }
-                if connection.plaintext_protocol == CodecProtocol::Http11
-        );
+        let indexed = backend.is_owned_http1();
         pool_params.max_connections = pool_params.max_connections.max(1);
         pool_params.max_connection_attempts = pool_params.max_connection_attempts.max(1);
         let (completion, _) = watch::channel(None);
@@ -4102,6 +4108,12 @@ async fn run_connection_attempt(
         let mut state = pool.borrow_mut();
         if state.sessions.is_empty() && state.connects_in_progress == 1 {
             state.take_all_waiters()
+        } else if state.backend.is_owned_http1() {
+            dialer
+                .take()
+                .and_then(|dialer| state.take_waiter(&dialer))
+                .into_iter()
+                .collect()
         } else {
             Vec::new()
         }
