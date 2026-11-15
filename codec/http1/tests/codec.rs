@@ -2187,6 +2187,108 @@ fn huge_url() {
     assert_eq!(callback.errors.len(), 1);
 }
 
+/// Parses `request` whole, in 4 KiB reads and byte by byte, and returns the one error's
+/// Proxygen error and status for each.
+fn rejection_per_fragmentation(request: &[u8]) -> Vec<(ProxygenError, Option<u32>)> {
+    [request.len(), 4096, 1]
+        .into_iter()
+        .map(|fragment_size| {
+            let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+            let mut callback = Recorder::default();
+            for fragment in request.chunks(fragment_size) {
+                parse(&mut codec, &mut callback, fragment);
+            }
+            assert_eq!(callback.events, ["begin", "error"], "{fragment_size}");
+            (callback.errors[0].0, callback.errors[0].1)
+        })
+        .collect()
+}
+
+/// RFC 9112 section 3: a request-target that uses up the head budget gets 414.
+#[test]
+fn request_target_past_the_head_limit_gets_414() {
+    let mut request = b"GET /".to_vec();
+    request.resize(MAX_HEADER_BYTES + 1, b'a');
+    request.extend_from_slice(b" HTTP/1.1\r\nHost: a\r\n\r\n");
+    assert_eq!(
+        rejection_per_fragmentation(&request),
+        [(ProxygenError::PARSE_HEADER, Some(414)); 3]
+    );
+}
+
+/// RFC 6585 section 5: a head that overflows after its request-target ended gets 431, even
+/// when a long target took most of the budget.
+#[test]
+fn head_past_the_limit_after_the_target_gets_431() {
+    let mut long_target = b"GET /".to_vec();
+    long_target.resize(MAX_HEADER_BYTES - 64, b'a');
+    long_target.extend_from_slice(b" HTTP/1.1\r\nX-Pad: ");
+    long_target.resize(MAX_HEADER_BYTES + 1, b'b');
+    for request in [
+        padded_head(b"GET / HTTP/1.1\r\nX-Pad: ", MAX_HEADER_BYTES + 1, b""),
+        long_target,
+    ] {
+        assert_eq!(
+            rejection_per_fragmentation(&request),
+            [(ProxygenError::PARSE_HEADER, Some(431)); 3]
+        );
+    }
+}
+
+/// Trailers are not part of the head: trailers past the budget stay 400.
+#[test]
+fn trailers_past_the_limit_stay_400() {
+    let mut request =
+        b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\nX: ".to_vec();
+    request.resize(request.len() + MAX_HEADER_BYTES, b'b');
+    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+    let mut callback = Recorder::default();
+    parse(&mut codec, &mut callback, &request);
+    assert_eq!(callback.errors.len(), 1);
+    assert_eq!(callback.errors[0].0, ProxygenError::PARSE_BODY);
+    assert_eq!(callback.errors[0].1, Some(400));
+}
+
+/// RFC 9112 section 6.1: chunked applied last over a coding the codec does not implement gets
+/// 501. Chunked that is not last (section 6.3), repeated chunked, or a malformed coding stays
+/// 400.
+#[test]
+fn unsupported_transfer_coding_gets_501_only_under_a_final_chunked() {
+    let cases: [(&[u8], u32); 9] = [
+        (b"Transfer-Encoding: gzip, chunked\r\n", 501),
+        (b"Transfer-Encoding: GZIP ,\tChunked\r\n", 501),
+        (
+            b"Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
+            501,
+        ),
+        (b"Transfer-Encoding: chunked, gzip\r\n", 400),
+        (b"Transfer-Encoding: gzip\r\n", 400),
+        (b"Transfer-Encoding: chunked, chunked\r\n", 400),
+        (b"Transfer-Encoding: gzip, chunked, chunked\r\n", 400),
+        (b"Transfer-Encoding: chunked,\r\n", 400),
+        (b"Transfer-Encoding: g zip, chunked\r\n", 400),
+    ];
+    for (field, status) in cases {
+        let request = [
+            b"POST / HTTP/1.1\r\nHost: a\r\n".as_slice(),
+            field,
+            b"\r\n0\r\n\r\n",
+        ]
+        .concat();
+        let context = field.escape_ascii().to_string();
+        let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+        let mut callback = Recorder::default();
+        parse(&mut codec, &mut callback, &request);
+        assert_eq!(callback.events, ["begin", "error"], "{context}");
+        assert_eq!(
+            callback.errors[0].0,
+            ProxygenError::PARSE_HEADER,
+            "{context}"
+        );
+        assert_eq!(callback.errors[0].1, Some(status), "{context}");
+    }
+}
+
 #[test]
 fn utf8_chars() {
     assert_simple_request(b"GET /echo?dl=%C3%91o%C3%B1o HTTP/1.1\r\n\r\n");

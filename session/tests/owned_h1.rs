@@ -4921,6 +4921,50 @@ fn methods_outside_llhttp_table_get_400_by_default_as_uniplex() {
     }
 }
 
+/// Both drivers answer a rejected head with the codec's status and close: 414 for a
+/// request-target past the head limit, 431 for another head past it, 501 for a transfer coding
+/// under a final chunked, and 400 when chunked is not last.
+#[test]
+fn rejected_heads_get_the_codec_status_as_uniplex() {
+    let mut long_target = b"GET /".to_vec();
+    long_target.resize((80 << 10) + 1, b'a');
+    long_target.extend_from_slice(b" HTTP/1.1\r\nHost: a\r\n\r\n");
+    let coded = |codings: &str| {
+        format!("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: {codings}\r\n\r\n0\r\n\r\n")
+            .into_bytes()
+    };
+    for (name, input, status) in [
+        ("long_target", long_target, "414 Request-URI Too Long"),
+        (
+            "head_over_the_limit",
+            head_of_length((80 << 10) + 1),
+            "431 Request Header Fields Too Large",
+        ),
+        (
+            "gzip_chunked",
+            coded("gzip, chunked"),
+            "501 Not Implemented",
+        ),
+        ("chunked_gzip", coded("chunked, gzip"), "400 Bad Request"),
+    ] {
+        let vector = Vector::new(name, &input, vec![Response::fixed(200, b"ok")]);
+        for split in [Split::Whole, Split::Every7, Split::OneByte] {
+            let label = format!("{name} {split:?}");
+            let owned = corpus_run(true, &vector, split);
+            let uniplex = corpus_run(false, &vector, split);
+            assert_eq!(
+                owned.output,
+                format!(
+                    "HTTP/1.1 {status}\r\nDate: <date>\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                ),
+                "{label}"
+            );
+            assert_eq!(owned.close, CloseKind::Reset, "{label}");
+            assert_eq!(owned, uniplex, "{label}");
+        }
+    }
+}
+
 /// Every corpus vector, fed whole, in 7-byte reads and one byte at a time, writes the same
 /// bytes (dates aside) and shows the application the same events under both sessions. No
 /// vector differs; DIV-029 would list any that did, each with its own assertion here.
@@ -7498,7 +7542,7 @@ fn owned_h1_writes_in_the_recorded_pieces() {
         ("expect_continue", [&[153], &[153], &[153]]),
         ("chunked_with_trailers", [&[99], &[99], &[99]]),
         ("head_at_the_limit", [&[94], &[94], &[92, 2]]),
-        ("head_over_the_limit", [&[103], &[103], &[103]]),
+        ("head_over_the_limit", [&[123], &[123], &[123]]),
         ("malformed_request_line", [&[103], &[103], &[103]]),
     ];
     let recorded_others: &[(&str, &[usize])] = &[

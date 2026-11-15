@@ -83,11 +83,19 @@ enum IngressPhase {
     Upgraded,
 }
 
+/// The statuses besides 400 go beyond Proxygen, which answers every ingress rejection 400, to
+/// follow the RFCs (`DIV-057`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ParseErrorKind {
     Header,
     HeaderContent,
     Body,
+    /// RFC 9112 section 3: the request-target used up the head budget (414).
+    UriTooLong,
+    /// RFC 6585 section 5: the request head is past its budget for another reason (431).
+    HeaderFieldsTooLarge,
+    /// RFC 9112 section 6.1: a transfer coding the codec does not implement (501).
+    NotImplemented,
 }
 
 #[cfg(test)]
@@ -177,6 +185,7 @@ pub struct Http1xCodec {
     header_name: Vec<u8>,
     header_value: Vec<u8>,
     target: Vec<u8>,
+    target_complete: bool,
     parsed_target: Option<ParseUrl>,
     reason: Vec<u8>,
     trailers: Option<HttpHeaders>,
@@ -271,6 +280,7 @@ impl Http1xCodec {
             header_name: Vec::new(),
             header_value: Vec::new(),
             target: Vec::new(),
+            target_complete: false,
             parsed_target: None,
             reason: Vec::new(),
             trailers: None,
@@ -547,12 +557,22 @@ impl Http1xCodec {
         self.parser_paused = true;
         let mut error = HttpException::new(HttpExceptionDirection::Ingress, message);
         error.set_proxygen_error(match kind {
-            ParseErrorKind::Header => ProxygenError::PARSE_HEADER,
+            ParseErrorKind::Header
+            | ParseErrorKind::UriTooLong
+            | ParseErrorKind::HeaderFieldsTooLarge
+            | ParseErrorKind::NotImplemented => ProxygenError::PARSE_HEADER,
             ParseErrorKind::HeaderContent => ProxygenError::HEADER_CONTENT_VALIDATION,
             ParseErrorKind::Body => ProxygenError::PARSE_BODY,
         });
         if self.direction.is_downstream() && self.egress_stream < self.ingress_stream {
-            error.set_http_status_code(400);
+            error.set_http_status_code(match kind {
+                ParseErrorKind::UriTooLong => 414,
+                ParseErrorKind::HeaderFieldsTooLarge => 431,
+                ParseErrorKind::NotImplemented => 501,
+                ParseErrorKind::Header | ParseErrorKind::HeaderContent | ParseErrorKind::Body => {
+                    400
+                }
+            });
         }
         error.set_partial_message(self.current_message.take());
         self.dispatch(

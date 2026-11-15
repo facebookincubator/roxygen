@@ -1,3 +1,5 @@
+use roxygen_core::http::is_tchar;
+
 use super::*;
 use crate::llhttp::Callbacks;
 
@@ -202,6 +204,7 @@ impl<C: IngressDelivery + ?Sized> Execution<'_, C> {
                     self.codec.protocol_bytes = 0;
                     self.codec.http09_request = false;
                     self.codec.target.clear();
+                    self.codec.target_complete = false;
                     self.codec.parsed_target = None;
                     self.codec.reason.clear();
                     self.codec.header_name.clear();
@@ -246,6 +249,7 @@ impl<C: IngressDelivery + ?Sized> Execution<'_, C> {
                     }
                 }
                 ParserEvent::UrlComplete => {
+                    self.codec.target_complete = true;
                     if let Some(message) = self.codec.current_message.as_mut() {
                         self.codec.parsed_target = message.set_url(&self.codec.target, true).ok();
                         message.set_http_version(parser.http_major, parser.http_minor);
@@ -392,13 +396,53 @@ impl<C: IngressDelivery + ?Sized> Execution<'_, C> {
     }
 }
 
+/// RFC 9112 section 6.1: codings the codec does not implement under one final chunked get 501.
+/// Chunked that is not last (section 6.3) and a malformed coding stay 400.
+fn unsupported_transfer_coding(headers: &HttpHeaders) -> (ParseErrorKind, &'static [u8]) {
+    let mut codings = Vec::new();
+    headers.for_each_value(HttpHeaderCode::TransferEncoding, |value| {
+        codings.extend(
+            value
+                .split(|byte| *byte == b',')
+                .map(trim_http_whitespace)
+                .filter(|coding| !coding.is_empty()),
+        );
+        false
+    });
+    let not_implemented = codings.split_last().is_some_and(|(last, rest)| {
+        last.eq_ignore_ascii_case(b"chunked")
+            && !rest.is_empty()
+            && rest
+                .iter()
+                .all(|coding| coding.iter().copied().all(is_tchar))
+    });
+    let kind = if not_implemented {
+        ParseErrorKind::NotImplemented
+    } else {
+        ParseErrorKind::Header
+    };
+    (kind, b"unsupported Transfer-Encoding")
+}
+
 impl Http1xCodec {
     fn track_header_bytes(&mut self, amount: usize) -> Result<(), (ParseErrorKind, &'static [u8])> {
         self.header_bytes = self.header_bytes.saturating_add(amount);
-        if self.header_bytes > MAX_HEADER_BYTES {
-            return Err((self.parse_error_kind(), b"HTTP header block is too large"));
+        if self.header_bytes <= MAX_HEADER_BYTES {
+            return Ok(());
         }
-        Ok(())
+        Err(match self.phase {
+            // Only the method and the spaces on either side of the target are counted with it, so
+            // the target used up the head budget.
+            IngressPhase::Headers if self.direction.is_downstream() && !self.target_complete => (
+                ParseErrorKind::UriTooLong,
+                b"HTTP request target is too long",
+            ),
+            IngressPhase::Headers => (
+                ParseErrorKind::HeaderFieldsTooLarge,
+                b"HTTP header block is too large",
+            ),
+            _ => (self.parse_error_kind(), b"HTTP header block is too large"),
+        })
     }
 
     fn parse_error_kind(&self) -> ParseErrorKind {
@@ -467,7 +511,7 @@ impl Http1xCodec {
                 !supported_encoding
             });
         if !supported_encoding {
-            return Err(header_error(b"unsupported Transfer-Encoding"));
+            return Err(unsupported_transfer_coding(message.headers()));
         }
         let version = (parser.http_major, parser.http_minor);
         message.set_http_version(version.0, version.1);
