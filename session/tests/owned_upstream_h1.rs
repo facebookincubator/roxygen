@@ -6867,6 +6867,337 @@ fn a_stale_reused_connection_refuses_a_reservation_after_its_fin() {
     });
 }
 
+#[cfg(target_os = "linux")]
+mod idle_peer_close {
+    use super::*;
+
+    /// The head the session writes for `get_head()`.
+    const GET: &str = "GET / HTTP/1.1\r\nHost: origin\r\nConnection: keep-alive\r\n\r\n";
+    /// What an origin may write on an idle connection before it closes it.
+    const REQUEST_TIMEOUT: &[u8] =
+        b"HTTP/1.1 408 Request Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
+    /// What the peer does on an idle connection before the next submission.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum IdlePeer {
+        /// Keeps it open and answers the request.
+        Open,
+        /// Half-closes it (FIN).
+        Fin,
+        /// Writes `REQUEST_TIMEOUT`, then half-closes it.
+        BytesThenFin,
+        /// Half-closes it, and the worker's I/O pass then wakes the session's read for the FIN.
+        FinAfterIoPass,
+        /// As `FinAfterIoPass`, and the session's next poll starts with the task's coop budget
+        /// spent.
+        FinWithBudgetSpent,
+        /// Resets it (`SO_LINGER` 0, then close).
+        Reset,
+    }
+
+    fn refused(code: HttpErrorCode, sequence: u64) -> RequestProgress {
+        RequestProgress {
+            error: Some(code),
+            unprocessed: true,
+            sequence: Some(sequence),
+        }
+    }
+
+    fn served(sequence: u64) -> RequestProgress {
+        RequestProgress {
+            error: None,
+            unprocessed: false,
+            sequence: Some(sequence),
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct IdleReuse {
+        /// One request per step, in order.
+        requests: Vec<RequestProgress>,
+        run: Option<HttpErrorCode>,
+        /// Every byte the peer read.
+        received: String,
+    }
+
+    /// `DIV-035` on a real loopback TCP connection. For each step the peer acts on the idle
+    /// connection and one request is submitted; after a close, once the client's socket shows it
+    /// but before the worker's next I/O pass, which alone would wake the session's parked read.
+    /// The session runs in the same task: `futures::join!` polls it right after the steps.
+    fn idle_reuse(steps: &'static [IdlePeer]) -> IdleReuse {
+        crate::uniplex_tests::run_on_hosted_worker(move |context| {
+            Box::pin(async move {
+                use std::io::Read;
+                use std::io::Write;
+                use std::os::fd::AsRawFd;
+
+                let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                    .expect("loopback listener");
+                let client = std::net::TcpStream::connect(listener.local_addr().unwrap())
+                    .expect("loopback client");
+                let (peer, _) = listener.accept().expect("loopback peer");
+                peer.set_nonblocking(true).unwrap();
+                let mut peer = Some(peer);
+                let client_fd = client.as_raw_fd();
+                let transport = roxygen_transport::tcp::TcpTransport::from_accepted(
+                    &context,
+                    client,
+                    roxygen_transport::byte_stream::ByteStreamLimits::new(
+                        256 << 10,
+                        256 << 10,
+                        1024,
+                    )
+                    .unwrap(),
+                )
+                .expect("adopted loopback client");
+                let (session, handle) =
+                    OwnedH1UpstreamSession::new(upstream_options(context, Rc::new(transport)))
+                        .unwrap();
+                let submit = || {
+                    handle.reserve_request().unwrap().submit(
+                        get_head(),
+                        HttpSourceHolder::empty(),
+                        CancellationToken::never(),
+                    )
+                };
+                let wait_idle = || {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while !handle.is_idle() {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    })
+                };
+                let mut received = Vec::new();
+                let (requests, run) = futures::join!(
+                    async {
+                        let mut requests = Vec::new();
+                        for &step in steps {
+                            let socket = peer
+                                .as_mut()
+                                .expect("the peer resets only in the last step");
+                            let mut buffer = [0; 4096];
+                            loop {
+                                match socket.read(&mut buffer) {
+                                    Ok(read) => {
+                                        assert_ne!(read, 0, "the client keeps its side open");
+                                        received.extend_from_slice(&buffer[..read]);
+                                    }
+                                    Err(error)
+                                        if error.kind() == std::io::ErrorKind::WouldBlock =>
+                                    {
+                                        break;
+                                    }
+                                    Err(error) => panic!("peer read: {error}"),
+                                }
+                            }
+                            if step == IdlePeer::BytesThenFin {
+                                socket.write_all(REQUEST_TIMEOUT).unwrap();
+                            }
+                            match step {
+                                IdlePeer::Open => {}
+                                IdlePeer::Fin
+                                | IdlePeer::BytesThenFin
+                                | IdlePeer::FinAfterIoPass
+                                | IdlePeer::FinWithBudgetSpent => {
+                                    socket.shutdown(std::net::Shutdown::Write).unwrap();
+                                }
+                                IdlePeer::Reset => {
+                                    let stream =
+                                        tokio::net::TcpStream::from_std(peer.take().unwrap())
+                                            .unwrap();
+                                    #[expect(
+                                        deprecated,
+                                        reason = "Tokio's only linger-zero reset setter"
+                                    )]
+                                    let linger = stream.set_linger(Some(Duration::ZERO));
+                                    linger.unwrap();
+                                    drop(stream);
+                                }
+                            }
+                            if step != IdlePeer::Open {
+                                // Blocks the worker until the client's socket shows the close, so
+                                // no I/O pass runs before the submission. `POLLRDHUP` waits for the
+                                // FIN behind any bytes.
+                                let mut client_socket = libc::pollfd {
+                                    fd: client_fd,
+                                    events: libc::POLLRDHUP,
+                                    revents: 0,
+                                };
+                                // SAFETY: `poll` reads and writes one `pollfd` at the pointer,
+                                // `client_socket`, which is initialized and outlives the call.
+                                let ready = unsafe { libc::poll(&mut client_socket, 1, 5000) };
+                                assert_eq!(ready, 1, "the client's socket shows {step:?}");
+                            }
+                            if matches!(
+                                step,
+                                IdlePeer::FinAfterIoPass | IdlePeer::FinWithBudgetSpent
+                            ) {
+                                // The I/O pass this yield waits for wakes the session's read.
+                                tokio::task::yield_now().await;
+                            }
+                            let mut submission = submit();
+                            if step == IdlePeer::FinWithBudgetSpent {
+                                // Tokio's and Roxygen's TCP reads then pend without reading.
+                                while tokio::task::coop::has_budget_remaining() {
+                                    tokio::task::consume_budget().await;
+                                }
+                            }
+                            let resolved =
+                                tokio::time::timeout(Duration::from_secs(5), &mut submission)
+                                    .await
+                                    .expect("the request is committed or refused");
+                            let error = match resolved {
+                                Ok(response) => {
+                                    let (_stream, mut source, _control) =
+                                        response.into_source_parts();
+                                    if step == IdlePeer::Open {
+                                        peer.as_mut().unwrap().write_all(OK_RESPONSE).unwrap();
+                                    }
+                                    tokio::time::timeout(
+                                        Duration::from_secs(5),
+                                        read_response(&mut source),
+                                    )
+                                    .await
+                                    .expect("the response or its failure arrives")
+                                    .error
+                                }
+                                Err(error) => Some(error.code()),
+                            };
+                            requests.push(RequestProgress::of(error, &submission));
+                            if step == IdlePeer::Open {
+                                wait_idle().await.expect("the session goes idle");
+                            }
+                        }
+                        if steps.last() == Some(&IdlePeer::Open) {
+                            let socket = peer.as_ref().unwrap();
+                            socket.shutdown(std::net::Shutdown::Write).unwrap();
+                        }
+                        requests
+                    },
+                    tokio::time::timeout(Duration::from_secs(5), session.run()),
+                );
+                if let Some(socket) = peer {
+                    let mut socket = tokio::net::TcpStream::from_std(socket).unwrap();
+                    let read = tokio::io::AsyncReadExt::read_to_end(&mut socket, &mut received);
+                    let _ = tokio::time::timeout(Duration::from_secs(5), read)
+                        .await
+                        .expect("the client closes the connection");
+                }
+                IdleReuse {
+                    requests,
+                    run: run
+                        .expect("the session ends")
+                        .err()
+                        .map(|error| error.code()),
+                    received: String::from_utf8_lossy(&received).into_owned(),
+                }
+            })
+        })
+    }
+
+    /// The session reads the peer's EOF before it commits the request, which is refused
+    /// unprocessed and never written, so a caller can resend it (`DIV-035`).
+    #[test]
+    fn a_request_on_an_idle_connection_its_peer_closed_is_refused_unprocessed() {
+        assert_eq!(
+            idle_reuse(&[IdlePeer::Open, IdlePeer::Fin]),
+            IdleReuse {
+                requests: vec![served(0), refused(HttpErrorCode::TRANSPORT_EOF, 1)],
+                run: None,
+                received: GET.to_owned(),
+            }
+        );
+    }
+
+    /// Bytes ahead of the FIN, here an unasked `408`, are no response to a request committed after
+    /// them: the session reads through to the EOF, which refuses the request unprocessed, and the
+    /// bytes, a response without a request, then fail the connection.
+    #[test]
+    fn a_close_behind_unasked_bytes_still_refuses_the_request_unprocessed() {
+        assert_eq!(
+            idle_reuse(&[IdlePeer::Open, IdlePeer::BytesThenFin]),
+            IdleReuse {
+                requests: vec![served(0), refused(HttpErrorCode::TRANSPORT_EOF, 1)],
+                run: Some(HttpErrorCode::PROTOCOL_ERROR),
+                received: GET.to_owned(),
+            }
+        );
+    }
+
+    /// The reset's read error refuses the request. The peer reads nothing after its reset, so
+    /// only the refusal, not `received`, shows that the head was not written.
+    #[test]
+    fn a_request_on_an_idle_connection_its_peer_reset_is_refused_unprocessed() {
+        assert_eq!(
+            idle_reuse(&[IdlePeer::Open, IdlePeer::Reset]),
+            IdleReuse {
+                requests: vec![served(0), refused(HttpErrorCode::TRANSPORT_READ_ERROR, 1)],
+                run: Some(HttpErrorCode::TRANSPORT_READ_ERROR),
+                received: GET.to_owned(),
+            }
+        );
+    }
+
+    /// The read that would see the EOF pends for coop budget without reading, and the check still
+    /// holds the request until a later poll reads the EOF and refuses it unprocessed.
+    #[test]
+    fn a_request_on_an_idle_connection_its_peer_closed_is_refused_with_the_budget_spent() {
+        assert_eq!(
+            idle_reuse(&[IdlePeer::Open, IdlePeer::FinWithBudgetSpent]),
+            IdleReuse {
+                requests: vec![served(0), refused(HttpErrorCode::TRANSPORT_EOF, 1)],
+                run: None,
+                received: GET.to_owned(),
+            }
+        );
+    }
+
+    /// The budget row's control, which needs no check: with budget left, the read that the
+    /// yield's I/O pass woke reads the EOF before the commit. So that yield does produce the pass.
+    #[test]
+    fn a_request_on_an_idle_connection_its_peer_closed_is_refused_with_the_budget_left() {
+        assert_eq!(
+            idle_reuse(&[IdlePeer::Open, IdlePeer::FinAfterIoPass]),
+            IdleReuse {
+                requests: vec![served(0), refused(HttpErrorCode::TRANSPORT_EOF, 1)],
+                run: None,
+                received: GET.to_owned(),
+            }
+        );
+    }
+
+    /// A served reuse leaves nothing that lets the next request commit onto the closed
+    /// connection.
+    #[test]
+    fn a_close_after_a_served_reuse_refuses_the_next_request_unprocessed() {
+        assert_eq!(
+            idle_reuse(&[IdlePeer::Open, IdlePeer::Open, IdlePeer::Fin]),
+            IdleReuse {
+                requests: vec![
+                    served(0),
+                    served(1),
+                    refused(HttpErrorCode::TRANSPORT_EOF, 2)
+                ],
+                run: None,
+                received: GET.repeat(2),
+            }
+        );
+    }
+
+    /// An open peer does not hold the commit.
+    #[test]
+    fn a_request_on_an_idle_connection_its_peer_kept_open_is_served() {
+        assert_eq!(
+            idle_reuse(&[IdlePeer::Open, IdlePeer::Open]),
+            IdleReuse {
+                requests: vec![served(0), served(1)],
+                run: None,
+                received: GET.repeat(2),
+            }
+        );
+    }
+}
+
 #[test]
 fn committed_requests_report_how_many_requests_their_connection_committed_before() {
     run_on_host(|context| {

@@ -3021,6 +3021,13 @@ impl UpstreamDriver {
         if self.exchange.is_some() || !self.ingress.is_empty() || self.read_error.is_some() {
             return false;
         }
+        if self.shared.committed.get() != 0
+            && self.shared.queued.borrow().is_some()
+            && self.read.peer_closed()
+        {
+            // The read that the peer's close wakes refuses the request unprocessed (`DIV-035`).
+            return false;
+        }
         let Some(mut submission) = self.shared.queued.borrow_mut().take() else {
             return false;
         };
