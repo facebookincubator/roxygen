@@ -10563,6 +10563,71 @@ mod tcp_tls {
             ending_after_a_drained_read(Ending::DropTransport);
         }
 
+        #[cfg(target_os = "linux")]
+        #[derive(Clone, Copy, Debug)]
+        enum PeerClose {
+            Fin,
+            BytesThenFin,
+            Reset,
+        }
+
+        /// `DIV-035`: `peer_closed` reports a peer's FIN or RST once it is in the socket, behind
+        /// unread bytes too, whether or not Tokio has seen it, and consumes nothing.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_tcp_reader_reports_the_peer_s_close_behind_unread_bytes() {
+            for close in [PeerClose::Fin, PeerClose::BytesThenFin, PeerClose::Reset] {
+                with_observed_tcp(
+                    limits(),
+                    move |context, transport, mut peer, observer| async move {
+                        use std::os::fd::AsRawFd;
+
+                        let mut reader = transport
+                            .reader(&context, Duration::ZERO, CancellationToken::never())
+                            .unwrap()
+                            .unwrap();
+                        assert!(!reader.peer_closed(), "{close:?}: the peer is open");
+                        match close {
+                            PeerClose::Fin => peer.shutdown().await.unwrap(),
+                            PeerClose::BytesThenFin => {
+                                peer.write_all(b"one ").await.unwrap();
+                                wait_until_queued(&observer, 4).await;
+                                assert!(!reader.peer_closed(), "unread bytes are not a close");
+                                peer.shutdown().await.unwrap();
+                            }
+                            PeerClose::Reset => {
+                                #[expect(
+                                    deprecated,
+                                    reason = "Tokio's only linger-zero reset setter"
+                                )]
+                                let linger = peer.set_linger(Some(Duration::ZERO));
+                                linger.unwrap();
+                                drop(peer);
+                            }
+                        }
+                        let mut socket = libc::pollfd {
+                            fd: observer.as_raw_fd(),
+                            events: libc::POLLRDHUP,
+                            revents: 0,
+                        };
+                        // SAFETY: `poll` reads and writes one `pollfd` at the pointer,
+                        // `socket`, which is initialized and outlives the call.
+                        let ready = unsafe { libc::poll(&mut socket, 1, 5000) };
+                        assert_eq!(ready, 1, "{close:?} reaches the socket");
+                        assert!(reader.peer_closed(), "{close:?} is a close");
+                        if let PeerClose::BytesThenFin = close {
+                            let signal = Arc::new(WakeSignal::default());
+                            let read = read_through(&mut reader, &signal, 64, 64).await.unwrap();
+                            assert_eq!(read_bytes(read), b"one ", "the probe consumed nothing");
+                            let read = read_through(&mut reader, &signal, 64, 64).await.unwrap();
+                            assert!(read.is_eof());
+                        }
+                        transport.close(&context).unwrap();
+                    },
+                );
+            }
+        }
+
         /// H2-L6: a drained reader's read stays registered, so an ordinary read is refused while
         /// it is, as while a pending read is. Dropping the reader ends that registration as it
         /// ends a pending read: the read is unregistered, the socket's clone of the waker is

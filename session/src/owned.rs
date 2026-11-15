@@ -275,6 +275,14 @@ impl ReadSlot {
         self.drained
     }
 
+    /// Whether the reader reports the peer's FIN or RST in the transport
+    /// (`UniplexReader::peer_closed`). Always false without a reader.
+    pub(crate) fn peer_closed(&self) -> bool {
+        self.reader
+            .as_ref()
+            .is_some_and(|reader| reader.peer_closed())
+    }
+
     /// Starts a read of at most `maximum` bytes that first offers `allocation_size` bytes, and
     /// polls it at once; `Ready` returns it.
     #[inline(always)]

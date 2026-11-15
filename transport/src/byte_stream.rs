@@ -731,6 +731,16 @@ impl OwnedReader {
         matches!(self.read, ReaderRead::Drained)
     }
 
+    /// Whether the peer's FIN or RST has reached the socket, even behind
+    /// unread bytes, as the kernel reports it now rather than as Tokio last
+    /// saw it. It consumes nothing. Only plaintext TCP on Linux reports it.
+    pub fn peer_closed(&self) -> bool {
+        self.polled
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|polled| polled.peer_closed())
+    }
+
     /// Ends the registered read, drained or pending, as a cancelled read ends,
     /// which releases the socket's waker.
     #[cold]
@@ -1250,6 +1260,9 @@ pub(crate) trait PolledReader {
 
     /// Whether its reads can report a drained stream.
     fn reports_drained(&self) -> bool;
+
+    /// `OwnedReader::peer_closed`.
+    fn peer_closed(&self) -> bool;
 
     /// Detaches the unfinished read's state, then calls `cancel` once, keeping
     /// that state until `cancel` returns or unwinds. `cancel` can start a

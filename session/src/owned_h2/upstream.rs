@@ -1370,6 +1370,12 @@ where
                     .iter()
                     .position(|submission| submission.status.selected_error().is_some());
                 cancelled.and_then(|position| queued.remove(position))
+            } else if self.connection.state.awaiting_ingress == 0
+                && admission.committed.get() != 0
+                && self.read.peer_closed()
+            {
+                // The read that the peer's close wakes refuses the request unprocessed (`DIV-035`).
+                return false;
             } else {
                 admission.queued.borrow_mut().pop_front()
             };

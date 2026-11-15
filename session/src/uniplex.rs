@@ -305,6 +305,12 @@ pub trait UniplexReader: 'static {
     fn is_drained(&self) -> bool {
         false
     }
+
+    /// Whether the peer's FIN or RST has reached the transport, even behind bytes that no read
+    /// has returned yet. It consumes nothing. The default reports nothing.
+    fn peer_closed(&self) -> bool {
+        false
+    }
 }
 
 /// The native byte stream's poll-based reader (`ByteStreamTransport::reader`).
@@ -328,6 +334,10 @@ impl UniplexReader for OwnedReader {
 
     fn is_drained(&self) -> bool {
         OwnedReader::is_drained(self)
+    }
+
+    fn peer_closed(&self) -> bool {
+        OwnedReader::peer_closed(self)
     }
 }
 

@@ -676,6 +676,11 @@ pub(crate) trait TokioByteStream: AsyncRead + AsyncWrite + Unpin + 'static {
         false
     }
 
+    /// `OwnedReader::peer_closed`. The default reports nothing.
+    fn peer_closed(&self) -> bool {
+        false
+    }
+
     fn enable_zero_copy(&self, _context: &WorkerContext, _threshold: usize) -> io::Result<bool> {
         Ok(false)
     }
@@ -800,6 +805,10 @@ impl TokioByteStream for TcpStream {
     fn poll_read_drained(&self, context: &mut Context<'_>) -> bool {
         poll_tcp_drained(self, context)
     }
+
+    fn peer_closed(&self) -> bool {
+        tcp_peer_closed(self)
+    }
 }
 
 fn poll_tcp_drained(stream: &TcpStream, context: &mut Context<'_>) -> bool {
@@ -819,6 +828,27 @@ fn release_read_waker(stream: &TcpStream) {
         stream.poll_read_ready(context)
     })))
     .poll(&mut Context::from_waker(Waker::noop()));
+}
+
+/// `POLLRDHUP` reports a FIN the kernel has processed, even behind unread
+/// bytes, and `POLLHUP` a reset. `POLLERR` alone is not a close: zero-copy
+/// completions raise it.
+#[cfg(target_os = "linux")]
+fn tcp_peer_closed(stream: &TcpStream) -> bool {
+    let mut socket = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLRDHUP,
+        revents: 0,
+    };
+    // SAFETY: `poll` reads and writes one `pollfd` at the pointer, `socket`,
+    // which is initialized and outlives the call.
+    let ready = unsafe { libc::poll(&mut socket, 1, 0) };
+    ready == 1 && socket.revents & (libc::POLLRDHUP | libc::POLLHUP) != 0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tcp_peer_closed(_stream: &TcpStream) -> bool {
+    false
 }
 
 pub(crate) struct AcceptedTcpStream {
@@ -927,6 +957,10 @@ impl TokioByteStream for AcceptedTcpStream {
 
     fn poll_read_drained(&self, context: &mut Context<'_>) -> bool {
         poll_tcp_drained(&self.stream, context)
+    }
+
+    fn peer_closed(&self) -> bool {
+        tcp_peer_closed(&self.stream)
     }
 
     fn enable_zero_copy(&self, _context: &WorkerContext, threshold: usize) -> io::Result<bool> {
@@ -1102,6 +1136,10 @@ impl<S: TokioByteStream> TokioByteStream for ObservedStream<S> {
 
     fn poll_read_drained(&self, context: &mut Context<'_>) -> bool {
         self.stream().poll_read_drained(context)
+    }
+
+    fn peer_closed(&self) -> bool {
+        self.stream().peer_closed()
     }
 
     fn enable_zero_copy(&self, context: &WorkerContext, threshold: usize) -> io::Result<bool> {
@@ -1888,6 +1926,10 @@ where
 
     fn reports_drained(&self) -> bool {
         S::READ_DRAINS
+    }
+
+    fn peer_closed(&self) -> bool {
+        self.stream.borrow().as_ref().is_some_and(S::peer_closed)
     }
 
     fn cancel_read(&self, cancel: &mut dyn FnMut()) {
