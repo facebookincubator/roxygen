@@ -641,6 +641,17 @@ fn resumes_parsing(producer: &HttpStreamSourceProducer, ingress_buffer_limit: u3
         .is_none_or(|buffered| buffered < ingress_buffer_limit)
 }
 
+/// `HttpCodecCallback::ingress_body_limit` for the body `producer` receives: how far its unread
+/// body may grow before it reaches `config`'s HTTP/1.1 ceiling (`DIV-058`).
+#[inline]
+fn ingress_body_limit(
+    producer: &HttpStreamSourceProducer,
+    config: &UniplexConfig,
+) -> Option<usize> {
+    let buffered = producer.body_bytes_buffered()? as usize;
+    Some(config.http1_ingress_body_ceiling().saturating_sub(buffered))
+}
+
 #[cold]
 #[inline(never)]
 fn cancelled() -> HttpError {
@@ -918,6 +929,10 @@ impl<A: OwnedApplication> CodecInput<'_, A> {
 impl<A: OwnedApplication> HttpCodecCallback for CodecInput<'_, A> {
     fn on_event(&mut self, _event: CodecEvent<'_>) {}
 
+    fn ingress_body_limit(&self, _stream: StreamId) -> Option<usize> {
+        ingress_body_limit(&self.exchange.as_ref()?.producer, self.config)
+    }
+
     fn on_ingress_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
         let mut actions = Vec::new();
         if self.failure.is_some() {
@@ -963,6 +978,7 @@ impl<A: OwnedApplication> HttpCodecCallback for CodecInput<'_, A> {
                 };
                 exchange.body_events = true;
                 match exchange.producer.body(body, padding, false) {
+                    // Not the window: the body limit keeps body events within it (`DIV-058`).
                     FlowControlState::Error => self.fail(failure(
                         HttpErrorCode::FLOW_CONTROL_ERROR,
                         b"ingress source rejected body bytes",

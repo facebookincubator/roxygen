@@ -1216,6 +1216,38 @@ fn filters_intercept_and_transform_every_codec_query() {
     );
 }
 
+/// `DIV-058`: a filtered callback answers the destination callback's ingress body limit, and a
+/// callback that does not answer it sets no bound.
+#[test]
+fn filtered_callbacks_answer_the_destinations_ingress_body_limit() {
+    struct Bounded;
+    impl HttpCodecCallback for Bounded {
+        fn on_event(&mut self, _event: CodecEvent<'_>) {}
+
+        fn ingress_body_limit(&self, stream: StreamId) -> Option<usize> {
+            (stream == StreamId::new(1)).then_some(4_000)
+        }
+    }
+    struct Unbounded;
+    impl HttpCodecCallback for Unbounded {
+        fn on_event(&mut self, _event: CodecEvent<'_>) {}
+    }
+
+    let mut bounded = Bounded;
+    let filtered = crate::FilteredCallback {
+        filter: &QueryTransformFilter,
+        callback: &mut bounded,
+    };
+    assert_eq!(filtered.ingress_body_limit(StreamId::new(1)), Some(4_000));
+    assert_eq!(filtered.ingress_body_limit(StreamId::new(3)), None);
+    let mut unbounded = Unbounded;
+    let filtered = crate::FilteredCallback {
+        filter: &QueryTransformFilter,
+        callback: &mut unbounded,
+    };
+    assert_eq!(filtered.ingress_body_limit(StreamId::new(1)), None);
+}
+
 #[test]
 fn spike_preserves_error_direction_and_code() {
     let mut codec = SpikeCodec::default();

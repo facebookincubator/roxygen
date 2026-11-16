@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::cell::OnceCell;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
@@ -37,6 +38,7 @@ use roxygen_core::headers::HttpHeaderCode;
 use roxygen_core::headers::HttpHeaders;
 use roxygen_core::http::HttpMethod;
 use roxygen_core::http::TransportDirection;
+use roxygen_core::ingress_completion::IngressCompletion;
 use roxygen_core::source::HttpSource;
 use roxygen_core::source_holder::HttpSourceHolder;
 use roxygen_runtime::cancellation::CancellationSource;
@@ -1093,6 +1095,7 @@ impl HttpHandler for TimeoutResponseHandler {
 struct BlockedBodyHandler {
     release: Rc<CancellableBaton>,
     bodies: Rc<Cell<usize>>,
+    completion: Rc<OnceCell<IngressCompletion>>,
 }
 
 struct AntiPipelineHandler {
@@ -1371,9 +1374,13 @@ impl HttpHandler for BlockedBodyHandler {
     ) -> LocalHandlerFuture {
         let release = Rc::clone(&self.release);
         let bodies = Rc::clone(&self.bodies);
+        let completion = Rc::clone(&self.completion);
         Box::pin(async move {
             let headers = request_source.read_header_event().await?;
             assert!(!headers.eom());
+            if let Some(observed) = request_source.ingress_completion() {
+                let _ = completion.set(observed);
+            }
             let _ = release.wait(CancellationToken::never()).await;
             loop {
                 let event = request_source.read_body_event(u32::MAX).await?;
@@ -6198,7 +6205,9 @@ fn malformed_chunk_response() -> (Outcome, usize) {
     })
 }
 
-fn backpressured_post(limit: u32, chunks: [usize; 3]) -> Outcome {
+/// Posts `chunks` to a handler that reads no body until ingress has paused with `paused` body
+/// bytes accepted and the third chunk unread.
+fn backpressured_post(config: UniplexConfig, chunks: [usize; 3], paused: u64) -> Outcome {
     run_on_worker(move |context| {
         Box::pin(async move {
             let total = chunks.iter().sum::<usize>();
@@ -6214,15 +6223,16 @@ fn backpressured_post(limit: u32, chunks: [usize; 3]) -> Outcome {
             ]);
             let bodies = Rc::new(Cell::new(0));
             let release = Rc::new(CancellableBaton::new());
+            let completion = Rc::new(OnceCell::new());
             let handler: HttpHandlerRef = Rc::new(BlockedBodyHandler {
                 release: Rc::clone(&release),
                 bodies: Rc::clone(&bodies),
+                completion: Rc::clone(&completion),
             });
             let erased: Rc<dyn UniplexTransport> = transport;
             let config = UniplexConfig {
-                ingress_buffer_limit: limit,
                 read_timeout: Duration::ZERO,
-                ..UniplexConfig::default()
+                ..config
             };
             let (session, _handle) = UniplexSession::new(
                 context,
@@ -6234,17 +6244,25 @@ fn backpressured_post(limit: u32, chunks: [usize; 3]) -> Outcome {
             .unwrap();
             let run = session.run();
             tokio::pin!(run);
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while state.borrow().reads.len() > 2 {
+            let accepted = || {
+                completion
+                    .get()
+                    .map_or(0, IngressCompletion::body_bytes_received)
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                while state.borrow().reads.len() > 2 || accepted() < paused {
                     tokio::select! {
                         _ = run.as_mut() => panic!("session completed before ingress paused"),
                         _ = tokio::task::yield_now() => {},
                     }
                 }
             })
-            .await
-            .expect("two chunks crossed the ingress pause threshold");
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            .await;
+            assert_eq!(
+                accepted(),
+                paused,
+                "body bytes accepted and unread when ingress paused"
+            );
             assert_eq!(
                 state.borrow().reads.len(),
                 2,
@@ -6282,6 +6300,7 @@ fn backpressure_timeout() -> Outcome {
             let handler: HttpHandlerRef = Rc::new(BlockedBodyHandler {
                 release,
                 bodies: Rc::clone(&bodies),
+                completion: Rc::default(),
             });
             let erased: Rc<dyn UniplexTransport> = transport;
             let config = UniplexConfig {
@@ -6307,54 +6326,6 @@ fn backpressure_timeout() -> Outcome {
                 bodies: bodies.get(),
                 error: result.err().map(|error| error.code()),
             }
-        })
-    })
-}
-
-fn ingress_hard_limit_is_enforced() -> (Outcome, Vec<u8>) {
-    run_on_worker(|context| {
-        Box::pin(async move {
-            let headers =
-                b"POST / HTTP/1.1\r\nHost: example\r\nContent-Length: 800\r\n\r\n".to_vec();
-            let (transport, state) = ScriptedTransport::new([
-                ReadAction::Data(headers),
-                ReadAction::Data(vec![b'x'; 400]),
-                ReadAction::Data(vec![b'x'; 400]),
-            ]);
-            let handler: HttpHandlerRef = Rc::new(BlockedBodyHandler {
-                release: Rc::new(CancellableBaton::new()),
-                bodies: Rc::new(Cell::new(0)),
-            });
-            let erased: Rc<dyn UniplexTransport> = transport;
-            let config = UniplexConfig {
-                buffer_limit: 700,
-                ingress_buffer_limit: 500,
-                maximum_read_size: 700,
-                read_allocation_size: 700,
-                ..UniplexConfig::default()
-            };
-            let (session, _handle) = UniplexSession::new(
-                context,
-                TransportDirection::Downstream,
-                erased,
-                Some(handler),
-                config,
-            )
-            .unwrap();
-            let result = tokio::time::timeout(Duration::from_secs(1), session.run())
-                .await
-                .expect("hard ingress limit terminates the overflowing stream");
-            let error = result.expect_err("the crossing chunk fails native Run");
-            let state = state.borrow();
-            (
-                Outcome {
-                    output: state.writes.concat(),
-                    close: state.close,
-                    bodies: 0,
-                    error: Some(error.code()),
-                },
-                error.message().to_vec(),
-            )
         })
     })
 }
@@ -8113,7 +8084,6 @@ enum H1IngressFailureCase {
     ParseHeaderEom,
     ParseBody,
     ParseAfterPriorError,
-    HardLimitBody,
     BeforeHeadersEof,
     BeforeHeadersParse,
     NoStatus,
@@ -8146,11 +8116,6 @@ impl H1IngressFailureCase {
             Some((
                 HttpErrorCode::TRANSPORT_READ_ERROR,
                 b"prior native ingress failure",
-            ))
-        } else if self == Self::HardLimitBody {
-            Some((
-                HttpErrorCode::FLOW_CONTROL_ERROR,
-                b"ingress source rejected body bytes",
             ))
         } else if self.eof() {
             Some((HttpErrorCode::TRANSPORT_EOF, b"unexpected EOF"))
@@ -8921,23 +8886,12 @@ thread_local! {
 async fn h1_ingress_retirement_operation(context: WorkerContext, state: Rc<H1IngressFailureState>) {
     let control = state.retirement.as_ref().unwrap();
     let _release = H1IngressRetirementRelease(Rc::clone(control));
-    let hard_limit = state.case == H1IngressFailureCase::HardLimitBody;
-    let input = if hard_limit {
-        vec![
-            ReadAction::Data(
-                b"POST / HTTP/1.1\r\nHost: example\r\nContent-Length: 800\r\n\r\n".to_vec(),
-            ),
-            ReadAction::WaitDataOrCancellation(Arc::clone(&control.error_ready), vec![b'x'; 400]),
-            ReadAction::Data(vec![b'x'; 400]),
-        ]
-    } else {
-        vec![
-            ReadAction::Data(
-                b"POST / HTTP/1.1\r\nHost: example\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
-            ),
-            ReadAction::WaitDataOrCancellation(Arc::clone(&control.error_ready), b"z\r\n".to_vec()),
-        ]
-    };
+    let input = vec![
+        ReadAction::Data(
+            b"POST / HTTP/1.1\r\nHost: example\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
+        ),
+        ReadAction::WaitDataOrCancellation(Arc::clone(&control.error_ready), b"z\r\n".to_vec()),
+    ];
     let (inner, transport_state) =
         ScriptedTransport::with_capability(input, ByteEventCapability::TransportEvents);
     *control.transport.borrow_mut() = Some(Rc::clone(&transport_state));
@@ -8948,20 +8902,9 @@ async fn h1_ingress_retirement_operation(context: WorkerContext, state: Rc<H1Ing
         probe: Arc::clone(&state.probe),
     });
     let handler: HttpHandlerRef = Rc::new(H1IngressFailureHandler(Rc::clone(&state)));
-    let config = if hard_limit {
-        UniplexConfig {
-            buffer_limit: 700,
-            ingress_buffer_limit: 500,
-            maximum_read_size: 700,
-            read_allocation_size: 700,
-            read_timeout: Duration::ZERO,
-            ..UniplexConfig::default()
-        }
-    } else {
-        UniplexConfig {
-            read_timeout: Duration::ZERO,
-            ..UniplexConfig::default()
-        }
+    let config = UniplexConfig {
+        read_timeout: Duration::ZERO,
+        ..UniplexConfig::default()
     };
     let (session, handle) = UniplexSession::new(
         context.clone(),
@@ -9200,9 +9143,6 @@ fn h1_ingress_retirement_case(case: H1IngressFailureCase, fault: H1IngressRetire
                     .as_ref()
                     .unwrap_err();
                 assert_eq!(error.code(), expected_code);
-                if case == H1IngressFailureCase::HardLimitBody {
-                    assert_eq!(error.message(), b"Sender exceeded flow control");
-                }
                 let transport = control.transport.borrow();
                 let transport = transport.as_ref().unwrap().borrow();
                 assert_eq!(transport.close, CloseKind::Reset);
@@ -9321,10 +9261,6 @@ mod h1 {
         ] {
             h1_ingress_retirement_case(H1IngressFailureCase::ParseBody, fault);
         }
-        h1_ingress_retirement_case(
-            H1IngressFailureCase::HardLimitBody,
-            H1IngressRetirementFault::None,
-        );
     }
 
     #[test]
@@ -9648,14 +9584,19 @@ mod h1 {
 
     #[test]
     fn h1_downstream_session_test_ingress_backpressure_limit_exceeded() {
-        let outcome = backpressured_post(65_535, [35_000, 35_000, 2_000]);
+        // The second read stops at the ceiling, 65_535 + 4_000 - 1 bytes.
+        let outcome = backpressured_post(UniplexConfig::default(), [35_000, 35_000, 2_000], 69_534);
         assert_eq!(outcome.bodies, 72_000);
         assert_ok_response(outcome, 200);
     }
 
     #[test]
     fn h1_downstream_session_test_ingress_backpressure_set_read_buffer_limit() {
-        let outcome = backpressured_post(500, [300, 300, 250]);
+        let config = UniplexConfig {
+            ingress_buffer_limit: 500,
+            ..UniplexConfig::default()
+        };
+        let outcome = backpressured_post(config, [300, 300, 250], 600);
         assert_eq!(outcome.bodies, 850);
         assert_ok_response(outcome, 200);
     }
@@ -9667,28 +9608,21 @@ mod h1 {
         assert_eq!(outcome.close, CloseKind::Reset);
     }
 
+    /// `DIV-058`: with 400 bytes of a 700-byte request window unread and the pause at 500, the
+    /// next 400-byte read is parsed only up to the window, and parsing pauses there, with 700
+    /// bytes unread, instead of failing the request.
     #[test]
-    fn h1_ingress_hard_limit_rejects_the_crossing_chunk() {
-        let (outcome, message) = ingress_hard_limit_is_enforced();
-        assert!(output_contains(&outcome, b"HTTP/1.1 400"));
-        assert_eq!(outcome.close, CloseKind::Reset);
-        assert_eq!(outcome.error, Some(HttpErrorCode::FLOW_CONTROL_ERROR));
-        assert_eq!(message, b"ingress source rejected body bytes");
-        assert!(outcome.output.starts_with(b"HTTP/1.1 400"));
-        let boundary = outcome
-            .output
-            .windows(4)
-            .position(|part| part == b"\r\n\r\n")
-            .expect("complete error response head")
-            + 4;
-        assert_eq!(outcome.output.len(), boundary);
-        assert!(
-            outcome
-                .output
-                .windows(17)
-                .any(|part| part.eq_ignore_ascii_case(b"content-length: 0"))
-        );
-        assert!(!output_contains(&outcome, b"HTTP/1.1 500"));
+    fn h1_ingress_body_events_stop_at_the_request_window() {
+        let config = UniplexConfig {
+            buffer_limit: 700,
+            ingress_buffer_limit: 500,
+            maximum_read_size: 700,
+            read_allocation_size: 700,
+            ..UniplexConfig::default()
+        };
+        let outcome = backpressured_post(config, [400, 400, 50], 700);
+        assert_eq!(outcome.bodies, 850);
+        assert_ok_response(outcome, 200);
     }
 
     #[test]

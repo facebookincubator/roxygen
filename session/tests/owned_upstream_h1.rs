@@ -4371,6 +4371,108 @@ fn uniplex_client_with_stats_keeps_a_callback_per_read() {
     assert_eq!(outcome.callbacks, 6);
 }
 
+/// `DIV-058`: with 400 bytes of a 700-byte response window unread and the pause at 500, both
+/// clients parse the next 400-byte read only up to the window and pause there instead of
+/// failing the response; once the caller reads, it gets all 850 bytes.
+#[test]
+fn h1_response_body_events_stop_at_the_window() {
+    let body = patterned(850);
+    for owned in [true, false] {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        let chunks: Vec<_> = body.chunks(400).map(<[u8]>::to_vec).collect();
+        let (run, parsed, received) = run_on_host(move |context| {
+            Box::pin(async move {
+                let gate = Arc::new(tokio::sync::Notify::new());
+                // Each body read yields first, so the client parses the bytes before it within
+                // its 700-byte buffer.
+                let (transport, _state) = ScriptedTransport::new(
+                    std::iter::once(ReadAction::WaitData(Arc::clone(&gate), head))
+                        .chain(chunks.into_iter().map(ReadAction::YieldData)),
+                );
+                let config = UniplexConfig {
+                    buffer_limit: 700,
+                    ingress_buffer_limit: 500,
+                    maximum_read_size: 700,
+                    read_allocation_size: 700,
+                    maximum_write_size: 700,
+                    ..upstream_config()
+                };
+                let read_body = |mut source: HttpSourceHolder| async move {
+                    source.read_header_event().await.unwrap();
+                    let completion = source.ingress_completion().unwrap();
+                    yield_until(|| {
+                        completion.body_bytes_received() >= 700 || completion.snapshot().is_some()
+                    })
+                    .await;
+                    let parsed = completion.body_bytes_received();
+                    let mut received = Vec::new();
+                    loop {
+                        let event = source.read_body_event(u32::MAX).await.unwrap();
+                        if let Some(bytes) = event.as_body() {
+                            let length = bytes.chain_length();
+                            received.extend_from_slice(&bytes.coalesce(length).unwrap());
+                        }
+                        if event.eom() {
+                            return (parsed, received);
+                        }
+                    }
+                };
+                let (run, (parsed, received)) = if owned {
+                    let mut options = upstream_options(context, transport);
+                    options.io = config;
+                    let (session, handle) = OwnedH1UpstreamSession::new(options).unwrap();
+                    let submission = handle.reserve_request().unwrap().submit(
+                        get_head(),
+                        HttpSourceHolder::empty(),
+                        CancellationToken::never(),
+                    );
+                    futures::join!(session.run(), async {
+                        let (_stream, source, _control) =
+                            submission.await.unwrap().into_source_parts();
+                        gate.notify_one();
+                        read_body(source).await
+                    })
+                } else {
+                    let (session, handle) = UniplexSession::new(
+                        context,
+                        TransportDirection::Upstream,
+                        transport,
+                        None,
+                        config,
+                    )
+                    .unwrap();
+                    futures::join!(session.run(), async {
+                        let response = handle
+                            .send_request(
+                                RequestSource::held(Some(get_head()), Vec::new()),
+                                CancellationToken::never(),
+                            )
+                            .await
+                            .unwrap();
+                        gate.notify_one();
+                        read_body(response.source).await
+                    })
+                };
+                (run.err().map(|error| error.code()), parsed, received)
+            })
+        });
+        assert_eq!(
+            parsed, 700,
+            "owned {owned}: the client paused at the window"
+        );
+        assert!(
+            received == body,
+            "owned {owned}: {} body bytes arrived",
+            received.len()
+        );
+        assert_eq!(run, None, "owned {owned}");
+    }
+}
+
 /// A scripted request whose last body event waits for `gate`.
 struct GatedTail {
     head: Option<HttpHeaderEvent>,

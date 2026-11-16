@@ -94,6 +94,7 @@ mod tcp_tls {
     #[cfg(target_os = "linux")]
     use crate::byte_stream::TransportRetirementError;
     use crate::byte_stream::close_path_errors_for_test;
+    use crate::byte_stream::read_queue_rebuilds_for_test;
     #[cfg(target_os = "linux")]
     use crate::established::AdoptedIoCompletion;
     #[cfg(target_os = "linux")]
@@ -5197,6 +5198,93 @@ mod tcp_tls {
             }));
     }
 
+    /// `DIV-058`: a TLS read returns its plaintext copy as one segment, in the queue the backend
+    /// built, however small its allocation size. One 12_000-byte record comes back as one
+    /// 12_000-byte segment backed by exactly those bytes.
+    #[test]
+    fn a_tls_read_returns_its_plaintext_as_one_segment() {
+        Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(LocalSet::new().run_until(async move {
+                let (certificate, server_config) = tls_fixture();
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let destination = listener.local_addr().unwrap();
+                let acceptor = TlsAcceptor::from(server_config);
+                let payload = pattern(12_000, 6);
+                let sent = payload.clone();
+                let server = tokio::task::spawn_local(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut stream = acceptor.accept(stream).await.unwrap();
+                    stream.write_all(&sent).await.unwrap();
+                    stream.flush().await.unwrap();
+                    stream.shutdown().await.unwrap();
+                    let mut eof = [0; 1];
+                    let _ = stream.read(&mut eof).await;
+                });
+                let (worker, driver) = WorkerDriver::new(4).unwrap();
+                let call = worker
+                    .call_local(move |context| async move {
+                        let mut options = TlsClientOptions::new("localhost");
+                        options.add_root_certificate(certificate);
+                        let transport = TlsTransport::connect(
+                            &context,
+                            address(destination),
+                            options,
+                            ByteStreamLimits::new(65_536, 1024, 8).unwrap(),
+                            Duration::from_secs(1),
+                            CancellationToken::never(),
+                        )
+                        .await
+                        .unwrap();
+                        let rebuilds = read_queue_rebuilds_for_test();
+                        let mut reads = Vec::new();
+                        let mut received = Vec::new();
+                        loop {
+                            let read = transport
+                                .read(
+                                    &context,
+                                    65_536,
+                                    1_000,
+                                    Duration::from_secs(5),
+                                    CancellationToken::never(),
+                                )
+                                .await
+                                .unwrap();
+                            if read.is_eof() {
+                                break;
+                            }
+                            reads.push((
+                                read.bytes_read(),
+                                read.data().segment_count(),
+                                read.data().backing_capacity_upper_bound(),
+                            ));
+                            received.extend(read_bytes(read));
+                        }
+                        assert_eq!(reads, [(12_000, 1, Some(12_000))]);
+                        assert_eq!(read_queue_rebuilds_for_test(), rebuilds);
+                        assert!(received == payload);
+                        transport.close(&context).unwrap();
+                    })
+                    .unwrap();
+                let driver_task = tokio::task::spawn_local(driver);
+                time::timeout(Duration::from_secs(5), call)
+                    .await
+                    .expect("TLS reads to EOF remain bounded")
+                    .unwrap();
+                worker.begin_shutdown();
+                time::timeout(Duration::from_secs(5), driver_task)
+                    .await
+                    .expect("worker shutdown remains bounded")
+                    .unwrap();
+                time::timeout(Duration::from_secs(5), server)
+                    .await
+                    .expect("TLS peer remains bounded")
+                    .unwrap();
+            }));
+    }
+
     #[test]
     fn owned_chain_reaches_tcp_writer() {
         Builder::new_current_thread()
@@ -9320,7 +9408,6 @@ mod tcp_tls {
         use super::*;
         use crate::byte_stream::OwnedReader;
         use crate::byte_stream::read_operations_for_test;
-        use crate::byte_stream::read_queue_rebuilds_for_test;
         use crate::byte_stream::read_registrations_for_test;
         use crate::tcp::io_read_futures_for_test;
         use crate::tcp_tls_tests::tcp_tls::native_write_queue::with_accepted_tcp;
@@ -9457,10 +9544,12 @@ mod tcp_tls {
             });
         }
 
-        /// A TCP reader read that continues past its first buffer (`DIV-017`) gathers buffers
-        /// longer than the allocation size, so its queue is still rebuilt in allocation-size views.
+        /// `DIV-058`: a TCP reader read that continues past its first buffer (`DIV-017`) returns
+        /// the buffers it gathered, unsplit, in the queue the backend built: a 64-byte burst read
+        /// with a 7-byte allocation size comes back as 7, 7, 14, 28 and 8 bytes, backed by the
+        /// 64 bytes offered.
         #[test]
-        fn a_tcp_reader_read_past_its_first_buffer_still_returns_allocation_size_views() {
+        fn a_tcp_reader_read_past_its_first_buffer_returns_its_gathered_buffers() {
             with_observed_tcp(
                 limits(),
                 |context, transport, mut peer, observer| async move {
@@ -9475,16 +9564,56 @@ mod tcp_tls {
                     reader.start_read(64, 7).unwrap();
                     let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
                     assert_eq!(read.data().limit(), 64);
-                    assert!(
-                        read.data().segments().all(|segment| segment.len() <= 7),
-                        "{:?}",
+                    assert_eq!(
                         read.data()
                             .segments()
                             .map(|segment| segment.len())
                             .collect::<Vec<_>>(),
+                        [7, 7, 14, 28, 8],
+                        "the first offer, then offers that double what was gathered, up to 64",
                     );
+                    assert_eq!(read.data().backing_capacity_upper_bound(), Some(64));
                     assert!(read_bytes(read) == burst);
-                    assert_eq!(read_queue_rebuilds_for_test(), rebuilds + 1);
+                    assert_eq!(read_queue_rebuilds_for_test(), rebuilds);
+                    transport.close(&context).unwrap();
+                },
+            );
+        }
+
+        /// `DIV-058` through `read`: an ordinary TCP read of a 31_041-byte burst with a
+        /// 4_000-byte allocation size gathers 4_000, 4_000, 8_000 and 15_041 bytes, its last offer
+        /// of 16_000 bytes ending short, and returns those buffers, unsplit, in the queue the
+        /// backend built, backed by the 32_000 bytes offered.
+        #[test]
+        fn a_tcp_read_past_its_first_buffer_returns_the_buffers_it_gathered() {
+            with_observed_tcp(
+                ByteStreamLimits::new(65_536, 1024, 8).unwrap(),
+                |context, transport, mut peer, observer| async move {
+                    let burst = pattern(31_041, 9);
+                    peer.write_all(&burst).await.unwrap();
+                    wait_until_queued(&observer, burst.len()).await;
+                    let rebuilds = read_queue_rebuilds_for_test();
+                    let read = transport
+                        .read(
+                            &context,
+                            65_536,
+                            4_000,
+                            Duration::ZERO,
+                            CancellationToken::never(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(read.data().limit(), 65_536);
+                    assert_eq!(
+                        read.data()
+                            .segments()
+                            .map(|segment| segment.len())
+                            .collect::<Vec<_>>(),
+                        [4_000, 4_000, 8_000, 15_041],
+                    );
+                    assert_eq!(read.data().backing_capacity_upper_bound(), Some(32_000));
+                    assert!(read_bytes(read) == burst);
+                    assert_eq!(read_queue_rebuilds_for_test(), rebuilds);
                     transport.close(&context).unwrap();
                 },
             );

@@ -591,19 +591,19 @@ impl H1IngressBound {
             "BODY-credit ceiling binds the unchanged single-worker plaintext H1 configuration",
         )?;
         let flow = i64::from(session.stream_flow_control);
-        let segment = i64::try_from(
-            session
-                .read_allocation_size
-                .min(session.stream_flow_control as usize)
-                .min(session.byte_stream_limits.maximum_read_size()),
-        )?;
+        let maximum = (session.stream_flow_control as usize)
+            .min(session.byte_stream_limits.maximum_read_size());
+        let allocation = session.read_allocation_size.min(maximum);
+        // `DIV-017`: a TCP read's largest buffer is its first offer or at most half the read.
+        let segment = i64::try_from(allocation.max(maximum / 2))?;
+        // `DIV-058`: the body event that crosses F carries it less than one allocation past.
         let ceiling = flow
-            .checked_add(segment)
+            .checked_add(i64::try_from(allocation)?)
             .and_then(|sum| sum.checked_sub(1))
             .ok_or(FixtureError::Assertion("checked BODY-credit ceiling"))?;
         require(
-            segment == 4_000 && ceiling == 266_143,
-            "prospective F plus normalized segment minus one, not an observed allowance",
+            segment == 131_072 && ceiling == 266_143,
+            "prospective F plus one allocation minus one, not an observed allowance",
         )?;
         Ok(Self {
             flow,
@@ -647,18 +647,15 @@ impl EnvelopeIngressBound {
         let connection = i64::from(session.connection_flow_control);
         let (segment, ceiling) = match route.protocol {
             Protocol::H1 => {
-                let segment = i64::try_from(
-                    session
-                        .read_allocation_size
-                        .min(session.stream_flow_control as usize)
-                        .min(session.byte_stream_limits.maximum_read_size()),
-                )?;
+                let maximum = (session.stream_flow_control as usize)
+                    .min(session.byte_stream_limits.maximum_read_size());
+                let segment = i64::try_from(maximum)?;
                 let ceiling = stream
-                    .checked_add(segment)
+                    .checked_add(i64::try_from(session.read_allocation_size.min(maximum))?)
                     .and_then(|sum| sum.checked_sub(1))
                     .ok_or(FixtureError::Assertion("checked H1 ingress envelope"))?;
                 require(
-                    segment == 4_000 && ceiling == 266_143,
+                    segment == 262_144 && ceiling == 266_143,
                     "fixed H1 BODY-credit envelope",
                 )?;
                 (segment, ceiling)
@@ -9436,7 +9433,7 @@ fn envelope_ingress_controls() -> TestResult<()> {
                 && bound.stream == 262_144
                 && bound.connection == 5_242_880
                 && match route.protocol {
-                    Protocol::H1 => bound.segment == 4_000 && bound.ceiling == 266_143,
+                    Protocol::H1 => bound.segment == 262_144 && bound.ceiling == 266_143,
                     Protocol::H2 => bound.segment == 16_384 && bound.ceiling == 5_242_880,
                 },
             "fixed route-specific BODY credit domains",
@@ -9792,7 +9789,7 @@ fn native_transport_backpressure_predicate_controls() {
     };
     let bound = H1IngressBound::from_config(route, &config).unwrap();
     assert_eq!(bound.flow, 262_144);
-    assert_eq!(bound.segment, 4_000);
+    assert_eq!(bound.segment, 131_072);
     assert_eq!(bound.ceiling, 266_143);
     for other in ROUTES
         .into_iter()
@@ -9841,7 +9838,10 @@ fn native_transport_backpressure_predicate_controls() {
     ceiling_queue.delta(true, (bound.flow - 1) % bound.segment);
     assert_eq!(ceiling_queue.read, bound.flow - 1);
     assert!(!ceiling_queue.ingress_pressure(bound, 1));
-    ceiling_queue.delta(true, bound.segment);
+    ceiling_queue.delta(
+        true,
+        i64::try_from(config.session.read_allocation_size).unwrap(),
+    );
     assert_eq!(ceiling_queue.read, 266_143);
     assert_eq!(ceiling_queue.ingress.unwrap().peak, 266_143);
     assert!(ceiling_queue.ingress_pressure(bound, 1));
@@ -9869,7 +9869,7 @@ fn native_transport_backpressure_predicate_controls() {
     oversized_callback.delta(true, bound.segment + 1);
     assert!(
         oversized_callback.invalid,
-        "one callback cannot exceed normalized S"
+        "one callback cannot exceed one TCP read buffer"
     );
     let mut underflow = ceiling_queue;
     underflow.delta(true, -bound.ceiling - 1);

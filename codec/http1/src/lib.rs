@@ -616,6 +616,44 @@ impl Http1xCodec {
         );
     }
 
+    /// How many bytes of a body run may be parsed or forwarded before `callback` is asked again
+    /// (`HttpCodecCallback::ingress_body_limit`): at least one, so parsing always progresses.
+    #[inline]
+    fn body_limit(&self, callback: &(impl IngressDelivery + ?Sized)) -> usize {
+        callback
+            .ingress_body_limit(self.ingress_stream)
+            .map_or(usize::MAX, |limit| limit.max(1))
+    }
+
+    /// Forwards `input`, tunnel or HTTP/0.9 response bytes, as body events within the body
+    /// limit, until it runs out or a callback pauses parsing; `result.consumed` counts what was
+    /// forwarded.
+    fn forward_body(
+        &mut self,
+        input: &Bytes,
+        callback: &mut (impl IngressDelivery + ?Sized),
+        callback_egress: &mut BufQueue,
+        result: &mut CodecIngressResult,
+    ) {
+        let mut offset = 0;
+        while offset < input.len() {
+            let end = input
+                .len()
+                .min(offset.saturating_add(self.body_limit(&*callback)));
+            let body = if offset == 0 && end == input.len() {
+                input.clone()
+            } else {
+                input.slice(offset..end)
+            };
+            result.consumed = end;
+            self.emit_body(body, callback, callback_egress, result);
+            offset = end;
+            if self.parser_error || (self.parser_paused && !self.upgrade_pause) {
+                break;
+            }
+        }
+    }
+
     fn emit_body(
         &mut self,
         body: Bytes,
@@ -1289,6 +1327,8 @@ trait IngressDelivery {
         event: CodecEvent<'_>,
         callback_egress: &mut BufQueue,
     ) -> CodecCallbackResult;
+
+    fn ingress_body_limit(&self, stream: StreamId) -> Option<usize>;
 }
 
 /// A callback of a concrete type, called directly: the body of
@@ -1304,6 +1344,10 @@ impl<C: HttpCodecCallback> IngressDelivery for C {
         let actions = self.on_ingress_event(event);
         HttpCodec::apply_callback_actions(codec, actions, self, callback_egress)
     }
+
+    fn ingress_body_limit(&self, stream: StreamId) -> Option<usize> {
+        HttpCodecCallback::ingress_body_limit(self, stream)
+    }
 }
 
 impl IngressDelivery for dyn HttpCodecCallback + '_ {
@@ -1316,6 +1360,10 @@ impl IngressDelivery for dyn HttpCodecCallback + '_ {
         #[cfg(test)]
         DYN_INGRESS_DELIVERIES.with(|deliveries| count_work(deliveries, 1));
         HttpCodec::dispatch_ingress_callback(codec, self, callback_egress, event)
+    }
+
+    fn ingress_body_limit(&self, stream: StreamId) -> Option<usize> {
+        HttpCodecCallback::ingress_body_limit(self, stream)
     }
 }
 

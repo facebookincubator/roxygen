@@ -487,6 +487,216 @@ fn paused_body_defers_eof_until_resume() {
     }
 }
 
+/// A session's view of one stream's body (`DIV-058`): parsing pauses once `buffered` reaches
+/// `pause_at`, and `ingress_body_limit` keeps it at or under `ceiling`; no ceiling, no bound.
+struct WindowedBody {
+    pause_at: usize,
+    ceiling: Option<usize>,
+    buffered: usize,
+    bodies: Vec<usize>,
+}
+
+impl WindowedBody {
+    fn new(pause_at: usize, ceiling: Option<usize>) -> Self {
+        Self {
+            pause_at,
+            ceiling,
+            buffered: 0,
+            bodies: Vec::new(),
+        }
+    }
+}
+
+impl HttpCodecCallback for WindowedBody {
+    fn on_event(&mut self, _event: CodecEvent<'_>) {}
+
+    fn on_ingress_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
+        if let CodecEvent::Body { body, .. } = event {
+            self.bodies.push(body.chain_length());
+            self.buffered += body.chain_length();
+            if self.buffered >= self.pause_at {
+                return vec![CodecCallbackAction::SetParserPaused(true)].into();
+            }
+        }
+        CodecCallbackActions::new()
+    }
+
+    fn ingress_body_limit(&self, _stream: StreamId) -> Option<usize> {
+        self.ceiling
+            .map(|ceiling| ceiling.saturating_sub(self.buffered))
+    }
+}
+
+/// `DIV-058`: each input segment of a body is one body event, until the event that would carry
+/// the body past the callback's limit, which stops at it. A 31_041-byte body read as 4_000,
+/// 4_000, 8_000 and 15_041 bytes stays four events with no limit or a distant one; under a
+/// ceiling of 10_999 (a pause at 10_000 plus 999), 8_000 bytes in, the third event stops at
+/// 2_999 bytes and the pause leaves the rest unparsed.
+#[test]
+fn body_events_stay_whole_until_one_reaches_the_body_limit() {
+    let head = b"POST / HTTP/1.1\r\nContent-Length: 31041\r\n\r\n";
+    let segments = [4_000, 4_000, 8_000, 15_041];
+    for dispatch in CallbackDispatch::ALL {
+        for (pause_at, ceiling, bodies, paused) in [
+            (usize::MAX, None, vec![4_000, 4_000, 8_000, 15_041], false),
+            (
+                1 << 20,
+                Some((1 << 20) + 999),
+                vec![4_000, 4_000, 8_000, 15_041],
+                false,
+            ),
+            (10_000, Some(10_999), vec![4_000, 4_000, 2_999], true),
+        ] {
+            let mut input = BufQueue::new(QUEUE_LIMIT);
+            input.push_bytes(Bytes::from_static(head)).unwrap();
+            for length in segments {
+                input.push_bytes(Bytes::from(vec![b'x'; length])).unwrap();
+            }
+            let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+            let mut callback = WindowedBody::new(pause_at, ceiling);
+            let mut egress = BufQueue::new(QUEUE_LIMIT);
+
+            let result = dispatch.ingress(&mut codec, &input, &mut callback, &mut egress);
+
+            let body_length: usize = bodies.iter().sum();
+            assert_eq!(callback.bodies, bodies, "{dispatch:?} {ceiling:?}");
+            assert_eq!(result.consumed, head.len() + body_length, "{dispatch:?}");
+            assert_eq!(codec.is_parser_paused(), paused, "{dispatch:?} {ceiling:?}");
+        }
+    }
+}
+
+/// `DIV-058`: a body that arrives in one segment with its head is parsed within the body limit
+/// too. With a pause at 5_000 and a ceiling of 5_999, a 20_000-byte body stops at 5_999 bytes.
+/// Chunked in 3_000-byte chunks (`bb8\r\n` headers), the 5_999 bytes after the head hold one
+/// chunk, its CRLF, the next chunk's header and 2_987 of its bytes. With no limit the
+/// unchunked body is one event.
+#[test]
+fn a_body_that_arrives_with_its_head_stays_within_the_body_limit() {
+    let chunked_head = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice();
+    let chunk = [b"bb8\r\n".as_slice(), &[b'x'; 3_000], b"\r\n"].concat();
+    let chunked = [chunked_head, &chunk.repeat(7), b"0\r\n\r\n"].concat();
+    let sized_head = b"POST / HTTP/1.1\r\nContent-Length: 20000\r\n\r\n".as_slice();
+    let sized = [sized_head, &[b'x'; 20_000]].concat();
+    for dispatch in CallbackDispatch::ALL {
+        for (wire, pause_at, ceiling, bodies, consumed) in [
+            (&sized, usize::MAX, None, vec![20_000], sized.len()),
+            (
+                &sized,
+                5_000,
+                Some(5_999),
+                vec![5_999],
+                sized_head.len() + 5_999,
+            ),
+            (
+                &chunked,
+                5_000,
+                Some(5_999),
+                vec![3_000, 2_987],
+                chunked_head.len() + 5_999,
+            ),
+        ] {
+            let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+            let mut callback = WindowedBody::new(pause_at, ceiling);
+            let mut egress = BufQueue::new(QUEUE_LIMIT);
+
+            let result =
+                dispatch.ingress(&mut codec, &ingress_queue(wire), &mut callback, &mut egress);
+
+            assert_eq!(callback.bodies, bodies, "{dispatch:?} {ceiling:?}");
+            assert_eq!(result.consumed, consumed, "{dispatch:?} {ceiling:?}");
+            assert_eq!(codec.is_parser_paused(), ceiling.is_some(), "{dispatch:?}");
+        }
+    }
+}
+
+/// `DIV-058`: tunnel bytes and an HTTP/0.9 response body are forwarded within the body limit,
+/// and what the pause leaves stays unconsumed. A 10_000-byte segment under a ceiling of 3_999
+/// (a pause at 3_000) forwards 3_999 bytes.
+#[test]
+fn raw_body_bytes_stay_within_the_body_limit() {
+    let raw = Bytes::from(vec![b'x'; 10_000]);
+    for dispatch in CallbackDispatch::ALL {
+        let mut tunnel = Http1xCodec::new(TransportDirection::Downstream);
+        let mut callback = WindowedBody::new(3_000, Some(3_999));
+        let mut egress = BufQueue::new(QUEUE_LIMIT);
+        let head = ingress_queue(b"CONNECT h:443 HTTP/1.1\r\n\r\n");
+        assert_eq!(
+            dispatch
+                .ingress(&mut tunnel, &head, &mut callback, &mut egress)
+                .consumed,
+            head.chain_length()
+        );
+        let input = BufQueue::from_bytes(raw.clone(), raw.len()).unwrap();
+
+        let result = dispatch.ingress(&mut tunnel, &input, &mut callback, &mut egress);
+
+        assert_eq!(callback.bodies, [3_999], "tunnel, {dispatch:?}");
+        assert_eq!(result.consumed, 3_999, "tunnel, {dispatch:?}");
+        assert!(tunnel.is_parser_paused());
+
+        let mut http09 = Http1xCodec::new(TransportDirection::Upstream);
+        let stream = http09.create_stream();
+        generate(
+            &mut http09,
+            EgressFrame::Headers {
+                stream,
+                message: &request(HttpMethod::Get, b"/", (0, 9)),
+                end_stream: true,
+                extra_headers: None,
+            },
+        );
+        let mut callback = WindowedBody::new(3_000, Some(3_999));
+
+        let result = dispatch.ingress(&mut http09, &input, &mut callback, &mut egress);
+
+        assert_eq!(callback.bodies, [3_999], "HTTP/0.9, {dispatch:?}");
+        assert_eq!(result.consumed, 3_999, "HTTP/0.9, {dispatch:?}");
+    }
+}
+
+/// A body limit of zero is read as one (`HttpCodecCallback::ingress_body_limit`), so a message
+/// body and tunnel bytes are still parsed, one byte per body event.
+#[test]
+fn a_zero_body_limit_delivers_one_byte_per_body_event() {
+    let message = b"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
+    for dispatch in CallbackDispatch::ALL {
+        let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+        let mut callback = WindowedBody::new(usize::MAX, Some(0));
+        let mut egress = BufQueue::new(QUEUE_LIMIT);
+
+        let result = dispatch.ingress(
+            &mut codec,
+            &ingress_queue(message),
+            &mut callback,
+            &mut egress,
+        );
+
+        assert_eq!(callback.bodies, [1, 1, 1], "message, {dispatch:?}");
+        assert_eq!(result.consumed, message.len(), "message, {dispatch:?}");
+
+        let mut tunnel = Http1xCodec::new(TransportDirection::Downstream);
+        let mut callback = WindowedBody::new(usize::MAX, Some(0));
+        let head = ingress_queue(b"CONNECT h:443 HTTP/1.1\r\n\r\n");
+        let result = dispatch.ingress(&mut tunnel, &head, &mut callback, &mut egress);
+        assert_eq!(
+            result.consumed,
+            head.chain_length(),
+            "tunnel head, {dispatch:?}"
+        );
+
+        let result = dispatch.ingress(
+            &mut tunnel,
+            &ingress_queue(b"abc"),
+            &mut callback,
+            &mut egress,
+        );
+
+        assert_eq!(callback.bodies, [1, 1, 1], "tunnel, {dispatch:?}");
+        assert_eq!(result.consumed, 3, "tunnel, {dispatch:?}");
+    }
+}
+
 #[test]
 fn concrete_ingress_delivers_every_callback_without_dyn_dispatch() {
     let downstream = || Http1xCodec::new(TransportDirection::Downstream);

@@ -11,6 +11,7 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
+use std::io::Write;
 use std::rc::Rc;
 use std::task::Context;
 use std::task::Poll;
@@ -24,6 +25,7 @@ use roxygen_core::error::HttpError;
 use roxygen_core::error::HttpErrorCode;
 use roxygen_core::events::HttpBodyEvent;
 use roxygen_core::events::HttpHeaderEvent;
+use roxygen_core::fixed_source::HttpFixedSource;
 use roxygen_core::handler::HandlerSessionContext;
 use roxygen_core::handler::HttpHandler;
 use roxygen_core::handler::LocalHandlerFuture;
@@ -33,11 +35,13 @@ use roxygen_core::source::HttpSource;
 use roxygen_core::source::LocalSourceFuture;
 use roxygen_core::source_holder::HttpSourceHolder;
 use roxygen_runtime::worker::WorkerContext;
+use roxygen_transport::byte_stream::ByteStreamLimits;
 use roxygen_transport::tcp::TcpTransport;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+use tokio::sync::Notify;
 
 use crate::acceptor::ServerSessionConfig;
 use crate::connection::ServeTransportOptions;
@@ -216,22 +220,29 @@ async fn serve_router_connection_with(
         listener.accept()
     );
     let (accepted, _) = accepted.expect("connection accepted");
-    let transport = TcpTransport::from_accepted(
+    let connection = serve_accepted(
         context,
         accepted.into_std().expect("standard stream"),
-        session.byte_stream_limits,
-    )
-    .expect("transport adopted");
+        Rc::new(PollingHandler(Rc::clone(script))),
+        protocol,
+        session,
+    );
+    (connection, client.expect("client connects"))
+}
+
+/// Serves `accepted` with `handler` and `session`.
+fn serve_accepted(
+    context: &WorkerContext,
+    accepted: std::net::TcpStream,
+    handler: Rc<dyn HttpHandler>,
+    protocol: CodecProtocol,
+    session: ServerSessionConfig,
+) -> ServerConnection {
+    let transport = TcpTransport::from_accepted(context, accepted, session.byte_stream_limits)
+        .expect("transport adopted");
     let mut options = ServeTransportOptions::new(protocol, TransportSecurity::Plaintext);
     options.session = session;
-    let connection = serve_transport(
-        context,
-        transport,
-        Rc::new(PollingHandler(Rc::clone(script))),
-        options,
-    )
-    .expect("attached");
-    (connection, client.expect("client connects"))
+    serve_transport(context, transport, handler, options).expect("attached")
 }
 
 /// Reads into `wire` until it ends with `end`.
@@ -347,6 +358,189 @@ fn router_ingress_body_error_delivers_the_written_body_then_fin() {
         assert_eq!(script.reads.get(), 0, "read_body_event is never called");
         let _ = within("the session closes", connection.wait_closed()).await;
     });
+}
+
+/// Reads each request's head, holds the request with its body unread, and answers it with a
+/// bodiless 200 once `respond` is notified.
+struct HoldingHandler {
+    held: Rc<RefCell<Vec<HttpSourceHolder>>>,
+    respond: Rc<Notify>,
+}
+
+impl HttpHandler for HoldingHandler {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        mut request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        let held = Rc::clone(&self.held);
+        let respond = Rc::clone(&self.respond);
+        Box::pin(async move {
+            request.read_header_event().await?;
+            held.borrow_mut().push(request);
+            respond.notified().await;
+            Ok(HttpSourceHolder::new(Box::new(
+                HttpFixedSource::make_fixed_response(200, None).expect("response"),
+            )))
+        })
+    }
+}
+
+/// Bytes queued on `observer`, a clone of the accepted socket.
+fn queued(observer: &std::net::TcpStream) -> usize {
+    let mut queued = [0; 32 << 10];
+    match observer.peek(&mut queued) {
+        Ok(length) => length,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+        Err(error) => panic!("peek of the accepted socket failed: {error}"),
+    }
+}
+
+/// Writes `bytes` through `writer`, a nonblocking clone of the client socket, and waits until
+/// `observer` has `queued_after` bytes queued, all without yielding, so that the server's next
+/// read finds every byte already queued.
+fn queue_without_yielding(
+    writer: &mut std::net::TcpStream,
+    observer: &std::net::TcpStream,
+    bytes: &[u8],
+    queued_after: usize,
+) {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match writer.write(rest) {
+            Ok(written) => rest = &rest[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("client write failed: {error}"),
+        }
+    }
+    let deadline = std::time::Instant::now() + BOUND;
+    while queued(observer) < queued_after {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{queued_after} bytes queued within {BOUND:?}"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// `DIV-058`: a request body event stops where it would take the unread body past the request
+/// window at `connection_flow_control`, or `read_allocation_size` or more past the pause at
+/// `stream_flow_control`, however large the read's buffers, so the owned and the default HTTP/1.1
+/// drivers pause without overflowing the window at any margin. With 8_000 body bytes unread, one
+/// read gathers a 16_384-byte burst as 1_000, 1_000, 2_000, 4_000, 8_000 and 384 bytes
+/// (`DIV-017`). The first four take the unread body to 16_000 bytes, under the pause at 16_384;
+/// the next event stops in the 8_000-byte buffer at the window or at 17_383 bytes, 999 past the
+/// pause, whichever comes first. With margins of 0, 998 and 999 bytes the session pauses with
+/// exactly 16_384 plus the margin buffered, and once the request is released it answers it and
+/// ends at the client's EOF.
+#[test]
+fn http1_request_body_events_stop_within_the_window_and_one_allocation_of_the_pause() {
+    for owned_http1 in [true, false] {
+        for margin in [0, 998, 999] {
+            on_worker(move |context| async move {
+                let session = ServerSessionConfig {
+                    owned_http1,
+                    stream_flow_control: 16_384,
+                    connection_flow_control: 16_384 + margin,
+                    read_allocation_size: 1_000,
+                    byte_stream_limits: ByteStreamLimits::new(16_384, 16_384, 1_024)
+                        .expect("nonzero limits"),
+                    ..router_session()
+                };
+                let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+                let (client, accepted) = tokio::join!(
+                    TcpStream::connect(listener.local_addr().expect("listener address")),
+                    listener.accept()
+                );
+                let client = client
+                    .expect("client connects")
+                    .into_std()
+                    .expect("standard client");
+                client.set_nodelay(true).expect("client disables Nagle");
+                let mut writer = client.try_clone().expect("client clone");
+                let mut client = TcpStream::from_std(client).expect("client registers");
+                let (accepted, _) = accepted.expect("connection accepted");
+                let accepted = accepted.into_std().expect("standard stream");
+                let observer = accepted.try_clone().expect("accepted clone");
+
+                let body = vec![b'x'; 24_384];
+                let mut first = format!(
+                    "POST /generate HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                first.extend_from_slice(&body[..8_000]);
+                queue_without_yielding(&mut writer, &observer, &first, first.len());
+                let held = Rc::new(RefCell::new(Vec::new()));
+                let respond = Rc::new(Notify::new());
+                let handler = HoldingHandler {
+                    held: Rc::clone(&held),
+                    respond: Rc::clone(&respond),
+                };
+                let connection = serve_accepted(
+                    &context,
+                    accepted,
+                    Rc::new(handler),
+                    CodecProtocol::Http11,
+                    session,
+                );
+                within("the request is held", async {
+                    while held.borrow().is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                assert_eq!(
+                    queued(&observer),
+                    0,
+                    "one read took the head and 8_000 body bytes"
+                );
+
+                queue_without_yielding(&mut writer, &observer, &body[8_000..], 16_384);
+                within("the second read", async {
+                    while queued(&observer) != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                drop(observer);
+                let expected = 16_384 + u64::from(margin);
+                let completion = held.borrow()[0]
+                    .ingress_completion()
+                    .expect("the request counts its body bytes");
+                within("the session pauses", async {
+                    while completion.body_bytes_received() < expected
+                        && completion.snapshot().is_none()
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                assert_eq!(
+                    completion.body_bytes_received(),
+                    expected,
+                    "the session paused {margin} bytes past 16_384"
+                );
+
+                held.borrow_mut().clear();
+                respond.notify_one();
+                let mut wire = Vec::new();
+                within("the response", read_until(&mut client, &mut wire, HEAD_END)).await;
+                assert!(
+                    wire.starts_with(b"HTTP/1.1 200 "),
+                    "{}",
+                    wire.escape_ascii()
+                );
+                writer
+                    .shutdown(std::net::Shutdown::Write)
+                    .expect("client half-closes");
+                let result = within("the session ends", connection.wait_closed()).await;
+                assert!(result.is_ok(), "{result:?}");
+            });
+        }
+    }
 }
 
 fn contains(wire: &[u8], needle: &[u8]) -> bool {

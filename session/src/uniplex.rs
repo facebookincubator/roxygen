@@ -632,6 +632,15 @@ impl UniplexConfig {
         }
         Ok(self)
     }
+
+    /// The unread body an HTTP/1.1 codec may take a stream to before it asks again
+    /// (`HttpCodecCallback::ingress_body_limit`): the body source's strict window,
+    /// `buffer_limit`, or `read_allocation_size - 1` past `ingress_buffer_limit`, where parsing
+    /// pauses, whichever is smaller, however large the read's buffers are (`DIV-058`).
+    pub(crate) fn http1_ingress_body_ceiling(&self) -> usize {
+        self.buffer_limit
+            .min(self.ingress_buffer_limit as usize + self.read_allocation_size - 1)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1538,6 +1547,7 @@ struct DriverState {
     byte_event_bridges: Vec<Rc<TransportObserverBridge>>,
     stream_read_timeout: Duration,
     ingress_buffer_limit: u32,
+    http1_ingress_body_ceiling: usize,
     wait_for_http1_response_on_drain: bool,
     abort_exchanges_on_eof: bool,
     flow_control_paused: bool,
@@ -4171,6 +4181,7 @@ impl UniplexSession {
             byte_event_bridges: Vec::new(),
             stream_read_timeout: config.stream_read_timeout,
             ingress_buffer_limit: config.ingress_buffer_limit,
+            http1_ingress_body_ceiling: config.http1_ingress_body_ceiling(),
             wait_for_http1_response_on_drain: config.wait_for_http1_response_on_drain,
             abort_exchanges_on_eof: config.abort_exchanges_on_eof,
             flow_control_paused: false,
@@ -5710,6 +5721,7 @@ fn parse_one_prefix(state: &Rc<RefCell<DriverState>>) -> Result<ParseOutcome, Co
             egress,
             stream_read_timeout,
             ingress_buffer_limit,
+            http1_ingress_body_ceiling,
             flow_control_paused,
             anti_pipeline_paused,
             upgrade_paused,
@@ -5732,6 +5744,7 @@ fn parse_one_prefix(state: &Rc<RefCell<DriverState>>) -> Result<ParseOutcome, Co
             pending_pushes,
             stream_read_timeout: *stream_read_timeout,
             ingress_buffer_limit: *ingress_buffer_limit,
+            http1_ingress_body_ceiling: *http1_ingress_body_ceiling,
             flow_control_paused,
             anti_pipeline_paused,
             upgrade_paused,
@@ -5871,6 +5884,7 @@ struct SessionCodecCallback<'a> {
     pending_pushes: &'a mut BTreeMap<StreamId, PendingPush>,
     stream_read_timeout: Duration,
     ingress_buffer_limit: u32,
+    http1_ingress_body_ceiling: usize,
     flow_control_paused: &'a mut bool,
     anti_pipeline_paused: &'a mut bool,
     upgrade_paused: &'a mut bool,
@@ -6400,6 +6414,8 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
                                     HttpErrorCode::FLOW_CONTROL_ERROR,
                                     b"ingress source rejected body bytes",
                                 );
+                                // Not the window for HTTP/1.1: its body limit keeps body events
+                                // within it (`DIV-058`).
                                 if self.core.protocol() == CodecProtocol::Http11
                                     && self.core.direction().is_downstream()
                                     && !stream.is_unspecified()
@@ -6808,6 +6824,12 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
 
     fn num_incoming_streams(&self) -> u32 {
         self.core.num_incoming_streams()
+    }
+
+    fn ingress_body_limit(&self, stream: StreamId) -> Option<usize> {
+        let state = self.core.stream_if_present(stream)?;
+        let buffered = state.buffered_ingress_bytes() as usize;
+        Some(self.http1_ingress_body_ceiling.saturating_sub(buffered))
     }
 }
 
@@ -10082,6 +10104,7 @@ fn handle_eof(
             egress,
             stream_read_timeout,
             ingress_buffer_limit,
+            http1_ingress_body_ceiling,
             flow_control_paused,
             anti_pipeline_paused,
             upgrade_paused,
@@ -10111,6 +10134,7 @@ fn handle_eof(
             pending_pushes,
             stream_read_timeout: *stream_read_timeout,
             ingress_buffer_limit: *ingress_buffer_limit,
+            http1_ingress_body_ceiling: *http1_ingress_body_ceiling,
             flow_control_paused,
             anti_pipeline_paused,
             upgrade_paused,

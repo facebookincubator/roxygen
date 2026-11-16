@@ -2342,6 +2342,10 @@ fn count_response_delivery(caller: &std::panic::Location<'_>) {
 impl HttpCodecCallback for ResponseInput<'_> {
     fn on_event(&mut self, _event: CodecEvent<'_>) {}
 
+    fn ingress_body_limit(&self, _stream: StreamId) -> Option<usize> {
+        ingress_body_limit(&self.exchange.as_ref()?.producer, self.config)
+    }
+
     #[cfg_attr(test, track_caller)]
     fn on_ingress_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
         #[cfg(test)]

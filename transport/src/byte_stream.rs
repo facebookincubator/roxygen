@@ -483,12 +483,8 @@ impl OwnedReader {
                 cancellation: &self.cancellation.token,
             },
         ) {
-            ReadStart::Started {
-                operation,
-                maximum,
-                allocation_size,
-            } => {
-                self.operation.restart(operation, maximum, allocation_size);
+            ReadStart::Started { operation, maximum } => {
+                self.operation.restart(operation, maximum);
                 self.read = ReaderRead::Reading { arm: false };
             }
             ReadStart::Finished(result) => self.read = ReaderRead::Finished(result),
@@ -587,20 +583,20 @@ impl OwnedReader {
         };
         match polled.try_read(context, maximum, allocation_size) {
             TryRead::Ready(result) => {
-                let result = bounded_read(result, maximum, allocation_size);
+                let result = bounded_read(result, maximum);
                 if is_drained(&result) {
-                    self.register_read(polled, context, maximum, allocation_size);
+                    self.register_read(polled, context, maximum);
                     self.read = ReaderRead::Drained;
                     self.settle_drained(context);
                 }
                 Poll::Ready(deliver_read(&self.operation.state, result))
             }
             TryRead::Pending => {
-                self.register_read(polled, context, maximum, allocation_size);
+                self.register_read(polled, context, maximum);
                 self.pend(context)
             }
             TryRead::Panicked(panic) => {
-                self.register_read(polled, context, maximum, allocation_size);
+                self.register_read(polled, context, maximum);
                 self.read = ReaderRead::Reading { arm: true };
                 resume_unwind(panic)
             }
@@ -632,7 +628,7 @@ impl OwnedReader {
         let allocation_size = allocation_size.min(maximum);
         match polled.try_read(context, maximum, allocation_size) {
             TryRead::Ready(result) => {
-                let result = bounded_read(result, maximum, allocation_size);
+                let result = bounded_read(result, maximum);
                 if !is_drained(&result) {
                     self.operation.finish(None);
                     self.read = ReaderRead::Idle;
@@ -642,12 +638,12 @@ impl OwnedReader {
                 Poll::Ready(deliver_read(&self.operation.state, result))
             }
             TryRead::Pending => {
-                self.operation.rebound(maximum, allocation_size);
+                self.operation.rebound(maximum);
                 self.operation.rewake(context);
                 self.pend(context)
             }
             TryRead::Panicked(panic) => {
-                self.operation.rebound(maximum, allocation_size);
+                self.operation.rebound(maximum);
                 self.operation.rewake(context);
                 self.read = ReaderRead::Reading { arm: true };
                 resume_unwind(panic)
@@ -700,7 +696,6 @@ impl OwnedReader {
         polled: Rc<dyn PolledReader>,
         context: &Context<'_>,
         maximum: usize,
-        allocation_size: usize,
     ) {
         let operation = {
             let mut state = self.operation.state.borrow_mut();
@@ -717,7 +712,7 @@ impl OwnedReader {
         };
         #[cfg(test)]
         record_read_registration();
-        self.operation.restart(operation, maximum, allocation_size);
+        self.operation.restart(operation, maximum);
     }
 
     /// Whether the read that `poll_start_read` last returned drained the
@@ -2138,16 +2133,11 @@ impl OwnedByteStream {
                 cancellation,
             },
         ) {
-            ReadStart::Started {
-                operation,
-                maximum,
-                allocation_size,
-            } => Box::pin(ReadOperation::new(
+            ReadStart::Started { operation, maximum } => Box::pin(ReadOperation::new(
                 self.io.clone(),
                 Rc::clone(&self.state),
                 operation,
                 maximum,
-                allocation_size,
             )),
             ReadStart::Finished(result) => Box::pin(std::future::ready(result)),
         }
@@ -2285,7 +2275,6 @@ enum ReadStart {
     Started {
         operation: u64,
         maximum: usize,
-        allocation_size: usize,
     },
     Finished(Result<TransportRead, HttpError>),
 }
@@ -2426,11 +2415,7 @@ fn start_read_operation(
     } else {
         drop(io);
     }
-    ReadStart::Started {
-        operation,
-        maximum,
-        allocation_size,
-    }
+    ReadStart::Started { operation, maximum }
 }
 
 /// Releases `io`, the backend's last owner, after [`start_read_operation`]
@@ -3078,7 +3063,6 @@ struct ReadOperation {
     state: Rc<RefCell<TransportState>>,
     operation: u64,
     maximum: usize,
-    allocation_size: usize,
     complete: bool,
 }
 
@@ -3088,7 +3072,6 @@ impl ReadOperation {
         state: Rc<RefCell<TransportState>>,
         operation: u64,
         maximum: usize,
-        allocation_size: usize,
     ) -> Self {
         #[cfg(test)]
         READ_OPERATIONS.with(|count| count.set(count.get() + 1));
@@ -3097,24 +3080,22 @@ impl ReadOperation {
             state,
             operation,
             maximum,
-            allocation_size,
             complete: false,
         }
     }
 
     /// An [`OwnedReader`]'s operation slot, complete until its first read.
     fn idle(io: Weak<dyn ByteStreamIo>, state: Rc<RefCell<TransportState>>) -> Self {
-        let mut slot = Self::new(io, state, 0, 0, 0);
+        let mut slot = Self::new(io, state, 0, 0);
         slot.complete = true;
         slot
     }
 
     /// Reuses a complete slot for the transport's read `operation`.
-    fn restart(&mut self, operation: u64, maximum: usize, allocation_size: usize) {
+    fn restart(&mut self, operation: u64, maximum: usize) {
         debug_assert!(self.complete, "only a complete read's slot is reused");
         self.operation = operation;
         self.maximum = maximum;
-        self.allocation_size = allocation_size;
         self.complete = false;
     }
 
@@ -3294,7 +3275,7 @@ impl ReadOperation {
             }
             ReadPoll::Io(result) => result,
         };
-        let result = bounded_read(result, self.maximum, self.allocation_size);
+        let result = bounded_read(result, self.maximum);
         // A read that drained its stream stays registered, for its reader to
         // settle (`OwnedReader::settle_drained`).
         if !(arm && is_drained(&result)) {
@@ -3347,23 +3328,21 @@ impl ReadOperation {
         drop(replaced);
     }
 
-    /// Gives the registered read the bounds of the read it now holds.
-    fn rebound(&mut self, maximum: usize, allocation_size: usize) {
+    /// Gives the registered read the bound of the read it now holds.
+    fn rebound(&mut self, maximum: usize) {
         debug_assert!(!self.complete, "only a registered read is rebounded");
         self.maximum = maximum;
-        self.allocation_size = allocation_size;
     }
 }
 
-/// A completed read's result within its bounds (`normalize_read`).
+/// A completed read's result within its bound (`normalize_read`).
 #[inline(always)]
 fn bounded_read(
     result: Result<TransportRead, HttpError>,
     maximum: usize,
-    allocation_size: usize,
 ) -> Result<TransportRead, HttpError> {
     match result {
-        Ok(result) => normalize_read(result, maximum, allocation_size),
+        Ok(result) => normalize_read(result, maximum),
         Err(error) => Err(error),
     }
 }
@@ -3695,49 +3674,28 @@ impl Drop for WriteOperation {
     }
 }
 
-/// Returns a completed read's bytes in a queue bounded at `maximum`, in segments of at most
-/// `allocation_size` bytes. A backend queue that already has both, as a Tokio-backed read's
-/// does, is returned as it is.
-fn normalize_read(
-    result: TransportRead,
-    maximum: usize,
-    allocation_size: usize,
-) -> Result<TransportRead, HttpError> {
-    let length = result.bytes_read();
-    if length > maximum {
+/// Returns a completed read's bytes in a queue bounded at `maximum`, with the segments its
+/// backend filled (`DIV-058`). A backend queue with that bound, as every Tokio-backed read's
+/// has, is returned as it is; any other is moved into one, keeping its segments and their
+/// backing.
+fn normalize_read(result: TransportRead, maximum: usize) -> Result<TransportRead, HttpError> {
+    if result.bytes_read() > maximum {
         return Err(read_error(
             b"byte-stream adapter exceeded the requested read bound",
         ));
     }
-    let drained = result.drained;
-    let fits = result
-        .data()
-        .segments()
-        .all(|segment| segment.len() <= allocation_size);
-    if fits && result.data().limit() == maximum {
+    if result.data().limit() == maximum {
         return Ok(result);
     }
+    let drained = result.drained;
     let eof = result.is_eof();
     let mut data = result.into_data();
     #[cfg(test)]
     READ_QUEUE_REBUILDS.with(|count| count.set(count.get() + 1));
     let mut bounded = BufQueue::new(maximum);
-    if fits {
-        bounded
-            .append(&mut data)
-            .map_err(|_| read_error(b"byte-stream read buffer exceeded its bound"))?;
-        return Ok(TransportRead::from_io(bounded, eof).with_drained(drained));
-    }
-    for mut segment in data.into_bytes_segments() {
-        while segment.len() > allocation_size {
-            bounded
-                .push_bytes(segment.split_to(allocation_size))
-                .map_err(|_| read_error(b"byte-stream read buffer exceeded its bound"))?;
-        }
-        bounded
-            .push_bytes(segment)
-            .map_err(|_| read_error(b"byte-stream read buffer exceeded its bound"))?;
-    }
+    bounded
+        .append(&mut data)
+        .map_err(|_| read_error(b"byte-stream read buffer exceeded its bound"))?;
     Ok(TransportRead::from_io(bounded, eof).with_drained(drained))
 }
 

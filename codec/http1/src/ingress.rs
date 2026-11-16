@@ -368,9 +368,16 @@ impl<C: IngressDelivery + ?Sized> Execution<'_, C> {
         }
         let metadata_boundary = event == ParserEvent::MessageBegin
             || (event == ParserEvent::ChunkHeader && parser.content_length == 0);
+        let rest = self.input.len().saturating_sub(event_end);
+        // The pause re-slices the rest of the run, so a body that follows its head in one run
+        // is parsed within the body limit too. The limit is at least one byte.
+        let body_boundary = event == ParserEvent::HeadersComplete
+            && self.codec.phase == IngressPhase::Body
+            && rest > 1
+            && rest > self.codec.body_limit(&*self.callback);
         if self.codec.parser_paused
-            || (metadata_boundary
-                && self.input.len().saturating_sub(event_end) > MAX_HEADER_BYTES + 1)
+            || (metadata_boundary && rest > MAX_HEADER_BYTES + 1)
+            || body_boundary
             || (event == ParserEvent::UrlComplete
                 && self.codec.http09_request
                 && !self.codec.http09_synthetic)
@@ -721,6 +728,7 @@ impl Http1xCodec {
                 IngressPhase::Headers | IngressPhase::Trailers => {
                     remaining.min(MAX_HEADER_BYTES.saturating_sub(self.header_bytes) + 1)
                 }
+                IngressPhase::Body => remaining.min(self.body_limit(&*callback)),
                 _ => remaining,
             };
             let tail;
@@ -802,8 +810,7 @@ impl Http1xCodec {
             if self.parser_paused && !self.upgrade_pause {
                 return false;
             }
-            result.consumed = input.len();
-            self.emit_body(input.clone(), callback, callback_egress, result);
+            self.forward_body(input, callback, callback_egress, result);
             return false;
         }
         if self.parser_paused {
@@ -825,8 +832,7 @@ impl Http1xCodec {
         }
         if self.phase == IngressPhase::Http09 {
             if !self.parser_paused {
-                result.consumed = input.len();
-                self.emit_body(input.clone(), callback, callback_egress, result);
+                self.forward_body(input, callback, callback_egress, result);
             }
             return false;
         }

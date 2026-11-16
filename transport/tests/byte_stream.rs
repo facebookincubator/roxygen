@@ -811,8 +811,7 @@ mod byte_stream {
         run_worker(|context| async move {
             let (transport, control) = transport(&context, ByteEventCapability::Unsupported, None);
             let allocation = vec![b'a', b'b', b'c', b'd', b'e', b'f'];
-            let first_pointer = allocation.as_ptr();
-            let second_pointer = first_pointer.wrapping_add(3);
+            let pointer = allocation.as_ptr();
             let mut inbound = BufQueue::new(allocation.len());
             inbound
                 .push_bytes(allocation.into())
@@ -823,12 +822,12 @@ mod byte_stream {
                 .read(&context, 6, 3, Duration::ZERO, CancellationToken::never())
                 .await
                 .expect("owned read succeeds");
-            let pointers = read
+            let segments = read
                 .data()
                 .segments()
-                .map(|segment| segment.as_ptr())
+                .map(|segment| (segment.as_ptr(), segment.len()))
                 .collect::<Vec<_>>();
-            assert_eq!(pointers, vec![first_pointer, second_pointer]);
+            assert_eq!(segments, vec![(pointer, 6)]);
 
             transport.close(&context).expect("transport closes");
         });
@@ -890,10 +889,10 @@ mod byte_stream {
         });
     }
 
-    /// N3c: a read whose backend queue is already bounded at the read's maximum, with every
-    /// segment within the allocation size, returns that queue instead of moving its bytes into
-    /// a new one. The result keeps the bound, remaining capacity, backing bound and segment
-    /// views that the moved copy had, and data with EOF still defers the EOF to the next read.
+    /// N3c: a read whose backend queue is already bounded at the read's maximum returns that
+    /// queue instead of moving its bytes into a new one. The result keeps the bound, remaining
+    /// capacity, backing bound and segment views that the moved copy had, and data with EOF
+    /// still defers the EOF to the next read.
     #[test]
     fn a_read_bounded_at_its_maximum_keeps_the_backends_queue() {
         run_worker(|context| async move {
@@ -945,15 +944,16 @@ mod byte_stream {
         });
     }
 
-    /// A backend queue bounded at the read's maximum that holds a segment longer than the
-    /// allocation size is still split into allocation-size views of the same backing.
+    /// `DIV-058`: a backend queue bounded at the read's maximum that holds a segment longer than
+    /// the allocation size is returned as it is, with that segment whole and its backing bound.
     #[test]
-    fn a_read_bounded_at_its_maximum_still_splits_segments_over_the_allocation_size() {
+    fn a_read_bounded_at_its_maximum_keeps_segments_over_the_allocation_size() {
         run_worker(|context| async move {
             let (transport, control) = transport(&context, ByteEventCapability::Unsupported, None);
             control.bound_reads_at_maximum();
             let allocation = b"abcdef".to_vec();
             let start = allocation.as_ptr();
+            let capacity = allocation.capacity();
             let mut inbound = BufQueue::new(allocation.len());
             inbound.push_vec(allocation).unwrap();
             control.feed(inbound, false);
@@ -969,10 +969,11 @@ mod byte_stream {
                     .segments()
                     .map(|segment| (segment.as_ptr(), segment.len()))
                     .collect::<Vec<_>>(),
-                vec![(start, 3), (start.wrapping_add(3), 3)]
+                vec![(start, 6)]
             );
+            assert_eq!(read.data().backing_capacity_upper_bound(), Some(capacity));
             assert_eq!(flatten(read.data()), b"abcdef");
-            assert_eq!(read_queue_rebuilds_for_test(), rebuilds + 1);
+            assert_eq!(read_queue_rebuilds_for_test(), rebuilds);
             transport.close(&context).unwrap();
         });
     }
@@ -1061,7 +1062,11 @@ mod byte_stream {
                     .unwrap();
                 assert!(read.bytes_read() <= 1_000);
                 assert!(!read.is_eof());
-                assert!(read.data().segments().all(|segment| segment.len() <= 257));
+                assert_eq!(
+                    read.data().limit(),
+                    1_000,
+                    "the read's queue keeps its bound"
+                );
                 let mut data = read.into_data();
                 received.append(&mut data).unwrap();
             }
@@ -5057,8 +5062,8 @@ mod byte_stream {
         }
 
         /// Each reader read returns its bytes within its own bounds: a queue bounded at that
-        /// read's maximum, in views of at most that read's allocation size, whatever an earlier
-        /// read's bounds were.
+        /// read's maximum, holding the backend's segments, whatever an earlier read's bounds
+        /// were.
         #[test]
         fn each_owned_reader_read_keeps_its_own_bounds() {
             run_worker(|context| async move {
@@ -5072,7 +5077,7 @@ mod byte_stream {
                 // (maximum, allocation size, bytes fed, segment lengths returned)
                 for (maximum, allocation_size, bytes, segments) in [
                     (8, 8, &b"abcdefgh"[..], vec![8]),
-                    (4, 2, b"wxyz", vec![2, 2]),
+                    (4, 2, b"wxyz", vec![4]),
                     (6, 3, b"pq", vec![2]),
                 ] {
                     control.feed(queue(&[bytes], bytes.len()), false);
@@ -5085,7 +5090,7 @@ mod byte_stream {
                             .map(|segment| segment.len())
                             .collect::<Vec<_>>(),
                         segments,
-                        "split at its own allocation size ({maximum}, {allocation_size})",
+                        "the backend's segments ({maximum}, {allocation_size})",
                     );
                     assert_eq!(flatten(read.data()), bytes);
                 }

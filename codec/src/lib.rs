@@ -561,6 +561,21 @@ pub trait HttpCodecCallback {
         0
     }
 
+    /// The most body bytes the codec may deliver for `stream` before it asks again, or `None`
+    /// for no bound. The codec reads zero as one, so that parsing progresses; a callback that
+    /// can take no more body bytes pauses parsing instead.
+    ///
+    /// The HTTP/1.1 codec asks before it parses each run of a message body, before each body
+    /// event of an upgraded tunnel or HTTP/0.9 response, and after each message head, bodiless
+    /// or not, that more than one byte of its run follows. It counts a chunked run's framing
+    /// against the limit too. A callback that pauses parsing at a buffered-body limit answers
+    /// this to bound how far one body event can carry a stream past that limit (`DIV-058`);
+    /// otherwise one event can carry a whole read buffer past it. Codec filters do not
+    /// intercept the query. Other codecs do not ask. Roxygen-only.
+    fn ingress_body_limit(&self, _stream: StreamId) -> Option<usize> {
+        None
+    }
+
     /// Whether this callback wants [`CodecEvent::FrameHeader`] events.
     ///
     /// A codec may skip delivering that observation-only event to a callback
@@ -1163,6 +1178,10 @@ impl HttpCodecCallback for FilteredCallback<'_> {
         let callback = &*self.callback;
         self.filter
             .num_incoming_streams(&|| callback.num_incoming_streams())
+    }
+
+    fn ingress_body_limit(&self, stream: StreamId) -> Option<usize> {
+        self.callback.ingress_body_limit(stream)
     }
 }
 
