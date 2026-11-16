@@ -17,7 +17,7 @@ addr = "0.15.6"
 base64 = { version = "0.23.1", features = ["alloc"] }
 brotli = "9.1.1"
 bytes = "1.12.1"
-cookie = "0.16.2"
+cookie = { version = "0.17.0", features = ["percent-encode"] }
 ferroxygen_client = { path = "../client" }
 ferroxygen_core = { path = "../core" }
 ferroxygen_runtime = { path = "../runtime" }
