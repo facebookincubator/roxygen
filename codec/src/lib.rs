@@ -5,6 +5,33 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+//! The interface between HTTP codecs and the sessions that drive them.
+//!
+//! A codec parses the bytes received on a connection into HTTP events and serializes HTTP
+//! messages into bytes. It does not perform I/O. The caller passes in the received bytes and an
+//! output buffer. `roxygen_http1` and `roxygen_http2` implement this interface, and
+//! `roxygen_session` drives them over a transport. Most applications use `roxygen_server` and
+//! `roxygen_client` and do not use a codec directly. The design follows Proxygen's codec and
+//! codec-filter interfaces.
+//!
+//! Main entry points:
+//!
+//! - [`HttpCodec`] is the codec trait. [`HttpCodec::on_ingress`] parses a prefix of the input,
+//!   reports each part of a message to an [`HttpCodecCallback`] as a [`CodecEvent`], and returns
+//!   how many bytes it consumed. Callbacks run synchronously, before `on_ingress` returns.
+//!   [`HttpCodec::generate`] serializes one [`EgressFrame`] into a [`BufQueue`].
+//! - [`HttpCodecCallback::on_ingress_event`] can return [`CodecCallbackActions`] that pause or
+//!   resume the parser or generate frames. The codec applies them before it parses further.
+//! - [`HttpCodecFilter`] intercepts codec operations and callbacks in both directions.
+//!   [`HttpCodecFilterChain`] puts a list of filters in front of a codec and is itself an
+//!   [`HttpCodec`].
+//! - [`HttpException`] is the parse or protocol error that [`CodecEvent::Error`] carries, and
+//!   [`H2ErrorCode`] is an HTTP/2 wire error code. The [`error_adapter`] module converts between
+//!   these types, [`HttpError`] and
+//!   [`HttpErrorCode`](roxygen_core::error::HttpErrorCode).
+//!
+//! Codecs and filters are worker-local, and `dyn HttpCodec` is not `Send`.
+
 use std::rc::Rc;
 
 use roxygen_core::buf_queue::BufQueue;

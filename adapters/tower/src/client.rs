@@ -11,6 +11,11 @@
 //! [`ClientStartup::start`]. Keep that task and its runtime running through
 //! shutdown, and reap the run before dropping the runtime. Only the run joins
 //! the client's work; [`ClientOwner`] and exchange handles do not.
+//!
+//! The [`SessionSettings`] timers and the pool's connect timeout run in
+//! addition to any timeouts in the connector. A `None` session timer keeps
+//! Roxygen's default. `Some(Duration::ZERO)`, or a zero
+//! `pool.connect_timeout`, disables that timer.
 
 pub mod connector;
 pub mod owner;

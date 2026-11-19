@@ -5,7 +5,61 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Incremental HTTP/1.0 and HTTP/1.1 parsing and framing.
+//! An incremental HTTP/1.0 and HTTP/1.1 codec.
+//!
+//! [`Http1xCodec`] implements [`HttpCodec`] for HTTP/1.x. `roxygen_session` drives it on HTTP/1
+//! connections, so most applications use `roxygen_server` and `roxygen_client` instead of this
+//! crate. Its parser is Rust generated from the grammar of [llhttp], the parser that Node.js
+//! uses, and the codec leaves all of llhttp's leniency flags off.
+//!
+//! A downstream codec ([`TransportDirection::Downstream`]) parses requests and generates
+//! responses. An upstream codec generates requests and parses responses. Input can arrive in
+//! pieces of any size, and the codec keeps its parse state between calls. It handles chunked
+//! bodies and trailers, pipelined requests, `CONNECT`, `Upgrade` including the WebSocket
+//! handshake, and HTTP/0.9 messages.
+//!
+//! - [`Http1xCodec::new`] and [`Http1xCodec::with_options`] create a codec. Setters such as
+//!   [`Http1xCodec::set_strict_validation`] change how it parses and frames messages.
+//! - [`Http1xCodec::on_ingress_with_callback`] parses like [`HttpCodec::on_ingress`] but calls
+//!   a callback of a concrete type instead of a `dyn HttpCodecCallback`.
+//! - [`server_accepted_upgrade`] checks whether a server's `Upgrade` header names a protocol
+//!   that the client offered.
+//!
+//! Parsing a request:
+//!
+//! ```
+//! use roxygen_codec::CodecEvent;
+//! use roxygen_codec::HttpCodec;
+//! use roxygen_codec::HttpCodecCallback;
+//! use roxygen_core::buf_queue::BufQueue;
+//! use roxygen_core::http::TransportDirection;
+//! use roxygen_http1::Http1xCodec;
+//!
+//! #[derive(Default)]
+//! struct Targets(Vec<Vec<u8>>);
+//!
+//! impl HttpCodecCallback for Targets {
+//!     fn on_event(&mut self, event: CodecEvent<'_>) {
+//!         if let CodecEvent::HeadersComplete { message, .. } = event
+//!             && let Some(target) = message.request_url()
+//!         {
+//!             self.0.push(target.to_vec());
+//!         }
+//!     }
+//! }
+//!
+//! let wire = b"GET /hello HTTP/1.1\r\nHost: example.com\r\n\r\n";
+//! let input = BufQueue::copy_from_slice(wire, wire.len())?;
+//! let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+//! let mut targets = Targets::default();
+//! let mut callback_egress = BufQueue::new(4096);
+//! let result = codec.on_ingress(&input, &mut targets, &mut callback_egress);
+//! assert_eq!(result.consumed, wire.len());
+//! assert_eq!(targets.0, [b"/hello".to_vec()]);
+//! # Ok::<(), roxygen_core::buf_queue::BufQueueError>(())
+//! ```
+//!
+//! [llhttp]: https://github.com/nodejs/llhttp
 
 use std::borrow::Cow;
 #[cfg(test)]

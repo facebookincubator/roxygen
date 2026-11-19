@@ -5,13 +5,51 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Owned metadata conversion between `http` 1.x and Roxygen.
+//! Conversions between the request and response heads of the `http` crate
+//! (version 1) and Roxygen's [`HttpMessage`].
 //!
-//! `http::HeaderMap` preserves the order of values for one name, but does not
-//! represent a global insertion order across different names. Conversion into
-//! Roxygen therefore uses `HeaderMap::iter()` order, and conversion back
-//! preserves duplicate-value order. Header names use `HeaderMap`'s normalized
-//! spelling. Raw header values, including obs-text, are otherwise preserved.
+//! Most applications get these conversions through `roxygen_tower_adapter`,
+//! which uses them for every request and response it carries. Only heads are
+//! converted. A body value passes through untouched, and
+//! `roxygen_hyper_adapter` adapts bodies.
+//!
+//! There are two kinds of conversion. Both report failures as
+//! [`HttpAdapterError`].
+//!
+//! - [`RoxygenRequest`] and [`RoxygenResponse`] convert to and from
+//!   `http::Request` and `http::Response` with `TryFrom`. These conversions are
+//!   strict. Metadata that the other side cannot represent is rejected, not
+//!   dropped. Toward Roxygen that covers extensions and sensitive header
+//!   values. Toward `http` it covers trailers, reason phrases and the message
+//!   fields listed in [`UnsupportedMessageMetadata`], such as framing,
+//!   addresses and TLS details.
+//! - [`project_request_head`] and [`project_response_head`] split an `http`
+//!   head into an [`HttpMessage`] for a worker and a [`NetworkHeadContext`]
+//!   that holds the extensions and stays on the application side.
+//!   [`request_head_to_http`] and [`response_head_to_http`] reverse the split.
+//!   The split functions accept a single HTTP/1.1 `chunked` transfer encoding
+//!   and set the message's chunked flag to match.
+//!
+//! `http::HeaderMap` keeps the order of the values for one name, but not the
+//! order across names. Conversion into Roxygen uses `HeaderMap::iter()` order,
+//! and conversion back keeps the order of repeated values. Header names use
+//! `HeaderMap`'s normalized spelling. Raw header values, including obs-text,
+//! are kept as they are. Conversion into Roxygen rejects a value with leading
+//! or trailing whitespace rather than trimming it.
+//!
+//! ```
+//! use roxygen_http_adapter::RoxygenRequest;
+//!
+//! let request = http::Request::builder()
+//!     .uri("https://example.com/index.html")
+//!     .header("accept", "text/html")
+//!     .body(())?;
+//! let request = RoxygenRequest::try_from(request)?;
+//! assert!(request.message().is_secure());
+//! let request = http::Request::try_from(request)?;
+//! assert_eq!(request.uri(), "https://example.com/index.html");
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 use std::collections::HashSet;
 

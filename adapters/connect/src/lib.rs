@@ -5,22 +5,44 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Experimental pooled HTTP/2 CONNECT tunnels for Tokio applications over native Roxygen
-//! sessions.
+//! A pool of HTTP/2 CONNECT tunnels for Tokio applications.
 //!
-//! One `HostedWorker` owns an attached `HttpSessionPool` per application route key, the pool's
-//! sessions, and every CONNECT stream. Tokio callers submit through bounded admission and receive
-//! a `PendingTunnel` once the proxy returns 2xx. The caller then chooses the data path: a
-//! transferable `Tunnel` over bounded bridges, or a relay that copies between the stream and the
-//! caller's own I/O on the protocol worker. Attached sessions send HTTP/2 PING probes and drop a
-//! proxy connection that stops acknowledging them. Application connectors own the proxy address,
-//! DNS, TLS, ALPN, and socket options. Optional helpers prepare the request, run the TLS
-//! handshake, and start the runtime lazily.
+//! A [`ConnectRuntime`] runs one protocol worker thread that keeps a pool of HTTP/2 proxy sessions
+//! per route key and owns every CONNECT stream on them. Tokio code calls
+//! [`ConnectClient::connect`] on a cloneable client handle and receives a [`PendingTunnel`] once
+//! the proxy returns 2xx. The crate builds on `roxygen_client` sessions and `roxygen_connect`
+//! streams, and does not use hyper or the `h2` crate. For a single tunnel on a session that you
+//! manage on a Roxygen worker, use `roxygen_connect` directly.
 //!
-//! `runtime` holds the Tokio-facing owner and client handle, `worker` runs on the protocol
-//! worker, `tunnel` is the application side of an established tunnel and its choice, `relay` is
-//! the worker-side relay, and `options`, `error`, and `stats` hold its bounds, failure
-//! classification, and counters.
+//! The application supplies a [`Connector`] that dials each proxy connection. It handles proxy
+//! selection, DNS, TLS, ALPN, and socket options. Equal route keys must name the same proxy and TLS
+//! configuration, because a key's first connector serves its route until the route retires.
+//! [`connect_tls`] runs a TLS handshake that requires h2, and [`connect_request`] builds a CONNECT
+//! from HTTP/1-style header fields. The crate does not fall back to HTTP/1.1. When a connector
+//! returns [`DialError::H2NotNegotiated`], the connect fails with
+//! [`ConnectErrorKind::H2NotNegotiated`], and later connects on that route key fail the same way
+//! for `h2_unsupported_ttl`.
+//!
+//! The caller then chooses one of two data paths. Bytes that the proxy sends right after the 2xx
+//! reach the chosen path first.
+//!
+//! - [`PendingTunnel::into_tunnel`] returns a [`Tunnel`], a transferable `AsyncRead` and
+//!   `AsyncWrite` connected to the stream through bounded buffers.
+//! - [`PendingTunnel::relay`] hands a socket or other I/O to the protocol worker, which copies
+//!   between it and the stream. The returned future resolves to a [`RelayOutcome`].
+//!
+//! A CONNECT that the proxy provably did not process, such as one reset with `REFUSED_STREAM`, is
+//! retried up to `max_unprocessed_retries` times. An established tunnel is never replayed.
+//! [`ConnectError::committed`] reports whether the proxy may have acted on a failed CONNECT.
+//! Sessions send an HTTP/2 PING after `ping_interval` without reads, and drop the proxy connection
+//! if the PING is not acknowledged within `ping_timeout`.
+//!
+//! Creating, shutting down, and dropping a [`ConnectRuntime`] block the calling thread, so do them
+//! outside asynchronous Tokio tasks, for example in `spawn_blocking`. [`LazyConnectRuntime`]
+//! starts the runtime on first use. [`ConnectOptions`] holds the limits and deadlines, and
+//! [`ConnectStats`] the counters.
+//!
+//! The API is experimental and may change.
 
 pub mod error;
 pub mod lazy;

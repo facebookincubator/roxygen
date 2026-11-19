@@ -5,6 +5,30 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+//! Runs the Axum integration fixture, an end-to-end test of
+//! `roxygen_tower_adapter`.
+//!
+//! A Roxygen Tower client sends streaming requests over plaintext loopback TCP
+//! to an Axum router served by the same adapter. The binary runs four
+//! scenarios over HTTP/1.1, then again over HTTP/2 with prior knowledge:
+//!
+//! - an upload with trailers, echoed back while it is still being sent,
+//! - a response body that fails,
+//! - a startup that fails because the worker has already quiesced,
+//! - cancellation during the upload.
+//!
+//! The binary checks the operation, cleanup and join results of each scenario,
+//! and exits with a failure status if any check fails.
+//!
+//! This is a test fixture, not a tutorial. It checks ownership and failure
+//! paths in detail, so it is much longer than an application needs. For a
+//! short server, see examples/axum_router.rs.
+//!
+//! ```sh
+//! cargo run --bin axum_tower_example
+//! cargo test -p ferroxygen_axum_tower_fixture
+//! ```
+
 use std::process::ExitCode;
 
 use roxygen_axum_tower_fixture::Protocol;

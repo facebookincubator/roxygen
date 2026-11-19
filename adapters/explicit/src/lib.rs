@@ -5,12 +5,37 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Experimental explicit-connection HTTP/1.1 client over Roxygen client sessions.
+//! An HTTP/1.1 client that sends each request on a new connection to a numeric address.
 //!
-//! `error`, `exchange`, `stats`, and `tunnel` are host-agnostic: they run one exchange, directly
-//! or through a CONNECT tunnel, over any `WorkerContext` and an adopted byte stream. `runtime` is
-//! the Tokio host: TCP dialing, tokio-rustls, a tunnel's proxy leg, `HostedWorker` slots, slot
-//! restart, and fail-open state.
+//! Each [`Target`] holds a numeric `SocketAddr` and, for TLS, the application's own rustls
+//! `ClientConfig`. A send dials a new connection, runs one HTTP/1.1 GET over a `roxygen_client`
+//! session, drains the response body, and closes the connection. The crate does not resolve names,
+//! reuse connections, or support HTTP/2. Most applications use `roxygen_client`, which resolves
+//! names and pools HTTP/1.1 and HTTP/2 connections.
+//!
+//! The target's [`Security`] selects the connection:
+//!
+//! - [`Security::Plaintext`] dials the destination over TCP.
+//! - [`Security::Tls`] dials the destination and runs TLS with the caller's configuration, which
+//!   must not offer ALPN.
+//! - [`Security::Tunnel`] dials a plaintext HTTP/1.1 proxy, opens a CONNECT tunnel to the
+//!   destination with `roxygen_connect`, and runs TLS inside it. That TLS configuration must offer
+//!   either no ALPN protocol or exactly `http/1.1`. The proxy's response head is returned in
+//!   [`Response::connect_head`], or in [`ExplicitError::connect_head`] after a rejection or a
+//!   later failure.
+//!
+//! The crate has two layers:
+//!
+//! - The [`exchange`](mod@exchange), [`tunnel`], [`error`], and [`stats`] modules are
+//!   host-agnostic and do not use the Tokio runtime API. [`exchange()`] runs one exchange over any
+//!   `WorkerContext` and an [`EstablishedIo`](roxygen_transport::established::EstablishedIo), so
+//!   an embedder on another host can supply its own dialing, TLS, and worker.
+//! - The [`runtime`] module is the Tokio host. [`ExplicitRuntime`] runs a fixed set of worker
+//!   slots, dials TCP, runs TLS with tokio-rustls, and restarts a slot after its worker stops, up
+//!   to `max_restarts_per_minute`. [`ExplicitClient::send`] sends one request to its target, and
+//!   [`SlotHealth`] lets an embedder route around a failing slot.
+//!
+//! The API is experimental and may change.
 
 pub mod error;
 pub mod exchange;

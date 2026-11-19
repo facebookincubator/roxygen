@@ -5,6 +5,80 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+//! HTTP messages, body buffers, and the source, filter and handler traits shared by the other
+//! Roxygen crates.
+//!
+//! Applications use these types directly too, to write handlers for `roxygen_server` and to send
+//! or read bodies with `roxygen_client`.
+//!
+//! A request or response is an [`HttpSource`](source::HttpSource), a single-consumer stream of
+//! one header event followed by body events. The consumer pulls each event, and each body read
+//! passes a byte limit for the event it returns. The traits do not require `Send`, and their
+//! futures are not `Send`, so sources, filters and handlers stay on the worker thread that owns
+//! their connection.
+//!
+//! Main entry points:
+//!
+//! - [`message::HttpMessage`] is a request or response head, with its
+//!   [`headers::HttpHeaders`]. The [`url`] module parses URLs.
+//! - [`buf_queue::BufQueue`] holds bytes as a queue of shared `bytes::Bytes` segments, so
+//!   splitting, appending and trimming a body do not copy it. Each queue has a length limit.
+//! - [`source_holder::HttpSourceHolder`] owns a source and stops it if the holder is dropped
+//!   before the message ends. [`fixed_source::HttpFixedSource`] serves an in-memory message,
+//!   [`stream_source::HttpStreamSource`] is fed by a separate producer, and
+//!   [`hybrid_source::HttpHybridSource`] returns a given head and then forwards body reads to
+//!   another source.
+//! - [`handler::HttpHandler`] turns a request source into a response source.
+//!   [`handler_chain::HttpHandlerChain`] links handlers, and
+//!   [`filter_factory::HttpFilterFactoryHandler`] wraps each request and response in
+//!   [`source_filter::HttpSourceFilter`]s.
+//! - [`error::HttpError`] carries an [`error::HttpErrorCode`] and is the error type of every
+//!   read and handler.
+//! - [`byte_event`] defines callbacks that fire when given bytes are written, transmitted by the
+//!   network card, or acknowledged by the peer.
+//!
+//! Reading an in-memory response four bytes at a time:
+//!
+//! ```
+//! use roxygen_core::buf_queue::BufQueue;
+//! use roxygen_core::fixed_source::HttpFixedSource;
+//! use roxygen_core::source::HttpSource;
+//! use roxygen_core::source_holder::HttpSourceHolder;
+//! # use std::future::Future;
+//! # use std::pin::pin;
+//! # use std::task::{Context, Poll, Waker};
+//! # fn block_on<F: Future>(future: F) -> F::Output {
+//! #     match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
+//! #         Poll::Ready(output) => output,
+//! #         Poll::Pending => unreachable!("an in-memory source is always ready"),
+//! #     }
+//! # }
+//! # block_on(async {
+//!
+//! let body = BufQueue::from_vec(b"hello world".to_vec(), usize::MAX)?;
+//! let response = HttpFixedSource::make_fixed_response(200, Some(body))?;
+//! let mut source = HttpSourceHolder::new(Box::new(response));
+//!
+//! let mut head = source.read_header_event().await?;
+//! assert_eq!(head.headers_mut().status_code()?, 200);
+//!
+//! let mut received: Vec<u8> = Vec::new();
+//! loop {
+//!     let event = source.read_body_event(4).await?;
+//!     if let Some(body) = event.as_body() {
+//!         for segment in body.segments() {
+//!             received.extend_from_slice(segment);
+//!         }
+//!     }
+//!     if event.eom() {
+//!         break;
+//!     }
+//! }
+//! assert_eq!(received, b"hello world");
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # }).unwrap();
+//! ```
+
 pub mod body_event_queue;
 pub mod buf_queue;
 pub mod byte_event;

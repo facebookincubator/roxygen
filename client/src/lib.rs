@@ -5,7 +5,71 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! HTTP/1.1 and HTTP/2 client connectors, sessions and pools, each running on one worker thread.
+//! An HTTP/1.1 and HTTP/2 client: a connector, connection pools and a simple request API.
+//!
+//! A client connection is a `roxygen_session` session that belongs to one worker thread, and
+//! requests on it run as futures on that worker. Other threads, including those of a Tokio
+//! runtime, reach a worker through its `WorkerHandle`, as the example below does. This crate
+//! adds DNS resolution, TCP and TLS dialing, certificate identity checks, pooling and response
+//! collection to the session. The Tower client in `roxygen_tower_adapter` builds on it.
+//!
+//! The main entry points:
+//!
+//! - [`HttpClient`] sends one request and collects the response into a [`Response`]. The
+//!   `_with_reader` variants and `request_with_visitor` let the caller handle the response as
+//!   it arrives. [`HttpClient::get`] and [`HttpClient::post`] dial a new connection for each
+//!   call, with a two-second timeout unless [`RequestOptions`] sets one.
+//!   [`HttpClient::request`] and its variants send a [`RequestSpec`] or a request source on a
+//!   session you already hold. `HttpClient` also sets the process-wide default CA paths,
+//!   certificate verifier and request logger.
+//! - [`HttpConnector`] dials an address and returns a [`ClientSession`]. [`ConnectionParams`]
+//!   configures TCP and TLS, and [`SessionParams`] configures the HTTP session. A
+//!   `ClientSession` is a cloneable handle, and dropping the last clone drains the connection.
+//!   [`ClientSession::attach_transport`] starts a session on a connection that the
+//!   application established.
+//! - [`HttpSessionPool`] reuses sessions to one address, and [`ClientConnectionCache`] keeps a
+//!   pool for each destination on a worker. Both return a session with a request
+//!   reservation, which [`HttpClient::request`] accepts.
+//! - [`experimental`] holds client sessions and a pool on the experimental owned session
+//!   drivers.
+//!
+//! TLS connections offer `h2` and `http/1.1` through ALPN by default. Plaintext connections use
+//! `ConnectionParams::plaintext_protocol`, which defaults to HTTP/1.1. The default
+//! [`IdentityValidation::Logging`] verifies the certificate chain but accepts a certificate
+//! issued for another host name. It reports the mismatch to `cert_verify_log` if that is set.
+//! Use [`IdentityValidation::Enforcing`] to reject such a certificate.
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use roxygen_client::HttpClient;
+//! use roxygen_client::RequestOptions;
+//! use roxygen_runtime::tokio_host::ManagedWorker;
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let worker = ManagedWorker::new(16)?;
+//!     // The request runs on the worker thread, which owns the connection.
+//!     let call = worker.handle().call_local(|context| async move {
+//!         let options = RequestOptions::default();
+//!         HttpClient::get(&context, "http://127.0.0.1:3000/", options).await
+//!     })?;
+//!     let response = tokio::runtime::Builder::new_current_thread()
+//!         .enable_all()
+//!         .build()?
+//!         .block_on(call)??;
+//!     worker.shutdown()?;
+//!     println!(
+//!         "status: {}",
+//!         response.headers.response_status().unwrap_or_default()
+//!     );
+//!     Ok(())
+//! }
+//! ```
+//!
+//! [`ClientConnectionCache`]: pool::ClientConnectionCache
+//! [`HttpSessionPool`]: pool::HttpSessionPool
+//! [`IdentityValidation::Enforcing`]: connector::IdentityValidation::Enforcing
+//! [`IdentityValidation::Logging`]: connector::IdentityValidation::Logging
 
 #![cfg_attr(all(test, target_os = "linux", fbcode_build), feature(linux_pidfd))]
 

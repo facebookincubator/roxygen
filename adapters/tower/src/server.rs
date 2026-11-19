@@ -11,6 +11,15 @@
 //! the entered application runtime, and then start it. Reap the task that
 //! drives that run before releasing caller capacity. Only `ServerRun` joins the
 //! connection's tasks; the handles and their wait methods do not.
+//!
+//! Each request's extensions hold the connection's `Arc<ConnectionContext>`
+//! and a [`ServerExchange`] that cancels or observes that exchange.
+//!
+//! The response body for a HEAD request, or for a 1xx, 204 or 304 response, is
+//! dropped on the application runtime without being polled, and the head is
+//! sent without `Transfer-Encoding`. HEAD and 304 responses keep an explicit
+//! `Content-Length`. A service returns only its final response, so returning a
+//! 100 status is an error.
 
 mod application;
 mod connection;

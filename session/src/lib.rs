@@ -5,7 +5,48 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Worker-local HTTP session and stream lifecycle primitives.
+//! HTTP/1.1 and HTTP/2 connection state machines, each owned by one worker thread.
+//!
+//! A session drives one connection. It runs the codec, keeps each stream's state, applies
+//! flow control and timeouts, and moves header and body events between the connection and
+//! the application's sources. A downstream session passes each request to an
+//! [`HttpHandler`], and an upstream session sends requests and returns their responses. Most
+//! applications use `roxygen_server` and `roxygen_client`, which start sessions on the
+//! connections they accept and dial.
+//!
+//! The main entry points:
+//!
+//! - [`UniplexSession`] runs HTTP/1.1 or HTTP/2 on a [`UniplexTransport`], which every
+//!   [`ByteStreamTransport`] implements. [`UniplexConfig`] sets its buffer sizes and timeouts,
+//!   and [`Http2SessionConfig`] sets its HTTP/2 settings and flow-control windows.
+//!   [`UniplexSession::run`] returns the future that drives the connection.
+//! - [`UniplexHandle`], returned with the session, sends requests and HTTP/2 PINGs and starts a
+//!   drain from the same worker while the session runs.
+//! - [`SessionCore`] and [`StreamState`] hold the protocol-neutral connection and stream
+//!   lifecycles that `UniplexSession` builds on. [`shutdown`] orders a session's drain and
+//!   teardown.
+//! - [`http2`] holds HTTP/2 priority scheduling, flood limits and statistics hooks.
+//! - [`owned_h1`] and [`owned_h2`] are experimental poll-driven drivers. Each runs one future
+//!   per connection without a task per request. A downstream driver serves each request with an
+//!   [`OwnedExchange`] from the application's [`OwnedApplication`].
+//! - [`experimental`] holds unstable additions such as HTTP/2 PING probes and stream aborts.
+//!
+//! # Cargo features
+//!
+//! - `test-hooks`: exposes a hidden test hook on [`UniplexHandle`] to other crates' tests.
+//!
+//! [`ByteStreamTransport`]: roxygen_transport::byte_stream::ByteStreamTransport
+//! [`Http2SessionConfig`]: http2::Http2SessionConfig
+//! [`HttpHandler`]: roxygen_core::handler::HttpHandler
+//! [`OwnedApplication`]: owned::OwnedApplication
+//! [`OwnedExchange`]: owned::OwnedExchange
+//! [`SessionCore`]: session::SessionCore
+//! [`StreamState`]: stream_state::StreamState
+//! [`UniplexConfig`]: uniplex::UniplexConfig
+//! [`UniplexHandle`]: uniplex::UniplexHandle
+//! [`UniplexSession`]: uniplex::UniplexSession
+//! [`UniplexSession::run`]: uniplex::UniplexSession::run
+//! [`UniplexTransport`]: uniplex::UniplexTransport
 
 mod exchange;
 pub mod experimental;
