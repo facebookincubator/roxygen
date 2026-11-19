@@ -134,6 +134,7 @@
 pub mod acceptor;
 pub mod connection;
 pub mod expect_continue;
+pub mod experimental;
 pub mod scoped_server;
 pub mod server;
 pub mod shutdown;
