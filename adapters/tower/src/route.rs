@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! Immutable client route values and side-effect-free request-head projection.
 //!
 //! These values do not bind a connector generation, resolve hosts, admit work,

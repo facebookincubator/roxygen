@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! Worker-local HTTP/1 byte-stream session driver.
 //!
 //! HTTP/1.1 writes batch ready events within the configured buffer and write limits.

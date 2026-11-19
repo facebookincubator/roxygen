@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! The owned HTTP/1.1 client pool (`DIV-046`) as an egress client of uvicorn and Envoy peers,
 //! over loopback TCP against a scripted peer, under API Proxy's pool parameters: a connection
 //! the peer closes while it is idle (uvicorn closes a keep-alive connection after 5 s, scaled

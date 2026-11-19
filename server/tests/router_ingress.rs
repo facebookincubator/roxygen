@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! The router prototype's ingress combination: `serve_transport` with
 //! `abort_exchanges_on_eof` (`DIV-053`), `abort_http2_streams_on_eof`
 //! (`DIV-055`), `non_abortive_close` (`DIV-038`), `exact_method_tokens`

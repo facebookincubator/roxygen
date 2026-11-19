@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! `DIV-023` oracles for the `roxygen_connect::experimental` tunnel abort.
 
 use std::cell::RefCell;

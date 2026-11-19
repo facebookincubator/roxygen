@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! CONNECT tunnels: tunnel configuration, the CONNECT response head, and the CONNECT over an
 //! attached proxy session.
 //!

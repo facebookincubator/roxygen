@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! The ordered list behind a pool's sessions.
 //!
 //! A slab of nodes doubly linked in the pool's order, where a `VecDeque` searched for a

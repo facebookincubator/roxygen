@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! `ReadSlot` outcomes, pinned for the same scripted reads through each read path: one
 //! `UniplexTransport::read` future per read, and the transport's `UniplexReader`.
 

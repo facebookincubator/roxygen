@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 // Owned HTTP/1.1 upstream session tests. Each byte comparison runs a `UniplexSession` HTTP/1.1
 // client with the same request, the same zero-timeout `UniplexConfig` and the same origin bytes.
 

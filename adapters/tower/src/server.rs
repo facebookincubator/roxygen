@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! Established-I/O Tower serving with a separately owned application parent.
 //!
 //! Reserve caller capacity before preparing a connection, drive `ServerRun` on

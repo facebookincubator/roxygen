@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! llhttp HTTP/1 methods, opt-in exact HTTP/2 method tokens (`DIV-040`), and
 //! verbatim HTTP/2 field values (`DIV-041`) over `serve_transport` and loopback TCP, on a `RuntimeOwner`
 //! worker and a `HostedWorker`, for HTTP/1.1 and h2c, next to hyper's server

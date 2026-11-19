@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! `roxygen_connect::session::ConnectSession` for `ClientSession`.
 
 use roxygen_connect::session::ConnectSession;

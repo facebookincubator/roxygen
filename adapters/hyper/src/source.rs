@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! Demand-driven application bodies with worker- or application-owned joins.
 //!
 //! Prepare on the Roxygen worker, then attach on the application's live Tokio

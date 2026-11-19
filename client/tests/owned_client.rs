@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! The experimental owned client session (`DIV-046`), over loopback TCP and
 //! adopted transports, against a hyper origin and scripted peers, on a
 //! `RuntimeOwner` worker that must quiesce without forcing.

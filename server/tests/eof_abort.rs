@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! Opt-in abort of open exchanges on a downstream HTTP/1.1 peer's EOF
 //! (`ServerSessionConfig::abort_exchanges_on_eof`, `DIV-053`), and of open
 //! streams on a downstream HTTP/2 peer's EOF

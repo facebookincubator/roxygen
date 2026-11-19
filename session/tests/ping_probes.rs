@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! HTTP/2 PING probe oracles (`DIV-024`): the frozen `HTTP2DownstreamSessionTest` probe cases
 //! and the Roxygen-only timer, failure, and configuration cases.
 use std::cell::Cell;

@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! HTTP/1 header generation preserves the header bytes, sizes and errors
 //! recorded before `repair.session_message_copies` (expectation-349).
 //! Each case drives one codec through its headers, a body, an EOM and the next

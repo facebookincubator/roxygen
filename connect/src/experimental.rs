@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! Roxygen-only CONNECT response-head access (`DIV-011`) and explicit stream
 //! abort (`DIV-023`).
 //!

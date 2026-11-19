@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! Tests of the owner-local wheel timer, including ports of folly's
 //! `HHWheelTimerTest` (folly/io/async/test/HHWheelTimerTest.cpp).
 //!

@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! Source-faithful HTTP/2 framing, flow control, and RFC 7541 HPACK.
 
 pub mod codec_impl;

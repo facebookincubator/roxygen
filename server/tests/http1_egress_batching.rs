@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! HTTP/1.1 egress batching (`DIV-034`): an HTTP/1.1 server
 //! session writes a response head with the body ready with it, body events that
 //! are ready together, and a streamed response's last data with its end, in one

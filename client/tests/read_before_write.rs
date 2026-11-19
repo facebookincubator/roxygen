@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! Read-before-write arbitration of HTTP/1.1 client sessions (`DIV-042`)
 //! through an `HttpSessionPool` over loopback TCP, on a `ManagedWorker` and a
 //! `HostedWorker`: after one or two exchanges on a pooled connection, the

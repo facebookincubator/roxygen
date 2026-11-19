@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! What a caller needs to retry, as hyper-util's `retry_canceled_requests`
 //! does, a request that failed unstarted on a reused connection (`DIV-035`):
 //! `UniplexResponse::sequence_number` counts the requests the connection

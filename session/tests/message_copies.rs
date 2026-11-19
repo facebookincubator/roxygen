@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! Group-168: an HTTP/1 session keeps no copy of an ingress message, and
 //! HTTP/2's copy, which only its `INVALID_STATE_TRANSITION` failure reads,
 //! shares the delivered message's header entries (expectation-351).

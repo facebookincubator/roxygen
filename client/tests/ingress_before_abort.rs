@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! `SessionParams::deliver_ingress_before_abort` lets a response's reader take
 //! the head and body bytes that arrived before the response failed, then the
 //! error, as Hyper's body channel and h2 do (`DIV-033`).

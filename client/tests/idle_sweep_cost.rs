@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! A manual measurement for `DIV-032`: what the interval idle sweep, which runs
 //! once per pool, costs an idle worker with one origin pool and with 128 (and with
 //! none, for the worker's own idle cost), under the router's pool parameters. Run

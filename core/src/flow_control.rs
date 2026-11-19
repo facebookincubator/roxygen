@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 const MAX_WINDOW_SIZE: u32 = i32::MAX as u32;
 
 /// A signed HTTP/2 flow-control window with an unsigned configured capacity.

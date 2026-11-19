@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! Per-cleanup wakers for the non-hosted driver's woken-only cleanup polling.
 //!
 //! Each activated cleanup gets its own `Send + Sync` waker. A wake records the

@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! `SessionParams::non_abortive_close` (`DIV-038`): a connector-built plaintext
 //! session that resets its connection (here because the caller dropped a
 //! response) closes it as hyper and reqwest do, by dropping the socket, so the

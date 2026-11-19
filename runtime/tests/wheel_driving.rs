@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! Driving a worker's wheel timer: the `LocalHost::wheel_timer` capability,
 //! the Tokio host's worker wheel, and its wakeup in the supervisor of hosted
 //! and managed workers (`run_managed_driver`).

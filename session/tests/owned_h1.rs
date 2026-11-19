@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 // Owned HTTP/1.1 downstream driver tests. Each byte comparison runs `UniplexSession` HTTP/1.1
 // with the same input, the same zero-timeout `UniplexConfig` and the same scripted response,
 // whose fixed `date` keeps the clock out of the comparison.

@@ -1,6 +1,12 @@
-// Copyright (c) Meta Platforms, Inc. and affiliates.
-// Derived from llhttp, Copyright (c) 2018 Fedor Indutny.
-// SPDX-License-Identifier: MIT
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ *
+ * Derived from llhttp, Copyright (c) 2018 Fedor Indutny, licensed under the
+ * MIT license found in the LICENSE file in this directory.
+ */
 
 use std::ops::Range;
 

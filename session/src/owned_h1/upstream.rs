@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! Experimental owned HTTP/1.1 upstream session.
 //!
 //! The poll-driven HTTP/1.1 sibling of [`crate::owned_h2::OwnedH2UpstreamSession`], with the

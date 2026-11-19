@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! `SessionParams::unframed_bodiless_http1_requests` sends a request whose head
 //! ends the message with no body framing, as reqwest sends a `POST` with an
 //! empty body (`DIV-036`).

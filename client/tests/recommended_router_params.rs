@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 //! One `HttpSessionPool` with the parameters recommended for a router that is
 //! compared with reqwest (most-recently-used reuse, hyper-util's interval
 //! sweep, no session timers, buffered ingress before abort (`DIV-033`), unframed
