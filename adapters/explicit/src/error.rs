@@ -65,7 +65,8 @@ pub enum ErrorKind {
     /// A local resource limit was reached (`ENHANCE_YOUR_CALM`), such as a full worker command
     /// queue.
     ExcessiveLoad,
-    /// A protocol violation, or input that this API rejects.
+    /// A protocol violation, or input that this API rejects. A message that the HTTP/1.1 codec
+    /// cannot parse is `Other` instead, with code `HEADER_PARSE_ERROR` or `BODY_PARSE_ERROR`.
     Protocol,
     /// The exchange's own cancellation token was cancelled.
     Cancelled,
@@ -247,7 +248,7 @@ impl ExplicitError {
 
     /// Classifies a failure of a tunnel's CONNECT. A final non-2xx head is `TunnelRejected`.
     /// The head comes from the typed `ConnectRejected` cause, or from a head-wait
-    /// `CONTENT_LENGTH_MISMATCH`, which the HTTP/1.1 codec reports for a rejection with a body.
+    /// `CONTENT_LENGTH_MISMATCH` that carries a final non-2xx head.
     pub(crate) fn from_connect(error: &HttpError, observed: Observed) -> Self {
         let head = match connect_rejection(error) {
             Some(rejected) => Some(ConnectHead::from_message(

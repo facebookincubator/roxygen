@@ -1410,8 +1410,8 @@ mod tunnel {
             ),
             (
                 Script::Answer(b"HTTP/1.1 200 OK\r\nX-Bad: a\x7fb\r\n\r\n".to_vec()),
-                ErrorKind::Protocol,
-                HttpErrorCode::PROTOCOL_ERROR,
+                ErrorKind::Other,
+                HttpErrorCode::HEADER_PARSE_ERROR,
                 None,
             ),
             (
@@ -1470,7 +1470,7 @@ mod tunnel {
             (
                 b"HTTP/1.1 403 Forbidden\r\nProxy-Status: fwdproxy; error=destination_ip_prohibited\r\nX-FB-Error-From: fwdproxy\r\nContent-Length: 19\r\n\r\nnineteen bytes here",
                 403,
-                HttpErrorCode::CONTENT_LENGTH_MISMATCH,
+                HttpErrorCode::CONNECT_ERROR,
             ),
         ];
         for (index, (answer, status, code)) in rejections.into_iter().enumerate() {

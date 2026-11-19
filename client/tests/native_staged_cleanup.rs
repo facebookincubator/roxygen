@@ -8121,25 +8121,55 @@ fn native_staged_fixture_failure_controls() {
     cleanup_panic_controls(&runtime);
 }
 
+const ISOLATED_CHILD_MARKER: &str = "ROXYGEN_NATIVE_CLIENT_ISOLATED_CHILD";
+
+// These tests count descriptors and threads for the whole process, so each
+// one runs alone in a child process of this test binary.
+fn isolated(name: &str, body: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+    let test = format!("native_staged_cleanup_tests::{name}");
+    let receipt = format!("isolated child passed {test}");
+    if std::env::var_os(ISOLATED_CHILD_MARKER).is_some_and(|marker| marker == test.as_str()) {
+        body()?;
+        println!("{receipt}");
+        return Ok(());
+    }
+    let output = Command::new(std::env::current_exe()?)
+        .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+        .env(ISOLATED_CHILD_MARKER, &test)
+        .stdin(Stdio::null())
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    print!("{stdout}");
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        return Err(failure(format!(
+            "isolated child failed with {}",
+            output.status
+        )));
+    }
+    require(
+        stdout.contains(&receipt),
+        "isolated child ran the test body",
+    )
+}
+
 #[test]
 fn native_staged_cancellation_and_pressure() {
-    run(Schedule::Stages)
-        .expect("all four native routes retire staged cancellation and real pressure");
+    isolated("native_staged_cancellation_and_pressure", || {
+        run(Schedule::Stages)
+    })
+    .expect("all four native routes retire staged cancellation and real pressure");
 }
 
 #[test]
 fn native_trusted_context() {
-    run(Schedule::Context)
+    isolated("native_trusted_context", || run(Schedule::Context))
         .expect("actual native connection facts remain separate from command context");
 }
 
 #[test]
-#[cfg_attr(
-    not(fbcode_build),
-    ignore = "process-wide FD/thread checkpoints require per-test process isolation (one test per process)"
-)]
 fn native_alive_owner_resources() {
-    run(Schedule::Resources)
+    isolated("native_alive_owner_resources", || run(Schedule::Resources))
         .expect("fixed warmed native worker schedule retains strict alive-owner FD/thread bounds");
 }
 

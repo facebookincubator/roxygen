@@ -1310,7 +1310,7 @@ mod exchange {
     }
 
     /// Heads whose status line parses but which the codec rejects, with the code each fails with.
-    const MALFORMED_HEADS: [(&str, &[u8], HttpErrorCode); 4] = [
+    const MALFORMED_HEADS: [(&str, &[u8], HttpErrorCode); 5] = [
         (
             "/bad-header",
             b"HTTP/1.1 200 OK\r\nX-Good: 1\r\nno colon\r\nContent-Length: 0\r\n\r\n",
@@ -1329,7 +1329,12 @@ mod exchange {
         (
             "/bad-value",
             b"HTTP/1.1 200 OK\r\nX-Bad: a\x7f\r\nContent-Length: 0\r\n\r\n",
-            HttpErrorCode::PROTOCOL_ERROR,
+            HttpErrorCode::HEADER_PARSE_ERROR,
+        ),
+        (
+            "/bare-cr",
+            b"HTTP/1.1 200 OK\r\nX-Bad: a\rb\r\nContent-Length: 0\r\n\r\n",
+            HttpErrorCode::HEADER_PARSE_ERROR,
         ),
     ];
 
@@ -1551,33 +1556,45 @@ mod exchange {
         assert_eq!(complete_bytes(&response), 0);
     }
 
+    /// A head within the codec's head limit, with a header name longer than the 65,535 bytes that
+    /// `HeaderName` accepts.
+    fn head_with_long_name(before: &[u8], after: &[u8]) -> Vec<u8> {
+        let mut head = b"HTTP/1.1 200 OK\r\n".to_vec();
+        head.extend_from_slice(before);
+        head.extend([b'x'; 1 << 16]);
+        head.extend_from_slice(b": dropped\r\n");
+        head.extend_from_slice(after);
+        head.extend_from_slice(b"Content-Length: 0\r\n\r\n");
+        head
+    }
+
+    /// 20,000 empty headers, about as many as the codec's head limit has room for.
+    fn crowded_head() -> Vec<u8> {
+        let mut crowded = b"HTTP/1.1 200 OK\r\n".to_vec();
+        (0..20_000).for_each(|_| crowded.extend_from_slice(b"a:\r\n"));
+        crowded.extend_from_slice(b"Content-Length: 0\r\n\r\n");
+        crowded
+    }
+
     #[test]
     fn unrepresentable_response_header_is_dropped_and_counted() {
-        let server = responding(
-            b"HTTP/1.1 200 OK\r\nX-Kept: yes\r\nX-Unrepresentable: a\\\r\\b\r\nContent-Length: 0\r\n\r\n"
-                .to_vec(),
-        );
+        let server = responding(head_with_long_name(b"X-Kept: yes\r\n", b""));
         let runtime = start(1, "rxh");
         let mut client = runtime.client(plain_target(server.address));
         let response = block_on(client.send(request("localhost", "/", HANG_GUARD))).expect("ok");
         assert_eq!(response.status, 200);
         assert_eq!(response.dropped_headers, 1);
         assert_eq!(response.headers.get("x-kept").expect("kept header"), "yes");
-        assert!(response.headers.get("x-unrepresentable").is_none());
+        assert_eq!(response.headers.len(), 2);
         assert_eq!(runtime.stats().dropped_response_headers, 1);
 
-        // More headers than `HeaderMap` can index, within the codec's head limit, using bare-LF
-        // lines and empty values.
-        let mut crowded = b"HTTP/1.1 200 OK\n".to_vec();
-        (0..25_000).for_each(|_| crowded.extend_from_slice(b"a:\n"));
-        crowded.extend_from_slice(b"Content-Length: 0\n\n");
-        let server = responding(crowded);
+        let server = responding(crowded_head());
         let mut client = runtime.client(plain_target(server.address));
         let response = block_on(client.send(request("localhost", "/", HANG_GUARD))).expect("ok");
         assert_eq!(response.status, 200);
         assert_eq!(
             response.headers.get_all("a").iter().count() + response.dropped_headers,
-            25_000
+            20_000
         );
         assert_eq!(runtime.stats().panics, 0);
     }
@@ -1586,20 +1603,21 @@ mod exchange {
     /// a default client's map holds: the same first values, drops, and counted drops.
     #[test]
     fn raw_headers_read_as_the_default_client_s_map() {
-        let mut crowded = b"HTTP/1.1 200 OK\n".to_vec();
-        (0..25_000).for_each(|_| crowded.extend_from_slice(b"a:\n"));
-        crowded.extend_from_slice(b"Content-Length: 0\n\n");
         let heads = [
-            b"HTTP/1.1 200 OK\r\nX-Kept: yes\r\nX-Unrepresentable: a\\\r\\b\r\n\
-                x-unrepresentable: after\r\nX-Dup: first\r\nx-dup: second\r\n\
-                X-Obs: caf\xe9\r\nLocation: /elsewhere\r\nContent-Length: 0\r\n\r\n"
-                .to_vec(),
-            crowded,
+            (
+                head_with_long_name(
+                    b"X-Kept: yes\r\n",
+                    b"X-Dup: first\r\nx-dup: second\r\nX-Obs: caf\xe9\r\nLocation: /elsewhere\r\n",
+                ),
+                1,
+            ),
+            (crowded_head(), 0),
         ];
+        let long_name = "x".repeat(1 << 16);
         let names = [
             "x-kept",
             "X-KEPT",
-            "x-unrepresentable",
+            long_name.as_str(),
             "x-dup",
             "x-obs",
             "location",
@@ -1609,7 +1627,7 @@ mod exchange {
             "bad name",
         ];
         let runtime = start(1, "rxr");
-        heads.into_iter().for_each(|head| {
+        heads.into_iter().for_each(|(head, dropped)| {
             let send = |raw: bool| {
                 let server = responding(head.clone());
                 let client = runtime.client(plain_target(server.address));
@@ -1625,7 +1643,10 @@ mod exchange {
             let raw = send(true);
             assert!(mapped.raw_headers.is_none());
             assert!(raw.headers.is_empty(), "{:?}", raw.headers);
-            assert_eq!(raw.dropped_headers, mapped.dropped_headers);
+            assert_eq!(
+                (raw.dropped_headers, mapped.dropped_headers),
+                (dropped, dropped)
+            );
             assert_eq!(
                 runtime.stats().dropped_response_headers - dropped_before,
                 u64::try_from(raw.dropped_headers).unwrap()
@@ -1650,27 +1671,6 @@ mod exchange {
                 );
             });
         });
-        let first = block_on(async {
-            let server = responding(
-                b"HTTP/1.1 200 OK\r\nX-Unrepresentable: a\\\r\\b\r\nx-unrepresentable: after\r\n\
-                    Content-Length: 0\r\n\r\n"
-                    .to_vec(),
-            );
-            let mut client = runtime
-                .client(plain_target(server.address))
-                .with_raw_headers();
-            client.send(request("localhost", "/", HANG_GUARD)).await
-        })
-        .expect("ok");
-        // The map drops the first value, so the second is the first it holds.
-        assert_eq!(
-            first
-                .raw_headers
-                .as_ref()
-                .and_then(|headers| headers.get_str("x-unrepresentable")),
-            Some("after")
-        );
-        assert_eq!(first.dropped_headers, 1);
     }
 
     #[test]

@@ -1106,18 +1106,21 @@ enum HeadEnding {
 /// head still queued, the stream source moves that head into the error and discards the queued
 /// body.
 ///
-/// Codec errors also carry the message being parsed. The HTTP/1.1 codec rejects a head with
-/// `HEADER_PARSE_ERROR` or `PROTOCOL_ERROR`, so the message on those errors is a partial head, and
-/// a close inside a head leaves the status line unparsed. Uniplex builds the codec without strict
-/// validation (`Http1xCodec::new`), so a bad trailer is a `BODY_PARSE_ERROR` rather than a
-/// `PROTOCOL_ERROR` after a head.
+/// Codec errors also carry the message being parsed, which may already hold a status. The
+/// HTTP/1.1 codec rejects a head with `HEADER_PARSE_ERROR` or `PROTOCOL_ERROR`, so the message on
+/// those errors is a partial head. A head that a close cuts short has no ingress size, which the
+/// codec sets only when a head is complete. Uniplex builds the codec without strict validation
+/// (`Http1xCodec::new`), so a bad trailer is a `BODY_PARSE_ERROR` rather than a `PROTOCOL_ERROR`
+/// after a head.
 fn final_head(mut error: HttpError) -> Result<(HttpMessage, HttpError), HttpError> {
     let rejected = error.code() == HttpErrorCode::HEADER_PARSE_ERROR
         || error.code() == HttpErrorCode::PROTOCOL_ERROR;
     // `is_final` turns a message without a kind into a response with status 0, so check first.
     let is_final = !rejected
         && error.http_message_mut().is_some_and(|head| {
-            head.response_status().is_some() && head.is_final().unwrap_or(false)
+            head.ingress_header_size().uncompressed != 0
+                && head.response_status().is_some()
+                && head.is_final().unwrap_or(false)
         });
     if !is_final {
         return Err(error);
