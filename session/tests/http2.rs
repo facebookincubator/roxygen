@@ -6754,6 +6754,8 @@ pub mod h2 {
         );
     }
 
+    /// The trailers, without END_STREAM, fail the stream in the codec before the body after
+    /// them reaches the stream's source.
     fn assert_real_state_machine_error() {
         let outcome = run_downstream_error_case(
             vec![FixtureRead::DataEof(peer_state_machine_error())],
@@ -6761,10 +6763,7 @@ pub mod h2 {
             UniplexConfig::default(),
             None,
         );
-        assert_eq!(
-            outcome.request_error,
-            Some(HttpErrorCode::INVALID_STATE_TRANSITION)
-        );
+        assert_eq!(outcome.request_error, Some(HttpErrorCode::PROTOCOL_ERROR));
         assert!(outcome.partial_message);
         assert_eq!(
             decode_server_frames(&outcome.wire).resets,

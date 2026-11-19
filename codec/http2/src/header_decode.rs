@@ -275,6 +275,7 @@ pub struct HeaderDecodeInfo {
     has_status: bool,
     regular_header_seen: bool,
     pseudo_header_seen: bool,
+    missing_end_stream: bool,
 }
 
 impl HeaderDecodeInfo {
@@ -303,6 +304,7 @@ impl HeaderDecodeInfo {
             has_status: false,
             regular_header_seen: false,
             pseudo_header_seen: false,
+            missing_end_stream: false,
         }
     }
 
@@ -314,6 +316,12 @@ impl HeaderDecodeInfo {
     }
 
     /// Sets `options` in place, as `with_options` does by value.
+    /// Marks a header block whose HEADERS frame did not end the stream, which trailers
+    /// must do.
+    pub(crate) const fn set_missing_end_stream(&mut self, missing: bool) {
+        self.missing_end_stream = missing;
+    }
+
     pub(crate) const fn set_options(&mut self, options: FieldDecodeOptions) {
         self.options = options;
         self.reference_fields = Self::uses_reference_fields(self.validate, options);
@@ -562,9 +570,15 @@ impl HeaderDecodeInfo {
             }
         }
         let response_trailers = !self.is_request && !self.has_status;
-        if (self.request_trailers || response_trailers) && self.pseudo_header_seen {
-            self.parsing_error = Some("Pseudo headers forbidden in trailers.".to_owned());
-            return;
+        if self.request_trailers || response_trailers {
+            if self.pseudo_header_seen {
+                self.parsing_error = Some("Pseudo headers forbidden in trailers.".to_owned());
+                return;
+            }
+            if self.missing_end_stream {
+                self.parsing_error = Some("Trailers without END_STREAM.".to_owned());
+                return;
+            }
         }
         self.message.set_http_version(1, 1);
         self.message.set_ingress_header_size(decoded_size);

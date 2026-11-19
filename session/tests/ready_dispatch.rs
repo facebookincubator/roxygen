@@ -1871,6 +1871,7 @@ enum ResponseEnding {
     TrailerFin,
     TrailerWithoutFin,
     ShortTrailerFin,
+    DataWithoutFin,
 }
 
 fn response_terminal_action(
@@ -1957,17 +1958,33 @@ fn response_terminal_action(
             drop(headers);
             drive_core_callbacks(&session.state, &handle.read_wake).unwrap();
 
-            let mut trailers = HttpHeaders::new();
-            trailers.set(b"x-trailer", b"done");
-            peer.generate(
-                &mut wire,
-                EgressFrame::Trailers {
-                    stream,
-                    trailers: &trailers,
-                },
-                &mut callback,
-            )
-            .unwrap();
+            if matches!(ending, ResponseEnding::DataWithoutFin) {
+                let mut body = BufQueue::new(16);
+                body.push_vec(b"x".to_vec()).unwrap();
+                peer.generate(
+                    &mut wire,
+                    EgressFrame::Body {
+                        stream,
+                        body,
+                        padding: None,
+                        end_stream: false,
+                    },
+                    &mut callback,
+                )
+                .unwrap();
+            } else {
+                let mut trailers = HttpHeaders::new();
+                trailers.set(b"x-trailer", b"done");
+                peer.generate(
+                    &mut wire,
+                    EgressFrame::Trailers {
+                        stream,
+                        trailers: &trailers,
+                    },
+                    &mut callback,
+                )
+                .unwrap();
+            }
             let length = wire.chain_length();
             let mut bytes = wire.coalesce(length).unwrap().to_vec();
             if matches!(ending, ResponseEnding::TrailerWithoutFin) {
@@ -2030,8 +2047,8 @@ fn received_trailer_fin_does_not_reset_an_abandoned_response() {
 }
 
 #[test]
-fn trailers_without_fin_still_cancel_an_abandoned_response() {
-    let (updates, error, parse_error) = response_terminal_action(ResponseEnding::TrailerWithoutFin);
+fn body_without_fin_still_cancels_an_abandoned_response() {
+    let (updates, error, parse_error) = response_terminal_action(ResponseEnding::DataWithoutFin);
     assert_eq!(error, None);
     assert_eq!(parse_error, None);
     assert_eq!(
@@ -2044,6 +2061,16 @@ fn trailers_without_fin_still_cancel_an_abandoned_response() {
             true,
         )]
     );
+}
+
+/// Trailers that do not end the stream fail it with PROTOCOL_ERROR, which resets it, so the
+/// abandoned response detaches without a second reset.
+#[test]
+fn trailers_without_fin_fail_an_abandoned_response() {
+    let (updates, error, parse_error) = response_terminal_action(ResponseEnding::TrailerWithoutFin);
+    assert_eq!(updates, vec![(StreamAction::None, true)]);
+    assert_eq!(error, None);
+    assert_eq!(parse_error, Some(HttpErrorCode::PROTOCOL_ERROR));
 }
 
 #[test]

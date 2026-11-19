@@ -1226,11 +1226,14 @@ impl Http2Codec {
             self.pending_end_stream = None;
             return Ok(());
         }
-        let (request, mut trailers) = match block.kind {
+        let (request, mut trailers, end_stream) = match block.kind {
             HeaderBlockKind::Headers {
-                request, trailers, ..
-            } => (request, trailers),
-            HeaderBlockKind::PushPromise { .. } => (true, false),
+                request,
+                trailers,
+                end_stream,
+                ..
+            } => (request, trailers, end_stream),
+            HeaderBlockKind::PushPromise { .. } => (true, false, true),
         };
         let memo_before = if !trailers
             && matches!(block.kind, HeaderBlockKind::Headers { .. })
@@ -1253,6 +1256,7 @@ impl Http2Codec {
                 false,
             );
             decode.set_options(self.field_options);
+            decode.set_missing_end_stream(!end_stream);
             let head = !trailers && matches!(block.kind, HeaderBlockKind::Headers { .. });
             let mut presizing = PresizingDecode {
                 decode: &mut decode,

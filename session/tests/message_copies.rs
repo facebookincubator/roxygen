@@ -861,8 +861,11 @@ fn http2_upstream_ingress_copy_shares_the_delivered_header_entries() {
     );
 }
 
+/// Trailers without END_STREAM, and DATA after them, arrive after the handler has read its
+/// headers. The codec fails the stream at the trailers, so its source never sees the DATA, and
+/// the failure carries the trailers the codec decoded rather than a copy of the head.
 #[test]
-fn http2_state_failure_carries_an_equal_message() {
+fn http2_trailers_without_end_stream_fail_after_the_head() {
     let mut codec = Http2Codec::new(TransportDirection::Upstream);
     let mut callback = super::NoopCodecCallback;
     let mut output = BufQueue::new(QUEUE_LIMIT);
@@ -906,8 +909,6 @@ fn http2_state_failure_carries_an_equal_message() {
             &mut callback,
         )
         .expect("request trailers");
-    // Without END_STREAM on the trailers the codec accepts the DATA after them,
-    // which the complete stream's source rejects.
     let mut trailer_bytes = queue_bytes(&trailer_wire);
     trailer_bytes[4] &= !0x1;
     let mut body_wire = BufQueue::new(QUEUE_LIMIT);
@@ -930,11 +931,6 @@ fn http2_state_failure_carries_an_equal_message() {
         &mut Http2Codec::new(TransportDirection::Downstream),
         &headers_wire,
     );
-    // The trailers and late DATA arrive after the handler has read its headers,
-    // so the source does not hold an unread header to stand in for the failure's
-    // message.
-    // The source rejects the DATA with its own error, which carries no message,
-    // so the failure's message is read from the stream's terminal error.
     let outcome = run_downstream(
         vec![(0, headers_wire), (1, late)],
         true,
@@ -953,15 +949,20 @@ fn http2_state_failure_carries_an_equal_message() {
             },
         )]
     );
-    let invalid = HttpErrorCode::INVALID_STATE_TRANSITION.as_u16();
+    let protocol = HttpErrorCode::PROTOCOL_ERROR.as_u16();
     assert_eq!(
         outcome.failures,
         [(
             StreamId::new(1),
             Failure {
-                body_error: invalid,
-                terminal: Some((invalid, expected[0].clone())),
-                shares_probe: Some(true),
+                body_error: protocol,
+                terminal: Some((
+                    protocol,
+                    "kindless 1.0 [\"x-trailer\": \"done\", ] keepalive=true chunked=false \
+                     upgraded=false websocket=false"
+                        .to_owned()
+                )),
+                shares_probe: Some(false),
             },
         )]
     );

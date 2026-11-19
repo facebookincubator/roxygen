@@ -5210,6 +5210,81 @@ fn trailers_reply_with_pseudo_headers() {
 }
 
 #[test]
+fn trailers_without_end_stream() {
+    let mut sender = Http2Codec::new(TransportDirection::Upstream);
+    let stream = sender.create_stream();
+    let mut output = BufQueue::new(4096);
+    sender
+        .generate(
+            &mut output,
+            EgressFrame::Headers {
+                stream,
+                message: &request(b"/guacamole"),
+                end_stream: false,
+                extra_headers: None,
+            },
+            &mut Trace::default(),
+        )
+        .unwrap();
+    let mut wire = bytes(&output);
+    wire.extend_from_slice(&encoded_headers(
+        1,
+        &[HpackHeader::new(b"x-trailer-1", b"pico-de-gallo")],
+        false,
+    ));
+    let (_, trace, _) = run_downstream_wire(&wire);
+    assert_trailers_rejected_without_end_stream(&trace);
+}
+
+fn reply_trailers_without_end_stream(trailers: &[HpackHeader]) -> Trace {
+    let mut receiver = Http2Codec::new(TransportDirection::Upstream);
+    receiver.create_stream();
+    let mut trace = Trace::default();
+    open(&mut receiver, &mut trace);
+    let mut wire = encoded_headers(1, &[HpackHeader::new(b":status", b"200")], false);
+    wire.extend_from_slice(&encoded_headers(1, trailers, false));
+    trace.events.clear();
+    assert_eq!(
+        ingress_one(&mut receiver, &wire, &mut trace).consumed,
+        wire.len()
+    );
+    trace
+}
+
+/// The head arrives, the trailers block is a stream error, and the connection is unaffected.
+fn assert_trailers_rejected_without_end_stream(trace: &Trace) {
+    assert_eq!(
+        trace
+            .events
+            .iter()
+            .filter(|event| matches!(event, Seen::Headers(1, ..)))
+            .count(),
+        1
+    );
+    assert!(trace.events.iter().any(|event| matches!(
+        event,
+        Seen::Error(1, Some(H2ErrorCode::PROTOCOL_ERROR), _, _)
+    )));
+    assert!(!trace.events.iter().any(|event| matches!(
+        event,
+        Seen::Trailers(..) | Seen::Complete(_) | Seen::Error(0, ..)
+    )));
+}
+
+#[test]
+fn trailers_reply_without_end_stream() {
+    let trace =
+        reply_trailers_without_end_stream(&[HpackHeader::new(b"x-trailer-1", b"pico-de-gallo")]);
+    assert_trailers_rejected_without_end_stream(&trace);
+}
+
+#[test]
+fn trailers_reply_empty_without_end_stream() {
+    let trace = reply_trailers_without_end_stream(&[]);
+    assert_trailers_rejected_without_end_stream(&trace);
+}
+
+#[test]
 fn trailers_reply_continuation() {
     let mut trailers = sample_trailers();
     trailers.add(b"x-huge", vec![b'x'; 20 * 1024]);
