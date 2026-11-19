@@ -241,7 +241,7 @@ impl HpackEncoder {
         self.encode_parts_into(headers, headroom, Vec::new())
     }
 
-    /// Encodes `headers` into `storage`, whose contents are discarded and whose capacity is reused.
+    /// Encodes `headers` into `storage`, discarding its contents and reusing its capacity.
     fn encode_parts_into<'a>(
         &mut self,
         headers: impl Iterator<Item = (&'a HeaderName, &'a [u8])>,
@@ -265,7 +265,7 @@ impl HpackEncoder {
         self.encode_inputs_into(headers, headroom, stats, Vec::new())
     }
 
-    /// Encodes `headers` into `storage`, whose contents are discarded and whose capacity is reused.
+    /// Encodes `headers` into `storage`, discarding its contents and reusing its capacity.
     fn encode_inputs_into(
         &mut self,
         headers: &impl HeaderInputs,
@@ -765,7 +765,7 @@ impl HpackDecoder {
         &self.context
     }
 
-    /// Decodes one field representation, whose first byte the caller has peeked as `byte`.
+    /// Decodes one field representation. The caller has already peeked its first byte as `byte`.
     fn decode_header(
         &mut self,
         input: &mut HpackDecodeBuffer<'_>,
@@ -975,8 +975,9 @@ impl HpackCodec {
         Ok(compressed)
     }
 
-    /// Keeps `block`'s storage for the next header block. Callers recycle only single-frame blocks, so the kept
-    /// storage was sized for at most one frame (the egress maximum frame size plus its frame prefix).
+    /// Keeps `block`'s storage for the next header block. Callers recycle only single-frame blocks,
+    /// so the kept storage was sized for at most one frame (the egress maximum frame size plus its
+    /// frame prefix).
     pub(crate) fn recycle_block(&mut self, block: EncodedHeaderBlock) {
         self.block_storage = block.into_storage();
     }
@@ -1178,7 +1179,7 @@ impl HpackCodec {
         (self.encoder.encode_inputs_calls, self.decoder.decode_calls)
     }
 
-    /// The field count that the last `encode_inputs_block` judged memo eligibility on.
+    /// The field count used by the memo eligibility check in the last `encode_inputs_block`.
     #[cfg(test)]
     pub(crate) const fn last_encode_fields(&self) -> usize {
         self.encode_fields
@@ -1693,7 +1694,7 @@ mod memo_tests {
         assert!(codec.encoder_memo.is_none());
     }
 
-    /// A consumer-shaped gRPC response of five fields whose `x-upstream-time` is `digit`.
+    /// A five-field gRPC response with `x-upstream-time` set to `digit`.
     fn grpc_response(digit: usize) -> Inputs {
         Inputs(vec![
             HpackHeader::new(":status", "200"),
@@ -1704,7 +1705,8 @@ mod memo_tests {
         ])
     }
 
-    /// A codec whose table holds every `grpc_response`, so that none of them mutates it again.
+    /// A codec with every `grpc_response` already in its table, so that encoding one does not
+    /// change the table again.
     fn indexed_digits() -> HpackCodec {
         let mut codec = HpackCodec::new();
         for digit in 0..10 {
@@ -1731,13 +1733,13 @@ mod memo_tests {
     #[test]
     fn churning_indexed_value_backs_off_memo() {
         // Every block differs from the one before and refers only to indexed fields, so the memo
-        // stays armed and every match pass misses. Block 1 finds no memo (the last warm-up block
+        // stays armed and every match pass misses. Block 1 has no memo (the last warm-up block
         // inserted) and builds the key. A miss after m consecutive misses idles 2^min(m, 5) - 1
         // blocks, so match passes run on blocks 2, 3, 5, 9, 17 and 33 (the next on 65), and the key
         // is built on block 1 and refilled on blocks 2, 4, 8, 16, 32 and 64, the block before each
-        // later pass (an isolated miss idles 0 blocks and refills at once): at most 7 key builds
-        // and 6 match passes. Without a back-off every block builds a key and blocks 2-64 run a
-        // match pass: 64 and 63.
+        // later pass (an isolated miss idles 0 blocks and refills immediately). That is at most 7
+        // key builds and 6 match passes. Without a back-off every block builds a key and blocks
+        // 2-64 run a match pass: 64 and 63.
         let mut codec = indexed_digits();
         let epoch = codec.encoder.context.mutation_epoch();
         let before = (codec.memo_key_builds, codec.memo_match_passes);

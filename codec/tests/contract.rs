@@ -1223,8 +1223,8 @@ fn filters_intercept_and_transform_every_codec_query() {
     );
 }
 
-/// `DIV-058`: a filtered callback answers the destination callback's ingress body limit, and a
-/// callback that does not answer it sets no bound.
+/// A filtered callback returns the destination callback's ingress body limit, and a callback
+/// that does not override it sets no bound.
 #[test]
 fn filtered_callbacks_answer_the_destinations_ingress_body_limit() {
     struct Bounded;

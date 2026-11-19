@@ -26,34 +26,34 @@ use crate::util::validate_method;
 use crate::util::validate_scheme;
 use crate::util::validate_url;
 
-/// Roxygen-only options for decoding a field section, all off by default.
+/// Options for decoding a field section, all off by default.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FieldDecodeOptions {
-    /// `DIV-040`: a request's `:method` is any RFC 9110 token, case-sensitive and kept byte
-    /// for byte (`Method::from_exact_token`), as `http::Method::from_bytes` reads it, instead
-    /// of a run of letters and `-` whose recognized methods match without regard to case.
+    /// Accepts any RFC 9110 token as a request's `:method`, case-sensitive and kept byte for
+    /// byte (`Method::from_exact_token`), as `http::Method::from_bytes` parses it. When off, a
+    /// method is a run of letters and `-`, and recognized methods match regardless of case.
     pub exact_methods: bool,
-    /// `DIV-041`: regular field values are stored exactly as decoded, as h2 stores them,
-    /// instead of trimmed of surrounding whitespace, and are validated as h2 validates
-    /// them: no byte below 0x20 other than HTAB and no DEL (so no obsolete line folding),
-    /// in strict mode also no byte above 0x7E, a `content-length` of at most 19 digits (an
-    /// empty one is kept, and a session reads it as zero), and a `te` of exactly
-    /// `trailers`. Crumbs of `cookie` are still combined into one value, without trimming
-    /// it.
+    /// Stores regular field values exactly as decoded, as h2 does, instead of trimming
+    /// surrounding whitespace. Values are then validated as h2 validates them. They must not
+    /// contain DEL or a byte below 0x20 other than HTAB (so obsolete line folding is
+    /// rejected), and in strict mode no byte above 0x7E. A `content-length` has at most 19
+    /// digits (an empty one is kept, and a session reads it as zero), and a `te` must be
+    /// exactly `trailers`. `cookie` crumbs are still combined into one value, without
+    /// trimming it.
     pub verbatim_values: bool,
 }
 
-/// Whether `value` is a field value h2 0.4 accepts (`HeaderValue::from_bytes`): no byte
-/// below 0x20 other than HTAB, and no DEL; with `strict`, Roxygen's strict validation, no
-/// byte above 0x7E either.
+/// Whether h2 0.4 accepts `value` as a field value (`HeaderValue::from_bytes`). It must not
+/// contain DEL or a byte below 0x20 other than HTAB. With `strict`, bytes above 0x7E are
+/// rejected too.
 fn is_h2_field_value(value: &[u8], strict: bool) -> bool {
     value
         .iter()
         .all(|byte| (*byte >= 0x20 || *byte == b'\t') && *byte != 0x7f && (!strict || *byte < 0x80))
 }
 
-/// Whether `value` is a `content-length` h2 0.4 accepts (`frame::headers::parse_u64`): at most
-/// 19 decimal digits, an empty value (which it reads as zero) included.
+/// Whether h2 0.4 accepts `value` as a `content-length` (`frame::headers::parse_u64`). It must
+/// have at most 19 decimal digits. An empty value is accepted and read as zero.
 fn is_h2_content_length(value: &[u8]) -> bool {
     value.len() <= 19 && value.iter().all(u8::is_ascii_digit)
 }
@@ -75,7 +75,7 @@ impl HttpRequestVerifier {
         *self = Self::default();
     }
 
-    /// `set_method`, reading the method as `options` say.
+    /// Calls `set_method`, or the exact-token parse if `options.exact_methods` is set.
     pub fn set_method_with(
         &mut self,
         message: &mut HttpMessage,
@@ -264,8 +264,8 @@ pub struct HeaderDecodeInfo {
     pub decode_error: Option<HpackError>,
     verifier: HttpRequestVerifier,
     options: FieldDecodeOptions,
-    /// `validate` without `FieldDecodeOptions::verbatim_values`: regular fields are validated
-    /// and stored trimmed, with one flag test in `on_header`.
+    /// Set when `validate` is on and `FieldDecodeOptions::verbatim_values` is off. Regular
+    /// fields are then validated and stored trimmed, and `on_header` tests only this flag.
     reference_fields: bool,
     is_request: bool,
     request_trailers: bool,
@@ -319,7 +319,6 @@ impl HeaderDecodeInfo {
         self.reference_fields = Self::uses_reference_fields(self.validate, options);
     }
 
-    /// `reference_fields` for `validate` and `options`.
     const fn uses_reference_fields(validate: bool, options: FieldDecodeOptions) -> bool {
         validate && !options.verbatim_values
     }
@@ -490,8 +489,8 @@ impl HeaderDecodeInfo {
         true
     }
 
-    /// The rest of `on_header` for a regular field kept verbatim (`DIV-041`), checked as h2
-    /// checks it.
+    /// The rest of `on_header` for a regular field when values are kept verbatim. The field is
+    /// validated as h2 validates it.
     #[inline(never)]
     fn add_verbatim_field(&mut self, name: &HeaderName, value: &[u8]) -> bool {
         let bytes = name.as_bytes();
@@ -530,7 +529,7 @@ impl HeaderDecodeInfo {
         }
     }
 
-    /// Fails on a regular field that validation refuses, keeping its value.
+    /// Fails on a regular field that validation rejects, keeping its value.
     #[cold]
     fn reject_field(&mut self, bytes: &[u8], value: &[u8]) -> bool {
         self.proxygen_error = Some(if bytes.is_empty() {
@@ -571,7 +570,7 @@ impl HeaderDecodeInfo {
         self.message.set_ingress_header_size(decoded_size);
     }
 
-    /// Replaces the `cookie` crumbs with `cookie`, their combination, kept verbatim with
+    /// Replaces the `cookie` crumbs with their combined value, which is kept verbatim with
     /// `FieldDecodeOptions::verbatim_values`.
     #[inline(never)]
     fn set_combined_cookie(&mut self, cookie: Box<[u8]>) {

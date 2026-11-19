@@ -11,7 +11,7 @@
 pub const FRAME_HEADER_SIZE: usize = 9;
 /// Maximum bytes preceding an encoded header block in a HEADERS frame.
 pub const FRAME_HEADERS_BASE_MAX_SIZE: usize = FRAME_PRIORITY_SIZE + 1;
-/// Bytes in the legacy priority fields carried by a HEADERS frame.
+/// Bytes in the RFC 7540 priority fields carried by a HEADERS frame.
 pub const FRAME_PRIORITY_SIZE: usize = 5;
 /// Bytes in an encoded stream identifier.
 pub const FRAME_STREAM_ID_SIZE: usize = 4;
@@ -42,7 +42,7 @@ pub const MAX_STREAM_ID: u32 = (1 << 31) - 1;
 pub const INITIAL_WINDOW: u32 = (1 << 16) - 1;
 /// Largest legal WINDOW_UPDATE increment.
 pub const MAX_WINDOW_UPDATE_SIZE: u32 = (1 << 31) - 1;
-/// Proxygen's default upper bound for an HPACK header table.
+/// Default upper bound for an HPACK header table.
 pub const MAX_HEADER_TABLE_SIZE: u32 = 1 << 16;
 /// Largest cached secondary-authentication authenticator.
 pub const MAX_AUTHENTICATOR_BUFFER_SIZE: u32 = 0x20_000;
@@ -53,7 +53,7 @@ pub const CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 pub const PROTOCOL: &str = "h2";
 /// Historical draft ALPN identifier.
 pub const PROTOCOL_DRAFT: &str = "h2-14";
-/// Proxygen experimental ALPN identifier.
+/// Proxygen's experimental ALPN identifier.
 pub const PROTOCOL_EXPERIMENTAL: &str = "h2-fb";
 /// Cleartext HTTP/2 upgrade identifier.
 pub const PROTOCOL_CLEARTEXT: &str = "h2c";

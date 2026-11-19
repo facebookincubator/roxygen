@@ -146,12 +146,10 @@ impl IndexedName {
     }
 }
 
-/// Port of proxygen `HeaderTable::names_map` (`HeaderTable.h:27-30`): for each live name, the
-/// insertion ordinal of its newest entry. Each entry links to the next older entry under the same
-/// key (`TableEntry::older`), so the links from the newest entry visit a name's entries newest
-/// first, as proxygen's per-name index list does, without a list per name. Common names are keyed
-/// by their one-byte code, as proxygen's `HPACKHeaderName` hash does (`HPACKHeaderName.h:208-216`),
-/// and other names by their precomputed name hash.
+/// For each live name, the insertion ordinal of its newest entry. Each entry links to the next
+/// older entry under the same key (`TableEntry::older`), so the links from the newest entry visit
+/// a name's entries newest first without a list per name. Common names are keyed by their one-byte
+/// code, and other names by their precomputed name hash.
 #[derive(Clone, Debug, Default)]
 struct NamesIndex {
     common: HashMap<u8, u32, BuildHasherDefault<CodeHasher>>,
@@ -161,8 +159,8 @@ struct NamesIndex {
     colliding: bool,
 }
 
-/// Proxygen hashes a common name by its code (`HPACKHeaderName.h:215`). Multiplying by the
-/// Fibonacci constant spreads the at most 256 codes across the hash's high bits.
+/// Hashes a common name by its code. Multiplying by the Fibonacci constant spreads the at most 256
+/// codes across the hash's high bits.
 #[derive(Default)]
 struct CodeHasher(u64);
 
@@ -251,9 +249,8 @@ impl NamesIndex {
     }
 }
 
-/// Mirrors the names-index half of proxygen `HeaderTable::removeLast` (`HeaderTable.cpp:120-131`):
-/// the key goes when its last entry does. Evictions take the oldest entry, so an evicted entry
-/// that is not the newest under its key leaves newer entries there.
+/// Removes a names-index key when its last entry is evicted. Evictions take the oldest entry, so an
+/// evicted entry that is not the newest under its key leaves newer entries there.
 fn forget_if_newest<K, Q, S>(names: &mut HashMap<K, u32, S>, key: &Q, ordinal: u32)
 where
     K: Borrow<Q> + Eq + Hash,
@@ -268,8 +265,8 @@ where
     }
 }
 
-/// Roxygen only, beyond proxygen: for each live `(name, value)` pair, the insertion ordinal of its
-/// newest entry, keyed by the pair hash.
+/// For each live `(name, value)` pair, the insertion ordinal of its newest entry, keyed by the pair
+/// hash.
 #[derive(Clone, Debug, Default)]
 struct ExactIndex {
     newest: HashMap<u64, u32, BuildHasherDefault<PrehashedHasher>>,
@@ -310,9 +307,9 @@ impl ExactIndex {
     }
 }
 
-/// The hashes of the header the last lookup found no exact match for, when that header would fit
-/// the table, so that the encoder's `add_missed` of that header does not hash it again. Every
-/// lookup overwrites it. Lookups take `&self`, hence the `Cell`.
+/// The hashes of the last looked-up header, if it had no exact match and would fit the table.
+/// `add_missed` reuses them so that it does not hash the header again. Every lookup overwrites
+/// it. Lookups take `&self`, hence the `Cell`.
 #[derive(Clone, Debug, Default)]
 struct LastMiss(Cell<Option<HeaderHashes>>);
 
@@ -397,7 +394,7 @@ impl HeaderTable {
         HEADER_HASHES.take()
     }
 
-    /// Returns how many distinct names the names index holds (proxygen `names().size()`).
+    /// Returns how many distinct names the names index holds.
     #[cfg(test)]
     pub(crate) fn names_len(&self) -> usize {
         self.names.len()
@@ -416,8 +413,8 @@ impl HeaderTable {
         self.add_hashed(header, None)
     }
 
-    /// Adds `header`, which the last lookup on this table found no exact match for, with that
-    /// lookup's hashes. The encoder calls it right after looking the same header up.
+    /// Adds `header`, reusing the hashes of the last lookup, which must have been a miss for this
+    /// same header. The encoder calls it right after that lookup.
     pub(super) fn add_missed(&mut self, header: HpackHeader) -> bool {
         let missed = self.last_miss.0.take();
         self.add_hashed(header, missed)
@@ -472,8 +469,8 @@ impl HeaderTable {
         true
     }
 
-    /// Mirrors proxygen `HeaderTable::removeLast` (`HeaderTable.cpp:117-139`); returns the evicted
-    /// entry's bytes, or `None` when the table is empty.
+    /// Evicts the oldest entry. Returns the evicted entry's size in bytes, or `None` when the table
+    /// is empty.
     fn remove_last(&mut self) -> Option<u32> {
         let oldest = self.next_ordinal.wrapping_sub(self.size());
         let evicted = self.entries.pop_back()?;
@@ -527,8 +524,8 @@ impl HeaderTable {
         (0, self.newest_index(newest, key))
     }
 
-    /// Mirrors proxygen `HeaderTable::getIndexImpl` (`HeaderTable.cpp:76-93`): compare values of
-    /// same-name entries newest first; on no match, return the newest same-name index.
+    /// Compares the values of same-name entries, newest first. Without a match, returns the newest
+    /// same-name index.
     fn scan(&self, newest_ordinal: u32, key: NameKey<'_>, value: &[u8]) -> (u32, u32) {
         let mut same_name = self.same_name(newest_ordinal, key).peekable();
         let newest = same_name.peek().copied().unwrap_or(0);
@@ -586,7 +583,8 @@ impl HeaderTable {
         self.next_ordinal.wrapping_sub(ordinal)
     }
 
-    /// The newest index named `key` from `newest`, its names-index key's newest ordinal, or 0.
+    /// The index of the newest live entry named `key`, or 0 if `key` does not match a live entry.
+    /// `newest` is the ordinal that the names index maps the key to.
     fn newest_index(&self, newest: u32, key: NameKey<'_>) -> u32 {
         self.same_name(newest, key).next().unwrap_or(0)
     }
@@ -920,9 +918,9 @@ mod tests {
     use super::NameKey;
     use super::TableHash;
 
-    /// The linear-scan `HeaderTable` lookups and mutations as of `0045fe7b35df`
-    /// (`table.rs:10-162`, `195-206`), frozen as the oracle for later lookup
-    /// indexes. Do not change.
+    /// A linear-scan reference implementation of the `HeaderTable` lookups and
+    /// mutations, which the tests compare the lookup indexes against. Do not
+    /// change.
     #[derive(Clone, Debug)]
     struct LinearTable {
         capacity: u32,
@@ -1328,7 +1326,7 @@ mod tests {
         );
     }
 
-    /// The consumer-shaped request table in steady state: `:authority c1`, `:path /echo`, then 66
+    /// A typical request table in steady state: `:authority c1`, `:path /echo`, then 66
     /// `x-request-id` values.
     fn consumer_steady_state() -> HeaderTable {
         let mut table = HeaderTable::new(4096);

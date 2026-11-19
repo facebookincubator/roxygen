@@ -17,7 +17,7 @@ use roxygen_core::http::HttpHeaderSize;
 
 use crate::hpack::*;
 
-/// 64-bit FNV-1a, the digest that wire-identity golden tests pin.
+/// 64-bit FNV-1a, the digest that the wire-identity golden tests check.
 pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
@@ -1329,7 +1329,7 @@ mod huffman {
     }
 
     /// Huffman-codes symbols (byte values, or `EOS_SYMBOL`) from the public
-    /// code table, padding the last byte with ones, without the product encoder.
+    /// code table, padding the last byte with ones, independently of the encoder.
     fn encode_symbols(symbols: impl IntoIterator<Item = u16>) -> Vec<u8> {
         let mut output = Vec::new();
         let mut accumulator = 0_u64;
@@ -3788,13 +3788,13 @@ mod hpack_codec {
         );
     }
 
-    /// The HPACK sequence that wire-identity tests pin: 2,000 deterministic blocks from a request
-    /// encoder and a response encoder, both with 4096-byte tables. Block `i` is, by `i % 4`, a
-    /// consumer-shaped request (0), a consumer-shaped response (1), a realistic 14-header request
-    /// with a rotating `traceparent` and a mixed-case `X-Request-Id` (2), or a realistic 8-header
-    /// response (3); requests use the request encoder. Both encoders resize to 256 bytes before
-    /// block 500 and back to 4096 before block 501. Responses of kind 3 take the owned-header path,
-    /// the rest the borrowed-input path.
+    /// The HPACK sequence that the wire-identity tests check: 2,000 deterministic blocks from a
+    /// request encoder and a response encoder, both with 4096-byte tables. Block `i` is, by
+    /// `i % 4`, a consumer-shaped request (0), a consumer-shaped response (1), a realistic
+    /// 14-header request with a rotating `traceparent` and a mixed-case `X-Request-Id` (2), or a
+    /// realistic 8-header response (3). Requests use the request encoder. Both encoders resize to
+    /// 256 bytes before block 500 and back to 4096 before block 501. Responses of kind 3 take the
+    /// owned-header path, the rest the borrowed-input path.
     fn golden_blocks() -> Vec<Vec<u8>> {
         golden_blocks_observed(|_, _| {})
     }

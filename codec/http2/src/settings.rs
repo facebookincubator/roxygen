@@ -63,7 +63,7 @@ pub struct HttpSettings {
 }
 
 impl HttpSettings {
-    /// Constructs the HTTP/2 defaults used by Proxygen.
+    /// Constructs the default HTTP/2 settings.
     pub fn new() -> Self {
         Self {
             settings: vec![

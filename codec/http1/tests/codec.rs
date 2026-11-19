@@ -494,8 +494,8 @@ fn paused_body_defers_eof_until_resume() {
     }
 }
 
-/// A session's view of one stream's body (`DIV-058`): parsing pauses once `buffered` reaches
-/// `pause_at`, and `ingress_body_limit` keeps it at or under `ceiling`; no ceiling, no bound.
+/// A session's view of one stream's body. Parsing pauses once `buffered` reaches `pause_at`,
+/// and `ingress_body_limit` keeps it at or under `ceiling` when one is set.
 struct WindowedBody {
     pause_at: usize,
     ceiling: Option<usize>,
@@ -534,11 +534,11 @@ impl HttpCodecCallback for WindowedBody {
     }
 }
 
-/// `DIV-058`: each input segment of a body is one body event, until the event that would carry
-/// the body past the callback's limit, which stops at it. A 31_041-byte body read as 4_000,
-/// 4_000, 8_000 and 15_041 bytes stays four events with no limit or a distant one; under a
-/// ceiling of 10_999 (a pause at 10_000 plus 999), 8_000 bytes in, the third event stops at
-/// 2_999 bytes and the pause leaves the rest unparsed.
+/// Each input segment of a body is one body event, until the event that would carry the body
+/// past the callback's limit, which stops at it. A 31_041-byte body read as 4_000, 4_000, 8_000
+/// and 15_041 bytes stays four events with no limit or a distant one. Under a ceiling of 10_999
+/// (a pause at 10_000 plus 999), 8_000 bytes in, the third event stops at 2_999 bytes and the
+/// pause leaves the rest unparsed.
 #[test]
 fn body_events_stay_whole_until_one_reaches_the_body_limit() {
     let head = b"POST / HTTP/1.1\r\nContent-Length: 31041\r\n\r\n";
@@ -573,8 +573,8 @@ fn body_events_stay_whole_until_one_reaches_the_body_limit() {
     }
 }
 
-/// `DIV-058`: a body that arrives in one segment with its head is parsed within the body limit
-/// too. With a pause at 5_000 and a ceiling of 5_999, a 20_000-byte body stops at 5_999 bytes.
+/// A body that arrives in one segment with its head is parsed within the body limit too.
+/// With a pause at 5_000 and a ceiling of 5_999, a 20_000-byte body stops at 5_999 bytes.
 /// Chunked in 3_000-byte chunks (`bb8\r\n` headers), the 5_999 bytes after the head hold one
 /// chunk, its CRLF, the next chunk's header and 2_987 of its bytes. With no limit the
 /// unchunked body is one event.
@@ -617,9 +617,9 @@ fn a_body_that_arrives_with_its_head_stays_within_the_body_limit() {
     }
 }
 
-/// `DIV-058`: tunnel bytes and an HTTP/0.9 response body are forwarded within the body limit,
-/// and what the pause leaves stays unconsumed. A 10_000-byte segment under a ceiling of 3_999
-/// (a pause at 3_000) forwards 3_999 bytes.
+/// Tunnel bytes and an HTTP/0.9 response body are forwarded within the body limit, and what
+/// the pause leaves stays unconsumed. A 10_000-byte segment under a ceiling of 3_999 (a pause
+/// at 3_000) forwards 3_999 bytes.
 #[test]
 fn raw_body_bytes_stay_within_the_body_limit() {
     let raw = Bytes::from(vec![b'x'; 10_000]);
@@ -2404,8 +2404,8 @@ fn huge_url() {
     assert_eq!(callback.errors.len(), 1);
 }
 
-/// Parses `request` whole, in 4 KiB reads and byte by byte, and returns the one error's
-/// Proxygen error and status for each.
+/// Parses `request` whole, in 4 KiB reads and byte by byte, and returns the error category
+/// and status of its one error for each.
 fn rejection_per_fragmentation(request: &[u8]) -> Vec<(ProxygenError, Option<u32>)> {
     [request.len(), 4096, 1]
         .into_iter()
@@ -4108,10 +4108,10 @@ fn one_segment_read(range: Range<usize>) -> Vec<Range<usize>> {
     std::iter::once(range).collect()
 }
 
-/// Drives `wire` as the session does: each read appends its segments to the
-/// ingress queue before one `on_ingress` call. A callback pause holds until
-/// the next call; after the last read, paused calls resume on what remains,
-/// and after an upgrade one more call takes the bytes that follow it.
+/// Drives `wire` as the session does. Each read appends its segments to the
+/// ingress queue before one `on_ingress` call, and a callback pause lasts
+/// until the next call. After the last read, paused calls resume on the
+/// remaining bytes. After an upgrade, one more call takes the bytes after it.
 fn run_trace(case: &TraceCase, wire: &Bytes, reads: &[Vec<Range<usize>>]) -> TraceOutcome {
     run_trace_through(CallbackDispatch::Dynamic, case, wire, reads)
 }
@@ -5479,9 +5479,9 @@ fn chunked_response_trailers_round_trip() {
 }
 
 /// Parses one downstream request with strict validation off and on, in every
-/// delivery the trace cases use, and checks that each run carries `headers`
-/// in this order and otherwise parses as one complete request (`connect`: an
-/// upgraded CONNECT that leaves the connection unusable).
+/// delivery the trace cases use. Checks that each run carries `headers` in this
+/// order and otherwise parses as one complete request. With `connect`, the
+/// request is an upgraded CONNECT that leaves the connection unusable.
 fn assert_request_headers(
     wire: &'static [u8],
     url: &[u8],
@@ -7087,8 +7087,8 @@ fn upstream_ordinary_response_upgrade_header_is_ordinary() {
                 );
             });
         }
-        // The frozen TestIgnoreUpstreamUpgrade response is read to EOF and closes, as without
-        // the option.
+        // A response that ignores the upgrade is read to EOF and closes, as without the
+        // option.
         let ignored =
             b"HTTP/1.1 200 OK\r\nConnection: close\r\nUpgrade: h2,h2c\r\n\r\n<!DOCTYPE html>";
         let mut default_codec = Http1xCodec::new(TransportDirection::Upstream);
@@ -7119,7 +7119,7 @@ fn upstream_h2c_get() -> HttpMessage {
     message
 }
 
-/// The message `upstream_ordinary_option_refuses_a_101` expects for a refused 101.
+/// The error message for a refused 101 in `upstream_ordinary_option_refuses_a_101`.
 const ORDINARY_101_REFUSAL: &[u8] = b"switching protocols refused for an ordinary request";
 
 #[test]
@@ -7199,7 +7199,7 @@ fn upstream_ordinary_option_refuses_a_101() {
 }
 
 /// Asserts that generating `message` on a fresh upstream codec with the option set fails with
-/// `INVALID_STATE_TRANSITION` and writes nothing, and that a GET generated next for the same
+/// `INVALID_STATE_TRANSITION` without writing, and that a GET generated next for the same
 /// stream is written as on a fresh codec with the option set.
 fn assert_upstream_ordinary_refusal(
     context: &str,
@@ -7407,7 +7407,7 @@ fn generate_upstream_exchange(
 /// ends the message.
 type FramingCase<'a> = (&'a str, HttpMessage, Option<HttpHeaders>, bool);
 
-/// Asserts each case is refused under the option, and generated as today without it.
+/// Asserts each case is refused under the option, and generated without it.
 fn assert_framing_refusals(cases: &[FramingCase<'_>]) {
     for (name, message, extra_headers, end_stream) in cases {
         assert_upstream_ordinary_refusal(name, message, *end_stream, extra_headers.as_ref());
@@ -7439,7 +7439,7 @@ fn upstream_ordinary_option_refuses_an_unframed_connect_body() {
     let gzip = ("Transfer-Encoding", "gzip");
     let cl5 = ("Content-Length", "5");
     let cases: Vec<FramingCase<'_>> = vec![
-        // (d): an unframed body.
+        // An unframed body.
         ("neither framing header", connect.clone(), None, false),
         (
             "HTTP/1.0, marked chunked",
@@ -7459,7 +7459,7 @@ fn upstream_ordinary_option_refuses_an_unframed_connect_body() {
             Some(extra(&[te])),
             false,
         ),
-        // (a): the Content-Length.
+        // More than one Content-Length, or one that is not a plain decimal.
         (
             "two equal Content-Length lines",
             with_lines(&connect, &[cl5, cl5], false),
@@ -7484,7 +7484,7 @@ fn upstream_ordinary_option_refuses_an_unframed_connect_body() {
             None,
             false,
         ),
-        // (c): both headers.
+        // Both framing headers.
         (
             "Transfer-Encoding: chunked and Content-Length, not marked chunked",
             with_lines(&connect, &[te, cl5], false),
@@ -7522,7 +7522,7 @@ fn upstream_ordinary_option_refuses_an_unframed_connect_body() {
             None,
             true,
         ),
-        // A head that ends the message declares no Content-Length but 0.
+        // On a head that ends the message, a Content-Length must be 0.
         (
             "Content-Length: 5 on a head that ends the message",
             with_lines(&connect, &[cl5], false),
@@ -7607,7 +7607,7 @@ fn upstream_ordinary_option_refuses_an_unframed_upgrade_body() {
     let cl0 = ("Content-Length", "0");
     let cl2 = ("Content-Length", "2");
     let cases: Vec<FramingCase<'_>> = vec![
-        // (d): an unframed body.
+        // An unframed body.
         (
             "WebSocket GET, neither framing header",
             websocket.clone(),
@@ -7645,28 +7645,29 @@ fn upstream_ordinary_option_refuses_an_unframed_upgrade_body() {
             Some(extra(&[te])),
             false,
         ),
-        // A written chunked line on a head that ends the message: no last chunk follows.
+        // A written chunked line on a head that ends the message is not followed by a last
+        // chunk.
         (
             "Transfer-Encoding: chunked, not marked chunked, on a head that ends the message",
             with_lines(&websocket, &[te], false),
             None,
             true,
         ),
-        // (c).
+        // Both framing headers.
         (
             "Transfer-Encoding: chunked and Content-Length, not marked chunked",
             with_lines(&websocket, &[te, cl2], false),
             None,
             false,
         ),
-        // (b): a second written Transfer-Encoding line.
+        // A second written Transfer-Encoding line.
         (
             "chunked then gzip, marked chunked",
             with_lines(&websocket, &[te, gzip], true),
             None,
             false,
         ),
-        // (a) on a head that ends the message.
+        // Two Content-Length lines on a head that ends the message.
         (
             "two Content-Length: 0 lines on a head that ends the message",
             with_lines(&websocket, &[cl0, cl0], false),
@@ -8254,7 +8255,7 @@ fn default_upstream_upgrade_handling_is_unchanged() {
 
 #[test]
 fn generated_head_keeps_uncommon_spelling() {
-    // Names outside the common-header table are written as the message spells them.
+    // Names outside the common-header table are written exactly as the message stores them.
     let mut message = request(HttpMethod::Get, b"/", (1, 1));
     message.headers_mut().add(HttpHeaderCode::Host, b"a");
     message.headers_mut().add("expect", b"100-continue");
@@ -9038,8 +9039,8 @@ fn count_allocations<T>(run: impl FnOnce() -> T) -> (T, usize) {
     (value, ALLOCATIONS.with(Cell::get))
 }
 
-/// Whether this build's std allocates through [`ALLOCATOR`]. Dev builds link a
-/// shared std whose own allocations, `Vec` growth among them, bypass it.
+/// Whether this build's std allocates through [`ALLOCATOR`]. When std is linked
+/// as a shared library, its own allocations, `Vec` growth among them, bypass it.
 fn std_allocations_observable() -> bool {
     count_allocations(|| drop(black_box(Vec::<u8>::with_capacity(4_096)))).1 == 1
 }
@@ -9127,7 +9128,7 @@ fn chunk_headers_and_terminators_allocate_nothing_after_warm_up() {
                     );
                 } else {
                     eprintln!(
-                        "{context}: allocation counts need a static std, as in @fbcode//mode/opt"
+                        "{context}: allocation counts need a static std, as in optimized builds"
                     );
                 }
             }
@@ -9232,10 +9233,11 @@ fn bodiless_post_with_chunked_transfer_encoding(unframed: bool) -> (Vec<u8>, boo
     (head, codec.is_reusable())
 }
 
-/// Caller framing is the caller's: a chunked `Transfer-Encoding` on a head that
-/// ends the message gets no last chunk, so the connection must close after it,
-/// with the option as without it. Reusing it would let a server that answers
-/// without reading the body parse the next request as chunk data.
+/// The codec leaves the caller's framing alone. A chunked `Transfer-Encoding` on
+/// a head that ends the message does not get a last chunk, so the connection
+/// must close after it, with or without the option. Reusing it would let a
+/// server that responds without reading the body parse the next request as
+/// chunk data.
 #[test]
 fn a_bodiless_post_with_caller_chunked_framing_closes_the_connection_when_enabled() {
     let expected = (

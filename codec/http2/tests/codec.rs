@@ -1759,7 +1759,7 @@ fn field_values_are_trimmed_by_default() {
 }
 
 /// Whether the request with the extra `fields` decodes, with verbatim values
-/// when `verbatim`; a refused request is a stream error answered with 400.
+/// when `verbatim`. A rejected request is a stream error that gets a 400.
 fn field_values_accepted(fields: &[(&[u8], &[u8])], verbatim: bool) -> bool {
     let capture = decode_twice_with(&request_with_fields(fields), |codec| {
         codec.set_verbatim_field_values(verbatim);
@@ -1779,8 +1779,8 @@ fn field_values_accepted(fields: &[(&[u8], &[u8])], verbatim: bool) -> bool {
 
 #[test]
 fn verbatim_field_values_refuse_what_h2_refuses_when_enabled() {
-    // h2 0.4 (`HeaderValue::from_bytes`) refuses a value byte below 0x20 other
-    // than HTAB, and DEL; RFC 9113 section 8.2.1 forbids NUL, CR and LF.
+    // h2 0.4 (`HeaderValue::from_bytes`) rejects DEL and any value byte below
+    // 0x20 other than HTAB. RFC 9113 forbids NUL, CR and LF in field values.
     for value in [
         b"a\r\n b".as_slice(),
         b"abc\r\n ",
@@ -1980,10 +1980,10 @@ enum Section {
     Response,
 }
 
-/// What `HeaderDecodeInfo` makes of `fields` in `section` with `validate`, `strict` and
-/// `options` (`None`: as `HeaderDecodeInfo::new` alone builds it): the request line or status
-/// and every field in order, or `!`, the parsing error and any Proxygen error and offending
-/// value.
+/// Decodes `fields` in `section` with `validate`, `strict` and `options`, and describes the
+/// result. `None` options means the `HeaderDecodeInfo::new` defaults. A success lists the
+/// request line or status and every field in order. A failure is `!` followed by the parsing
+/// error, any `ProxygenError` and the offending value.
 fn decoded_outcome(
     section: Section,
     fields: &[(&[u8], &[u8])],
@@ -2055,20 +2055,20 @@ fn decoded_outcome(
     outcome
 }
 
-/// Which option a pinned section exercises.
+/// Which option a recorded section exercises.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Exercised {
     ExactMethods,
     VerbatimValues,
 }
 
-/// `validate` and `strict` of a pinned outcome.
+/// `validate` and `strict` of a recorded outcome.
 const CHECKED: (bool, bool) = (true, false);
 const STRICT: (bool, bool) = (true, true);
 const UNCHECKED: (bool, bool) = (false, false);
 
-/// A field section and, for each `validate` and `strict`, what current Roxygen makes of it
-/// with its option off and on, byte for byte.
+/// A field section and, for each `validate` and `strict`, what the decoder produces with its
+/// option off and on, byte for byte.
 struct PinnedSection {
     section: Section,
     fields: &'static [(&'static [u8], &'static [u8])],
@@ -2524,9 +2524,9 @@ fn field_section_outcomes_are_pinned_with_each_option_off_and_on() {
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
-/// A request section that both options change, with `validate` and `strict`, and what current
-/// Roxygen makes of it with both off, with exact methods alone, with verbatim values alone and
-/// with both on.
+/// A request section that both options change, with `validate` and `strict`, and what the
+/// decoder produces with both off, with exact methods alone, with verbatim values alone and with
+/// both on.
 const PINNED_COMBINED: &[(Section, &[(&[u8], &[u8])], (bool, bool), [&str; 4])] = &[
     (
         Section::Method(b"post"),
@@ -5456,8 +5456,8 @@ fn split_after_first_frame(wire: &[u8]) -> (&[u8], &[u8]) {
 }
 
 /// A request head that needs a CONTINUATION frame reaches the callback only once its block
-/// ends; until then the downstream codec reports the partial head (`DIV-055`), and trailers
-/// on an open stream are not a request head.
+/// ends. Until then the downstream codec reports the partial head, and trailers on an open
+/// stream are not a request head.
 #[test]
 fn partial_request_head_is_reported_until_its_block_ends() {
     let mut client = Http2Codec::new(TransportDirection::Upstream);
@@ -5533,8 +5533,8 @@ fn partial_request_head_is_reported_until_its_block_ends() {
     );
 }
 
-/// A request block on a stream above the final GOAWAY's last stream opens no stream: the
-/// codec drops its events when the block ends, so it is no partial request head (`DIV-055`).
+/// A request block on a stream above the final GOAWAY's last stream does not open a stream. The
+/// codec drops its events when the block ends, so it is not a partial request head.
 #[test]
 fn partial_request_head_above_the_final_goaway_is_not_reported() {
     let mut client = Http2Codec::new(TransportDirection::Upstream);
@@ -6438,8 +6438,9 @@ fn websocket_upgrade_state_commits_before_generated_callback() {
     assert!(callback.messages[0].is_ingress_websocket_upgrade());
 }
 
-/// With no WebSocket upgrade pending, no codec path looks a stream up in the upgrade set: an end
-/// of message, an upstream response and its trailers, an egress reset and an ingress reset.
+/// With no WebSocket upgrade pending, these codec paths do not look a stream up in the upgrade
+/// set: an end of message, an upstream response and its trailers, an egress reset and an ingress
+/// reset.
 #[test]
 fn streams_without_a_pending_upgrade_never_probe_the_upgrade_set() {
     let generate = |codec: &mut Http2Codec, frame: EgressFrame<'_>| {
@@ -6644,8 +6645,8 @@ const VALUE_MODES: [ControlEscapeMode; 3] = [
     ControlEscapeMode::Strict,
 ];
 
-/// A frozen copy of `validate_header_value` before the word-at-a-time
-/// prefix scan.
+/// A byte-at-a-time reference version of `validate_header_value`, without
+/// the word-at-a-time prefix scan.
 fn reference_validate_header_value(value: &[u8], mode: ControlEscapeMode) -> bool {
     #[derive(Clone, Copy)]
     enum Fold {
@@ -7436,7 +7437,7 @@ fn consumer_request_block(id: u64) -> Vec<u8> {
     block
 }
 
-/// A downstream codec past the preface, and a reference codec whose header stats disable the
+/// A downstream codec past the preface, and a second codec whose header stats disable the
 /// decoder memo, so it decodes every block in full.
 fn consumer_receivers() -> (Http2Codec, Http2Codec) {
     let mut receiver = Http2Codec::new(TransportDirection::Downstream);
@@ -7553,8 +7554,8 @@ fn unmemoizable_encode_visits_each_header_once() {
     let mut message = request(b"/echo");
     message.set_method(HttpMethod::Post).unwrap();
     for block in 0..4_u32 {
-        // A new id per block is inserted into the table, so the epoch changes every block and no
-        // memo can arm.
+        // A new id per block is inserted into the table, so the epoch changes every block and the
+        // memo cannot arm.
         message
             .headers_mut()
             .set(b"x-request-id", format!("{block:016x}").as_bytes());
@@ -8107,9 +8108,8 @@ fn shared_headers_remain_valid_after_memo_invalidation_and_replacement() {
     );
 }
 
-/// The DATA generation `Http2Codec::generate` performed before payload
-/// prefixes moved straight into the staging queue: one split-off chunk queue
-/// per non-final frame and a vector of frame lengths.
+/// A simple reference version of the DATA generation in `Http2Codec::generate`:
+/// one split-off chunk queue per non-final frame and a vector of frame lengths.
 fn reference_generate_data(
     output: &mut BufQueue,
     mut body: BufQueue,
@@ -8503,8 +8503,8 @@ fn multi_frame_data_matches_the_reference_frame_loop() {
     }
 }
 
-/// Records events as [`Trace`] does, answers PINGs and connection errors as a
-/// session would, and may opt out of frame-header events.
+/// Records events as [`Trace`] does, replies to PINGs and connection errors as
+/// a session would, and may opt out of frame-header events.
 struct FrameHeaderRecorder {
     observes_frame_headers: bool,
     trace: Trace,
@@ -8669,9 +8669,10 @@ fn first_frame_check_survives_the_opt_out() {
     assert_eq!(opted_out_egress, observed_egress);
 }
 
-/// Value length of `x-golden-pad` for the HEADERS framing golden's `ordinal`th block. Every value is made of bytes
-/// whose Huffman code is 8 bits long, so each block grows by exactly one byte per value byte, and the sweeps cross
-/// the compact tail limit, the maximum frame size and the CONTINUATION split.
+/// Value length of `x-golden-pad` for the HEADERS framing golden's `ordinal`th block. Every value
+/// is made of bytes whose Huffman code is 8 bits long, so each block grows by exactly one byte per
+/// value byte, and the sweeps cross the compact tail limit, the maximum frame size and the
+/// CONTINUATION split.
 fn golden_pad_length(ordinal: usize) -> usize {
     let step = ordinal / 10;
     match ordinal % 10 {
@@ -8683,10 +8684,11 @@ fn golden_pad_length(ordinal: usize) -> usize {
     }
 }
 
-/// Generates 500 deterministic HEADERS blocks (and 10 push promises from the downstream codec), each followed
-/// by 128 B of DATA, alternating a downstream and an upstream codec, and returns the wire bytes, the codec events
-/// and the summed `bytes_written`. Each codec's output is flushed after every second block of that codec, so blocks land both
-/// in empty outputs and behind earlier frames.
+/// Generates 500 deterministic HEADERS blocks (and 10 push promises from the downstream codec),
+/// each followed by 128 B of DATA, alternating a downstream and an upstream codec, and returns the
+/// wire bytes, the codec events and the summed `bytes_written`. Each codec's output is flushed
+/// after every second block of that codec, so blocks land both in empty outputs and behind earlier
+/// frames.
 fn header_frames_transcript() -> (Vec<u8>, Vec<Seen>, usize) {
     let mut codecs = [
         Http2Codec::new(TransportDirection::Downstream),
@@ -8931,8 +8933,8 @@ fn strategy_headers_reuse_block_storage() {
     );
 }
 
-/// A 200 response whose `x-golden-pad` value is `length` bytes, each with an 8-bit Huffman code, so the HEADERS
-/// payload grows by exactly one byte per value byte.
+/// A 200 response whose `x-golden-pad` value is `length` bytes, each with an 8-bit Huffman code,
+/// so the HEADERS payload grows by exactly one byte per value byte.
 fn padded_response(length: usize) -> HttpMessage {
     let mut message = response(200);
     let pad: Vec<u8> = b"X&*,;Z".iter().copied().cycle().take(length).collect();
@@ -9014,8 +9016,8 @@ fn single_frame_headers_above_the_compact_limit_reuse_block_storage() {
          the compact tail limit"
     );
 
-    // A block that needs CONTINUATION gives its storage to the output, so the codec keeps nothing larger than a
-    // single frame and the next block allocates again.
+    // A block that needs CONTINUATION gives its storage to the output, so the codec does not keep
+    // storage larger than a single frame and the next block allocates again.
     let shapes = padded_headers_shapes(&mut codec, &padded_response(40_000), 15);
     assert_eq!(
         shapes.last().map(|&(kind, flags, _)| (kind, flags)),
@@ -9185,14 +9187,14 @@ pub(crate) fn consumer_response_fields(sequence: u64) -> Vec<HpackHeader> {
     ]
 }
 
-/// A delivered name as it was spelled when the digests were recorded. `origin` was then in the
-/// common-header table, which spelled it `Origin`; it is now delivered as received.
+/// Maps a delivered name to its spelling in the recorded digests, which capitalize `origin` as
+/// `Origin`.
 fn recorded_spelling(name: &[u8]) -> &[u8] {
     if name == b"origin" { b"Origin" } else { name }
 }
 
-/// The delivered heads' `(name, value)` lists, in order, and the bytes of re-encoding each head
-/// through a fresh egress codec.
+/// The FNV-1a digest and length of the delivered heads' `(name, value)` lists, then of the bytes
+/// of re-encoding each head through a fresh egress codec.
 fn delivered_and_reencoded(messages: &[HttpMessage], direction: TransportDirection) -> [u64; 4] {
     let mut heads = Vec::new();
     let mut reencoded = Vec::new();

@@ -7,10 +7,10 @@
 
 //! Native Rust output of the upstream llhttp grammar, plus its HTTP helpers.
 //!
-//! `generated` is emitted from llhttp 9.4.4 by the separate
-//! `roxygen-llhttp-tooling` generator. `runtime` ports `src/native/http.c` and
+//! `generated` is emitted from llhttp 9.4.4 by
+//! `codec/http1/generator/generate.cjs`. `runtime` ports `src/native/http.c` and
 //! the lifecycle and callback conventions in `src/native/api.c` from the same
-//! revision. See `llhttp/README.md` for provenance and regeneration.
+//! revision.
 
 #[path = "llhttp/generated.rs"]
 mod generated;

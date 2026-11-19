@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Source-faithful HTTP/2 frame parsing and serialization.
+//! HTTP/2 frame parsing and serialization.
 
 use bytes::Bytes;
 use bytes::BytesMut;
@@ -30,7 +30,7 @@ use crate::constants::MAX_FRAME_PAYLOAD_LENGTH;
 use crate::constants::MAX_STREAM_ID;
 use crate::constants::MAX_WINDOW_UPDATE_SIZE;
 
-/// Lowest frame type reserved by Proxygen for experimental extensions.
+/// Lowest frame type in the range that Proxygen reserves for experimental extensions.
 pub const MIN_EXPERIMENTAL_FRAME_TYPE: u8 = 0xf0;
 
 /// A wire frame type. Unknown peer-provided values remain representable.
@@ -101,7 +101,7 @@ pub struct FrameHeader {
     pub flags: u8,
 }
 
-/// Legacy dependency-based priority fields retained by the framing surface.
+/// RFC 7540 dependency-based priority fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PriorityUpdate {
     pub stream_dependency: u64,
@@ -109,7 +109,8 @@ pub struct PriorityUpdate {
     pub weight: u8,
 }
 
-/// Proxygen's default legacy priority tuple.
+/// The default RFC 7540 priority fields. `weight` holds the wire value, one less than the
+/// weight, so 15 means the default weight of 16.
 pub const DEFAULT_PRIORITY: PriorityUpdate = PriorityUpdate {
     stream_dependency: 0,
     exclusive: false,
@@ -224,7 +225,7 @@ pub struct ParsedFrame {
     pub consumed: usize,
 }
 
-/// Whether Proxygen recognizes a frame type for local generation.
+/// Whether a frame type is accepted in a locally generated frame header.
 pub const fn is_valid_frame_type(frame_type: FrameType) -> bool {
     let value = frame_type.as_u8();
     if value < MIN_EXPERIMENTAL_FRAME_TYPE {
@@ -248,7 +249,7 @@ pub const fn frame_has_padding(header: &FrameHeader) -> bool {
     header.flags & Flags::PADDED != 0
 }
 
-/// Returns Proxygen's diagnostic spelling for a frame type.
+/// Returns the diagnostic name of a frame type.
 pub const fn get_frame_type_string(frame_type: FrameType) -> &'static str {
     match frame_type.as_u8() {
         0 => "DATA",
@@ -775,7 +776,7 @@ pub(crate) fn parse_push_promise_cursor<'a>(
     Ok((promised_stream, header_block))
 }
 
-/// Parses a PING payload, preserving Proxygen's opaque host-order `u64` API.
+/// Parses a PING payload as an opaque host-order `u64`.
 pub fn parse_ping(input: &BufQueue, header: &FrameHeader) -> Result<u64, FrameError> {
     parse_ping_cursor(SegmentCursor::from_queue(input), header)
 }
@@ -850,7 +851,8 @@ pub(crate) fn parse_continuation_cursor<'a>(
     input.bounded(length)
 }
 
-/// Parses Proxygen's Alt-Svc extension payload.
+/// Parses an Alt-Svc extension payload in Proxygen's layout (max age, port, protocol, host,
+/// origin), which differs from the RFC 7838 ALTSVC frame.
 pub fn parse_alt_svc(input: &BufQueue, header: &FrameHeader) -> Result<AltSvcFrame, FrameError> {
     if (header.length as usize) < FRAME_ALT_SVC_SIZE_BASE {
         return Err(peer(H2ErrorCode::FRAME_SIZE_ERROR));
@@ -1059,9 +1061,9 @@ fn write_small_frame(
 
 /// Writes a DATA frame while preserving the backing of every payload segment.
 ///
-/// `reuse_payload_headroom` is retained for API compatibility with Proxygen.
-/// [`Bytes`] cannot safely expose mutable headroom. Both values append unpadded
-/// metadata to a unique output tail with room, or use a separate allocation.
+/// `reuse_payload_headroom` is ignored, because [`Bytes`] cannot safely expose
+/// mutable headroom. Either value appends unpadded metadata to a unique output
+/// tail with room, or uses a separate allocation.
 pub fn write_data(
     output: &mut BufQueue,
     data: BufQueue,
@@ -1095,7 +1097,7 @@ impl DataHeaderArena {
 
 /// The arena, only when `payload` starts with a segment that is not unique.
 ///
-/// The header is never unique then either, so the payload alone already decides
+/// The header is not unique in that case either, so the payload alone determines
 /// whether exports and tail appends can reuse the segments around the header.
 fn header_arena<'a>(
     arena: Option<&'a mut DataHeaderArena>,
@@ -1159,8 +1161,8 @@ pub(crate) fn write_data_from_with(
 
 /// Segment capacity that stages `body` as DATA frames of at most `max_frame`
 /// payload bytes: each frame adds a header, at most one split boundary and at
-/// most one padding segment. Zero when the frames exceed `capacity`, so a write
-/// that is going to fail reserves nothing.
+/// most one padding segment. Zero when the frames exceed `capacity`, so that a
+/// write that is going to fail does not reserve anything.
 pub(crate) fn data_frames_segment_bound(
     body: &BufQueue,
     max_frame: usize,
@@ -1199,8 +1201,9 @@ fn write_data_header(
         ensure_output_capacity(output, total)?;
         if !output.try_append_copy_to_tail(&header)? {
             match headers {
-                // Recorded as the vector it replaces, so compact-tail and
-                // backing decisions downstream stay the same.
+                // Recorded with a 9-byte backing, as a separate vector would
+                // be, so that compact-tail and backing decisions downstream
+                // are the same either way.
                 Some(arena) => {
                     output.push_bytes_with_backing(arena.header(&header), FRAME_HEADER_SIZE)?
                 }
@@ -1468,7 +1471,8 @@ pub fn write_continuation(
     Ok(total)
 }
 
-/// Writes Proxygen's Alt-Svc extension frame.
+/// Writes an Alt-Svc extension frame in Proxygen's layout, which differs from the RFC 7838
+/// ALTSVC frame.
 pub fn write_alt_svc(
     output: &mut BufQueue,
     stream: u32,

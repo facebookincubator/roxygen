@@ -55,10 +55,11 @@ impl From<H2ErrorCode> for u32 {
     }
 }
 
-/// A legacy Proxygen error value used by the HTTP/1 codec adapter.
+/// An error category carried by [`HttpException`].
 ///
-/// Only values used by the assigned conversions receive names. Unknown legacy
-/// values remain representable and follow the reference default branches.
+/// The numeric values match Proxygen's `ProxygenError` enum. Only some values
+/// have names. Other values remain representable, and
+/// [`http_exception_to_http_error_code`] maps them to `PROTOCOL_ERROR`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct ProxygenError(u8);
@@ -89,7 +90,7 @@ impl ProxygenError {
     }
 }
 
-/// The data-flow direction affected by a legacy codec exception.
+/// The data-flow direction affected by an [`HttpException`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HttpExceptionDirection {
     Ingress,
@@ -97,9 +98,8 @@ pub enum HttpExceptionDirection {
     IngressAndEgress,
 }
 
-/// The H1/H2 subset of the legacy codec exception adapted by Roxygen.
-///
-/// There is deliberately no HTTP/3 status field or accessor.
+/// An HTTP/1.1 or HTTP/2 codec error, as delivered by
+/// [`CodecEvent::Error`](crate::CodecEvent::Error).
 #[derive(Clone, Debug)]
 pub struct HttpException {
     direction: HttpExceptionDirection,
@@ -166,7 +166,7 @@ impl HttpException {
         self.http_status_code.is_some()
     }
 
-    /// Sets the HTTP response status, treating zero as the legacy absent value.
+    /// Sets the HTTP response status. Zero clears it.
     pub fn set_http_status_code(&mut self, status: u32) {
         self.http_status_code = (status != 0).then_some(status);
     }
@@ -234,7 +234,7 @@ const fn is_invalid_source_error_code(raw: u16) -> bool {
     )
 }
 
-/// Converts an H2 wire code into the protocol-neutral Roxygen error code.
+/// Converts an H2 wire code into the protocol-neutral [`HttpErrorCode`].
 pub const fn h2_error_code_to_http_error_code(code: H2ErrorCode) -> HttpErrorCode {
     let raw = code.as_u32();
     if raw <= H2ErrorCode::HTTP_1_1_REQUIRED.as_u32() {
@@ -244,7 +244,7 @@ pub const fn h2_error_code_to_http_error_code(code: H2ErrorCode) -> HttpErrorCod
     }
 }
 
-/// Converts a legacy H1/H2 codec exception into a Roxygen error code.
+/// Converts a codec exception into an [`HttpErrorCode`].
 pub const fn http_exception_to_http_error_code(exception: &HttpException) -> HttpErrorCode {
     if let Some(code) = exception.codec_status_code() {
         return h2_error_code_to_http_error_code(code);
@@ -258,7 +258,7 @@ pub const fn http_exception_to_http_error_code(exception: &HttpException) -> Htt
     }
 }
 
-/// Converts a Roxygen error code into its legacy HTTP/1 adapter category.
+/// Converts an [`HttpErrorCode`] into its [`ProxygenError`] category.
 pub const fn http_error_code_to_proxygen_error(code: HttpErrorCode) -> ProxygenError {
     match code.as_u16() {
         0 => ProxygenError::NONE,
@@ -278,7 +278,8 @@ pub const fn http_error_code_to_proxygen_error(code: HttpErrorCode) -> ProxygenE
     }
 }
 
-/// Adapts a Roxygen error to the H1/H2 subset of the legacy codec exception.
+/// Converts an [`HttpError`] into an [`HttpException`] that affects both
+/// directions.
 pub fn http_error_to_http_exception(error: &HttpError) -> HttpException {
     let mut exception =
         HttpException::new(HttpExceptionDirection::IngressAndEgress, error.message());

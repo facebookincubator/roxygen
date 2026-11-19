@@ -364,7 +364,8 @@ pub(super) fn decode_to_slice(encoded: &[u8], out: &mut [u8]) -> Result<usize, H
                 continue;
             }
 
-            // Nothing fits: valid only as fewer than 8 bits of ones after the last symbol.
+            // The remaining bits do not decode to a symbol, so they must be padding of fewer
+            // than 8 one bits.
             if tail && bits < 8 && (window | (u64::MAX >> bits)) == u64::MAX {
                 return Ok(written);
             }

@@ -313,9 +313,8 @@ pub enum OwnedEgressFrame {
 
 /// Hooks run immediately around one callback-requested generation operation.
 ///
-/// This is a worker-local interception seam for filters whose state transition
-/// must remain ordered with the generated frame. It deliberately exposes only
-/// Roxygen-owned framing types.
+/// Codec filters use this to keep a state change ordered with the generated
+/// frame. It is worker-local and exposes only this crate's framing types.
 pub trait CodecCallbackGenerateInterceptor {
     /// Runs immediately before the owned frame is generated.
     fn before_generate(&self, frame: &OwnedEgressFrame) -> Result<(), HttpError>;
@@ -568,27 +567,28 @@ pub trait HttpCodecCallback {
         0
     }
 
-    /// The most body bytes the codec may deliver for `stream` before it asks again, or `None`
-    /// for no bound. The codec reads zero as one, so that parsing progresses; a callback that
-    /// can take no more body bytes pauses parsing instead.
+    /// Returns the most body bytes the codec may deliver for `stream` before it calls this
+    /// again, or `None` for no limit.
     ///
-    /// The HTTP/1.1 codec asks before it parses each run of a message body, before each body
-    /// event of an upgraded tunnel or HTTP/0.9 response, and after each message head, bodiless
-    /// or not, that more than one byte of its run follows. It counts a chunked run's framing
-    /// against the limit too. A callback that pauses parsing at a buffered-body limit answers
-    /// this to bound how far one body event can carry a stream past that limit (`DIV-058`);
-    /// otherwise one event can carry a whole read buffer past it. Codec filters do not
-    /// intercept the query. Other codecs do not ask. Roxygen-only.
+    /// The codec treats zero as one so that parsing progresses. A callback that cannot take more
+    /// body bytes pauses parsing instead. A callback that pauses parsing at a buffered-body limit
+    /// returns a value here to bound how far one body event can carry the stream past that
+    /// limit. Without one, a single event can carry a whole read buffer past it.
+    ///
+    /// Only the HTTP/1.1 codec calls this, and codec filters do not intercept it. That codec
+    /// calls it before it parses each run of a message body, before each body event of an
+    /// upgraded tunnel or HTTP/0.9 response, and after each message head, with or without a
+    /// body, that is followed by more than one byte of its run. A chunked run's framing counts
+    /// against the limit.
     fn ingress_body_limit(&self, _stream: StreamId) -> Option<usize> {
         None
     }
 
-    /// Whether this callback wants [`CodecEvent::FrameHeader`] events.
+    /// Whether to deliver [`CodecEvent::FrameHeader`] events to this callback.
     ///
     /// A codec may skip delivering that observation-only event to a callback
     /// that returns `false`. Every other event, and all codec state, is
-    /// unchanged. Roxygen-only; see `DIV-026` in
-    /// `roxygen/migration/DIVERGENCES.md`.
+    /// unchanged.
     fn observes_frame_headers(&self) -> bool {
         true
     }
@@ -596,8 +596,8 @@ pub trait HttpCodecCallback {
 
 /// Runtime-neutral HTTP/1.1 or HTTP/2 parser and framer.
 ///
-/// The trait object is intentionally not `Send`. Its methods accept no source,
-/// session, task, or runtime ownership, leaving those responsibilities with the
+/// The trait object is intentionally not `Send`. Its methods do not take
+/// ownership of a source, session, task, or runtime. Those stay with the
 /// worker-local session.
 pub trait HttpCodec {
     /// Selected wire protocol.
@@ -657,11 +657,12 @@ pub trait HttpCodec {
     /// Last stream identifier initiated by the peer.
     fn last_incoming_stream_id(&self) -> StreamId;
 
-    /// Whether the codec holds part of a request head that opens a stream: a downstream
-    /// HTTP/2 HEADERS frame without END_HEADERS whose CONTINUATION frames have not yet ended
-    /// the block, so no callback has seen the stream. A block refused for concurrency, or on
-    /// a stream above the last stream of a GOAWAY the codec sent, opens none. Codecs that
-    /// keep no partial head return false.
+    /// Whether the codec holds part of a request head that opens a stream.
+    ///
+    /// A downstream HTTP/2 codec holds a HEADERS frame without END_HEADERS until CONTINUATION
+    /// frames end the block, so the stream has not been delivered to a callback yet. A block
+    /// refused for concurrency, or on a stream above the last stream of a GOAWAY that the codec
+    /// sent, does not open a stream. Codecs that do not keep partial heads return false.
     fn has_partial_request_head(&self) -> bool {
         false
     }
@@ -1645,10 +1646,10 @@ impl HttpCodec for HttpCodecFilterChain {
     }
 }
 
-/// Protocol-neutral transport seam reserved for a future multiplexed session.
+/// A protocol-neutral transport for a future multiplexed session.
 ///
-/// Request streams and unidirectional control streams remain distinct without
-/// exposing QUIC, QPACK, datagram, or runtime types in the current API.
+/// Request streams and unidirectional control streams stay distinct, and the
+/// API does not expose QUIC, QPACK, datagram, or runtime types.
 pub trait MultiplexedSessionTransport {
     /// Bidirectional stream used for one request/response exchange.
     type RequestStream;

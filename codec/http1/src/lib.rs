@@ -55,9 +55,9 @@ use sha1::Sha1;
 
 const MAX_HEADER_BYTES: usize = 80 * 1024;
 const WEBSOCKET_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-/// The longest request line besides its method and target.
+/// The longest request line, not counting its method and target.
 const MAX_REQUEST_LINE_SUFFIX: usize = b"  HTTP/255.255\r\n".len();
-/// The longest status line besides its reason.
+/// The longest status line, not counting its reason.
 const MAX_STATUS_LINE_SUFFIX: usize = b"HTTP/255.255 65535 \r\n".len();
 /// The lines `generate_headers` may add after the message's headers: chunked
 /// framing, Date, Connection with its keep-alive token, and the final CRLF.
@@ -65,8 +65,8 @@ const GENERATED_LINES: usize = b"Transfer-Encoding: chunked\r\n".len()
     + b"Date: Tue, 06 Oct 2026 00:00:00 GMT\r\n".len()
     + b"Connection: , keep-alive\r\n".len()
     + b"\r\n".len();
-/// The generated websocket lines and Upgrade token, besides the stored accept
-/// key.
+/// The generated websocket lines and Upgrade token, not counting the stored
+/// accept key.
 const MAX_WEBSOCKET_LINES: usize = b"Upgrade: websocket\r\n".len()
     + b"Sec-WebSocket-Accept: \r\n".len()
     + b"Sec-WebSocket-Key: 0123456789012345678901==\r\n".len()
@@ -90,18 +90,20 @@ enum IngressPhase {
     Upgraded,
 }
 
-/// The statuses besides 400 go beyond Proxygen, which answers every ingress rejection 400, to
-/// follow the RFCs (`DIV-057`).
+/// Why ingress parsing failed, and the HTTP status a downstream codec reports for it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ParseErrorKind {
+    /// A malformed message head (400).
     Header,
+    /// A header value rejected by strict validation (400).
     HeaderContent,
+    /// A parse error after the head, in the body, chunk framing or trailers (400).
     Body,
-    /// RFC 9112 section 3: the request-target used up the head budget (414).
+    /// The request-target used up the head budget (414, RFC 9112).
     UriTooLong,
-    /// RFC 6585 section 5: the request head is past its budget for another reason (431).
+    /// The request head is past its budget for another reason (431, RFC 6585).
     HeaderFieldsTooLarge,
-    /// RFC 9112 section 6.1: a transfer coding the codec does not implement (501).
+    /// A transfer coding the codec does not implement (501, RFC 9112).
     NotImplemented,
 }
 
@@ -115,7 +117,7 @@ fn dyn_ingress_deliveries() -> usize {
     DYN_INGRESS_DELIVERIES.with(Cell::get)
 }
 
-/// Work counts of the egress path, read by the count oracles.
+/// Work counts of the egress path, checked by tests.
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct EgressWork {
@@ -132,7 +134,7 @@ std::thread_local! {
     static FORMATTED_STRINGS: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Strings built by `format!` on this thread, read by the count oracles.
+/// Strings built by `format!` on this thread, checked by tests.
 #[cfg(test)]
 fn formatted_strings() -> usize {
     FORMATTED_STRINGS.with(Cell::get)
@@ -143,8 +145,8 @@ fn count_work(counter: &Cell<usize>, amount: usize) {
     counter.set(counter.get() + amount);
 }
 
-/// The bytes that end an egress message: none, or for chunked egress the final
-/// CRLF, preceded by the last chunk when it was not written yet.
+/// The bytes that end an egress message. Chunked egress ends with the final
+/// CRLF, preceded by the last chunk if it was not written yet.
 #[derive(Clone, Copy, Debug)]
 enum MessageEnd {
     Nothing,
@@ -178,13 +180,12 @@ pub struct Http1xCodec {
     force_1_1: bool,
     strict_validation: bool,
     downstream_upgrade_as_ordinary: bool,
-    /// Roxygen-only (`DIV-036`): a request head that ends its message gets no body framing.
     unframed_bodiless_requests: bool,
     /// The last request stream parsed under `downstream_upgrade_as_ordinary`, or unspecified.
     last_ordinary_request: StreamId,
     upstream_upgrade_as_ordinary: bool,
-    /// The last request an upstream codec generated was generated under
-    /// `upstream_upgrade_as_ordinary`, so its response is read as an ordinary response.
+    /// Whether the last request an upstream codec generated was sent as ordinary, so that its
+    /// response is read as an ordinary response.
     ordinary_request_sent: bool,
     release_egress_after_request: bool,
     parser: Option<Box<Parser>>,
@@ -336,35 +337,37 @@ impl Http1xCodec {
         codec
     }
 
-    /// Additionally restricts header values to ASCII for subsequent messages.
+    /// Sets whether to reject ingress header values that contain a byte of 0x7f or above.
     pub fn set_strict_validation(&mut self, strict: bool) {
         self.strict_validation = strict;
     }
 
-    /// Roxygen-only (`DIV-030`): parses each downstream request whose head is read after this
-    /// call, including one with an `Upgrade` header or a `CONNECT` method, as an ordinary
-    /// request, so parsing continues behind it. Off by default, which is the reference
-    /// codec's upgrade handling. It has no effect on an upstream codec.
+    /// Parses each downstream request whose head is read after this call as an ordinary
+    /// request, including one with an `Upgrade` header or a `CONNECT` method, so that parsing
+    /// continues behind it. Off by default. It has no effect on an upstream codec.
+    ///
+    /// The bytes behind such a request may already be parsed as HTTP/1.1, so generating a 101
+    /// or WebSocket upgrade response to it, or to any request before it, fails.
     pub fn set_downstream_upgrade_as_ordinary(&mut self, enabled: bool) {
         self.downstream_upgrade_as_ordinary = enabled;
     }
 
-    /// Roxygen-only (`DIV-031`): sends each request an upstream codec generates after this call,
-    /// including one with an `Upgrade` header or a `CONNECT` method, as an ordinary request, and
-    /// reads its response as an ordinary response. Off by default, which is the reference
-    /// codec's upgrade handling. It has no effect on a downstream codec.
+    /// Sends each request that an upstream codec generates after this call as an ordinary
+    /// request, including one with an `Upgrade` header or a `CONNECT` method, and reads its
+    /// response as an ordinary response. Off by default. It has no effect on a downstream codec.
     pub fn set_upstream_upgrade_as_ordinary(&mut self, enabled: bool) {
         self.upstream_upgrade_as_ordinary = enabled;
     }
 
-    /// Roxygen-only (`DIV-036`): an upstream request whose head ends the message (it has no
-    /// body) and that carries neither `Content-Length` nor a chunked `Transfer-Encoding` is sent
-    /// with no body framing at all, as Hyper sends a request with an empty body, instead of the
-    /// reference codec's `Transfer-Encoding: chunked` and empty last chunk for a `POST` (or,
-    /// where chunking is not allowed, `Connection: close`). A head with framing of the caller's
-    /// is generated exactly as without the option (a caller's chunked `Transfer-Encoding` with no
-    /// body still closes the connection), and a request that has a body is framed as before.
-    /// Off by default. It has no effect on a downstream codec.
+    /// Sends an upstream request without body framing when its head ends the message and it
+    /// carries neither `Content-Length` nor a chunked `Transfer-Encoding`, as hyper sends a
+    /// request with an empty body. Off by default. It has no effect on a downstream codec.
+    ///
+    /// Without the option, such a `POST` gets `Transfer-Encoding: chunked` and an empty last
+    /// chunk, or `Connection: close` where chunking is not allowed. A head that carries the
+    /// caller's own framing is generated as without the option, so a caller's chunked
+    /// `Transfer-Encoding` with no body still closes the connection. A request that has a body
+    /// is framed normally.
     pub fn set_unframed_bodiless_requests(&mut self, enabled: bool) {
         self.unframed_bodiless_requests = enabled;
     }
@@ -379,7 +382,8 @@ impl Http1xCodec {
         if !self.direction.is_downstream() {
             return None;
         }
-        // `DIV-030`: as `generate_headers` refuses the switch, so does this resolution.
+        // As in `generate_headers`, a request parsed as ordinary, or one before it, never
+        // switches protocols.
         let accepted = if self.is_at_or_before_an_ordinary_request(self.ingress_stream) {
             false
         } else if self.connect_request {
@@ -623,8 +627,9 @@ impl Http1xCodec {
         );
     }
 
-    /// How many bytes of a body run may be parsed or forwarded before `callback` is asked again
-    /// (`HttpCodecCallback::ingress_body_limit`): at least one, so parsing always progresses.
+    /// How many bytes of a body run may be parsed or forwarded before the codec calls
+    /// `HttpCodecCallback::ingress_body_limit` again. It is at least one, so that parsing always
+    /// progresses.
     #[inline]
     fn body_limit(&self, callback: &(impl IngressDelivery + ?Sized)) -> usize {
         callback
@@ -632,9 +637,9 @@ impl Http1xCodec {
             .map_or(usize::MAX, |limit| limit.max(1))
     }
 
-    /// Forwards `input`, tunnel or HTTP/0.9 response bytes, as body events within the body
-    /// limit, until it runs out or a callback pauses parsing; `result.consumed` counts what was
-    /// forwarded.
+    /// Forwards `input` (tunnel or HTTP/0.9 response bytes) as body events within the body
+    /// limit. It stops when the input runs out or a callback pauses parsing. `result.consumed`
+    /// counts the bytes forwarded.
     fn forward_body(
         &mut self,
         input: &Bytes,
@@ -761,7 +766,7 @@ impl Http1xCodec {
             if stream != self.egress_stream {
                 return Err(invalid_state(b"HTTP/1 request stream is out of order"));
             }
-            // `DIV-031`: the flag asks for a handshake whose 101 an ordinary request refuses.
+            // A websocket upgrade needs a 101, which a request sent as ordinary cannot accept.
             if self.upstream_upgrade_as_ordinary && message.is_egress_websocket_upgrade() {
                 return Err(invalid_state(
                     b"HTTP/1 egress websocket upgrade on a request sent as ordinary",
@@ -778,8 +783,8 @@ impl Http1xCodec {
             self.response_pending = true;
             request = request_fields(message);
             method = request.and_then(|(name, _)| HttpMethod::from_bytes(name.as_bytes()));
-            // `DIV-031`: under the option a CONNECT is an ordinary request, with no egress
-            // upgrade, no tunnel and a response read by its own framing.
+            // Under the option a CONNECT is an ordinary request. It has no egress upgrade or
+            // tunnel, and its response is read by its own framing.
             self.ordinary_request_sent = self.upstream_upgrade_as_ordinary;
             self.connect_request =
                 method == Some(HttpMethod::Connect) && !self.ordinary_request_sent;
@@ -797,7 +802,7 @@ impl Http1xCodec {
             }
             response = response_fields(message)
                 .ok_or_else(|| invalid_state(b"HTTP/1 response requires a status"))?;
-            // `DIV-030`: the bytes behind a request parsed as ordinary may already be parsed as
+            // The bytes behind a request parsed as ordinary may already be parsed as
             // HTTP/1.1, so the connection cannot switch protocols in a response to it or to any
             // request before it.
             if self.is_at_or_before_an_ordinary_request(stream)
@@ -990,8 +995,8 @@ impl Http1xCodec {
             output.extend_from_slice(b"\r\n");
         }
 
-        // `DIV-036`: only a head that ends its message with no framing of the
-        // caller's goes out unframed.
+        // Only a head that ends its message and has none of the caller's framing
+        // goes out unframed.
         let unframed = end_stream
             && self.unframed_bodiless_requests
             && !transfer_encoding_written
@@ -1087,15 +1092,19 @@ impl Http1xCodec {
         version
     }
 
-    /// Roxygen-only (`DIV-031`): whether the head of a request that the upstream option sends
-    /// as ordinary, read as `generate_headers` writes it (`message`'s headers, then
-    /// `extra_headers`), tells the origin where the request ends exactly as this codec frames
-    /// it: at most one `Content-Length`, a decimal length that is 0 on a head that ends the
-    /// message; at most one written `Transfer-Encoding` line, never beside a `Content-Length`
-    /// and only over this codec's chunk framing; and, behind a head that does not end the
-    /// message, a body framed by that length or that chunking. Under the option, generating a
-    /// request for which this is false fails. It is true for every other request, which is
-    /// written as without the option.
+    /// Whether the head of a request sent as ordinary marks exactly where the request ends, as
+    /// this codec frames it.
+    ///
+    /// The head is checked as `generate_headers` writes it, from `message`'s headers and then
+    /// `extra_headers`. It may carry at most one `Content-Length`, with a plain decimal value
+    /// that must be 0 if the head ends the message. It may carry at most one written
+    /// `Transfer-Encoding` line, never together with a `Content-Length`, and only when this
+    /// codec chunk-frames the body. If the head does not end the message, the body must be
+    /// framed by that length or by chunking.
+    ///
+    /// With [`set_upstream_upgrade_as_ordinary`](Self::set_upstream_upgrade_as_ordinary) on,
+    /// generating a request for which this is false fails. It is always true for a request with
+    /// neither an `Upgrade` header nor a `CONNECT` method.
     pub fn frames_ordinary_request(
         &self,
         message: &HttpMessage,
@@ -1117,16 +1126,16 @@ impl Http1xCodec {
         }
         let version = self.egress_version(message);
         if version == (0, 9) {
-            // No header line is written, so nothing frames a body.
+            // No header line is written, so a body cannot be framed.
             return end_stream;
         }
         let may_chunk = version.0 == 1 && version.1 >= 1;
         let mut lengths = Vec::new();
         let mut chunked_seen = false;
         let mut transfer_encodings = 0_usize;
-        // As the header loop of `generate_headers`: the last `Content-Length` is written; a
-        // `Transfer-Encoding` line before the first chunked one is dropped, as is that line
-        // on HTTP/1.0, and every later line without CR or LF is written verbatim.
+        // This follows the header loop of `generate_headers`. The last `Content-Length` is
+        // written. A `Transfer-Encoding` line before the first chunked one is dropped, as is
+        // that line on HTTP/1.0, and every later line without CR or LF is written verbatim.
         for (code, _, value) in headers() {
             if code == HttpHeaderCode::ContentLength {
                 lengths.push(value);
@@ -1145,7 +1154,7 @@ impl Http1xCodec {
                 }
             }
         }
-        // As `generate_headers`: a message marked chunked is chunked under its chunked line,
+        // As in `generate_headers`, a message marked chunked is chunked under its chunked line,
         // and a POST or such a message with neither framing header gets a generated one.
         let marked = message.is_chunked() && may_chunk;
         let generated = (method == Some(HttpMethod::Post) || marked)
@@ -1269,8 +1278,8 @@ impl Http1xCodec {
         }
     }
 
-    /// Fails as appending `incoming` bytes to `output` would, so that a frame
-    /// queued in parts is queued whole or not at all.
+    /// Fails with the error that appending `incoming` bytes to `output` would
+    /// return, so that a frame queued in parts is queued whole or not at all.
     fn check_output_room(output: &BufQueue, incoming: usize) -> Result<(), HttpError> {
         let current = output.chain_length();
         let error = match current.checked_add(incoming) {
@@ -1288,9 +1297,9 @@ impl Http1xCodec {
         ))
     }
 
-    /// Returns the length of a frame of `prefix`, `body` and `suffix` bytes,
-    /// or fails as staging the frame in one queue and appending that queue to
-    /// `output` would, including when the frame's length overflows.
+    /// Returns the length of a frame of `prefix`, `body` and `suffix` bytes.
+    /// Fails with the error that staging the frame in one queue and appending
+    /// it to `output` would return, including when the length overflows.
     fn check_frame_room(
         output: &BufQueue,
         prefix: usize,
@@ -1315,8 +1324,8 @@ impl Http1xCodec {
 }
 
 /// Counts every string built by `format!` from here to the end of this file
-/// (the `generate` arms and the mounted test modules), so the count oracles see
-/// any chunk prefix formatted through `core::fmt`.
+/// (the `generate` arms and the mounted test modules), so that tests catch any
+/// chunk prefix formatted through `core::fmt`.
 #[cfg(test)]
 macro_rules! format {
     ($($argument:tt)*) => {{
@@ -1338,8 +1347,8 @@ trait IngressDelivery {
     fn ingress_body_limit(&self, stream: StreamId) -> Option<usize>;
 }
 
-/// A callback of a concrete type, called directly: the body of
-/// [`HttpCodec::dispatch_ingress_callback`]'s default, which `Http1xCodec` does
+/// Calls a callback of a concrete type directly, with the same body as the
+/// default [`HttpCodec::dispatch_ingress_callback`], which `Http1xCodec` does
 /// not override.
 impl<C: HttpCodecCallback> IngressDelivery for C {
     fn deliver(
@@ -1375,12 +1384,12 @@ impl IngressDelivery for dyn HttpCodecCallback + '_ {
 }
 
 impl Http1xCodec {
-    /// [`HttpCodec::on_ingress`] for a callback of concrete type `C`.
+    /// Same as [`HttpCodec::on_ingress`], but calls a callback of concrete type
+    /// `C` directly instead of through `dyn HttpCodecCallback`.
     ///
     /// It parses with the same code, delivers the same callbacks in the same
     /// order, applies each callback's controls before parsing continues, and
-    /// returns the same result. The parser calls `C` directly rather than
-    /// through `dyn HttpCodecCallback`.
+    /// returns the same result.
     pub fn on_ingress_with_callback<C: HttpCodecCallback>(
         &mut self,
         input: &BufQueue,
@@ -1704,7 +1713,7 @@ fn trim_http_whitespace(value: &[u8]) -> &[u8] {
 #[inline]
 fn holds_cr_or_lf(value: &[u8]) -> bool {
     !word_scan::all_words(value, |word| {
-        // CR and LF are below 0x0e: most words hold no such byte.
+        // CR and LF are below 0x0e, and most words do not contain such a byte.
         word_scan::has_less(word, 0x0e) == 0
             || (word_scan::has_zero(word ^ word_scan::repeat(b'\r'))
                 | word_scan::has_zero(word ^ word_scan::repeat(b'\n')))
@@ -1733,9 +1742,9 @@ fn invalid_state(message: &'static [u8]) -> HttpError {
     HttpError::with_message(HttpErrorCode::INVALID_STATE_TRANSITION, message)
 }
 
-/// Reads the method and URL as `HttpMessage`'s `&mut` request accessors would:
-/// a message with no kind reads as an empty method and URL, and a response
-/// has neither.
+/// Returns the method and URL the way `HttpMessage`'s `&mut` request accessors
+/// would. A message with no kind yields an empty method and URL, and a response
+/// yields `None`.
 fn request_fields(message: &HttpMessage) -> Option<(&str, &[u8])> {
     (!message.is_response()).then(|| {
         (
@@ -1745,9 +1754,9 @@ fn request_fields(message: &HttpMessage) -> Option<(&str, &[u8])> {
     })
 }
 
-/// Reads the status and reason as `HttpMessage`'s `&mut` response accessors
-/// would: a message with no kind reads as status 0 and an empty reason, and a
-/// request has neither.
+/// Returns the status and reason the way `HttpMessage`'s `&mut` response
+/// accessors would. A message with no kind yields status 0 and an empty reason,
+/// and a request yields `None`.
 fn response_fields(message: &HttpMessage) -> Option<(u16, &[u8])> {
     (!message.is_request()).then(|| {
         (
@@ -1764,7 +1773,7 @@ const STATIC_CHUNK_LINES: usize = 0x1000;
 const CHUNK_LINE_WIDTH: usize = 5;
 
 /// The line that opens each chunk shorter than [`STATIC_CHUNK_LINES`], right
-/// aligned in its entry, so that queueing it allocates nothing.
+/// aligned in its entry, so that queueing it does not allocate.
 static CHUNK_LINES: [u8; STATIC_CHUNK_LINES * CHUNK_LINE_WIDTH] = {
     let mut lines = [0; STATIC_CHUNK_LINES * CHUNK_LINE_WIDTH];
     let mut length = 0;
@@ -1775,10 +1784,9 @@ static CHUNK_LINES: [u8; STATIC_CHUNK_LINES * CHUNK_LINE_WIDTH] = {
     lines
 };
 
-/// Writes the line that opens a chunk, `length` in lowercase hex digits and
-/// then CRLF, so that it ends at `end` in `line`, and returns its start. The
-/// digits are written as [`push_decimal`] writes decimal ones, not through
-/// `core::fmt`.
+/// Writes `length` as lowercase hex followed by CRLF so that the line ends at
+/// `end` in `line`, and returns where it starts. Like [`push_decimal`], it does
+/// not go through `core::fmt`.
 const fn write_chunk_line(line: &mut [u8], end: usize, mut length: usize) -> usize {
     const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut start = end - 2;
@@ -1794,9 +1802,9 @@ const fn write_chunk_line(line: &mut [u8], end: usize, mut length: usize) -> usi
     }
 }
 
-/// The line that opens a chunk: a static line from [`CHUNK_LINES`], or for a
-/// chunk of at least [`STATIC_CHUNK_LINES`] bytes one buffer whose capacity is
-/// the line's length.
+/// Returns the line that opens a chunk of `length` bytes. A chunk shorter than
+/// [`STATIC_CHUNK_LINES`] borrows a line from [`CHUNK_LINES`]. Other chunks get
+/// a buffer of exactly the line's length.
 fn chunk_prefix(length: usize) -> Cow<'static, [u8]> {
     if length < STATIC_CHUNK_LINES {
         let digits = (usize::BITS - (length | 1).leading_zeros()).div_ceil(4) as usize;
@@ -1854,11 +1862,11 @@ mod word_scan {
         word.wrapping_sub(repeat(bound)) & !word & HIGH
     }
 
-    /// Whether `test` holds for each of a set of words that covers every
-    /// byte of `bytes`: its whole words and its last eight bytes, or for
-    /// fewer than eight bytes one word built from them. A byte class that
-    /// `test` checks in every byte of a word is thus checked in every byte of
-    /// `bytes`, with no byte checked on its own.
+    /// Whether `test` holds for a set of words that together cover every byte
+    /// of `bytes`. The set is the whole words plus the last eight bytes, or a
+    /// single word built from the bytes when there are fewer than eight. A byte
+    /// class that `test` checks in every byte of a word is therefore checked in
+    /// every byte of `bytes`, without a per-byte loop.
     #[inline]
     pub(super) fn all_words(bytes: &[u8], test: impl Fn(u64) -> bool) -> bool {
         if let Some(last) = bytes.last_chunk::<8>() {

@@ -64,7 +64,7 @@ const STRICT_NAME_BYTE: u8 = 1;
 /// separator `http_token` maps, or a byte at or above 0x80.
 const COMPAT_NAME_BYTE: u8 = 2;
 
-/// `http_token`'s answers for both name modes, by byte.
+/// `http_token` results for both name modes, indexed by byte.
 const NAME_BYTES: [u8; 256] = {
     let mut table = [0; 256];
     let mut index = 0;
@@ -233,7 +233,7 @@ pub(crate) fn has_ascii_uppercase(bytes: &[u8]) -> bool {
         }
         start += 8;
     }
-    // The last word may re-read bytes already checked, which cannot change an "any" answer.
+    // The last word may re-read bytes already checked, which cannot change the result.
     start < length && has_uppercase_byte(word_at(bytes, length - 8))
 }
 
@@ -288,8 +288,8 @@ pub const fn disallowed_modern_http_field(code: HttpHeaderCode) -> bool {
     )
 }
 
-/// Produces the source diagnostic shape without exposing field values below
-/// verbosity level two.
+/// Formats a request's URL for debug logs. Below verbosity level 2 only its
+/// length is included.
 pub fn debug_message(message: &mut HttpMessage, level: u8) -> Vec<u8> {
     if !message.is_request() {
         return Vec::new();
@@ -348,8 +348,8 @@ const fn http_token(byte: u8) -> Option<u8> {
 mod tests {
     use super::*;
 
-    /// `validate_url` as it was before the branch-free byte scan, kept as the
-    /// differential oracle.
+    /// A plain byte-scan version of `validate_url` for the test to compare
+    /// against.
     fn oracle_validate_url(url: &[u8], strict: bool) -> bool {
         if url.is_empty() || url.iter().any(|byte| matches!(*byte, 0..=0x20 | 0x7f)) {
             return false;

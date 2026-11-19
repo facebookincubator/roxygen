@@ -274,7 +274,7 @@ mod error_adapter {
         assert_eq!(
             http_exception_to_http_error_code(&owned),
             HttpErrorCode::PROTOCOL_ERROR,
-            "the frozen adapter's unknown legacy-category fallback remains total",
+            "a category without its own mapping falls back to PROTOCOL_ERROR",
         );
     }
 

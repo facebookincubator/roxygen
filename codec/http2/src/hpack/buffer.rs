@@ -47,8 +47,8 @@ pub struct HpackEncodeBuffer {
 }
 
 impl HpackEncodeBuffer {
-    /// Returns and resets the number of header block buffer allocations on this thread: a block buffer that
-    /// starts with new storage, grows while encoding, or copies a memoized block.
+    /// Returns and resets this thread's count of header block buffer allocations. A block buffer
+    /// counts when it starts with new storage, grows while encoding, or copies a memoized block.
     #[cfg(test)]
     pub(crate) fn take_block_allocations() -> usize {
         BLOCK_ALLOCATIONS.with(|count| count.replace(0))
@@ -79,7 +79,7 @@ impl HpackEncodeBuffer {
     }
 
     /// Like [`with_headroom_and_capacity`](Self::with_headroom_and_capacity), but encodes into
-    /// `storage`, whose contents are discarded and whose capacity is reused.
+    /// `storage`, discarding its contents and reusing its capacity.
     pub(crate) fn with_storage(
         huffman_enabled: bool,
         headroom: usize,
@@ -216,8 +216,8 @@ pub struct EncodedHeaderBlock {
 }
 
 impl EncodedHeaderBlock {
-    /// Copies `bytes` after `headroom` into `storage`, whose contents are discarded and whose
-    /// capacity is reused.
+    /// Copies `bytes` after `headroom` into `storage`, discarding its contents and reusing its
+    /// capacity.
     pub(super) fn copy_with_headroom_into(
         mut storage: Vec<u8>,
         bytes: &[u8],
@@ -393,8 +393,8 @@ impl<'a> HpackDecodeBuffer<'a> {
         self.decode_integer_from(first, NBIT_MASKS[usize::from(nbits)])
     }
 
-    /// Finishes an integer whose first byte, `first`, has been read: a prefix below `mask` is the
-    /// whole value, and a full prefix continues out of line.
+    /// Finishes an integer after its first byte, `first`, has been read. A prefix below `mask` is
+    /// the whole value, and a full prefix continues out of line.
     #[inline]
     fn decode_integer_from(&mut self, first: u8, mask: u8) -> Result<u64, HpackError> {
         let prefix = first & mask;

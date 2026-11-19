@@ -50,11 +50,10 @@ struct FlowControlState {
 
 /// An owning HTTP/2 codec wrapper with connection-level flow control.
 ///
-/// The wrapped codec is the exact continuation used by receive-window updates,
-/// ingress callbacks, and egress generation. An outer
-/// [`roxygen_codec::HttpCodecFilterChain`] can wrap this value so synthesized
-/// errors traverse the same reverse callback path and preserve callback
-/// actions.
+/// Window updates, ingress callbacks and egress frames all go through the
+/// wrapped codec. An outer [`roxygen_codec::HttpCodecFilterChain`] can wrap
+/// this value so that synthesized errors take the same callback path and keep
+/// their callback actions.
 pub struct FlowControlledCodec {
     codec: Box<dyn HttpCodec>,
     state: Rc<RefCell<FlowControlState>>,

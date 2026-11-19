@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Source-faithful HTTP/2 framing, flow control, and RFC 7541 HPACK.
+//! HTTP/2 framing, flow control, and HPACK (RFC 7541).
 
 pub mod codec_impl;
 pub mod constants;

@@ -20,8 +20,8 @@ use super::generated::finish;
 use super::generated::methods;
 use super::lenient_flags;
 
-/// Receives parser callbacks. A callback returns an llhttp callback code; in
-/// particular, `Error::PAUSED.0` suspends execution at a callback boundary.
+/// Receives parser callbacks. Each callback returns an llhttp callback code, and
+/// `Error::PAUSED.0` suspends execution at a callback boundary.
 pub(crate) trait Callbacks {
     fn on_event(&mut self, parser: &mut Parser, event: Event, range: Range<usize>) -> i32;
 }
@@ -43,7 +43,7 @@ pub(crate) struct ExecuteResult {
 }
 
 /// Incremental llhttp state. Input ranges refer only to the current `execute`
-/// call; no borrow or address into the input survives that call.
+/// call, and the parser does not keep a borrow or address into the input.
 #[derive(Debug)]
 pub(crate) struct Parser {
     pub(crate) content_length: u64,
@@ -172,8 +172,9 @@ impl Parser {
         self.finish_callbacks(&mut callback)
     }
 
-    /// End-of-input is separate from executing an empty slice, which resumes
-    /// transitions left pending by a callback pause at the end of a segment.
+    /// Signals end of input. This differs from executing an empty slice, which
+    /// resumes transitions left pending by a callback pause at the end of a
+    /// segment.
     pub(crate) fn finish_callbacks<C: Callbacks + ?Sized>(&mut self, callbacks: &mut C) -> Error {
         if self.error != Error::OK {
             return Error::OK;

@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Source-faithful HTTP/2 codec built from the framing and HPACK layers.
+//! HTTP/2 codec built from the framing and HPACK layers.
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -148,7 +148,6 @@ struct PreparedMessageHeaders<'a> {
     headers: &'a HttpHeaders,
     extra: Option<&'a HttpHeaders>,
     date: Option<String>,
-    /// `DIV-041`: values are encoded as stored instead of trimmed.
     verbatim_values: bool,
 }
 
@@ -172,9 +171,9 @@ pub(crate) fn take_header_visits() -> usize {
 
 impl PreparedMessageHeaders<'_> {
     /// Visits the pseudo-headers, then each header and the date. With `MESSAGE_FIELDS_ONLY`, it
-    /// skips headers that HTTP/2 does not carry and trims their values unless `VERBATIM`, which
-    /// `for_each` sets from `verbatim_values`; without it, it visits every header untrimmed, which
-    /// only suits length bounds.
+    /// skips headers that HTTP/2 does not carry and trims values unless `VERBATIM` is set
+    /// (`for_each` sets it from `verbatim_values`). Without `MESSAGE_FIELDS_ONLY`, it visits every
+    /// header untrimmed, which is only suitable for length bounds.
     fn visit<'a, const MESSAGE_FIELDS_ONLY: bool, const VERBATIM: bool>(
         &'a self,
         mut visitor: impl FnMut(Header<'a>),
@@ -375,18 +374,18 @@ impl Http2Codec {
         self.parallel.disable_double_goaway_drain();
     }
 
-    /// Retains Proxygen's compatibility setting.
+    /// Has no effect. It mirrors an option of Proxygen's HTTP/2 codec.
     ///
-    /// Both values preserve payload backing because [`Bytes`](bytes::Bytes) has no safe
-    /// mutable-headroom operation; frame metadata is allocated separately.
+    /// Payload backing is always preserved, because [`Bytes`](bytes::Bytes) has no safe
+    /// mutable-headroom operation. Frame metadata is allocated separately.
     pub fn set_reuse_payload_headroom(&mut self, enabled: bool) {
         self.reuse_payload_headroom = enabled;
     }
 
     /// Copies small unpadded DATA into bounded compact wire segments.
     ///
-    /// Large and padded frames retain payload backing. Copied body owners may
-    /// be released during generation, before physical write completion.
+    /// Large and padded frames retain payload backing. Copied body buffers may
+    /// be released while the frame is generated, before the write completes.
     pub fn set_compact_data(&mut self, enabled: bool) {
         self.compact_data = enabled;
     }
@@ -405,30 +404,33 @@ impl Http2Codec {
         self.strict_validation = enabled;
     }
 
-    /// Roxygen-only (`DIV-040`): a request's `:method` is read as RFC 9110 section 9.1 defines
-    /// methods, and as h2 (`http::Method::from_bytes`) reads them: any token, case-sensitive and
-    /// kept byte for byte (`Method::from_exact_token`), so `post` and `Post` are extension
-    /// methods and only `POST` is `HttpMethod::Post`, instead of the reference decoder's run of
-    /// letters and `-`, whose recognized methods match without regard to case and whose
-    /// extension methods are uppercased. A `:method` that is not a token, the empty one
-    /// included, makes the request malformed. Off by default.
+    /// Parses a request's `:method` as an exact RFC 9110 token, as h2 does
+    /// (`http::Method::from_bytes`). Off by default.
+    ///
+    /// The method is case-sensitive and kept byte for byte (`Method::from_exact_token`), so
+    /// `post` and `Post` are extension methods and only `POST` is `HttpMethod::Post`. A
+    /// `:method` that is not a token, the empty one included, makes the request malformed. When
+    /// off, a method is a run of letters and `-`, recognized methods match regardless of case,
+    /// and extension methods are uppercased.
     pub fn set_exact_methods(&mut self, enabled: bool) {
         self.decoder_memo = None;
         self.field_options.exact_methods = enabled;
     }
 
-    /// Roxygen-only (`DIV-041`): every decoded field section (request and response heads,
-    /// trailers, push promises) stores its regular field values exactly as decoded, surrounding
-    /// spaces and tabs included, as h2 (and hyper over it) does, instead of trimming them as the
-    /// reference decoder does for every field; and every generated message head encodes its
-    /// regular field values as stored (as h2 writes a `HeaderValue`), instead of trimming them
-    /// (trailers already go out as stored). Values are then checked as h2 checks them, so the
-    /// decoder never accepts one h2 refuses: a byte below 0x20 other than HTAB, or DEL, makes the
-    /// message malformed (no obsolete line folding), as does a `content-length` that is not at
-    /// most 19 digits or a `te` other than `trailers`. An empty `content-length`, which h2 reads
-    /// as zero, is kept as an empty field (a uniplex session with
-    /// `verbatim_http2_header_values` checks the body against zero). `cookie` crumbs are still
-    /// combined into one value, untrimmed. Pseudo-headers are unchanged. Off by default.
+    /// Keeps regular field values exactly as received or stored, without trimming surrounding
+    /// spaces and tabs, as h2 (and hyper over it) does. Off by default.
+    ///
+    /// This applies to every decoded field section (request and response heads, trailers and
+    /// push promises) and to every generated message head. When off, both directions trim the
+    /// values. Trailers are sent as stored either way, and pseudo-headers are not affected.
+    ///
+    /// When on, values are validated as h2 validates them, so the decoder accepts only values
+    /// that h2 accepts. DEL or a byte below 0x20 other than HTAB makes the message malformed, so
+    /// obsolete line folding is rejected. A `content-length` with a non-digit byte or more than
+    /// 19 digits, or a `te` other than `trailers`, also makes the message malformed. An empty
+    /// `content-length`, which h2 reads as zero, is kept as an empty field, and a uniplex session
+    /// with `verbatim_http2_header_values` checks the body against zero. `cookie` crumbs are
+    /// still combined into one value, untrimmed.
     pub fn set_verbatim_field_values(&mut self, enabled: bool) {
         self.decoder_memo = None;
         self.field_options.verbatim_values = enabled;
@@ -637,8 +639,8 @@ impl Http2Codec {
         true
     }
 
-    // Fatal errors report protocol consumption independently of cursor progress;
-    // the ingress loop stops before using that cursor again.
+    // Fatal errors report protocol consumption independently of cursor progress.
+    // The ingress loop stops before it uses that cursor again.
     fn process_data(
         &mut self,
         input: &mut SegmentCursor<'_>,
