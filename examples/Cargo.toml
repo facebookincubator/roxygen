@@ -4,7 +4,7 @@
 name = "ferroxygen_examples"
 version = "0.1.0"
 edition = "2024"
-description = "Examples for the Roxygen HTTP library."
+description = "Example programs for Roxygen"
 repository = "https://github.com/facebookincubator/roxygen"
 license = "MIT"
 publish = false

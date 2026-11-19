@@ -4,6 +4,7 @@
 name = "ferroxygen_axum_tower_fixture"
 version = "0.1.0"
 edition = "2024"
+description = "An end-to-end test of Roxygen's Tower adapter with Axum"
 repository = "https://github.com/facebookincubator/roxygen"
 license = "MIT"
 publish = false

@@ -4,6 +4,7 @@
 name = "ferroxygen_curl"
 version = "0.1.0"
 edition = "2024"
+description = "A curl-like command-line client built on Roxygen"
 repository = "https://github.com/facebookincubator/roxygen"
 license = "MIT"
 publish = false

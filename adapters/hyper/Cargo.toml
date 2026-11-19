@@ -4,6 +4,7 @@
 name = "ferroxygen_hyper_adapter"
 version = "0.1.0"
 edition = "2024"
+description = "http-body implementations over Roxygen bodies, and the reverse"
 repository = "https://github.com/facebookincubator/roxygen"
 license = "MIT"
 publish = false

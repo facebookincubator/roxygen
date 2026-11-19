@@ -4,6 +4,7 @@
 name = "ferroxygen_codec"
 version = "0.1.0"
 edition = "2024"
+description = "The codec interface shared by Roxygen's HTTP/1 and HTTP/2 codecs"
 repository = "https://github.com/facebookincubator/roxygen"
 license = "MIT"
 publish = false

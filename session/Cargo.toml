@@ -4,6 +4,7 @@
 name = "ferroxygen_session"
 version = "0.1.0"
 edition = "2024"
+description = "HTTP/1.1 and HTTP/2 connection state machines for Roxygen"
 repository = "https://github.com/facebookincubator/roxygen"
 license = "MIT"
 publish = false
