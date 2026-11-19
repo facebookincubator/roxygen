@@ -565,6 +565,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferroxygen_examples"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "ferroxygen_client",
+ "ferroxygen_core",
+ "ferroxygen_hyper_adapter",
+ "ferroxygen_runtime",
+ "ferroxygen_server",
+ "ferroxygen_tower_adapter",
+ "ferroxygen_transport",
+ "rcgen",
+ "tokio",
+]
+
+[[package]]
 name = "ferroxygen_explicit"
 version = "0.1.0"
 dependencies = [

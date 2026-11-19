@@ -13,6 +13,7 @@ members = [
   "connect",
   "core",
   "curl",
+  "examples",
   "runtime",
   "server",
   "session",
