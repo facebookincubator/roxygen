@@ -6304,7 +6304,7 @@ pub mod h2 {
         });
         assert_eq!(outcome.0, HttpErrorCode::TRANSPORT_READ_ERROR);
         assert_eq!(outcome.1, 0);
-        assert_eq!(outcome.2, FixtureClose::Reset);
+        assert_eq!(outcome.2, FixtureClose::ShutdownWrite);
     }
 
     fn assert_real_upstream_request_body_error() {
@@ -11097,7 +11097,10 @@ pub mod h2 {
                         assert_eq!(state.borrow().close, FixtureClose::Open);
                         assert_eq!(source_probe.source_drops.get(), 0);
                     } else {
-                        complete_credit_wait(|| state.borrow().close == FixtureClose::Reset).await;
+                        complete_credit_wait(|| {
+                            state.borrow().close == FixtureClose::ShutdownWrite
+                        })
+                        .await;
                     }
                     assert!(
                         tokio::time::Instant::now().into_std()
@@ -11133,7 +11136,7 @@ pub mod h2 {
             let error = run.expect_err("unchanged connection stall must time out");
             assert_eq!(error.code(), HttpErrorCode::FLOW_CONTROL_ERROR);
             assert_eq!(error.message(), b"HTTP/2 connection flow-control timeout");
-            assert_eq!(state.borrow().close, FixtureClose::Reset);
+            assert_eq!(state.borrow().close, FixtureClose::ShutdownWrite);
         }
         assert!(!control.source_yield_paused.get());
         assert!(!source_gate.released.load(Ordering::SeqCst));
@@ -11404,7 +11407,7 @@ pub mod h2 {
             run.unwrap().unwrap_err().code(),
             HttpErrorCode::FLOW_CONTROL_ERROR
         );
-        assert_eq!(wire.borrow().close, FixtureClose::Reset);
+        assert_eq!(wire.borrow().close, FixtureClose::ShutdownWrite);
         let decoded = complete_credit_wire(true, &wire);
         assert_eq!(decoded.frames.body_bytes, 65_535);
         assert!(decoded.frames.window_updates.is_empty());
@@ -11708,7 +11711,7 @@ pub mod h2 {
             run.unwrap().unwrap_err().code(),
             HttpErrorCode::FLOW_CONTROL_ERROR
         );
-        assert_eq!(wire.borrow().close, FixtureClose::Reset);
+        assert_eq!(wire.borrow().close, FixtureClose::ShutdownWrite);
         let decoded = complete_credit_wire(true, &wire);
         assert_eq!(decoded.frames.body_bytes, 65_535);
         assert!(decoded.frames.window_updates.is_empty());
@@ -12007,7 +12010,7 @@ pub mod h2 {
             );
         } else {
             assert_eq!(outcome.error, Some(HttpErrorCode::INTERNAL_ERROR));
-            assert_eq!(outcome.close, FixtureClose::Reset);
+            assert_eq!(outcome.close, FixtureClose::ShutdownWrite);
         }
     }
 
@@ -13200,7 +13203,7 @@ pub mod h2 {
                     .await
                     .expect_err("connection window overflow fails the session");
                 assert_eq!(error.code(), HttpErrorCode::FLOW_CONTROL_ERROR);
-                assert_eq!(state.borrow().close, FixtureClose::Reset);
+                assert_eq!(state.borrow().close, FixtureClose::ShutdownWrite);
                 let events = events.borrow();
                 let message = event_position(
                     &events,
@@ -13807,11 +13810,7 @@ pub mod h2 {
                                 [(StreamId::new(1), 200)]
                             );
                             cleanup.close_input.notify_one();
-                            let expected_close = if fail_read {
-                                FixtureClose::Reset
-                            } else {
-                                FixtureClose::ShutdownWrite
-                            };
+                            let expected_close = FixtureClose::ShutdownWrite;
                             eligibility_wait(&changed, || {
                                 handle.closing_state_for_test().0
                                     && state.borrow().close == expected_close
@@ -13825,8 +13824,8 @@ pub mod h2 {
                             let shutdown_before = transport.shutdown_calls.get();
                             let reset_before = transport.reset_calls.get();
                             let close_before = transport.close_calls.get();
-                            assert_eq!(reset_before, usize::from(fail_read));
-                            assert_eq!(shutdown_before, usize::from(!fail_read));
+                            assert_eq!(reset_before, 0);
+                            assert_eq!(shutdown_before, 1);
                             assert_eq!(close_before, 0);
                             assert!(!events_before.contains(&LifecycleEvent::Destroy));
                             assert_eq!(worker_drops.load(Ordering::SeqCst), 0);
@@ -13887,8 +13886,8 @@ pub mod h2 {
                             .initiate_drain()
                             .expect("completed drain is also a no-op")
                     );
-                    assert_eq!(transport.reset_calls.get(), usize::from(fail_read));
-                    assert_eq!(transport.shutdown_calls.get(), usize::from(!fail_read));
+                    assert_eq!(transport.reset_calls.get(), 0);
+                    assert_eq!(transport.shutdown_calls.get(), 1);
                     assert_eq!(transport.close_calls.get(), 0);
                     assert_eq!(
                         events
@@ -16487,7 +16486,7 @@ pub mod h2 {
                     .await
                     .expect_err("connection WINDOW_UPDATE overflow fails session");
                 assert_eq!(error.code(), HttpErrorCode::FLOW_CONTROL_ERROR);
-                assert_eq!(state.borrow().close, FixtureClose::Reset);
+                assert_eq!(state.borrow().close, FixtureClose::ShutdownWrite);
                 let cancelled = probe.cancelled.borrow();
                 assert_eq!(cancelled.len(), 1);
                 assert_eq!(cancelled[0].0.event_type, ByteEventType::NicTx);
@@ -16979,7 +16978,7 @@ pub mod h2 {
                         ),
                         "{source_error:?}"
                     );
-                    assert_eq!(state.borrow().close, FixtureClose::Reset);
+                    assert_eq!(state.borrow().close, FixtureClose::ShutdownWrite);
                 } else {
                     run_result.expect("stream overflow remains stream-local");
                     assert_eq!(
@@ -17053,7 +17052,7 @@ pub mod h2 {
                         .code(),
                     HttpErrorCode::FLOW_CONTROL_ERROR
                 );
-                assert_eq!(state.borrow().close, FixtureClose::Reset);
+                assert_eq!(state.borrow().close, FixtureClose::ShutdownWrite);
             })
         });
     }
@@ -17207,7 +17206,7 @@ pub mod h2 {
         let decoded = decode_server_frames(&outcome.wire);
         if connection_blocked {
             assert_eq!(outcome.error, Some(HttpErrorCode::FLOW_CONTROL_ERROR));
-            assert_eq!(outcome.close, FixtureClose::Reset);
+            assert_eq!(outcome.close, FixtureClose::ShutdownWrite);
         } else {
             assert_eq!(outcome.error, None);
             assert_eq!(
@@ -18946,7 +18945,7 @@ pub mod h2 {
                     .expect("rate-limit shutdown timed out")
                     .expect_err("rate-limit breach fails the connection");
                 assert_eq!(run_error.code(), HttpErrorCode::CANCEL);
-                assert_eq!(state.borrow().close, FixtureClose::Reset);
+                assert_eq!(state.borrow().close, FixtureClose::ShutdownWrite);
                 let samples = stats.rate_samples.borrow();
                 assert!(samples.iter().any(|sample| {
                     sample.kind == RateLimitKind::Resets
@@ -18995,7 +18994,7 @@ pub mod h2 {
                     .await
                     .expect_err("fourth semantic control request breaches the limit");
                 assert_eq!(error.code(), HttpErrorCode::CANCEL);
-                assert_eq!(state.borrow().close, FixtureClose::Reset);
+                assert_eq!(state.borrow().close, FixtureClose::ShutdownWrite);
                 assert_eq!(
                     decode_server_frames(&state.borrow().writes.concat()).ping_replies,
                     [11]
@@ -19545,7 +19544,7 @@ pub mod h2 {
                     Err(error) => error,
                 };
                 assert_eq!(error.code(), HttpErrorCode::CANCEL);
-                assert_eq!(state.borrow().close, FixtureClose::Reset);
+                assert_eq!(state.borrow().close, FixtureClose::ShutdownWrite);
                 assert!(stats.rate_samples.borrow().iter().any(|sample| {
                     sample.kind == RateLimitKind::DirectErrors
                         && sample.count == 51
@@ -20733,7 +20732,7 @@ pub mod h2 {
 
                 assert!(session.run().await.is_err());
                 assert_eq!(prefix_drops.load(Ordering::SeqCst), 1);
-                assert_eq!(state.borrow().close, FixtureClose::Reset);
+                assert_eq!(state.borrow().close, FixtureClose::ShutdownWrite);
             })
         });
     }

@@ -573,15 +573,14 @@ async fn owned_http2_reset_flood(
 }
 
 /// A reset-flood breach on `owned_http2` fails the connection with
-/// GOAWAY(`CANCEL`), and `non_abortive_close` turns the reset that follows into
-/// a FIN.
+/// GOAWAY(`CANCEL`) and then a FIN, with or without `non_abortive_close`.
 #[test]
-fn owned_http2_reset_flood_closes_with_eof_when_enabled() {
+fn owned_http2_reset_flood_closes_with_eof() {
     on_worker(|context| async move {
         assert_eq!(
             owned_http2_reset_flood(context.clone(), false).await,
-            (vec![0x8], true),
-            "by default the breach sends GOAWAY(CANCEL), then resets"
+            (vec![0x8], false),
+            "by default the breach sends GOAWAY(CANCEL), then a FIN"
         );
         assert_eq!(
             owned_http2_reset_flood(context, true).await,

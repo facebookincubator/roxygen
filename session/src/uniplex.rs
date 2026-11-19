@@ -1596,6 +1596,12 @@ struct DriverState {
     reads_closed: bool,
     writes_finished: bool,
     reset_after_draining_writes: bool,
+    /// Set when an HTTP/2 connection fails, which ends it with FIN after its
+    /// GOAWAY. `abortive_close` overrides it.
+    fin_after_failure: bool,
+    /// Set by a write error, a panic, a worker shutdown, a cancel and a ping
+    /// probe timeout, each of which resets the transport.
+    abortive_close: bool,
     transport_reset_issued: bool,
     reset_after_error_response: Option<StreamId>,
     deferred_drain: bool,
@@ -1950,6 +1956,10 @@ impl DriverState {
                 || self.codec.is_reusable()
                 || self.codec.is_busy()
                 || self.core().num_transactions() != 0)
+    }
+
+    fn closes_with_fin(&self) -> bool {
+        self.fin_after_failure && !self.abortive_close
     }
 
     fn has_pending_egress(&self) -> bool {
@@ -3161,6 +3171,9 @@ impl UniplexHandle {
                         )
                     });
                 self.retain_committed_header_error(&state, &error);
+                if first_panic.is_some() {
+                    state.borrow_mut().abortive_close = true;
+                }
                 capture_panic(&mut first_panic, || {
                     fail_connection(&state, &self.shared.write_wake, error, true)
                 });
@@ -3712,15 +3725,25 @@ fn release_panicked_owner(
     capture_panic(first_panic, || drop(released));
 }
 
+/// Resets the transport once, or shuts down its write side when a failed
+/// HTTP/2 connection ends with FIN.
 fn reset_transport_once(
     state: &Rc<RefCell<DriverState>>,
     transport: &Rc<dyn UniplexTransport>,
     context: &WorkerContext,
 ) -> Result<(), HttpError> {
-    if std::mem::replace(&mut state.borrow_mut().transport_reset_issued, true) {
-        return Ok(());
+    let fin = {
+        let mut state = state.borrow_mut();
+        if std::mem::replace(&mut state.transport_reset_issued, true) {
+            return Ok(());
+        }
+        state.closes_with_fin()
+    };
+    if fin {
+        transport.shutdown_write(context)
+    } else {
+        transport.close_with_reset(context)
     }
-    transport.close_with_reset(context)
 }
 
 fn request_abort_cleanup(
@@ -3755,6 +3778,7 @@ fn request_abort_cleanup(
         b"uniplex run future was cancelled",
     );
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+        state.borrow_mut().abortive_close = true;
         fail_connection(state, write_wake, error, true)
     })) {
         record_cleanup_panic(cleanup, payload);
@@ -4227,6 +4251,8 @@ impl UniplexSession {
             reads_closed: false,
             writes_finished: false,
             reset_after_draining_writes: false,
+            fin_after_failure: false,
+            abortive_close: false,
             transport_reset_issued: false,
             reset_after_error_response: None,
             deferred_drain: false,
@@ -4324,7 +4350,7 @@ impl UniplexSession {
                     bytes_read: state.bytes_read,
                     bytes_scheduled: state.bytes_scheduled,
                     bytes_written: state.bytes_written,
-                    reset: state.reset_after_draining_writes,
+                    reset: state.reset_after_draining_writes && !state.closes_with_fin(),
                 }
             };
             cleanup_control.summary.set(Some(summary));
@@ -4887,6 +4913,7 @@ fn drop_connection_for_ping_probe(
         shared.write_cancellation.request_cancellation();
     });
     capture_panic(&mut first_panic, || {
+        state.borrow_mut().abortive_close = true;
         fail_connection(state, &shared.write_wake, ping_probe_timeout_error(), true);
     });
     capture_panic(&mut first_panic, || {
@@ -7335,6 +7362,7 @@ fn cancel_writer_for_worker_shutdown(
     write_wake: &tokio::sync::Notify,
     read_cancellation: &CancellationSource,
 ) {
+    state.borrow_mut().abortive_close = true;
     fail_connection(
         state,
         write_wake,
@@ -7604,6 +7632,7 @@ async fn write_loop(
             .await
             {
                 let byte_event_error = error.clone();
+                state.borrow_mut().abortive_close = true;
                 fail_connection(&state, write_wake, error, true);
                 let _ = observer.cancel_events(&context, &byte_event_error);
                 state.borrow_mut().byte_event_cancel_error.take();
@@ -10700,6 +10729,7 @@ fn fail_connection(
         }
         let mut queued_work = state.take_egress_work();
         state.reset_after_draining_writes |= reset;
+        state.fin_after_failure |= reset && state.codec.protocol() == CodecProtocol::Http2;
         state.reads_closed = true;
         let wire_code = http_error_code_to_h2_error_code(error.code(), false);
         let _ = generate_goaway(&mut state, wire_code);

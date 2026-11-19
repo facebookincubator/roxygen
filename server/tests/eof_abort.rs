@@ -1793,7 +1793,8 @@ fn abort_http2_streams_on_eof_is_off_by_default_and_reaches_both_http2_configs()
 
 /// With `abort_http2_streams_on_eof`, a peer EOF while a stream is open fails
 /// the connection with `TRANSPORT_EOF`. The handler future is cancelled, the
-/// session does not write on the stream, and the transport is reset.
+/// session does not write on the stream, and the connection ends with a
+/// GOAWAY and a FIN.
 #[test]
 fn http2_eof_aborts_a_held_stream_when_enabled() {
     in_both_h2_modes(|context, owned| async move {
@@ -1822,7 +1823,8 @@ fn http2_eof_aborts_a_held_stream_when_enabled() {
             !h2_frame_kinds(&wire, 1).contains(&H2_HEADERS),
             "no response head is written: {wire:?}"
         );
-        assert!(reset, "the abort resets the transport");
+        assert!(!reset, "the abort ends the connection with a FIN");
+        assert_eq!(h2_goaways(&wire), [(1, INTERNAL_ERROR)]);
     });
 }
 
@@ -1905,7 +1907,7 @@ fn http2_eof_stops_a_streaming_response_when_enabled() {
                 .all(|frame| frame.flags & END_STREAM == 0),
             "the aborted response never ends its stream: {wire:?}"
         );
-        assert!(reset, "the abort resets the transport");
+        assert!(!reset, "the abort ends the connection with a FIN");
     });
 }
 
@@ -1960,14 +1962,15 @@ fn http2_eof_mid_upload_aborts_without_the_500_when_enabled() {
     );
     assert!(
         outcomes.iter().all(|(_, abort, head, reset, error)| {
-            if *abort {
-                head.is_none() && *reset && *error == Some(HttpErrorCode::TRANSPORT_EOF)
+            let served = if *abort {
+                head.is_none() && *error == Some(HttpErrorCode::TRANSPORT_EOF)
             } else {
-                *head == Some(STATUS_500) && !*reset && error.is_none()
-            }
+                *head == Some(STATUS_500) && error.is_none()
+            };
+            served && !*reset
         }),
-        "by default both drivers answer 500 and close cleanly; with the option the EOF \
-         aborts the open stream without a response: {outcomes:?}"
+        "by default both drivers answer 500; with the option the EOF aborts the open \
+         stream without a response; either way the connection ends with a FIN: {outcomes:?}"
     );
 }
 
@@ -2292,13 +2295,12 @@ fn http2_request_and_eof_in_one_write_abort_when_enabled() {
             !h2_frame_kinds(&wire, 1).contains(&H2_HEADERS),
             "no response head is written: {wire:?}"
         );
-        assert!(reset, "the abort resets the transport");
+        assert!(!reset, "the abort ends the connection with a FIN");
     });
 }
 
-/// Under `non_abortive_close` the abort's reset is a FIN, so the
-/// client reads the abort's GOAWAY: one, with INTERNAL_ERROR and the held
-/// stream as the last.
+/// Under `non_abortive_close` the abort also ends with a FIN after its
+/// GOAWAY: one, with INTERNAL_ERROR and the held stream as the last.
 #[test]
 fn http2_eof_aborts_with_a_goaway_and_a_fin_under_non_abortive_close() {
     in_both_h2_modes(|context, owned| async move {
@@ -2508,7 +2510,7 @@ fn http2_eof_inside_a_request_head_aborts_when_enabled() {
             if abort {
                 let error = closed.expect_err("the EOF fails the connection");
                 assert_eq!(error.code(), HttpErrorCode::TRANSPORT_EOF);
-                assert!(reset, "the abort resets the transport");
+                assert!(!reset, "the abort ends the connection with a FIN");
             } else {
                 closed.expect("by default the EOF closes the connection");
                 assert!(!reset, "the connection closes without a reset");

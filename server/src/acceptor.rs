@@ -196,17 +196,18 @@ pub struct ServerSessionConfig {
     /// A stream is open while its response's END_STREAM is unserialized or its request head is
     /// still arriving. The failure works like a transport read error. Every stream's handler is
     /// cancelled and its sources stopped, and no error response is sent. Output already
-    /// serialized is still written, followed by a GOAWAY, and the transport is reset (closed
-    /// with FIN under `non_abortive_close`). With the option off, only streams with an
-    /// incomplete request end and the others are still served, so a half-closed client still
-    /// gets their responses. An EOF with no open stream closes the connection normally. Both
-    /// HTTP/2 drivers apply it. HTTP/1.1 connections use `abort_exchanges_on_eof` instead.
+    /// serialized is still written, followed by a GOAWAY and a FIN. With the option off, only
+    /// streams with an incomplete request end and the others are still served, so a
+    /// half-closed client still gets their responses. An EOF with no open stream closes the
+    /// connection normally. Both HTTP/2 drivers apply it. HTTP/1.1 connections use
+    /// `abort_exchanges_on_eof` instead.
     pub abort_http2_streams_on_eof: bool,
     /// When the session resets a connection, closes its socket without `SO_LINGER` zero.
     /// Off by default.
     ///
     /// Resets include an HTTP/1.1 stream reset (such as a response body error, after writing
-    /// what was already serialized), a connection error and `ServerConnection::cancel`. The
+    /// what was already serialized), an HTTP/1.1 connection error, an HTTP/2 write error and
+    /// `ServerConnection::cancel`. A failed HTTP/2 connection ends with FIN either way. The
     /// socket is closed by dropping it, as hyper's server does (hyper never resets a
     /// connection). The kernel still sends the bytes already written, then FIN, or RST only if
     /// received bytes are unread. An HTTP/1.1 response body error also discards output that is

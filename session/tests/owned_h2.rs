@@ -1090,12 +1090,12 @@ fn owned_h2_a_parked_reader_still_ends_on_its_wake_close_and_abort() {
         (
             ParkedEnd::ReadError(HttpErrorCode::TRANSPORT_READ_ERROR),
             Err(HttpErrorCode::TRANSPORT_READ_ERROR),
-            FixtureClose::Reset,
+            FixtureClose::Closed,
         ),
         (
             ParkedEnd::ReadError(HttpErrorCode::DROPPED),
             Err(HttpErrorCode::DROPPED),
-            FixtureClose::Reset,
+            FixtureClose::Closed,
         ),
         (ParkedEnd::Close, Ok(()), FixtureClose::Closed),
         (
@@ -3041,7 +3041,7 @@ fn uniplex_eof_aborts_a_held_stream_after_a_refusal_found_no_room() {
                 "stream 3's REFUSED_STREAM found no room"
             );
             assert_eq!(abandoned.get(), 1, "the EOF aborts held stream 1");
-            assert_eq!(state.borrow().close, FixtureClose::Reset);
+            assert_eq!(state.borrow().close, FixtureClose::ShutdownWrite);
             assert_eq!(
                 run.err().map(|error| error.code()),
                 Some(HttpErrorCode::PROTOCOL_ERROR),
@@ -4093,7 +4093,7 @@ fn assert_a_cancel_all_panic_keeps_the_original_error(byte_event: bool) {
             let mut dropped = probe.dropped.borrow().clone();
             dropped.sort_unstable();
             assert_eq!(dropped, [1, 3, 5]);
-            assert_eq!(state.borrow().close, FixtureClose::Reset);
+            assert_eq!(state.borrow().close, FixtureClose::Closed);
             assert_worker_serves(context).await;
         })
     });
@@ -4178,7 +4178,7 @@ fn assert_an_eof_abort_cancel_panic_keeps_transport_eof() {
                 )]
             );
             assert_eq!(contained_panic_counts(&worker, &start), (1, 0, 0));
-            assert_eq!(state.borrow().close, FixtureClose::Reset);
+            assert_eq!(state.borrow().close, FixtureClose::Closed);
             assert_worker_serves(context).await;
         })
     });
@@ -16512,7 +16512,7 @@ fn owned_control_rate_limit_counts_only_semantic_request_callbacks() {
     // SETTINGS, PRIORITY_UPDATE and the first PING count; SETTINGS ACK, the PING ACK and
     // WINDOW_UPDATE do not, so the second PING is the fourth control frame.
     assert_eq!(run, Err(HttpErrorCode::CANCEL));
-    assert_eq!(close, FixtureClose::Reset);
+    assert_eq!(close, FixtureClose::Closed);
     assert_eq!(written.ping_replies, [11]);
     assert_eq!(written.goaways, [(StreamId::new(1), H2ErrorCode::CANCEL)]);
 }
@@ -16536,7 +16536,7 @@ fn owned_settings_flood_trips_control_limit_before_acknowledging() {
         ))
     });
     assert_eq!(run, Err(HttpErrorCode::CANCEL));
-    assert_eq!(close, FixtureClose::Reset);
+    assert_eq!(close, FixtureClose::Closed);
     assert_eq!(
         written.settings_acks, 2,
         "the third SETTINGS breaches the limit before it is acknowledged"
@@ -16598,7 +16598,7 @@ fn owned_reset_rate_limit_cancels_unrelated_active_request() {
         })
     });
     assert_eq!(run, Err(HttpErrorCode::CANCEL));
-    assert_eq!(close, FixtureClose::Reset);
+    assert_eq!(close, FixtureClose::Closed);
     assert_eq!(written.goaways, [(StreamId::new(3), H2ErrorCode::CANCEL)]);
     assert_eq!(probes.len(), 2);
     assert_eq!(
@@ -16649,7 +16649,7 @@ fn owned_rapid_reset_flood_trips_the_reset_limit() {
         ))
     });
     assert_eq!(run, Err(HttpErrorCode::CANCEL));
-    assert_eq!(close, FixtureClose::Reset);
+    assert_eq!(close, FixtureClose::Closed);
     assert_eq!(written.goaways.len(), 1);
     assert_eq!(written.goaways[0].1, H2ErrorCode::CANCEL);
     assert!(
@@ -16872,7 +16872,7 @@ fn owned_direct_error_rate_limit_suppresses_the_crossing_semantic_error() {
         Err(HttpErrorCode::CANCEL),
         "the 51st direct semantic error breaches the limit"
     );
-    assert_eq!(close, FixtureClose::Reset);
+    assert_eq!(close, FixtureClose::Closed);
     assert!(written.header_statuses.len() <= 50);
     assert!(
         written
@@ -18323,7 +18323,7 @@ fn connection_flow_control_timeout_fails_the_connection() {
             );
             assert!(frames.resets.is_empty());
             assert_eq!(frames.body_bytes, 65_535);
-            assert_eq!(state.borrow().close, FixtureClose::Reset);
+            assert_eq!(state.borrow().close, FixtureClose::Closed);
             assert_eq!(
                 probes.borrow()[0].cancelled.borrow().as_slice(),
                 &[(HttpErrorCode::FLOW_CONTROL_ERROR, false)]
@@ -18599,10 +18599,10 @@ fn assert_same_timeline(
 /// Flow-control timeouts, owned against `UniplexSession` on the same paused clock: a response
 /// blocked on its stream window is reset with FLOW_CONTROL_ERROR at the write timeout and the
 /// connection drains later, and one blocked on the connection window fails the connection with
-/// GOAWAY(FLOW_CONTROL_ERROR) and a transport reset at the write timeout. Both drivers write the
-/// same frames at the same instants and end with the same result. (A drained connection then
-/// closes differently, which is not a timer property: the owned driver closes the transport
-/// where `UniplexSession` shuts down its write side.)
+/// GOAWAY(FLOW_CONTROL_ERROR) and then FIN at the write timeout. Both drivers write the same
+/// frames at the same instants and end with the same result. (They end the transport
+/// differently, which is not a timer property: the owned driver closes the transport where
+/// `UniplexSession` shuts down its write side.)
 #[test]
 fn owned_flow_control_timeouts_match_uniplex() {
     let drain_at = 3 * WRITE;
@@ -18637,11 +18637,13 @@ fn owned_flow_control_timeouts_match_uniplex() {
         assert_eq!(owned.error, uniplex.error);
         let timeout = [(WRITE, StreamId::new(1), H2ErrorCode::FLOW_CONTROL_ERROR)];
         if connection_blocked {
-            assert_eq!(owned.close, uniplex.close);
+            assert_eq!(
+                (owned.close, uniplex.close),
+                (FixtureClose::Closed, FixtureClose::ShutdownWrite)
+            );
             assert!(owned.resets.is_empty());
             assert_timeline(&owned.goaways, &timeout);
             assert_eq!(owned.error, Some(HttpErrorCode::FLOW_CONTROL_ERROR));
-            assert_eq!(owned.close, FixtureClose::Reset);
         } else {
             assert_timeline(&owned.resets, &timeout);
             assert_eq!(owned.error, None);

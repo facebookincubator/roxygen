@@ -2809,8 +2809,7 @@ where
                 && !self.writes_pending()
                 && !self.transport_reset
             {
-                self.reset_transport();
-                progress = true;
+                progress |= self.close_failed();
             }
             if self.transport_reset
                 && !self.writes_pending()
@@ -5468,6 +5467,32 @@ where
                 stream.wake.schedule()
             });
         }
+    }
+
+    /// Closes a failed connection whose GOAWAY is written with FIN, so the peer
+    /// reads the GOAWAY and then EOF. `false` while the outstanding read has yet
+    /// to observe cancellation.
+    #[cold]
+    #[inline(never)]
+    fn close_failed(&mut self) -> bool {
+        if self.read.is_reading() {
+            return false;
+        }
+        self.transport_reset = true;
+        let site = PanicSite::Transport;
+        contain(&self.context, &mut self.failure, site, None, || {
+            if self.transport.close(&self.context).is_err() {
+                self.connection.state.summary.reset = true;
+                let _ = self.transport.close_with_reset(&self.context);
+            }
+        });
+        for id in self.streams.ids_in_order() {
+            let stream = &self.streams[&id];
+            contain(&self.context, &mut self.failure, site, None, || {
+                stream.wake.schedule()
+            });
+        }
+        true
     }
 
     #[cold]
