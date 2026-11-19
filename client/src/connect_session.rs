@@ -43,7 +43,7 @@ impl ConnectSession for ClientSession {
 
     /// The returned future owns a session clone until it resolves, because
     /// dropping the last `ClientSession` drains the session, and a draining
-    /// session refuses the uncommitted CONNECT.
+    /// session rejects the uncommitted CONNECT.
     fn send_connect_request(
         &self,
         request: HttpSourceHolder,

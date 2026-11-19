@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Native fixed-worker HTTP/1.1 and HTTP/2 client surfaces.
+//! HTTP/1.1 and HTTP/2 client connectors, sessions and pools, each running on one worker thread.
 
 #![cfg_attr(all(test, target_os = "linux", fbcode_build), feature(linux_pidfd))]
 
@@ -320,7 +320,7 @@ impl SourceRequest {
     }
 }
 
-/// Convenience request facade mirroring the frozen `HTTPClient` helpers.
+/// Static helpers for simple requests, and the process-wide client defaults.
 pub struct HttpClient;
 
 impl HttpClient {

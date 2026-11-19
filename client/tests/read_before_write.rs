@@ -5,12 +5,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Read-before-write arbitration of HTTP/1.1 client sessions (`DIV-042`)
-//! through an `HttpSessionPool` over loopback TCP, on a `ManagedWorker` and a
-//! `HostedWorker`: after one or two exchanges on a pooled connection, the
-//! engine closes it (FIN) and a request is committed on it in the worker turn
-//! that sees the FIN become readable, before the session's next poll. The request
-//! must fail unstarted regardless of how many exchanges the connection carried.
+//! Read-before-write arbitration of HTTP/1.1 client sessions, through an
+//! `HttpSessionPool` over loopback TCP on a `ManagedWorker` and a
+//! `HostedWorker`. After one or two exchanges on a pooled connection, the
+//! engine closes it (FIN), and a request is committed on it in the worker turn
+//! in which the FIN becomes readable, before the session's next poll. The
+//! request must fail unstarted however many exchanges the connection carried.
 
 use std::future::Future;
 use std::io::Read;
@@ -45,7 +45,8 @@ use crate::pool::PoolParams;
 
 const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 
-/// What the request committed after the engine's FIN met, and what the engine saw.
+/// The outcome of the request committed after the engine's FIN, and what the
+/// engine read.
 #[derive(Debug, PartialEq)]
 struct FinCommit {
     sequence_number: u64,
@@ -58,8 +59,8 @@ struct FinCommit {
     resent: Option<(u64, bool)>,
 }
 
-/// Reads request heads from `stream` until it ends, answering each with `OK`
-/// while `answer` lasts, and returns how many heads it read.
+/// Reads request heads from `stream`, replying `OK` to each, until it has sent
+/// `answer` replies or the stream ends, and returns how many heads it read.
 fn serve(stream: &mut TcpStream, mut answer: usize) -> usize {
     let mut input = Vec::new();
     let mut buffer = [0; 1024];
@@ -122,11 +123,12 @@ async fn read_to_end(response: &mut UniplexResponse) -> Result<(), HttpErrorCode
     Ok(())
 }
 
-/// `prior_exchanges` exchanges on one pooled connection, then the FIN and the
-/// commit in one worker turn, with session timers off.
+/// Runs `prior_exchanges` exchanges on one pooled connection, then the FIN and
+/// the commit in one worker turn, with session timers off.
+///
 /// The worker thread blocks while the engine writes a byte on a side connection
-/// and then sends its FIN, so its next reactor turn sees both, the side byte
-/// first: the client task runs before the session, takes the idle pooled
+/// and then sends its FIN, so its next reactor turn reports both, the side byte
+/// first. The client task then runs before the session, takes the idle pooled
 /// session and commits the request.
 fn fin_commit(
     context: WorkerContext,

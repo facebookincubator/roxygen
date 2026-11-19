@@ -97,10 +97,10 @@ pub enum PoolError {
     /// These parameters belong to native connection creation, not attachment.
     #[error("native connection/session configuration is unavailable for an attached factory")]
     NativeConfigurationOnly,
-    /// The factory's immediate-hop security disagrees with the pool contract.
+    /// The factory's immediate-hop security does not match the pool's.
     #[error("attached session security does not match the pool")]
     SecurityMismatch,
-    /// The attached pool's connection bounds refuse another session; see
+    /// The attached pool's connection bounds do not allow another session. See
     /// [`HttpSessionPool::full`].
     #[error("attached pool ownership capacity is exhausted")]
     OwnershipCapacity,
@@ -129,62 +129,64 @@ pub enum PoolError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PoolParams {
+    /// Bounds the pool's sessions plus pending connects. Zero disables reuse and retains one
+    /// connection slot.
     pub max_connections: u32,
+    /// Maximum dial attempts per connect. Zero normalizes to one.
     pub max_connection_attempts: u8,
+    /// Whether TLS connections cache sessions for resumption.
     pub enable_tls_session_caching: bool,
+    /// Bounds each dial attempt, and by default each acquisition wait.
     pub connect_timeout: Duration,
+    /// Session age limit, with jitter. Zero disables expiry.
     pub max_age: Duration,
+    /// Waiter limit, applied once the pool's sessions reach `max_connections`.
     pub max_waiters: u16,
-    /// Roxygen-only (`DIV-032`): retires a session once it has had no active or reserved
-    /// exchange for this long, through a pool task and again at acquisition; zero, the
-    /// default, disables it. A session with an active or reserved exchange is never retired,
-    /// however long the exchange runs. Native pools only: an attached pool's
-    /// [`AttachedPoolParams`] has no idle timeout.
+    /// Retires a session once it has been idle, without active or reserved exchanges, for
+    /// this long. Zero (the default) disables it. Attached pools do not have one.
     pub idle_timeout: Duration,
-    /// Roxygen-only (`DIV-032`): which idle session an acquisition takes when no busy
-    /// session can take another exchange. Native pools only.
+    /// Which idle session an acquisition takes when the busy sessions cannot take another
+    /// exchange.
     pub reuse_order: SessionReuseOrder,
-    /// Roxygen-only (`DIV-032`): when the pool task and acquisitions retire
-    /// sessions idle for `idle_timeout`.
+    /// When the pool task and acquisitions retire sessions idle for `idle_timeout`.
     pub idle_sweep: IdleSweep,
-    /// Roxygen-only (`DIV-032`): bounds each of an acquisition's waits, for a session, a
-    /// stream slot or the dial it started, and fails it with [`PoolError::Timeout`] at a step
-    /// that finds no session to take once this long has passed since its first such step. A
-    /// step that finds a session takes it however late, and a woken acquisition that again
-    /// finds none waits again for the whole bound, so one acquisition can wait up to about
-    /// twice it. `None`, the default, uses `connect_timeout`, as before; each dial attempt
-    /// stays bounded by `connect_timeout`. `Some(Duration::ZERO)` acts as a zero
-    /// `connect_timeout` does: an acquisition that would wait or dial fails. Native and owned
-    /// pools: an attached pool's [`AttachedPoolParams`] has none, and its `connect_timeout`
-    /// bounds both.
+    /// Bounds how long an acquisition waits for a session, a stream slot or its own dial.
+    /// The bound counts from the acquisition's first step that cannot take a session. Once
+    /// it has passed, a later step that still cannot take one fails with
+    /// [`PoolError::Timeout`]. A step that can take a session takes it, however late. Each
+    /// wait is also bounded by this from when it starts, so the total can approach twice
+    /// this. `None` (the default) uses `connect_timeout`, which still bounds each dial
+    /// attempt. `Some(Duration::ZERO)` fails an acquisition that would wait or dial.
+    /// Attached pools use `connect_timeout`.
     pub acquisition_timeout: Option<Duration>,
 }
 
-/// When idle retirement retires sessions (`DIV-032`).
+/// When the pool retires idle sessions.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum IdleSweep {
     /// The pool task retires each session when it has been idle for
-    /// `idle_timeout`, and an acquisition retires every such session it finds.
+    /// `idle_timeout`, and each acquisition step retires every such session.
     #[default]
     AtExpiry,
-    /// As hyper-util 0.1.20's legacy pool (reqwest 0.12.28): the pool task sweeps
-    /// every `max(idle_timeout, 90 ms)`, from when a session first became idle with
-    /// no waiter to take it until the pool drains, retiring the sessions idle for
-    /// longer than `idle_timeout`, so a session closes up to one period after that.
-    /// An acquisition retires expired sessions only in reuse order until it finds
-    /// one that is not, and leaves the others to the sweep.
+    /// Sweeps idle sessions on a fixed period, like hyper-util 0.1.20's `legacy` pool
+    /// (reqwest 0.12.28). The pool task runs every `max(idle_timeout, 90 ms)` and retires
+    /// the sessions idle for longer than `idle_timeout`, so a session closes up to one
+    /// period late. Sweeping starts when a session first becomes idle without a waiter to
+    /// take it, and stops when the pool drains. An acquisition retires expired sessions in
+    /// reuse order only until it reaches one that has not expired, and leaves the rest to
+    /// the sweep.
     Interval,
 }
 
-/// The idle session that a pool acquisition reuses (`DIV-032`).
+/// Which idle session a pool acquisition reuses.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SessionReuseOrder {
-    /// The frozen order: the session given an exchange least recently.
+    /// The session given an exchange least recently.
     #[default]
     LeastRecentlyUsed,
-    /// The session that most recently lost its last active or reserved exchange, as
-    /// hyper-util's legacy pool (reqwest) reuses the connection returned last, so that
-    /// sessions beyond what the traffic needs stay idle and reach `idle_timeout`.
+    /// The session that became idle most recently, as hyper-util's `legacy` pool (used
+    /// by reqwest) reuses the connection returned last. Sessions beyond what the traffic
+    /// needs then stay idle and reach `idle_timeout`.
     MostRecentlyUsed,
 }
 
@@ -205,48 +207,47 @@ impl Default for PoolParams {
     }
 }
 
-/// Scheduler settings for an address-free pool. Native TLS settings are absent.
+/// Scheduler settings for a pool of attached sessions, which has no address or TLS settings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AttachedPoolParams {
-    /// Bounds pending factories plus established sessions. Retiring sessions,
-    /// which a drain, an expiry, or a flush removed from selection and which
-    /// have not closed, count too unless `max_retiring` is set.
-    /// Zero disables reuse and retains one connection slot.
+    /// Bounds pending factories plus established sessions. Retiring sessions, which a
+    /// drain, an expiry or a flush removed from selection but which have not closed,
+    /// count too unless `max_retiring` is set. Zero disables reuse and retains one
+    /// connection slot.
     pub max_connections: u32,
     /// Maximum factory attempts per connection task; zero normalizes to one.
     pub max_connection_attempts: u8,
-    /// Scheduler wait timeout, also supplied to each factory invocation.
-    /// Zero disables the additional acquisition and factory-attempt deadlines
-    /// for attached pools only; native [`PoolParams`] semantics are unchanged.
-    /// A factory's underlying connector may retain its own finite timeout.
-    /// Cancellation, waiter limits, and ownership bounds remain enforced.
+    /// Scheduler wait timeout, also passed to each factory call. Zero disables the
+    /// acquisition and factory-attempt deadlines, unlike a zero
+    /// [`PoolParams::connect_timeout`]. A factory's underlying connector may still apply
+    /// its own timeout.
     pub connect_timeout: Duration,
-    /// Native jittered session age limit; zero disables expiry. With
-    /// `max_retiring` set, an aged session that is the last selectable one
-    /// keeps serving while the dial gate would refuse its replacement.
+    /// Session age limit, with jitter. Zero disables expiry. With `max_retiring` set,
+    /// an aged session that is the last selectable one keeps serving while the
+    /// connection bounds would block a dial for its replacement.
     pub max_age: Duration,
-    /// Native waiter limit, applied when established sessions alone refuse a
-    /// dial: they reach `max_connections`, retiring sessions included unless
-    /// `max_retiring` is set, or with it set, established and retiring sessions
-    /// together reach `max_connections + max_retiring`. Pending connects retain
-    /// the native exception to this limit.
+    /// Waiter limit, applied when the established sessions alone block a dial. That is
+    /// when they reach `max_connections`, counting retiring sessions unless
+    /// `max_retiring` is set, or, with it set, when established and retiring sessions
+    /// together reach `max_connections + max_retiring`. As in native pools, pending
+    /// connects do not trigger the limit.
     pub max_waiters: u16,
-    /// `None` counts retiring sessions against `max_connections`. `Some(n)`
-    /// frees a session's `max_connections` slot once it starts retiring, as
-    /// `HTTPCoroSessionPool` does, and permits a dial only while all owned
-    /// sessions, retiring included, plus pending connects stay below
-    /// `max_connections + n` (`DIV-025`).
+    /// `None` counts retiring sessions against `max_connections`. `Some(n)` frees a
+    /// session's `max_connections` slot once it starts retiring, and permits a dial only
+    /// while all owned sessions, retiring included, plus pending connects stay below
+    /// `max_connections + n`.
     pub max_retiring: Option<u32>,
-    /// Waiters one pending connect absorbs, counting the acquisition that
-    /// started it, before another acquisition starts a connect within the
-    /// connection bounds; zero normalizes to one, the native scheduler. Above
-    /// one, a connect absorbs no more waiters than the session of the last
-    /// completed connect admitted streams. The connect's session wakes every
-    /// waiter still credited to it, so those it cannot serve dial or wait
-    /// within the bounds again, and a woken waiter that a pending connect
-    /// absorbs passes its wake to the first waiter no pending connect covers.
-    /// A failed connect fails waiters as `addNewConnection` does; above one,
-    /// releasing its slot wakes no waiter (`DIV-025`).
+    /// How many waiters one pending connect absorbs, counting the acquisition that
+    /// started it, before another acquisition starts a connect within the connection
+    /// bounds. Zero normalizes to one, which matches native pools.
+    ///
+    /// Above one, a connect absorbs at most as many waiters as there were streams admitted
+    /// by the session that the last completed connect established. The connect's session
+    /// wakes every waiter still credited to it, so that those it cannot serve dial or wait
+    /// again within the bounds. A woken waiter that a pending connect absorbs passes its
+    /// wake to the first waiter that a pending connect does not cover. A failed connect
+    /// fails waiters as in native pools, and above one, releasing its slot does not wake a
+    /// waiter.
     pub pending_connect_credit: u32,
 }
 
@@ -268,15 +269,17 @@ impl Default for AttachedPoolParams {
 /// Creates one unbound session on the supplied worker without a native address,
 /// resolver, or TLS fallback. The factory owns its destination and configuration.
 pub trait AttachedSessionFactory: 'static {
-    /// Runs locally. Cancellation is pool-owned, not tied to an individual waiter.
-    /// The factory enforces a nonzero supplied attempt timeout. Zero requests no
-    /// additional attempt deadline, without replacing the underlying connector's
-    /// configured finite or disabled timeout. Waiter expiry alone does not
-    /// cancel the factory or discard its eventual handoff.
-    /// On cancellation the future must finish resource disposal and join any work
-    /// it owns before returning, or return the session for the pool to drain/join.
-    /// Hidden detached app-runtime work is not permitted. An application runtime
-    /// used by the factory must keep progressing through runtime quiescence.
+    /// Creates a session on `context`'s worker, where the future runs.
+    ///
+    /// `cancellation` belongs to the pool, not to a single waiter, and a waiter's expiry
+    /// alone does not cancel the factory or discard the session it returns. The factory
+    /// must enforce a nonzero `timeout`. A zero `timeout` means no extra deadline, and
+    /// leaves the underlying connector's own timeout in place.
+    ///
+    /// On cancellation the future must dispose of its resources and join any work it owns
+    /// before returning, or return the session for the pool to drain and join. It must not
+    /// leave detached work on another runtime, and a runtime it uses must keep running
+    /// through runtime quiescence.
     fn create(
         &self,
         context: WorkerContext,
@@ -300,15 +303,14 @@ impl Drop for AttachedConnectCause {
     }
 }
 
-/// A native connection failure paired with the original application error.
+/// A connection failure paired with the original application error.
 ///
-/// Clones share the external error, without requiring that error to be cloneable.
-/// The source chain exposes the original object; native metadata is available
-/// through [`Self::http_error`]. Diagnostics format only the native error and do
-/// not invoke application formatting. Owned cause disposal contains destructor
-/// panics so it cannot interrupt pool cleanup. Cloning or extracting the raw Arc
-/// transfers responsibility for that reference's diagnostics and disposal to its
-/// caller. No application task or pool ownership is added by this value.
+/// Clones share the application error, which need not be `Clone`. The source chain
+/// exposes the application error, and [`Self::http_error`] returns the paired `HttpError`.
+/// `Display` and `Debug` format only that `HttpError` and do not call the application
+/// error's formatting. Dropping the cause catches destructor panics so that they cannot
+/// interrupt pool cleanup. A caller that clones or extracts the raw `Arc` becomes
+/// responsible for formatting and dropping that reference.
 #[derive(Clone)]
 pub struct AttachedConnectFailure {
     http_error: HttpError,
@@ -374,16 +376,13 @@ impl StdError for AttachedConnectFailure {
     }
 }
 
-/// An attached factory whose failures retain their original external causes.
+/// An attached factory whose failures keep their original application errors.
 ///
-/// Execution, timeout, cancellation, and resource-join obligations are identical
-/// to [`AttachedSessionFactory`]. The future remains worker-local. A failure is
-/// associated with its actual connection-task result, not with a particular
-/// waiter: native retry selection and fanout are unchanged.
+/// It has the same execution, timeout, cancellation and cleanup requirements as
+/// [`AttachedSessionFactory`]. A failure belongs to its connection task, not to a
+/// particular waiter, so retries and fan-out to waiters work as in native pools.
 pub trait AttachedSessionFactoryWithCause: 'static {
-    /// Enforces a nonzero attempt timeout; zero adds no deadline over the
-    /// underlying connector's configured timeout. Original connector causes and
-    /// the cancellation/join obligations of [`AttachedSessionFactory`] remain.
+    /// Creates a session, with the same requirements as [`AttachedSessionFactory::create`].
     fn create(
         &self,
         context: WorkerContext,
@@ -435,7 +434,7 @@ enum PoolBackend {
         max_retiring: Option<u32>,
         pending_connect_credit: u32,
     },
-    /// Native dials of owned client sessions (`DIV-046`).
+    /// Owned client sessions that the pool dials itself.
     Owned {
         address: SocketAddress,
         connection: ConnectionParams,
@@ -458,8 +457,8 @@ impl PoolBackend {
         }
     }
 
-    /// Only an owned HTTP/1.1 pool indexes its sessions (S6.9) and fails a failed attempt's
-    /// dialer (`DIV-046`).
+    /// Only an owned HTTP/1.1 pool indexes its sessions and fails the acquisition that
+    /// started a failed dial.
     fn is_owned_http1(&self) -> bool {
         matches!(
             self,
@@ -486,8 +485,7 @@ pub(crate) trait PoolReservation: Sized + 'static {
     /// Reserves `session`, which `state`'s pool selected.
     fn reserve(state: &Rc<RefCell<PoolState>>, session: PooledSession) -> Result<Self, PoolError>;
 
-    /// The reservation an owned pool's dial made for the acquisition that started the dial
-    /// (`DIV-046`).
+    /// The reservation an owned pool's dial made for the acquisition that started the dial.
     fn handed_over(reservation: OwnedGetSessionResult) -> Result<Self, PoolError>;
 }
 
@@ -505,7 +503,7 @@ impl PoolReservation for GetSessionResult {
         }
     }
 
-    /// Native and attached pools hand over no owned session.
+    /// Native and attached pools do not hand over owned sessions.
     fn handed_over(_reservation: OwnedGetSessionResult) -> Result<Self, PoolError> {
         Err(PoolError::InvalidSessionState)
     }
@@ -582,9 +580,8 @@ impl HttpSessionFactory for SimpleHttpSessionFactory {
     }
 }
 
-/// A pooled session. A pool's backend creates one kind: native and attached
-/// pools hold uniplex `ClientSession`s, owned pools owned client sessions
-/// (`DIV-046`).
+/// A pooled session. Each pool holds one kind: native and attached pools hold
+/// uniplex `ClientSession`s, and owned pools hold owned client sessions.
 #[derive(Clone)]
 pub(crate) enum PooledSession {
     Uniplex(ClientSession),
@@ -613,8 +610,9 @@ impl PooledSession {
         }
     }
 
-    /// For an owned session, without its worker's admission, which an owned
-    /// pool's acquisition step checks once for all of its sessions.
+    /// Whether the session can take another exchange. For an owned session this skips the
+    /// worker admission check, which an owned pool's acquisition step makes once for all of
+    /// its sessions.
     fn supports_more_transactions(&self) -> bool {
         match self {
             Self::Uniplex(session) => session.supports_more_transactions(),
@@ -622,7 +620,7 @@ impl PooledSession {
         }
     }
 
-    /// An owned HTTP/1.1 session whose slot is returning (`DIV-029`).
+    /// Whether this is an owned HTTP/1.1 session whose slot is returning.
     fn is_returning(&self) -> bool {
         match self {
             Self::Uniplex(_) => false,
@@ -646,9 +644,8 @@ impl PooledSession {
         }
     }
 
-    /// An owned session an acquisition may wait for instead of dialing, since
-    /// its driver returns a slot at its next turn (`DIV-046`); never a uniplex
-    /// session.
+    /// Whether an acquisition may wait for this session instead of dialing, because
+    /// its driver returns a slot at its next turn. Always false for a uniplex session.
     fn claimable(&self) -> bool {
         match self {
             Self::Uniplex(_) => false,
@@ -683,8 +680,8 @@ impl PooledSession {
         }
     }
 
-    /// The exchanges in flight that least-loaded selection compares (`DIV-048`): an owned
-    /// session's `in_flight`; a uniplex session's reserved and active transactions.
+    /// The exchanges in flight that least-loaded selection compares: an owned session's
+    /// `in_flight`, or a uniplex session's reserved and active transactions.
     fn load(&self) -> u32 {
         match self {
             Self::Uniplex(session) => session.admitted_transactions(),
@@ -714,9 +711,9 @@ impl PooledSession {
         }
     }
 
-    /// The slot of the session's entry in its pool's list, which an owned session records
-    /// (`None` while it has no entry); `None` for a uniplex session, which records none, so
-    /// that its pool searches for its entry.
+    /// The slot of the session's entry in its pool's list, as an owned session records it
+    /// (`Some(None)` while it has no entry). `None` for a uniplex session, which does not
+    /// record its slot, so that its pool searches for its entry.
     fn recorded_slot(&self) -> Option<Option<SessionSlot>> {
         match self {
             Self::Uniplex(_) => None,
@@ -742,8 +739,8 @@ impl PooledSession {
         }
     }
 
-    /// Binds the session to `pool`. An owned session also takes the flag that tells the
-    /// pool's index it stopped admitting without a release (S6.9).
+    /// Binds the session to `pool`. An owned session also takes the flag that marks the
+    /// pool's index unsettled when the session stops taking requests without a release.
     fn bind_pool(&self, pool: Weak<RefCell<PoolState>>, unsettled: Option<Rc<Cell<bool>>>) {
         match self {
             Self::Uniplex(session) => session.bind_pool(pool),
@@ -751,8 +748,8 @@ impl PooledSession {
         }
     }
 
-    /// When an owned session started, from which its age counts; `None` for a uniplex
-    /// session, whose pool keeps no index.
+    /// When an owned session started, from which its age counts. `None` for a uniplex
+    /// session, whose pool does not keep an index.
     fn started(&self) -> Option<Instant> {
         match self {
             Self::Uniplex(_) => None,
@@ -801,10 +798,10 @@ struct SessionEntry {
     session: PooledSession,
     max_age: Duration,
     ownership: Option<Rc<SessionOwnership>>,
-    /// When the session last lost its last active or reserved exchange, while it has none.
+    /// When the session's last active or reserved exchange ended, until it takes another.
     idle_since: Option<Instant>,
-    /// An indexed pool's: whether the session counted in `idle_sessions` when the pool last
-    /// counted it (S6.9).
+    /// In an indexed pool, whether the session was in `idle_sessions` when the pool last
+    /// counted it.
     counted_idle: bool,
 }
 
@@ -829,8 +826,8 @@ impl SessionEntry {
         }
     }
 
-    /// Stamps the session idle once it has no active or reserved exchange, at the pass's
-    /// `now`, which the first stamp reads, and clears the stamp while it has one.
+    /// Stamps the session idle at the pass's `now` once it has no active or reserved
+    /// exchange, and clears the stamp while it has one. The pass's first stamp reads the clock.
     fn stamp_idle(&mut self, now: &mut Option<Instant>) {
         self.idle_since = if self.session.admitted_transactions() == 0 {
             self.idle_since
@@ -840,7 +837,8 @@ impl SessionEntry {
         };
     }
 
-    /// When an owned session reaches its maximum age; `None` when it never does.
+    /// When an owned session reaches its maximum age. `None` for a uniplex session, for a
+    /// zero `max_age`, or when the deadline is past `Instant`'s range.
     fn max_age_deadline(&self) -> Option<Instant> {
         if self.max_age.is_zero() {
             return None;
@@ -849,15 +847,15 @@ impl SessionEntry {
     }
 
     /// When the session became idle, while it has no active or reserved exchange.
-    /// The session's own count decides, as a callback run by a new reservation
-    /// can reach the pool before the reservation's `TransactionAttached` does.
+    /// The session's own count is used because a callback run by a new reservation
+    /// can reach the pool before the reservation's `TransactionAttached` event.
     fn idle_since(&self) -> Option<Instant> {
         self.idle_since
             .filter(|_| self.session.admitted_transactions() == 0)
     }
 
-    /// Whether the session has been idle for `timeout`: at least that long at
-    /// expiry, longer on an interval, as hyper-util's checkout and sweep compare.
+    /// Whether the session has been idle for `timeout`: at least that long for
+    /// `AtExpiry`, longer for `Interval`, matching hyper-util's checkout and sweep.
     fn idle_expired(&self, now: Instant, timeout: Duration, sweep: IdleSweep) -> bool {
         !timeout.is_zero()
             && self.idle_since().is_some_and(|since| {
@@ -880,7 +878,7 @@ struct Waiter {
     id: u64,
     baton: Rc<CancellableBaton>,
     error: RefCell<Option<PoolError>>,
-    /// The reservation an owned pool's dial made for this waiter's acquisition (`DIV-046`).
+    /// The reservation an owned pool's dial made for this waiter's acquisition.
     handoff: RefCell<Option<OwnedGetSessionResult>>,
     credit: Option<Rc<ConnectCredit>>,
 }
@@ -1046,23 +1044,22 @@ async fn supervise_pool(
 /// The shortest period of `IdleSweep::Interval`, as hyper-util's `MIN_CHECK`.
 const MIN_IDLE_SWEEP_PERIOD: Duration = Duration::from_millis(90);
 
-/// Retires sessions that keep no active or reserved exchange for the pool's
-/// `idle_timeout` (`DIV-032`): with `IdleSweep::AtExpiry` when the longest-idle
-/// session expires, with `IdleSweep::Interval` every `max(idle_timeout, 90 ms)`
-/// from when a session first became idle with no waiter to take it, as hyper-util
-/// 0.1.20's `IdleTask`.
+/// Retires sessions that stay idle, without active or reserved exchanges, for the pool's
+/// `idle_timeout`. With `IdleSweep::AtExpiry` it runs when the longest-idle session
+/// expires. With `IdleSweep::Interval` it runs every `max(idle_timeout, 90 ms)` from when
+/// a session first became idle without a waiter to take it, as hyper-util 0.1.20's
+/// `IdleTask` does.
 ///
-/// At expiry, a session that becomes idle expires after every session already
-/// idle, so the task is signalled only while it waits without a deadline because
-/// no session was idle; otherwise it wakes only at its deadline. Every pass scans
-/// all pooled sessions. A pass retires every session expired by then, or finds that
-/// the session it waited for was reused and recomputes from the longest-idle
-/// session left; idle periods that end at k distinct times cost up to k retiring
-/// passes, each followed by a recompute, even within one `idle_timeout`. Apart from
-/// those, steady traffic, which reuses sessions idle only briefly, costs about one
-/// or two passes per `idle_timeout` rather than one per request. On an interval,
-/// the task is signalled once, to start, and then sweeps once per period until the
-/// pool drains, whether or not any session is idle.
+/// At expiry, a session that becomes idle expires after every session already idle, so the
+/// task is signalled only while it waits without a deadline, which it does while the pool
+/// lacks idle sessions. Otherwise it wakes only at its deadline. Every pass scans all
+/// pooled sessions. A pass retires every session expired by then or, if the session it
+/// waited for was reused, recomputes from the longest-idle session left. Idle periods that
+/// end at k distinct times cost up to k retiring passes, each followed by a recompute, even
+/// within one `idle_timeout`. Apart from those, steady traffic, which reuses sessions idle
+/// only briefly, costs about one or two passes per `idle_timeout` rather than one per
+/// request. On an interval, the task is signalled once, to start, and then sweeps once per
+/// period until the pool drains, whether or not any session is idle.
 async fn retire_idle_sessions(
     state: Weak<RefCell<PoolState>>,
     wake: Rc<CancellableBaton>,
@@ -1083,7 +1080,8 @@ async fn retire_idle_sessions(
             let timeout = pool.pool_params.idle_timeout;
             let sweep = pool.pool_params.idle_sweep;
             let period = timeout.max(MIN_IDLE_SWEEP_PERIOD);
-            // A deadline past `Instant`'s range never comes: wait unparked, unsignalled.
+            // A deadline past `Instant`'s range is never reached: wait without a deadline
+            // and without being signalled.
             let deadline = match sweep {
                 IdleSweep::AtExpiry => {
                     let longest_idle = pool.longest_idle_since();
@@ -1118,7 +1116,7 @@ async fn retire_idle_sessions(
                     tokio::task::yield_now().await;
                 }
                 IdleSweep::AtExpiry => {}
-                // As hyper-util, from when the sweep ends.
+                // As in hyper-util, the period counts from when the sweep ends.
                 IdleSweep::Interval => sweep_at = Some(Instant::now().checked_add(period)),
             }
             drop(expired);
@@ -1134,36 +1132,48 @@ async fn retire_idle_sessions(
     }
 }
 
-/// An owned HTTP/1.1 pool's selection index (S6.9, performance only): its sessions that
-/// can take an exchange, linked in the pool's order into a busy and an idle class list
-/// (`SessionList`'s classes), with lower bounds of when a member's maximum age or any idle
-/// timeout can end. While it is settled, an acquisition step selects the first busy session
-/// that can take an exchange, else the idle session at the back (most recently used) or
-/// front (least recently used) of the idle list, a release the pool hears for one session,
-/// or a dialed session joining the back of the pool's order, updates that session alone, and
-/// an event of a session that stopped admitting, such as a peer's close of an idle
-/// connection, removes that session alone, each without a pass over the pool's sessions,
-/// with the result of those passes. Any other step or event takes the pool's passes and
-/// unsettles the index, and the next release's passes rebuild and settle it.
+/// An owned HTTP/1.1 pool's selection index. It only makes selection faster. Results match
+/// the pool's full passes.
 ///
-/// The index is exact while every change to a session that the passes test reaches the pool
-/// as an event for that session: an owned HTTP/1.1 session becomes able to take an exchange
-/// when it joins the pool, and again only when its driver returns its slot
-/// (`capacity_available`) or its slot turns returning (`DIV-029`), which its returning hook
-/// reports (`record_returning`), becomes idle only in that callback or in the idleness its
-/// run reports, stops being idle only by a reservation, and stops admitting by
-/// `admission_closed`, by the pool closing it, or by a cancellation, which sets `unsettled`.
-/// A session that stops taking exchanges without an event (its worker cancelled) stays in its
-/// list until a step meets it and drops it.
+/// It links the sessions that can take an exchange, in the pool's order, into a busy and an
+/// idle class list (`SessionList`'s classes), and keeps lower bounds of when a member's
+/// maximum age, or any session's idle timeout, can end. The index is settled while it
+/// mirrors the pool. While it is settled, these avoid a pass over the pool's sessions:
+///
+/// - an acquisition step selects the first busy session that can take an exchange, else
+///   the idle session at the back (most recently used) or front (least recently used) of
+///   the idle list;
+/// - a release for one session, or a dialed session joining the back of the pool's order,
+///   updates that session alone;
+/// - an event of a session that stopped admitting, such as a peer closing an idle
+///   connection, removes that session alone.
+///
+/// Any other step or event takes the pool's passes and unsettles the index. The next
+/// release's passes rebuild and settle it.
+///
+/// The index is exact while every change to a session that the passes test reaches the
+/// pool as an event for that session. An owned HTTP/1.1 session:
+///
+/// - becomes able to take an exchange when it joins the pool, and again only when its
+///   driver returns its slot (`capacity_available`) or its slot turns returning, which its
+///   returning hook reports (`record_returning`);
+/// - becomes idle only in that callback or in the idleness its run reports;
+/// - stops being idle only by a reservation;
+/// - stops admitting by `admission_closed`, by the pool closing it, or by a cancellation,
+///   which sets `unsettled`.
+///
+/// A session that stops taking exchanges without an event (its worker cancelled) stays in
+/// its list until a step reaches it and drops it.
 struct SessionIndex {
-    /// Set while the index may not mirror the pool; `None` when the pool keeps no index.
-    /// Shared with the pool's owned sessions, whose cancellation sets it.
+    /// Set while the index may not mirror the pool. `None` when the pool does not keep an
+    /// index. Shared with the pool's owned sessions, which set it on cancellation.
     unsettled: Option<Rc<Cell<bool>>>,
-    /// No session's idle stamp is earlier.
+    /// A lower bound on every session's idle stamp.
     idle_floor: Option<Instant>,
-    /// No session in a class list reaches its maximum age earlier; `None` while none can. The
-    /// passes retire a session for its age only while it can take an exchange, so a session
-    /// that ages while it cannot leaves the floor until it joins a list again.
+    /// A lower bound on when a session in a class list reaches its maximum age, or `None`
+    /// while those sessions cannot expire. The passes retire a session for its age only
+    /// while it can take an exchange, so a session that ages while it cannot is left out of
+    /// the floor until it joins a list again.
     age_floor: Option<Instant>,
 }
 
@@ -1178,7 +1188,8 @@ impl SessionIndex {
     }
 }
 
-/// An index list whose member's class changed without an event the pool heard.
+/// The error for an index list member whose class changed without an event reaching the
+/// pool.
 struct IndexMismatch;
 
 pub(crate) struct PoolState {
@@ -1188,7 +1199,7 @@ pub(crate) struct PoolState {
     observer: Option<Rc<dyn PoolObserver>>,
     idle_observer: Option<Rc<dyn IdleSessionObserver>>,
     sessions: SessionList<SessionEntry>,
-    /// An owned pool's selection among its established sessions (`DIV-048`).
+    /// An owned pool's selection among its established sessions.
     selection: OwnedSessionSelection,
     index: SessionIndex,
     idle_sessions: usize,
@@ -1203,7 +1214,7 @@ pub(crate) struct PoolState {
     /// without a deadline (`idle_retirement_parked`), or, on an interval, to start.
     idle_wake: Rc<CancellableBaton>,
     idle_retirement_parked: bool,
-    /// `IdleSweep::Interval`: when a session first became idle with no waiter to
+    /// `IdleSweep::Interval`: when a session first became idle without a waiter to
     /// take it, as hyper-util's first `put` onto its idle list spawns its sweep.
     idle_sweep_from: Option<Instant>,
     #[cfg(test)]
@@ -1222,13 +1233,13 @@ pub(crate) struct PoolState {
     /// Searches for a session that an acquisition may wait for instead of dialing.
     #[cfg(test)]
     claim_scans: Cell<u64>,
-    /// Sessions those searches looked at.
+    /// Sessions those searches visited.
     #[cfg(test)]
     claim_visits: Cell<u64>,
     /// Steps and releases take the pool's passes, as without an index.
     #[cfg(test)]
     force_scans: Cell<bool>,
-    /// The counters an owned pool reports (`DIV-032`), except `waiters`, the list's length.
+    /// The counters an owned pool reports, except `waiters`, which is the queue's length.
     stats: OwnedPoolStats,
     next_waiter_id: u64,
     pooling_enabled: bool,
@@ -1262,8 +1273,8 @@ impl PoolState {
         self.pool_scans.set(self.pool_scans.get() + 1);
     }
 
-    /// The slot of `session`'s entry: an owned session's is the slot it recorded, found
-    /// without a search; a uniplex session's is found by a pass over the pool's sessions.
+    /// The slot of `session`'s entry. An owned session records its slot, so no search is
+    /// needed. A uniplex session's slot is found by a pass over the pool's sessions.
     fn slot_of(&self, session: &PooledSession) -> Option<SessionSlot> {
         let Some(recorded) = session.recorded_slot() else {
             self.count_scan();
@@ -1278,7 +1289,7 @@ impl PoolState {
         own.then_some(slot)
     }
 
-    /// Whether the index mirrors the pool (S6.9).
+    /// Whether the index mirrors the pool.
     fn index_settled(&self) -> bool {
         self.index
             .unsettled
@@ -1315,9 +1326,9 @@ impl PoolState {
         })
     }
 
-    /// Whether an acquisition may take a returning session: only while none waits and the pool
-    /// reuses sessions; otherwise its retirement wakes the first waiter, or drains it
-    /// (`DIV-046`).
+    /// Whether an acquisition may take a returning session: only while the waiter queue is
+    /// empty and the pool reuses sessions. Otherwise the slot's retirement wakes the first
+    /// waiter, or drains the session.
     fn selects_returning(&self) -> bool {
         self.pooling_enabled && self.waiters.is_empty()
     }
@@ -1330,13 +1341,13 @@ impl PoolState {
             && (returning || !entry.session.is_returning())
     }
 
-    /// Rebuilds the index after a release's passes, which left every stamp and the idle count
-    /// as they compute them (S6.9): each session that can take an exchange joins its class
-    /// list in the pool's order, each entry records whether it counted idle, and the floors are
-    /// recomputed, the age floor over the class lists' members. The index settles only if what
-    /// selection through it relies on holds: no session is finished or draining, a stamped pool
-    /// stamps exactly its idle sessions, and, most recently used, the idle list is in stamp
-    /// order.
+    /// Rebuilds the index after a release's passes have updated every stamp and the idle
+    /// count. Each session that can take an exchange joins its class list in the pool's
+    /// order, each entry records whether it counted idle, and the floors are recomputed, the
+    /// age floor over the class lists' members only. The index settles only if selection
+    /// through it would be exact: every session is running and admitting, a stamping pool
+    /// has stamped exactly its idle sessions, and with most-recently-used reuse the idle
+    /// list is in stamp order.
     fn settle_index(&mut self) {
         let Some(unsettled) = self.index.unsettled.clone() else {
             return;
@@ -1379,10 +1390,9 @@ impl PoolState {
         unsettled.set(!settled);
     }
 
-    /// Whether an acquisition step may select through the index: it is settled, and no
-    /// session that can take an exchange can have reached its maximum age, nor, retired at
-    /// expiry, any session its idle timeout, so that the step's own search for them would find
-    /// none.
+    /// Whether an acquisition step may select through the index. The index must be settled,
+    /// the age floor must not have passed, and with `IdleSweep::AtExpiry` the idle floor must
+    /// not have expired. The step's own search for expired sessions would then come up empty.
     fn index_ready(&self, now: Option<Instant>) -> bool {
         if !self.index_settled() {
             return false;
@@ -1401,13 +1411,13 @@ impl PoolState {
         true
     }
 
-    /// Selects through the index the session that `next_step`'s passes would select (S6.9):
-    /// the first busy session that can take an exchange, else the idle session at the back
-    /// (most recently used) or front (least recently used) of the idle list, retiring each
-    /// expired one it meets on an interval, as `select_idle_session` does; least loaded
-    /// (`DIV-048`), as `indexed_least_loaded_busy_session` says. A member that can no longer
-    /// take an exchange leaves its list; one whose class changed without an event falls back to
-    /// the passes and unsettles the index.
+    /// Selects through the index the session that `next_step`'s passes would select: the
+    /// first busy session that can take an exchange, else the idle session at the back (most
+    /// recently used) or front (least recently used) of the idle list. Like
+    /// `select_idle_session`, it retires each expired idle session it reaches on an interval.
+    /// See `indexed_least_loaded_busy_session` for least-loaded selection. A member that
+    /// cannot take an exchange leaves its list. A member whose class changed without an event
+    /// unsettles the index, and selection falls back to the passes.
     fn select_indexed(
         &mut self,
         checkout_at: Option<Instant>,
@@ -1471,12 +1481,11 @@ impl PoolState {
         Ok(None)
     }
 
-    /// The busy list's part of `select_least_loaded` through the index (`DIV-048`): `Break`
-    /// with the first member with no exchange in flight; else `Continue` with the first member
-    /// of the fewest exchanges in flight, if any, which `select_indexed` takes only when the
-    /// idle list, walked as `indexed_idle_session` walks it, yields no session. Busy members of
-    /// an indexed (HTTP/1.1) pool are sessions not yet reserved or whose driver has not settled
-    /// their free slot, so the busy list is short.
+    /// The busy list's part of `select_least_loaded` through the index. Returns `Break` with
+    /// the first member that has zero exchanges in flight, else `Continue` with the first
+    /// member with the fewest, if any. `select_indexed` takes that fallback only when the idle
+    /// list does not yield a session. Busy members of an indexed (HTTP/1.1) pool are sessions
+    /// not yet reserved or whose driver is not idle yet, so the busy list is short.
     fn indexed_least_loaded_busy_session(
         &mut self,
     ) -> Result<ControlFlow<SessionSlot, Option<SessionSlot>>, IndexMismatch> {
@@ -1505,7 +1514,8 @@ impl PoolState {
         Ok(ControlFlow::Continue(least.map(|(_, slot)| slot)))
     }
 
-    /// `select_indexed` is its one caller, so that it inlines into `next_step`.
+    /// The idle session that `select_indexed` takes from the idle list. `select_indexed` is
+    /// its only caller, so that it inlines into `next_step`.
     fn indexed_idle_session(
         &mut self,
         checkout_at: Option<Instant>,
@@ -1566,11 +1576,11 @@ impl PoolState {
             })
     }
 
-    /// Indexes the session at `slot` again after an event the pool heard for it alone (S6.9).
-    /// `moved`: the event moved it to the back of the pool's order, where it joins its class
-    /// list. A class it takes without that move needs a search for its place: the session
-    /// leaves the index unsettled instead. Most recently used, an idle session out of stamp
-    /// order with its neighbors does too.
+    /// Re-indexes the session at `slot` after an event for that session alone. `moved` means
+    /// the event moved it to the back of the pool's order, where it joins its class list. A
+    /// class change without that move would need a search for its place, so it unsettles the
+    /// index instead. With most-recently-used reuse, an idle session out of stamp order with
+    /// its neighbors unsettles it too.
     fn index_session(&mut self, slot: SessionSlot, moved: bool) {
         if self.index.unsettled.is_none() {
             return;
@@ -1623,9 +1633,9 @@ impl PoolState {
                 .is_none_or(|next| own <= next)
     }
 
-    /// Whether the index can hear a release of `session` alone (S6.9): it is settled, so no
-    /// other session is finished, draining or changed since the pool last looked at it; the
-    /// session itself still admits and runs; and the release drains nothing.
+    /// Whether the index can handle a release of `session` alone. The index must be settled,
+    /// so that the other sessions are running, admitting and unchanged since the last pass.
+    /// The session must still be running and admitting, and the release must not drain it.
     fn index_hears(&self, session: &PooledSession, release_idle: bool) -> bool {
         self.index_settled()
             && (self.pooling_enabled || !release_idle)
@@ -1634,9 +1644,9 @@ impl PoolState {
     }
 
     /// The first session in the pool's order that an acquisition may wait for instead of
-    /// dialing (`DIV-046`). Such a session's slot is returning, so a settled index lists it as
-    /// busy (`record_returning`), and only the busy list, which holds no session with an
-    /// exchange in flight, is searched (S6.9).
+    /// dialing. Such a session's slot is returning, so a settled index lists it as busy
+    /// (`record_returning`), and only the busy list is searched. Sessions with an exchange in
+    /// flight are not in that list, so it is short.
     fn claimable_session(&self) -> Option<PooledSession> {
         let claimable = |entry: &SessionEntry| {
             #[cfg(test)]
@@ -1662,11 +1672,11 @@ impl PoolState {
         slot.map(|slot| self.sessions.get(slot).session.clone())
     }
 
-    /// Whether the index can hear an event of `session` alone once the session stopped
-    /// admitting (S6.9): it is settled, so no other session is finished, draining or changed
-    /// since the pool last looked at it; the session is finished or draining, so the pool's
-    /// passes would remove it and change nothing else; and the event drains nothing. A
-    /// draining pool's teardown removes entries without their counts, which its passes redo.
+    /// Whether the index can handle an event of `session` alone after the session stopped
+    /// admitting. The index must be settled, so that the other sessions are unchanged since
+    /// the last pass. The session must be finished or draining, so that the passes would only
+    /// remove it, and the event must not drain a session. A draining pool is excluded because
+    /// its teardown removes entries without their counts, which its passes redo.
     fn index_hears_retirement(&self, session: &PooledSession, release_idle: bool) -> bool {
         self.index_settled()
             && !self.draining
@@ -1674,8 +1684,8 @@ impl PoolState {
             && (session.is_finished() || session.is_draining())
     }
 
-    /// The waiter of the acquisition that waits for `session`'s returning slot, which takes
-    /// the session's wake whatever it reports (`DIV-046`).
+    /// Removes the waiter of the acquisition that waits for `session`'s returning slot. That
+    /// waiter takes the session's wake, whatever event the session reports.
     fn take_claimer(&mut self, session: Option<&PooledSession>) -> Option<Rc<Waiter>> {
         session
             .and_then(PooledSession::claimant)
@@ -1683,10 +1693,9 @@ impl PoolState {
             .and_then(|index| self.waiters.remove(index))
     }
 
-    /// `notify_session_event`'s pass for a release the index hears, on `session` alone
-    /// (S6.9): its move to the back, its idle count, the claimer and waiters it wakes, its
-    /// stamp, then its class. Returns the claimer, the waiters, the idle count and whether
-    /// idle retirement wakes.
+    /// `notify_session_event`'s pass for an indexed release, on `session` alone: its move to
+    /// the back, its idle count, the claimer and waiters it wakes, its stamp, then its class.
+    /// Returns the claimer, the waiters, the idle count and whether idle retirement wakes.
     fn release_indexed(
         &mut self,
         session: &PooledSession,
@@ -1722,13 +1731,12 @@ impl PoolState {
         (claimer, waiters, self.idle_sessions, idle_wake)
     }
 
-    /// `notify_session_event`'s pass for an event of a session that stopped admitting, which the
-    /// index hears (S6.9): the session's entry, if the pool still holds it, leaves the pool and
-    /// its idle count, as the passes' removal of finished and draining sessions would remove it,
-    /// then the claimer and waiters it wakes. The index stays settled: the other sessions are as
-    /// it last saw them, and its floors still bound their stamps and deadlines. Returns the
-    /// entry, for its caller to drop once the pool is released, the claimer, the waiters and
-    /// the idle count.
+    /// `notify_session_event`'s pass for an indexed event of a session that stopped
+    /// admitting. The session's entry, if the pool still holds it, leaves the pool and its
+    /// idle count, as the passes would remove it, and the claimer and waiters to wake are
+    /// taken. The index stays settled, because the other sessions are unchanged and the
+    /// floors still bound their stamps and deadlines. Returns the entry, which the caller
+    /// drops once the pool is released, the claimer, the waiters and the idle count.
     fn retire_indexed(
         &mut self,
         session: &PooledSession,
@@ -1750,10 +1758,10 @@ impl PoolState {
         (entry, claimer, waiters, self.idle_sessions)
     }
 
-    /// Checks that a settled index mirrors the pool: every session that can take an exchange
-    /// is in its class list, the lists hold only pooled sessions in the pool's order, the
-    /// counts, stamps and floors are what the passes would leave, and, most recently used, the
-    /// idle list is in stamp order.
+    /// Checks that a settled index mirrors the pool. Every session that can take an exchange
+    /// is in its class list, and the lists hold only pooled sessions, in the pool's order. The
+    /// counts, stamps and floors match what the passes would leave. With most-recently-used
+    /// reuse, the idle list is in stamp order.
     #[cfg(debug_assertions)]
     fn verify_index(&self) {
         if !self.index_settled() {
@@ -1904,7 +1912,7 @@ impl PoolState {
         credited.into()
     }
 
-    /// Removes the first waiter that no pending connect is expected to serve.
+    /// Removes the first waiter that a pending connect is not expected to serve.
     fn take_uncovered_waiter(&mut self) -> Option<Rc<Waiter>> {
         let index = self.waiters.iter().position(|waiter| {
             waiter.credit.as_ref().is_none_or(|credit| {
@@ -1967,11 +1975,11 @@ impl PoolState {
         self.waiters.remove(index)
     }
 
-    /// Stamps when each session lost its last active or reserved exchange, for idle
-    /// retirement and the most-recently-used order, and reports whether idle retirement
-    /// must wake for a session that became idle: at expiry while it waits without a
-    /// deadline; on an interval to start sweeping, the first time no waiter is
-    /// `handed` a session as one becomes idle.
+    /// Stamps when each session became idle, for idle retirement and the
+    /// most-recently-used order. Returns whether idle retirement must wake for a session
+    /// that became idle: with `AtExpiry` while the task waits without a deadline, and with
+    /// `Interval` to start sweeping, the first time a session becomes idle without being
+    /// `handed` to a waiter.
     fn track_idle_sessions(&mut self, handed: bool) -> bool {
         if !self.stamps_idle() {
             return false;
@@ -1983,8 +1991,8 @@ impl PoolState {
         self.wakes_idle_retirement(now, handed)
     }
 
-    /// `track_idle_sessions` for the session at `slot` alone, which a settled index vouches
-    /// is that pass: every other session's stamp already is what it would leave (S6.9).
+    /// `track_idle_sessions` for the session at `slot` alone. With a settled index this
+    /// matches the full pass, because every other session's stamp is already up to date.
     fn track_idle_session(&mut self, slot: Option<SessionSlot>, handed: bool) -> bool {
         if !self.stamps_idle() {
             return false;
@@ -2023,15 +2031,14 @@ impl PoolState {
         }
     }
 
-    /// Whether the pool's sessions may take an acquisition: an owned pool checks
-    /// its worker's admission here, once per acquisition step and again after a
-    /// drain the step runs, for all of its sessions (`DIV-046`), where a
-    /// `ClientSession` checks its own.
+    /// Whether the pool's sessions may take an acquisition. An owned pool checks its
+    /// worker's admission here for all of its sessions, once per acquisition step and
+    /// again after a drain the step runs. A `ClientSession` checks its own.
     fn admits_reservations(&self) -> bool {
         !matches!(self.backend, PoolBackend::Owned { .. }) || worker_admits(self.context.handle())
     }
 
-    /// When the longest-idle session became idle; `None` while no session is idle.
+    /// When the longest-idle session became idle, or `None` while every session is busy.
     fn longest_idle_since(&self) -> Option<Instant> {
         self.sessions
             .iter()
@@ -2041,7 +2048,7 @@ impl PoolState {
 
     /// Removes the idle-expired sessions and closes their admission before any is
     /// drained: a drain runs callbacks, which must not reserve a session that a
-    /// later drain in the same batch would then refuse.
+    /// later drain in the same batch would then reject.
     fn take_idle_expired(&mut self, now: Instant) -> RetiredSessions {
         let timeout = self.pool_params.idle_timeout;
         let sweep = self.pool_params.idle_sweep;
@@ -2060,12 +2067,11 @@ impl PoolState {
         expired
     }
 
-    /// The session an acquisition reuses when no busy session can take another
-    /// exchange, in reuse order, never a returning one (`DIV-046`). On an
-    /// interval (`checkout_at`), as hyper-util's checkout pops its idle list
-    /// from the end: it retires expired candidates into `retired`, closing
-    /// their admission, until it finds one that is not, and leaves older
-    /// expired sessions to the sweep.
+    /// The session an acquisition reuses when the busy sessions cannot take another
+    /// exchange, in reuse order, and never a returning one. On an interval
+    /// (`checkout_at`), like hyper-util's checkout popping its idle list from the end, it
+    /// retires expired candidates into `retired` and closes their admission until it
+    /// reaches one that has not expired. Older expired sessions are left to the sweep.
     #[inline(never)]
     fn select_idle_session(
         &mut self,
@@ -2096,8 +2102,8 @@ impl PoolState {
         }
     }
 
-    /// The selectable session that most recently became idle; of two that became idle at
-    /// once, the later in the pool's order.
+    /// The selectable session that most recently became idle. Of two that became idle at
+    /// the same instant, the later one in the pool's order is chosen.
     fn most_recently_idle_session(&self) -> Option<SessionSlot> {
         self.count_scan();
         self.most_recently_idle_entry()
@@ -2116,10 +2122,10 @@ impl PoolState {
             .map(|(_, slot)| slot)
     }
 
-    /// The session a least-loaded acquisition takes (`DIV-048`), as `least_loaded_entry`
-    /// finds it. On an interval (`checkout_at`), an idle candidate that has expired is retired
-    /// into `retired`, its admission closed, as `select_idle_session` retires one, and the
-    /// search runs again over the sessions left.
+    /// The session a least-loaded acquisition takes, as `least_loaded_entry` picks it. On an
+    /// interval (`checkout_at`), an expired idle candidate is retired into `retired` with its
+    /// admission closed, as in `select_idle_session`, and the search runs again over the
+    /// sessions left.
     #[inline(never)]
     fn select_least_loaded(
         &mut self,
@@ -2144,9 +2150,9 @@ impl PoolState {
     }
 
     /// Of the sessions that can take an exchange, one with the fewest exchanges in flight
-    /// (`PooledSession::load`), taken in the passes' order (`DIV-048`): the first busy one in
-    /// the pool's order, else an idle one in reuse order. An idle session has none in flight,
-    /// so when no busy session is that lightly loaded, every candidate is idle.
+    /// (`PooledSession::load`), in the passes' order: the first busy one in the pool's order,
+    /// else an idle one in reuse order. An idle session has zero in flight, so when every
+    /// busy session is more loaded, every candidate is idle.
     fn least_loaded_entry(&self) -> Option<SessionSlot> {
         let returning = self.selects_returning();
         let (_, busy) = self
@@ -2223,10 +2229,10 @@ fn drain_sessions(sessions: Vec<PooledSession>) {
     });
 }
 
-/// Sessions removed from the pool whose drains are still owed. Dropping the
-/// batch, also while unwinding from a panicking callback, drains every session
-/// left in it: the pool no longer reaches them, so a skipped drain would leave
-/// the connection open and the pool's drain waiting for it.
+/// Sessions removed from the pool that still need a drain. Dropping the batch,
+/// even while unwinding from a panicking callback, drains every session left in
+/// it. The pool cannot reach them anymore, so a skipped drain would leave the
+/// connection open and the pool's drain waiting for it.
 #[derive(Default)]
 struct RetiredSessions(Vec<PooledSession>);
 
@@ -2399,14 +2405,14 @@ pub(crate) fn notify_session_event(
     }
 }
 
-/// Records a reservation an owned pool's acquisition made, as a
-/// `ClientSession`'s `TransactionAttached` reaches `notify_session_event`, on
-/// the session's entry alone (`DIV-046`): no longer idle, and moved to the back
-/// when `enqueue_back`. Every other session's state is unchanged: each idle
-/// transition was reported when it happened. A reservation that takes the
-/// returning slot an acquisition waits for (a reservation on the session's
-/// handle) wakes that acquisition, which steps again: the slot's retirement
-/// announces no capacity once it is taken (`DIV-029`).
+/// Records a reservation an owned pool's acquisition made, on the session's
+/// entry alone, as a `ClientSession`'s `TransactionAttached` reaches
+/// `notify_session_event`. The session stops being idle, and moves to the back
+/// when `enqueue_back`. Every other session's state is unchanged, because each
+/// idle transition was reported when it happened. A reservation on the
+/// session's handle that takes the returning slot an acquisition waits for
+/// wakes that acquisition, which steps again, because the slot's retirement
+/// does not report capacity once the slot is taken.
 pub(crate) fn record_reservation(
     pool: &Rc<RefCell<PoolState>>,
     session: &PooledSession,
@@ -2436,12 +2442,12 @@ pub(crate) fn record_reservation(
     }
 }
 
-/// Lists an owned HTTP/1.1 session whose slot turned returning (`DIV-029`), at its exchange's
-/// consumer's completion or at the release of a reservation taken on that slot, as a busy
-/// session that can take an exchange: as a returned slot's release
-/// would, the session moves to the back of the pool's order, where it joins the index's busy
-/// list, so that selection sees it before its driver retires the exchange. Returns false,
-/// changing nothing, when the pool is borrowed further up the stack.
+/// Lists an owned HTTP/1.1 session whose slot turned returning as a busy session that can
+/// take an exchange. The slot turns returning when the exchange's consumer completes, or when
+/// a reservation taken on that slot is released. As for a returned slot's release, the
+/// session moves to the back of the pool's order and joins the index's busy list, so that
+/// selection can take it before its driver retires the exchange. Returns false without
+/// changes when the pool is borrowed further up the stack.
 pub(crate) fn record_returning(pool: &Rc<RefCell<PoolState>>, session: &PooledSession) -> bool {
     let Ok(mut state) = pool.try_borrow_mut() else {
         return false;
@@ -2479,7 +2485,7 @@ struct WaiterRegistration {
     state: Weak<RefCell<PoolState>>,
     id: u64,
     credit: Option<Rc<ConnectCredit>>,
-    /// The session whose returning slot the waiter waits for (`DIV-046`).
+    /// The session whose returning slot the waiter waits for.
     claim: Option<PooledSession>,
 }
 
@@ -2595,7 +2601,7 @@ impl Drop for OwnershipGuard {
 struct SessionCompletion {
     closed: LocalClientFuture<Result<(), HttpError>>,
     ownership: Rc<SessionOwnership>,
-    /// The session joined the pool, whose stats counted it opened and count it closed.
+    /// The session joined the pool, so its stats counted it opened and will count it closed.
     counted: bool,
 }
 
@@ -2625,7 +2631,7 @@ impl SessionCompletion {
     }
 }
 
-/// Counts in `pool`'s stats (`DIV-032`).
+/// Updates `pool`'s stats.
 pub(crate) fn count_pool_stats(pool: &RefCell<PoolState>, count: impl FnOnce(&mut OwnedPoolStats)) {
     count(&mut pool.borrow_mut().stats);
 }
@@ -2680,15 +2686,15 @@ struct ConnectionAttempt {
     factory: ConnectionFactory,
     ownership: Option<OwnershipGuard>,
     guard: ConnectingGuard,
-    /// An owned pool's: the waiter of the acquisition step that started the attempt, which the
-    /// attempt's session is handed to while it waits, and which, in an HTTP/1.1 pool, the
-    /// attempt's failure fails (`DIV-046`).
+    /// In an owned pool, the waiter of the acquisition step that started the attempt. The
+    /// attempt's session is handed to it while it waits, and in an HTTP/1.1 pool the
+    /// attempt's failure fails it.
     dialer: Option<Rc<Waiter>>,
 }
 
 enum AcquireStep {
     /// `retired`: idle-expired sessions to drain once `session` is reserved, so
-    /// that no callback their drain runs can reserve `session` first. `drained`:
+    /// that a callback their drain runs cannot reserve `session` first. `drained`:
     /// the step drained aged sessions after its worker admission check.
     Session {
         session: PooledSession,
@@ -2754,7 +2760,7 @@ impl HttpSessionPool {
         pool
     }
 
-    /// An owned pool (`DIV-046`): `with_connector`'s pool, dialing owned client
+    /// Creates an owned pool: like `with_connector`, but dialing owned client
     /// sessions with `connection` and `session`.
     pub(crate) fn owned(
         context: WorkerContext,
@@ -2788,17 +2794,17 @@ impl HttpSessionPool {
         }
     }
 
-    /// Creates a worker-local address-free pool after registering its supervisor.
-    /// The security declaration describes the immediate hop, independently of an
-    /// origin scheme; `Unknown` does not claim TLS or authentication.
+    /// Creates a worker-local pool of sessions from `factory`, after registering its
+    /// supervisor. `security` describes the immediate hop, independently of the origin's
+    /// scheme. `Unknown` does not claim TLS or authentication.
     ///
-    /// Pending factories count against `max_connections`. Sessions retiring
-    /// after a drain, an expiry, or a flush stay owned until completion and
-    /// count against it too unless [`AttachedPoolParams::max_retiring`] is set;
-    /// then pending factories and all owned sessions together count against
-    /// `max_connections` plus that bound. New construction rejects quiescence.
-    /// Lowering capacity does not evict outstanding ownership; it prevents new
-    /// admission until enough existing slots finish or transfer.
+    /// Pending factories count against `max_connections`. Sessions retiring after a
+    /// drain, an expiry or a flush stay owned until they complete, and count against it
+    /// too unless [`AttachedPoolParams::max_retiring`] is set. Then pending factories and
+    /// all owned sessions together count against `max_connections` plus that bound.
+    /// Construction fails with [`PoolError::Draining`] once the worker is quiescing.
+    /// Lowering capacity does not evict owned sessions. It blocks new ones until enough
+    /// existing slots finish or transfer.
     pub fn try_with_attached_factory(
         context: WorkerContext,
         params: AttachedPoolParams,
@@ -2813,12 +2819,12 @@ impl HttpSessionPool {
         )
     }
 
-    /// Creates an address-free pool that retains selected external connector causes.
+    /// Like [`Self::try_with_attached_factory`], but keeps the factory's original errors.
     ///
-    /// Admission, ownership bounds, retries, and cleanup match
-    /// [`Self::try_with_attached_factory`]. Native-only failures still produce
-    /// [`PoolError::ConnectFailed`]; cause-bearing failures produce
-    /// [`PoolError::AttachedConnectFailed`]. This does not retry HTTP requests.
+    /// Admission, ownership bounds, retries and cleanup are the same. A failure without an
+    /// application error produces [`PoolError::ConnectFailed`], and one with an
+    /// application error produces [`PoolError::AttachedConnectFailed`]. This does not
+    /// retry HTTP requests.
     pub fn try_with_attached_factory_with_cause(
         context: WorkerContext,
         params: AttachedPoolParams,
@@ -2924,7 +2930,7 @@ impl HttpSessionPool {
             (Rc::clone(&state.tasks), Rc::clone(&state.idle_wake))
         };
         let state = Rc::downgrade(&self.state);
-        // A refused spawn means the pool is already draining, which retires every session.
+        // If the spawn fails, the pool is already draining, which retires every session.
         let _ = spawn_pool_task(&tasks, move |cancellation| {
             retire_idle_sessions(state, wake, cancellation)
         });
@@ -2993,7 +2999,7 @@ impl HttpSessionPool {
         Ok(())
     }
 
-    /// An owned pool's selection among its established sessions (`DIV-048`).
+    /// Sets an owned pool's selection among its established sessions.
     pub(crate) fn set_session_selection(
         &self,
         selection: OwnedSessionSelection,
@@ -3128,11 +3134,11 @@ impl HttpSessionPool {
         Ok(())
     }
 
-    /// Whether the dial gate refuses another connection. Pending connects and
+    /// Whether the connection bounds block another dial. Pending connects and
     /// established sessions count against `max_connections`, and so do an
     /// attached pool's retiring sessions unless it sets
     /// [`AttachedPoolParams::max_retiring`]. With it set to `n`, retiring
-    /// sessions leave that count and the gate also refuses once all owned
+    /// sessions leave that count, and the bounds also block a dial once all owned
     /// sessions plus pending connects reach `max_connections + n`. While this
     /// is false, [`AttachedPoolParams::pending_connect_credit`] may still
     /// credit an acquisition to a pending connect instead of dialing.
@@ -3141,7 +3147,7 @@ impl HttpSessionPool {
     }
 
     /// Whether the pool holds more connections than [`full`](Self::full)
-    /// admits, for example after [`set_max_connections`](Self::set_max_connections)
+    /// allows, for example after [`set_max_connections`](Self::set_max_connections)
     /// lowered the limit: the connections `full` counts exceed
     /// `max_connections`, or, with [`AttachedPoolParams::max_retiring`] set to
     /// `n`, all owned sessions plus pending connects exceed
@@ -3207,15 +3213,16 @@ impl HttpSessionPool {
         state.sessions.is_empty() && state.waiters.is_empty() && state.connects_in_progress == 0
     }
 
-    /// Initiates drain immediately, even if the returned observation is never
-    /// polled. Completion joins every pool task and owned session, including
-    /// late factories and sessions retiring after flush/expiry. Explicitly
-    /// detached sessions transfer that responsibility to their new owner.
+    /// Drains the pool and returns a future that resolves once every pool task and
+    /// owned session has been joined.
     ///
-    /// This is not transport flush/shutdown or physical worker completion. Keep
-    /// required runtimes alive through runtime quiescence, then join the owner.
-    /// Dropping this future never abandons cleanup. Repeated observations retain
-    /// the same failure, reported only after the remaining joins finish.
+    /// The drain starts immediately, even if the future is never polled. The join
+    /// includes late factories and sessions retiring after a flush or expiry. A
+    /// detached session is joined by its new owner instead. The join does not cover
+    /// transport flush and shutdown or worker shutdown, so keep the required runtimes
+    /// alive through runtime quiescence, then join the owner. Dropping the future does
+    /// not abandon cleanup. Repeated calls report the same failure, only after the
+    /// remaining joins finish.
     pub fn drain_and_join(&self) -> LocalClientFuture<Result<(), PoolError>> {
         let mut completion = self.state.borrow().tasks.completion.subscribe();
         self.drain();
@@ -3341,9 +3348,10 @@ impl HttpSessionPool {
         }
     }
 
-    /// Transfers responsibility for the detached session's completion to the
-    /// recipient. Its former observer releases any attached ownership slot on
-    /// its next turn, independently of the detached session's eventual closure.
+    /// Removes an idle session and hands it, with responsibility for its completion,
+    /// to the caller. Returns `None` while acquisitions wait or when every session is
+    /// busy. The pool's observer of the session releases any attached ownership slot
+    /// on its next turn, regardless of when the session closes.
     pub fn detach_idle_session(&self) -> Option<DetachedClientSession> {
         let mut state = self.state.borrow_mut();
         if !state.waiters.is_empty() {
@@ -3363,9 +3371,9 @@ impl HttpSessionPool {
         Some(DetachedClientSession(session))
     }
 
-    /// Establishes joined ownership before making a detached session available.
-    /// Attached pools require matching security and an available ownership slot;
-    /// native pools retain their original insertion and configuration policies.
+    /// Adds a detached idle session. Before making it available, the pool takes
+    /// ownership of it, so that the pool's drain joins it. Attached pools require matching
+    /// security and a free ownership slot. Native pools apply their usual rules.
     pub fn insert_idle_session(&self, session: DetachedClientSession) -> Result<(), PoolError> {
         let client_session = session.0;
         let session = PooledSession::Uniplex(client_session.clone());
@@ -3422,7 +3430,7 @@ impl HttpSessionPool {
         self.state.borrow().sessions.len()
     }
 
-    /// The counters an owned pool reports (`DIV-032`).
+    /// The counters an owned pool reports.
     pub(crate) fn owned_stats(&self) -> OwnedPoolStats {
         let state = self.state.borrow();
         OwnedPoolStats {
@@ -3700,11 +3708,11 @@ pub(crate) enum AcquisitionStart<Reservation> {
     Waiting(LocalClientFuture<Result<Reservation, PoolError>>),
 }
 
-/// Starts an acquisition now, for an owned pool's fast path (`DIV-046`): a
-/// first step that selects a session, or fails, ends it with no boxed future
-/// and no clock read for its deadline; only one that must wait for a session
-/// or a dial continues in a boxed future, its deadline anchored when that step
-/// found no session.
+/// Starts an acquisition immediately, for an owned pool's fast path. A first step
+/// that selects a session, or fails, ends it without a boxed future or a clock read
+/// for its deadline. Only an acquisition that must wait for a session or a dial
+/// continues in a boxed future, with its deadline anchored when that step could not
+/// take a session.
 pub(crate) fn start_acquisition<Reservation: PoolReservation>(
     state: Rc<RefCell<PoolState>>,
     cancellation: CancellationToken,
@@ -3741,7 +3749,7 @@ enum Stepped<Reservation> {
 }
 
 /// Reserves the session the step selects, draining the idle-expired sessions it
-/// retired afterwards, or starts the dial it admits.
+/// retired afterwards, or starts the step's dial.
 fn acquisition_step<Reservation: PoolReservation>(
     state: &Rc<RefCell<PoolState>>,
     started: &mut Option<Instant>,
@@ -3792,10 +3800,10 @@ fn acquisition_step<Reservation: PoolReservation>(
     })
 }
 
-/// Fails the step with `DROPPED` once a drain it ran after its worker admission
-/// check (`DIV-046`) began the worker's quiescence: before the step reserves,
-/// as `reserve_request` would then refuse, or after it, since the owned driver
-/// would refuse the step's reservation at submit.
+/// Fails the step with `DROPPED` if a drain it ran after its worker admission
+/// check began the worker's quiescence. Before the step reserves,
+/// `reserve_request` would then reject the reservation. After it, the owned
+/// driver would reject the reservation at submit.
 fn recheck_admission(state: &Rc<RefCell<PoolState>>) -> Result<(), PoolError> {
     if state.borrow().admits_reservations() {
         Ok(())
@@ -3853,8 +3861,8 @@ pub(crate) fn take_waits_for_wakeup_for_test() -> u64 {
     WAITS_FOR_WAKEUP.replace(0)
 }
 
-/// Waits for the waiter's wake; returns the reservation an owned pool's dial handed it, if
-/// any.
+/// Waits for the waiter's wake. Returns the reservation that an owned pool's dial handed
+/// to the waiter, if any.
 async fn wait_for_wakeup(
     state: &RefCell<PoolState>,
     waiter: Rc<Waiter>,
@@ -4045,8 +4053,8 @@ async fn run_connection_attempt(
                 connected.bind_pool(Rc::downgrade(&pool), unsettled);
                 let mut wake_count = connected.available_transactions();
                 let max_age = sampled_max_age(pool.borrow().pool_params.max_age);
-                // An owned session records its entry's slot, so that a settled index hears it
-                // join at the back of the pool's order instead of passing over the pool (S6.9).
+                // An owned session records its entry's slot, so that a settled index can
+                // handle it joining at the back of the pool's order without a pass over the pool.
                 let joined =
                     matches!(connected, PooledSession::Owned(_)).then(|| connected.clone());
                 {
@@ -4078,7 +4086,8 @@ async fn run_connection_attempt(
                         let mut state = pool.borrow_mut();
                         state.observed_capacity =
                             Some(u32::try_from(wake_count).unwrap_or(u32::MAX));
-                        // Credited waiters the session cannot serve go back through the gate.
+                        // Credited waiters that the session cannot serve go through the
+                        // connection bounds again.
                         state.take_credited_waiters(credit)
                     };
                     signal_waiters(credited);
@@ -4127,18 +4136,18 @@ async fn run_connection_attempt(
     };
     cancel_waiters(waiters, error);
     if guard.credit.is_some() {
-        // Frozen `addNewConnection` signals no waiter after a failed connect.
+        // As in native pools, releasing a failed connect's slot does not signal a waiter.
         ownership.wake_on_release.set(false);
     }
     guard.release(false);
     None
 }
 
-/// Hands `session`, which an owned pool's dial established and pooled, to `dialer`, the waiter
-/// of the acquisition step that started the dial, while that waiter still waits and the worker
-/// admits reservations (`DIV-046`): the waiter leaves the queue with a reservation on the
-/// session, made as its next step would make one on a session it selected, or with the error
-/// that refused it. Returns whether the session was handed over.
+/// Hands `session`, which an owned pool's dial established and pooled, to `dialer`, the
+/// waiter of the acquisition step that started the dial, if that waiter still waits and the
+/// worker accepts reservations. The waiter leaves the queue with a reservation on the
+/// session, made as its next step would make one, or with the error that rejected the
+/// reservation. Returns whether the session was handed over.
 fn hand_over_session(
     pool: &Rc<RefCell<PoolState>>,
     session: &PooledSession,
@@ -4165,8 +4174,8 @@ fn hand_over_session(
     true
 }
 
-/// `started` anchors the acquisition's deadline; a first step without one
-/// anchors it when it finds no session.
+/// `started` anchors the acquisition's deadline. A first step without one
+/// anchors it when it cannot take a session.
 fn next_step(
     state: &Rc<RefCell<PoolState>>,
     started: &mut Option<Instant>,
@@ -4186,7 +4195,7 @@ fn next_step(
         // below retires them as hyper-util's checkout does.
         let expired_at = now.filter(|_| idle_sweep == IdleSweep::AtExpiry);
         let checkout_at = now.filter(|_| idle_sweep == IdleSweep::Interval);
-        // A settled index selects as the passes below would, without them (S6.9).
+        // A settled index selects as the passes below would, without them.
         let selected = if admitting && pool.index_ready(now) {
             pool.select_indexed(checkout_at, &mut idle_expired)
         } else {
@@ -4215,12 +4224,13 @@ fn next_step(
                         .iter()
                         .any(|entry| entry.session.supports_more_transactions())
                 {
-                    // The last selectable session serves on while the gate refuses its replacement.
+                    // The last selectable session keeps serving while the bounds block a
+                    // replacement.
                     pool.sessions.insert_before(next, entry);
                     break;
                 }
                 if expired_at.is_some_and(|now| entry.idle_expired(now, idle_timeout, idle_sweep)) {
-                    // As `take_idle_expired`: no drain may let a callback reserve it.
+                    // As in `take_idle_expired`, so that a drain callback cannot reserve it.
                     entry.session.close_admission();
                     idle_expired.push(entry.session);
                 } else {
@@ -4271,12 +4281,12 @@ fn next_step(
                 pool.absorb_waiter()
             };
             if woken && absorbed.is_some() {
-                // The wake left the dial gate open; pass it to an uncovered waiter.
+                // The wake left room for a dial. Pass it to an uncovered waiter.
                 relayed = pool.take_uncovered_waiter();
             }
             let waits = at_connection_capacity || absorbed.is_some();
             // An owned pool's acquisition that would dial waits instead for a
-            // session whose driver returns a slot at its next turn (`DIV-046`).
+            // session whose driver returns a slot at its next turn.
             let claim = if waits || !admitting || !matches!(pool.backend, PoolBackend::Owned { .. })
             {
                 None

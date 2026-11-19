@@ -5,10 +5,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! `SessionParams::non_abortive_close` (`DIV-038`): a connector-built plaintext
-//! session that resets its connection (here because the caller dropped a
-//! response) closes it as hyper and reqwest do, by dropping the socket, so the
-//! engine sees FIN rather than RST.
+//! `SessionParams::non_abortive_close`: a connector-built plaintext session that
+//! resets its connection (here because the caller dropped a response) closes it
+//! as hyper and reqwest do, by dropping the socket, so the engine reads FIN
+//! rather than RST.
 
 use std::future::Future;
 use std::io::ErrorKind;
@@ -51,14 +51,14 @@ use crate::pool::HttpSessionPool;
 use crate::pool::PoolError;
 use crate::pool::PoolParams;
 
-/// How the engine's connection ended after the request it never answered.
+/// How the engine's connection ended after a request that got no response.
 #[derive(Debug, PartialEq)]
 enum EngineSaw {
     Fin,
     Reset,
 }
 
-/// An HTTP/1.1 engine that reads one request head, never answers, and reports
+/// An HTTP/1.1 engine that reads one request head, never responds, and reports
 /// how the client ended the connection. `head_seen` is set once the head is read.
 fn silent_engine() -> (SocketAddr, Arc<AtomicBool>, JoinHandle<EngineSaw>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("engine binds");
@@ -150,8 +150,8 @@ fn session_params(non_abortive_close: bool) -> SessionParams {
 }
 
 /// Sends a GET through an `HttpSessionPool`, drops its response before the
-/// engine answers (as a router does when its client cancels), drains the pool,
-/// and returns how the engine saw the connection end, on both executors.
+/// engine responds (as a router does when its client cancels), drains the pool,
+/// and returns how the connection ended at the engine, on both executors.
 fn dropped_response_before_headers(non_abortive_close: bool) -> [EngineSaw; 2] {
     on_workers(move |context| {
         Box::pin(async move {
@@ -199,7 +199,7 @@ fn non_abortive_close_is_off_by_default() {
     assert!(!SessionParams::default().non_abortive_close);
 }
 
-/// Pins the default: the session resets the connection with `SO_LINGER` zero.
+/// By default the session resets the connection with `SO_LINGER` zero.
 #[test]
 fn a_dropped_response_resets_the_engine_connection_by_default() {
     assert_eq!(
@@ -208,8 +208,8 @@ fn a_dropped_response_resets_the_engine_connection_by_default() {
     );
 }
 
-/// As hyper and reqwest, which drop the connection of a dropped response: the
-/// engine sees FIN.
+/// As in hyper and reqwest, dropping the response drops the connection, so the
+/// engine reads FIN.
 #[test]
 fn a_dropped_response_closes_the_engine_connection_with_fin_when_enabled() {
     assert_eq!(
@@ -218,7 +218,7 @@ fn a_dropped_response_closes_the_engine_connection_with_fin_when_enabled() {
     );
 }
 
-/// The TLS adapter's own failure paths still reset, so a TLS connection refuses
+/// The TLS adapter's own failure paths still reset, so a TLS connection rejects
 /// the option before it dials.
 #[test]
 fn non_abortive_close_refuses_a_tls_connection() {
@@ -253,7 +253,7 @@ fn non_abortive_close_refuses_a_tls_connection() {
     assert_eq!(hosted, HttpErrorCode::INVALID_STATE_TRANSITION);
 }
 
-/// An attached transport that the caller declares TLS refuses the option too.
+/// An attached transport that the caller marks as TLS rejects the option too.
 #[test]
 fn non_abortive_close_refuses_an_attached_tls_transport() {
     let [managed, hosted] = on_workers(|context| {

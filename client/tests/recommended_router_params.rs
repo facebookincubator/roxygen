@@ -6,15 +6,17 @@
  */
 
 //! One `HttpSessionPool` with the parameters recommended for a router that is
-//! compared with reqwest (most-recently-used reuse, hyper-util's interval
-//! sweep, no session timers, buffered ingress before abort (`DIV-033`), unframed
-//! bodyless requests (`DIV-036`), and non-abortive close (`DIV-038`)) against a
-//! raw HTTP/1.1 engine: a normal request, a bodiless one and a truncated
-//! response share one connection, the truncated response's bytes precede its
-//! error, the next request dials another, and that one idles out; a request
-//! cancelled before its response head closes its connection with FIN; and a
-//! request committed on a reused connection the engine closed fails unstarted,
-//! so the caller retries it on a fresh connection.
+//! compared with reqwest, against a raw HTTP/1.1 engine. The parameters are
+//! most-recently-used reuse, hyper-util's interval sweep, no session timers,
+//! ingress delivered before an abort, unframed bodiless requests and
+//! non-abortive close.
+//!
+//! A normal request, a bodiless one and a truncated response share one
+//! connection. The truncated response's bytes precede its error, the next
+//! request dials another connection, and that one idles out. A request
+//! cancelled before its response head closes its connection with FIN. A request
+//! committed on a reused connection that the engine closed fails unstarted, so
+//! the caller retries it on a fresh connection.
 
 use std::future::Future;
 use std::io::Read;
@@ -59,12 +61,12 @@ use crate::pool::IdleSweep;
 use crate::pool::PoolParams;
 use crate::pool::SessionReuseOrder;
 
-/// The router's `backend_pool_idle_timeout_secs` (4 s by default), shortened.
+/// The router's idle timeout (4 s by default), shortened.
 const IDLE: Duration = Duration::from_millis(200);
 const OK: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
 const TRUNCATED: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nfirst";
 
-/// What the engine saw on one of its connections, in order.
+/// What happened on one of the engine's connections, in order.
 #[derive(Debug, PartialEq)]
 enum Seen {
     Request(Vec<u8>),
@@ -77,7 +79,7 @@ enum Seen {
 /// A raw HTTP/1.1 engine for the router's pool.
 struct Engine {
     address: SocketAddr,
-    /// What the engine saw on each connection, sent once every one closed.
+    /// What happened on each connection, sent once all of them have closed.
     served: Receiver<Vec<Vec<Seen>>>,
     /// Set once the engine read a `POST /hold` request.
     hold_seen: Arc<AtomicBool>,
@@ -92,11 +94,12 @@ struct Engine {
     close: Sender<()>,
 }
 
-/// An engine that accepts `connections` connections and answers each request
-/// with `ok`, except `POST /truncated`, which it answers with 5 of 10 body bytes
-/// before it closes the connection; `POST /hold`, which it never answers; and
-/// `POST /then-close`, after whose reply it closes its side (FIN) once told to
-/// and keeps reading. Once every connection closed, it sends what it saw on each.
+/// An engine that accepts `connections` connections and replies `ok` to each
+/// request, with three exceptions. `POST /truncated` gets 5 of 10 body bytes,
+/// then the engine closes its side. `POST /hold` gets no reply. After its reply
+/// to `POST /then-close`, the engine waits for a signal on `close`, closes its
+/// side (FIN) and keeps reading. Once every connection has closed, it sends what
+/// happened on each.
 fn engine(connections: usize) -> Engine {
     let listener = TcpListener::bind("127.0.0.1:0").expect("engine binds");
     let address = listener.local_addr().expect("engine address");
@@ -230,9 +233,9 @@ enum Received {
     Error(HttpErrorCode),
 }
 
-/// Sends a POST of `body` (bodiless, as the router sends its probes, when
-/// `None`) on the pool's next session; returns the request's sequence number on
-/// its connection, whether it was started, and what the client read.
+/// Sends a POST of `body` on the pool's next session, or a bodiless POST (as the
+/// router sends its probes) when `body` is `None`. Returns the request's sequence
+/// number on its connection, whether it was started, and what the client read.
 async fn post(
     pool: &HttpSessionPool,
     path: &[u8],
@@ -383,7 +386,7 @@ fn the_recommended_router_pool_reuses_retires_and_delivers_truncated_responses()
             ];
             // The engine reports once its second connection idled out too.
             let served = served_by(&engine).await;
-            // The session the truncated response failed reports its error to the join.
+            // The session that the truncated response failed reports its error to the join.
             let _ = pool.drain_and_join().await;
             (exchanges, served)
         })
@@ -436,8 +439,8 @@ fn the_recommended_router_pool_reuses_retires_and_delivers_truncated_responses()
         let [_, Seen::Closed(idle)] = second[..] else {
             panic!("the idle connection closes cleanly: {second:?}");
         };
-        // The interval sweep retires a connection idle for longer than IDLE, at a
-        // sweep every IDLE: after more than IDLE and within about two periods.
+        // The sweep runs every IDLE and retires a connection idle for longer than
+        // IDLE, so it closes after more than IDLE and within about two periods.
         assert!(
             idle > IDLE && idle < 3 * IDLE + Duration::from_millis(500),
             "retired after {idle:?}"
@@ -496,8 +499,8 @@ fn the_recommended_router_pool_closes_a_connection_cancelled_before_its_head_wit
     }
 }
 
-/// What the router's retry loop sees of a request committed on a reused
-/// connection whose engine closed it before the session wrote the request.
+/// The result of a request committed on a reused connection that the engine
+/// closed before the session wrote the request.
 #[cfg(not(fbcode_build))]
 #[derive(Debug, PartialEq)]
 struct StaleAttempt {
@@ -506,12 +509,12 @@ struct StaleAttempt {
     received: Vec<Received>,
 }
 
-/// The stale reused connection of `DIV-035`, with the recommended parameters:
-/// after one exchange the engine closes its side (FIN) while the next request's
-/// session writer is held (the session's `test-hooks` feature), as when that
-/// FIN and the commit fall in one turn. The request fails unstarted on a
-/// reused connection, which is the router's (and hyper-util's) retry signal,
-/// and the retry dials a fresh connection, where it succeeds.
+/// A stale reused connection with the recommended parameters. After one
+/// exchange the engine closes its side (FIN) while the next request's session
+/// writer is held (the session's `test-hooks` feature), as when that FIN and the
+/// commit fall in one turn. The request fails unstarted on a reused connection,
+/// which is the router's (and hyper-util's) retry signal, and the retry succeeds
+/// on a fresh connection.
 #[cfg(not(fbcode_build))]
 #[test]
 fn the_recommended_router_pool_signals_a_retry_for_a_request_on_a_stale_reused_connection() {
@@ -548,7 +551,8 @@ fn the_recommended_router_pool_signals_a_retry_for_a_request_on_a_stale_reused_c
                 .close
                 .send(())
                 .expect("the engine waits for the FIN request");
-            // Loopback delivers the FIN at once; the session reads it meanwhile.
+            // Loopback delivers the FIN immediately, and the session reads it
+            // during this sleep.
             tokio::time::sleep(Duration::from_millis(100)).await;
             release.notify_one();
             let received = tokio::time::timeout(Duration::from_secs(2), read(&mut response))

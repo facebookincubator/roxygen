@@ -5,9 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! `SessionParams::unframed_bodiless_http1_requests` sends a request whose head
-//! ends the message with no body framing, as reqwest sends a `POST` with an
-//! empty body (`DIV-036`).
+//! `SessionParams::unframed_bodiless_http1_requests` sends a bodiless request
+//! as a head with no body framing, as reqwest sends a `POST` with an empty body.
 
 use std::io::Read;
 use std::io::Write;
@@ -30,7 +29,7 @@ use crate::pool::HttpSessionPool;
 use crate::pool::PoolParams;
 
 /// The bytes an engine receives for a bodiless `POST /generate` sent through
-/// an `HttpSessionPool`, up to its answer.
+/// an `HttpSessionPool`, up to the response.
 fn bodiless_post_on_the_wire(unframed: bool) -> Vec<u8> {
     let listener = TcpListener::bind("127.0.0.1:0").expect("engine binds");
     let address = listener.local_addr().expect("engine address");

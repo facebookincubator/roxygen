@@ -360,7 +360,7 @@ thread_local! {
     static WORKER_RESOLVERS: RefCell<HashMap<WorkerId, WorkerResolverEntry>> = RefCell::new(HashMap::new());
 }
 
-/// Worker-local coroutine DNS facade.
+/// Resolves hostnames with the resolver and stats collector registered for each worker.
 pub struct CoroDnsResolver;
 
 impl CoroDnsResolver {
@@ -1116,43 +1116,41 @@ pub struct SessionParams {
     pub session_stats: Option<Rc<dyn ClientSessionStats>>,
     pub header_codec_stats: Option<Rc<dyn HeaderCodecStats>>,
     pub header_indexing_strategy: Option<Rc<dyn HeaderIndexingStrategy>>,
-    /// Experimental PING probes for every HTTP/2 session built from these
-    /// parameters (`DIV-024`); HTTP/1.1 sessions ignore them. `None`, the
-    /// default, sends none.
+    /// Experimental PING probes for HTTP/2 sessions. HTTP/1.1 sessions ignore
+    /// them. `None` (the default) disables them.
     pub ping_probes: Option<PingProbeConfig>,
-    /// Roxygen-only, default off (`DIV-033`): a response whose stream is aborted
-    /// (a peer reset, a transport EOF or read error, a connection error) after
-    /// part of it arrived still delivers the head and body events already
-    /// received, in order, before the error, as Hyper's body channel and h2 do.
-    /// Off, the frozen behavior, the error discards them.
+    /// Delivers the head and body events of a partly received response, in order,
+    /// before the error that aborts it (a peer reset, a transport EOF or read
+    /// error, a connection error), as hyper and h2 do. Off by default, in which
+    /// case the error discards them.
     pub deliver_ingress_before_abort: bool,
-    /// Roxygen-only, default off (`DIV-036`): an HTTP/1.1 request whose head ends the
-    /// message (no body) and carries neither `Content-Length` nor a chunked
-    /// `Transfer-Encoding` goes out with no body framing, as reqwest sends a `POST`
-    /// with an empty body, instead of an empty chunked body. HTTP/2 sessions ignore it.
+    /// Sends a bodiless HTTP/1.1 request without body framing instead of with an
+    /// empty chunked body, as reqwest sends a `POST` with an empty body. This
+    /// applies when the head carries neither `Content-Length` nor a chunked
+    /// `Transfer-Encoding`. Off by default. HTTP/2 sessions ignore it.
     pub unframed_bodiless_http1_requests: bool,
-    /// Roxygen-only, default off (`DIV-038`): a session that resets its connection (a
-    /// dropped response, a failed or cancelled session, an HTTP/1.1 stream reset)
-    /// closes the socket without `SO_LINGER` zero, as hyper and reqwest close one by
-    /// dropping it: the kernel still sends the bytes already written, then FIN, or RST
-    /// only if received bytes are unread. Plaintext only: a connector refuses it for a
-    /// TLS connection, and `ClientSession::attach_transport` for a TLS transport.
+    /// Closes the socket without `SO_LINGER` zero when the session resets its
+    /// connection (a dropped response, a failed or cancelled session, an HTTP/1.1
+    /// stream reset), as hyper and reqwest do by dropping it. The kernel still sends
+    /// the bytes already written, then FIN, or RST only if received bytes are
+    /// unread. Off by default. Plaintext only: connectors and
+    /// `ClientSession::attach_transport` reject it for TLS.
     pub non_abortive_close: bool,
 }
 
-/// Attaches already-connected I/O without performing DNS, TLS, or routing.
+/// Options for attaching already-connected I/O, which skips DNS, TLS and routing.
 pub struct ClientAttachOptions {
     pub protocol: CodecProtocol,
     pub session: SessionParams,
     pub security: TransportSecurity,
     pub upstream_origin: Option<UpstreamOrigin>,
-    /// Cancels the attached session, including its outstanding exchanges.
-    /// Cancellation after the supervisor publishes native completion is not promised.
+    /// Cancels the attached session, including its outstanding exchanges. A cancel
+    /// that races with session completion may have no effect.
     pub cancellation: CancellationToken,
 }
 
 impl ClientAttachOptions {
-    /// Requires an explicit wire protocol and immediate-hop security assertion.
+    /// Creates options for the given wire protocol and immediate-hop security.
     pub fn new(protocol: CodecProtocol, security: TransportSecurity) -> Self {
         Self {
             protocol,
@@ -1207,7 +1205,7 @@ pub(crate) struct SessionCompletionState {
 }
 
 /// Owner-local observation of one session scope's outcome. A published
-/// outcome wins over a later close; both are sticky.
+/// outcome takes precedence over a later close, and both are sticky.
 pub(crate) type SessionCompletion = Rc<RefCell<SessionCompletionState>>;
 
 fn session_completion_outcome(completion: &SessionCompletion) -> Option<SessionOutcome> {
@@ -1223,8 +1221,8 @@ fn session_completion_outcome(completion: &SessionCompletion) -> Option<SessionO
     })
 }
 
-/// Publishes the scope's outcome once. Dropped before publishing, as when the
-/// worker drops the scope, it closes the completion instead.
+/// Publishes the scope's outcome once. If it is dropped before publishing, as
+/// when the worker drops the scope, it closes the completion instead.
 pub(crate) struct SessionCompletionPublisher(Option<SessionCompletion>);
 
 impl SessionCompletionPublisher {
@@ -1257,8 +1255,8 @@ impl Drop for SessionCompletionPublisher {
     }
 }
 
-// Nothing between a publisher entry point and this call can begin or end
-// unwinding, so sampling `panicking()` here matches sampling it on entry.
+// Unwinding cannot begin or end between a publisher entry point and this call,
+// so sampling `panicking()` here matches sampling it on entry.
 fn wake_completion_waiters(waiters: Vec<Weak<CompletionWaiter>>) {
     let unwinding = std::thread::panicking();
     let mut first_panic = None;
@@ -1282,7 +1280,7 @@ fn wake_completion_waiters(waiters: Vec<Weak<CompletionWaiter>>) {
     }
 }
 
-/// Returns a completion and the publisher that settles it, without a session.
+/// Returns a completion and its publisher, without a session.
 #[cfg(test)]
 pub(crate) fn session_completion_for_test() -> (SessionCompletionPublisher, SessionCompletion) {
     let completion = SessionCompletion::default();
@@ -1298,7 +1296,7 @@ pub(crate) fn completion_waiters_for_test(completion: &SessionCompletion) -> usi
     completion.borrow().waiters.len()
 }
 
-/// Waits for a published outcome; a closed completion fails `session scope failed`.
+/// Waits for a published outcome. A closed completion fails with `session scope failed`.
 pub(crate) fn wait_session_completion(
     completion: &SessionCompletion,
 ) -> LocalClientFuture<SessionOutcome> {
@@ -1532,7 +1530,7 @@ impl HttpSourceFilterHooks for SessionRequestCancellation {
     }
 }
 
-/// A request head read that fails `CORO_CANCELLED` when either session token is
+/// A request head read that fails with `CORO_CANCELLED` when either session token is
 /// cancelled. A token cancelled before the first poll drops the unpolled read.
 /// The first poll polls the read once and builds the token waits only if it is
 /// pending. Every exit drops the read before it checks the tokens.
@@ -1694,12 +1692,12 @@ pub struct ClientSession {
 }
 
 impl ClientSession {
-    /// Consumes an established transport on its exact owner worker.
+    /// Starts a session on an established transport, on the transport's owner worker.
     ///
-    /// Protocol and immediate security are explicit trusted inputs. Endpoints
-    /// and identity are read from the transport, never from request headers.
-    /// Failure disposes the transport on its owner; successful attachment roots
-    /// session completion independently of the returned handle.
+    /// The protocol and the immediate-hop security are trusted caller inputs.
+    /// Endpoints and identity are read from the transport, never from request
+    /// headers. On failure the transport is disposed of on its owner. On success
+    /// the session runs in a worker scope rather than in the returned handle.
     pub fn attach_transport(
         worker: &WorkerContext,
         transport: OwnedByteStream,
@@ -1744,26 +1742,27 @@ impl ClientSession {
         &self.inner.connection
     }
 
-    /// Returns independent backend-value and close-scope retirement observation.
+    /// Returns an observer that reports when the transport's I/O value and close
+    /// scope are retired.
     ///
-    /// Native TCP/TLS supplies this receipt. `None` means unsupported, not
-    /// completed cleanup. Unlike `wait_closed`, it includes the transport's
-    /// close scope, but does not certify I/O success or physical worker joins.
-    /// Retaining or dropping it does not change session or transport ownership.
+    /// Native TCP and TLS transports provide one. `None` means the transport does
+    /// not support it, not that cleanup finished. Unlike `wait_closed`, it covers
+    /// the transport's close scope. It does not report whether I/O succeeded.
+    /// Holding or dropping it does not affect the session or the transport.
     pub fn transport_retirement(&self) -> Option<TransportRetirement> {
         self.inner.transport_retirement.clone()
     }
 
-    /// Requests cancellation locally without submitting a command or waiting for capacity.
-    /// Cancellation after the supervisor publishes native completion is not promised.
+    /// Requests cancellation without submitting a command or waiting for capacity.
+    /// A cancel that races with session completion may have no effect.
     pub fn cancel(&self) {
         self.inner.draining.set(true);
         self.inner.cancellation.request_cancellation();
     }
 
-    /// Observes session finalization, including its joined tasks and callbacks.
-    /// Transport flush/shutdown can still be scheduled; runtime quiescence joins
-    /// that separate scope. Dropping this observation does not cancel cleanup.
+    /// Waits until the session finishes, including its tasks and callbacks.
+    /// The transport's flush and shutdown may still be pending, and runtime
+    /// quiescence waits for those. Dropping the future does not cancel cleanup.
     pub fn wait_closed(&self) -> LocalClientFuture<Result<UniplexRunSummary, HttpError>> {
         wait_session_completion(&self.inner.completion)
     }
@@ -1775,8 +1774,7 @@ impl ClientSession {
     }
 
     /// Holds the session's writer, the next time it would stage egress, until
-    /// `release` is notified (the session's `test-hooks` feature, which Buck's
-    /// test build lacks).
+    /// `release` is notified. Needs the session crate's `test-hooks` feature.
     #[cfg(all(test, not(fbcode_build)))]
     pub(crate) fn hold_writer_for_test(&self, release: Rc<tokio::sync::Notify>) {
         self.inner.handle.hold_writer_for_test(release);
@@ -1845,9 +1843,9 @@ impl ClientSession {
         )
     }
 
-    /// Commits `request` on `reservation`. `cancellation` covers the head read
-    /// and admission; `body_cancellation`, when present, stays attached to the
-    /// upload after admission.
+    /// Commits `request` on `reservation`. `cancellation` covers the head read and
+    /// admission. After admission, `body_cancellation`, if present, stays attached to
+    /// the upload.
     pub(crate) fn send_reserved_request_inner(
         &self,
         request: HttpSourceHolder,
@@ -1879,8 +1877,8 @@ impl ClientSession {
     }
 
     /// Commits an already-read header and its remaining body using reserved capacity.
-    /// Caller and session cancellation are checked before admission; caller
-    /// cancellation remains attached to the upload after admission.
+    /// Caller and session cancellation are checked before admission. After
+    /// admission, caller cancellation stays attached to the upload.
     pub fn send_reserved_request_with_headers(
         &self,
         headers: HttpHeaderEvent,
@@ -1906,7 +1904,7 @@ impl ClientSession {
         self.inner.handle.initiate_drain()
     }
 
-    /// Refuses new reservations and requests ahead of `initiate_drain`, so that
+    /// Rejects new reservations and requests before `initiate_drain` runs, so that
     /// callbacks run by another session's drain cannot reserve this one.
     pub(crate) fn close_admission(&self) {
         self.inner.draining.set(true);
@@ -1921,8 +1919,8 @@ impl ClientSession {
         self.inner.protocol
     }
 
-    /// Whether the native connector observed TLS resumption. Established-I/O
-    /// attachment reports false and does not inspect an external TLS session.
+    /// Whether the connector's TLS handshake resumed a session. Sessions started
+    /// by `attach_transport` report false.
     pub fn tls_session_reused(&self) -> bool {
         self.inner.tls_session_reused
     }
@@ -2134,8 +2132,8 @@ pub(crate) fn client_byte_stream_limits() -> ByteStreamLimits {
 }
 
 /// Dials a plaintext TCP connection and reads its connection context, enabling
-/// `non_abortive_close` (`DIV-038`) first. A cancellation that lands while the
-/// connect completes closes the connected transport.
+/// `non_abortive_close` first. A cancellation that lands while the connect
+/// completes closes the connected transport.
 pub(crate) async fn dial_plaintext(
     context: &WorkerContext,
     address: SocketAddress,
@@ -2173,8 +2171,8 @@ pub(crate) async fn dial_plaintext(
     Ok((transport, metadata))
 }
 
-/// The TLS adapter's own failure paths reset, so `SessionParams::non_abortive_close`
-/// is plaintext only (`DIV-038`).
+/// The TLS adapter resets the connection on its own failure paths, so
+/// `SessionParams::non_abortive_close` is plaintext only.
 pub(crate) fn non_abortive_close_with_tls() -> HttpError {
     client_error(
         HttpErrorCode::INVALID_STATE_TRANSITION,
@@ -2350,8 +2348,8 @@ struct ClientSessionOwner {
 }
 
 impl UniplexRunOwner for ClientSessionOwner {
-    /// Attachment cancellation wins over session cancellation, and either
-    /// wins over quiescence, which a cancellation still follows.
+    /// Attachment cancellation takes precedence over session cancellation, and
+    /// either takes precedence over quiescence, which a cancellation still follows.
     fn poll_stop(&mut self, context: &mut Context<'_>) {
         loop {
             if !self.aborting && self.external.update_waker(context.waker()) {

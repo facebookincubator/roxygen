@@ -5,10 +5,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! A manual measurement for `DIV-032`: what the interval idle sweep, which runs
-//! once per pool, costs an idle worker with one origin pool and with 128 (and with
-//! none, for the worker's own idle cost), under the router's pool parameters. Run
-//! it in an optimized build.
+//! A manual measurement of what the interval idle sweep, which runs once per
+//! pool, costs an idle worker. It measures 0, 1 and 128 origin pools (0 gives the
+//! worker's own idle cost) with an inference router's pool parameters. Run it in
+//! an optimized build.
 
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -42,8 +42,7 @@ use crate::pool::IdleSweep;
 use crate::pool::PoolParams;
 use crate::pool::SessionReuseOrder;
 
-/// The router's idle timeout (`backend_pool_idle_timeout_secs` unset), which is
-/// also the sweep period.
+/// The router's default idle timeout, which is also the sweep period.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(4);
 /// Sweep periods in the measured window.
 const PERIODS: u32 = 5;
@@ -96,8 +95,8 @@ fn router_pool(context: WorkerContext, engine: SocketAddr) -> HttpSessionPool {
     )
 }
 
-/// One GET on the pool's next session, read to its end; the session then idles
-/// with no waiter, which starts the pool's sweep.
+/// Sends one GET on the pool's next session and reads it to the end. The session
+/// then idles with no waiter, which starts the pool's sweep.
 async fn one_exchange(pool: &HttpSessionPool) {
     let GetSessionResult {
         reservation,
@@ -158,8 +157,8 @@ struct IdleSweepCost {
     sessions: usize,
 }
 
-/// Starts `pools` router pools to `engine` on a fresh `HostedWorker`, their
-/// sweeps a period apart in all, waits until every session has retired, then
+/// Starts `pools` router pools to `engine` on a fresh `HostedWorker`, with their
+/// sweeps spread over one period, waits until every session has retired, then
 /// measures the worker over `PERIODS` sweep periods.
 fn measure(engine: SocketAddr, pools: usize) -> IdleSweepCost {
     let worker = HostedWorker::spawn(HostedWorkerOptions {

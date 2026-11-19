@@ -1134,7 +1134,8 @@ fn params(capacity: u32) -> AttachedPoolParams {
     }
 }
 
-/// The `adapters.connect` accounting: retiring sessions leave `max_connections`.
+/// The CONNECT adapter's accounting: a retiring session frees its
+/// `max_connections` slot.
 fn retiring_params(capacity: u32) -> AttachedPoolParams {
     AttachedPoolParams {
         max_retiring: Some(capacity),
@@ -4223,9 +4224,9 @@ fn attached_pool_expiration_retires_before_acquisition_error() {
     }
 }
 
-/// CL-L3: a retired-session batch that is not empty is still drained, in one
-/// pass. An acquisition that retires the pool's only session, aged out, and
-/// then fails drains that session; its step has no waiter to signal.
+/// A non-empty batch of retired sessions is drained in one pass. An acquisition
+/// that retires the pool's only session (aged out) and then fails still drains
+/// that session, although its step has no waiter to signal.
 #[test]
 fn an_acquisition_drains_the_session_it_retires_in_one_pool_batch_pass() {
     for timed_out in [false, true] {

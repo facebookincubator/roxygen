@@ -2186,7 +2186,7 @@ impl AsyncWrite for OfferRecordingIo {
 }
 
 #[test]
-fn idle_client_read_offers_proxygen_read_allocation_default() {
+fn idle_client_read_offers_the_default_read_allocation() {
     for protocol in [CodecProtocol::Http11, CodecProtocol::Http2] {
         run_on_worker(move |context| async move {
             let peer = OfferRecordingIo::default();
@@ -2211,7 +2211,7 @@ fn idle_client_read_offers_proxygen_read_allocation_default() {
             let idle = peer.take_offers();
             assert!(
                 idle.iter().all(|offer| *offer == 4_000),
-                "{protocol:?}: an idle client read offers readBufNewAllocSize_ (4_000 bytes): \
+                "{protocol:?}: an idle client read offers the default allocation (4_000 bytes): \
                  {idle:?}",
             );
 

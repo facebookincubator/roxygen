@@ -5,14 +5,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The owned HTTP/1.1 client pool (`DIV-046`) as an egress client of uvicorn and Envoy peers,
-//! over loopback TCP against a scripted peer, under API Proxy's pool parameters: a connection
-//! the peer closes while it is idle (uvicorn closes a keep-alive connection after 5 s, scaled
-//! down here), thousands of connections, responses that close their connection or delimit
-//! their body by it, chunked responses, a cancel in the middle of a response, and a peer that
-//! closes each connection as soon as it accepts it. Each scenario runs on a `RuntimeOwner`
-//! worker that must quiesce without forcing, except the close race, which runs on a
-//! `ManagedWorker` and a `HostedWorker`.
+//! The owned HTTP/1.1 client pool as an egress client of uvicorn and Envoy peers, tested over
+//! loopback TCP against a scripted peer with reqwest-like pool parameters.
+//!
+//! The scenarios cover a connection that the peer closes while it is idle (uvicorn closes a
+//! keep-alive connection after 5 s, scaled down here), thousands of connections, responses that
+//! close their connection or delimit their body by closing it, chunked responses, a cancel in
+//! the middle of a response, and a peer that closes each connection immediately after accepting
+//! it. Each scenario runs on a `RuntimeOwner` worker that must quiesce without forcing, except
+//! the close race, which runs on a `ManagedWorker` and a `HostedWorker`.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -130,8 +131,8 @@ fn socket_address(address: SocketAddr) -> SocketAddress {
     SocketAddress::new(address.ip().to_string(), address.port())
 }
 
-/// API Proxy's HTTP/1.1 egress pool: no connection cap (reqwest has none), a 90 s idle timeout
-/// swept on an interval, most recently used first, and the default waiter bound.
+/// A reqwest-like HTTP/1.1 egress pool: no connection cap, a 90 s idle timeout swept on an
+/// interval, most recently used first, and the default waiter bound.
 fn egress_params() -> PoolParams {
     PoolParams {
         max_connections: u32::MAX,
@@ -166,7 +167,7 @@ fn patterned(length: usize) -> Vec<u8> {
     (0..length).map(|index| (index % 251) as u8).collect()
 }
 
-/// How the peer closes a connection it no longer serves.
+/// How the peer closes a connection it has stopped serving.
 #[derive(Clone, Copy, Debug)]
 enum PeerClose {
     /// A FIN, after which it reads until the client closes, counting what arrives.
@@ -190,7 +191,7 @@ struct PeerShared {
     after_close: AtomicUsize,
     /// `/gate` connections the client closed in the middle of their response.
     cut_mid_response: AtomicUsize,
-    /// `/hold` requests answer in rounds of this many, once the round's last one arrives.
+    /// `/hold` requests get responses in rounds of this many, once the round's last one arrives.
     hold_round: AtomicUsize,
     held: AtomicUsize,
     hold_release: tokio::sync::watch::Sender<usize>,
@@ -226,8 +227,8 @@ impl PeerShared {
 /// - `/http10`: an HTTP/1.0 `Content-Length` response, then a close;
 /// - `/http10-keep-alive`: an HTTP/1.0 `Content-Length` response with
 ///   `Connection: keep-alive`;
-/// - `/http10-eof` and `/eof`: an HTTP/1.0 or HTTP/1.1 response whose body the close
-///   delimits; `/eof-close` adds `Connection: close`;
+/// - `/http10-eof` and `/eof`: an HTTP/1.0 or HTTP/1.1 response whose body ends at the
+///   close; `/eof-close` adds `Connection: close`;
 /// - `/chunked`, `/chunked-trailers` and `/chunked-close`: a chunked keep-alive response,
 ///   one with trailers, and one with `Connection: close`;
 /// - `/gate`: a chunked response's head and first chunk, then the rest once the test opens
@@ -274,7 +275,7 @@ impl Peer {
                     socket
                         .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
                         .expect("peer binds");
-                    // Thousands of dials arrive at once.
+                    // Thousands of dials arrive together.
                     let listener = socket.listen(4096).expect("peer listens");
                     bound
                         .send(listener.local_addr().expect("peer address"))
@@ -349,8 +350,8 @@ enum Next {
 }
 
 /// Reads the next request head, buffering what follows it. The keep-alive timer, and a close
-/// the test requests, apply only while no byte of a next request has arrived, as uvicorn's
-/// timer does.
+/// the test requests, apply only until the first byte of the next request arrives, as with
+/// uvicorn's timer.
 async fn next_request(
     stream: &mut tokio::net::TcpStream,
     input: &mut Vec<u8>,
@@ -456,8 +457,8 @@ fn chunk(piece: &[u8]) -> Vec<u8> {
     framed
 }
 
-/// Answers `path`; `Ok(false)` when the response closes the connection, `Err` when the
-/// connection is gone.
+/// Responds to `path`. Returns `Ok(false)` when the response closes the connection and `Err`
+/// when the connection is gone.
 async fn respond(
     stream: &mut tokio::net::TcpStream,
     path: &str,
@@ -565,7 +566,7 @@ async fn get(path: &str) -> (HttpHeaderEvent, HttpSourceHolder) {
     (head, HttpSourceHolder::empty())
 }
 
-/// A response as its reader saw it.
+/// A response as its reader received it.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Received {
     status: Option<u16>,
@@ -645,7 +646,7 @@ async fn read_pull_through(body: &mut OwnedClientPullThroughBody) -> Received {
 enum Reading {
     /// From the response's source, which the session's run drives.
     Source,
-    /// Through a pull-through body that drives the connection (`DIV-047`).
+    /// Through a pull-through body that drives the connection.
     PullThrough,
 }
 
@@ -715,12 +716,9 @@ async fn until(mut ready: impl FnMut() -> bool) {
 }
 
 /// A pooled connection that the peer closes after its keep-alive timeout, with a FIN or a
-/// full close, is retired by the pool as soon as its driver reads the close, before any
-/// acquisition: the pool holds no session once the peer has closed them all, and the next
-/// exchanges dial fresh connections and are served, with no request refused and no byte
-/// written to a closed connection. (Per close: the peer's idle closes, the pool's sessions
-/// once they were read, sessions opened and closed, the next exchanges' responses and
-/// sequence numbers, the peer's connections, and bytes after its FINs.)
+/// full close, is retired as soon as its driver reads the close, before any acquisition. The
+/// next exchanges dial fresh connections and are served, and the client does not write to a
+/// closed connection.
 #[test]
 fn a_pooled_connection_the_peer_closes_while_idle_is_retired_before_reuse() {
     const CONNECTIONS: usize = 4;
@@ -776,7 +774,8 @@ fn a_pooled_connection_the_peer_closes_while_idle_is_retired_before_reuse() {
     }
 }
 
-/// What a request submitted in the worker turn that sees the peer's close become readable met.
+/// The outcome of a request submitted in the worker turn in which the peer's close becomes
+/// readable.
 #[derive(Debug, PartialEq)]
 struct CloseCommit {
     /// The submission failed with this code, before commit.
@@ -790,8 +789,8 @@ struct CloseCommit {
     resent: Option<(bool, u64, Received)>,
 }
 
-/// Reads request heads from `stream`, answering each with `OK`, until `answer` are answered
-/// or the stream ends.
+/// Reads request heads from `stream` and replies `OK` to each, until it has sent `answer`
+/// replies or the stream ends.
 fn serve_blocking(stream: &mut TcpStream, mut answer: usize) {
     let mut input = Vec::new();
     let mut buffer = [0; 1024];
@@ -809,12 +808,14 @@ fn serve_blocking(stream: &mut TcpStream, mut answer: usize) {
     }
 }
 
-/// `prior_exchanges` exchanges on one pooled connection, then the peer's keep-alive close and
-/// the next request's submission in one worker turn, as `read_before_write.rs` schedules them
-/// for `HttpSessionPool`: the worker thread blocks while the peer writes a byte on a side
-/// connection and then closes, so the next reactor turn sees both, the side byte first, and
-/// the client task takes the idle pooled session and submits before its driver's next poll.
-/// A request refused unprocessed is resent on the next acquisition.
+/// Runs `prior_exchanges` exchanges on one pooled connection, then the peer's keep-alive close
+/// and the next request's submission in one worker turn, scheduled as `read_before_write.rs`
+/// does for `HttpSessionPool`.
+///
+/// The worker thread blocks while the peer writes a byte on a side connection and then closes,
+/// so the next reactor turn reports both, the side byte first. The client task then takes the
+/// idle pooled session and submits before its driver's next poll. A request refused
+/// unprocessed is resent on the next acquisition.
 fn close_commit(
     context: WorkerContext,
     prior_exchanges: usize,
@@ -904,7 +905,7 @@ fn close_commit(
         let sequence_number = submission.sequence_number();
         let refused = match outcome {
             Ok(response) => {
-                // Committed: read what the response met.
+                // Committed: read the response to its end.
                 let mut source = response.source.into_source_owner().into_source_holder();
                 let _ = read_source(&mut source).await;
                 None
@@ -966,10 +967,10 @@ fn close_commit_on_workers(prior_exchanges: usize, close: PeerClose) -> [CloseCo
 }
 
 /// A request submitted on a pooled keep-alive connection in the worker turn in which the
-/// peer's keep-alive close becomes readable is refused before commit (`DIV-035`): the driver
-/// reads before it commits, so it fails with `TRANSPORT_EOF`, unprocessed, with the
-/// connection's earlier requests as its sequence number, and nothing is written to the closed
-/// connection; resent on the next acquisition, it is served on a new connection, whatever the
+/// peer's keep-alive close becomes readable is refused before commit. The driver reads before
+/// it commits, so the request fails unprocessed with `TRANSPORT_EOF`, its sequence number is
+/// the count of the connection's earlier requests, and the client does not write to the closed
+/// connection. Resent on the next acquisition, it is served on a new connection, whatever the
 /// worker kind, the earlier exchanges and the close.
 #[test]
 fn a_request_submitted_as_the_peer_s_keep_alive_close_arrives_is_refused_unprocessed() {
@@ -993,11 +994,10 @@ fn a_request_submitted_as_the_peer_s_keep_alive_close_arrives_is_refused_unproce
 }
 
 /// Each closing or close-delimited response is read whole through the pool, from its source
-/// and through a pull-through body, and retires its connection: the session finishes cleanly,
-/// the next exchange dials a new connection, and no request follows on the closed one. A
-/// chunked or HTTP/1.0 keep-alive response leaves its connection to the next exchange.
-/// (Per path and reading: the response, whether the next exchange reused the connection, the
-/// first session's outcome once retired, the peer's connections, and bytes after its FINs.)
+/// and through a pull-through body, and retires its connection. The session finishes cleanly,
+/// the next exchange dials a new connection, and the client does not send another request on
+/// the closed connection. A chunked or HTTP/1.0 keep-alive response leaves its connection to
+/// the next exchange.
 #[test]
 fn closing_and_chunked_responses_are_read_whole_and_retire_or_keep_their_connection() {
     let body = patterned(BODY_LENGTH);
@@ -1180,15 +1180,12 @@ async fn read_rest(held: Held) -> Received {
     }
 }
 
-/// A cancel in the middle of one pooled exchange's response closes that exchange's connection
-/// alone: of four pooled connections, two others carry exchanges held in the middle of their
-/// responses, which complete once the peer continues, and the next three exchanges are served
-/// on those two and on the fourth, which was idle, with no dial. The peer sees the
-/// client close the cancelled connection in the middle of its response, the pool counts one
-/// session closed, and a cancel that selects an error fails the cancelled response with it.
-/// (Per cancel and reading: the cancelled response's error, the other responses, the pool's
-/// sessions, sessions opened and closed, whether the next exchanges were served on the
-/// surviving connections, the peer's connections and its cut responses.)
+/// A cancel in the middle of one pooled exchange's response closes only that exchange's
+/// connection. Of four pooled connections, two others carry exchanges held in the middle of
+/// their responses, which complete once the peer continues. The next three exchanges are
+/// served on those two and on the fourth, which was idle, without a dial. The client closes
+/// the cancelled connection in the middle of its response, the pool counts one session closed,
+/// and a cancel that selects an error fails the cancelled response with it.
 #[test]
 fn a_cancel_mid_response_closes_only_its_connection() {
     let cases = [
@@ -1337,14 +1334,13 @@ impl Drop for HangUpPeer {
     }
 }
 
-/// A connection the peer closes as soon as it accepts it is dialed once for the acquisition
-/// that started the dial, as hyper-util dials once for a request and sends it on that
-/// connection: the pool reserves the dialed session for that acquisition at the dial
-/// (`DIV-046`), so the peer's close, which the session's driver reads before the acquisition
-/// next runs, refuses the acquisition's request unprocessed instead of retiring the session
-/// and drawing another dial. The reservation reports that it was dialed for its acquisition,
-/// so a caller following hyper-util does not resend the request. (The acquisition's outcome,
-/// dials, sessions opened, the peer's connections.)
+/// A connection that the peer closes immediately after accepting it is dialed once, for the
+/// acquisition that started the dial, as hyper-util dials once for a request and sends the
+/// request on that connection. The pool reserves the dialed session for that acquisition at
+/// the dial, so when the session's driver reads the peer's close before the acquisition next
+/// runs, the acquisition's request is refused unprocessed instead of the pool retiring the
+/// session and dialing again. The reservation reports that it was dialed for its acquisition,
+/// so a caller following hyper-util does not resend the request.
 #[test]
 fn a_fresh_connection_the_peer_drops_at_once_is_dialed_once_for_its_acquisition() {
     let peer = HangUpPeer::start();
@@ -1396,9 +1392,9 @@ fn a_fresh_connection_the_peer_drops_at_once_is_dialed_once_for_its_acquisition(
 }
 
 /// A peer whose listener accepts one connection and then closes, so that later dials to its
-/// address are refused, and that answers `OK` to each request on that connection until the
-/// client closes it. While that connection is open it holds the port, so no other test's
-/// `127.0.0.1:0` listener can take it.
+/// address are refused. It replies `OK` to each request on that connection until the client
+/// closes it. While that connection is open it holds the port, so another test's
+/// `127.0.0.1:0` listener cannot take it.
 struct OneConnectionPeer {
     address: SocketAddr,
     closed: Arc<AtomicBool>,
@@ -1436,11 +1432,9 @@ impl Drop for OneConnectionPeer {
 }
 
 /// A dial refused while another connection of the pool is busy fails the acquisition that
-/// started it at once, with the dial's `ConnectFailed` after its attempts, as hyper-util fails
-/// a request whose connect fails (`DIV-046`), where frozen `addNewConnection` fails waiters
-/// only when no other connect is pending and no session exists, so the acquisition waited for
-/// the busy exchange to end. The busy connection serves on. (The acquisition's outcome, dials
-/// and failed dials, waiters left, and the busy connection's response.)
+/// started it immediately, with the dial's `ConnectFailed` after its attempts, as hyper-util
+/// fails a request whose connect fails. The acquisition does not wait for the busy exchange to
+/// end, and the busy connection keeps serving.
 #[test]
 fn a_dial_refused_beside_a_busy_connection_fails_its_acquisition_at_once() {
     let peer = OneConnectionPeer::start();
@@ -1485,9 +1479,9 @@ fn a_dial_refused_beside_a_busy_connection_fails_its_acquisition_at_once() {
 }
 
 /// `MANY` concurrent exchanges on an empty pool with no connection cap dial `MANY` connections
-/// on demand, all in flight at once, since the peer answers none until all have arrived; once
-/// they are idle, `MANY` concurrent exchanges again are served on those connections, with no
-/// dial, no waiter left and no acquisition timeout.
+/// on demand, all in flight together, because the peer holds every response until all the
+/// requests have arrived. Once the connections are idle, a second round of `MANY` concurrent
+/// exchanges is served on them without a dial, a leftover waiter or an acquisition timeout.
 #[test]
 fn thousands_of_concurrent_exchanges_dial_on_demand_and_reuse_their_connections() {
     let peer = Peer::start(None, PeerClose::Fin);
@@ -1526,9 +1520,9 @@ fn thousands_of_concurrent_exchanges_dial_on_demand_and_reuse_their_connections(
 }
 
 /// `CONSUMERS` streams, each running `ROUNDS` exchanges back to back, share a pool capped at
-/// `CAP` connections, so most acquisitions wait. No waiter starves: every exchange is served,
-/// none times out, and no acquisition is overtaken by more acquisitions than there are
-/// streams, as a first-come order allows.
+/// `CAP` connections, so most acquisitions wait. Waiters do not starve: every exchange is
+/// served without a timeout, and an acquisition is overtaken by at most as many acquisitions
+/// as there are streams, as a first-come order allows.
 #[test]
 fn waiters_on_a_capped_pool_are_served_in_turn_while_streams_reacquire() {
     const CAP: u32 = 64;
@@ -1592,11 +1586,10 @@ fn waiters_on_a_capped_pool_are_served_in_turn_while_streams_reacquire() {
 }
 
 /// Requests that arrive one at a time and each hold their connection, as long streamed
-/// responses do, grow a pool to `MANY` connections, each dialed on demand, with no pass over
-/// the pool's sessions and no look at a busy session in the search for a returning one (S6.9);
-/// once the peer finishes the responses, the connections serve `MANY` concurrent exchanges
-/// with no dial and no pass. (Sessions grown, the growth's passes and looks, responses
-/// finished, exchanges served, sessions opened, the passes after the growth.)
+/// responses do, grow a pool to `MANY` connections, each dialed on demand. The growth does not
+/// scan the pool's sessions or visit a busy session while looking for a returning one. Once
+/// the peer finishes the responses, the connections serve `MANY` concurrent exchanges without
+/// a dial or a scan.
 #[test]
 fn a_pool_grows_to_thousands_of_connections_one_held_request_at_a_time() {
     let peer = Peer::start(None, PeerClose::Fin);
@@ -1634,11 +1627,9 @@ fn a_pool_grows_to_thousands_of_connections_one_held_request_at_a_time() {
 }
 
 /// When the peer closes half of `MANY` idle pooled connections, as uvicorn's keep-alive timeout
-/// does, the pool retires each when its driver reads the close, with no pass over the pool's
-/// sessions and its selection index still settled (S6.9), and the connections left serve as
-/// many concurrent exchanges with no dial and no pass. (The index settled before the closes,
-/// the passes the closes took, the index settled after them, the sessions left, the exchanges
-/// served, sessions opened, the passes the exchanges took.)
+/// does, the pool retires each one when its driver reads the close. The retirements do not scan
+/// the pool's sessions, the selection index stays settled, and the remaining connections
+/// serve as many concurrent exchanges without a dial or a scan.
 #[test]
 fn a_peer_closing_idle_connections_among_thousands_leaves_the_rest_serving() {
     const CLOSED: usize = MANY / 2;
@@ -1684,7 +1675,7 @@ fn a_peer_closing_idle_connections_among_thousands_leaves_the_rest_serving() {
 }
 
 /// Establishes `MANY` connections in `pool` with one round of `/hold` exchanges, all in flight
-/// at once, and waits until each is idle or retired.
+/// together, and waits until each is idle or retired.
 async fn establish_many(pool: &OwnedHttpSessionPool) {
     let exchanges =
         futures::future::join_all((0..MANY).map(|_| exchange(pool, "/hold", Reading::Source)))
@@ -1695,10 +1686,10 @@ async fn establish_many(pool: &OwnedHttpSessionPool) {
     }
 }
 
-/// With `MANY` idle connections in a pool under API Proxy's parameters, back-to-back exchanges
-/// take and return one of them with no pass over the pool's sessions (S6.9). With a short idle
-/// timeout instead, the interval sweep retires all of them with at most one retiring pass per
-/// period, however many sessions became idle at distinct times.
+/// With `MANY` idle connections in a reqwest-like pool, back-to-back exchanges take and return
+/// one of them without scanning the pool's sessions. With a short idle timeout instead, the
+/// interval sweep retires all of them with at most one retiring pass per period, however many
+/// sessions became idle at distinct times.
 #[test]
 fn thousands_of_idle_connections_are_selected_without_a_pass_and_swept_in_a_few_passes() {
     const IDLE: Duration = Duration::from_millis(300);

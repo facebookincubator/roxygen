@@ -5,11 +5,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The experimental owned session pool (`DIV-046`): `HttpSessionPool`'s
-//! acquisition, waiter, admission and idle-retirement behavior on owned client
-//! sessions, over loopback TCP against a hyper origin (HTTP/1.1, and HTTP/2 with
-//! prior knowledge), on a `RuntimeOwner` worker that must quiesce without
-//! forcing.
+//! The experimental owned session pool: `HttpSessionPool`'s acquisition,
+//! waiter, admission and idle-retirement behavior on owned client sessions,
+//! over loopback TCP against a hyper origin (HTTP/1.1, and HTTP/2 with prior
+//! knowledge), on a `RuntimeOwner` worker that must quiesce without forcing.
 
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
@@ -171,7 +170,7 @@ fn full(body: impl Into<Bytes>) -> OriginBody {
     Full::new(body.into()).boxed()
 }
 
-/// `/` answers `ok`, `/close` answers `ok` and closes its HTTP/1.1
+/// `/` responds `ok`, `/close` responds `ok` and closes its HTTP/1.1
 /// connection, and `/slow` streams `SLOW_CHUNKS` chunks `CHUNK_GAP` apart.
 async fn respond(
     request: hyper::Request<Incoming>,
@@ -202,7 +201,7 @@ async fn respond(
 
 async fn serve(stream: tokio::net::TcpStream, protocol: CodecProtocol) {
     let io = TokioIo::new(stream);
-    // A connection the client closes or resets ends with an error no test reads.
+    // A connection that the client closes or resets ends with an error, which the tests ignore.
     if protocol == CodecProtocol::Http2 {
         let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
             .serve_connection(io, service_fn(respond))
@@ -278,8 +277,8 @@ impl Drop for Origin {
     }
 }
 
-/// A socket bound to `address` that never listens: while it lives, a dial to its port is
-/// refused and no other test's `127.0.0.1:0` listener can take the port. `reuse_address` lets
+/// A socket bound to `address` that never listens. While it lives, a dial to its port is
+/// refused and another test's `127.0.0.1:0` listener cannot take the port. `reuse_address` lets
 /// it take over a port that an accepted connection still holds, but also lets another
 /// address-reusing socket bind that port by number.
 fn reserve(address: SocketAddr, reuse_address: bool) -> tokio::net::TcpSocket {
@@ -395,7 +394,7 @@ async fn until(mut ready: impl FnMut() -> bool) {
     }
 }
 
-/// Lets the session retire its finished exchange.
+/// Waits until the session has retired its finished exchange.
 async fn settle(session: &OwnedClientSession) {
     until(|| session.is_idle()).await;
 }
@@ -635,8 +634,8 @@ fn timed_params(connect_timeout: Duration, acquisition_timeout: Option<Duration>
 }
 
 /// How an acquisition from a one-connection pool with `params` ends, and after how long,
-/// while an earlier acquisition holds the session's only slot: an owned pool's, or with
-/// `native` an `HttpSessionPool`'s.
+/// while an earlier acquisition holds the session's only slot. The pool is an owned pool, or an
+/// `HttpSessionPool` when `native` is set.
 fn held_slot_acquisition(
     protocol: CodecProtocol,
     params: PoolParams,
@@ -713,11 +712,11 @@ fn without_an_acquisition_timeout_a_waiter_times_out_at_the_connect_timeout() {
     }
 }
 
-/// The deadline check reads `acquisition_timeout` too, not only the waits: a step that finds
-/// no session 300 ms after the acquisition's first such step times out under a 200 ms or a
-/// zero acquisition timeout with a 5 s connect timeout, and not under a 5 s acquisition
-/// timeout with a 200 ms connect timeout. A zero one fails the acquisition that would dial
-/// the session to hold, so its step runs on the empty pool.
+/// The deadline check applies `acquisition_timeout` too, not only the waits. A step that cannot
+/// take a session 300 ms after the acquisition's first such step times out under a 200 ms or a
+/// zero acquisition timeout with a 5 s connect timeout, but not under a 5 s acquisition timeout
+/// with a 200 ms connect timeout. A zero timeout fails the acquisition that would dial the
+/// session to hold, so its step runs on the empty pool.
 #[test]
 fn a_step_past_the_acquisition_timeout_times_out() {
     let short = Duration::from_millis(200);
@@ -868,7 +867,7 @@ fn a_dial_stays_bounded_by_the_connect_timeout() {
 
 /// A hyper HTTP/2 origin that accepts one connection, then closes its listener, so that later
 /// dials are refused, and serves that connection until the client closes it. While that
-/// connection is open it holds the port, so no other test's `127.0.0.1:0` listener can take it.
+/// connection is open it holds the port, so another test's `127.0.0.1:0` listener cannot take it.
 struct OneConnectionHttp2Origin {
     address: SocketAddr,
     /// 1 once the listener is closed.
@@ -918,10 +917,8 @@ impl Drop for OneConnectionHttp2Origin {
 }
 
 /// A dial refused beside an HTTP/2 session whose only stream is reserved leaves the acquisition
-/// that started it waiting, as `HttpSessionPool`'s does (`DIV-025`), and the session's freed
-/// stream then serves it; only an owned HTTP/1.1 pool fails such an acquisition at once
-/// (`DIV-046`). (The acquisition's outcome, and the pool's dials, failed dials and waiters
-/// after the refused dials.)
+/// that started it waiting, as `HttpSessionPool` does, and the session's freed stream then
+/// serves it. Only an owned HTTP/1.1 pool fails such an acquisition immediately.
 #[test]
 fn an_http2_dial_refused_beside_a_full_session_waits_for_its_stream() {
     let origin = OneConnectionHttp2Origin::start();
@@ -1006,11 +1003,11 @@ fn a_waiter_dials_a_replacement_when_the_only_session_closes_admission() {
 }
 
 /// A reservation reports whether the pool dialed its connection for the acquisition that
-/// returned it (`DIV-046`), as hyper-util tells a new connection from a reused one: the first
-/// acquisition's, handed its own dial's session, was dialed for it; one that took that session
-/// idle, one taken on the session's handle, and one whose acquisition waited at
-/// `max_connections` for a session dialed for an acquisition dropped before its dial
-/// completed, were not.
+/// returned it, as hyper-util distinguishes a new connection from a reused one. The first
+/// acquisition, handed its own dial's session, reports `true`. An acquisition that took that
+/// session idle, a reservation taken on the session's handle, and an acquisition that waited at
+/// `max_connections` for a session dialed for an acquisition dropped before its dial completed
+/// report `false`.
 #[test]
 fn a_reservation_reports_whether_its_connection_was_dialed_for_its_acquisition() {
     for protocol in PROTOCOLS {
@@ -1122,7 +1119,7 @@ async fn uniplex_try_one_exchange(pool: &HttpSessionPool) -> Result<ClientSessio
 /// another connection, and whether the first closed cleanly, through an owned
 /// pool or an `HttpSessionPool` whose sessions age out after 28 to 52 ms.
 ///
-/// The connections the origin accepts are not compared: in both pools the aged
+/// The connections the origin accepts are not compared. In both pools the aged
 /// session's drain wakes the acquisition's own waiter, which then starts a
 /// second dial beside the first, and whether that dial connects before the
 /// waiter is served depends on task timing.
@@ -1259,7 +1256,7 @@ fn the_pool_refuses_what_owned_sessions_cannot_honor_before_dialing() {
 /// tests that reuse a just-released session.
 const IDLE: Duration = Duration::from_millis(100);
 
-/// Pool parameters with `max_connections` and `DIV-032`'s idle retirement.
+/// Pool parameters with `max_connections` and idle retirement.
 fn idle_params(
     max_connections: u32,
     reuse_order: SessionReuseOrder,
@@ -1555,7 +1552,7 @@ fn most_recently_used_reuse_picks_the_session_released_last() {
     assert_eq!(picks, [true, true, true]);
 }
 
-/// Whether `items` holds no value twice.
+/// Whether every value in `items` is distinct.
 fn all_distinct<T: PartialEq>(items: &[T]) -> bool {
     items
         .iter()
@@ -1564,16 +1561,17 @@ fn all_distinct<T: PartialEq>(items: &[T]) -> bool {
 }
 
 /// How each of three sequential exchanges, 20 ms apart, ended (served, or its
-/// acquisition's error), and whether each was served on a connection no
-/// earlier exchange used, through an owned pool or an `HttpSessionPool` with a
-/// 1 ns idle timeout and hyper-util's reuse order and sweep: a router's zero
-/// `pool_idle_timeout`, "expire as soon as idle" to reqwest.
+/// acquisition's error), and whether each was served on a connection that an
+/// earlier exchange did not use. The pool is an owned pool or an
+/// `HttpSessionPool` with a 1 ns idle timeout and hyper-util's reuse order and
+/// sweep, which models reqwest's zero `pool_idle_timeout` ("expire as soon as
+/// idle").
 ///
-/// The connections the origin accepts are not compared: in both pools the
-/// session the checkout retires wakes the acquisition's own waiter when its
-/// drain closes its admission, and the waiter then starts a second dial beside
-/// the first, as in `aged_session_scenario`; whether the next exchange takes
-/// that unused session or dials again depends on task timing.
+/// The connections the origin accepts are not compared. In both pools the
+/// session that the checkout retires wakes the acquisition's own waiter when
+/// its drain closes its admission, and the waiter then starts a second dial
+/// beside the first, as in `aged_session_scenario`. Whether the next exchange
+/// takes that unused session or dials again depends on task timing.
 fn one_nanosecond_idle_scenario(
     owned: bool,
     protocol: CodecProtocol,
@@ -1641,8 +1639,8 @@ fn one_nanosecond_idle_scenario(
 
 /// As in an `HttpSessionPool`, a session the pool dialed counts as idle only
 /// once it has served, so the dialing acquisition takes it before hyper-util's
-/// checkout can retire it, however short the idle timeout: "expire as soon as
-/// idle" means no reuse of an idle session, not no use.
+/// checkout can retire it, however short the idle timeout. "Expire as soon as
+/// idle" rules out reusing an idle session, not using a fresh one.
 #[test]
 fn a_freshly_dialed_session_serves_its_dialing_acquisition_under_a_1_ns_idle_timeout() {
     for protocol in PROTOCOLS {
@@ -1660,9 +1658,9 @@ fn a_freshly_dialed_session_serves_its_dialing_acquisition_under_a_1_ns_idle_tim
     }
 }
 
-/// Least-loaded selection (`DIV-048`) keeps that: a session the pool dialed has no exchange in
-/// flight, as an idle one has, and of equally loaded sessions a busy one, which the dialed
-/// session counts as, is taken first.
+/// Least-loaded selection keeps that behavior. A session the pool dialed has no exchange in
+/// flight, like an idle one, but counts as busy, and among equally loaded sessions a busy one
+/// is taken first.
 #[test]
 fn a_freshly_dialed_session_serves_its_dialing_acquisition_under_least_loaded_selection() {
     for protocol in PROTOCOLS {
@@ -1718,7 +1716,8 @@ fn a_direct_reservation_restarts_the_idle_period() {
 }
 
 /// A direct reservation that outlives the idle timeout leaves the retirement
-/// task waiting with no idle session; the session's next idle period wakes it.
+/// task waiting while the session is busy. The session's next idle period wakes
+/// it.
 #[test]
 fn a_session_released_by_a_long_direct_exchange_is_retired_after_it() {
     for protocol in PROTOCOLS {
@@ -1810,9 +1809,9 @@ impl Wake for ReentrantWaker {
     }
 }
 
-/// As `ClientSession`'s draining flag, the admission the pool closes on the
-/// sessions one idle-retirement pass retires refuses a reservation that a
-/// waiter's waker takes while the pass drains the first of them.
+/// Like `ClientSession`'s draining flag, the admission that the pool closes on
+/// the sessions retired by one idle-retirement pass rejects a reservation that
+/// a waiter's waker takes while the pass drains the first of them.
 #[test]
 fn a_waker_cannot_reserve_a_session_retired_in_the_same_pass() {
     let origin = Origin::start(CodecProtocol::Http11);
@@ -1908,13 +1907,13 @@ impl Wake for QuiesceOnWake {
     }
 }
 
-/// The drain, inside an acquisition's step, whose waiter wake begins the
+/// Which drain in an acquisition's step wakes the waiter that begins the
 /// worker's quiescence.
 #[derive(Clone, Copy, Debug)]
 enum QuiescingDrain {
-    /// An aged session's, before the step reserves the session it selected.
+    /// An aged session's drain, before the step reserves its selection.
     MaxAge,
-    /// An idle-expired session's, after the step reserves the session it selected.
+    /// An idle-expired session's drain, after the step reserves its selection.
     IdleExpiry,
 }
 
@@ -2018,12 +2017,12 @@ fn quiescing_drain_scenario(drain: QuiescingDrain) -> Result<(), Option<HttpErro
     outcome
 }
 
-/// An acquisition whose own step drains a session whose callbacks begin the
-/// worker's quiescence fails with `DROPPED`. After an aged session's drain,
-/// which precedes the reservation, it refuses as `ClientSession::reserve_request`
-/// does once the worker quiesces. After an idle-expired session's drain, which
-/// follows the reservation, it releases that reservation instead of returning
-/// one that the quiescing driver refuses at submit.
+/// An acquisition fails with `DROPPED` when a drain in its own step begins the
+/// worker's quiescence. An aged session is drained before the reservation, so
+/// the acquisition fails as `ClientSession::reserve_request` does once the
+/// worker quiesces. An idle-expired session is drained after the reservation,
+/// so the acquisition releases that reservation instead of returning one that
+/// the quiescing driver would reject at submit.
 #[test]
 fn an_acquisition_fails_when_its_own_drain_quiesces_the_worker() {
     assert_eq!(
@@ -2034,8 +2033,8 @@ fn an_acquisition_fails_when_its_own_drain_quiesces_the_worker() {
 
 /// Reserves an HTTP/1.1 session from an owned pool, or from an `HttpSessionPool`
 /// unless `owned`, begins the worker's quiescence and submits a request on the
-/// reservation with no yield in between. Returns the code and message that
-/// refused the request, unless its 200 response was read.
+/// reservation with no yield in between. Returns the error's code and message
+/// if the request is refused, or `Ok` once its 200 response is read.
 fn submitted_after_quiescence(owned: bool) -> Result<(), (HttpErrorCode, String)> {
     let origin = Origin::start(CodecProtocol::Http11);
     let address = origin.address;
@@ -2114,13 +2113,14 @@ fn submitted_after_quiescence(owned: bool) -> Result<(), (HttpErrorCode, String)
     outcome
 }
 
-/// A request reserved before the worker begins its quiescence and submitted at
-/// once after it is served by an `HttpSessionPool`'s `ClientSession`, whose run
-/// has not observed the quiescence yet, and refused `REFUSED_STREAM` by an owned
-/// session, whose run drains before its driver commits the submission
-/// (`DIV-046`). The acquisition step's admission recheck after an idle-expired
-/// drain rests on that refusal: if owned sessions ever commit reservations taken
-/// before quiescence, this test fails, and that recheck should be revisited.
+/// A request reserved before the worker begins its quiescence and submitted
+/// immediately after it. An `HttpSessionPool`'s `ClientSession` serves it,
+/// because its run has not observed the quiescence yet. An owned session
+/// refuses it with `REFUSED_STREAM`, because its run drains before its driver
+/// commits the submission. The acquisition step's admission recheck after an
+/// idle-expired drain relies on that refusal: if owned sessions ever commit
+/// reservations taken before quiescence, this test fails, and that recheck
+/// should be revisited.
 #[test]
 fn a_request_reserved_before_quiescence_is_served_only_by_the_uniplex_pool() {
     assert_eq!(
@@ -2135,15 +2135,17 @@ fn a_request_reserved_before_quiescence_is_served_only_by_the_uniplex_pool() {
     );
 }
 
-/// The idle timeout, and so the sweep period, of the differential schedules.
+/// The idle timeout, and so the sweep period, of the schedules run against
+/// `HyperUtilPool`.
 const SWEEP_IDLE: Duration = Duration::from_millis(200);
 
-/// hyper-util 0.1.20's legacy pool for one origin of HTTP/1.1 connections with
-/// no waiters, as `pool_idle_timeout`'s differential tests model it: `put`
-/// pushes a released connection onto the end of the idle list and, on the
-/// first push ever, starts sweeps every `max(timeout, 90 ms)`, each evicting
-/// every entry idle for longer than the timeout; a checkout pops from the end,
-/// dropping expired entries until one is not, and dials when none is left.
+/// A model of the `client::legacy` pool in hyper-util 0.1.20, for one origin
+/// of HTTP/1.1 connections with no waiters, as in the `pool_idle_timeout.rs`
+/// tests. `put` pushes a released connection onto the end of the idle list.
+/// The first push ever starts sweeps every `max(timeout, 90 ms)`, each evicting
+/// every entry idle for longer than the timeout. A checkout pops from the end,
+/// dropping expired entries until it reaches one that has not expired, and
+/// dials when the list is empty.
 struct HyperUtilPool {
     timeout: Duration,
     idle: Vec<(usize, Instant)>,
@@ -2214,7 +2216,8 @@ impl HyperUtilPool {
     }
 }
 
-/// One step of a differential schedule, `at` milliseconds after `Start`.
+/// One step of a schedule run against `HyperUtilPool`, `at` milliseconds after
+/// `Start`.
 #[derive(Clone, Copy, Debug)]
 enum Step {
     /// Starts the clock: the steps before it run back to back.
@@ -2368,7 +2371,7 @@ fn assert_sweeps_as_hyper_util(steps: &'static [Step]) {
 }
 
 /// The sweep timer runs from the first release, not from a dial, and keeps its
-/// period while no connection is idle.
+/// period while the pool is empty.
 const FIRST_RELEASE_STARTS_SWEEPS: &[Step] = &[
     Step::Hold { at: 0, slot: 0 },
     Step::Start,
@@ -2386,7 +2389,7 @@ const FIRST_RELEASE_STARTS_SWEEPS: &[Step] = &[
     Step::Open { at: 750, open: &[] },
 ];
 
-/// A connection that becomes idle after a sweep that found every connection
+/// A connection that becomes idle after a sweep in which every connection was
 /// busy is swept on the old period.
 const BUSY_SWEEP_KEEPS_THE_PERIOD: &[Step] = &[
     Step::Hold { at: 0, slot: 0 },
@@ -2405,9 +2408,9 @@ const BUSY_SWEEP_KEEPS_THE_PERIOD: &[Step] = &[
     Step::Open { at: 650, open: &[] },
 ];
 
-/// A checkout takes the connection released last while it is not expired and
-/// leaves older expired connections to the next sweep; when the connection
-/// released last has expired, it drops every idle connection and dials.
+/// A checkout takes the connection released last while it has not expired and
+/// leaves older expired connections to the next sweep. Once that connection has
+/// expired, the checkout drops every idle connection and dials.
 const CHECKOUT_LEAVES_EXPIRED_TO_THE_SWEEP: &[Step] = &[
     Step::Hold { at: 0, slot: 0 },
     Step::Hold { at: 0, slot: 1 },
@@ -2445,7 +2448,8 @@ const CHECKOUT_LEAVES_EXPIRED_TO_THE_SWEEP: &[Step] = &[
     Step::Open { at: 850, open: &[] },
 ];
 
-/// The model, on exact times, leaves open what each schedule expects.
+/// Run on exact times, the model keeps open the connections that each schedule
+/// expects.
 #[test]
 fn hyper_util_model_follows_the_differential_schedules() {
     for steps in [
@@ -2472,8 +2476,8 @@ fn interval_checkout_leaves_older_expired_connections_to_the_sweep() {
     assert_sweeps_as_hyper_util(CHECKOUT_LEAVES_EXPIRED_TO_THE_SWEEP);
 }
 
-/// As hyper-util's idle interval, sweeps run at most every 90 ms, however short
-/// the idle timeout.
+/// As with hyper-util's idle interval, sweeps run at most every 90 ms, however
+/// short the idle timeout.
 #[test]
 fn interval_sweep_runs_at_most_every_90_ms() {
     for protocol in PROTOCOLS {
@@ -2543,12 +2547,11 @@ fn drain_joins_idle_retirement() {
     }
 }
 
-/// Counts the heap allocations a thread makes while its counter is enabled; the
-/// client crate's test build uses it as its global allocator. As
-/// `server/tests/allocation_count.rs` records, Buck's fbcode test builds link
-/// every other crate as a shared library whose allocations bypass it, so there
-/// it counts the client crate's own allocations only: the pools' and the owned
-/// session's. A uniplex control checks that it sees them.
+/// Counts the heap allocations a thread makes while its counter is enabled. The
+/// client crate's test build uses it as its global allocator. Some build
+/// systems link every other crate as a shared library whose allocations bypass
+/// it, so there it counts only the client crate's own allocations: the pools'
+/// and the owned session's. A uniplex control checks that it counts them.
 struct CountingAllocator;
 
 std::thread_local! {
@@ -2610,8 +2613,8 @@ fn first_poll_allocations<Acquisition: Future>(
     (polled, ALLOCATIONS.with(Cell::get))
 }
 
-/// The fast acquisition path (`L-R1`): an acquisition that finds an idle
-/// session is served on its first poll without a boxed future.
+/// When an idle session is available, the fast acquisition path serves the
+/// acquisition on its first poll without a boxed future.
 #[test]
 fn an_acquisition_that_finds_an_idle_session_allocates_nothing() {
     for protocol in PROTOCOLS {
@@ -2769,8 +2772,7 @@ fn max_connections_zero_disables_reuse() {
     }
 }
 
-/// Polls `future` once, with the current task's waker.
-/// Answers every request with an empty 200.
+/// Responds to every request with an empty 200.
 struct Ok200;
 
 impl HttpHandler for Ok200 {
@@ -2787,8 +2789,8 @@ impl HttpHandler for Ok200 {
     }
 }
 
-/// Submits a GET on `reservation` and reads its response: the status, or the
-/// error code; and whether the request failed unprocessed (`DIV-035`).
+/// Submits a GET on `reservation` and reads its response. Returns the status or
+/// the error code, and whether the request failed unprocessed.
 async fn outcome(reservation: OwnedClientReservation) -> (Result<u16, HttpErrorCode>, bool) {
     let (head, body) = request("/").await;
     let mut submission = pin!(reservation.submit(head, body, CancellationToken::never()));
@@ -2811,14 +2813,13 @@ async fn outcome(reservation: OwnedClientReservation) -> (Result<u16, HttpErrorC
     (status, request.request_unprocessed())
 }
 
-/// `DIV-052` with `DIV-035`: four acquisitions on a one-connection owned
-/// HTTP/2 pool, sent in one burst to an `owned_http2` server whose header
-/// limit is 2 per long interval. The first two are answered. The third header
-/// block crosses the limit: its head is not delivered, it is cancelled without
-/// a RST_STREAM, and the server drains with GOAWAY(last incoming stream,
-/// `NO_ERROR`). The GOAWAY covers it, so it fails when the connection ends
-/// and is not unprocessed; only an unprocessed request would be resent, on a
-/// connection the pool dials for it.
+/// Four acquisitions on a one-connection owned HTTP/2 pool, sent in one burst
+/// to an `owned_http2` server whose header-frame limit is 2 per long interval.
+/// The first two get responses. The third header block crosses the limit: its
+/// head is not delivered, it is cancelled without a RST_STREAM, and the server
+/// drains with GOAWAY(last incoming stream, `NO_ERROR`). The GOAWAY covers it,
+/// so it fails when the connection ends and is not unprocessed. Only an
+/// unprocessed request would be resent, on a connection the pool dials for it.
 #[test]
 fn an_owned_http2_burst_past_the_header_limit_resends_only_unprocessed_requests() {
     let mut config = ServerConfig {
@@ -2874,10 +2875,11 @@ fn an_owned_http2_burst_past_the_header_limit_resends_only_unprocessed_requests(
             pool.connection_attempts_for_test() - attempts,
         )
     });
-    // The burst reaches the server in one read, so the fourth header block breaches too and
-    // is aborted the same way, under the same GOAWAY (`DIV-052` difference 3): no request is
-    // left for the GOAWAY to exclude, and none is resent. The two aborted requests fail when
-    // the drained connection ends: at its EOF, or at a client write that races the close.
+    // The burst reaches the server in one read, and a header breach does not pause the
+    // server's parser, so the fourth header block breaches too and is aborted the same way,
+    // under the same GOAWAY. The GOAWAY therefore does not exclude a request, and the pool
+    // does not resend one. The two aborted requests fail when the drained connection ends:
+    // at its EOF, or at a client write that races the close.
     let ended = |outcome: &(Result<u16, HttpErrorCode>, bool)| {
         matches!(
             outcome,
@@ -2907,12 +2909,12 @@ fn an_owned_http2_burst_past_the_header_limit_resends_only_unprocessed_requests(
     );
 }
 
-/// `DIV-003`: a non-hosted worker polls only the cleanups that were woken.
-/// The owned pool's cleanups still run on a `RuntimeOwner` worker, each step
-/// within a bound: eight back-to-back HTTP/1.1 acquisitions wait for their
-/// returning session (`DIV-029`), an idle session is retired without an
-/// acquisition (`DIV-032`), and the worker then shuts down with the pool's and
-/// a session's cleanups pending and joins without forcing.
+/// A non-hosted worker polls only the cleanups that were woken. The owned
+/// pool's cleanups still run on a `RuntimeOwner` worker, each step within a
+/// bound. Eight back-to-back HTTP/1.1 acquisitions wait for their returning
+/// session, an idle session is retired without an acquisition, and the worker
+/// then shuts down with the pool's and a session's cleanups pending and joins
+/// without forcing.
 #[test]
 fn owned_pool_cleanups_run_and_join_under_woken_only_polling() {
     async fn bounded<Work: Future>(what: &str, work: Work) -> Work::Output {
@@ -2961,12 +2963,13 @@ fn owned_pool_cleanups_run_and_join_under_woken_only_polling() {
     );
 }
 
+/// Polls `future` once, with the current task's waker.
 async fn poll_once<Work: Future>(mut future: Pin<&mut Work>) -> Poll<Work::Output> {
     std::future::poll_fn(|context| Poll::Ready(future.as_mut().poll(context))).await
 }
 
-/// B2's pool parameters as the router sets them (`MostRecentlyUsed`, a 90 s idle timeout
-/// swept on an interval), with `max_connections`.
+/// An inference router's pool parameters (`MostRecentlyUsed`, a 90 s idle timeout swept on an
+/// interval), with `max_connections`.
 fn router_params(max_connections: u32) -> PoolParams {
     idle_params(
         max_connections,
@@ -2977,10 +2980,9 @@ fn router_params(max_connections: u32) -> PoolParams {
 }
 
 /// On HTTP/1.1 a stream's next request arrives before the owned driver has returned the slot
-/// of the response the stream just read. The acquisition takes that returning slot (N8.4w,
-/// `DIV-046`) instead of starting a connection attempt that would never dial: back-to-back
-/// exchanges on one session start no attempt and spawn no pool task, and each is served on
-/// that session.
+/// of the response the stream just read. The acquisition takes that returning slot instead of
+/// starting a connection attempt that would never dial. Back-to-back exchanges on one session
+/// do not start an attempt or spawn a pool task, and each is served on that session.
 #[test]
 fn back_to_back_http1_acquisitions_wait_for_the_returning_session_without_an_attempt() {
     for (name, params) in [("default", params(4)), ("router", router_params(4))] {
@@ -3017,7 +3019,7 @@ fn back_to_back_http1_acquisitions_wait_for_the_returning_session_without_an_att
 }
 
 /// An acquisition that waits for a returning session takes it when the driver returns it,
-/// ahead of an earlier waiter whose own dial is still pending, and starts no attempt itself.
+/// ahead of an earlier waiter whose own dial is still pending, and does not start an attempt.
 #[test]
 fn a_waiter_for_a_returning_session_takes_it_ahead_of_an_earlier_waiter_s_dial() {
     let origin = Origin::start(CodecProtocol::Http11);
@@ -3066,9 +3068,9 @@ fn a_waiter_for_a_returning_session_takes_it_ahead_of_an_earlier_waiter_s_dial()
 }
 
 /// An acquisition dropped or cancelled while it waits for a returning session gives up its
-/// claim on it: the next acquisition waits for that session instead of dialing. An acquisition
-/// waits for a returning session only while another acquisition waits, here for its own dial,
-/// since one that meets it with none waiting takes it at once (N8.4w, `DIV-046`).
+/// claim on it, so the next acquisition waits for that session instead of dialing. An
+/// acquisition waits for a returning session only while another acquisition waits, here for
+/// its own dial. Without another waiter, it takes the returning session immediately.
 #[test]
 fn a_cancelled_acquisition_releases_the_returning_session_it_waited_for() {
     // (whether the acquisition is dropped, or cancelled through its token)
@@ -3125,7 +3127,7 @@ fn a_cancelled_acquisition_releases_the_returning_session_it_waited_for() {
 }
 
 /// An HTTP/1.1 origin that accepts one connection and then closes its listener, so that a
-/// later dial to its address is refused, and answers `ok` to every request on that
+/// later dial to its address is refused, and responds `ok` to every request on that
 /// connection until the client closes it.
 struct OneConnectionOrigin {
     address: SocketAddr,
@@ -3174,12 +3176,12 @@ impl Drop for OneConnectionOrigin {
 }
 
 /// A session that fails while an acquisition waits for its returning slot leaves that
-/// acquisition to dial a replacement, as an acquisition that had started its own attempt did;
-/// an acquisition waits for a returning slot only while another acquisition waits, here for its
-/// own dial (N8.4w, `DIV-046`). With none waiting, a back-to-back acquisition takes the
-/// returning session at once, and when the session fails before its driver commits the request
-/// submitted on it, that request is refused unprocessed (`DIV-029`, `DIV-035`) and the next
-/// acquisition dials a replacement, or fails with the dial's error, as before.
+/// acquisition to dial a replacement, like an acquisition that started its own attempt. An
+/// acquisition waits for a returning slot only while another acquisition waits, here for its
+/// own dial. Without another waiter, a back-to-back acquisition takes the returning session
+/// immediately. When the session then fails before its driver commits the request submitted
+/// on it, that request is refused unprocessed, and the next acquisition dials a replacement or
+/// fails with the dial's error.
 #[test]
 fn an_acquisition_waiting_for_a_returning_session_that_fails_dials_or_errors_as_before() {
     {
@@ -3278,10 +3280,10 @@ fn an_acquisition_waiting_for_a_returning_session_that_fails_dials_or_errors_as_
     }
 }
 
-/// An acquisition that meets a returning session with no acquisition waiting takes it at once
-/// (N8.4w, `DIV-046`), whatever the pool's limits: at `max_connections`, with no waiter allowed
-/// there, since it does not wait, and with a 1 ns idle timeout (S2.7), since a session reserved
-/// again while its slot is returning is never idle between its exchanges.
+/// When a session is returning and the pool has no waiter, an acquisition takes that session
+/// immediately, whatever the pool's limits. That includes `max_connections` with `max_waiters`
+/// set to 0, since the acquisition does not wait, and a 1 ns idle timeout, since a session
+/// reserved again while its slot is returning is never idle between exchanges.
 #[test]
 fn pool_limits_and_idle_retirement_bound_a_back_to_back_acquisition_as_before() {
     let cases = [
@@ -3337,11 +3339,11 @@ fn pool_limits_and_idle_retirement_bound_a_back_to_back_acquisition_as_before() 
     }
 }
 
-/// `DIV-043`, as a router's late teardown meets it: a `HostedWorker` whose
-/// teardown deadline has passed destroys an owned pool, its session midway
-/// through a streamed response, before the session's native I/O cleanup and
-/// the pool's task join finished. That destruction is an abandonment: the
-/// worker reports a clean overrun instead of a panic.
+/// A `HostedWorker` teardown that passes its deadline, as in a router's late
+/// shutdown, destroys an owned pool while its session is midway through a
+/// streamed response. The session's native I/O cleanup and the pool's task join
+/// have not finished, so the destruction is an abandonment and the worker
+/// reports a clean overrun instead of a panic.
 #[test]
 fn a_forced_worker_teardown_abandons_an_owned_pool_mid_response() {
     for protocol in PROTOCOLS {
@@ -3437,8 +3439,8 @@ fn position_of(sessions: &[OwnedClientSession], session: &OwnedClientSession) ->
 }
 
 /// A reservation taken on a pooled session's handle is recorded on that session's entry,
-/// which the pool finds from the slot its list recorded on the session, with no pass over
-/// the pool's sessions.
+/// which the pool locates from the slot recorded on the session, without a pass over the
+/// pool's sessions.
 #[test]
 fn a_direct_reservation_is_recorded_without_a_pool_wide_pass() {
     let origin = Origin::start(CodecProtocol::Http11);
@@ -3463,11 +3465,11 @@ fn a_direct_reservation_is_recorded_without_a_pool_wide_pass() {
     );
 }
 
-/// The K of `bench/h2/client-arms.md` §A's large HTTP/1.1 pools.
+/// The size of the large HTTP/1.1 pools in these tests.
 const K64: usize = 64;
 
-/// One unary round of `streams`: as many acquisitions held at once, their exchanges run
-/// together, then every session the round used idle again.
+/// One unary round of `streams` acquisitions, all held together. Their exchanges run
+/// concurrently, then the round waits until every session it used is idle again.
 async fn unary_round(pool: &OwnedHttpSessionPool, streams: usize) {
     let held = hold(pool, streams).await;
     let sessions: Vec<_> = held
@@ -3488,11 +3490,9 @@ async fn unary_round(pool: &OwnedHttpSessionPool, streams: usize) {
     until(|| sessions.iter().all(OwnedClientSession::is_idle)).await;
 }
 
-/// `bench/h2/client-arms.md` §A's K=64 shape, in unary rounds: once 64 sessions are open, each
-/// round's 64 acquisitions select an idle session and its 64 releases return one with no pass
-/// over the pool's sessions, under the router's parameters, both reuse orders, both sweeps, a
-/// maximum age and least-loaded selection (`DIV-048`). No acquisition searches for a returning
-/// session or dials.
+/// Unary rounds on a 64-session HTTP/1.1 pool. Once 64 sessions are open, each round's 64
+/// acquisitions select an idle session and its 64 releases return one without a pass over the
+/// pool's sessions. Acquisitions do not search for a returning session or dial.
 #[test]
 fn k64_unary_rounds_select_and_release_with_no_pool_wide_pass() {
     let first = OwnedSessionSelection::FirstAvailable;
@@ -3569,9 +3569,9 @@ fn k64_unary_rounds_select_and_release_with_no_pool_wide_pass() {
     }
 }
 
-/// Idle sessions are reused in the order `DIV-032` documents, whatever the pool's size: most
-/// recently used, the session released last first (LIFO); least recently used, the session
-/// released first first (FIFO).
+/// Idle sessions are reused in the order that `SessionReuseOrder` sets, whatever the pool's
+/// size. Most recently used takes the session released last first (LIFO). Least recently used
+/// takes the session released first first (FIFO).
 #[test]
 fn idle_sessions_are_reused_in_release_order_or_its_reverse() {
     const COUNT: usize = 8;
@@ -3634,7 +3634,7 @@ fn idle_sessions_are_reused_in_release_order_or_its_reverse() {
     }
 }
 
-/// An idle session whose connection closes, or which is cancelled, leaves selection; the
+/// An idle session leaves selection when its connection closes or it is cancelled. The
 /// others are still reused in order, and an acquisition beyond them dials.
 #[test]
 fn closed_and_cancelled_idle_sessions_leave_selection() {
@@ -3675,11 +3675,11 @@ fn closed_and_cancelled_idle_sessions_leave_selection() {
     }
 }
 
-/// An acquisition retires the idle-expired sessions it meets, as the pool's own passes do: on
-/// an interval the expired candidates in reuse order, at expiry every expired session; a
-/// retired session is never selected again. (Schedules that make an acquisition dial are left
-/// to the interval schedule tests: a retired session's drain wakes the dialing acquisition,
-/// which may dial twice, as in `one_nanosecond_idle_scenario`.)
+/// An acquisition retires the idle-expired sessions it reaches, as the pool's own passes do.
+/// On an interval it retires the expired candidates in reuse order, and at expiry every expired
+/// session. A retired session is never selected again. Schedules that make an acquisition dial
+/// are left to the interval schedule tests, because a retired session's drain wakes the dialing
+/// acquisition, which may dial twice, as in `one_nanosecond_idle_scenario`.
 #[test]
 fn sessions_retired_for_idleness_leave_selection() {
     let timeout = Duration::from_secs(90);
@@ -3792,7 +3792,7 @@ fn the_index_holds_no_session_the_pool_removed() {
 }
 
 /// What one step of `pool_schedule` did, by session ordinal (the order in which the schedule
-/// first met each session).
+/// first reached each session).
 #[derive(Debug, PartialEq)]
 enum ScheduleEvent {
     Pick(usize),
@@ -3809,7 +3809,7 @@ enum ScheduleEvent {
 /// and the sessions left open.
 ///
 /// Aging is for sweeps on an interval: at expiry, idle retirement's own task may wake on a
-/// release and retire an aged session before an acquisition meets it.
+/// release and retire an aged session before an acquisition reaches it.
 async fn pool_schedule(
     pool: &OwnedHttpSessionPool,
     timeout: Option<Duration>,
@@ -3880,8 +3880,7 @@ async fn pool_schedule(
 
 /// The index selects as the pool's passes do: `pool_schedule` makes the same picks, dials as
 /// often and leaves as many sessions open on a pool selecting through its index as on one whose
-/// passes are forced, under each reuse order and sweep, and under least-loaded selection
-/// (`DIV-048`).
+/// passes are forced, under each reuse order and sweep, and under least-loaded selection.
 #[test]
 fn the_index_selects_as_the_pool_s_passes_do() {
     let ninety = Duration::from_secs(90);
@@ -3957,9 +3956,9 @@ fn the_index_selects_as_the_pool_s_passes_do() {
     }
 }
 
-/// At expiry, once idle time may have passed a session's idle timeout, the step takes the
-/// pool's passes, which retire every expired session before they select: idle time that passes
-/// for the idle sessions alone, with the index settled, retires them, and the session released
+/// At expiry, once idle time may have passed a session's idle timeout, the step uses the pool's
+/// passes, which retire every expired session before they select. Idle time that passes only
+/// for the idle sessions, while the index is settled, retires them, and the session released
 /// since is taken.
 #[test]
 fn an_acquisition_at_expiry_retires_the_sessions_whose_idle_time_passed() {
@@ -4008,10 +4007,10 @@ fn an_acquisition_at_expiry_retires_the_sessions_whose_idle_time_passed() {
     );
 }
 
-/// A cancelled session stops admitting before its pool hears of it: the cancellation unsettles
-/// the index, so that a reservation in the same turn and the next release take the pool's
-/// passes, and once the session's closed admission reaches the pool a release settles the index
-/// again, which then skips the cancelled session.
+/// A cancelled session stops admitting before its pool is notified. The cancellation unsettles
+/// the index, so a reservation in the same turn and the next release use the pool's passes.
+/// Once the session's closed admission reaches the pool, a release settles the index again, and
+/// the index then skips the cancelled session.
 #[test]
 fn a_cancellation_unsettles_the_index_until_a_release_settles_it() {
     let origin = Origin::start(CodecProtocol::Http11);
@@ -4043,10 +4042,10 @@ fn a_cancellation_unsettles_the_index_until_a_release_settles_it() {
     );
 }
 
-/// A session that reaches its maximum age while it serves an exchange is not one the passes
-/// retire, since it cannot take another: the other sessions keep being selected and released
-/// through the index, with no pass over the pool's sessions, until its exchange ends. Then the
-/// next acquisition retires it, as the passes do, and takes another session.
+/// The passes do not retire a session that reaches its maximum age while it serves an
+/// exchange, since it cannot take another. The other sessions keep being selected and released
+/// through the index, without a pass over the pool's sessions, until its exchange ends. Then
+/// the next acquisition retires it, as the passes do, and takes another session.
 #[test]
 fn a_session_aged_while_busy_leaves_selection_indexed_until_its_exchange_ends() {
     const ROUNDS: usize = 16;
@@ -4151,13 +4150,13 @@ async fn four_idle_http2_sessions(pool: &OwnedHttpSessionPool) -> Vec<OwnedClien
         .collect()
 }
 
-/// A least-loaded acquisition (`DIV-048`) takes the session with the fewest streams in flight;
-/// of equally loaded sessions, an idle one in `DIV-032`'s reuse order, a busy one in the pool's
+/// A least-loaded acquisition takes the session with the fewest streams in flight. Among
+/// equally loaded sessions it takes an idle one in reuse order, or a busy one in the pool's
 /// order. Eight acquisitions held one after another on four idle HTTP/2 sessions of four
-/// streams therefore take each session twice: least recently used, in release order, twice;
-/// most recently used, in its reverse, twice. `FirstAvailable`, the default, packs them onto
-/// the first session with room: four on the first idle session the reuse order takes, then
-/// four on the next.
+/// streams therefore take each session twice: in release order twice under least recently
+/// used, and in reverse release order twice under most recently used. `FirstAvailable`, the
+/// default, packs them onto the first session with room: four on the first idle session the
+/// reuse order takes, then four on the next.
 #[test]
 fn least_loaded_selection_spreads_held_http2_reservations_in_reuse_order() {
     let least = SessionReuseOrder::LeastRecentlyUsed;
@@ -4221,12 +4220,12 @@ fn least_loaded_selection_spreads_held_http2_reservations_in_reuse_order() {
     }
 }
 
-/// Under least-loaded selection (`DIV-048`), loops of exchanges run concurrently over four
-/// HTTP/2 sessions of four streams. Each acquisition takes a session at most one stream above
-/// every other, read from the sessions' own capacity right after its reservation (nothing else
-/// runs between the reservation and the read); every session serves; every exchange completes,
-/// also with twenty loops for sixteen streams, so that acquisitions wait for a stream; and no
-/// connection is added.
+/// Under least-loaded selection, loops of exchanges run concurrently over four HTTP/2 sessions
+/// of four streams. Each acquisition takes a session at most one stream above every other, as
+/// read from the sessions' own capacity right after its reservation, with no other code running
+/// between the reservation and the read. Every session serves and every exchange completes,
+/// also with twenty loops for sixteen streams, so that acquisitions wait for a stream. The pool
+/// does not add a connection.
 #[test]
 fn least_loaded_selection_keeps_concurrent_http2_load_within_one_stream_and_starves_nothing() {
     const ROUNDS: usize = 16;
@@ -4303,10 +4302,11 @@ fn least_loaded_selection_keeps_concurrent_http2_load_within_one_stream_and_star
     }
 }
 
-/// On HTTP/1.1, whose sessions take one exchange, a least-loaded acquisition (`DIV-048`) takes
-/// an idle session before one whose slot is free but whose driver is not idle yet: a
-/// reservation dropped unsubmitted, before the driver's next turn. `FirstAvailable`, the
-/// default, takes the latter first, as the busy session that can take an exchange.
+/// On HTTP/1.1, where a session takes one exchange at a time, a least-loaded acquisition
+/// prefers an idle session over one with a free slot and a driver that is not idle yet. A
+/// reservation dropped unsubmitted leaves a session in that state until the driver's next
+/// turn. `FirstAvailable`, the default, takes that session first, as the busy session that
+/// can take an exchange.
 #[test]
 fn least_loaded_selection_takes_an_idle_http1_session_before_one_not_yet_idle() {
     let configs = [
@@ -4348,13 +4348,13 @@ fn least_loaded_selection_takes_an_idle_http1_session_before_one_not_yet_idle() 
     }
 }
 
-/// Of equally loaded sessions a least-loaded acquisition (`DIV-048`) takes a busy one first,
-/// as `FirstAvailable` does: an HTTP/1.1 session the pool dialed for an acquisition dropped
-/// before its dial completed has no exchange in flight, as an idle session has, and counts as
-/// busy until its first reservation (`DIV-046`), so the next acquisition takes it before the
-/// idle session, under either selection. Two acquisitions dial, and the first is dropped before
+/// Among equally loaded sessions a least-loaded acquisition takes a busy one first, as
+/// `FirstAvailable` does. An HTTP/1.1 session that the pool dialed for an acquisition dropped
+/// before its dial completed has no exchange in flight, like an idle session, but counts as
+/// busy until its first reservation. The next acquisition therefore takes it before the idle
+/// session, under either selection. Two acquisitions dial, and the first is dropped before
 /// either attempt runs, so the second keeps the attempts dialing and the first's dial completes
-/// with no dialer to hand its session to.
+/// without a dialer to hand its session to.
 #[test]
 fn least_loaded_selection_takes_a_dialed_session_no_acquisition_took_before_an_idle_one() {
     let configs = [
@@ -4404,9 +4404,9 @@ fn least_loaded_selection_takes_a_dialed_session_no_acquisition_took_before_an_i
     }
 }
 
-/// A least-loaded acquisition (`DIV-048`) takes the least loaded session that can take an
-/// exchange, however loaded: an HTTP/1.1 session whose free slot its driver has not settled yet,
-/// when no session is idle, is taken in the acquisition's first poll, with no connection
+/// A least-loaded acquisition takes the least loaded session that can take an exchange,
+/// however loaded. When every session is busy, an HTTP/1.1 session that has a free slot but
+/// whose driver is not idle yet is taken in the acquisition's first poll, without a connection
 /// attempt, under either selection.
 #[test]
 fn least_loaded_selection_takes_a_session_not_yet_idle_rather_than_dial() {
@@ -4528,11 +4528,11 @@ async fn two_pull_through_idle_sessions(
     (first.session, second.session)
 }
 
-/// `DIV-032`'s idle retirement and most-recently-used order hold on
-/// pull-through sessions: the run, to which the drive returns when the
-/// response is produced, retires the exchange and publishes idleness, which
-/// the session's run scope reports to the pool, as for any owned session.
-/// The scenarios of `idle_session_is_retired_and_replaced` (both sweeps),
+/// Idle retirement and most-recently-used order hold on pull-through sessions.
+/// The run, to which the drive returns when the response is produced, retires
+/// the exchange and publishes idleness, which the session's run scope reports
+/// to the pool, as for any owned session. These are the scenarios of
+/// `idle_session_is_retired_and_replaced` (both sweeps),
 /// `most_recently_used_reuse_picks_the_session_released_last` and
 /// `most_recently_used_reuse_lets_the_cold_session_retire`, through
 /// pull-through exchanges.
@@ -4640,9 +4640,9 @@ fn pull_through_sessions_are_reported_idle_and_retired() {
     );
 }
 
-/// A waiter takes the session a pull-through exchange released: the drive
-/// returns to the run at the response's end, and the run returns the slot,
-/// whose `capacity_available` wakes the waiter, which reuses the session.
+/// A waiter takes the session that a pull-through exchange released. The drive
+/// returns to the run at the response's end, and the run returns the slot. The
+/// slot's `capacity_available` wakes the waiter, which reuses the session.
 #[test]
 fn a_waiter_takes_the_session_a_pull_through_exchange_released() {
     let origin = Origin::start(CodecProtocol::Http11);
@@ -4673,10 +4673,10 @@ fn a_waiter_takes_the_session_a_pull_through_exchange_released() {
     );
 }
 
-/// The router's HTTP/1.1 parameters (prod_inference `RoxygenClientParams`):
-/// hyper-util's legacy pool (MRU reuse, interval sweeps, no connection
-/// limit, one connection attempt) and session timers off with every
-/// hyper-parity option on.
+/// An inference router's HTTP/1.1 parameters: a pool shaped like hyper-util's
+/// `client::legacy` pool (MRU reuse, interval sweeps, unlimited connections,
+/// one connection attempt), and session timers off with every hyper-parity
+/// option on.
 fn router_http1() -> (PoolParams, SessionParams) {
     (
         PoolParams {
@@ -4724,11 +4724,12 @@ fn the_router_s_session_parameters_are_accepted_with_pull_through() {
 const BACK_TO_BACK_REQUESTS: usize = 8;
 
 /// Runs `streams` streams of `BACK_TO_BACK_REQUESTS` exchanges each, through
-/// pull-through exchanges when `pull_through`: every stream first holds a
-/// reservation of its own at once, so the pool opens one session per stream;
-/// then each acquires its next reservation as soon as it has read its previous
-/// response to its end, with no settle. Returns this thread's
-/// `wait_for_wakeup` calls after the first reservations were all held.
+/// pull-through exchanges when `pull_through`. Every stream first holds a
+/// reservation of its own, all together, so the pool opens one session per
+/// stream. Each stream then acquires its next reservation as soon as it has
+/// read its previous response to its end, without waiting for the session to
+/// go idle. Returns this thread's `wait_for_wakeup` calls after the first
+/// reservations were all held.
 async fn back_to_back(pool: &OwnedHttpSessionPool, streams: usize, pull_through: bool) -> u64 {
     let first: Vec<_> = futures::stream::iter((0..streams).map(|_| acquire(pool)))
         .buffer_unordered(streams)
@@ -4756,13 +4757,12 @@ async fn back_to_back(pool: &OwnedHttpSessionPool, streams: usize, pull_through:
     take_waits_for_wakeup_for_test()
 }
 
-/// N8.4w (`DIV-046`, `DIV-029`): a stream that has read its HTTP/1.1
-/// response to its end acquires its next reservation before the driver's turn
-/// retires the exchange, and the pool selects that session, or another free
-/// one, at once: no acquisition waits for a returning session, and none dials.
-/// K streams over K sessions, at K = 1, 8 and 64, with this module's pool
-/// parameters and with the router's, through plain and pull-through
-/// exchanges.
+/// A stream that has read its HTTP/1.1 response to its end acquires its next
+/// reservation before the driver's turn retires the exchange, and the pool
+/// immediately selects that session or another free one. Acquisitions neither
+/// wait for a returning session nor dial. K streams run over K sessions, at
+/// K = 1, 8 and 64, with this module's pool parameters and with the router's,
+/// through plain and pull-through exchanges.
 #[test]
 fn back_to_back_http1_acquisitions_never_wait_for_a_returning_session() {
     for streams in [1, 8, 64] {
@@ -4800,12 +4800,11 @@ fn back_to_back_http1_acquisitions_never_wait_for_a_returning_session() {
     }
 }
 
-/// N8.4w (`DIV-046`): while an acquisition waits, the session a back-to-back
-/// acquisition's previous exchange is returning goes to the waiter, not to
-/// that acquisition: the retirement's `capacity_available` wakes the first
-/// waiter, as before. Two streams of five exchanges each share one
-/// connection and alternate, the second taking the session after the
-/// first's first exchange.
+/// While an acquisition waits, the session that a back-to-back acquisition's
+/// previous exchange is returning goes to the waiter, not to that acquisition,
+/// because the retirement's `capacity_available` wakes the first waiter. Two
+/// streams of five exchanges each share one connection and alternate, the
+/// second taking the session after the first's first exchange.
 #[test]
 fn a_waiting_acquisition_takes_a_returning_session_before_its_consumer_acquires_again() {
     let origin = Origin::start(CodecProtocol::Http11);
@@ -4845,9 +4844,9 @@ fn a_waiting_acquisition_takes_a_returning_session_before_its_consumer_acquires_
     );
 }
 
-/// N8.4w (`DIV-046`): with reuse disabled, a back-to-back acquisition does
-/// not take the session its previous exchange is returning, which the release
-/// drains: it dials anew.
+/// With reuse disabled, a back-to-back acquisition does not take the session
+/// that its previous exchange is returning, which the release drains. It dials
+/// a new connection instead.
 #[test]
 fn max_connections_zero_never_reuses_a_returning_session() {
     let origin = Origin::start(CodecProtocol::Http11);
@@ -4868,11 +4867,11 @@ fn max_connections_zero_never_reuses_a_returning_session() {
 }
 
 /// Runs `streams` streams of `BACK_TO_BACK_REQUESTS` exchanges each on `pool`, after making
-/// `streams + idle` sessions idle when `idle` is nonzero: every stream first holds a
-/// reservation of its own at once, then acquires its next one as soon as it has read its
+/// `streams + idle` sessions idle when `idle` is nonzero. Every stream first holds a
+/// reservation of its own, all together, then acquires its next one as soon as it has read its
 /// previous response to its end. Returns this thread's `wait_for_wakeup` calls after the first
-/// reservations were all held, and how many later acquisitions took a session that no first
-/// reservation held.
+/// reservations were all held, and how many later acquisitions took a session other than
+/// those the first reservations held.
 async fn back_to_back_sessions(
     pool: &OwnedHttpSessionPool,
     streams: usize,
@@ -4913,14 +4912,12 @@ async fn back_to_back_sessions(
     (take_waits_for_wakeup_for_test(), elsewhere)
 }
 
-/// `DIV-046`, `DIV-048`: K streams over K HTTP/1.1
-/// sessions acquire their next reservation as soon as they have read their previous response to
-/// its end. Under least-loaded selection, as under `FirstAvailable`, no acquisition waits for a
-/// returning session and none dials; with K more sessions idle, every acquisition takes a
-/// returning session, its stream's or another the first reservations held, ahead of the idle
-/// ones: a least-loaded acquisition ranks a returning session with no exchange in flight and,
-/// as a busy session, first. K = 8 and 64, with this module's pool parameters and with the
-/// router's.
+/// K streams over K HTTP/1.1 sessions acquire their next reservation as soon as they have read
+/// their previous response to its end. Under least-loaded selection, as under `FirstAvailable`,
+/// acquisitions neither wait for a returning session nor dial. With K more sessions idle, every
+/// acquisition takes a returning session (its stream's, or another that the first reservations
+/// held) ahead of the idle ones, because a least-loaded acquisition ranks a returning session,
+/// which has no exchange in flight and counts as busy, first.
 #[test]
 fn least_loaded_back_to_back_http1_acquisitions_never_wait_for_a_returning_session() {
     for selection in [
@@ -4960,12 +4957,11 @@ fn least_loaded_back_to_back_http1_acquisitions_never_wait_for_a_returning_sessi
     }
 }
 
-/// `DIV-046`, `DIV-048`: no starvation under
-/// least-loaded selection. K streams share one HTTP/1.1 connection, each acquiring its next
-/// reservation as soon as it has read its previous response to its end: while acquisitions
-/// wait, a stream's back-to-back acquisition does not take the session it is returning, whose
-/// retirement wakes the first waiter, so the streams take the connection in turn. K = 8 and 64,
-/// under either selection.
+/// Waiters do not starve under least-loaded selection. K streams share one HTTP/1.1
+/// connection, each acquiring its next reservation as soon as it has read its previous response
+/// to its end. While acquisitions wait, a stream's back-to-back acquisition does not take the
+/// session it is returning, whose retirement wakes the first waiter, so the streams take the
+/// connection in turn.
 #[test]
 fn least_loaded_back_to_back_acquisitions_starve_no_waiter() {
     const ROUNDS: usize = 3;
@@ -5020,10 +5016,9 @@ fn least_loaded_back_to_back_acquisitions_starve_no_waiter() {
     }
 }
 
-/// `DIV-046`: a reservation taken on a returning
-/// HTTP/1.1 session and dropped before its driver's turn leaves the session returning, with no
-/// pool event (`DIV-029`), and the pool's index lists it again: the next acquisition takes it
-/// in its first poll, under either selection.
+/// A reservation taken on a returning HTTP/1.1 session and dropped before its driver's turn
+/// leaves the session returning without a pool event, and the pool's index lists it again. The
+/// next acquisition takes it in its first poll, under either selection.
 #[test]
 fn a_reservation_dropped_on_a_returning_session_leaves_it_selectable() {
     for selection in [
@@ -5060,12 +5055,11 @@ fn a_reservation_dropped_on_a_returning_session_leaves_it_selectable() {
     }
 }
 
-/// `DIV-046`, `DIV-029`: a returning HTTP/1.1 session whose slot a reservation took, through the
-/// pool or on the session, is not claimable. Its driver's turn retires the exchange without
-/// announcing capacity, since the slot is taken, so no wake would reach an acquisition waiting
-/// for it. While that reservation is held, an acquisition that finds no session dials, and so
-/// does the next one; each is served on a connection of its own. Under either selection, with
-/// this module's pool parameters and with the router's.
+/// A returning HTTP/1.1 session whose slot a reservation took, through the pool or on the
+/// session, is not claimable. Its driver's turn retires the exchange without announcing
+/// capacity, since the slot is taken, so a wake would not reach an acquisition waiting for it.
+/// While that reservation is held, an acquisition without a free session dials, and so does
+/// the next one, and each is served on a connection of its own.
 #[test]
 fn acquisitions_dial_past_a_returning_session_whose_slot_is_reserved() {
     let cases = [
@@ -5091,7 +5085,7 @@ fn acquisitions_dial_past_a_returning_session_whose_slot_is_reserved() {
                     .expect("an open pool takes a selection");
                 let first = acquire(&pool).await;
                 assert_eq!(exchange(first.reservation, "/").await, b"ok");
-                // No yield since the read: the session is returning, and no acquisition waits.
+                // No yield since the read: the session is returning, and the pool has no waiter.
                 let held = if direct {
                     first
                         .session
@@ -5111,8 +5105,8 @@ fn acquisitions_dial_past_a_returning_session_whose_slot_is_reserved() {
                 let mut later = pin!(pool.get_session_with_reservation(CancellationToken::never()));
                 assert!(poll_once(later.as_mut()).await.is_pending());
                 let attempts = pool.connection_attempts_for_test() - attempts;
-                // An acquisition that no wake reaches resolves only when its wait times out or
-                // the held reservation is released, which comes after both bounds.
+                // An acquisition that is never woken resolves only when its wait times out or
+                // the held reservation is released. Both happen after the two bounds below.
                 let bound = TIMEOUT / 4;
                 let next = tokio::time::timeout(bound, next)
                     .await
@@ -5156,10 +5150,9 @@ fn acquisitions_dial_past_a_returning_session_whose_slot_is_reserved() {
     );
 }
 
-/// `DIV-046`, `DIV-029`: an acquisition waits for a returning HTTP/1.1 session while another
-/// waits for its dial; a reservation then taken on that session's handle takes the slot, whose
-/// retirement announces no capacity, so it wakes the waiting acquisition, which dials. Under
-/// either selection, with this module's pool parameters and with the router's.
+/// An acquisition waits for a returning HTTP/1.1 session while another waits for its dial. A
+/// reservation then taken on that session's handle takes the slot, whose retirement does not
+/// announce capacity, so the reservation wakes the waiting acquisition, which dials.
 #[test]
 fn a_reservation_on_a_claimed_returning_session_wakes_the_acquisition_waiting_for_it() {
     let cases = [
@@ -5204,8 +5197,8 @@ fn a_reservation_on_a_claimed_returning_session_wakes_the_acquisition_waiting_fo
                     .session
                     .reserve_request()
                     .expect("a returning slot admits a reservation");
-                // An acquisition that no wake reaches resolves only when its wait times out or
-                // the held reservation is released, which comes after both bounds.
+                // An acquisition that is never woken resolves only when its wait times out or
+                // the held reservation is released. Both happen after the two bounds below.
                 let bound = TIMEOUT / 4;
                 let earlier = tokio::time::timeout(bound, earlier)
                     .await
@@ -5259,8 +5252,8 @@ async fn exchange_root(reservation: OwnedClientReservation, pull_through: bool) 
 /// each on sessions the pool already opened, through pull-through exchanges
 /// when `pull_through`, and returns this thread's pool batch passes from the
 /// streams' first acquisitions to their last exchanges' retirements. Before
-/// that, `streams` reservations held at once open the sessions, and each
-/// exchanges once; then every session settles.
+/// that, `streams` reservations held together open the sessions, each
+/// exchanges once, and every session goes idle.
 async fn batch_passes_back_to_back(
     pool: &OwnedHttpSessionPool,
     streams: usize,
@@ -5305,12 +5298,9 @@ async fn batch_passes_back_to_back(
     take_batch_passes_for_test()
 }
 
-/// CL-L3: back-to-back exchanges on open sessions wake no waiter and retire
-/// no session, so they make no pass over a batch of waiters to signal or of
-/// sessions to drain, which is empty: not at their acquisitions' steps, nor
-/// at their sessions' events. Owned pools over both protocols at K = 1 and 8,
-/// on HTTP/1.1 with this module's pool parameters and the router's and
-/// through plain and pull-through exchanges, and an `HttpSessionPool`.
+/// Back-to-back exchanges on open sessions neither wake a waiter nor retire a
+/// session, so the pool's batch of waiters and sessions to drain stays empty.
+/// The pool does not pass over it at an acquisition's step or a session event.
 #[test]
 fn back_to_back_exchanges_make_no_pass_over_an_empty_pool_batch() {
     let cases = [1, 8].into_iter().flat_map(|streams| {
@@ -5371,10 +5361,10 @@ fn back_to_back_exchanges_make_no_pass_over_an_empty_pool_batch() {
     assert_eq!(observed, expected, "no pass over an empty batch");
 }
 
-/// CL-L3: a waiter batch that is not empty is still signalled, in one pass.
-/// With one connection of one stream held, a second acquisition waits;
-/// releasing the held reservation wakes it, and nothing else in its
-/// acquisition has a waiter to signal or a session to drain.
+/// A non-empty waiter batch is signalled in one pass. With one connection of
+/// one stream held, a second acquisition waits. Releasing the held reservation
+/// wakes it, and its acquisition has no other waiter to signal or session to
+/// drain.
 #[test]
 fn a_released_session_wakes_its_waiter_in_one_pool_batch_pass() {
     for protocol in PROTOCOLS {
@@ -5665,7 +5655,7 @@ fn raw_http2_peer(script: impl FnOnce(&mut TcpStream) + Send + 'static) -> RawPe
 }
 
 /// A NO_ERROR GOAWAY that covers the one request in flight is counted when it closes the
-/// session's admission, while the request waits for its response; the session closes
+/// session's admission, while the request waits for its response. The session closes
 /// cleanly once the response ends.
 #[test]
 fn stats_count_a_no_error_goaway_when_it_closes_admission() {
@@ -5721,7 +5711,7 @@ fn stats_count_a_no_error_goaway_when_it_closes_admission() {
     );
 }
 
-/// A GOAWAY with an error code fails the session; it is counted as a peer GOAWAY and as
+/// A GOAWAY with an error code fails the session. It is counted as a peer GOAWAY and as
 /// an error.
 #[test]
 fn stats_count_a_goaway_with_an_error_code() {
@@ -5766,7 +5756,7 @@ fn stats_count_a_goaway_with_an_error_code() {
 
 /// A session past `max_age` that an acquisition retires, and the pool's drain of its
 /// replacement, are local drains. Each session counts once, under the reason that closed
-/// its admission first: no GOAWAY the origin sends back is counted.
+/// its admission first, so a GOAWAY that the origin sends back is not counted.
 #[test]
 fn stats_count_local_drains_once_per_session() {
     for protocol in PROTOCOLS {
@@ -5822,7 +5812,7 @@ fn stats_count_local_drains_once_per_session() {
 }
 
 /// The peer refuses one stream and resets another, which are counted while the session
-/// stays open; then a GOAWAY whose last stream precedes a request in flight refuses it.
+/// stays open. Then a GOAWAY whose last stream precedes a request in flight refuses it.
 #[test]
 fn stats_count_the_streams_a_peer_refuses_or_resets() {
     let peer = raw_http2_peer(|stream| {
@@ -5946,8 +5936,8 @@ fn stats_count_resets_on_a_session_the_pool_dropped() {
     );
 }
 
-/// A peer's NO_ERROR reset after a stream's whole response stops only its upload
-/// (`DIV-050`) and is not counted; one before the response fails the stream and is.
+/// A peer's NO_ERROR reset after a stream's whole response stops only its upload and is not
+/// counted. One before the response fails the stream and is counted.
 #[test]
 fn stats_count_a_no_error_reset_only_before_the_whole_response() {
     let peer = raw_http2_peer(|stream| {

@@ -7,12 +7,12 @@
 
 //! The ordered list behind a pool's sessions.
 //!
-//! A slab of nodes doubly linked in the pool's order, where a `VecDeque` searched for a
-//! session and shifted the others to move or remove it: an item whose slot is known is
-//! found, removed or moved to the back in constant time. A node may also be linked into one
-//! of two class lists, which keep the main order: an owned HTTP/1.1 pool's selectable
-//! sessions, busy or idle (S6.9). Freed nodes are reused before the slab grows, so the list
-//! allocates only when it holds more items than it ever has.
+//! A slab of nodes doubly linked in the pool's order. An item whose slot is known is found,
+//! removed or moved to the back in constant time, where a `VecDeque` would search for it and
+//! shift the others. A node may also be linked into one of two class lists, which keep the
+//! main order. They hold an owned HTTP/1.1 pool's selectable sessions, busy or idle. Freed
+//! nodes are reused before the slab grows, so the list allocates only when it holds more
+//! items than it ever has.
 
 /// An item that records the slot the list gives it.
 pub(super) trait Linked {
@@ -211,7 +211,7 @@ impl<T: Linked> SessionList<T> {
         self.detach(slot.0)
     }
 
-    /// `VecDeque::pop_front`, which the list's differential test against a `VecDeque` uses.
+    /// Removes the first item, like `VecDeque::pop_front`.
     #[cfg(test)]
     pub(super) fn pop_front(&mut self) -> Option<T> {
         self.order.head.map(|index| self.detach(index))
@@ -242,8 +242,8 @@ impl<T: Linked> SessionList<T> {
         None
     }
 
-    /// Removes the items that `keep` refuses, testing each in order, and drops them, in
-    /// order, once every item is tested, as `VecDeque::retain` drops after its pass.
+    /// Removes the items for which `keep` returns false, testing each in order. The removed
+    /// items are dropped in order after every item is tested, as `VecDeque::retain` does.
     pub(super) fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
         let mut cursor = self.order.head;
         let mut removed = Ends::default();
@@ -252,7 +252,7 @@ impl<T: Linked> SessionList<T> {
             if keep(self.get(Slot(index))) {
                 continue;
             }
-            // Park the node, still holding its item, on a list of removed nodes.
+            // Move the node, still holding its item, to a list of removed nodes.
             self.set_class(Slot(index), None);
             self.unlink(index);
             self.len -= 1;
@@ -545,7 +545,7 @@ mod tests {
         let drops = Rc::clone(&fixture.drops);
         let mut tested = Vec::new();
         fixture.list.retain(|item| {
-            // No removed item is dropped until every item is tested.
+            // Removed items are not dropped until every item is tested.
             assert!(drops.borrow().is_empty());
             tested.push(item.id);
             item.id % 2 == 0
@@ -608,8 +608,8 @@ mod tests {
         slot
     }
 
-    /// Every operation the pool used on its `VecDeque` leaves the list in the
-    /// same order as the `VecDeque`.
+    /// Random sequences of the `VecDeque` operations the pool needs leave the
+    /// list in the same order as a `VecDeque`.
     #[test]
     fn operations_leave_the_same_order_as_a_vec_deque() {
         let mut fixture = Fixture::new();

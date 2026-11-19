@@ -5,80 +5,79 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Experimental owned client sessions (`DIV-046`).
+//! Experimental owned client sessions.
 //!
 //! [`OwnedClientSession`] runs one client connection on an owned upstream driver,
-//! `OwnedH1UpstreamSession` for HTTP/1.1 or `OwnedH2UpstreamSession` for HTTP/2, which polls
-//! the codec, the request uploads and the response sources from one future per connection,
-//! with no task per request. It takes `ClientSession`'s inputs ([`ConnectionParams`],
-//! [`SessionParams`], [`ClientAttachOptions`]) and keeps its lifetime contract: the driver's
-//! run is rooted in a worker scope rather than in the handle, the attachment's cancellation
-//! cancels the session, worker quiescence closes its admission, and
-//! [`OwnedClientSession::wait_closed`] observes the run's outcome. Either closes admission at
-//! once, before the run observes it; the attachment's cancellation wins over quiescence and is
-//! observed until the run's cleanup completes, and a panic in the quiescence drain cancels the
-//! session and fails it `INTERNAL_ERROR`, as for a `ClientSession`, and is counted in the worker's
-//! `WorkerPollStats` (`DIV-056`). A panic the driver contains, also counted there, fails only its
-//! request (on HTTP/1.1, which cannot drop half a message, it also ends the session), drains the
-//! session, or ends the session with `Err(INTERNAL_ERROR)`, which `wait_closed` reports; the
-//! worker keeps serving. A reservation's submission
-//! resolves at the driver's commitment, or at the first response head, with the response's
-//! fresh [`HttpResponseSource`]; submissions and requests report `OwnedRequestProgressExt`
-//! progress (`DIV-035`).
+//! `OwnedH1UpstreamSession` for HTTP/1.1 or `OwnedH2UpstreamSession` for HTTP/2. The driver
+//! polls the codec, the request uploads and the response sources from one future per
+//! connection, with no task per request.
 //!
-//! Refused before any dial, with `INVALID_STATE_TRANSITION` and an error that names the
-//! field, instead of ignored:
+//! It takes `ClientSession`'s inputs ([`ConnectionParams`], [`SessionParams`],
+//! [`ClientAttachOptions`]) and keeps its lifetime rules. The driver's run is rooted in a
+//! worker scope rather than in the handle. The attachment's cancellation cancels the session,
+//! and worker quiescence closes its admission. Both close admission immediately, before the
+//! run observes them. The attachment's cancellation takes precedence over quiescence and is
+//! observed until the run's cleanup completes. [`OwnedClientSession::wait_closed`] reports the
+//! run's outcome.
 //!
-//! - on HTTP/1.1, session timers: `stream_read_timeout`, `connection_read_timeout` and
+//! A panic in the quiescence drain cancels the session and fails it with `INTERNAL_ERROR`, as
+//! for a `ClientSession`. A panic the driver contains fails only its request, drains the
+//! session, or ends the session with `Err(INTERNAL_ERROR)`, which `wait_closed` reports. On
+//! HTTP/1.1, which cannot drop half a message, a request-scoped panic also ends the session.
+//! Both kinds are counted in the worker's `WorkerPollStats`, and the worker keeps serving.
+//!
+//! A reservation's submission resolves when the driver commits the request, or at the first
+//! response head, with the response's fresh [`HttpResponseSource`]. Submissions and requests
+//! report progress through `OwnedRequestProgressExt`.
+//!
+//! Unlike with a `ClientSession`, dropping every handle does not drain the session, because a
+//! drain would reject a submission the driver has not committed yet. The connection stays
+//! open until `close_when_idle`, `cancel`, the peer or worker quiescence closes it.
+//!
+//! # Session parameters
+//!
+//! These are rejected before any dial with `INVALID_STATE_TRANSITION` and an error that names
+//! the field, instead of being ignored:
+//!
+//! - On HTTP/1.1, the session timers: `stream_read_timeout`, `connection_read_timeout` and
 //!   `write_timeout` must each be `Some(Duration::ZERO)`, since `None` selects
-//!   `UniplexConfig`'s nonzero default;
+//!   `UniplexConfig`'s nonzero default.
 //! - `lifecycle_observer`, `session_stats`, `header_codec_stats`, and `ping_probes` with a
-//!   nonzero interval;
-//! - on HTTP/2, an `ENABLE_PUSH` setting other than 0;
-//! - TLS: `connect` dials plaintext TCP only, and `attach` refuses `non_abortive_close` on a
+//!   nonzero interval.
+//! - On HTTP/2, an `ENABLE_PUSH` setting other than 0.
+//! - TLS: `connect` dials plaintext TCP only, and `attach` rejects `non_abortive_close` on a
 //!   TLS transport, as `ClientSession::attach_transport` does.
 //!
-//! Honored as `ClientSession` honors them: on HTTP/2 `settings`,
-//! `max_concurrent_outgoing_streams`, `connection_flow_control`, `header_indexing_strategy`
-//! and all three session timers, except that `ENABLE_PUSH=0` joins settings that carry none,
-//! where `ClientSession` advertises 1; on HTTP/1.1 `unframed_bodiless_http1_requests`
-//! (`DIV-036`); on both, `deliver_ingress_before_abort` (`DIV-033`), and `non_abortive_close`
-//! (`DIV-038`) on the plaintext transport. HTTP/1.1 sessions read before committing a
-//! request, fail an unstarted request when the peer closes, and batch ready output, as
-//! uniplex sessions do (`DIV-035`, `DIV-034`). HTTP/1.1 sessions ignore the HTTP/2-only fields.
+//! These behave as they do on `ClientSession`:
 //!
-//! Dropping every handle leaves the connection open until `close_when_idle`, `cancel`, its
-//! peer or its worker's quiescence closes it, where dropping the last `ClientSession`
-//! drains it (`DIV-020`): a drain would refuse a submission the driver has not committed yet.
+//! - On HTTP/2, `settings`, `max_concurrent_outgoing_streams`, `connection_flow_control`,
+//!   `header_indexing_strategy` and all three session timers.
+//! - On HTTP/1.1, `unframed_bodiless_http1_requests`.
+//! - On both, `deliver_ingress_before_abort` and, on a plaintext transport,
+//!   `non_abortive_close`.
 //!
-//! An HTTP/1.1 session's driver is rooted with `OwnedH1UpstreamSession::run_pull_through`
-//! (`DIV-047`) in its run scope, whose stop check, quiescence drain and idle report are
-//! unchanged. Each exchange selects how its response is read:
-//! [`OwnedClientReservation::submit`] as on any session, or
+//! The one difference is that an HTTP/2 session adds `ENABLE_PUSH=0` to settings that lack
+//! it, where `ClientSession` advertises 1. HTTP/1.1 sessions ignore the HTTP/2-only fields.
+//! Like uniplex sessions, HTTP/1.1 sessions read before committing a request, fail an
+//! unstarted request when the peer closes, and batch ready output.
+//!
+//! # Pull-through reads
+//!
+//! An HTTP/1.1 session's driver runs under `OwnedH1UpstreamSession::run_pull_through`, with
+//! the same stop check, quiescence drain and idle report. Each exchange selects how its
+//! response is read: [`OwnedClientReservation::submit`] as on any session, or
 //! [`OwnedClientReservation::submit_pull_through`], which resolves to an
 //! [`OwnedClientPullThroughBody`] whose reads drive the connection once the request is
-//! written. On HTTP/2 a pull-through submission is refused with `INVALID_STATE_TRANSITION`
+//! written. On HTTP/2 a pull-through submission is rejected with `INVALID_STATE_TRANSITION`
 //! before it reaches the driver, and is not reported unprocessed.
 //!
+//! # Pooling
+//!
 //! [`OwnedHttpSessionPool`] pools owned sessions to one address with `HttpSessionPool`'s
-//! scheduler and `PoolParams`, which it shares: the drivers' `capacity_available` and
-//! `admission_closed` callbacks, and the idleness a driver publishes at the end of a turn,
-//! which the session's run scope reports, feed the pool as a `ClientSession`'s lifecycle
-//! events do. Its acquisitions take a selected session on their first poll with no
-//! allocation and no clock read for their deadline ([`OwnedSessionAcquisition`]), an
-//! HTTP/1.1 session whose slot is returning included while no acquisition waits (`DIV-046`),
-//! and one that would dial waits instead for an HTTP/1.1 session whose driver returns its
-//! slot at its next turn. An acquisition that dials is handed its dial's session, reserved for
-//! it when the dial completes, if it still waits then, as hyper-util sends a request on the
-//! connection it dialed for it, which [`OwnedClientReservation::dialed_for_acquisition`]
-//! reports. In an HTTP/1.1 pool a dial that fails after its attempts fails it with the dial's
-//! error, as hyper-util fails a request whose connect fails; an HTTP/2 pool's fails waiters
-//! as `HttpSessionPool`'s does.
-//! [`OwnedHttpSessionPool::set_session_selection`] opts into taking the least loaded of the
-//! sessions that can take an exchange (`DIV-048`). A reservation
-//! taken on a pooled session's handle reaches its pool as one the pool's acquisition made,
-//! and the admission the pool closes on a session it retires or drains refuses the handle's
-//! reservations, as a `ClientSession`'s draining flag does.
+//! scheduler and `PoolParams`. See [`OwnedSessionAcquisition`] for how acquisitions select,
+//! wait and dial. A reservation taken on a pooled session's handle counts in the
+//! pool as one made by the pool's acquisition. A session the pool retires or drains rejects
+//! the handle's reservations, as a `ClientSession`'s draining flag does.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -193,14 +192,14 @@ struct SessionInner {
     pool: PoolBinding,
 }
 
-/// A pooled session's link to its [`OwnedHttpSessionPool`] (`DIV-046`).
+/// A pooled session's link to its [`OwnedHttpSessionPool`].
 struct PoolBinding {
     pool: RefCell<Option<Weak<RefCell<PoolState>>>>,
-    /// Admission closed: the pool closed it, or the driver reported it.
+    /// The pool closed admission, or the driver reported that it closed.
     draining: Cell<bool>,
-    /// No capacity was left when the session was last reserved or reported.
+    /// The session had zero capacity when it was last reserved or reported.
     full: Cell<bool>,
-    /// The pool last saw the session idle, or the session is not pooled.
+    /// The session was idle at its last report to the pool, or it is not pooled.
     reported_idle: Cell<bool>,
     /// The session has taken a reservation since it was pooled. Until then the
     /// pool does not count it idle, as a `ClientSession` is not idle before its
@@ -210,10 +209,10 @@ struct PoolBinding {
     /// about to return, instead of dialing.
     claimant: Cell<Option<u64>>,
     /// The slot of the session's entry in its pool's list, so that the pool
-    /// finds the entry without a search.
+    /// can locate the entry without a search.
     slot: Cell<Option<SessionSlot>>,
-    /// Set when the session stops admitting without an event its pool hears,
-    /// so that the pool's selection index looks at every session again (S6.9).
+    /// Set when the session stops taking requests without notifying its pool,
+    /// so that the pool's selection index rechecks every session.
     unsettled: RefCell<Option<Rc<Cell<bool>>>>,
 }
 
@@ -233,8 +232,8 @@ impl Default for PoolBinding {
 }
 
 impl SessionInner {
-    /// Tells the session's pool, if any, that the session stops admitting without
-    /// an event the pool hears, as a cancellation does (S6.9).
+    /// Marks the session's pool, if any, to recheck every session, for a session
+    /// that stops taking requests without notifying the pool, as on cancellation.
     fn unsettle_pool(&self) {
         if let Some(unsettled) = self.pool.unsettled.borrow().as_ref() {
             unsettled.set(true);
@@ -259,13 +258,13 @@ enum PoolEvent {
 /// The driver's callbacks, which feed the pool's notifications and counters.
 struct PoolObserver {
     session: Weak<SessionInner>,
-    /// Apart from `session`: once the pool drops a session whose admission closed and its
-    /// handles are gone, the driver still reports its streams' resets.
+    /// Held apart from `session` because the driver still reports stream resets after the
+    /// pool drops a closed session and its handles are gone.
     pool: Weak<RefCell<PoolState>>,
 }
 
 impl PoolObserver {
-    /// Counts in the pool's stats (`DIV-032`).
+    /// Updates the pool's stats, if the pool is still alive.
     fn count(&self, count: impl FnOnce(&mut OwnedPoolStats)) {
         if let Some(pool) = self.pool.upgrade() {
             count_pool_stats(&pool, count);
@@ -313,11 +312,11 @@ impl OwnedUpstreamObserver for PoolObserver {
     }
 }
 
-/// Reports `event` to the session's pool, if it is pooled: a session with
+/// Reports `event` to the session's pool, if it is pooled. A session with
 /// capacity again wakes as many waiters as it can serve, and one whose
-/// admission closed wakes one, which dials its replacement. As a
-/// `ClientSession`'s wake count, the capacity omits the worker's admission,
-/// which the woken acquisitions check.
+/// admission closed wakes one, which dials its replacement. As for a
+/// `ClientSession`, the wake count ignores the worker's admission state, which
+/// the woken acquisitions check.
 fn notify_pool(inner: &Rc<SessionInner>, event: PoolEvent) {
     let Some(pool) = inner.pool.pool.borrow().as_ref().and_then(Weak::upgrade) else {
         return;
@@ -357,9 +356,9 @@ fn notify_pool(inner: &Rc<SessionInner>, event: PoolEvent) {
     );
 }
 
-/// Lists a pooled HTTP/1.1 session in its pool's selection index once its slot turned
-/// returning (`DIV-029`), which no pool event reports. A pool borrowed
-/// further up the stack has its index unsettled instead, so that its passes see the session.
+/// Adds a pooled HTTP/1.1 session to its pool's selection index once its slot is returning,
+/// since a pool event does not report that. If the pool is borrowed further up the stack,
+/// its index is marked unsettled instead, so that its next pass includes the session.
 fn report_returning(inner: &Rc<SessionInner>) {
     let Some(pool) = inner.pool.pool.borrow().as_ref().and_then(Weak::upgrade) else {
         return;
@@ -396,7 +395,7 @@ impl Upstream {
         }
     }
 
-    /// HTTP/1.1 only (`DIV-029`); an HTTP/2 stream's capacity returns at once.
+    /// HTTP/1.1 only. An HTTP/2 stream's capacity returns immediately.
     fn returning_capacity(&self) -> u32 {
         match self {
             Self::Http1(handle) => handle.returning_capacity(),
@@ -422,7 +421,7 @@ impl Upstream {
 impl OwnedClientSession {
     /// Dials `address` over plaintext TCP with `connection`'s TCP options and starts the
     /// owned driver for `connection.plaintext_protocol`, as `HttpConnector::connect` starts
-    /// a `ClientSession`. Parameters the driver cannot honor, and TLS, are refused before
+    /// a `ClientSession`. TLS and parameters the driver cannot support are rejected before
     /// the dial.
     pub fn connect(
         context: &WorkerContext,
@@ -459,9 +458,9 @@ impl OwnedClientSession {
         })
     }
 
-    /// Consumes an established transport on its owner worker, as
-    /// `ClientSession::attach_transport` does, and starts the owned driver for
-    /// `options.protocol`. Cancelling `options.cancellation` cancels the session.
+    /// Starts the owned driver for `options.protocol` on an established transport, on its
+    /// owner worker, as `ClientSession::attach_transport` does. Cancelling
+    /// `options.cancellation` cancels the session.
     pub fn attach(
         worker: &WorkerContext,
         transport: OwnedByteStream,
@@ -505,12 +504,13 @@ impl OwnedClientSession {
         &self.inner.connection
     }
 
-    /// Requests the connection can admit now: 0 once the attachment is
-    /// cancelled, the worker stops accepting work or the session's pool closes
-    /// its admission; otherwise on HTTP/1.1 1 while its one slot is free or
-    /// returning (`DIV-029`) and admission is open, and on HTTP/2 the lower of
-    /// its own and its peer's
-    /// `MAX_CONCURRENT_STREAMS`, less the reserved and active streams.
+    /// The number of requests the connection can take now.
+    ///
+    /// This is 0 once the attachment is cancelled, the worker stops accepting work or the
+    /// session's pool closes its admission. Otherwise, on HTTP/1.1 it is 1 while the one
+    /// slot is free or returning and the driver's admission is open. On HTTP/2 it is the
+    /// lower of the local and the peer's `MAX_CONCURRENT_STREAMS`, less the reserved and
+    /// active streams.
     pub fn available_capacity(&self) -> u32 {
         if self.admission_closed() {
             return 0;
@@ -518,12 +518,12 @@ impl OwnedClientSession {
         self.inner.upstream.available_capacity()
     }
 
-    /// No reservation, exchange, upload or write is outstanding.
+    /// Whether the session has no outstanding reservation, exchange, upload or write.
     pub fn is_idle(&self) -> bool {
         self.inner.upstream.is_idle()
     }
 
-    /// The driver's run has completed.
+    /// Whether the driver's run has completed.
     pub fn is_finished(&self) -> bool {
         match &self.inner.upstream {
             Upstream::Http1(handle) => handle.is_finished(),
@@ -531,12 +531,13 @@ impl OwnedClientSession {
         }
     }
 
-    /// Takes one admission slot. Fails with `DROPPED` once the attachment is
-    /// cancelled, the worker stops accepting work or the session's pool closes
-    /// its admission, as `ClientSession::reserve_request` does, before the run
-    /// observes any of them, and otherwise with `REFUSED_STREAM` when no slot
-    /// is available. A pooled session's pool records the reservation as one
-    /// its acquisition made.
+    /// Takes one admission slot.
+    ///
+    /// Fails with `DROPPED`, as `ClientSession::reserve_request` does, once the attachment
+    /// is cancelled, the worker stops accepting work or the session's pool closes its
+    /// admission, even before the run observes it. Otherwise fails with `REFUSED_STREAM`
+    /// when no slot is available. A pooled session's pool records the reservation as if
+    /// its own acquisition made it.
     pub fn reserve_request(&self) -> Result<OwnedClientReservation, HttpError> {
         if self.admission_closed() {
             return Err(admission_closed_error());
@@ -554,8 +555,8 @@ impl OwnedClientSession {
         }
     }
 
-    /// As `reserve_request` on a session of `pool`, without the worker
-    /// admission check, which the pool's acquisition step made.
+    /// Like `reserve_request` on a session of `pool`, but skips the worker
+    /// admission check, which the pool's acquisition step already made.
     pub(crate) fn reserve_pooled(
         &self,
         pool: &Rc<RefCell<PoolState>>,
@@ -567,8 +568,8 @@ impl OwnedClientSession {
     }
 
     /// Reserves a slot and records it with `pool`, as a `ClientSession`'s
-    /// `TransactionAttached` reaches its pool: the session is no longer idle,
-    /// and moves to the back when it was idle or became full.
+    /// `TransactionAttached` event does. The session stops being idle, and
+    /// moves to the back if it was idle or became full.
     fn reserve_for_pool(
         &self,
         pool: &Rc<RefCell<PoolState>>,
@@ -611,40 +612,40 @@ impl OwnedClientSession {
         self.inner.upstream.cancel();
     }
 
-    /// Observes the driver's outcome once its run, I/O cleanup included, has
-    /// completed. Dropping this observation changes nothing.
+    /// Waits for the driver's outcome once its run, including I/O cleanup, has
+    /// completed. Dropping the future does not affect the session.
     pub fn wait_closed(&self) -> LocalClientFuture<Result<UniplexRunSummary, HttpError>> {
         wait_session_completion(&self.inner.completion)
     }
 
-    /// As `ClientSession`'s admission check, ahead of the run's next poll.
+    /// Like `ClientSession`'s admission check, before the run's next poll.
     fn admission_closed(&self) -> bool {
         self.session_admission_closed() || !worker_admits(&self.inner.worker)
     }
 
-    /// `admission_closed` without the worker admission check: the attachment
-    /// is cancelled, or the pool closed the session's admission (as a
-    /// `ClientSession`'s draining flag) or saw the driver close it.
+    /// `admission_closed` without the worker admission check. True when the
+    /// attachment is cancelled, or when the pool closed the session's admission
+    /// or recorded that the driver closed it.
     fn session_admission_closed(&self) -> bool {
         self.is_draining() || self.inner.attachment.is_cancellation_requested()
     }
 
-    /// Admission closed for the pool: it closed it, or the driver reported it.
+    /// Whether the pool closed admission, or the driver reported that it closed.
     pub(crate) fn is_draining(&self) -> bool {
         self.inner.pool.draining.get()
     }
 
-    /// Idle and admitting after its first reservation, as a pool counts a
-    /// `ClientSession` idle: an acquisition selects a session the pool dialed
-    /// as one that can take an exchange, so the dialing acquisition takes it
-    /// before the idle checkout can retire it.
+    /// Whether the session is idle and admitting after its first reservation, as
+    /// a pool counts a `ClientSession` idle. Until then an acquisition selects a
+    /// session the pool dialed as one that can take an exchange, so that the
+    /// dialing acquisition takes it before the idle checkout can retire it.
     pub(crate) fn is_pooled_idle(&self) -> bool {
         !self.is_draining() && self.inner.pool.reserved.get() && self.is_idle()
     }
 
-    /// An HTTP/1.1 session whose slot is returning: its exchange's consumer
-    /// completed it, and the driver's next turn retires it
-    /// (`OwnedH1UpstreamHandle::returning_capacity`, `DIV-029`).
+    /// Whether this is an HTTP/1.1 session whose slot is returning. The exchange's
+    /// consumer completed it, and the driver's next turn retires it
+    /// (`OwnedH1UpstreamHandle::returning_capacity`).
     pub(crate) fn is_returning(&self) -> bool {
         self.inner.upstream.returning_capacity() != 0
     }
@@ -659,10 +660,10 @@ impl OwnedClientSession {
         }
     }
 
-    /// Whether an acquisition may wait for this session instead of dialing: no
-    /// other acquisition waits for it, its admission is open, and its driver
-    /// returns a slot at its next turn, which the read response's completion
-    /// woke (`OwnedH1UpstreamHandle::returning_capacity`).
+    /// Whether an acquisition may wait for this session instead of dialing. That
+    /// requires that another acquisition is not already waiting for it, that its
+    /// admission is open, and that its driver, woken by the response's completion,
+    /// returns a slot at its next turn (`OwnedH1UpstreamHandle::returning_capacity`).
     pub(crate) fn claimable(&self) -> bool {
         self.inner.pool.claimant.get().is_none()
             && !self.session_admission_closed()
@@ -693,12 +694,10 @@ impl OwnedClientSession {
         u32::from(!self.is_idle())
     }
 
-    /// The exchanges in flight that a least-loaded pool compares (`DIV-048`): on HTTP/2 the
-    /// streams its driver admitted, reserved or open; on HTTP/1.1, whose one slot is free
-    /// whenever the session can take an exchange, `admitted_transactions`, so that an idle
-    /// session comes before one whose driver has not settled its free slot, except that a
-    /// returning session (`DIV-029`), whose exchange its consumer completed, has none, and so
-    /// comes first, as the busy one of equally loaded sessions (`DIV-046`).
+    /// The exchanges in flight that a least-loaded pool compares. On HTTP/2 that is the
+    /// streams the driver admitted, reserved or open. On HTTP/1.1 it is 0 for an idle or
+    /// returning session and 1 otherwise. Ties go to the busy session, so a returning session
+    /// is taken before an idle one, and both before one whose driver is not idle yet.
     pub(crate) fn in_flight(&self) -> u32 {
         match &self.inner.upstream {
             Upstream::Http1(_) => u32::from(!self.is_idle() && !self.is_returning()),
@@ -706,7 +705,7 @@ impl OwnedClientSession {
         }
     }
 
-    /// Refuses further pool reservations ahead of `initiate_drain`.
+    /// Rejects further pool reservations before `initiate_drain` runs.
     pub(crate) fn close_admission(&self) {
         self.inner.pool.draining.set(true);
     }
@@ -734,8 +733,8 @@ impl OwnedClientSession {
         self.inner.worker_id
     }
 
-    /// Binds the session to its pool, whose notifications the driver's
-    /// capacity and admission callbacks then feed.
+    /// Binds the session to its pool, so that the driver's capacity and
+    /// admission callbacks notify the pool.
     pub(crate) fn bind_pool(
         &self,
         pool: Weak<RefCell<PoolState>>,
@@ -748,7 +747,7 @@ impl OwnedClientSession {
             session: Rc::downgrade(&self.inner),
             pool,
         });
-        // A finished session refuses the observer; the pool drops it at its next turn.
+        // A finished session rejects the observer. The pool drops the session at its next turn.
         let _ = match &self.inner.upstream {
             Upstream::Http1(handle) => handle.set_observer(observer),
             Upstream::Http2(handle) => handle.set_observer(observer),
@@ -800,7 +799,7 @@ pub(crate) fn admission_closed_error() -> HttpError {
     client_error(HttpErrorCode::DROPPED, b"client session admission closed")
 }
 
-/// Refuses TLS: owned sessions dial plaintext TCP only.
+/// Rejects TLS, since owned sessions dial plaintext TCP only.
 fn refuse_tls(connection: &ConnectionParams) -> Result<(), HttpError> {
     if matches!(connection.transport, ClientTransportOptions::Tls(_)) {
         return Err(refusal(
@@ -817,7 +816,7 @@ enum DriverConfig {
 }
 
 impl DriverConfig {
-    /// Refuses, naming the field, what the owned drivers cannot honor.
+    /// Rejects the parameters the owned drivers cannot support, naming the field.
     fn new(protocol: CodecProtocol, session: &SessionParams) -> Result<Self, HttpError> {
         let (http2, name) = match protocol {
             CodecProtocol::Http11 => (false, "HTTP/1.1"),
@@ -969,9 +968,9 @@ fn start(
     Ok(OwnedClientSession { inner })
 }
 
-/// The session's worker scope, as `ClientSession`'s run owner: the
-/// attachment's cancellation cancels the session, and worker quiescence
-/// closes its admission, so it closes once its exchanges retire.
+/// The session's worker scope, the counterpart of `ClientSession`'s run owner.
+/// The attachment's cancellation cancels the session, and worker quiescence
+/// closes its admission, so that the session closes once its exchanges retire.
 struct RunScope {
     worker: WorkerContext,
     attachment: CancellationWakeRegistration,
@@ -984,12 +983,11 @@ struct RunScope {
 }
 
 impl RunScope {
-    /// Runs the driver, then publishes its outcome, which an attachment
-    /// cancellation, or a failure to close admission, replaces. As uniplex
-    /// polls a `ClientSession`'s run owner, the stop requests are polled
-    /// before each poll of the run and once after the run completes, so a
-    /// cancellation that the run's final poll requests, the driver's
-    /// destruction included, is observed.
+    /// Runs the driver, then publishes its outcome. An attachment cancellation or a
+    /// failure to close admission replaces the outcome. As for a `ClientSession`'s
+    /// run owner, the stop requests are polled before each poll of the run and once
+    /// after the run completes, so that a cancellation requested during the run's
+    /// final poll, including the driver's destruction, is observed.
     async fn run(
         mut self,
         upstream: Upstream,
@@ -1010,9 +1008,9 @@ impl RunScope {
     }
 
     /// Reports a pooled session that became idle to its pool, as a
-    /// `ClientSession`'s `DeactivateConnection` does: the driver publishes
+    /// `ClientSession`'s `DeactivateConnection` does. The driver publishes
     /// idleness at the end of a quiescent turn, after the callback that released
-    /// the last slot, so the pool can retire it and reuse it in order.
+    /// the last slot, so that the pool can retire the session and reuse it in order.
     fn report_idle(&self) {
         if let Some(inner) = self.session.upgrade()
             && !inner.pool.reported_idle.get()
@@ -1022,8 +1020,8 @@ impl RunScope {
         }
     }
 
-    /// As `ClientSessionOwner::poll_stop`, the attachment's cancellation wins
-    /// over quiescence, which drains no cancelled session.
+    /// As in `ClientSessionOwner::poll_stop`, the attachment's cancellation takes
+    /// precedence over quiescence, which does not drain a cancelled session.
     fn poll_stop(&mut self, upstream: &Upstream, context: &mut Context<'_>) {
         if !self.aborting && self.attachment.update_waker(context.waker()) {
             self.aborting = true;
@@ -1058,11 +1056,10 @@ impl RunScope {
     }
 }
 
-/// Closes admission for worker quiescence, as `ClientSessionOwner::stop` does:
-/// a failure, or a panic of a callback the close runs (a refused request's
-/// source cleanup), cancels the session, whose run then completes its I/O
-/// cleanup, and is returned. The panic is counted at connection scope on
-/// `worker` (`DIV-056`).
+/// Closes admission for worker quiescence, as `ClientSessionOwner::stop` does.
+/// A failure, or a panic in a callback the close runs (such as a rejected
+/// request's source cleanup), cancels the session and is returned. The run then
+/// completes its I/O cleanup. A panic is counted at connection scope on `worker`.
 fn drain(worker: &WorkerContext, upstream: &Upstream) -> Option<HttpError> {
     let failure = match catch_unwind(AssertUnwindSafe(|| upstream.close_when_idle())) {
         Ok(Ok(_)) => return None,
@@ -1099,13 +1096,14 @@ enum Reservation {
 
 impl OwnedClientReservation {
     /// Whether an [`OwnedHttpSessionPool`] dialed this reservation's connection for the
-    /// acquisition that returned the reservation, and reserved it when the dial completed
-    /// (`DIV-046`). hyper-util's legacy pool calls such a connection new and every connection
-    /// its checkout takes reused, one dialed for another request included, and resends a
-    /// request refused before it was written only on a reused one. A reservation an
-    /// acquisition took on a session it selected, idle, returning or dialed for another
-    /// acquisition, or one taken with [`OwnedClientSession::reserve_request`], was not dialed
-    /// for its acquisition.
+    /// acquisition that returned it, and reserved it when the dial completed.
+    ///
+    /// hyper-util's `legacy` pool treats such a connection as new, and every connection its
+    /// checkout takes as reused, including one dialed for another request. It retries a
+    /// request that failed before it was written only on a reused connection. This returns
+    /// false for a reservation on a session the acquisition selected (idle, returning or
+    /// dialed for another acquisition), and for one taken with
+    /// [`OwnedClientSession::reserve_request`].
     pub fn dialed_for_acquisition(&self) -> bool {
         self.dialed_for_acquisition
     }
@@ -1115,8 +1113,8 @@ impl OwnedClientReservation {
     }
 
     /// Submits an already-read request head and its body source. The
-    /// submission resolves at the driver's commitment, with the response's
-    /// fresh source.
+    /// submission resolves when the driver commits the request, with the
+    /// response's fresh source.
     pub fn submit(
         self,
         headers: HttpHeaderEvent,
@@ -1133,10 +1131,9 @@ impl OwnedClientReservation {
         })
     }
 
-    /// As [`submit`](Self::submit), but the submission resolves at the first
-    /// response head, or at a response that ends or fails before one, as the
-    /// owned upstreams' `submit_with_response_interest` does, which documents
-    /// `producer_completion`.
+    /// Like [`submit`](Self::submit), but the submission resolves at the first
+    /// response head, or when the response ends or fails before one. The owned
+    /// upstreams' `submit_with_response_interest` documents `producer_completion`.
     pub fn submit_with_response_interest(
         self,
         headers: HttpHeaderEvent,
@@ -1164,10 +1161,10 @@ impl OwnedClientReservation {
         })
     }
 
-    /// Roxygen-only (`DIV-047`): as [`submit`](Self::submit), but the response's
-    /// [`OwnedClientPullThroughBody`] drives the HTTP/1.1 connection from inside its reads
-    /// (`OwnedH1UpstreamReservation::submit_pull_through`). On HTTP/2 the request is refused
-    /// with `INVALID_STATE_TRANSITION` at once, and the refusal does not report
+    /// Like [`submit`](Self::submit), but the response's [`OwnedClientPullThroughBody`]
+    /// drives the HTTP/1.1 connection from inside its reads
+    /// (`OwnedH1UpstreamReservation::submit_pull_through`). On HTTP/2 the request is
+    /// rejected immediately with `INVALID_STATE_TRANSITION`, without reporting
     /// `request_unprocessed`.
     pub fn submit_pull_through(
         self,
@@ -1196,7 +1193,7 @@ enum Submission {
 }
 
 impl OwnedClientSubmission {
-    /// Selects `error` for the request; selected before the response is
+    /// Selects `error` for the request. If selected before the response is
     /// claimed, it fails the submission.
     pub fn cancel(&self, error: HttpError) {
         match &self.0 {
@@ -1268,19 +1265,19 @@ impl OwnedClientResponse {
     }
 }
 
-/// A submitted pull-through request (`DIV-047`): a future of its response, which resolves at
-/// the driver's commitment. Dropping it before it resolves cancels the request, as dropping an
-/// [`OwnedClientSubmission`] does.
+/// A submitted pull-through request: a future of its response, which resolves when the
+/// driver commits the request. Dropping it before it resolves cancels the request, as
+/// dropping an [`OwnedClientSubmission`] does.
 pub struct OwnedClientPullThroughSubmission(PullThroughSubmission);
 
 enum PullThroughSubmission {
     Http1(OwnedH1PullThroughSubmission),
-    /// Refused before it reached a driver: HTTP/2 has no pull-through exchanges.
+    /// Rejected before it reached a driver, since HTTP/2 does not support pull-through.
     Refused(Option<HttpError>),
 }
 
 impl OwnedClientPullThroughSubmission {
-    /// Selects `error` for the request; selected before the response is
+    /// Selects `error` for the request. If selected before the response is
     /// claimed, it fails the submission.
     pub fn cancel(&self, error: HttpError) {
         if let PullThroughSubmission::Http1(submission) = &self.0 {
@@ -1332,16 +1329,15 @@ impl Future for OwnedClientPullThroughSubmission {
     }
 }
 
-/// A claimed pull-through response (`DIV-047`): its body, its request's control, and how many
-/// requests its connection committed before it.
+/// A claimed pull-through response: its body, its request's control, and how many requests
+/// its connection committed before it.
 pub struct OwnedClientPullThroughResponse {
     pub body: OwnedClientPullThroughBody,
     pub request: OwnedClientRequest,
     pub sequence: u64,
 }
 
-/// A pull-through exchange's response body (`DIV-047`), `OwnedH1PullThroughBody`'s client
-/// handle.
+/// A pull-through exchange's response body: the client handle of an `OwnedH1PullThroughBody`.
 pub struct OwnedClientPullThroughBody(OwnedH1PullThroughBody);
 
 impl OwnedClientPullThroughBody {
@@ -1364,8 +1360,8 @@ impl OwnedClientPullThroughBody {
         self.0.poll_body(context, maximum)
     }
 
-    /// Stops the response, as dropping the body does: its read retires before its source is
-    /// cleared with `error`, and its connection's drive returns to the session's run.
+    /// Stops the response, as dropping the body does. Its read retires before its source is
+    /// cleared with `error`, and the session's run resumes driving the connection.
     pub fn stop(&mut self, error: Option<HttpErrorCode>) {
         self.0.stop(error);
     }
@@ -1382,7 +1378,7 @@ enum Request {
 }
 
 impl OwnedClientRequest {
-    /// The request's admission slot has been released.
+    /// Whether the request's admission slot has been released.
     pub fn capacity_released(&self) -> bool {
         match &self.0 {
             Request::Http1(request) => request.capacity_released(),

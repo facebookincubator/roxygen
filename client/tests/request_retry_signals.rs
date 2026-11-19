@@ -5,11 +5,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! What a caller needs to retry, as hyper-util's `retry_canceled_requests`
-//! does, a request that failed unstarted on a reused connection (`DIV-035`):
-//! `UniplexResponse::sequence_number` counts the requests the connection
-//! carried before, and `UniplexResponseProgressExt::request_started` says
-//! whether any of the request was serialized.
+//! The signals a caller needs to retry a request that failed unstarted on a
+//! reused connection, as hyper-util's `retry_canceled_requests` does.
+//! `UniplexResponse::sequence_number` counts the requests the connection carried
+//! before, and `UniplexResponseProgressExt::request_started` reports whether any
+//! of the request was serialized.
 
 use std::io::Read;
 use std::io::Write;
@@ -42,7 +42,7 @@ use crate::pool::PoolParams;
 fn a_pooled_connection_reports_its_earlier_requests_and_each_request_s_start() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("engine binds");
     let address = listener.local_addr().expect("engine address");
-    // One keep-alive connection that answers two GETs.
+    // One keep-alive connection that replies to two GETs.
     let engine = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("engine accepts");
         let mut input = Vec::new();
@@ -149,24 +149,24 @@ fn read_request_head(stream: &mut TcpStream, input: &mut Vec<u8>) {
     input.drain(..end + 4);
 }
 
-/// What `stale_reused_connection` observed of the second request.
+/// What `stale_reused_connection` recorded about the second request.
 #[cfg(not(fbcode_build))]
 #[derive(Debug, PartialEq)]
 struct StaleReuse {
     sequence_number: u64,
     started_before_the_eof: bool,
     started_after: bool,
-    /// The head read's error within a bound; `None` while it is still pending.
+    /// The head read's error, or `None` if the read is still pending at the bound.
     head_error: Option<roxygen_core::error::HttpErrorCode>,
     /// What the engine received after its FIN.
     engine_received: Vec<u8>,
 }
 
-/// A pooled connection that carried one request is reused for a second one,
-/// whose session writer is held (the session's `test-hooks` feature) while the
-/// engine closes its side (FIN), as when that FIN and the request's commit fall
-/// in one turn: the shape of hyper-util's `retry_canceled_requests` case.
-/// With session timers off, as the router sets them.
+/// Reuses a pooled connection that carried one request for a second request,
+/// with session timers off. The second request's session writer is held (the
+/// session's `test-hooks` feature) while the engine closes its side (FIN), as
+/// when that FIN and the request's commit fall in one turn. This is the case
+/// that hyper-util's `retry_canceled_requests` handles.
 #[cfg(not(fbcode_build))]
 fn stale_reused_connection() -> StaleReuse {
     let listener = TcpListener::bind("127.0.0.1:0").expect("engine binds");
@@ -251,7 +251,8 @@ fn stale_reused_connection() -> StaleReuse {
                 .expect("second request is committed");
             let started_before_the_eof = response.request_started();
             close.send(()).expect("engine waits for the FIN request");
-            // Loopback delivers the FIN at once; the session reads it meanwhile.
+            // Loopback delivers the FIN immediately, and the session reads it
+            // during this sleep.
             tokio::time::sleep(Duration::from_millis(100)).await;
             release.notify_one();
             let head_error = tokio::time::timeout(
@@ -293,8 +294,8 @@ fn stale_reused_connection() -> StaleReuse {
     }
 }
 
-/// The request fails unstarted with `TRANSPORT_EOF` on the
-/// reused connection, never written: hyper-util's retry condition
+/// The request fails unstarted with `TRANSPORT_EOF` on the reused connection
+/// and is never written, which meets hyper-util's retry condition
 /// (`sequence_number != 0 && !request_started()`).
 #[cfg(not(fbcode_build))]
 #[test]

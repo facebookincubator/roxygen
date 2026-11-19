@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The experimental owned client session (`DIV-046`), over loopback TCP and
+//! The experimental owned client session, over loopback TCP and
 //! adopted transports, against a hyper origin and scripted peers, on a
 //! `RuntimeOwner` worker that must quiesce without forcing.
 
@@ -181,7 +181,7 @@ fn large_body() -> Vec<u8> {
     (0..LARGE).map(|index| (index % 251) as u8).collect()
 }
 
-/// The origin's routes, one per exchange of the differential table.
+/// The origin's routes for the `Exchange` requests.
 async fn respond(
     request: hyper::Request<Incoming>,
 ) -> Result<hyper::Response<OriginBody>, Infallible> {
@@ -249,7 +249,7 @@ async fn respond(
 
 async fn serve(stream: tokio::net::TcpStream, protocol: CodecProtocol) {
     let io = TokioIo::new(stream);
-    // A connection the client resets ends with an error no oracle reads.
+    // The tests ignore the error that ends a connection that the client resets.
     if protocol == CodecProtocol::Http2 {
         let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
             .serve_connection(io, service_fn(respond))
@@ -316,7 +316,8 @@ impl Drop for Origin {
     }
 }
 
-/// One exchange of the differential table.
+/// One exchange with the origin. `TABLE` holds the ones compared between
+/// session types.
 #[derive(Clone, Copy, Debug)]
 enum Exchange {
     Fixed,
@@ -373,7 +374,7 @@ impl Exchange {
     }
 }
 
-/// A response as a reader sees it, without the origin's `Date`.
+/// A response as its reader received it, without the origin's `Date`.
 #[derive(Debug, Default, PartialEq)]
 struct Received {
     status: Option<u16>,
@@ -768,10 +769,10 @@ fn settings_list(payload: &[u8]) -> Vec<(u16, u32)> {
         .collect()
 }
 
-/// A raw HTTP/2 peer: it reads the client's preface and SETTINGS, then, for
-/// each limit `advertise` sends, sends SETTINGS with that
-/// `MAX_CONCURRENT_STREAMS` and reports when the client acknowledged it. Once
-/// `advertise` closes, it reads until the client's GOAWAY or EOF.
+/// A raw HTTP/2 peer that reads the client's preface and SETTINGS. For each
+/// limit received on `advertise`, it sends SETTINGS with that
+/// `MAX_CONCURRENT_STREAMS` and reports when the client has acknowledged it.
+/// Once `advertise` closes, it reads until the client's GOAWAY or EOF.
 fn settings_peer() -> (SocketAddr, mpsc::Sender<u32>, mpsc::Receiver<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("peer binds");
     let address = listener.local_addr().expect("peer address");
@@ -805,10 +806,10 @@ fn settings_peer() -> (SocketAddr, mpsc::Sender<u32>, mpsc::Receiver<()>) {
     (address, advertise, acknowledgments)
 }
 
-/// The owned HTTP/2 session's capacity with `local` as its own outgoing
-/// limit: before the peer's SETTINGS, after SETTINGS of 3 and of 5, with
-/// every slot reserved, and once those reservations drop; and the refusal of
-/// one reservation more.
+/// The owned HTTP/2 session's capacity, with `local` as its own outgoing
+/// limit, before the peer's SETTINGS, after SETTINGS of 3 and of 5, with every
+/// slot reserved, and once those reservations drop, plus the error for one
+/// reservation too many.
 fn http2_capacities(local: Option<u32>) -> (Vec<u32>, Option<HttpErrorCode>) {
     let (address, advertise, acknowledgments) = settings_peer();
     run_on_worker(move |context| async move {
@@ -932,8 +933,8 @@ fn cancelling_the_session_fails_its_exchange_and_closes_it() {
     }
 }
 
-/// The first SETTINGS a client's HTTP/2 connection sends, read by a peer
-/// that answers nothing, then the client cancels.
+/// The first SETTINGS that a client's HTTP/2 connection sends, read by a peer
+/// that does not respond. The client then cancels.
 fn first_settings(owned: bool) -> Vec<(u16, u32)> {
     let listener = TcpListener::bind("127.0.0.1:0").expect("peer binds");
     let address = listener.local_addr().expect("peer address");
@@ -996,10 +997,9 @@ fn the_owned_http2_session_disables_push_where_the_client_session_enables_it() {
     assert_eq!(owned, without_push, "nothing else differs");
 }
 
-/// How the engine's read ends after an owned session with
-/// `non_abortive_close` is cancelled while its request waits for a response:
-/// a session that dialed, or one that attached a TCP transport its caller
-/// dialed.
+/// How the engine's read ends when an owned session with or without
+/// `non_abortive_close` is cancelled while its request waits for a response.
+/// The session dialed, or attached a TCP transport that its caller dialed.
 fn engine_read_after_cancel((attached, non_abortive_close): (bool, bool)) -> &'static str {
     let listener = TcpListener::bind("127.0.0.1:0").expect("engine binds");
     let address = listener.local_addr().expect("engine address");
@@ -1060,8 +1060,8 @@ fn a_cancelled_session_resets_its_connection_by_default_and_ends_it_with_fin_whe
     );
 }
 
-/// A submission's progress before the driver runs, its response's once
-/// claimed, and whether the response's capacity was released once read.
+/// A submission's progress before the driver runs, its response's progress
+/// once claimed, and the release of the response's capacity once read.
 #[test]
 fn submissions_and_responses_report_request_progress() {
     for protocol in [CodecProtocol::Http11, CodecProtocol::Http2] {
@@ -1136,8 +1136,8 @@ fn a_drained_session_refuses_a_reserved_request_unprocessed() {
 }
 
 /// A response-interest submission stays pending while the origin holds the
-/// response head, and fails with the submission's cancel; on another session
-/// it resolves at the origin's head.
+/// response head, and fails with the submission's cancel. On another session,
+/// it resolves when the origin sends the head.
 #[test]
 fn a_response_interest_submission_waits_for_the_response_head() {
     for protocol in [CodecProtocol::Http11, CodecProtocol::Http2] {
@@ -1227,8 +1227,8 @@ impl HeaderCodecStats for QuietStats {
     fn record_decode_too_large(&self) {}
 }
 
-/// A parameter the owned client refuses on `protocol`, and the field its
-/// error names.
+/// A parameter that the owned client rejects on `protocol`, and the field
+/// named in its error.
 struct Refused {
     protocol: CodecProtocol,
     session: SessionParams,
@@ -1325,8 +1325,8 @@ fn refused() -> Vec<Refused> {
     table
 }
 
-/// A refusal as observed: the case, and the error's code and whether its
-/// message names the field; `None` when the session started instead.
+/// A rejection as observed: the case, then the error's code and whether its
+/// message contains the field name, or `None` when the session started.
 type Refusal = (CodecProtocol, &'static str, Option<(HttpErrorCode, bool)>);
 
 fn refusal(
@@ -1455,8 +1455,7 @@ fn attach_refuses_what_the_owned_drivers_cannot_honor() {
     assert_eq!(unsupported, Some(HttpErrorCode::CONNECT_ERROR));
 }
 
-/// Counts the indexing decisions an HPACK encoder asks for, and indexes
-/// nothing.
+/// Counts the HPACK encoder's indexing queries and returns `false` for each.
 #[derive(Clone)]
 struct CountingStrategy(Rc<Cell<usize>>);
 
@@ -1471,11 +1470,11 @@ impl HeaderIndexingStrategy for CountingStrategy {
     }
 }
 
-/// The router's session parameters (prod_inference `RoxygenClientParams`):
-/// timers off; `deliver_ingress_before_abort` (`DIV-033`) on both protocols;
-/// on HTTP/1.1 every other hyper-parity option; on HTTP/2 hyper's SETTINGS, no
-/// local stream limit and hyper's connection window, with the HTTP/1.1-only
-/// options also on, which HTTP/2 sessions ignore.
+/// An inference router's session parameters. Timers are off and
+/// `deliver_ingress_before_abort` is on for both protocols. HTTP/1.1 also gets
+/// the other hyper-parity options. HTTP/2 gets hyper's SETTINGS and connection
+/// window and an unlimited local stream count, plus the HTTP/1.1-only options,
+/// which HTTP/2 sessions ignore.
 fn router_session(protocol: CodecProtocol, strategy: &CountingStrategy) -> SessionParams {
     let http2 = protocol == CodecProtocol::Http2;
     let setting = |identifier, value| CodecSetting { identifier, value };
@@ -1500,11 +1499,11 @@ fn router_session(protocol: CodecProtocol, strategy: &CountingStrategy) -> Sessi
     }
 }
 
-/// The statuses of two exchanges and the indexing decisions they asked for.
+/// The statuses of two exchanges and the number of indexing queries they made.
 type Served = (Vec<Option<u16>>, usize);
 
-/// With the router's parameters, what a uniplex `ClientSession` serves, and
-/// what an owned session serves or its refusal's code.
+/// What a uniplex `ClientSession` and an owned session serve with the router's
+/// parameters, or the owned session's error code if it rejects them.
 fn router_exchanges(protocol: CodecProtocol) -> (Served, Result<Served, HttpErrorCode>) {
     let origin = Origin::start(protocol);
     let address = origin.address;
@@ -1586,8 +1585,9 @@ fn stream_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// An h2c peer that answers stream 1 with a 200 head and `first`, then resets
-/// it with `CANCEL`, in one write, and reads until the client's GOAWAY or EOF.
+/// An h2c peer that responds on stream 1 with a 200 head and `first`, then
+/// resets it with `CANCEL`, in one write, and reads until the client's GOAWAY
+/// or EOF.
 fn reset_after_data_peer() -> (SocketAddr, std::thread::JoinHandle<()>) {
     const HEADERS: u8 = 1;
     const DATA: u8 = 0;
@@ -1676,9 +1676,10 @@ fn reset_after_data_reads(enabled: bool) -> (Received, Received) {
     (uniplex, owned)
 }
 
-/// `DIV-033` on an owned HTTP/2 session: with the option on, a response reset
-/// after part of it arrived yields the head and bytes received, then the
-/// reset's error, as through a `ClientSession`; with it off, both lose them.
+/// `deliver_ingress_before_abort` on an owned HTTP/2 session. With the option
+/// on, a response reset after part of it arrived yields the head and bytes
+/// received, then the reset's error, as through a `ClientSession`. With it off,
+/// both sessions drop them.
 #[test]
 fn an_owned_http2_reset_after_data_yields_the_data_first_when_enabled() {
     let (uniplex, owned) = reset_after_data_reads(true);
@@ -1756,10 +1757,10 @@ fn cancelling_the_attachment_cancels_the_session() {
     }
 }
 
-/// An idle owned session when its worker quiesces: what the scenario saw
+/// Quiesces the worker of an idle owned session. Returns the scenario's result
 /// (the exchange's status, whether `wait_closed` resolved `Ok`, and
-/// `is_finished`), whether the quiesce completed in time, and how many
-/// workers were forced.
+/// `is_finished`), whether the quiesce completed in time, and how many workers
+/// were forced.
 fn quiesce_with_an_idle_session(
     protocol: CodecProtocol,
 ) -> (Option<(Option<u16>, bool, bool)>, bool, usize) {
@@ -1856,10 +1857,9 @@ async fn attach_to_origin(
     OwnedClientSession::attach(context, transport, options).expect("owned session attaches")
 }
 
-/// Cancelling the attachment closes the session's admission at once, before
-/// its run observes the cancellation, as `ClientSession::reserve_request`
-/// refuses with `DROPPED`: (capacity before, capacity after, the reservation's
-/// error, `wait_closed`'s error).
+/// Cancelling the attachment closes the session's admission immediately,
+/// before its run observes the cancellation, so a reservation fails with
+/// `DROPPED` as `ClientSession::reserve_request` does.
 #[test]
 fn attachment_cancellation_closes_admission_before_the_run_observes_it() {
     for protocol in [CodecProtocol::Http11, CodecProtocol::Http2] {
@@ -1889,11 +1889,9 @@ fn attachment_cancellation_closes_admission_before_the_run_observes_it() {
     }
 }
 
-/// Worker quiescence closes an idle session's admission at once, before its
-/// run observes it, as `ClientSession::reserve_request` refuses with
-/// `DROPPED`; the session then closes: (the exchange's status, capacity
-/// before, capacity after, the reservation's error, whether `wait_closed`
-/// resolved `Ok`).
+/// Worker quiescence closes an idle session's admission immediately, before
+/// its run observes it, so a reservation fails with `DROPPED` as
+/// `ClientSession::reserve_request` does. The session then closes.
 #[test]
 fn worker_quiescence_closes_admission_before_the_run_observes_it() {
     for protocol in [CodecProtocol::Http11, CodecProtocol::Http2] {
@@ -1920,7 +1918,7 @@ fn worker_quiescence_closes_admission_before_the_run_observes_it() {
 }
 
 /// The contained panics `worker` counted since `start`, by scope: exchange,
-/// connection, driver (`DIV-056`).
+/// connection, driver.
 fn contained_panic_counts(worker: &WorkerHandle, start: &WorkerPollStats) -> (u64, u64, u64) {
     let delta = worker.poll_stats().since(start);
     (
@@ -1989,13 +1987,11 @@ async fn queue_a_panicking_upload_then_quiesce(
     submission.await.err().map(|error| error.code())
 }
 
-/// A body that panics as worker quiescence's drain refuses its queued request
-/// is contained as `ClientSession` contains a drain callback's panic: the
-/// session is cancelled, its run's I/O cleanup completes without a forced
+/// A body that panics while worker quiescence's drain refuses its queued
+/// request is contained as `ClientSession` contains a drain callback's panic.
+/// The session is cancelled, its run's I/O cleanup completes without a forced
 /// worker, and `wait_closed` fails `INTERNAL_ERROR`. The run scope counts the
-/// panic at connection scope (`DIV-056`): (the exchange's status, the refused
-/// submission's error, `wait_closed`'s error and message, `is_finished`, the
-/// worker's contained panics by scope).
+/// panic at connection scope.
 #[test]
 fn a_panic_in_the_quiescence_drain_cancels_the_session_and_completes_its_cleanup() {
     for protocol in [CodecProtocol::Http11, CodecProtocol::Http2] {
@@ -2037,11 +2033,10 @@ fn a_panic_in_the_quiescence_drain_cancels_the_session_and_completes_its_cleanup
     }
 }
 
-/// A failed quiescence drain cancels the session without an event its pool hears, so the
-/// session sets the selection-index flag its pool handed it at `bind_pool` (S6.9), as its
-/// cancellation does; a drain that closes admission leaves the flag alone. The pool is already
-/// gone, so only the session can set the flag: (the exchange's status, the flag after a clean
-/// drain), then the same after a drain whose refused upload panics.
+/// A failed quiescence drain cancels the session without notifying its pool, so the session
+/// sets the selection-index flag that its pool passed to `bind_pool`, as its cancellation does.
+/// A drain that closes admission leaves the flag alone. The pool is already gone, so only the
+/// session can set the flag.
 #[test]
 fn a_failed_quiescence_drain_unsettles_its_pool_s_index() {
     for protocol in [CodecProtocol::Http11, CodecProtocol::Http2] {
@@ -2073,8 +2068,7 @@ fn a_failed_quiescence_drain_unsettles_its_pool_s_index() {
 
 /// An attachment cancellation requested inside worker quiescence's drain wins
 /// over the drain's failure, as `ClientSession`'s attachment cancellation
-/// wins over its quiescence: (the exchange's status, the refused submission's
-/// error, `wait_closed`'s error).
+/// wins over its quiescence.
 #[test]
 fn an_attachment_cancellation_wins_over_a_failed_quiescence_drain() {
     for protocol in [CodecProtocol::Http11, CodecProtocol::Http2] {
@@ -2103,10 +2097,9 @@ fn an_attachment_cancellation_wins_over_a_failed_quiescence_drain() {
 }
 
 /// Worker quiescence after an attachment cancellation leaves the session to
-/// the cancellation, as `ClientSession`'s owner drains no cancelled session:
-/// a queued request fails `CORO_CANCELLED` rather than being refused as
-/// drained: (the exchange's status, the queued submission's error,
-/// `wait_closed`'s error).
+/// the cancellation, as `ClientSession`'s owner does not drain a cancelled
+/// session. A queued request fails `CORO_CANCELLED` rather than being refused
+/// as drained.
 #[test]
 fn quiescence_after_an_attachment_cancellation_does_not_drain_the_session() {
     for protocol in [CodecProtocol::Http11, CodecProtocol::Http2] {
@@ -2167,12 +2160,10 @@ impl HeaderIndexingStrategy for CancelOnLastDrop {
     }
 }
 
-/// An attachment cancellation requested during the run's final poll, as the
+/// An attachment cancellation requested during the run's final poll, while the
 /// owned HTTP/2 driver destroys its header indexing strategy, fails
-/// `wait_closed` `CORO_CANCELLED`, as `ClientSession`'s owner rechecks its
-/// attachment after its run's cleanup: (the exchange's status, whether the
-/// attachment was cancelled before the close and after it, `wait_closed`'s
-/// error).
+/// `wait_closed` with `CORO_CANCELLED`. `ClientSession`'s owner does the same
+/// because it rechecks its attachment after its run's cleanup.
 #[test]
 fn an_attachment_cancellation_during_the_run_s_final_poll_fails_wait_closed() {
     let origin = Origin::start(CodecProtocol::Http2);
@@ -2206,13 +2197,13 @@ fn an_attachment_cancellation_during_the_run_s_final_poll_fails_wait_closed() {
     );
 }
 
-/// The request header whose HPACK encoding [`PanicsOnHeader`] panics on.
+/// The request header that makes [`PanicsOnHeader`] panic.
 #[cfg(panic = "unwind")]
 const PANIC_HEADER: &str = "x-panic";
 
 /// A header indexing strategy that panics when the owned HTTP/2 driver's
-/// encoder asks about [`PANIC_HEADER`], outside any narrower boundary than the
-/// driver's turn (`DIV-056`).
+/// encoder queries [`PANIC_HEADER`]. Only the driver's turn catches the panic,
+/// not a narrower boundary.
 #[cfg(panic = "unwind")]
 #[derive(Clone)]
 struct PanicsOnHeader;
@@ -2231,14 +2222,11 @@ impl HeaderIndexingStrategy for PanicsOnHeader {
     }
 }
 
-/// `DIV-056`: a panic in an owned HTTP/2 session's driver, outside
-/// any narrower boundary, ends that session alone. Its run returns
-/// `Err(INTERNAL_ERROR)` once its teardown has joined native I/O, the run
-/// scope publishes that to `wait_closed` without panicking, the panic is
-/// counted at driver scope, and the worker serves a second session and
-/// quiesces without forcing: (the first exchange's status, the panicking
-/// request's error, `wait_closed`'s error and message, `is_finished`, the
-/// worker's contained panics by scope, the second session's status).
+/// A panic in an owned HTTP/2 session's driver, outside any narrower boundary,
+/// ends only that session. Its run returns `Err(INTERNAL_ERROR)` once its
+/// teardown has joined native I/O, the run scope publishes that to
+/// `wait_closed` without panicking, and the panic is counted at driver scope.
+/// The worker then serves a second session and quiesces without forcing.
 #[cfg(panic = "unwind")]
 #[test]
 fn owned_client_session_driver_panic_does_not_fail_the_worker() {
@@ -2331,16 +2319,13 @@ impl Drop for PanickingUpload {
     }
 }
 
-/// `DIV-056`: a pooled owned HTTP/2 session outlives a request whose
-/// upload panics. The request is written, then its upload's first read panics:
-/// its response fails `CORO_CANCELLED` as for a failed upload, its source is
-/// dropped without `stop_reading`, the panic is counted at exchange scope, and
-/// the pool's next acquisition takes the same session, which serves it, with
-/// no other dial. `/hang` never answers, so only the upload's failure ends the
-/// first response: (the first response's error, the upload's stops and drops,
-/// whether the session finished, whether the next acquisition took the same
-/// connection, its response's status, the pool's sessions, dial attempts and
-/// closed sessions, the worker's contained panics by scope).
+/// A pooled owned HTTP/2 session outlives a request whose upload panics. The
+/// request is written, then its upload's first read panics. Its response fails
+/// `CORO_CANCELLED` as for a failed upload, its source is dropped without
+/// `stop_reading`, the panic is counted at exchange scope, and the pool's next
+/// acquisition takes the same session, which serves it without another dial.
+/// `/hang` never responds, so only the upload's failure ends the first
+/// response.
 #[cfg(panic = "unwind")]
 #[test]
 fn owned_pool_keeps_a_session_after_an_h2_upload_panic() {
@@ -2432,17 +2417,13 @@ fn owned_pool_keeps_a_session_after_an_h2_upload_panic() {
     );
 }
 
-/// `DIV-056`: a pooled owned HTTP/1.1 session ends with its
-/// request when that request's upload panics: HTTP/1.1 cannot drop half a
-/// message, so the request fails as a failed upload does, its source is dropped
-/// without `stop_reading`, and its connection resets with `Err(INTERNAL_ERROR)`
-/// instead of the panic failing the worker. The panic is counted at exchange
-/// scope, and the pool's next acquisition dials a new session, which serves it.
-/// `/hang` never answers, so only the upload's failure ends the first response:
-/// (the first response's error, the upload's stops and drops, whether the
-/// session finished, whether the next acquisition took another connection, its
-/// response's status, the pool's sessions, dial attempts and closed sessions,
-/// the worker's contained panics by scope).
+/// A pooled owned HTTP/1.1 session ends with its request when that request's
+/// upload panics. HTTP/1.1 cannot drop half a message, so the request fails as
+/// a failed upload does, its source is dropped without `stop_reading`, and its
+/// connection resets with `Err(INTERNAL_ERROR)` instead of the panic failing
+/// the worker. The panic is counted at exchange scope, and the pool's next
+/// acquisition dials a new session, which serves it. `/hang` never responds, so
+/// only the upload's failure ends the first response.
 #[cfg(panic = "unwind")]
 #[test]
 fn owned_pool_replaces_a_session_after_an_h1_upload_panic() {
@@ -2534,11 +2515,10 @@ fn owned_pool_replaces_a_session_after_an_h1_upload_panic() {
 }
 
 /// On HTTP/2, which has no pull-through exchanges, a pull-through submission
-/// is refused with `INVALID_STATE_TRANSITION` before it reaches the driver,
-/// and reports no `request_unprocessed`, so a stale-connection retry would not
+/// is refused with `INVALID_STATE_TRANSITION` before it reaches the driver. It
+/// does not report `request_unprocessed`, so a stale-connection retry would not
 /// repeat it. The session then serves a plain exchange as its first committed
-/// request: (the refusal's code, the refused submission's progress, the next
-/// exchange's status and sequence number).
+/// request.
 #[test]
 fn submit_pull_through_is_refused_on_http2() {
     let origin = Origin::start(CodecProtocol::Http2);
@@ -2571,10 +2551,10 @@ fn submit_pull_through_is_refused_on_http2() {
     );
 }
 
-/// Every owned HTTP/1.1 session is rooted with `run_pull_through`, so each
-/// exchange selects how its response is read, with no session option: a
-/// pull-through exchange, then a plain one, then another pull-through one, on
-/// one connection (`DIV-047`): (status, body length, sequence number) each.
+/// Every owned HTTP/1.1 session runs with `run_pull_through`, so each exchange
+/// selects how its response is read, without a session option. A pull-through
+/// exchange, then a plain one, then another pull-through one share one
+/// connection.
 #[test]
 fn every_owned_http1_session_takes_pull_through_and_plain_exchanges() {
     let origin = Origin::start(CodecProtocol::Http11);
@@ -2670,7 +2650,7 @@ async fn pull_through_exchange(session: &OwnedClientSession, exchange: Exchange)
 }
 
 /// A pull-through session's responses, read through their bodies, equal an
-/// owned session's for the differential table's exchanges on one HTTP/1.1
+/// owned session's for the `Exchange::TABLE` exchanges on one HTTP/1.1
 /// connection: a fixed body, a 128 KiB upload echoed (the body takes the drive
 /// only once the upload is written), a streamed body with trailers, a 204,
 /// HEAD and a 300 000-byte body.
@@ -2713,8 +2693,8 @@ fn pull_through_responses_equal_owned_responses_over_http1() {
 }
 
 /// Reads a slow response's head and its body events through `body` until one
-/// carries bytes: (the head's status, that event's bytes, empty if the
-/// response ended first).
+/// carries bytes. Returns the head's status and that event's bytes, which are
+/// empty if the response ended first.
 async fn pull_through_head_and_first_chunk(
     body: &mut OwnedClientPullThroughBody,
 ) -> (Option<u16>, Vec<u8>) {
@@ -2735,10 +2715,10 @@ async fn pull_through_head_and_first_chunk(
 }
 
 /// What `wait_closed` reports, within 2 s, once the consumer of a slow
-/// response retires after its first chunk: on a pull-through session by
-/// stopping its body, which stays alive until then, and on an owned session by
-/// dropping its response's source: (the status, whether a chunk was read
-/// first, whether the run reset its transport or its error's code).
+/// response stops after its first chunk. On a pull-through session it stops
+/// its body, which stays alive until then. On an owned session it drops its
+/// response's source. Returns the status, whether a chunk was read first, and
+/// whether the run reset its transport or the error's code.
 fn closed_after_retiring_a_slow_response(
     pull_through: bool,
 ) -> (Option<u16>, bool, Result<bool, HttpErrorCode>) {
@@ -2803,8 +2783,9 @@ fn closed_after_retiring_a_slow_response(
 }
 
 /// Stopping a pull-through body mid-response closes its connection as
-/// dropping an owned response's source does, while the body still lives: the
-/// stop retires the read, clears the source and returns the drive to the run.
+/// dropping an owned response's source does, even while the body is still
+/// alive. The stop retires the read, clears the source and returns the drive
+/// to the run.
 #[test]
 fn a_stopped_pull_through_body_closes_its_connection_as_a_dropped_owned_source_does() {
     let pulled = closed_after_retiring_a_slow_response(true);
@@ -2813,12 +2794,10 @@ fn a_stopped_pull_through_body_closes_its_connection_as_a_dropped_owned_source_d
 }
 
 /// An attachment cancellation while a pull-through body holds the drive and is
-/// not being read cancels the session: the scope's stop check cancels the
+/// not being read cancels the session. The scope's stop check cancels the
 /// connection, which takes the drive back, so the run fails the exchange and
 /// completes, and `wait_closed` fails `CORO_CANCELLED` before the body is read
-/// again; the body's next read returns that error: (the status, whether a
-/// chunk was read first, `wait_closed` within 2 s, the next read's error,
-/// `is_finished`).
+/// again. The body's next read returns that error.
 #[test]
 fn pull_through_attachment_cancellation_while_held_cancels_the_session() {
     let origin = Origin::start(CodecProtocol::Http11);
@@ -2864,11 +2843,9 @@ fn pull_through_attachment_cancellation_while_held_cancels_the_session() {
 }
 
 /// Worker quiescence while a pull-through body holds the drive closes the
-/// session's admission at once and drains it without taking the drive back:
-/// the body reads the rest of its response, then the session closes and the
-/// worker quiesces without forcing: (the status, the whole body, the read's
-/// error, the reservation's error after quiescence began, whether
-/// `wait_closed` resolved `Ok`, `is_finished`).
+/// session's admission immediately and drains it without taking the drive
+/// back. The body reads the rest of its response, then the session closes and
+/// the worker quiesces without forcing.
 #[test]
 fn pull_through_worker_quiescence_while_held_drains_after_the_exchange() {
     let origin = Origin::start(CodecProtocol::Http11);
@@ -2911,11 +2888,11 @@ fn pull_through_worker_quiescence_while_held_drains_after_the_exchange() {
     );
 }
 
-/// A loopback origin whose first connection answers its request with a
-/// `Content-Length: 100` head and 10 body bytes, then, when the client sends
-/// on the returned sender, closes the connection and acknowledges on the
-/// returned receiver. With `replace`, it then serves an `ok` response on a
-/// second connection, which it reads until the client closes it.
+/// A loopback origin that responds on its first connection with a
+/// `Content-Length: 100` head and 10 body bytes. When the client sends on the
+/// returned sender, it closes the connection and acknowledges on the returned
+/// receiver. With `replace`, it then serves an `ok` response on a second
+/// connection, which it reads until the client closes it.
 fn eof_mid_response_origin(
     replace: bool,
 ) -> (
@@ -2963,15 +2940,13 @@ fn one_connection() -> PoolParams {
 
 /// While a pull-through body holds the drive and is not read, an upstream EOF
 /// inside its response is not applied, so its pool still counts the session
-/// open; the body's next read applies it, and the driver's `admission_closed`,
-/// which runs inside that read, reaches the pool there: the session is
+/// open. The body's next read applies it, and the driver's `admission_closed`,
+/// which runs inside that read, reaches the pool there. The session is
 /// draining when the read returns, and the waiter it wakes dials a
 /// replacement and is served on it. An owned session's run, the control,
-/// applies the EOF at once. (PT: the status, the first chunk, draining before
-/// the read, the waiter pending before it, the read's error, draining after
-/// it, the replacement's response and whether it is another connection.)
+/// applies the EOF immediately.
 #[test]
-fn n8_admission_closed_during_an_inline_drive_reaches_the_pool() {
+fn admission_closed_during_an_inline_drive_reaches_the_pool() {
     let (address, close, closures, origin) = eof_mid_response_origin(true);
     let pulled = run_on_worker(move |context| async move {
         let pool = OwnedHttpSessionPool::new(

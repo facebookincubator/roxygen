@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The experimental owned session pool (`DIV-046`).
+//! The experimental owned session pool.
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -40,37 +40,40 @@ use crate::pool::PoolState;
 use crate::pool::PooledSession;
 use crate::pool::start_acquisition;
 
-/// A worker-local pool of [`OwnedClientSession`]s to one address, with
-/// `HttpSessionPool`'s scheduler and [`PoolParams`]: the same connection,
-/// waiter, connect-timeout, acquisition-timeout, maximum-age, idle-timeout,
-/// reuse-order and idle-sweep semantics (`DIV-032`), shared with it. An HTTP/1.1 pool keeps its
-/// sessions that can take an exchange in a selection index, so that an
-/// acquisition that finds one, and a release, make no pass over the pool's
-/// sessions however many it holds; the selection is the scheduler's, or, opted into with
-/// [`OwnedHttpSessionPool::set_session_selection`], the least loaded session's (`DIV-048`).
+/// A worker-local pool of [`OwnedClientSession`]s to one address.
+///
+/// It shares `HttpSessionPool`'s scheduler and [`PoolParams`], with the same connection,
+/// waiter, connect-timeout, acquisition-timeout, maximum-age, idle-timeout, reuse-order and
+/// idle-sweep behavior. An HTTP/1.1 pool keeps the sessions that can take an exchange in an
+/// index, so that an acquisition that takes one, and a release, do not scan the pool's
+/// sessions. The scheduler selects the session unless
+/// [`OwnedHttpSessionPool::set_session_selection`] switches to the least loaded one.
 pub struct OwnedHttpSessionPool(HttpSessionPool);
 
 /// Which session an [`OwnedHttpSessionPool`]'s acquisition takes among its established
-/// sessions that can take an exchange (`DIV-048`).
+/// sessions that can take an exchange.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum OwnedSessionSelection {
     /// `HttpSessionPool`'s order: the first session in the pool's order that has an exchange
-    /// and can take another, else an idle session in `PoolParams::reuse_order` (`DIV-032`), so
-    /// that exchanges pack onto the first session with room.
+    /// and can take another, else an idle session in `PoolParams::reuse_order`. Exchanges
+    /// pack onto the first session with room.
     #[default]
     FirstAvailable,
-    /// The session with the fewest exchanges in flight: on HTTP/2 the fewest streams reserved
-    /// or open, so idle sessions first; on HTTP/1.1, whose sessions take one exchange, an idle
-    /// session before one whose free slot its driver has not settled yet, and a session whose
-    /// slot is returning, which has none in flight, before an idle one (`DIV-046`). Equally
-    /// loaded sessions are taken in `FirstAvailable`'s order: a busy one first, in the pool's
-    /// order, then an idle one in `PoolParams::reuse_order`.
+    /// The session with the fewest exchanges in flight.
+    ///
+    /// On HTTP/2 that is the fewest streams reserved or open, so idle sessions come first.
+    /// On HTTP/1.1, where a session takes one exchange, a session whose slot is returning
+    /// comes first, then an idle session, then one whose driver is not idle yet. Equally
+    /// loaded sessions are taken in `FirstAvailable`'s order: a busy one first, in the
+    /// pool's order, then an idle one in `PoolParams::reuse_order`.
     LeastLoaded,
 }
 
-/// A snapshot of an [`OwnedHttpSessionPool`]'s counters (`DIV-032`), which the pool keeps
-/// on its worker and updates only on its slow paths: dials, waits, admission closes,
-/// session completions and peer stream resets. Every field but `waiters` only grows.
+/// A snapshot of an [`OwnedHttpSessionPool`]'s counters.
+///
+/// The pool keeps them on its worker and updates them only on slow paths: dials, waits,
+/// admission closes, session completions and peer stream resets. Every field but
+/// `waiters` only grows.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct OwnedPoolStats {
@@ -82,32 +85,30 @@ pub struct OwnedPoolStats {
     pub connect_attempts: u64,
     /// Dial attempts that failed.
     pub connect_failures: u64,
-    /// Sessions whose admission a peer's GOAWAY closed, counted when it closed, before the
-    /// session's streams finish: a `NO_ERROR` GOAWAY, which drains the connection, as well
-    /// as one with an error code. A GOAWAY that arrives after admission closed for another
-    /// reason is not counted.
+    /// Sessions whose admission was closed by a peer GOAWAY, with `NO_ERROR` or an error
+    /// code. Counted when admission closes, before the session's streams finish. A GOAWAY
+    /// that arrives after admission closed for another reason is not counted.
     pub peer_goaways: u64,
     /// Of `peer_goaways`, those whose GOAWAY carried a code other than `NO_ERROR`.
     pub peer_goaway_errors: u64,
-    /// Sessions whose admission the pool closed to retire them: at `max_age` or
-    /// `idle_timeout`, at their release when `max_connections` is zero, or in the pool's
-    /// drain.
+    /// Sessions the pool closed to new exchanges to retire them: at `max_age` or
+    /// `idle_timeout`, on release when `max_connections` is zero, or when the pool drains.
     pub local_drains: u64,
-    /// Streams the peer refused, unprocessed: with an RST_STREAM carrying
-    /// `REFUSED_STREAM`, or with a GOAWAY whose last stream precedes them. Counted at the
-    /// refusal, also on a session the pool no longer holds, as after a GOAWAY.
+    /// Streams the peer refused unprocessed, with an RST_STREAM carrying `REFUSED_STREAM`
+    /// or a GOAWAY whose last stream ID is lower. Counted at the refusal, also on a session
+    /// the pool has already removed, as after a GOAWAY.
     pub refused_streams: u64,
-    /// Streams the peer reset with an RST_STREAM carrying another code, counted as
-    /// `refused_streams` are; not a `NO_ERROR` reset after the stream's whole response,
-    /// which stops only its upload (`DIV-050`).
+    /// Streams the peer reset with an RST_STREAM carrying any other code, counted like
+    /// `refused_streams`. A `NO_ERROR` reset after the whole response arrived only stops
+    /// the upload, and is not counted.
     pub reset_streams: u64,
     /// Acquisitions waiting now for a session, a stream slot or a dial.
     pub waiters: usize,
-    /// The most acquisitions that waited at once.
+    /// The highest number of acquisitions waiting at the same time.
     pub peak_waiters: usize,
     /// Acquisitions that failed with [`PoolError::Timeout`].
     pub acquisition_timeouts: u64,
-    /// Acquisitions refused with [`PoolError::MaxWaiters`].
+    /// Acquisitions rejected with [`PoolError::MaxWaiters`].
     pub max_waiters_rejections: u64,
 }
 
@@ -136,31 +137,32 @@ impl PoolReservation for OwnedGetSessionResult {
     }
 }
 
-/// A pending [`OwnedHttpSessionPool`] acquisition. Its first poll runs the
-/// pool's first acquisition step in place: a selected session is reserved and
-/// returned with no allocation, no clock read for the acquisition's deadline
-/// and one worker admission check, plus another after a drain the step runs
-/// (`DIV-046`), and the reservation is recorded on its entry alone. A nonzero
-/// `idle_timeout` or `max_age` still reads the clock for the sessions' expiry,
-/// as `HttpSessionPool`'s step does. Only an acquisition that waits for a
-/// session or a dial continues in a boxed future.
-/// While no acquisition waits, an HTTP/1.1 session whose slot is returning is
-/// taken at once (`DIV-046`). One that finds no session to take, below
-/// `max_connections`, waits for such a session, if no other acquisition waits
-/// for it, instead of starting a connection attempt; that session's next
-/// notification wakes it ahead of earlier waiters (`DIV-046`). One that starts a
-/// connection attempt and still waits when the attempt ends takes the attempt's
-/// outcome (`DIV-046`): the session the attempt established, reserved for it then
-/// while its worker admits reservations, so that a peer's close that the session
-/// reads before the acquisition runs refuses its request, unprocessed, instead of
-/// drawing another dial; or, in an HTTP/1.1 pool, the attempt's
-/// [`PoolError::ConnectFailed`], whatever other
-/// sessions or attempts the pool has. In an HTTP/2 pool a failed attempt fails it
-/// only with every waiter, as the last pending attempt of a pool with no session,
-/// as `HttpSessionPool`'s does.
-/// Dropping it before it resolves abandons the acquisition, as dropping
-/// `HttpSessionPool`'s does, and leaves a returning session it waited for to
-/// the next acquisition.
+/// A pending [`OwnedHttpSessionPool`] acquisition.
+///
+/// Its first poll runs the pool's first acquisition step in place. A selected session is
+/// reserved and returned without allocating or reading the clock for the acquisition's
+/// deadline. A nonzero `idle_timeout` or `max_age` still reads the clock for session
+/// expiry, as in `HttpSessionPool`. Only an acquisition that waits for a session or a dial
+/// continues in a boxed future.
+///
+/// While the waiter queue is empty, an HTTP/1.1 session whose slot is returning is taken
+/// immediately. Below `max_connections`, an acquisition that cannot take a session waits
+/// for such a returning session instead of dialing, unless another acquisition already
+/// waits for it. That session's next notification wakes it ahead of earlier waiters.
+///
+/// An acquisition that starts a dial and is still waiting when the dial ends takes its
+/// outcome, as hyper-util sends a request on the connection it dialed for it. A new
+/// session is reserved for it while the worker accepts reservations, so that a peer close
+/// read before the acquisition runs fails its request unprocessed instead of causing
+/// another dial. [`OwnedClientReservation::dialed_for_acquisition`] reports such a
+/// reservation. In an HTTP/1.1 pool a failed dial fails it with
+/// [`PoolError::ConnectFailed`], whatever other sessions or dials the pool has, as
+/// hyper-util fails a request whose connect fails. In an HTTP/2 pool, as in
+/// `HttpSessionPool`, a failed dial fails waiters only when it was the last pending dial of
+/// a pool without sessions, and then it fails all of them.
+///
+/// Dropping it before it resolves abandons the acquisition and leaves a returning session
+/// it waited for to the next acquisition.
 pub struct OwnedSessionAcquisition(Acquisition);
 
 enum Acquisition {
@@ -204,10 +206,10 @@ impl Future for OwnedSessionAcquisition {
 }
 
 impl OwnedHttpSessionPool {
-    /// A pool dialing `address` over plaintext TCP, as
+    /// Creates a pool that dials `address` over plaintext TCP, as
     /// [`OwnedClientSession::connect`] does, with `connection` and `session`.
-    /// Parameters an owned session cannot honor, and TLS, are
-    /// refused here, as `connect` refuses them, before any dial.
+    /// TLS and parameters an owned session cannot support are rejected here,
+    /// as `connect` rejects them, before any dial.
     pub fn new(
         context: WorkerContext,
         address: SocketAddress,
@@ -226,8 +228,8 @@ impl OwnedHttpSessionPool {
         )))
     }
 
-    /// Acquires a reservation, as `HttpSessionPool::get_session_with_reservation`,
-    /// on the fast acquisition path: see [`OwnedSessionAcquisition`].
+    /// Acquires a reservation, like `HttpSessionPool::get_session_with_reservation`
+    /// but on the fast path described at [`OwnedSessionAcquisition`].
     pub fn get_session_with_reservation(
         &self,
         cancellation: CancellationToken,
@@ -238,10 +240,10 @@ impl OwnedHttpSessionPool {
         })
     }
 
-    /// Selects among the pool's established sessions as `selection` says (`DIV-048`), from
-    /// the next acquisition step on; [`OwnedSessionSelection::FirstAvailable`] until set.
-    /// Refused with [`PoolError::Draining`] once the pool drains, as `HttpSessionPool`'s
-    /// setters are.
+    /// Sets how acquisitions select among the pool's established sessions, from the next
+    /// acquisition step on. The default is [`OwnedSessionSelection::FirstAvailable`].
+    /// Fails with [`PoolError::Draining`] once the pool drains, like `HttpSessionPool`'s
+    /// setters.
     pub fn set_session_selection(&self, selection: OwnedSessionSelection) -> Result<(), PoolError> {
         self.0.set_session_selection(selection)
     }
@@ -250,22 +252,23 @@ impl OwnedHttpSessionPool {
         self.0.session_count()
     }
 
-    /// The pool's counters now (`DIV-032`).
+    /// Returns a snapshot of the pool's counters.
     pub fn stats(&self) -> OwnedPoolStats {
         self.0.owned_stats()
     }
 
-    /// No session, waiter or pending connect.
+    /// Whether the pool has no session, waiter or pending connect.
     pub fn empty(&self) -> bool {
         self.0.empty()
     }
 
-    /// As `HttpSessionPool::drain`.
+    /// Drains the pool, like `HttpSessionPool::drain`.
     pub fn drain(&self) -> bool {
         self.0.drain()
     }
 
-    /// As `HttpSessionPool::drain_and_join`.
+    /// Drains the pool and returns a future that resolves once its tasks and sessions are
+    /// joined, like `HttpSessionPool::drain_and_join`.
     pub fn drain_and_join(&self) -> LocalClientFuture<Result<(), PoolError>> {
         self.0.drain_and_join()
     }

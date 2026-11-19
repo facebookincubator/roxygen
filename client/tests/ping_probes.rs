@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! PING probe plumbing through `SessionParams` and `ClientAttachOptions` (`DIV-024`).
+//! PING probe plumbing through `SessionParams` and `ClientAttachOptions`.
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -69,12 +69,12 @@ use crate::pool::PoolParams;
 
 const DEADLINE: Duration = Duration::from_secs(10);
 const INTERVAL: Duration = Duration::from_millis(50);
-/// The probe timeout of oracles that expect a drop.
+/// The probe timeout for tests that expect a drop.
 const TIMEOUT: Duration = Duration::from_millis(50);
-/// The probe interval of oracles that expect a drop after an exchange, long
+/// The probe interval for tests that expect a drop after an exchange, long
 /// enough that the exchange completes before the first probe.
 const DROP_INTERVAL: Duration = Duration::from_millis(500);
-/// The probe timeout of oracles that expect acknowledged probes to keep the
+/// The probe timeout for tests that expect acknowledged probes to keep the
 /// session, long enough that a scheduling stall does not drop it.
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -171,8 +171,8 @@ fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// An HTTP/2 server in raw frames, independent of Roxygen's codec: it
-/// acknowledges SETTINGS, answers each request with a `200` head (ending the
+/// An HTTP/2 server written in raw frames, independent of Roxygen's codec. It
+/// acknowledges SETTINGS, replies to each request with a `200` head (ending the
 /// stream when `end_responses`), and acknowledges only the first `acks` PINGs.
 /// It returns when the client closes or resets the connection.
 async fn raw_h2_peer(mut io: DuplexStream, acks: usize, end_responses: bool, log: Log) {
@@ -224,7 +224,7 @@ async fn raw_h2_peer(mut io: DuplexStream, acks: usize, end_responses: bool, log
     }
 }
 
-/// An HTTP/1.1 server that answers each request with an empty `200` and
+/// An HTTP/1.1 server that replies to each request with an empty `200` and
 /// records every byte it receives.
 async fn raw_h1_peer(mut io: DuplexStream, log: Log) {
     let mut buffer = [0; 4096];
@@ -339,7 +339,7 @@ fn assert_probe_timeout(error: &HttpError) {
     assert!(is_ping_probe_timeout(error), "{error:?}");
 }
 
-/// Counts the PINGs a server session answered.
+/// Counts the PING acknowledgements a server session sent.
 struct PingsAnswered(Arc<AtomicUsize>);
 
 impl LifecycleObserver for PingsAnswered {
@@ -366,8 +366,8 @@ impl HttpHandler for Ok200 {
     }
 }
 
-/// A Roxygen server that counts the PINGs it answers, over TLS with ALPN h2
-/// or over h2c, and the certificate it presents.
+/// Starts a Roxygen server, over TLS with ALPN h2 or over h2c, that counts the
+/// PINGs it acknowledges. Returns the server and the certificate it presents.
 fn start_server(tls: bool, pings: &Arc<AtomicUsize>) -> (ScopedHttpServer, Option<Vec<u8>>) {
     let mut config = ServerConfig {
         plaintext_protocol: CodecProtocol::Http2,

@@ -7,7 +7,7 @@
 
 //! `SessionParams::deliver_ingress_before_abort` lets a response's reader take
 //! the head and body bytes that arrived before the response failed, then the
-//! error, as Hyper's body channel and h2 do (`DIV-033`).
+//! error, as hyper's body channel and h2 do.
 
 use std::future::Future;
 use std::io::Read;
@@ -46,8 +46,8 @@ enum WaitForIngress {
     BeforeBody,
 }
 
-/// What a reader saw: the head's status or the error code it got instead,
-/// then each body event's bytes and the error that ended the body.
+/// What a reader received: the head's status or the error code returned
+/// instead, then each body event's bytes and the error that ended the body.
 #[derive(Debug, PartialEq)]
 enum Seen {
     Head(u16),
@@ -55,8 +55,8 @@ enum Seen {
     Error(HttpErrorCode),
 }
 
-/// An HTTP/1.1 peer that answers one request on one connection with `reply`,
-/// then closes the connection.
+/// An HTTP/1.1 peer that responds to one request on one connection with
+/// `reply`, then closes the connection.
 fn raw_engine(reply: &'static [u8]) -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("engine binds");
     let address = listener.local_addr().expect("engine address");
@@ -311,9 +311,9 @@ fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// An h2c peer that answers stream 1 with a 200 head and `first`, then resets
-/// it with `CANCEL`, all in one write, and keeps the connection open until the
-/// client closes it.
+/// An h2c peer that responds on stream 1 with a 200 head and `first`, then
+/// resets it with `CANCEL`, all in one write, and keeps the connection open
+/// until the client closes it.
 fn h2_engine() -> (SocketAddr, JoinHandle<()>) {
     const SETTINGS: u8 = 4;
     const HEADERS: u8 = 1;

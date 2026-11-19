@@ -2209,8 +2209,10 @@ mod connector {
         assert!(mismatched.is_err());
     }
 
+    /// The connector does not classify TLS connect failures, so a hostname
+    /// mismatch also reports `verification_error` as `false`.
     #[test]
-    fn tls_connection_failure_stats_preserve_frozen_verify_flag() {
+    fn tls_connection_failure_stats_report_no_verification_error() {
         let (server, certificate) = start_tls_server(&[b"http/1.1"]);
         let address = server.address().expect("server has an address");
         let events = Arc::new(Mutex::new(Vec::new()));

@@ -6,8 +6,8 @@
  */
 
 //! `PoolParams::idle_timeout` retires sessions without an exchange, on the
-//! schedule `PoolParams::idle_sweep` picks, and `PoolParams::reuse_order` picks
-//! the idle session that serves next (`DIV-032`).
+//! schedule that `PoolParams::idle_sweep` selects, and
+//! `PoolParams::reuse_order` selects the idle session that serves next.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -68,14 +68,15 @@ use crate::pool::PoolError;
 use crate::pool::PoolParams;
 use crate::pool::SessionReuseOrder;
 
-/// Also the scheduling slack that tests reusing a just-released session allow.
+/// The idle timeout, and the scheduling slack that tests reusing a
+/// just-released session allow.
 const IDLE: Duration = Duration::from_millis(100);
 /// `/slow` streams `SLOW_CHUNKS` chunks this far apart, for four idle timeouts in all.
 const CHUNK_GAP: Duration = Duration::from_millis(40);
 const SLOW_CHUNKS: usize = 10;
-/// `/silent` answers after this long without sending anything first.
+/// `/silent` responds after this long without sending anything first.
 const SILENCE: Duration = Duration::from_millis(300);
-/// `/large` answers with this many bytes, more than the transport buffers.
+/// `/large` responds with this many bytes, more than the transport buffers.
 const LARGE: usize = 8 << 20;
 
 /// A chunked 200 response whose chunks arrive `CHUNK_GAP` apart.
@@ -131,8 +132,8 @@ fn fixed_ok() -> HttpSourceHolder {
     ))
 }
 
-/// Answers `/slow` with `SlowBody`, `/silent` with `ok` after `SILENCE`, `/large`
-/// with `LARGE` bytes, and anything else with `ok`.
+/// Responds to `/slow` with `SlowBody`, `/silent` with `ok` after `SILENCE`,
+/// `/large` with `LARGE` bytes, and anything else with `ok`.
 struct IdleTestHandler;
 
 impl HttpHandler for IdleTestHandler {
@@ -185,8 +186,8 @@ fn bounded<T>(call: WorkerCall<T>) {
         .expect("client task completes");
 }
 
-/// Runs the client task on a `ManagedWorker` and again on a `HostedWorker`,
-/// whose pool tasks are independent Tokio tasks that only their own wakeups poll.
+/// Runs the client task on a `ManagedWorker` and again on a `HostedWorker`, where
+/// pool tasks are independent Tokio tasks polled only by their own wakeups.
 fn run_on_worker<F>(factory: F)
 where
     F: FnOnce(WorkerContext) -> Pin<Box<dyn Future<Output = ()> + 'static>>
@@ -280,8 +281,8 @@ fn pool_with_sweep(
     )
 }
 
-/// A native pool to `address` with `params`' connection limit, idle timeout,
-/// reuse order and sweep, whose sessions report to `lifecycle_observer`.
+/// A native pool to `address` with the connection limit, idle timeout, reuse
+/// order and sweep from `params`. Its sessions report to `lifecycle_observer`.
 fn new_pool(
     context: WorkerContext,
     address: SocketAddr,
@@ -297,7 +298,7 @@ fn new_pool(
             ..params
         },
         ConnectionParams::default(),
-        // No session timer can retire a connection in these tests.
+        // Session timers are off, so they cannot retire a connection.
         SessionParams {
             stream_read_timeout: Some(Duration::ZERO),
             connection_read_timeout: Some(Duration::ZERO),
@@ -379,7 +380,7 @@ async fn acquire(pool: &HttpSessionPool) -> GetSessionResult {
         .expect("acquisition succeeds")
 }
 
-/// Lets the session account the finished exchange as no longer active.
+/// Waits until the session stops counting the finished exchange as active.
 async fn settle(session: &ClientSession) {
     while session.active_transactions() != 0 {
         tokio::task::yield_now().await;
@@ -741,8 +742,8 @@ fn reservation_made_while_an_acquisition_retires_sessions_is_served() {
 }
 
 /// Starts one acquisition from the pool, polled once, when a session gains its
-/// first reservation, as an application's lifecycle callback may: the session
-/// counts that reservation before the pool hears of it.
+/// first reservation, as an application's lifecycle callback may. The session
+/// counts that reservation before the pool is notified of it.
 #[derive(Default)]
 struct AcquireOnActivate {
     pool: RefCell<Weak<HttpSessionPool>>,
@@ -909,9 +910,9 @@ async fn assert_retired_session_closes_and_pool_drains(
     );
 }
 
-/// A panic in the callback that the reservation of an acquisition's selection
-/// runs still drains the expired session the acquisition retired, so that
-/// session closes and the pool can drain while a caller holds a clone of it.
+/// A panic in the callback run by reserving the acquisition's selection still
+/// drains the expired session that the acquisition retired, so that session
+/// closes and the pool can drain while a caller holds a clone of it.
 #[test]
 fn reservation_callback_panic_still_drains_the_sessions_an_acquisition_retired() {
     for (idle_sweep, reuse_order) in [
@@ -1062,18 +1063,20 @@ fn staggered_idle_sessions_retire_in_turn() {
     });
 }
 
-/// The idle timeout, and so the sweep period, of the differential tests.
+/// The idle timeout, and so the sweep period, of the tests that compare the
+/// pool with `HyperUtilPool`.
 const SWEEP_IDLE: Duration = Duration::from_millis(200);
 
-/// hyper-util 0.1.20's legacy pool (`src/client/legacy/pool.rs`), which the
-/// router pins through reqwest 0.12.28 and its own hyper-util client, for one
-/// origin of HTTP/1.1 connections with no waiters: `put` pushes a released
-/// connection onto the end of the idle list and, on the first push ever, spawns
-/// `IdleTask`, which sleeps `max(timeout, 90 ms)` (`MIN_CHECK`) from then and
-/// again after each `clear_expired`, until the pool drops, evicting every entry
-/// idle for longer than the timeout. A checkout (`IdlePopper::pop`) pops from
-/// the end, dropping expired entries until one is not, and dials when none is
-/// left. A sweep runs just after its deadline, as a timer fires.
+/// A model of the `client::legacy` pool in hyper-util 0.1.20, the pool behind
+/// reqwest 0.12, for one origin of HTTP/1.1 connections with no waiters.
+///
+/// `put` pushes a released connection onto the end of the idle list. The first
+/// push ever spawns `IdleTask`, which sleeps `max(timeout, 90 ms)`
+/// (`MIN_CHECK`) from then and again after each `clear_expired`, until the pool
+/// drops, and evicts every entry idle for longer than the timeout. A checkout
+/// (`IdlePopper::pop`) pops from the end, dropping expired entries until it
+/// reaches one that has not expired, and dials when the list is empty. A sweep
+/// runs just after its deadline, as a timer fires.
 struct HyperUtilPool {
     timeout: Duration,
     idle: Vec<(usize, Instant)>,
@@ -1144,7 +1147,8 @@ impl HyperUtilPool {
     }
 }
 
-/// One step of a differential schedule, `at` milliseconds after `Start`.
+/// One step of a schedule run against `HyperUtilPool`, `at` milliseconds after
+/// `Start`.
 #[derive(Clone, Copy, Debug)]
 enum Step {
     /// Starts the clock: the steps before it run back to back, so that dials
@@ -1300,7 +1304,7 @@ fn assert_sweeps_as_hyper_util(steps: &'static [Step]) {
 }
 
 /// The sweep timer runs from the first release, not from a dial, and keeps its
-/// period while no connection is idle (0.1.21 stops it on an empty pool).
+/// period while the pool is empty (0.1.21 stops it on an empty pool).
 const FIRST_RELEASE_STARTS_SWEEPS: &[Step] = &[
     Step::Hold { at: 0, slot: 0 },
     // Dialed just before; released at 100, which starts sweeps at 300, 500, 700, ...
@@ -1312,7 +1316,8 @@ const FIRST_RELEASE_STARTS_SWEEPS: &[Step] = &[
     },
     // Sweeps from the dial would wait for 400.
     Step::Open { at: 350, open: &[] },
-    // The 500 sweep finds it idle about 100 ms; restarted at 400, sweeps would close it at 600.
+    // The exchange's connection is idle about 100 ms at the 500 sweep.
+    // Sweeps restarted at 400 would close it at 600.
     Step::Exchange { at: 400 },
     Step::Open {
         at: 650,
@@ -1321,7 +1326,7 @@ const FIRST_RELEASE_STARTS_SWEEPS: &[Step] = &[
     Step::Open { at: 750, open: &[] },
 ];
 
-/// A connection that becomes idle after a sweep that found every connection
+/// A connection that becomes idle after a sweep in which every connection was
 /// busy is swept on the old period (0.1.20 does not restart it).
 const BUSY_SWEEP_KEEPS_THE_PERIOD: &[Step] = &[
     Step::Hold { at: 0, slot: 0 },
@@ -1343,9 +1348,9 @@ const BUSY_SWEEP_KEEPS_THE_PERIOD: &[Step] = &[
     Step::Open { at: 650, open: &[] },
 ];
 
-/// A checkout takes the connection released last while it is not expired and
-/// leaves older expired connections to the next sweep; when the connection
-/// released last has expired, it drops every idle connection and dials.
+/// A checkout takes the connection released last while it has not expired and
+/// leaves older expired connections to the next sweep. Once that connection has
+/// expired, the checkout drops every idle connection and dials.
 const CHECKOUT_LEAVES_EXPIRED_TO_THE_SWEEP: &[Step] = &[
     Step::Hold { at: 0, slot: 0 },
     Step::Hold { at: 0, slot: 1 },
@@ -1388,7 +1393,8 @@ const CHECKOUT_LEAVES_EXPIRED_TO_THE_SWEEP: &[Step] = &[
     Step::Open { at: 850, open: &[] },
 ];
 
-/// The model, on exact times, leaves open what each schedule expects.
+/// Run on exact times, the model keeps open the connections that each schedule
+/// expects.
 #[test]
 fn hyper_util_model_follows_the_differential_schedules() {
     for steps in [
@@ -1415,8 +1421,8 @@ fn interval_checkout_leaves_older_expired_connections_to_the_sweep() {
     assert_sweeps_as_hyper_util(CHECKOUT_LEAVES_EXPIRED_TO_THE_SWEEP);
 }
 
-/// As hyper-util's idle interval, sweeps run at most every 90 ms, however short
-/// the idle timeout.
+/// As with hyper-util's idle interval, sweeps run at most every 90 ms, however
+/// short the idle timeout.
 #[test]
 fn interval_sweep_runs_at_most_every_90_ms() {
     let server = start_server();
@@ -1526,7 +1532,7 @@ fn most_recently_used_reuse_picks_the_session_released_last() {
         Box::pin(async move {
             let pool = pool_with_order(context, address, 2, SessionReuseOrder::MostRecentlyUsed);
             let (older, newer) = two_idle_sessions(&pool).await;
-            // Released in the other order, the older session is now the most recent.
+            // Released in the other order, the older session is then the most recent.
             let first = acquire(&pool).await;
             let second = acquire(&pool).await;
             assert_eq!(first.session.local_address(), newer.local_address());
@@ -1573,8 +1579,8 @@ fn idle_retirement_runs_at_most_twice_per_timeout_under_sequential_traffic() {
     });
 }
 
-/// An idle timeout too long for any session to reach retires nothing and does
-/// not wake retirement for each released session.
+/// An idle timeout longer than any session stays idle does not retire sessions
+/// or wake retirement for each released session.
 #[test]
 fn unreachable_idle_timeout_does_not_wake_retirement_per_request() {
     for idle_sweep in [IdleSweep::AtExpiry, IdleSweep::Interval] {
@@ -1609,10 +1615,10 @@ fn unreachable_idle_timeout_does_not_wake_retirement_per_request() {
 }
 
 /// Sessions whose idle periods start `IDLE / 4` apart, over four idle timeouts,
-/// retire in that order and none before it has been idle for the timeout. Each
+/// retire in that order, each only after it has been idle for the timeout. Each
 /// distinct expiry may cost its own retiring pass, so the passes scale with the
-/// sessions, not with the timeouts; apart from one recompute after each retiring
-/// pass, only a constant number of passes retires nothing.
+/// sessions, not with the timeouts. Apart from one recompute after each
+/// retiring pass, the number of empty passes is constant.
 #[test]
 fn many_staggered_idle_sessions_retire_in_release_order() {
     const SESSIONS: usize = 16;
@@ -1687,9 +1693,9 @@ fn many_staggered_idle_sessions_retire_in_release_order() {
 }
 
 /// Under sustained traffic from many concurrent requesters over several idle
-/// timeouts, the passes that retire nothing stay within about two per elapsed
-/// timeout, plus two at the start and one recompute per retiring pass, however
-/// many requests run, in each reuse order and sweep mode.
+/// timeouts, empty retirement passes stay within about two per elapsed timeout,
+/// plus two at the start and one recompute per retiring pass, however many
+/// requests run, in each reuse order and sweep mode.
 #[test]
 fn idle_retirement_passes_under_sustained_concurrent_traffic() {
     for idle_sweep in [IdleSweep::AtExpiry, IdleSweep::Interval] {
@@ -1765,9 +1771,9 @@ fn idle_retirement_passes_under_sustained_traffic(
 }
 
 /// After a burst opens `BURST` sessions, `REQUESTERS` concurrent requesters need
-/// only a few: the most-recently-used order keeps reusing those, so the rest of
-/// the burst idles out, while the least-recently-used order cycles through, and
-/// so keeps, every session, in either sweep mode.
+/// only a few of them. The most-recently-used order keeps reusing those few, so
+/// the rest of the burst idles out. The least-recently-used order cycles
+/// through every session and so keeps them all. Both hold in either sweep mode.
 #[test]
 fn most_recently_used_reuse_keeps_fewer_sessions_under_concurrent_traffic() {
     for idle_sweep in [IdleSweep::AtExpiry, IdleSweep::Interval] {
@@ -1838,8 +1844,8 @@ fn sessions_left_after_a_burst(idle_sweep: IdleSweep) {
     );
 }
 
-/// `MostRecentlyUsed` records idle periods without an idle timeout, which then
-/// retires nothing and runs no retirement task.
+/// `MostRecentlyUsed` records idle periods even without an idle timeout, but
+/// the pool then does not retire sessions or run a retirement task.
 #[test]
 fn most_recently_used_reuse_without_an_idle_timeout_never_retires() {
     let server = start_server();
