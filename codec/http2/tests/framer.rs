@@ -360,8 +360,8 @@ fn goaway_double_read() {
         &[&0u32.to_be_bytes(), &u32::MAX.to_be_bytes()],
     );
     assert!(matches!(
-        parse_frame(&mut wire.clone_shared()),
-        Err(FrameError::Peer(code)) if code == H2ErrorCode::PROTOCOL_ERROR
+        parsed(wire).frame,
+        Frame::Goaway { error_code, .. } if error_code == H2ErrorCode::INTERNAL_ERROR
     ));
 }
 

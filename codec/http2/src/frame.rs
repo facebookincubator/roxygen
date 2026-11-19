@@ -528,10 +528,12 @@ fn parse_uint31(cursor: &mut SegmentCursor<'_>) -> Result<u32, FrameError> {
     Ok(cursor.read_u32()? & MAX_STREAM_ID)
 }
 
+/// An error code this endpoint does not know is read as INTERNAL_ERROR, which RFC 9113
+/// allows, so the frame that carries it is still valid.
 fn parse_error_code(cursor: &mut SegmentCursor<'_>) -> Result<H2ErrorCode, FrameError> {
     let code = cursor.read_u32()?;
-    if code >= 14 {
-        return Err(peer(H2ErrorCode::PROTOCOL_ERROR));
+    if code > H2ErrorCode::HTTP_1_1_REQUIRED.as_u32() {
+        return Ok(H2ErrorCode::INTERNAL_ERROR);
     }
     Ok(H2ErrorCode::from_u32(code))
 }

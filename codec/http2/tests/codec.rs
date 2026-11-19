@@ -3853,8 +3853,13 @@ fn basic_rst_invalid_code() {
     let mut wire = BufQueue::new(1024);
     frame::write_rst_stream(&mut wire, 1, H2ErrorCode::from_u32(99)).unwrap();
     let input = bytes(&wire);
-    let (codec, _, _) = run_downstream_wire(&input);
-    assert!(!codec.is_reusable());
+    let (codec, trace, _) = run_downstream_wire(&input);
+    assert!(codec.is_reusable());
+    assert!(
+        trace
+            .events
+            .contains(&Seen::Abort(1, H2ErrorCode::INTERNAL_ERROR))
+    );
 }
 
 #[test]
