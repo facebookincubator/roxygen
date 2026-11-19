@@ -54,7 +54,7 @@ impl Wake for CleanupWakeNode {
     }
 }
 
-/// A cleanup's wake node and the waker that its every poll uses.
+/// A cleanup's wake node and the waker used for each of its polls.
 pub(super) struct WokenHandle {
     pub(super) node: Arc<CleanupWakeNode>,
     pub(super) waker: Waker,

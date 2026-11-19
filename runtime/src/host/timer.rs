@@ -8,27 +8,24 @@
 //! An owner-local hashed hierarchical wheel timer.
 //!
 //! [`WheelTimer`] ports folly's `HHWheelTimer`. A host drives it through one
-//! wakeup ([`WheelWakeup`], folly's private `AsyncTimeout`) and calls
-//! [`WheelTimer::expire`] when that wakeup fires. [`Timeout`] is the analog of
-//! `HHWheelTimer::Callback`: one reusable slot per owner object. On a host
+//! wakeup ([`WheelWakeup`]) and calls [`WheelTimer::expire`] when that wakeup
+//! fires. A [`Timeout`] is one reusable slot per owner object. On a host
 //! without a wheel, a `Timeout` falls back to at most one host sleep at a
 //! time.
 //!
-//! Roxygen's rules on top of folly's wheel:
+//! The wheel follows these rules:
 //! - Never early. A slot fires only when its exact deadline is at or before
 //!   the `now` passed to `expire`. The wakeup is armed at the earliest exact
 //!   deadline, not at a tick boundary.
 //! - Expiry marks and wakes. Due slots are marked fired, their wakers are
 //!   cloned and woken after the wheel's state is released, and the owner
-//!   observes the expiry in its own poll. No owner code, a waker's clone
-//!   included, runs inside the wheel.
-//! - Lazy later, eager earlier. A later deadline and a cancel are stores; the
-//!   wheel relinks or unlinks the slot when it processes the slot's bucket.
-//!   An earlier deadline, or arming an unlinked slot, links at once.
-//! - [`WheelTimer::stop`] is `~HHWheelTimer`'s `cancelAll`: armed timeouts
-//!   complete as [`Expiry::Stopped`], and so do later schedules.
-//!
-//! These are Roxygen runtime primitives, recorded in `DIV-003`.
+//!   observes the expiry in its own poll. Owner code, including a waker's
+//!   clone, never runs inside the wheel.
+//! - Lazy later, eager earlier. A later deadline and a cancel only update the
+//!   slot. The wheel relinks or unlinks the slot when it processes its bucket.
+//!   An earlier deadline, or arming an unlinked slot, links immediately.
+//! - [`WheelTimer::stop`] completes armed timeouts as [`Expiry::Stopped`], and
+//!   later schedules complete the same way.
 
 use std::cell::RefCell;
 use std::mem;
@@ -51,14 +48,14 @@ const WHEEL_BITS: u32 = 8;
 const WHEEL_SIZE: usize = 1 << WHEEL_BITS;
 const WHEEL_MASK: u64 = WHEEL_SIZE as u64 - 1;
 const BITMAP_WORDS: usize = WHEEL_SIZE / 64;
-/// folly's `LARGEST_SLOT`: farther deadlines wait in the last level-3 bucket
-/// and cascade again from their exact deadline.
+/// The largest tick distance a slot is linked at, the same cap folly's wheel
+/// uses. Farther deadlines wait in the last level-3 bucket and cascade again
+/// from their exact deadline.
 const LARGEST_SLOT: u64 = 0xffff_ffff;
 const NIL: u32 = u32::MAX;
 const UNLINKED: u16 = u16::MAX;
 
-/// The host's one wakeup for a wheel: folly `HHWheelTimer`'s private
-/// `AsyncTimeout`.
+/// The host's single wakeup for a wheel.
 pub trait WheelWakeup: 'static {
     /// Requests one call of [`WheelTimer::expire`] on the owner thread,
     /// outside any task poll, at or after `deadline`. Replaces any earlier
@@ -66,7 +63,7 @@ pub trait WheelWakeup: 'static {
     fn arm(&self, deadline: Instant);
 
     /// Withdraws the request. A wakeup that cannot be withdrawn may still
-    /// fire; the wheel then finds nothing due.
+    /// fire, and `expire` then fires no slots.
     fn disarm(&self);
 }
 
@@ -75,22 +72,22 @@ pub trait WheelWakeup: 'static {
 pub enum Expiry {
     /// The deadline passed.
     Elapsed,
-    /// The wheel stopped first (`~HHWheelTimer`'s `callbackCanceled`).
+    /// The wheel stopped first.
     Stopped,
 }
 
 /// Owner-local counters of one wheel.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WheelStats {
-    /// Armed timeouts: folly's `HHWheelTimer::count()`.
+    /// Armed timeouts.
     pub armed: usize,
     /// `schedule_at` calls.
     pub scheduled: u64,
     /// Slots that fired with [`Expiry::Elapsed`].
     pub fired: u64,
-    /// `expire` calls that fired nothing.
+    /// `expire` calls that fired no slots.
     pub empty_expiries: u64,
-    /// Links and relinks made at once by `schedule_at` and `extend_to`.
+    /// Links and relinks made immediately by `schedule_at` and `extend_to`.
     pub relinked: u64,
     /// Slots the wheel moved to another bucket because they were not yet due
     /// when their bucket was processed.
@@ -127,13 +124,13 @@ struct Slot {
     bucket: u16,
     state: SlotState,
     deadline: Instant,
-    /// The deadline the slot was linked with. A later deadline is a store:
-    /// processing the bucket relinks the slot.
+    /// The deadline the slot was linked with. A later deadline only updates
+    /// `deadline`, and processing the bucket relinks the slot.
     linked_deadline: Instant,
     waker: Option<Waker>,
-    /// The waker is lent out to be cloned with the state released. Storing
-    /// another waker or freeing the slot clears this, and the lent waker is
-    /// then dropped instead of returned.
+    /// Set while the waker is out of the slot to be cloned with the state
+    /// released. Storing another waker or freeing the slot clears this, so the
+    /// taken waker is dropped instead of put back.
     lent: bool,
 }
 
@@ -153,14 +150,14 @@ struct WheelState {
     free: u32,
     armed_wakeup: Option<Instant>,
     stopped: bool,
-    /// Slots whose owners to wake once the state is released.
+    /// Slots to wake once the state is released.
     wakes: Vec<u32>,
     stats: WheelStats,
 }
 
 /// What arming a slot requires of the host.
 enum Armed {
-    /// Nothing: the slot is linked, and the wakeup covers it.
+    /// The slot is linked, and the wakeup already covers it.
     Covered,
     /// The wakeup must move earlier, to this instant.
     Wakeup(Instant),
@@ -169,7 +166,8 @@ enum Armed {
     Stopped,
 }
 
-/// folly's `HHWheelTimer`, owner-local: `!Send`, shared through `Rc`.
+/// A hashed hierarchical wheel timer. It is owner-local (`!Send`) and shared
+/// through `Rc`.
 pub struct WheelTimer {
     state: RefCell<WheelState>,
     wakeup: Box<dyn WheelWakeup>,
@@ -199,11 +197,10 @@ impl WheelTimer {
         })
     }
 
-    /// `HHWheelTimer::timeoutExpired`: marks every armed slot whose deadline
-    /// is at or before `now` as fired, in tick order and then FIFO, re-arms
-    /// the wakeup, and then wakes the fired slots' owners. If a waker's clone
-    /// or wake panics, the others are still woken and the first panic is
-    /// re-raised.
+    /// Marks every armed slot whose deadline is at or before `now` as fired,
+    /// in tick order and then FIFO, re-arms the wakeup, and then wakes the
+    /// fired slots' owners. If a waker's clone or wake panics, the others are
+    /// still woken and the first panic is re-raised.
     pub fn expire(&self, now: Instant) {
         let (rearm, wakes) = {
             let mut state = self.state.borrow_mut();
@@ -227,12 +224,12 @@ impl WheelTimer {
         self.wake_slots(wakes);
     }
 
-    /// `~HHWheelTimer`'s `cancelAll`: completes every armed timeout, and
-    /// every fired one its owner has not observed (folly cancels
-    /// `timeoutsToRunNow_`), as [`Expiry::Stopped`], wakes the armed ones'
-    /// owners, and withdraws the wakeup. Later schedules complete as stopped
-    /// at once, and `expire` does nothing. Returns how many timeouts
-    /// completed as stopped.
+    /// Stops the wheel and returns how many timeouts completed as stopped.
+    ///
+    /// Every armed timeout, and every fired one that its owner has not yet
+    /// observed, completes as [`Expiry::Stopped`]. The armed ones' owners are
+    /// woken and the wakeup is withdrawn. Later schedules complete as stopped
+    /// immediately, and later `expire` calls have no effect.
     pub fn stop(&self) -> usize {
         let (stopped, wakes) = {
             let mut state = self.state.borrow_mut();
@@ -272,8 +269,8 @@ impl WheelTimer {
     }
 
     /// Wakes a slot's owner through a clone of its waker. A waker's clone is
-    /// arbitrary code, so the slot lends its waker out and the clone is made
-    /// with the state released.
+    /// arbitrary code, so the waker is taken out of the slot and cloned with
+    /// the state released.
     fn wake_slot(&self, index: u32) {
         let lent = self.state.borrow_mut().lend_waker(index);
         let Some(waker) = lent else {
@@ -380,10 +377,9 @@ impl WheelTimer {
     }
 
     /// Unlinks and frees a slot. Freeing the wheel's last slot withdraws the
-    /// wakeup, as folly's cancel does when `count_` reaches 0; a cancelled
-    /// slot stays linked, and a later arm of it is covered by the wakeup, so
-    /// only freeing the last slot does. The waker is dropped, and the wakeup
-    /// withdrawn, after the state is released.
+    /// wakeup. Cancelling does not, because a cancelled slot stays linked and a
+    /// later arm of it relies on the wakeup. The waker is dropped, and the
+    /// wakeup withdrawn, after the state is released.
     fn release(&self, index: u32) {
         let (_waker, withdraw) = {
             let mut state = self.state.borrow_mut();
@@ -466,9 +462,9 @@ impl WheelState {
         Some(waker)
     }
 
-    /// Takes back a waker `lend_waker` lent. Returns it instead, to drop with
-    /// the state released, if the slot stored another waker or was freed
-    /// meanwhile.
+    /// Puts back a waker that `lend_waker` took out. Returns it instead, to
+    /// drop with the state released, if the slot stored another waker or was
+    /// freed meanwhile.
     fn return_waker(&mut self, index: u32, waker: Waker) -> Option<Waker> {
         let slot = &mut self.slots[index as usize];
         if !mem::take(&mut slot.lent) {
@@ -479,8 +475,8 @@ impl WheelState {
     }
 
     /// Arms a slot for `deadline`. A slot linked at or before `deadline`
-    /// stays where it is; otherwise it is linked at once and the wakeup moved
-    /// earlier if needed. Returns the wakeup request to make.
+    /// stays where it is. Otherwise it is linked immediately and the wakeup
+    /// moved earlier if needed. Returns the wakeup request to make.
     fn arm(&mut self, index: u32, deadline: Instant) -> Armed {
         let slot = &mut self.slots[index as usize];
         if self.stopped {
@@ -543,12 +539,11 @@ impl WheelState {
         self.start + Duration::from_nanos(tick.saturating_mul(self.tick_nanos))
     }
 
-    /// folly `scheduleTimeoutImpl`, with the current tick as the base: links
-    /// a slot at the tail of the bucket of its deadline's tick (the current
-    /// tick if that tick is processed), on level 0 within `WHEEL_SIZE` ticks
-    /// and on the level of the distance otherwise. Returns when the wakeup
-    /// must fire for it: its deadline on level 0, its bucket's cascade
-    /// boundary above.
+    /// Links a slot at the tail of the bucket of its deadline's tick, or of
+    /// the current tick if that tick is already processed. The slot goes on
+    /// level 0 within `WHEEL_SIZE` ticks of the current tick, and otherwise on
+    /// the level of that distance. Returns when the wakeup must fire for it:
+    /// its deadline on level 0, or its bucket's cascade boundary above.
     fn link(&mut self, index: u32) -> Instant {
         let deadline = self.slots[index as usize].deadline;
         let mut due = self.tick_of(deadline).max(self.current);
@@ -645,8 +640,8 @@ impl WheelState {
         }
     }
 
-    /// folly `timeoutExpired`'s cascade at an epoch boundary: level 1, then
-    /// level 2 when level 1 wraps, then level 3 when level 2 wraps.
+    /// Cascades at an epoch boundary: level 1, then level 2 when level 1
+    /// wraps, then level 3 when level 2 wraps.
     fn cascade_boundary(&mut self) {
         for level in 1..WHEEL_LEVELS {
             let bucket = ((self.current >> (level as u32 * WHEEL_BITS)) & WHEEL_MASK) as usize;
@@ -657,8 +652,8 @@ impl WheelState {
         }
     }
 
-    /// folly `cascadeTimers`: relinks a bucket's armed slots from their
-    /// deadlines, relative to the current tick.
+    /// Relinks a bucket's armed slots from their deadlines, relative to the
+    /// current tick.
     fn cascade(&mut self, level: usize, bucket: usize) {
         let mut cursor = self.clear_bucket(level, bucket);
         while cursor != NIL {
@@ -771,8 +766,7 @@ fn next_set(bitmap: &[u64; BITMAP_WORDS], from: usize) -> Option<usize> {
     })
 }
 
-/// A reusable timeout slot owned by one object: the analog of
-/// `HHWheelTimer::Callback` and `AsyncTimeout`. It is `!Send` and not
+/// A reusable timeout slot owned by one object. It is `!Send` and not
 /// `Clone`.
 ///
 /// An expiry is only marked; the owner observes it with
@@ -794,8 +788,8 @@ enum Backend {
 }
 
 impl Timeout {
-    /// A timeout for `host`. It takes nothing until its first schedule, which
-    /// takes a slot on the host's wheel timer
+    /// A timeout for `host`. It holds no slot or sleep until its first
+    /// schedule, which takes a slot on the host's wheel timer
     /// ([`Host::wheel_timer`](crate::host::Host::wheel_timer)) or, on a host
     /// without one, binds it to at most one host sleep at a time.
     pub fn new(host: &Host) -> Self {
@@ -837,7 +831,7 @@ impl Timeout {
 
     /// Moves an armed timeout's deadline, keeping its waker. On a fired
     /// timeout whose expiry is not yet observed, discards the expiry and
-    /// re-arms. Does nothing to an idle timeout.
+    /// re-arms. An idle timeout stays idle.
     pub fn extend_to(&mut self, deadline: Instant) {
         match &mut self.backend {
             Backend::Wheel { wheel, slot } if *slot != NIL => wheel.extend(*slot, deadline),
@@ -902,12 +896,13 @@ struct HostSleep {
     deadline: Instant,
 }
 
-/// The fallback backend: at most one host sleep at a time. A later deadline
-/// and a cancel are stores. The sleep is replaced when the deadline moves
-/// earlier; when it resolves before the deadline (an extended deadline, or a
-/// host that fires early), it is re-armed for the remainder. Every arm polls
-/// the sleep, since it may have resolved and woken the owner unobserved. The
-/// clock is read only when the sleep resolves.
+/// The fallback backend: at most one host sleep at a time.
+///
+/// A later deadline, or a cancel, only updates the stored deadline. The sleep
+/// is replaced when the deadline moves earlier. When it resolves before the
+/// deadline (an extended deadline, or a host that fires early), it is re-armed
+/// for the remainder. Every arm polls the sleep, since it may have resolved and
+/// woken the owner unobserved. The clock is read only when the sleep resolves.
 struct LazySleep {
     host: Host,
     sleep: Option<HostSleep>,
@@ -975,11 +970,11 @@ impl LazySleep {
         self.waker = Some(waker.clone());
     }
 
-    /// Arms for `deadline`: a store while the current sleep resolves no
-    /// later, a new sleep otherwise. The sleep is polled either way, so that
-    /// the host holds the current waker and a sleep that resolved unobserved
-    /// re-arms for the remainder; a deadline already past completes at once
-    /// and wakes the owner.
+    /// Arms for `deadline`. The current sleep is kept if it resolves no later,
+    /// and replaced otherwise. The sleep is polled either way, so that the host
+    /// holds the current waker and a sleep that resolved unobserved re-arms for
+    /// the remainder. A deadline already past completes immediately and wakes
+    /// the owner.
     fn arm(&mut self, deadline: Instant) {
         self.deadline = Some(deadline);
         let renew = self
@@ -1000,8 +995,8 @@ impl LazySleep {
     }
 
     /// Polls the sleep with the owner's waker. A resolution at or after the
-    /// deadline fires; an earlier one re-arms for the remainder and polls the
-    /// new sleep once. If that one resolves at once too, the owner is woken
+    /// deadline fires. An earlier one re-arms for the remainder and polls the
+    /// new sleep once. If that one resolves immediately too, the owner is woken
     /// to retry. A resolved sleep of a cancelled timeout is dropped. Returns
     /// whether the timeout fired.
     fn poll_sleep(&mut self) -> bool {

@@ -514,8 +514,8 @@ impl<F> ObservedTask<F> {
             .expect("a terminal observed task retains its context")
             .envelope()
             .clone();
-        // Under `observability` the dropped context's span handle reaches the
-        // subscriber; without it, nothing in this drop can panic.
+        // With `observability`, dropping the task's span handle calls the
+        // subscriber, which can panic. Otherwise this drop cannot panic.
         #[cfg(feature = "observability")]
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
             context.run(|| drop(self.future.take()));

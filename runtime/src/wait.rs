@@ -95,13 +95,14 @@ impl<State> Shared<State> {
     }
 }
 
-/// The timeout of a baton's registered waiter. On a host with a wheel timer
-/// it is one [`Timeout`] slot, bound at the first armed wait and kept for the
-/// baton's lifetime: a later deadline no earlier than the slot's, and a
-/// disarm, only store. On a host without one it is the current arm's host
-/// sleep, made at each arm and dropped at each disarm. Only the waiter that
-/// armed it uses it, from its own poll and completion, with the baton's state
-/// released.
+/// The timeout of a baton's registered waiter.
+///
+/// On a host with a wheel timer it is one [`Timeout`] slot, bound at the first
+/// armed wait and kept for the baton's lifetime. A later deadline, or a disarm,
+/// only updates the slot. On a host without a wheel it is a host sleep, created
+/// at each arm and dropped at each disarm. Only the waiter that armed it uses
+/// it, from its own poll and completion, while the baton's state is not
+/// borrowed.
 #[derive(Default)]
 struct WaitTimer(RefCell<WaitSlot>);
 
@@ -114,12 +115,13 @@ enum WaitSlot {
 }
 
 impl WaitTimer {
-    /// Arms the timeout for `deadline` and discards an expiry not yet
-    /// observed. The expiry wakes `waker`. On a wheel host, a deadline already
-    /// past that was set before this poll (`registered_earlier`) is armed as
-    /// a host sleep, which the waiter polls in this poll as it polled every
-    /// arm's host sleep before the wheel: the wait times out in this poll
-    /// exactly when that sleep is ready at once (`RUN-004`).
+    /// Arms the timeout for `deadline`, to wake `waker`, and discards an expiry
+    /// not yet observed.
+    ///
+    /// On a wheel host, a deadline that was set before this poll
+    /// (`registered_earlier`) and has already passed is armed as a host sleep
+    /// instead, so that the wait times out in this poll exactly when that sleep
+    /// is immediately ready.
     fn schedule_at(&self, host: &Host, deadline: Instant, waker: &Waker, registered_earlier: bool) {
         let past = || registered_earlier && deadline <= host.now();
         let mut slot = self.0.borrow_mut();
@@ -186,9 +188,8 @@ impl fmt::Debug for WaitTimer {
     }
 }
 
-/// The outcome a wait commits when its timeout slot expires: a stopped wheel
-/// (`~HHWheelTimer`'s `callbackCanceled`) cancels the wait, as destroying its
-/// baton does.
+/// The outcome a wait commits when its timeout slot expires. A stopped wheel
+/// cancels the wait, as destroying its baton does.
 fn expiry_status(expiry: Expiry) -> WaitStatus {
     match expiry {
         Expiry::Elapsed => WaitStatus::TimedOut,
@@ -415,9 +416,9 @@ impl TimedWait {
         cancellation_requested
     }
 
-    /// Brings the baton's timeout to the registration's generation: arms it
-    /// for the registered deadline, waking `waker` at expiry, or disarms it.
-    /// If arming panics, the next poll retries. `registered_earlier`: the
+    /// Brings the baton's timeout up to the registration's generation, arming
+    /// it for the registered deadline (to wake `waker`) or disarming it. If
+    /// arming panics, the next poll retries. `registered_earlier` means the
     /// waiter registered before this poll, so the deadline was set before it.
     fn synchronize_timer(&mut self, waker: &Waker, registered_earlier: bool) {
         let (generation, deadline) = {
@@ -750,9 +751,9 @@ impl CancellableWait {
         cancellation_requested
     }
 
-    /// Brings the baton's timeout to the registration's generation: arms it
-    /// for the registered deadline, waking `waker` at expiry, or disarms it.
-    /// If arming panics, the next poll retries. `registered_earlier`: the
+    /// Brings the baton's timeout up to the registration's generation, arming
+    /// it for the registered deadline (to wake `waker`) or disarming it. If
+    /// arming panics, the next poll retries. `registered_earlier` means the
     /// waiter registered before this poll, so the deadline was set before it.
     fn synchronize_timer(&mut self, waker: &Waker, registered_earlier: bool) {
         let (generation, deadline) = {

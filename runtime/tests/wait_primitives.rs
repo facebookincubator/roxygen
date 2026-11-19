@@ -1882,8 +1882,8 @@ mod wait {
     }
 
     /// `set_timeout` on a waiting baton moves its deadline later and earlier,
-    /// from the instant of the call (`RUN-004`): a later deadline is a store
-    /// on the wheel and an earlier one relinks the slot.
+    /// from the instant of the call. A later deadline is a store on the wheel
+    /// and an earlier one relinks the slot.
     #[test]
     fn set_timeout_while_waiting_moves_the_deadline_both_ways() {
         run_paused(|| async {
@@ -1919,12 +1919,11 @@ mod wait {
     }
 
     /// A deadline that `set_timeout` moved, and that is due by the wait's next
-    /// poll, times the wait out in that poll, before a later signal, exactly
-    /// when a Tokio sleep made for it then is ready at its first poll, as the
-    /// host sleep made at that poll was (`RUN-004`): on a timed wait, whose
-    /// timeout is re-armed, and on an untimed one, whose timeout is armed
-    /// first. Tokio rounds a deadline up to its next millisecond tick, so one
-    /// just due may not be; 100 ms past the deadline it is.
+    /// poll, times the wait out in that poll, ahead of a later signal. It does
+    /// so exactly when a Tokio sleep made at that poll, like the wait's host
+    /// sleep, is ready at its first poll. This holds on timed and untimed
+    /// waits. Tokio rounds a deadline up to its next millisecond tick, so a
+    /// just-due deadline may not be ready, but one 100 ms past is.
     #[test]
     fn a_moved_deadline_due_by_the_next_poll_times_out_in_that_poll() {
         run_paused(|| async {
@@ -1966,8 +1965,8 @@ mod wait {
     }
 
     /// On a wheel host, an armed wait takes a slot on the wheel instead of a
-    /// host sleep and times out at its deadline, never earlier; dropping a
-    /// waiting baton and its wait frees the slot (`RUN-003`).
+    /// host sleep and times out at its deadline, never earlier. Dropping a
+    /// waiting baton and its wait frees the slot.
     #[test]
     fn armed_waits_take_a_wheel_slot_on_a_wheel_host() {
         run_on_wheel_host(async {
@@ -2056,8 +2055,8 @@ mod wait {
     }
 
     /// A signal beats a timeout that fired on the wheel but that the waiter
-    /// has not observed yet: the waiter commits in its own poll, where the
-    /// signal is seen first (`RUN-004`).
+    /// has not observed yet. The waiter commits in its own poll, where the
+    /// signal is seen first.
     #[test]
     fn a_signal_beats_a_fired_but_unobserved_timeout() {
         run_on_wheel_host(async {
@@ -2081,9 +2080,9 @@ mod wait {
         });
     }
 
-    /// A wheel stopped while waits are armed (`~HHWheelTimer`'s `cancelAll`,
-    /// as at a worker's teardown) completes them as cancelled, the destroyed
-    /// baton's outcome (`RUN-008`), and so it does a wait armed after it.
+    /// A wheel stopped while waits are armed, as at a worker's teardown,
+    /// completes them as cancelled, the same outcome as a destroyed baton. A
+    /// wait armed after the stop completes as cancelled too.
     #[test]
     fn a_stopped_wheel_cancels_armed_waits() {
         run_on_wheel_host(async {
@@ -2111,11 +2110,10 @@ mod wait {
         });
     }
 
-    /// On a wheel host an armed wait on a reused baton allocates nothing,
-    /// where a Tokio sleep took one allocation per wait; a fresh baton and
-    /// its armed wait allocate only the baton's state; an untimed wait
-    /// allocates nothing. The counts are observable only where std's
-    /// allocations reach this crate's counting allocator (opt builds).
+    /// On a wheel host, an armed wait on a reused baton does not allocate. A
+    /// fresh baton and its armed wait allocate only the baton's state, and an
+    /// untimed wait does not allocate. The counts are observable only where
+    /// std's allocations reach this crate's counting allocator.
     #[test]
     fn armed_waits_allocate_nothing_on_a_wheel_host() {
         run_on_wheel_host(async {

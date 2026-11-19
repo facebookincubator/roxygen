@@ -106,9 +106,8 @@ pub enum ManagedWorkerError {
     ShutdownNotificationPanicked,
     #[error("worker task group failed: {0}")]
     TaskGroup(#[from] TaskGroupError),
-    /// Roxygen-only (`DIV-043`): the worker's teardown deadline passed before its
-    /// driver finished, so its remaining tasks, unfinished cleanup included, were
-    /// dropped.
+    /// The worker's teardown deadline passed before its driver finished, so its
+    /// remaining tasks, including unfinished cleanup, were dropped.
     #[error("worker teardown passed its deadline")]
     TeardownDeadlineExceeded,
 }
@@ -120,13 +119,14 @@ const LONGEST_SLEEP: Duration = Duration::from_secs(86_400);
 const DEFAULT_BLOCKING_THREAD_NAME: &str = "tokio-runtime-worker";
 
 /// Name of the thread that joins a `HostedWorker`'s owner thread for a bounded
-/// join (`DIV-043`).
+/// join.
 const JOINER_THREAD_NAME: &str = "roxygen-join";
 
-/// A teardown deadline that [`HostedWorker::shutdown_by`] sets, or moves earlier,
-/// at any time, read by the owner thread's supervisor and runtime teardown, and
-/// the count of the runtime's live blocking-pool threads that teardown waits for
-/// (`DIV-043`).
+/// A worker's teardown deadline and its count of live blocking-pool threads.
+///
+/// [`HostedWorker::shutdown_by`] sets the deadline or moves it earlier at any
+/// time. The owner thread's supervisor and runtime teardown read it, and
+/// teardown waits for the counted threads to exit.
 #[derive(Default)]
 struct TeardownDeadline {
     state: Mutex<TeardownState>,
@@ -171,7 +171,7 @@ impl TeardownDeadline {
         self.lock().deadline
     }
 
-    /// The deadline, with `waker` registered to learn of a new or earlier one.
+    /// The deadline, with `waker` registered to be woken by a new or earlier one.
     fn poll_deadline(&self, waker: &Waker) -> Option<Instant> {
         let mut state = self.lock();
         match &mut state.supervisor {
@@ -258,13 +258,14 @@ impl TeardownTimer {
     }
 }
 
-/// A worker's runtime. Without a teardown deadline, dropping it drops the
-/// runtime here, which drops its tasks and then waits for blocking-pool work.
-/// With one, it shuts the blocking pool down without waiting and drops the
-/// runtime's tasks here, inside the runtime's context, as `shutdown_background`
-/// does, then waits for the blocking-pool threads to exit only until the
-/// deadline, following it as it moves earlier, and leaves any still running to
-/// finish on their own (`DIV-043`).
+/// A worker's runtime.
+///
+/// Without a teardown deadline, dropping it drops the runtime here, which drops
+/// its tasks and then waits for blocking-pool work. With one, it shuts the
+/// blocking pool down without waiting and drops the runtime's tasks here, inside
+/// the runtime's context, as `shutdown_background` does. It then waits for the
+/// blocking-pool threads to exit only until the deadline, following it as it
+/// moves earlier, and leaves any still running to finish on their own.
 struct OwnedRuntime {
     runtime: Option<Runtime>,
     teardown: Arc<TeardownDeadline>,
@@ -308,8 +309,8 @@ struct ManagedDriver {
 
 impl Drop for ManagedDriver {
     fn drop(&mut self) {
-        // Destroyed unfinished (past a teardown deadline): the panic it caught is
-        // still its task's.
+        // Dropped unfinished, past a teardown deadline. The panic it caught still
+        // belongs to its task.
         let Some(payload) = self.failure.take() else {
             return;
         };
@@ -372,7 +373,7 @@ impl Wake for GateWake {
     }
 }
 
-/// Tells a worker supervisor whether its own waker fired since it last ran.
+/// Records whether a worker supervisor's own waker fired since it last ran.
 /// `LocalSet::run_until` polls the future it drives on every wake of any local
 /// task, and a supervisor has work only when one of its inputs (quiescence,
 /// outstanding work, its deadline timers, its teardown deadline, its task group
@@ -506,11 +507,11 @@ fn count(update: impl FnOnce(&mut WakeupCounts)) {
     WAKEUP_COUNTS.set(counts);
 }
 
-/// The host wakeup of a worker's wheel: one Tokio `Sleep`, created at the
-/// first arm and reset afterwards, polled by the worker's supervisor future,
+/// The host wakeup of a worker's wheel. It is one Tokio `Sleep`, created at the
+/// first arm and reset afterwards, and polled by the worker's supervisor future,
 /// which expires the wheel when it resolves. Withdrawing the wakeup drops the
-/// sleep, which deregisters it from Tokio's timer, and the next arm makes it
-/// anew in the same box.
+/// sleep, which deregisters it from Tokio's timer, and the next arm creates a
+/// new one in the same box.
 #[derive(Default)]
 struct TokioWakeup {
     sleep: RefCell<Option<Pin<Box<Option<Sleep>>>>>,
@@ -603,7 +604,7 @@ impl TokioWakeup {
 
     /// Polls the sleep with the supervisor's context. The supervisor's poll
     /// starts with the wheel step, and Tokio polls the `LocalSet` root with
-    /// a fresh coop budget, so coop never refuses this poll.
+    /// a fresh coop budget, so this poll always has coop budget.
     fn poll_sleep(&self, context: &mut Context<'_>) -> Poll<()> {
         self.needs_poll.set(false);
         let mut boxed = self.sleep.borrow_mut();
@@ -627,15 +628,15 @@ impl WheelWakeup for SharedWakeup {
     }
 
     /// A Tokio sleep is withdrawn only by dropping it. The wheel disarms when
-    /// it frees its last slot and in `stop`, after which `expire` does
-    /// nothing.
+    /// it frees its last slot and in `stop`. After `stop`, `expire` returns
+    /// immediately.
     fn disarm(&self) {
         self.0.withdraw();
     }
 }
 
 /// The wheel timer of one hosted or managed worker and its wakeup. The wheel
-/// is created when a timer first asks for it.
+/// is created when a timer first needs it.
 struct WorkerWheel {
     host: Host,
     wakeup: Rc<TokioWakeup>,
@@ -664,15 +665,15 @@ impl WorkerWheel {
         Rc::clone(timer)
     }
 
-    /// The supervisor's wheel step, run at its polls where the wheel's sleep
-    /// is due: polls the sleep, and expires the wheel when it resolves. A
+    /// The supervisor's wheel step, run in the polls where the wheel's sleep
+    /// is due. It polls the sleep and expires the wheel when it resolves. A
     /// sleep that `expire` re-arms is polled again, so that Tokio holds the
-    /// supervisor's waker for it; if it keeps resolving at once, the
+    /// supervisor's waker for it. If it keeps resolving immediately, the
     /// supervisor is woken to continue. An arm while the sleep is not due
     /// wakes the supervisor's waker stored here, or taken when the supervisor
-    /// started. The panic of an owner's waker that `expire` re-raised (the
-    /// wheel stays consistent and driven) goes to `wheel_panicked`. Out of
-    /// line, so that a supervisor poll with no sleep due carries none of it.
+    /// started. A panic from an owner's waker that `expire` re-raised goes to
+    /// `wheel_panicked`, and the wheel stays consistent and driven. It is out of
+    /// line to keep this code off supervisor polls with no sleep due.
     #[inline(never)]
     fn drive(
         &self,
@@ -743,10 +744,9 @@ impl InstalledWheel {
         }
     }
 
-    /// The wheel's teardown, done once: stops the wheel (`~HHWheelTimer`'s
-    /// `cancelAll`), drops the sleep and the supervisor's waker while the
-    /// runtime is alive, and uninstalls the wheel. Returns the panic of an
-    /// owner's waker that `stop` re-raised.
+    /// Tears the wheel down, once. It stops the wheel, drops the sleep and the
+    /// supervisor's waker while the runtime is alive, and uninstalls the wheel.
+    /// Returns the panic of an owner's waker that `stop` re-raised.
     fn uninstall(&mut self) -> Option<PanicPayload> {
         let wheel = self.wheel.take()?;
         let stopped = catch_unwind(AssertUnwindSafe(|| {
@@ -798,11 +798,11 @@ async fn run_managed_driver(
     let mut joined = Box::pin(tasks.join());
     let mut timer: Option<(QuiesceDeadline, Pin<Box<Sleep>>)> = None;
     let mut teardown_timer = TeardownTimer::default();
-    // Unwinding out of this future would drop unjoined tasks, so a panic of
-    // an owner's waker during expiry shuts the worker down. After the final
-    // join and the wheel's teardown (which an owner's waker can panic in
-    // too), the first such panic is reported as the owner thread's; payloads
-    // are disposed of with `discard_panic`, since their destructors can panic.
+    // Unwinding out of this future would drop unjoined tasks, so a panic from
+    // an owner's waker during expiry shuts the worker down instead. The wheel's
+    // teardown can panic the same way. After the final join and that teardown,
+    // the first such panic is reported as the owner thread's. Payloads go
+    // through `discard_panic` because their destructors can panic.
     let mut wheel_panic = None;
     let supervised = poll_fn(|parent| {
         // While a quiesce or teardown deadline is armed, the supervisor runs at
@@ -864,9 +864,10 @@ async fn run_managed_driver(
     let result = match supervised {
         Supervised::Joined(result) => result.map_err(ManagedWorkerError::from),
         Supervised::TeardownDeadlinePassed => {
-            // Destroying the driver aborts its unfinished cleanup tasks and re-raises a
-            // command, cleanup or driver panic it recorded, which the join reports. The work
-            // they abandon unjoined, from here to the thread's exit, is expected.
+            // Destroying the driver aborts its unfinished cleanup tasks and re-raises any
+            // command, cleanup or driver panic it recorded, which the join reports.
+            // `begin_forced_teardown` makes drops of work abandoned from here to the
+            // thread's exit skip their joined assertions.
             begin_forced_teardown();
             tasks.abort_all();
             match tasks.join().await {
@@ -885,7 +886,7 @@ async fn run_managed_driver(
 
 /// A worker hosted by a dedicated thread, current-thread runtime, and LocalSet.
 /// Like `HostedWorker`, it drives a wheel timer for its owner thread, which
-/// `Host::tokio().wheel_timer()` reports there (`DIV-003`).
+/// `Host::tokio().wheel_timer()` reports there.
 pub struct ManagedWorker {
     handle: WorkerHandle,
     owner: Option<JoinHandle<Result<(), ManagedWorkerError>>>,
@@ -970,8 +971,8 @@ impl ManagedWorker {
         self.completion.clone()
     }
 
-    /// Cancels and physically joins the worker. Notification panics are
-    /// reported as errors only after joining, including on the Drop path.
+    /// Cancels and joins the worker. Notification panics are reported as errors
+    /// only after joining, including on the Drop path.
     pub fn shutdown(mut self) -> Result<(), ManagedWorkerError> {
         self.shutdown_and_join()
     }
@@ -1007,43 +1008,45 @@ pub struct HostedWorkerOptions {
     pub command_capacity: NonZeroUsize,
     /// Name of the dedicated owner thread. It must not contain a NUL byte.
     pub thread_name: String,
-    /// Roxygen-only (`DIV-043`): runs once on the owner thread after its LocalSet and
-    /// runtime are gone, with nothing left to poll there, and before `completion()` is
-    /// published; also when the worker fails to start once its thread runs. Every
-    /// LocalSet task (commands, cleanup, `spawn_local`) and every runtime task
-    /// (`tokio::spawn`) has been dropped on the owner thread by then, with or without a
-    /// [`HostedWorker::shutdown_by`] deadline, also when cleanup overran it; only
-    /// blocking-pool work such a deadline abandoned can still be running, on its own
-    /// threads. A panic in it is caught and reported as
+    /// Runs once on the owner thread after its LocalSet and runtime are gone, and before
+    /// `completion()` is published. It also runs if the worker fails to start after its
+    /// thread is running.
+    ///
+    /// By then every LocalSet task (commands, cleanup, `spawn_local`) and every runtime
+    /// task (`tokio::spawn`) has been dropped on the owner thread, with or without a
+    /// [`HostedWorker::shutdown_by`] deadline, even if cleanup overran it. Only
+    /// blocking-pool work that such a deadline abandoned can still be running, on its own
+    /// threads. A panic in the hook is caught and reported as
     /// `ManagedWorkerError::OwnerThreadPanicked` unless the worker already failed.
     pub on_owner_thread_stop: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
-/// Roxygen-only (`DIV-037`): configuration of the blocking-pool threads of a
-/// [`HostedWorker`]'s runtime, which run work such as `spawn_blocking` and
-/// `tokio::net::lookup_host` that the worker's commands start.
+/// Configuration of the blocking-pool threads of a [`HostedWorker`]'s runtime,
+/// which run work such as `spawn_blocking` and `tokio::net::lookup_host` that the
+/// worker's commands start.
 pub struct HostedWorkerBlockingPool {
     /// Name of every blocking-pool thread. It must not contain a NUL byte.
     pub thread_name: String,
     /// Runs on each blocking-pool thread when it starts, before it runs any
     /// work, and never on the owner thread.
     pub on_thread_start: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
-    /// Roxygen-only (`DIV-043`): runs on each blocking-pool thread as it exits, after
-    /// its last work, and never on the owner thread (Tokio's `on_thread_stop`). A
-    /// bounded teardown waits for it as part of the thread's exit; a thread that a
-    /// teardown deadline abandoned runs it when its work returns.
+    /// Runs on each blocking-pool thread as it exits, after its last work, and
+    /// never on the owner thread (Tokio's `on_thread_stop`). A bounded teardown
+    /// waits for it as part of the thread's exit. A thread that a teardown
+    /// deadline abandoned runs it when its work returns.
     pub on_thread_stop: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
 }
 
-/// Roxygen-only (`DIV-043`): how [`HostedWorker::join_by`] ended.
+/// How [`HostedWorker::join_by`] ended.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[must_use]
 pub enum HostedWorkerJoin {
-    /// The owner thread exited by the deadline and was joined; its result, the one
+    /// The owner thread exited by the deadline and was joined. Holds the result that
     /// `completion()` publishes.
     Joined(Result<(), ManagedWorkerError>),
     /// The owner thread was still running at the deadline, or the caller is the
-    /// owner thread, and was detached; it publishes `completion()` when it ends.
+    /// owner thread. The thread was detached and publishes `completion()` when it
+    /// ends.
     Detached,
 }
 
@@ -1059,10 +1062,10 @@ fn joined(result: std::thread::Result<Result<(), ManagedWorkerError>>) -> Hosted
     }
 }
 
-/// Configures `builder`'s blocking pool as `blocking_pool` says (Tokio's
-/// defaults without one) and counts its live threads in `teardown`, which a
-/// bounded teardown waits for (`DIV-043`). The hooks hold `teardown` weakly: the
-/// runtime owns them, and the deadline cell holds the supervisor's waker, which
+/// Configures `builder`'s blocking pool from `blocking_pool`, or with Tokio's
+/// defaults if it is `None`, and counts its live threads in `teardown` for a
+/// bounded teardown to wait for. The hooks hold `teardown` weakly, because the
+/// runtime owns them and the deadline cell holds the supervisor's waker, which
 /// holds the runtime's handle.
 fn configure_blocking_pool(
     builder: &mut Builder,
@@ -1114,7 +1117,7 @@ enum OwnerThread {
     /// Joined, without a deadline, by whoever joins it.
     Unjoined(OwnerThreadHandle),
     /// A joiner thread joins it, thread-local destructors included, and sends
-    /// the result, so that a wait for its exit can end at a deadline (`DIV-043`).
+    /// the result, so that a wait for its exit can end at a deadline.
     Joining {
         owner: ThreadId,
         joined: mpsc::Receiver<HostedWorkerJoin>,
@@ -1178,31 +1181,39 @@ impl OwnerThread {
 }
 
 /// A `Send + Sync` worker that owns a dedicated thread, current-thread runtime, and `LocalSet`.
+///
 /// Unlike `ManagedWorker`, it drives `WorkerDriver::with_host`, so commands and activated
 /// cleanups run as independent Tokio local tasks.
 ///
-/// Shutdown and Drop follow `ManagedWorker`'s, with no deadline: when the driver processes
+/// # Shutdown
+///
+/// Without a deadline, shutdown and Drop follow `ManagedWorker`'s. When the driver processes
 /// shutdown, it drops queued commands and every running command still alive on the owner thread,
 /// and lets registered cleanup run to completion. Each command is its own Tokio local task, so
-/// until then a woken command may still be polled, sees `is_cancelled()`, and may finish, which a
+/// until then a woken command may still be polled, observe `is_cancelled()`, and finish, which a
 /// `ManagedWorker` command never does. `completion()` is published after every task is joined and
 /// the LocalSet and runtime are dropped. Dropping the runtime waits for blocking-pool work that
 /// commands started, such as `spawn_blocking` or `tokio::net::lookup_host`.
 ///
-/// The owner thread has a wheel timer, which `Host::tokio().wheel_timer()` and the context
-/// host report there and a `Timeout` uses; the worker's supervisor drives it through one Tokio
-/// `Sleep` and stops it after the final join (`DIV-003`).
+/// [`Self::shutdown_by`] bounds that teardown by a deadline, as Tokio's
+/// `Runtime::shutdown_timeout` does, and [`Self::join_by`] bounds the join.
+///
+/// # Drop
 ///
 /// Drop calls `begin_shutdown` and then, off the owner thread, joins the owner thread, which
-/// blocks until all of that finishes and the thread exits. Async code therefore drops the worker
-/// from a blocking context such as `spawn_blocking`, never on a Tokio worker thread. A joining Drop
-/// deadlocks on a blocking-pool thread of this worker's runtime, and while the dropping caller
-/// holds a `completion()` borrow, which keeps the owner thread from publishing completion. A Drop
-/// on the owner thread does not join; `completion()` is that path's join point.
+/// blocks until shutdown completes and the thread exits. Async code should therefore drop the
+/// worker from a blocking context such as `spawn_blocking`, never on a Tokio worker thread. A
+/// joining Drop deadlocks on a blocking-pool thread of this worker's runtime, and while the
+/// dropping caller holds a `completion()` borrow, which keeps the owner thread from publishing
+/// completion. A Drop on the owner thread does not join, and `completion()` is that path's join
+/// point. After `shutdown_by`, Drop waits for the owner thread's exit only until the deadline and
+/// then detaches it.
 ///
-/// Roxygen-only (`DIV-043`): [`Self::shutdown_by`] bounds that teardown by a deadline, as Tokio's
-/// `Runtime::shutdown_timeout` does, and [`Self::join_by`] bounds the join; Drop after
-/// `shutdown_by` waits for the owner thread's exit until the deadline and then detaches it.
+/// # Timers
+///
+/// The owner thread has a wheel timer. On that thread, `Host::tokio().wheel_timer()` and the
+/// context host return it, and a `Timeout` takes its slot from it. The worker's supervisor drives
+/// it through one Tokio `Sleep` and stops it after the final join.
 pub struct HostedWorker {
     handle: WorkerHandle,
     owner: Mutex<Option<OwnerThread>>,
@@ -1211,9 +1222,9 @@ pub struct HostedWorker {
 }
 
 impl HostedWorker {
-    /// Starts the owner thread and blocks until its worker is running; async
-    /// callers use `spawn_blocking`. A thread name with a NUL byte returns
-    /// `ManagedWorkerError::ThreadSpawn` without starting a thread.
+    /// Starts the owner thread and blocks until its worker is running, so async
+    /// callers should call it from `spawn_blocking`. A thread name with a NUL
+    /// byte returns `ManagedWorkerError::ThreadSpawn` without starting a thread.
     pub fn spawn(options: HostedWorkerOptions) -> Result<Self, ManagedWorkerError> {
         Self::spawn_inner(options, None)
     }
@@ -1272,7 +1283,7 @@ impl HostedWorker {
                     )
                 }))
                 .unwrap_or(Err(ManagedWorkerError::OwnerThreadPanicked));
-                // The LocalSet and runtime are gone, with every task: nothing is polled here now.
+                // The LocalSet, the runtime and every task have been dropped by now.
                 let result =
                     match on_owner_thread_stop.map(|hook| catch_unwind(AssertUnwindSafe(hook))) {
                         Some(Err(payload)) => {
@@ -1282,8 +1293,8 @@ impl HostedWorker {
                         Some(Ok(())) | None => result,
                     };
                 // Completion wakers are caller code, and dropping the sender notifies them too.
-                // After an owner-thread Drop no one joins this thread, and std aborts the process
-                // if its unjoined result panics on drop.
+                // After an owner-thread Drop this thread is never joined, and std aborts the
+                // process if its unjoined result panics on drop.
                 let published = catch_unwind(AssertUnwindSafe(|| {
                     completed_tx.send_replace(Some(result.clone()));
                 }));
@@ -1315,8 +1326,8 @@ impl HostedWorker {
         }
     }
 
-    /// [`Self::spawn`], with the runtime's blocking-pool threads named and started as
-    /// `blocking_pool` says (`DIV-037`). A blocking thread name with a NUL byte returns
+    /// Like [`Self::spawn`], but names and starts the runtime's blocking-pool threads as
+    /// configured by `blocking_pool`. A blocking thread name with a NUL byte returns
     /// `ManagedWorkerError::ThreadSpawn` without starting a thread.
     pub fn spawn_with_blocking_pool(
         options: HostedWorkerOptions,
@@ -1331,7 +1342,7 @@ impl HostedWorker {
 
     /// The owner thread's result, published once the worker is fully torn
     /// down. Release every borrow of it before dropping the worker. Wakers
-    /// registered through it run on the owner thread and must not panic: the
+    /// registered through it run on the owner thread and must not panic. The
     /// owner thread discards such a panic, but Tokio may then drop other
     /// waiters' wakers without waking them.
     pub fn completion(&self) -> watch::Receiver<Option<Result<(), ManagedWorkerError>>> {
@@ -1345,43 +1356,52 @@ impl HostedWorker {
         self.handle.begin_shutdown()
     }
 
-    /// Roxygen-only (`DIV-043`): [`Self::shutdown`], with the teardown bounded by
-    /// `deadline`, as Tokio's `Runtime::shutdown_timeout` bounds a runtime's. If the
-    /// driver has not finished by then (registered cleanup still running), the owner
-    /// thread stops polling it and drops it and every command and cleanup task,
-    /// unfinished cleanup included, and `completion()` reports
-    /// `ManagedWorkerError::TeardownDeadlineExceeded`, or
-    /// `ManagedWorkerError::TaskGroup(TaskPanicked)` if a command, cleanup or the
-    /// driver panicked, as without a deadline. That destruction abandons the work it
-    /// finds unjoined: from then until the owner thread exits,
-    /// [`crate::task_group::in_forced_teardown`] holds there, and a task group or an
-    /// owned session driver dropped with work unjoined still cancels that work, and
-    /// raises a panic that work raises as it is destroyed, but does not assert that
-    /// it was joined. The owner thread then drops its
-    /// LocalSet, as without a deadline, and its runtime as Tokio's
-    /// `Runtime::shutdown_background` does: the blocking pool is shut down (blocking
-    /// work spawned from then on is refused) and every `tokio::spawn` task is dropped
-    /// on the owner thread, inside the runtime's context, without waiting. It then
-    /// waits for the runtime's blocking-pool threads to exit until the deadline;
-    /// blocking-pool work still running then (such as `spawn_blocking`, or
-    /// `tokio::net::lookup_host` waiting on a resolver) is abandoned to finish on its
-    /// own thread, unreported, as Tokio's `shutdown_timeout` abandons it. Only Drop
-    /// impls of the worker's tasks and the `on_owner_thread_stop` hook run on the
-    /// owner thread after the deadline. Every task is thus dropped on the owner thread
-    /// before the stop hook runs and `completion()` is published, also when cleanup
-    /// overran the deadline; the wait for blocking-pool threads then returns at once,
-    /// and work still running on them runs alongside the hook.
+    /// Starts shutdown like [`Self::shutdown`], with the teardown bounded by `deadline`, as
+    /// Tokio's `Runtime::shutdown_timeout` bounds a runtime's.
     ///
-    /// A later call can move the deadline earlier, never later; every teardown phase
-    /// that waits (the driver's cleanup, the wait for blocking-pool threads, and a
-    /// bounded join) follows the earlier deadline, except a runtime drop that began
-    /// without any deadline, which runs on the owner thread as without one. The first
-    /// call also hands the owner thread to a joiner thread (named `roxygen-join`), so
-    /// that a later [`Self::join_by`] or Drop can wait for the thread's exit until a
-    /// deadline. Calling it on many workers before joining any lets them all tear down
-    /// at once, each by the same deadline. Returns `WorkerHandle::begin_shutdown`'s
-    /// result and, like it, re-raises a shutdown notification panic after the worker
-    /// has left `Open`.
+    /// Returns `WorkerHandle::begin_shutdown`'s result and, like it, re-raises a shutdown
+    /// notification panic after the worker has left `Open`.
+    ///
+    /// # Deadline expiry
+    ///
+    /// If the driver has not finished by the deadline (registered cleanup still running), the
+    /// owner thread stops polling it and drops it along with every command and cleanup task,
+    /// including unfinished cleanup. `completion()` then reports
+    /// `ManagedWorkerError::TeardownDeadlineExceeded`, or
+    /// `ManagedWorkerError::TaskGroup(TaskPanicked)` if a command, cleanup or the driver
+    /// panicked, as without a deadline.
+    ///
+    /// That destruction abandons unjoined work. From then until the owner thread exits,
+    /// [`crate::task_group::in_forced_teardown`] returns `true` there. A task group or owned
+    /// session driver dropped with unjoined work still cancels that work and raises any panic
+    /// the work raises as it is destroyed, but does not assert that it was joined.
+    ///
+    /// # Runtime teardown
+    ///
+    /// After the driver finishes or is dropped, the owner thread drops its LocalSet, as without
+    /// a deadline, and its runtime as Tokio's `Runtime::shutdown_background` does. The blocking
+    /// pool is shut down, so blocking work spawned from then on is rejected, and every
+    /// `tokio::spawn` task is dropped on the owner thread, inside the runtime's context, without
+    /// waiting. The owner thread then waits for the runtime's blocking-pool threads to exit until
+    /// the deadline. Blocking-pool work still running then (such as `spawn_blocking`, or
+    /// `tokio::net::lookup_host` waiting on a resolver) is left to finish on its own thread,
+    /// unreported, as Tokio's `shutdown_timeout` leaves it.
+    ///
+    /// Only Drop impls of the worker's tasks and the `on_owner_thread_stop` hook run on the owner
+    /// thread after the deadline. Every task is dropped on the owner thread before the stop hook
+    /// runs and `completion()` is published, even when cleanup overran the deadline. In that case
+    /// the wait for blocking-pool threads returns immediately, and work still running on them runs
+    /// alongside the hook.
+    ///
+    /// # Repeated calls
+    ///
+    /// A later call can move the deadline earlier, never later. Every teardown phase that waits
+    /// (the driver's cleanup, the wait for blocking-pool threads, and a bounded join) follows the
+    /// earlier deadline, except a runtime drop that began without any deadline, which runs on the
+    /// owner thread as without one. The first call also hands the owner thread to a joiner thread
+    /// (named `roxygen-join`), so that a later [`Self::join_by`] or Drop can wait for the thread's
+    /// exit until a deadline. Calling it on many workers before joining any lets them all tear
+    /// down concurrently by the same deadline.
     pub fn shutdown_by(&self, deadline: Instant) -> bool {
         self.teardown.set_no_later_than(deadline);
         {
@@ -1391,13 +1411,14 @@ impl HostedWorker {
         self.handle.begin_shutdown()
     }
 
-    /// Roxygen-only (`DIV-043`): starts shutdown as Drop does (without changing any
-    /// teardown deadline), waits until `deadline` for the owner thread to exit, its
-    /// thread-local destructors included (a joiner thread joins it), and returns its
-    /// result if it did; otherwise detaches it. Like Drop, it never unwinds, and on the
-    /// owner thread it detaches at once. With a teardown deadline from
-    /// [`Self::shutdown_by`], a little slack past it lets the owner thread finish
-    /// dropping its tasks and running its stop hook.
+    /// Starts shutdown as Drop does and waits until `deadline` for the owner thread to exit.
+    ///
+    /// The wait covers the thread's thread-local destructors, because a joiner thread joins
+    /// it. Returns the thread's result if it exited in time, and otherwise detaches it. It
+    /// does not change any teardown deadline. Like Drop, it never unwinds, and on the owner
+    /// thread it detaches immediately. With a teardown deadline from [`Self::shutdown_by`], a
+    /// `deadline` a little past it gives the owner thread time to finish dropping its tasks
+    /// and running its stop hook.
     pub fn join_by(mut self, deadline: Instant) -> HostedWorkerJoin {
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.handle.begin_shutdown())) {
             crate::panic::discard_panic(payload);

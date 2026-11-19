@@ -151,10 +151,12 @@ impl KeepAliveState {
 ///
 /// Tokens carry only liveness. Access to the value requires this `!Send`
 /// owner, so dropping a token on another thread cannot touch or destroy local
-/// state. Call [`Self::finalize`] before dropping the owner; unfinalized drop
-/// is unsupported and panics in all build modes. During an existing unwind,
-/// secondary invariant assertions are suppressed while fields are retired;
-/// this preserves the initiating failure, not successful finalization.
+/// state.
+///
+/// Call [`Self::finalize`] before dropping the owner. Dropping an unfinalized
+/// owner panics in all build modes, unless the thread is already unwinding.
+/// In that case the checks are skipped so that the original panic propagates,
+/// and the value is dropped without waiting for outstanding tokens.
 pub struct KeepAliveOwner<T> {
     value: Option<T>,
     state: Arc<KeepAliveState>,

@@ -94,7 +94,7 @@ mod poll_stats {
         }
     }
 
-    /// A host whose spawned tasks run only when the test runs them.
+    /// A host that runs its spawned tasks only when the test runs them.
     #[derive(Clone, Default)]
     struct ManualHost {
         tasks: Rc<RefCell<VecDeque<LocalFuture>>>,
@@ -363,7 +363,6 @@ mod poll_stats {
         assert_eq!(merged.cleanup_polls, 50);
     }
 
-    /// `DIV-056`.
     #[test]
     fn contained_panics_are_counted_by_scope_and_the_message_is_read() {
         let (handle, driver) = WorkerDriver::new(4).expect("worker starts");
@@ -425,7 +424,6 @@ mod poll_stats {
         drop(driver);
     }
 
-    /// `DIV-056`.
     #[cfg(feature = "observability")]
     #[test]
     fn a_panicking_subscriber_is_discarded() {
@@ -475,8 +473,9 @@ mod poll_stats {
         drop(driver);
     }
 
-    /// Records each `roxygen::contained_panic` event on the thread it is the default for as
-    /// one line; it panics instead on the next event while `panic_next` is set.
+    /// Records each `roxygen::contained_panic` event as one line, on the thread where it
+    /// is the default subscriber. While `panic_next` is set, it panics on the next event
+    /// instead.
     #[cfg(feature = "observability")]
     #[derive(Clone, Default)]
     struct EventRecorder {

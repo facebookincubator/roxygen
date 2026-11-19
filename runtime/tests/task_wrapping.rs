@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Task wrapper oracles.
+//! Tests for task wrapping.
 
 mod task_wrapping {
     use std::any::Any;
@@ -207,12 +207,12 @@ mod task_wrapping {
         }
     }
 
-    /// tracing-core caches a span callsite's interest when the callsite is
-    /// first hit, and while exactly one dispatcher is registered it takes
-    /// that interest from the hitting thread's default. A first hit from a
-    /// test thread without a recorder, while another thread's recorder is
-    /// the only dispatcher, would disable the runtime's span callsite for
-    /// every thread until the next dispatcher registers.
+    /// Hits the runtime's span callsite once under a recorder. tracing-core
+    /// caches a callsite's interest at its first hit and, while exactly one
+    /// dispatcher is registered, takes it from the hitting thread's default. A
+    /// first hit from a test thread without a recorder, while another thread's
+    /// recorder is the only dispatcher, would disable the callsite for every
+    /// thread until the next dispatcher registers.
     #[cfg(feature = "observability")]
     fn register_span_callsite() {
         static REGISTERED: std::sync::Once = std::sync::Once::new();
@@ -688,7 +688,7 @@ mod task_wrapping {
             }
         }
 
-        /// Pends until the signal opens; the plan's polls start after that.
+        /// Pends until the signal opens. The plan's polls start after that.
         fn gated(self, gate: &Signal) -> Self {
             Self {
                 gate: Some(gate.clone()),
@@ -764,7 +764,7 @@ mod task_wrapping {
         }
     }
 
-    /// A host whose spawned tasks run only when the test runs them.
+    /// A host that runs its spawned tasks only when the test runs them.
     #[derive(Clone, Default)]
     struct ManualHost {
         tasks: Rc<RefCell<VecDeque<LocalFuture>>>,
@@ -1097,10 +1097,11 @@ mod task_wrapping {
             .join(" ")
     }
 
-    /// The scenario's transcript, without its tracing callbacks, equals its
-    /// `GOLDENS` entry. Under `observability`, the whole transcript, with each
-    /// tracing callback in its place among the other events and the context
-    /// that it saw, is also compared by its length and hash in `TRACES`.
+    /// Asserts that the scenario's transcript, without its tracing callbacks,
+    /// equals its `GOLDENS` entry. Under `observability`, the whole transcript,
+    /// with each tracing callback in its place among the other events and the
+    /// context installed when it ran, is also compared by its length and hash
+    /// in `TRACES`.
     fn assert_transcript(name: &str, lines: &[String]) {
         let actual: Vec<&str> = lines
             .iter()
@@ -1448,7 +1449,7 @@ mod task_wrapping {
             }
         }
 
-        /// Polls the driver; a hosted driver's tasks then run once, and the
+        /// Polls the driver. A hosted driver's tasks then run once, and the
         /// driver is polled again to join them.
         fn turn(&mut self) {
             self.poll();
@@ -2344,7 +2345,7 @@ mod task_wrapping {
         })
     }
 
-    /// Strips the context that a tracing callback saw.
+    /// Strips the context recorded with a tracing callback.
     #[cfg(feature = "observability")]
     fn without_context(line: &str) -> &str {
         line.rfind(" [").map_or(line, |index| &line[..index])
@@ -2430,9 +2431,8 @@ mod task_wrapping {
 
     /// Installs, once, a panic hook that reports a panic in `quietly` without
     /// a backtrace and, in a sweep child, exits at `CLEANUP_PANIC` instead of
-    /// letting the runtime abort: an abort would dump core, and the host's
-    /// core dump handler ignores `RLIMIT_CORE`. Other panics go to the hook
-    /// it replaces.
+    /// letting the runtime abort. An abort would dump core, and some core dump
+    /// handlers ignore `RLIMIT_CORE`. Other panics go to the hook it replaces.
     #[cfg(feature = "observability")]
     fn install_panic_hook() {
         static HOOK: std::sync::Once = std::sync::Once::new();
@@ -2471,8 +2471,8 @@ mod task_wrapping {
     }
 
     /// Runs `run` with this thread's panics reported without a backtrace.
-    /// The test runner sets `RUST_BACKTRACE=1`, and symbolizing a backtrace
-    /// for each of a sweep's thousands of expected panics takes minutes.
+    /// When `RUST_BACKTRACE=1` is set, symbolizing a backtrace for each of a
+    /// sweep's thousands of expected panics takes minutes.
     #[cfg(feature = "observability")]
     fn quietly<T>(run: impl FnOnce() -> T) -> T {
         struct Restore(bool);
@@ -2588,8 +2588,8 @@ mod task_wrapping {
     /// panicking at that callback, and summarizes each run's outcome
     /// (`place_outcome`). A callback that runs while the thread unwinds,
     /// outside any `catch_unwind`, is left out, since a panic there aborts
-    /// the process; a child process checks that it does and hashes the
-    /// transcript recorded before the abort. The callbacks that `IN_CHILD`
+    /// the process. A child process checks that such a panic aborts and hashes
+    /// the transcript recorded before the abort. The callbacks that `IN_CHILD`
     /// lists run in child processes.
     #[cfg(feature = "observability")]
     fn sweep(name: &str, run: &dyn Fn(&Cast), unwinding_contained: bool) -> Vec<String> {
@@ -2634,26 +2634,28 @@ mod task_wrapping {
     }
 
     /// Callbacks, by sweep and number, that run outside an unwind but where a
-    /// subscriber panic still aborts the process, or leaks memory that the
-    /// leak sanitizer reports, on the runtime that `GOLDENS` records. Each
-    /// runs in a child process. Aborts: a panic at the enter of a
-    /// `WorkerDriver::new` command's terminal install, after its poll returns
-    /// ready, closes the command span and leaves the observed future's inner
-    /// future in place, so the driver drops the task as the panic leaves its
-    /// poll, `cancel_operation` finds no span, and the command's
-    /// `CommandTask` re-raises that panic in a destructor; and a panic at the
-    /// new span of a hosted task group's `close`, in a shutdown that runs
-    /// while the thread unwinds, leaves the group's tasks in place, so its
-    /// `Drop` assertion panics during the unwind; and, where the user
-    /// future's drop panics, a panic that leaves that future in place (a
-    /// span's clone when the task is wrapped, or the enter of the install
-    /// that would drop it), so it drops during the unwind. A child process
-    /// checks that each one aborts and hashes the transcript recorded before
-    /// the abort. Leaks: an exit or `try_close` that a return runs, from a
-    /// guard or envelope dropped after the returned value exists, leaks that
-    /// value when it panics. One child process per sweep runs them with leak
-    /// detection off, and their outcomes are compared as the in-process ones
-    /// are.
+    /// subscriber panic still aborts the process (first list) or leaks memory
+    /// that the leak sanitizer reports (second list), on the runtime that
+    /// `GOLDENS` records. Each runs in a child process.
+    ///
+    /// A panic at the enter of a `WorkerDriver::new` command's terminal
+    /// install, after its poll returns ready, closes the command span and
+    /// leaves the observed future's inner future in place. The driver then
+    /// drops the task as the panic leaves its poll, `cancel_operation` does not
+    /// find a span, and the command's `CommandTask` re-raises that panic in a
+    /// destructor. A panic at the new span of a hosted task group's `close`, in
+    /// a shutdown that runs while the thread unwinds, leaves the group's tasks
+    /// in place, so its `Drop` assertion panics during the unwind. Where the
+    /// user future's drop panics, a panic that leaves that future in place (a
+    /// span's clone when the task is wrapped, or the enter of the install that
+    /// would drop it) makes it drop during the unwind. A child process checks
+    /// that each of these aborts and hashes the transcript recorded before the
+    /// abort.
+    ///
+    /// An exit or `try_close` that a return runs, from a guard or envelope
+    /// dropped after the returned value exists, leaks that value when it
+    /// panics. One child process per sweep runs these with leak detection off,
+    /// and their outcomes are compared as the in-process ones are.
     #[cfg(feature = "observability")]
     const IN_CHILD: &[(&str, &[usize], &[usize])] = &[
         ("sweep/group/Ready", &[], &[2, 6, 10]),
@@ -2995,7 +2997,7 @@ mod task_wrapping {
 
     /// A hosted command's pending poll keeps two nested installs and two
     /// catches under `observability`, so that its command span's callbacks
-    /// see the group context; the base build makes one of each.
+    /// run under the group context. The base build makes one of each.
     const HOSTED_POLL_WORK: usize = if cfg!(feature = "observability") {
         2
     } else {
@@ -3076,9 +3078,10 @@ mod task_wrapping {
         rig.finish();
     }
 
-    /// A hosted cleanup's wrapper polls a cleanup body without choosing among
-    /// the body kinds; a `TaskGroup` task's and a hosted command's wrapper
-    /// choose once per poll, and an owner-polled command has no wrapper.
+    /// A hosted cleanup's wrapper polls its cleanup body without dispatching
+    /// on the body kind. A `TaskGroup` task's wrapper and a hosted command's
+    /// wrapper dispatch once per poll, and an owner-polled command has no
+    /// wrapper.
     #[test]
     fn each_pending_poll_counts_its_task_body_dispatches() {
         let dispatches = pending_poll_work().map(|(.., dispatches)| dispatches);
@@ -3089,8 +3092,8 @@ mod task_wrapping {
         );
     }
 
-    /// A task whose poll starts a span on a new observer from the context it
-    /// sees, and records the link installed there and the parent that the
+    /// A task whose poll starts a span on a new observer from the installed
+    /// context, and records the link installed there and the parent that the
     /// observer recorded.
     fn observed_parent(seen: &Rc<RefCell<Vec<(Option<SpanLink>, Option<SpanLink>)>>>) -> Probe {
         let seen = Rc::clone(seen);
@@ -3472,9 +3475,9 @@ mod task_wrapping {
         }
     }
 
-    /// Transcripts and sweep summaries recorded on the runtime from before
-    /// `repair.runtime_task_wrapping`, with only the `cfg(test)` hooks added.
-    /// Both builds compare the lines that are not tracing callbacks (`t:`);
+    /// Reference transcripts and sweep summaries, recorded on an earlier
+    /// version of the runtime with only the `cfg(test)` hooks added. Both
+    /// builds compare the lines that are not tracing callbacks (`t:`).
     /// `TRACES` hashes every scenario's whole transcript, tracing callbacks
     /// included, and the `TRACED` scenarios' transcripts here also list them.
     const GOLDENS: &[(&str, &str)] = &[
@@ -8447,8 +8450,8 @@ mod task_wrapping {
 
     /// The length and hash of each scenario's whole transcript under
     /// `observability`, its tracing callbacks in place among the other events
-    /// and each with the context that it saw (`stable_trace`), recorded on
-    /// the same state as `GOLDENS`.
+    /// and each with the context installed when it ran (`stable_trace`),
+    /// recorded on the same runtime as `GOLDENS`.
     #[cfg(feature = "observability")]
     const TRACES: &[(&str, usize, u32)] = &[
         ("abort/PanicDropAbortsItself", 32, 0x6b8e21cd),

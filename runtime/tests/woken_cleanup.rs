@@ -325,8 +325,8 @@ mod woken_cleanup {
         worker.shut_down();
     }
 
-    /// A cleanup that finishes once it has seen `target` from `sent`, and
-    /// reports its finish.
+    /// A cleanup that finishes, and reports it on `done`, at its first poll
+    /// after `sent` reaches `target`.
     struct CountingCleanup {
         sent: Arc<AtomicU64>,
         target: u64,
@@ -1030,8 +1030,8 @@ mod woken_cleanup {
         worker.shut_down();
     }
 
-    /// A cleanup that finishes once a command sets `released`, which wakes
-    /// nothing.
+    /// A cleanup that finishes once a command sets `released`. Setting it
+    /// does not wake the cleanup.
     struct UnwokenCleanup {
         released: Arc<AtomicBool>,
     }

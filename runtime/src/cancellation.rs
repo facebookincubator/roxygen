@@ -266,7 +266,7 @@ impl CancellationSource {
         }
     }
 
-    /// Same answer as `self.token().is_cancellation_requested()`.
+    /// Returns the same value as `self.token().is_cancellation_requested()`.
     #[inline]
     pub fn is_cancellation_requested(&self) -> bool {
         self.state.requested.load(Ordering::Acquire)
@@ -330,7 +330,7 @@ impl CancellationToken {
     }
 
     /// Creates an owner-local wake registration permanently bound to this token.
-    /// No listener is installed until its waker is updated.
+    /// A listener is not installed until its waker is first updated.
     pub fn wake_registration(&self) -> CancellationWakeRegistration {
         CancellationWakeRegistration {
             token: self.clone(),
@@ -423,9 +423,10 @@ pub struct CancellationWakeRegistration {
 }
 
 impl CancellationWakeRegistration {
-    /// Updates the wake target and reports whether cancellation was observed.
-    /// A `true` result does not promise a fresh wake of the supplied target; a
-    /// `false` result does not prevent cancellation immediately afterward.
+    /// Updates the wake target and returns whether cancellation was observed.
+    ///
+    /// A `true` result does not guarantee a fresh wake of the supplied target,
+    /// and a `false` result does not prevent cancellation immediately afterward.
     /// Never-cancellable tokens neither retain nor clone the waker.
     ///
     /// A waker callback panic may leave the new target installed. The retained
@@ -638,8 +639,8 @@ mod callback_safety_tests {
         static DROPS: Cell<u8> = const { Cell::new(0) };
     }
 
-    /// A waker whose clone can request cancellation and whose drops can panic,
-    /// each driven by this thread's test state.
+    /// A waker that can request cancellation when cloned and panic when dropped,
+    /// as set by this thread's test state.
     fn callback_waker() -> Waker {
         fn clone(_: *const ()) -> RawWaker {
             if let Some(source) = CANCEL_ON_CLONE.take() {

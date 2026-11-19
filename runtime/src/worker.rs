@@ -103,8 +103,8 @@ pub enum CleanupRegistrationError {
     IdentifierExhausted,
 }
 
-/// The scope at which one of Roxygen's owned HTTP drivers contained a panic
-/// (`DIV-056`): which `WorkerPollStats` counter counts it.
+/// The scope at which one of Roxygen's owned HTTP drivers contained a panic,
+/// which selects the `WorkerPollStats` counter that counts it.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContainedPanicScope {
@@ -245,7 +245,7 @@ impl Drop for TrackedTask {
     }
 }
 
-/// An admitted command: its job under its command span, and its
+/// An admitted command, holding its job (under its command span) and its
 /// `WorkCompletion`. `WorkerDriver::new` boxes it as one task; a hosted
 /// driver's task group keeps it inline beneath the group span. Destruction
 /// drops the job and then releases the completion, each at most once.
@@ -405,9 +405,9 @@ impl WorkerShared {
     }
 
     /// Registers the driver's waker and, while the worker is `Open`, moves the
-    /// queued commands to `intake`, under one lock. A stored waker that
-    /// `will_wake` this one is kept; a replaced one drops outside the lock,
-    /// before anything is taken.
+    /// queued commands to `intake`. A stored waker that `will_wake` this one is
+    /// kept. A replaced one is dropped outside the queue lock, before the
+    /// commands are taken.
     pub(crate) fn take_open_commands(&self, waker: &Waker, intake: &mut Vec<WorkerCommand>) {
         let mut queue = self.queue();
         if !queue
@@ -440,9 +440,9 @@ impl WorkerShared {
 
     /// Queues a woken cleanup for the next woken pass and wakes the driver.
     /// Every pass registers the driver waker before it drains the list, and
-    /// whatever takes the waker wakes it. So when no waker is stored, the
+    /// any code that takes the waker wakes it. So when no waker is stored, the
     /// driver is already due to poll again, as is a driver not yet polled,
-    /// and that poll drains this entry. A closed worker queues nothing.
+    /// and that poll drains this entry. A closed worker drops the entry.
     fn push_ready_cleanup(&self, entry: ReadyEntry) {
         let driver = {
             let mut queue = self.queue();
@@ -861,8 +861,8 @@ pub(crate) fn take_spawned_job_size() -> Option<usize> {
     SPAWNED_JOB_SIZE.take()
 }
 
-/// A cancellable observation of worker admission closing.
-/// Dropping this future unregisters observation and leaves draining unchanged.
+/// A future that completes when worker admission closes.
+/// Dropping it unregisters its waker and does not affect draining.
 pub struct WorkerQuiescing {
     token: CancellationToken,
     registration: Option<CancellationRegistration>,
@@ -889,8 +889,8 @@ impl Future for WorkerQuiescing {
     type Output = ();
 
     /// A registered waker that would wake this task stays registered without
-    /// taking the registry lock: cancellation takes and wakes it after marking
-    /// the token, so a poll that sees the token unmarked can stay pending.
+    /// taking the registry lock. Cancellation takes and wakes it after marking
+    /// the token, so a poll that reads the token unmarked can stay pending.
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
         if this.token.is_cancellation_requested() {
@@ -990,7 +990,7 @@ impl WorkerContext {
         current_id() == self.owner_thread()
     }
 
-    /// Same answer as `self.handle().is_cancelled()`.
+    /// Returns the same value as `self.handle().is_cancelled()`.
     #[inline]
     pub fn is_cancelled(&self) -> bool {
         self.handle.shared.cancelled.load(Ordering::Acquire)
@@ -1018,12 +1018,14 @@ impl WorkerContext {
         self.local.active_guards.get()
     }
 
-    /// For Roxygen's owned HTTP drivers (`DIV-056`): counts a panic contained
-    /// at `scope` in this worker's `WorkerPollStats`. Under `observability`
-    /// it also emits an error event with target `roxygen::contained_panic`
-    /// and fields `scope`, `site`, `stream` (when known) and `message`, the
-    /// payload's text truncated to 128 bytes; a panic in the subscriber is
-    /// discarded. The caller keeps, and disposes of, `payload`.
+    /// Counts a panic that one of Roxygen's owned HTTP drivers contained at
+    /// `scope` in this worker's `WorkerPollStats`.
+    ///
+    /// Under `observability` it also emits an error event with target
+    /// `roxygen::contained_panic` and fields `scope`, `site`, `stream` (when
+    /// known) and `message`, the payload's text truncated to 128 bytes. A panic
+    /// in the subscriber is discarded. The caller keeps, and disposes of,
+    /// `payload`.
     #[doc(hidden)]
     #[cold]
     #[inline(never)]
@@ -1282,7 +1284,7 @@ impl WorkerContext {
 
     /// Polls the cleanups woken since the last pass, each once, in wake
     /// order, or, once shutdown starts, every unfinished cleanup in
-    /// registration order. No registry borrow is held across a poll. The
+    /// registration order. A registry borrow is never held across a poll. The
     /// driver registered its waker before its commands ran.
     fn poll_woken_cleanup_tasks(
         &self,
@@ -1757,14 +1759,13 @@ impl Drop for CleanupPublisher {
     }
 }
 
-/// Sendable, repeatable observation of registered cleanup-future retirement.
+/// A cloneable, `Send` observer of a registered cleanup future's retirement.
 ///
-/// Confirmation follows owner-thread destruction of the future and its owned
-/// captures, including scope accounting. It does not certify cleanup success,
-/// destruction of shared referents, child joins, worker joins, or I/O completion.
-/// Disarming or forcibly dropping a future can confirm retirement. This observer
-/// retains no worker-local state or execution ownership; dropping it does not
-/// activate, cancel, or join cleanup.
+/// [`Self::wait`] completes once the future and its captures are dropped on the
+/// owner thread, including scope accounting. It does not report whether the
+/// cleanup succeeded. Disarming or forcibly dropping the future also counts as
+/// retirement. The observer holds no worker-local state, and dropping it does
+/// not activate, cancel, or join the cleanup.
 #[derive(Clone)]
 pub struct WorkerCleanupObserver {
     shared: Arc<Mutex<CleanupObservationState>>,
@@ -1857,7 +1858,7 @@ impl WorkerCleanupRegistration {
     /// Removes the armed callback without running it.
     ///
     /// Returns `true` when this call removed the callback. It returns `false`
-    /// when shutdown already drained it or its owner state no longer exists.
+    /// when shutdown already drained it or its owner state has been dropped.
     pub fn disarm(mut self) -> Result<bool, CleanupRegistrationError> {
         let actual = current_id();
         if actual != self.owner_thread {
@@ -2071,7 +2072,7 @@ pub struct WorkerCleanupTask {
 }
 
 impl WorkerCleanupTask {
-    /// Observes physical retirement without transferring owner-local task ownership.
+    /// Returns an observer of the cleanup's retirement, without taking the task.
     pub fn observe(&self) -> WorkerCleanupObserver {
         self.state.publisher.observe()
     }
@@ -2080,7 +2081,7 @@ impl WorkerCleanupTask {
         matches!(&*self.state.phase.borrow(), TrackedCleanupPhase::Finished)
     }
 
-    /// Explicitly drops completion observation without cancelling the task.
+    /// Drops this handle without cancelling the cleanup task.
     pub fn detach(self) {}
 }
 
@@ -2399,11 +2400,11 @@ impl<T> Drop for ResponseSender<T> {
 /// The job that `call_local` spawns: its job future, stored once, and the
 /// sender for that future's output.
 ///
-/// The call_local oracles in `tests/worker_affinity.rs` pin its destruction
-/// order. An unpolled job drops its sender and then its future; a started job
-/// drops its future and then its sender; a completed job drops its future in
-/// place before it sends the output. Whatever is still live when a poll
-/// unwinds is dropped during that unwind, inside the poll.
+/// The `call_local` tests check its destruction order. An unpolled job drops
+/// its sender and then its future. A started job drops its future and then its
+/// sender. A completed job drops its future in place before it sends the
+/// output. Whatever is still live when a poll unwinds is dropped during that
+/// unwind, inside the poll.
 struct CallLocalJob<Fut, T> {
     // Structurally pinned: never moved, and dropped in place once, when
     // `phase` leaves `Unpolled` or `Started` for `Retired`.
@@ -2468,7 +2469,7 @@ where
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
         // SAFETY: `future` is the only structurally pinned field, and the
-        // type is `Unpin` only when `Fut` is. Nothing in this module moves
+        // type is `Unpin` only when `Fut` is. This module never moves
         // `future` out of a job: `poll` polls it in place, and `retire_future`
         // drops it in place. The other fields are not pinned.
         let job = unsafe { self.get_unchecked_mut() };

@@ -1516,9 +1516,9 @@ mod worker {
             })
     }
 
-    /// The command span as the span observer of the installed context reports
-    /// it. Only a context captured under the probe's submission carries that
-    /// observer, so this is `Absent` when no such context is installed.
+    /// Returns the command span that the installed context's span observer
+    /// reports. Only a context captured under the probe's submission carries
+    /// that observer, so this is `Absent` when that context is not installed.
     fn installed_command() -> CommandSpan {
         ContextEnvelope::capture()
             .span_observer()
@@ -1775,7 +1775,7 @@ mod worker {
         result.map(|output| output.value)
     }
 
-    /// A host whose spawned tasks run only when the test runs them.
+    /// A host that runs its spawned tasks only when the test runs them.
     #[derive(Clone, Default)]
     struct ManualHost {
         tasks: Rc<RefCell<VecDeque<LocalFuture>>>,
@@ -1839,7 +1839,7 @@ mod worker {
             Self::with_capacity(kind, 4)
         }
 
-        /// Polls the driver; a hosted driver's tasks then run once, and the
+        /// Polls the driver. A hosted driver's tasks then run once, and the
         /// driver is polled again to join them.
         fn turn(&mut self) -> Poll<()> {
             let polled = poll_retirement_driver(&mut self.driver);
@@ -1854,7 +1854,7 @@ mod worker {
         /// when the panic left a poll and `Closed` when it left shutdown. The
         /// hosted driver's task group contains it, and the driver then shuts
         /// down and reports `TaskPanicked`. Under either driver, the job's
-        /// context is no longer installed.
+        /// context is not installed after the panic.
         fn assert_job_panic(
             &self,
             payload: Box<dyn Any + Send>,
@@ -2149,8 +2149,7 @@ mod worker {
         assert_call_local_job_stored_once::<u8, 4096>();
         assert_call_local_job_stored_once::<u64, 4096>();
         assert_call_local_job_stored_once::<u128, 4096>();
-        // The size of the roxygen_explicit job future before
-        // `repair.explicit_exchange_layout`.
+        // The size that a `roxygen_explicit` job future once had.
         assert_call_local_job_stored_once::<u8, 10_960>();
         assert_call_local_job_stored_once::<u64, 10_960>();
         assert_call_local_job_stored_once::<u128, 10_960>();
@@ -2317,7 +2316,7 @@ mod worker {
     }
 
     impl CallWorker {
-        /// The driver's owner-local context; the test thread is the owner.
+        /// The driver's owner-local context. The test thread is the owner.
         fn context(&self) -> WorkerContext {
             self.driver.context().clone()
         }
@@ -2325,20 +2324,19 @@ mod worker {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum RegistryStep {
-        /// A cleanup callback ran: in this worker state, on the owner thread
-        /// or not, and inside the request context entered when it registered
-        /// or not.
+        /// A cleanup callback ran, with the worker state at that time, whether
+        /// it ran on the owner thread, and whether it ran inside the request
+        /// context entered when it registered.
         Ran {
             id: usize,
             state: WorkerState,
             owner: bool,
             registered_context: bool,
         },
+        /// A cleanup callback's captures were dropped.
         CapturesDropped(usize),
-        Disarmed {
-            id: usize,
-            removed: bool,
-        },
+        /// A registration was disarmed, with the result of `disarm`.
+        Disarmed { id: usize, removed: bool },
     }
 
     /// The run of a callback that the shutdown drain takes.
@@ -2351,7 +2349,7 @@ mod worker {
         }
     }
 
-    /// The log of one cleanup registry oracle.
+    /// The log of one cleanup registry test.
     #[derive(Clone)]
     struct RegistryProbe {
         owner: ThreadId,
@@ -2497,7 +2495,7 @@ mod worker {
             disarm(&mut registrations, [6, 0, 7, 3, 5]);
             // These follow the freed ones, so a store that reuses freed slots
             // and drains in slot order fails. With the three still armed they
-            // exceed one B-tree leaf (11 entries).
+            // exceed one B-tree node (11 entries).
             registrations.extend((8..20).map(|id| Some(probe.register(&context, id))));
             drop(context);
             disarm(&mut registrations, [13, 8, 19, 10, 11]);
@@ -2726,7 +2724,7 @@ mod worker {
     }
 
     /// After every step the armed count equals the armed registrations, and
-    /// the stored slots equal the most registrations ever armed at once.
+    /// the stored slots equal the most registrations ever armed at one time.
     #[test]
     fn cleanup_registry_stores_only_armed_registrations() {
         for kind in CALL_DRIVERS {
@@ -2829,7 +2827,7 @@ mod worker {
         Dropped(usize),
     }
 
-    /// The owner-thread log of the `OrderFuture`s that one oracle registers.
+    /// The owner-thread log of the `OrderFuture`s that one test registers.
     #[derive(Clone, Default)]
     struct OrderLog(Rc<RefCell<Vec<OrderStep>>>);
 
@@ -3310,7 +3308,7 @@ mod worker {
     fn driver_pass_after_the_lifecycle_leaves_open_admits_no_command() {
         for kind in CALL_DRIVERS {
             // A pass that starts after the lifecycle left Open drops the
-            // queued commands through shutdown and admits none.
+            // queued commands through shutdown and does not admit any.
             let mut worker = CallWorker::with_capacity(kind, 8);
             let counters = CommandCounters::default();
             for _ in 0..3 {
@@ -3322,8 +3320,8 @@ mod worker {
             assert_eq!(worker.handle.outstanding_work(), 0, "{kind:?}");
 
             // The lifecycle leaves Open inside one pass, after its Open
-            // pre-check and before it takes the queue: that pass takes no
-            // command, reaches its non-Open exit, and closes the worker,
+            // pre-check and before it takes the queue. That pass does not take
+            // a command, reaches its non-Open exit, and closes the worker,
             // dropping the queued commands without running their factories.
             let mut worker = CallWorker::with_capacity(kind, 8);
             assert!(worker.turn().is_pending(), "{kind:?}");

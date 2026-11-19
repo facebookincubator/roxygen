@@ -47,21 +47,21 @@ pub struct WorkerFailure {
     pub error: ManagedWorkerError,
 }
 
-/// Physical joining, distinct from async quiescence and worker success.
+/// Counts from joining a runtime's worker threads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ShutdownReport {
-    /// Worker threads physically joined by the root.
+    /// Worker threads joined by the root.
     pub workers_joined: usize,
     /// Workers with unfinished commands or scopes when grace expired.
     pub workers_forced: usize,
 }
 
-/// Completed physical retirement, including failures from the joined workers.
+/// The result of joining every worker, including the failures they reported.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetirementReport {
-    /// Physical joins and final grace-expiry accounting.
+    /// Join and grace-expiry counts.
     pub report: ShutdownReport,
-    /// Indexed failures retained in notification-then-join order.
+    /// Worker failures, with shutdown-request failures before join failures.
     pub failures: Vec<WorkerFailure>,
 }
 
@@ -71,7 +71,7 @@ impl RetirementReport {
     }
 }
 
-/// Typed lifecycle failures; a failed quiescence still requires root joining.
+/// Runtime lifecycle errors. A runtime still has to be joined after a failed quiescence.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RuntimeError {
     #[error("a managed runtime requires at least one worker")]
@@ -122,8 +122,10 @@ struct Shared {
     quiescing: AtomicBool,
 }
 
-/// A cloneable capability, never an owner of threads or worker-local state.
-/// Dropping even the last public handle neither blocks nor replaces shutdown.
+/// A cloneable handle for submitting work to a runtime and starting its shutdown.
+///
+/// It owns neither threads nor worker-local state, so dropping the last handle
+/// does not block or shut the runtime down.
 #[derive(Clone)]
 pub struct RuntimeHandle {
     shared: Arc<Shared>,
@@ -146,7 +148,7 @@ impl RuntimeHandle {
             .map(|worker| worker.handle.clone())
     }
 
-    /// Closes admission immediately and returns a Send cleanup observer.
+    /// Closes admission immediately and returns a `Send` cleanup observer.
     ///
     /// Workers notify admitted scopes through `WorkerContext::quiescing`, drain
     /// commands and scopes until the earliest deadline, then cancel unfinished
@@ -155,8 +157,8 @@ impl RuntimeHandle {
     ///
     /// All borrowed reactors and application runtimes must keep progressing until
     /// this future completes. Grace bounds draining, not arbitrary user polls,
-    /// destructors, or cleanup. Completion does not physically join any thread;
-    /// the synchronous root must call `RuntimeOwner::join`, also after failure.
+    /// destructors, or cleanup. Completion does not join any thread. The
+    /// synchronous root must still call [`RuntimeOwner::join`], even after a failure.
     ///
     /// A notification panic is rethrown only after every worker has started
     /// quiescing. Cleanup continues independently; a later call can observe it.
@@ -193,7 +195,8 @@ impl RuntimeHandle {
     }
 }
 
-/// Observation only: dropping this future never abandons worker cleanup.
+/// Resolves once every worker's cleanup has finished. Dropping it does not
+/// stop that cleanup.
 #[must_use = "await quiescence before physically joining the runtime at its root"]
 pub struct QuiesceFuture {
     inner: Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + 'static>>,
@@ -212,13 +215,16 @@ enum Ownership {
     Joined(Result<RetirementReport, RuntimeError>),
 }
 
-/// Unique, non-Send lifecycle owner retained by the synchronous bootstrap root.
+/// The unique, `!Send` owner of a runtime, held by the synchronous root that
+/// started it.
 ///
-/// Start outside Tokio, distribute handles, await quiescence while application
-/// runtimes remain alive, then physically join outside Tokio. Ordinary handles
-/// cannot become the last lifecycle owner. No global or detached reaper exists.
-/// Drop is a blocking cancellation-and-join fallback and cannot recover a dead
-/// borrowed runtime; it is not the normal shutdown path and discards failures.
+/// Start it outside Tokio, distribute handles, await quiescence while the
+/// application runtimes are still alive, then join outside Tokio. Handles never
+/// become the owner, and the runtime does not use a global or detached reaper.
+///
+/// Dropping the owner cancels and joins the workers as a blocking fallback. It
+/// discards failures, and it cannot recover a borrowed runtime that has already
+/// stopped.
 pub struct RuntimeOwner {
     handle: RuntimeHandle,
     ownership: Ownership,
@@ -280,12 +286,13 @@ impl RuntimeOwner {
         })
     }
 
-    /// Shares submission and shutdown observation, not lifecycle ownership.
+    /// Returns a handle for submission and shutdown that does not own the runtime.
     pub fn handle(&self) -> RuntimeHandle {
         self.handle.clone()
     }
 
-    /// Physically joins every worker after quiescence, surfacing all failures.
+    /// Joins every worker after quiescence. Worker failures are returned together
+    /// as `RuntimeError::WorkersFailed`.
     /// `NotQuiesced` and `InsideTokio` preserve ownership for a later retry.
     /// Completed joins are idempotent and return the cached result.
     pub fn join(&mut self) -> Result<ShutdownReport, RuntimeError> {
@@ -308,13 +315,18 @@ impl RuntimeOwner {
         self.shutdown_and_join()?.into_join_result()
     }
 
-    /// Cancels immediately and physically joins without requiring a quiescence observer.
-    /// This blocking fallback may shorten draining but never starts or extends grace.
-    /// Cleanup dependencies must progress independently of the synchronous root;
-    /// arbitrary user cleanup is not bounded by this operation.
-    /// `InsideTokio` preserves ownership and is checked even before cached returns.
-    /// An `Ok` receipt confirms joining, not worker success: inspect its failures.
-    /// Completed receipts are cached, including after an error-bearing `join()`.
+    /// Cancels immediately and joins every worker, even if quiescence was never
+    /// requested.
+    ///
+    /// This blocking fallback may shorten draining but never starts or extends
+    /// grace. Cleanup dependencies must make progress without the synchronous
+    /// root, and arbitrary user cleanup is not bounded by this call.
+    ///
+    /// An `Ok` result means the workers were joined, not that they succeeded, so
+    /// check [`RetirementReport::failures`]. A completed result is cached, including
+    /// after a `join()` that joined the workers but returned their failures as an
+    /// error. `InsideTokio` is checked before the cache and preserves ownership for
+    /// a later retry.
     pub fn shutdown_and_join(&mut self) -> Result<RetirementReport, RuntimeError> {
         if Handle::try_current().is_ok() {
             return Err(RuntimeError::InsideTokio);

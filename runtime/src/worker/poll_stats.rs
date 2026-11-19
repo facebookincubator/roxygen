@@ -6,7 +6,7 @@
  */
 
 //! Per-worker driver poll counters, written only by the worker's owner thread
-//! and readable from any thread (`DIV-003`).
+//! and readable from any thread.
 
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -50,9 +50,9 @@ pub struct WorkerPollStats {
     /// Activated cleanup tasks that have not finished.
     pub cleanups_active: u64,
     /// Panics that Roxygen's owned HTTP drivers on this worker contained in
-    /// one exchange's callbacks (`DIV-056`). Panics that meet in one
-    /// aggregator, such as a drop that panics while another panic unwinds,
-    /// count once, so this and the next two counters are lower bounds.
+    /// one exchange's callbacks. Panics that are combined into one, such as a
+    /// drop that panics while another panic unwinds, count once, so this and
+    /// the next two counters are lower bounds.
     pub contained_exchange_panics: u64,
     /// Panics those drivers contained in a callback of a whole connection,
     /// such as a lifecycle observer.

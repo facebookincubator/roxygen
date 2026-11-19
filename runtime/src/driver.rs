@@ -52,16 +52,21 @@ pub struct WorkerDriver {
 }
 
 impl WorkerDriver {
-    /// Polls commands and the activated cleanups whose wakers fired. Each
-    /// cleanup is polled at most once per pass, in wake order. Shutdown polls
-    /// every unfinished cleanup in registration order.
+    /// Creates a driver that polls commands and activated cleanups itself.
+    ///
+    /// Each pass polls only the cleanups that were woken, each at most once and
+    /// in wake order. Shutdown polls every unfinished cleanup in registration
+    /// order.
     pub fn new(command_capacity: usize) -> Result<(WorkerHandle, Self), WorkerCreateError> {
         Self::create(command_capacity, None)
     }
 
-    /// Dispatches each command and activated cleanup as an independent host task.
+    /// Creates a driver that runs each command and activated cleanup as its
+    /// own host task.
+    ///
     /// The returned driver must itself be driven on the host's owner thread until
-    /// shutdown completes. Command admission and cleanup ownership stay here.
+    /// shutdown completes. Command admission and cleanup ownership stay with the
+    /// driver.
     pub fn with_host(
         command_capacity: usize,
         host: Host,

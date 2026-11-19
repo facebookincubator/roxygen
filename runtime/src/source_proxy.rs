@@ -298,7 +298,7 @@ impl<E> Drop for StopRequest<E> {
     }
 }
 
-/// Cloneable cross-thread capability for one idempotent stop request.
+/// A cloneable, thread-safe handle for one idempotent stop request to a source.
 pub struct SourceAbortHandle<E> {
     shared: Arc<BridgeShared<E>>,
     wake: mpsc::Sender<()>,
@@ -314,8 +314,9 @@ impl<E> Clone for SourceAbortHandle<E> {
 }
 
 impl<E> SourceAbortHandle<E> {
-    /// Creates an inert capability for a source whose terminal event was already
-    /// consumed. It owns no source, worker, or task; stop requests return false.
+    /// Creates an inert handle for a source whose terminal event was already
+    /// consumed. It does not own a source, worker, or task, and stop requests
+    /// return false.
     pub fn completed() -> Self {
         let (wake, receiver) = mpsc::channel(1);
         drop(receiver);
@@ -557,7 +558,7 @@ impl Drop for SourceControlRequest {
     }
 }
 
-/// Cloneable bounded control capability for owner-worker source updates.
+/// A cloneable handle for bounded updates to a source on its owner worker.
 pub struct SourceControlHandle<E> {
     shared: Arc<BridgeShared<E>>,
     commands: mpsc::Sender<SourceControlRequest>,
@@ -597,14 +598,16 @@ where
     }
 }
 
-/// Repeatable observation of actual source-scope retirement and known owned
-/// destruction failures, including destruction performed during source polling.
+/// A cloneable observer of the cleanup of a source's driving scope.
 ///
-/// This owns no execution or source. Confirmation is not operation success,
-/// frame delivery, native/application retirement, child/worker joins, or I/O
-/// completion. Dropping observation never cancels or joins the source.
-/// Rejected/discarded outputs remain source-owned. Accepted read replies belong
-/// to the consumer; their later destruction cannot change this receipt.
+/// [`Self::wait`] completes once the scope's future and captures are dropped on
+/// the owner worker. It reports a failure if a source-owned value panicked
+/// while being dropped, including values dropped during source polling, or if
+/// the scope's result is lost. Rejected or discarded outputs are source-owned.
+/// Read replies that the consumer accepted are not, even if the consumer
+/// abandons them before it is notified, so dropping them later does not change
+/// the result. The result does not report read success or delivery, and
+/// dropping the observer does not cancel or join the source.
 #[derive(Clone)]
 pub struct SourceCleanupObserver {
     scope: WorkerCleanupObserver,
@@ -612,9 +615,9 @@ pub struct SourceCleanupObserver {
 }
 
 impl SourceCleanupObserver {
-    /// Waits for the actual registered scope before combining its outcome with
-    /// known owned-destruction failures. Failure is sticky and never publishes
-    /// early; ordinary poll panic with successful destruction can still confirm.
+    /// Waits for the scope's cleanup to finish, then returns an error if it
+    /// failed or if any source-owned value panicked while being dropped. A
+    /// panic from a source poll does not fail the wait if every drop succeeded.
     pub fn wait(
         &self,
     ) -> impl Future<Output = Result<(), WorkerCleanupObservationError>> + Send + 'static {
@@ -931,12 +934,12 @@ pub struct LocalSourceAttachment<S: LocalHttpSource> {
 }
 
 impl<S: LocalHttpSource> LocalSourceAttachment<S> {
-    /// Transfers a source on its original worker, without new worker admission.
+    /// Hands `source` to the registered scope on its original worker, without
+    /// a new worker admission.
     ///
-    /// Rejection stops and destroys the input locally. Acceptance transfers
-    /// ownership to the registered scope, including cancellation before that
-    /// scope first consumes the handoff. No `Send`, `Sync`, or `Unpin` source
-    /// bound is required.
+    /// On error the source is stopped and dropped here. On success the scope
+    /// owns it, even if the scope is cancelled before it takes the handoff.
+    /// The source does not need to be `Send`, `Sync`, or `Unpin`.
     pub fn attach(mut self, source: S) -> Result<(), RemoteSourceCreateError> {
         let mut owner = LocalSourceOwner {
             source: Some(source),
@@ -1060,16 +1063,9 @@ where
             .map(|(source, _observer)| source)
     }
 
-    /// Exports a local source and observes its actual registered driving scope.
-    ///
-    /// The receipt confirms future/capture retirement on the owner, not read
-    /// success, delivery, child joins, worker shutdown, or transport completion.
-    /// Dropping the observer does not cancel the source. Failure while destroying
-    /// the scope future/captures, or loss of its publisher, is unconfirmed. A
-    /// source operation panic followed by successful scope destruction can still
-    /// confirm retirement; it does not certify successful source callbacks.
-    /// Accepted reply ownership is independent of scope retirement, including
-    /// replies abandoned by the consumer before receiving their notification.
+    /// Exports a local source and returns an observer of the scope that drives
+    /// it. See [`SourceCleanupObserver`] for what the observer reports. Dropping
+    /// the observer does not cancel the source.
     pub fn try_from_local_with_observer<S>(
         context: &WorkerContext,
         command_capacity: usize,
@@ -1134,13 +1130,14 @@ where
 
     /// Reserves a source-driving scope while worker admission is open.
     ///
-    /// Returns an owner-local attachment, a transferable consumer, and the real
-    /// scope receipt captured before activation. The same scope waits for the
-    /// single handoff and drives the source. It holds graceful-shutdown credit
-    /// until retirement; a previously admitted continuation may attach during
-    /// grace without submitting a new command. Forced shutdown, either endpoint
-    /// being dropped, or explicit source cancellation ends an unused reservation.
-    /// Observation alone never keeps the scope alive or cancels it.
+    /// Returns an owner-local attachment, a transferable consumer, and an
+    /// observer of the scope, created before the scope is activated. The scope
+    /// waits for the single handoff and then drives the source. Graceful
+    /// shutdown waits for the scope to finish, so a continuation admitted
+    /// earlier can attach during grace without submitting a new command. Forced
+    /// shutdown, dropping either endpoint, or cancelling the source ends an
+    /// unused reservation. The observer does not keep the scope alive or cancel
+    /// it.
     pub fn prepare_local<S>(
         context: &WorkerContext,
         command_capacity: usize,

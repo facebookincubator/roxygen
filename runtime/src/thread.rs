@@ -118,7 +118,7 @@ mod tests {
         };
         assert_eq!(created, 0);
         // SAFETY: `pthread_create` succeeded, so it initialized `thread` with a
-        // joinable thread that nothing else joins or detaches.
+        // joinable thread that is not joined or detached anywhere else.
         let joined = unsafe { libc::pthread_join(thread.assume_init(), std::ptr::null_mut()) };
         assert_eq!(joined, 0);
 

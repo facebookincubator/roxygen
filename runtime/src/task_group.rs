@@ -95,7 +95,7 @@ impl fmt::Debug for TaskId {
     }
 }
 
-/// The slot of no slab entry; removal there finds nothing.
+/// A slot index that never holds an entry, so lookups and removals there miss.
 pub(crate) const NO_SLOT: usize = usize::MAX;
 
 /// Owner-local entries addressed by slot, each stored with the identifier it
@@ -233,11 +233,12 @@ impl<T> Drop for IdSlab<T> {
     }
 }
 
-/// Completion follows owner-thread destruction of the task's future.
+/// The result of a task, reported after its future was dropped on the owner thread.
 ///
-/// A panic payload remains owned here until this value is dropped. Retire state
-/// keyed by `id` before dropping it: payload destruction may itself panic.
-/// `discard` provides the task group's bounded, panic-suppressing disposal policy.
+/// A panic payload stays owned by this value until it is dropped. Clean up state
+/// keyed by `id` before dropping it, because dropping the payload may itself panic.
+/// [`Self::discard`] drops the payload and suppresses panics from its destructor,
+/// leaking it after a bounded number of attempts.
 pub struct TaskCompletion {
     pub id: TaskId,
     pub result: Result<(), TaskGroupError>,
@@ -280,8 +281,8 @@ enum TaskBody {
     Cleanup(ObservedTask<HostedCleanup>),
 }
 
-// The command variant stays the largest, so the cleanup variant adds nothing
-// to `TaskState`.
+// The command variant stays the largest, so the cleanup variant does not grow
+// `TaskState`.
 const _: () = assert!(size_of::<ObservedTask<HostedCleanup>>() <= size_of::<CommandTask>());
 
 type Payload = Box<dyn Any + Send>;
@@ -577,13 +578,13 @@ enum CommandPhase {
     GroupFinishing,
 }
 
-/// Polls a hosted command's job directly under the command context. Nothing
-/// runs between the group and command installs, so the group context is
-/// installed only on the terminal paths that run under it. Under
-/// `observability`, `HostedTask::poll` uses `poll_observed` instead, which
-/// keeps the group install, and a `catch_unwind` inside it, around the poll so
-/// that the subscriber sees the command span's enter and exit under the group
-/// context.
+/// Polls a hosted command's job directly under the command context.
+///
+/// The group context would wrap only the command install, so it is installed
+/// only on the terminal paths that run code under it. Under `observability`,
+/// `HostedTask::poll` uses `poll_observed` instead, which keeps the group
+/// install and a `catch_unwind` around the poll so that the subscriber receives
+/// the command span's enter and exit under the group context.
 #[cfg(not(feature = "observability"))]
 #[inline(always)]
 fn poll_command(
@@ -985,7 +986,7 @@ impl TaskGroup {
         self.abort_remaining(false);
     }
 
-    /// `abort_all`, which with `take_panic` also takes the first panic that a task raises as
+    /// Like `abort_all`. With `take_panic`, also returns the first panic that a task raises as
     /// this abort destroys it.
     fn abort_remaining(&mut self, take_panic: bool) -> Option<Payload> {
         self.close();
@@ -1050,22 +1051,23 @@ impl Default for TaskGroup {
 
 thread_local! {
     /// Set on a `HostedWorker`'s owner thread when its supervisor destroys the worker's driver
-    /// past the teardown deadline (`DIV-043`), and never cleared: the thread only tears down
-    /// from then on.
+    /// after the teardown deadline. It is never cleared, because the thread only tears down from
+    /// then on.
     static FORCED_TEARDOWN: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Roxygen-only (`DIV-043`): whether this thread is the owner thread of a `HostedWorker` whose
-/// teardown passed its deadline, so that its supervisor destroyed the worker's driver and every
-/// unfinished cleanup. Every later drop on the thread belongs to that forced teardown, which
-/// abandons the work it finds unjoined: a drop that asserts an ordinary teardown joined its
-/// work, as a task group's or an owned session driver's does, does not assert it then, but
-/// still raises a panic that work raises as it is destroyed.
+/// Returns whether this thread is in a `HostedWorker`'s forced teardown.
+///
+/// That happens when the worker misses its teardown deadline and its supervisor destroys the
+/// driver and every unfinished cleanup. Every later drop on the thread is part of that teardown,
+/// which abandons unjoined work. Drops that normally assert that their work was joined, such as
+/// a task group's or an owned session driver's, skip that assertion but still raise any panic
+/// the work raises as it is destroyed.
 pub fn in_forced_teardown() -> bool {
     FORCED_TEARDOWN.get()
 }
 
-/// Marks this owner thread's teardown as forced (`DIV-043`).
+/// Marks this owner thread's teardown as forced.
 pub(crate) fn begin_forced_teardown() {
     FORCED_TEARDOWN.set(true);
 }
@@ -1084,9 +1086,9 @@ impl Drop for TaskGroup {
             let raised = self.abort_remaining(in_forced_teardown());
             let payload = match cancellation {
                 Err(payload) => {
-                    // The cancellation's panic wins. The task's is disposed of here: dropped as
-                    // the cancellation's panic unwinds, a payload whose destructor panics would
-                    // abort the process.
+                    // The cancellation's panic takes precedence. The task's payload is disposed
+                    // of here, because a panicking payload destructor would abort the process if
+                    // it ran while the cancellation's panic unwinds.
                     if let Some(raised) = raised {
                         crate::panic::discard_panic(raised);
                     }
@@ -1095,7 +1097,7 @@ impl Drop for TaskGroup {
                 Ok(()) => raised,
             };
             if let Some(payload) = payload {
-                // Resumed while the thread already unwinds, it would abort the process.
+                // Resuming while the thread is already unwinding would abort the process.
                 if std::thread::panicking() {
                     crate::panic::discard_panic(payload);
                 } else {

@@ -57,7 +57,7 @@ fn ms(milliseconds: u64) -> Duration {
 }
 
 /// Runs `test` as a command on a worker that `run_managed_driver` drives, as
-/// a `HostedWorker`'s owner thread does, with Tokio's clock paused; then shuts
+/// a `HostedWorker`'s owner thread does, with Tokio's clock paused. Then shuts
 /// the worker down and returns the command's output. The worker runs on its
 /// own thread, which must finish within `TEST_TIMEOUT` of wall time.
 fn on_paused_worker<Test, Work, Output>(test: Test) -> Output
@@ -222,7 +222,7 @@ fn hosted_and_managed_workers_report_one_wheel() {
 }
 
 /// On a worker, a `Timeout` made from the worker's host takes a slot on the
-/// worker's wheel at its first schedule, and nothing before it.
+/// worker's wheel at its first schedule, and not before it.
 #[test]
 fn a_timeout_on_a_worker_host_takes_a_slot_on_its_wheel() {
     let worker = hosted_worker("rox-wheel-binds");
@@ -463,8 +463,8 @@ fn poll_supervisor(handle: &WorkerHandle, since: WakeupCounts, polls: usize) -> 
 
 /// The supervisor polls the wheel's sleep only when Tokio may have fired it,
 /// or when Tokio must take the supervisor's waker for it. Its other polls,
-/// after the wheel has emptied and while a far timeout is armed, poll no
-/// `Sleep`.
+/// after the wheel has emptied and while a far timeout is armed, do not poll
+/// a `Sleep`.
 #[test]
 fn a_supervisor_poll_with_no_wheel_work_polls_no_sleep() {
     let worker = hosted_worker("rox-wheel-quiet");
@@ -548,7 +548,7 @@ fn arm_kept(handle: &WorkerHandle, offsets: &'static [u64]) -> (u64, usize) {
 /// Arming wakes the supervisor exactly once while the wheel's sleep needs a
 /// poll (it is new, or it fired), however many arms come before that poll.
 /// Arms while Tokio holds the supervisor's waker for the sleep, and the
-/// re-arm the supervisor's own `expire` makes, wake nothing.
+/// re-arm the supervisor's own `expire` makes, do not wake it.
 #[test]
 fn an_empty_wheel_wakes_the_supervisor_exactly_once_on_arm() {
     let worker = hosted_worker("rox-wheel-arm-wakes");
@@ -602,10 +602,9 @@ fn an_empty_wheel_wakes_the_supervisor_exactly_once_on_arm() {
     }
 }
 
-/// The zero-config guard on workers: commands that use no timers, including
-/// one that makes a `Timeout` and never schedules it, create no wheel and no
-/// `Sleep`, poll none and request no supervisor wake, on hosted and managed
-/// workers.
+/// On hosted and managed workers, commands that do not use timers, including
+/// one that makes a `Timeout` and never schedules it, do not create a wheel or
+/// a `Sleep`, poll a `Sleep`, or request a supervisor wake.
 #[test]
 fn a_worker_with_no_timers_allocates_no_sleep() {
     let hosted = hosted_worker("rox-wheel-untimed");
@@ -639,9 +638,8 @@ fn a_worker_with_no_timers_allocates_no_sleep() {
     }
 }
 
-/// The zero-config guard for batons: untimed waits on timed and cancellable
-/// batons, signalled or cancelled, create no wheel and no `Sleep`, on hosted
-/// and managed workers.
+/// On hosted and managed workers, untimed waits on timed and cancellable
+/// batons, signalled or cancelled, do not create a wheel or a `Sleep`.
 #[test]
 fn untimed_baton_waits_on_a_worker_create_no_wheel() {
     let hosted = hosted_worker("rox-wheel-untimed-batons");
@@ -737,7 +735,7 @@ fn tokio_host_sleeps_use_the_worker_wheel() {
 }
 
 /// A Tokio host sleep still pending when its worker's wheel stops resolves at
-/// its deadline, as a Tokio sleep, never earlier; and so does one made after.
+/// its deadline, as a Tokio sleep, never earlier. So does one made after.
 #[test]
 fn a_host_sleep_outliving_its_wheel_resolves_at_its_deadline() {
     let (pending, made_after) = on_paused_worker(|_| async move {
@@ -755,13 +753,13 @@ fn a_host_sleep_outliving_its_wheel_resolves_at_its_deadline() {
     assert_eq!((pending, made_after), (ms(10), ms(5)));
 }
 
-/// On a worker, a Tokio host sleep whose deadline is due by its first poll is
-/// ready at that poll exactly when a Tokio sleep made then is, so it wins an
-/// arbitration that polls it first against ready work when that Tokio sleep
-/// would (Uniplex makes its flow, buffer and GOAWAY sleeps anew at each
-/// arbitration). Tokio rounds a deadline up to its next millisecond tick: at a
-/// deadline on a tick, and after one, both are ready; half a tick before the
-/// rounded deadline neither is. None schedules on the wheel.
+/// On a worker, a Tokio host sleep due by its first poll is ready at that poll
+/// exactly when a fresh Tokio sleep would be, so a biased `select!` against
+/// ready work picks it in the same cases. This matters because
+/// `UniplexSession` makes its flow, buffer and GOAWAY sleeps anew at each
+/// arbitration. Tokio rounds a deadline up to its next millisecond tick, so
+/// half a tick before the rounded deadline neither sleep is ready. Due host
+/// sleeps do not schedule on the wheel.
 #[test]
 fn a_due_host_sleep_is_ready_at_its_first_poll_when_a_tokio_sleep_is() {
     let (picks, scheduled) = on_paused_worker(|_| async move {
@@ -826,9 +824,9 @@ fn a_supervisor_poll_with_no_wheel_calls_no_wheel_step() {
 }
 
 /// Once a timer has created the wheel, a supervisor poll runs the wheel step
-/// only while the wheel's wakeup is due: never with nothing armed, and once
-/// for an arm, the poll that has Tokio take the supervisor's waker for the
-/// new sleep, on hosted and managed workers.
+/// only while the wheel's wakeup is due, on hosted and managed workers. It
+/// never runs while the wheel is empty, and runs once for an arm, in the poll
+/// where Tokio takes the supervisor's waker for the new sleep.
 #[test]
 fn a_supervisor_poll_steps_the_wheel_only_while_its_wakeup_is_due() {
     let hosted = hosted_worker("rox-wheel-present");
@@ -888,12 +886,11 @@ fn a_supervisor_poll_steps_the_wheel_only_while_its_wakeup_is_due() {
     }
 }
 
-/// The zero-config residue guard (LR-P39): with session timers off, a
-/// worker's only timed wait (an engine dial's connect bound) creates the
-/// wheel and arms its wakeup. Once that wait completes and its baton drops,
-/// the wheel has withdrawn the wakeup, dropping its Tokio sleep, so Tokio's
-/// parks are untimed again, and later supervisor polls leave the wheel alone,
-/// on hosted and managed workers.
+/// On hosted and managed workers with session timers off, a worker's only
+/// timed wait (such as a dial's connect timeout) creates the wheel and arms
+/// its wakeup. Once that wait completes and its baton drops, the wheel has
+/// withdrawn the wakeup and dropped its Tokio sleep. Tokio's parks are then
+/// untimed again, and later supervisor polls leave the wheel alone.
 #[test]
 fn a_one_shot_wait_leaves_no_wakeup_behind() {
     let hosted = hosted_worker("rox-wheel-one-shot");
@@ -947,10 +944,10 @@ fn a_one_shot_wait_leaves_no_wakeup_behind() {
     }
 }
 
-/// A wakeup the wheel withdrew is re-armed by its next arm: the sleep is made
-/// anew in its box and the supervisor is woken once to have Tokio take its
-/// waker (design §2.5: arming never polls the sleep), and the timeout fires
-/// at its deadline, round after round, under a paused clock.
+/// A wakeup the wheel withdrew is re-armed by its next arm, round after round,
+/// under a paused clock. The sleep is made anew in its box. Arming never polls
+/// the sleep, so the supervisor is woken once for Tokio to take its waker. The
+/// timeout fires at its deadline.
 #[test]
 fn a_re_arm_after_a_withdrawal_wakes_the_supervisor_once_and_fires_at_its_deadline() {
     let rounds = on_paused_worker(|context| async move {
@@ -983,10 +980,10 @@ fn a_re_arm_after_a_withdrawal_wakes_the_supervisor_once_and_fires_at_its_deadli
     );
 }
 
-/// A cancelled slot stays linked, so a later arm no earlier than its link is
-/// covered by the wakeup without a new request: neither the cancel nor
-/// freeing another slot while it is linked withdraws the wakeup, and the
-/// re-armed slot fires at its deadline, under a paused clock.
+/// A cancelled slot stays linked, so re-arming it no earlier than its link
+/// reuses the wakeup without a new request. Neither the cancel nor freeing
+/// another slot while it is linked withdraws the wakeup. Under a paused clock,
+/// the re-armed slot fires at its deadline.
 #[test]
 fn a_cancelled_slot_re_armed_while_linked_still_fires() {
     async fn re_arm(timeout: &mut Timeout, deadline: Instant) -> Expiry {
@@ -1047,9 +1044,9 @@ fn a_cancelled_slot_re_armed_while_linked_still_fires() {
     );
 }
 
-/// Re-arming a withdrawn wakeup allocates nothing: the Tokio sleep is made
-/// anew in the box the first arm allocated. Observable only where std's
-/// allocations reach this crate's counting allocator (opt builds); the
+/// Re-arming a withdrawn wakeup does not allocate: the Tokio sleep is made
+/// anew in the box the first arm allocated. Allocations are observable only
+/// where std's allocations reach this crate's counting allocator. The
 /// withdrawals and sleeps made are counted everywhere.
 #[test]
 fn a_re_arm_after_a_withdrawal_allocates_nothing() {
@@ -1138,12 +1135,12 @@ fn observe_teardown(owner: Arc<CountingWake>, report: mpsc::Sender<Teardown>) {
         .expect("the test observes the teardown");
 }
 
-/// Teardown stops the wheel after the final join: a timeout kept armed past
-/// it completes as stopped and its owner is woken, a later schedule
-/// completes as stopped at once, nothing fires, and the thread's Tokio host
-/// reports no wheel. Shutdown does not wait for armed timers. Both through
-/// `shutdown` and through a forced quiesce, whose running command (and the
-/// timeout it holds) is dropped.
+/// Teardown stops the wheel after the final join. A timeout kept armed past it
+/// completes as stopped and its owner is woken, a later schedule completes as
+/// stopped immediately, the wheel does not fire, and the thread's Tokio host
+/// reports no wheel. Shutdown does not wait for armed timers. This holds both
+/// through `shutdown` and through a forced quiesce, which drops the running
+/// command and the timeout it holds.
 #[test]
 fn teardown_stops_the_wheel_and_nothing_fires_after_it() {
     for forced in [false, true] {
@@ -1211,7 +1208,7 @@ fn teardown_stops_the_wheel_and_nothing_fires_after_it() {
     }
 }
 
-/// A timeout waker whose wake panics, with a string payload or with a
+/// A timeout waker that panics on wake, with a string payload or with a
 /// payload whose destructor panics too.
 struct PanickingWake {
     payload_drop_panics: bool,
@@ -1333,10 +1330,11 @@ fn expiry_panic_shuts_the_worker_down(payload_drop_panics: bool) {
     assert_eq!(handle.state(), WorkerState::Closed);
 }
 
-/// A timeout waker that panics when the teardown stops the wheel is reported
-/// as the owner thread's panic once the teardown finishes, alone or after a
-/// waker panic during expiry, with payloads whose destructors panic: the
-/// owner thread publishes completion and the process does not abort.
+/// A timeout waker can panic when the teardown stops the wheel. That panic is
+/// reported as the owner thread's panic once the teardown finishes, whether or
+/// not a waker panicked during expiry first. Each payload's destructor panics
+/// too. The owner thread still publishes completion and the process does not
+/// abort.
 #[test]
 fn a_waker_panic_during_teardown_is_reported_after_it() {
     for after_expiry_panic in [false, true] {
@@ -1386,7 +1384,7 @@ fn a_waker_panic_during_teardown_is_reported_after_it() {
     }
 }
 
-/// A bounded teardown's deadline (`HostedWorker::shutdown_by`, `DIV-043`).
+/// A bounded teardown's deadline (`HostedWorker::shutdown_by`).
 const BOUNDED_TEARDOWN: Duration = Duration::from_millis(300);
 
 /// Reports, as it is dropped, whether the thread's Tokio host still reported
@@ -1457,13 +1455,13 @@ fn published(worker: &HostedWorker) -> Result<(), ManagedWorkerError> {
 }
 
 /// A bounded teardown whose deadline passes while a cleanup holds an armed
-/// wheel timeout ends with `TeardownDeadlineExceeded` and stops the wheel only
-/// after the final join: the cleanup, dropped there, still sees the wheel
-/// installed and a timeout kept armed across the teardown not yet completed.
-/// After the teardown that timeout has completed as stopped and its owner was
-/// woken once, a later schedule completes as stopped at once, nothing fires,
-/// and the thread's Tokio host reports no wheel (the owner thread's stop hook
-/// observes it); completion is then published.
+/// wheel timeout ends with `TeardownDeadlineExceeded`. The wheel stops only
+/// after the final join, so when the cleanup is dropped the wheel is still
+/// installed and a timeout kept armed across the teardown has not completed.
+/// The owner thread's stop hook, which runs before completion is published,
+/// records that this timeout then completed as stopped and its owner was woken
+/// once, that a later schedule completes as stopped, that the wheel did not
+/// fire, and that the thread's Tokio host reports no wheel.
 #[test]
 fn a_bounded_teardown_past_its_deadline_stops_the_wheel_after_the_final_join() {
     let owner = Arc::new(CountingWake::default());
@@ -1506,11 +1504,11 @@ fn a_bounded_teardown_past_its_deadline_stops_the_wheel_after_the_final_join() {
     assert_eq!(handle.state(), WorkerState::Closed);
 }
 
-/// A timeout waker that panics when a bounded teardown, past its deadline,
-/// stops the wheel after the final join is reported as the owner thread's
-/// panic, over `TeardownDeadlineExceeded`, also when the payload's destructor
-/// panics: the owner thread publishes completion and the process does not
-/// abort.
+/// A timeout waker can panic when a bounded teardown, past its deadline, stops
+/// the wheel after the final join. That panic is reported as the owner
+/// thread's panic instead of `TeardownDeadlineExceeded`, even when the
+/// payload's destructor panics. The owner thread still publishes completion
+/// and the process does not abort.
 #[test]
 fn a_waker_panic_as_a_bounded_teardown_stops_the_wheel_is_reported_over_its_deadline() {
     for payload_drop_panics in [false, true] {
@@ -1546,13 +1544,12 @@ struct WokenFire {
     polls: usize,
 }
 
-/// The inline driver polls a cleanup only when
-/// the cleanup's own waker fires, and the supervisor runs only when its wake
-/// gate's waker fires. A cleanup that a cross-thread wake (no command, so no
-/// work completion wakes the supervisor) makes arm a timeout is still woken at
-/// its deadline: the arm wakes the supervisor through the gate, the
-/// supervisor's expiry wakes the cleanup, and the cleanup is polled three
-/// times in all.
+/// The inline driver polls a cleanup only when the cleanup's own waker fires,
+/// and the supervisor runs only when its wake gate's waker fires. Here a wake
+/// from another thread, after the command has completed, makes the cleanup arm
+/// a timeout, so only the arm can wake the supervisor. The arm wakes the
+/// supervisor through the gate, the supervisor's expiry wakes the cleanup at
+/// its deadline, and the cleanup is polled three times in all.
 #[test]
 fn a_wheel_expiry_wakes_its_cleanup_under_woken_polling() {
     let worker = ManagedWorker::new(4).expect("managed worker starts");

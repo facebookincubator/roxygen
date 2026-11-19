@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Tokio-hosted `Send + Sync` worker oracles.
+//! Tests for Tokio-hosted `Send + Sync` workers.
 
 mod hosted_worker {
     use std::cell::RefCell;
@@ -173,7 +173,7 @@ mod hosted_worker {
         observer
     }
 
-    /// Drops the worker on a new thread; a Drop that never returns fails the
+    /// Drops the worker on a new thread. A Drop that never returns fails the
     /// test instead of hanging it.
     fn drop_off_owner_thread(worker: HostedWorker) -> std::thread::Result<()> {
         let (dropped_tx, dropped_rx) = mpsc::channel();
@@ -1082,10 +1082,10 @@ mod hosted_worker {
         assert_eq!(completion.borrow().clone(), Some(Ok(())));
     }
 
-    /// An owner-thread Drop whose completion waiters' wakers panic with a
-    /// payload that panics on drop. Tokio spreads waiters across notify shards,
-    /// so closing the channel also reaches a waiter that the panicking
-    /// publication skipped.
+    /// Drops a worker on its owner thread while its completion waiters have
+    /// wakers that panic with a payload that panics on drop. Tokio spreads
+    /// waiters across notify shards, so closing the channel also reaches a
+    /// waiter that the panicking publication skipped.
     fn drop_on_owner_thread_with_panicking_completion_wakers() {
         const WAITERS: usize = 16;
         let worker = HostedWorker::spawn(options("rox-hosted-owner-drop-payload", 2))
@@ -1276,9 +1276,9 @@ mod hosted_worker {
         );
     }
 
-    /// Teardown deadline of the bounded-shutdown oracles (`DIV-043`).
+    /// Teardown deadline of the bounded-shutdown tests.
     const TEARDOWN_DEADLINE: Duration = Duration::from_millis(400);
-    /// How long past a teardown deadline these oracles join a worker.
+    /// How long past a teardown deadline these tests join a worker.
     const JOIN_SLACK: Duration = Duration::from_secs(2);
     /// Bound on how late past its deadline a bounded wait may return.
     const LATENESS: Duration = Duration::from_secs(1);
@@ -1329,10 +1329,9 @@ mod hosted_worker {
     }
 
     /// Starts blocking-pool work on the worker that runs until the returned
-    /// sender releases it (or is dropped) and then reports its thread. With
-    /// `awaited`, a command awaits it, as a command awaiting
-    /// `tokio::net::lookup_host`, which resolves on the blocking pool, awaits a
-    /// held resolver; otherwise nothing does.
+    /// sender releases it (or is dropped), then reports its thread. With
+    /// `awaited`, a command awaits the work, the way `tokio::net::lookup_host`
+    /// awaits a stuck resolver call on the blocking pool.
     fn hold_blocking_work(
         handle: &WorkerHandle,
         awaited: bool,
@@ -1372,8 +1371,8 @@ mod hosted_worker {
         wait(started_rx).expect("command parked");
     }
 
-    /// Runs `join` on a new thread and returns its result and when it returned;
-    /// a join that is not back by `bound` fails the test instead of hanging it.
+    /// Runs `join` on a new thread and returns its result and when it returned.
+    /// A join that is not back by `bound` fails the test instead of hanging it.
     fn join_off_owner_thread<Joined: Send + 'static>(
         bound: Instant,
         join: impl FnOnce() -> Joined + Send + 'static,
@@ -1451,8 +1450,8 @@ mod hosted_worker {
             .iter()
             .map(|worker| record_timed_thread_exit(&worker.handle()))
             .collect();
-        // Worker 0 holds blocking work nothing awaits, worker 1 a held "resolver"
-        // its command awaits; workers 2 and 3 are healthy.
+        // Worker 0 holds blocking work that is not awaited, and worker 1 a held
+        // "resolver" that its command awaits. Workers 2 and 3 are healthy.
         let held = [
             hold_blocking_work(&workers[0].handle(), false),
             hold_blocking_work(&workers[1].handle(), true),
@@ -1882,7 +1881,7 @@ mod hosted_worker {
 
     /// Installs a thread-local destructor on the owner thread that runs after
     /// `completion()` is published and holds the thread until the returned
-    /// sender releases it; the receivers report its entry and its return.
+    /// sender releases it. The receivers report its entry and its return.
     fn hold_thread_exit(
         handle: &WorkerHandle,
     ) -> (
@@ -2203,14 +2202,12 @@ mod hosted_worker {
         }
     }
 
-    /// Past its teardown deadline the supervisor destroys unfinished cleanup, which abandons the
-    /// task groups that cleanup owns: here one still joining a task that never finishes, and one
-    /// never closed. Their drops still cancel and drop their tasks on the owner thread, but do not
-    /// assert that they were closed and joined: the worker reports a clean overrun. The cleanup
-    /// that never finishes also holds a timeout armed on the owner thread's wheel, which the
-    /// worker stops only after that final join: the cleanup is dropped with the wheel installed
-    /// and the timeout still armed, then the timeout completes as stopped and its waker is woken
-    /// once.
+    /// Past its teardown deadline, the supervisor destroys unfinished cleanup and abandons the task
+    /// groups it owns. Here one group is still joining a task that never finishes and the other was
+    /// never closed. Their drops cancel and drop their tasks on the owner thread without asserting
+    /// that the groups were closed and joined, so the worker reports a clean overrun. The wheel
+    /// stops only after the final join, so the cleanup is dropped with the wheel installed and its
+    /// timeout armed. The timeout then completes as stopped and its waker is woken once.
     #[test]
     fn a_forced_teardown_abandons_the_task_groups_of_unfinished_cleanup() {
         let (stopped_tx, stopped_rx) = mpsc::channel();
@@ -2304,8 +2301,9 @@ mod hosted_worker {
         }
     }
 
-    /// A forced teardown abandons the joins of the task groups it destroys, not the panics their
-    /// tasks raise as they are destroyed: the worker reports one, as it does a cleanup's.
+    /// A forced teardown abandons the joins of the task groups it destroys, but not the panics
+    /// their tasks raise as they are destroyed. The worker reports such a panic as it does a
+    /// cleanup's.
     #[test]
     fn a_forced_teardown_still_reports_a_task_that_panics_as_its_abandoned_group_drops_it() {
         let worker = HostedWorker::spawn(options("rox-hosted-forced-group-panic", 2))
@@ -2353,9 +2351,9 @@ mod hosted_worker {
         _group: TaskGroup,
     }
 
-    /// A forced teardown that destroys an abandoned group while the thread already unwinds
-    /// discards the panic a task of that group raises as it is destroyed, rather than aborting
-    /// the process: the worker reports the panic that was unwinding.
+    /// When a forced teardown destroys an abandoned group while the thread is already unwinding,
+    /// it discards the panic that a task of that group raises as it is destroyed, instead of
+    /// aborting the process. The worker reports the panic that was unwinding.
     #[test]
     fn a_forced_teardown_discards_a_task_panic_its_abandoned_group_raises_while_unwinding() {
         let worker = HostedWorker::spawn(options("rox-hosted-forced-group-unwind", 2))
@@ -2400,7 +2398,7 @@ mod hosted_worker {
         );
     }
 
-    /// Raises a panic whose payload's destructor panics too, as it drops.
+    /// Panics as it drops, with a payload whose destructor also panics.
     struct PayloadPanicOnDrop;
 
     impl Drop for PayloadPanicOnDrop {
@@ -2409,10 +2407,10 @@ mod hosted_worker {
         }
     }
 
-    /// A forced teardown that destroys an abandoned group whose cancellation runs a waker that
-    /// panics disposes of the panic a task of that group raises as it is destroyed, here one whose
-    /// payload's destructor panics too, before that cancellation's panic unwinds, rather than
-    /// aborting the process: the worker reports the cancellation's panic.
+    /// A forced teardown destroys an abandoned group whose cancellation runs a waker that panics.
+    /// A task of that group also panics as it is destroyed, with a payload whose destructor panics
+    /// too. The teardown disposes of the task's panic before the cancellation's panic unwinds,
+    /// instead of aborting the process, and the worker reports the cancellation's panic.
     #[test]
     fn a_forced_teardown_disposes_of_a_task_panic_when_its_abandoned_group_s_cancellation_panics() {
         let worker = HostedWorker::spawn(options("rox-hosted-forced-group-cancel", 2))
@@ -2466,10 +2464,10 @@ mod hosted_worker {
         );
     }
 
-    /// A forced teardown that destroys an abandoned group while the thread already unwinds
-    /// discards the panic of that group's cancellation, here a waker that panics, and the panic a
-    /// task of that group raises as it is destroyed, here one whose payload's destructor panics
-    /// too, rather than aborting the process: the worker reports the panic that was unwinding.
+    /// A forced teardown destroys an abandoned group while the thread is already unwinding. The
+    /// group's cancellation runs a waker that panics, and a task of the group panics as it is
+    /// destroyed, with a payload whose destructor panics too. Both panics are discarded instead of
+    /// aborting the process, and the worker reports the panic that was unwinding.
     #[test]
     fn a_forced_teardown_discards_its_abandoned_group_s_cancellation_panic_while_unwinding() {
         let worker = HostedWorker::spawn(options("rox-hosted-forced-group-cancel-unwind", 2))
@@ -2548,8 +2546,8 @@ mod hosted_worker {
         ]
     }
 
-    /// Only a forced teardown abandons task groups: on a worker's owner thread, an unclosed or
-    /// unjoined group still asserts as it drops, while the worker runs and during a bounded
+    /// Only a forced teardown abandons task groups. On a worker's owner thread, an unclosed or
+    /// unjoined group still asserts as it drops, both while the worker runs and during a bounded
     /// teardown whose deadline has not passed.
     #[test]
     fn task_group_drops_outside_a_forced_teardown_still_assert() {
@@ -2600,7 +2598,7 @@ mod hosted_worker {
         let exited = record_thread_exit(&handle);
         let completion = worker.completion();
         // A held borrow keeps the owner thread from publishing completion, which
-        // no teardown deadline can bound.
+        // a teardown deadline cannot bound.
         let borrowed = completion.borrow();
 
         let deadline = Instant::now() + Duration::from_millis(200);
@@ -2626,14 +2624,14 @@ mod hosted_worker {
     enum OnForeignDrop {
         /// Reports it, then panics (Tokio catches a panic dropping a task).
         Panic,
-        /// Aborts the process, as the router's `LocalOnly` bridge does.
+        /// Aborts the process, as some `Send` wrappers around `!Send` values do.
         Abort,
     }
 
-    /// A value bound to the thread that creates it, such as a request body the
-    /// router wraps in its `LocalOnly` Send bridge: it reports whether it was
-    /// dropped on that thread and whether the owner-thread stop hook had run
-    /// by then, and panics or aborts if it was dropped anywhere else.
+    /// A value bound to the thread that creates it, such as a `!Send` request
+    /// body wrapped to be `Send`. It reports whether it was dropped on that
+    /// thread and whether the owner-thread stop hook had run by then, and
+    /// panics or aborts if it was dropped on another thread.
     struct ThreadAffine {
         owner: ThreadId,
         on_foreign_drop: OnForeignDrop,
@@ -2663,8 +2661,8 @@ mod hosted_worker {
     }
 
     /// Stops a worker with `shutdown_by` while a pending `tokio::spawn` task
-    /// holds a [`ThreadAffine`] value created on the owner thread, as a hidden
-    /// prefill drain holds a `LocalOnly` engine response. With `overrun`, a
+    /// holds a [`ThreadAffine`] value created on the owner thread, as a
+    /// detached task draining a thread-bound response would. With `overrun`, a
     /// registered cleanup that never finishes holds the teardown past its
     /// deadline. Returns how the join ended and the value's report.
     fn stop_with_a_pending_thread_affine_runtime_task(
@@ -2890,7 +2888,7 @@ mod hosted_worker {
     }
 
     /// Stops a worker whose blocking pool ran a thread with `pool`'s hooks
-    /// under a far teardown deadline; returns how long the join took.
+    /// under a far teardown deadline, and returns how long the join took.
     fn bounded_teardown_after_a_blocking_thread(
         thread_name: &str,
         pool: HostedWorkerBlockingPool,

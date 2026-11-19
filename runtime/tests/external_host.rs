@@ -918,8 +918,9 @@ mod external_host {
         pool.run_until_stalled();
         assert_eq!(tasks.try_join_next().unwrap().id, first);
         tasks.spawn_local_tracked(|_| pending::<()>()).unwrap();
-        // The other group's task 0 shares task 0's freed slot, now held by task
-        // 2; its tasks 3 and 4 name slots this group never had.
+        // The other group's task 0 has the same slot as this group's freed
+        // task 0, which task 2 now holds. Its tasks 3 and 4 have slots that
+        // this group never had.
         for id in [foreign[0], foreign[3], foreign[4]] {
             assert!(!tasks.abort(id), "{id:?}");
         }

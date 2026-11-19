@@ -6,11 +6,11 @@
  */
 
 //! Tests of the owner-local wheel timer, including ports of folly's
-//! `HHWheelTimerTest` (folly/io/async/test/HHWheelTimerTest.cpp).
+//! HHWheelTimer tests.
 //!
 //! The manual host fires the wheel's wakeup at exactly the instant the wheel
-//! armed, so fire instants are asserted exactly, which is stricter than the
-//! folly tests' `T_CHECK_NOT_EARLY` bounds.
+//! armed, so the tests assert exact fire instants instead of folly's
+//! not-early bounds.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -73,9 +73,8 @@ impl Wake for QueueWaker {
 
 type OnExpiry = Box<dyn FnMut(&Harness)>;
 
-/// The owner of one `Timeout`, the analog of folly's `TestTimeout`. It
-/// observes its slot when woken, as an owner's poll would, and records the
-/// observation instant.
+/// The owner of one `Timeout`. It observes its slot when woken, as an owner's
+/// poll would, and records the observation instant.
 struct TestTimeout {
     id: usize,
     timeout: RefCell<Timeout>,
@@ -147,7 +146,6 @@ impl Harness {
         owner
     }
 
-    /// `HHWheelTimer::scheduleTimeout(callback, timeout)`.
     fn schedule(&self, owner: &TestTimeout, timeout: Duration) {
         self.schedule_at(owner, self.now() + timeout);
     }
@@ -194,8 +192,7 @@ impl Harness {
         }
     }
 
-    /// `EventBase::loop()`: fires the wakeup at each armed instant until none
-    /// is armed.
+    /// Fires the wakeup at each armed instant for as long as one is armed.
     fn run(&self) {
         for _ in 0..100_000 {
             let Some(armed) = self.wakeup.armed.get() else {
@@ -239,8 +236,8 @@ impl Drop for Harness {
     }
 }
 
-/// Port of `HHWheelTimerTest.FireOnce`: simple timeouts fire once, a second
-/// schedule replaces the first, and equal deadlines fire in schedule order.
+/// Simple timeouts fire once, a second schedule replaces the first, and equal
+/// deadlines fire in schedule order.
 #[test]
 fn fire_once() {
     let harness = Harness::new(ms(1));
@@ -266,8 +263,7 @@ fn fire_once() {
     assert_eq!(harness.observed(), vec![t1.id, t2.id, t3.id]);
 }
 
-/// Port of `HHWheelTimerTest.SlowFast`: a timeout scheduled after a later one
-/// still fires first, on time.
+/// A timeout scheduled after a later one still fires first, on time.
 #[test]
 fn slow_fast() {
     let harness = Harness::new(ms(1));
@@ -287,8 +283,8 @@ fn slow_fast() {
     assert_eq!(harness.observed(), vec![t2.id, t1.id]);
 }
 
-/// Port of `HHWheelTimerTest.GetTimeRemaining`, as `Timeout::deadline`: none
-/// before scheduling, the exact deadline while armed, none after expiry.
+/// `Timeout::deadline` is `None` before scheduling, the exact deadline while
+/// armed, and `None` after expiry.
 #[test]
 fn get_time_remaining() {
     let harness = Harness::new(ms(1));
@@ -307,9 +303,8 @@ fn get_time_remaining() {
     assert_eq!(t1.timestamps(), vec![start + ms(10)]);
 }
 
-/// Port of `HHWheelTimerTest.NegativeTimeout`: a deadline already in the
-/// past, even before the wheel's start, fires at the next expiry, before an
-/// earlier-scheduled future timeout.
+/// A deadline already in the past, even before the wheel's start, fires at the
+/// next expiry, before an earlier-scheduled future timeout.
 #[test]
 fn negative_timeout() {
     let harness = Harness::new(ms(1));
@@ -332,10 +327,9 @@ fn negative_timeout() {
     assert_eq!(harness.observed(), vec![tt2.id, tt1.id]);
 }
 
-/// Port of `HHWheelTimerTest.prematureTimeout` as the never-early property.
-/// The host is late past the first tick before a 2555 ms timeout is
-/// scheduled on a 10 ms wheel; folly's tick arithmetic could fire it up to a
-/// tick early, and Roxygen's wheel never fires before the deadline.
+/// A timeout never fires before its deadline. The host is late past the first
+/// tick before a 2555 ms timeout is scheduled on a 10 ms wheel, so tick
+/// arithmetic alone could fire it up to a tick early.
 #[test]
 fn premature_timeout_never_fires_early() {
     let harness = Harness::new(ms(10));
@@ -355,9 +349,9 @@ fn premature_timeout_never_fires_early() {
     assert_eq!(t2.timestamps(), vec![scheduled + ms(2555)]);
 }
 
-/// The wheel arms its wakeup at the exact deadline, not at a tick boundary,
-/// and a host fire before it (an EventBase timer may fire up to a tick
-/// early) fires nothing and re-arms the same deadline.
+/// The wheel arms its wakeup at the exact deadline, not at a tick boundary.
+/// A host fire before it (a host timer may fire up to a tick early) does not
+/// fire the timeout and re-arms the same deadline.
 #[test]
 fn early_host_fire_rearms_without_firing() {
     let harness = Harness::new(ms(10));
@@ -376,9 +370,9 @@ fn early_host_fire_rearms_without_firing() {
     assert_eq!(t1.timestamps(), vec![start + ms(15)]);
 }
 
-/// Port of `HHWheelTimerTest.Level1`: a timeout in the next epoch fires on
-/// time. As in folly, the wakeup first stops at the epoch boundary (tick
-/// 256), where the level-1 bucket cascades, then at the deadline.
+/// A timeout in the next epoch fires on time. The wakeup first stops at the
+/// epoch boundary (tick 256), where the level-1 bucket cascades, then at the
+/// deadline.
 #[test]
 fn level1() {
     let harness = Harness::new(ms(1));
@@ -395,8 +389,8 @@ fn level1() {
     );
 }
 
-/// Port of `HHWheelTimerTest.ReschedTest`: a timeout scheduled from an
-/// expiry for `WHEEL_SIZE - 1` ticks fires on time.
+/// A timeout scheduled from an expiry for `WHEEL_SIZE - 1` ticks fires on
+/// time.
 #[test]
 fn resched_test() {
     let harness = Harness::new(ms(1));
@@ -445,7 +439,7 @@ fn level2_cascades_at_each_level_boundary() {
     );
 }
 
-/// A timeout beyond folly's `LARGEST_SLOT` (2^32 - 1 ticks) is clamped into
+/// A timeout beyond `LARGEST_SLOT` (2^32 - 1 ticks) is clamped into
 /// the level-3 bucket of tick 2^32 - 1, which cascades at tick 0xFF000000,
 /// and re-cascades from its exact deadline until it fires on time.
 #[test]
@@ -502,11 +496,10 @@ fn long_timeout_on_a_busy_wheel_is_reslotted_once() {
     assert_eq!(harness.wheel.stats().reslotted, 1);
 }
 
-/// Port of `HHWheelTimerTest.CancelTimeout`. Cancelling a fired slot before
-/// its owner observes it discards the expiry (a timeout cancelled while
-/// "ready to be fired"), at the head, in the middle and at the end of a
-/// tick; cancelling armed slots of later ticks keeps them from firing; and a
-/// slot rescheduled from its own expiry fires again.
+/// Cancelling a fired slot before its owner observes it discards the expiry,
+/// whether the slot is at the head, in the middle or at the end of a tick.
+/// Cancelling armed slots of later ticks keeps them from firing, and a slot
+/// rescheduled from its own expiry fires again.
 #[test]
 fn cancel_timeout() {
     let harness = Harness::new(ms(1));
@@ -559,8 +552,8 @@ fn cancel_timeout() {
         );
     }
     assert_eq!(harness.armed(), 0);
-    // Cancels are stores: the cancelled 20 ms bucket still wakes the host
-    // once, and that expiry fires nothing.
+    // Cancels are stores. The cancelled 20 ms bucket still wakes the host
+    // once, and that expiry does not fire a timeout.
     assert_eq!(harness.now(), start + ms(20));
     assert_eq!(harness.wheel.stats().empty_expiries, 1);
 }
@@ -596,8 +589,8 @@ fn later_extends_store_without_relinking() {
     );
 }
 
-/// An earlier deadline, by `extend_to` or `schedule_at`, relinks at once and
-/// moves the wakeup earlier.
+/// An earlier deadline, by `extend_to` or `schedule_at`, relinks immediately
+/// and moves the wakeup earlier.
 #[test]
 fn earlier_deadline_relinks_and_rearms_immediately() {
     let harness = Harness::new(ms(1));
@@ -620,7 +613,8 @@ fn earlier_deadline_relinks_and_rearms_immediately() {
 }
 
 /// A cancel is a store: the slot stays linked until its bucket is processed,
-/// which fires nothing. Re-arming it later than its link is a store too.
+/// and processing the bucket does not fire the slot. Re-arming the slot later
+/// than its link is a store too.
 #[test]
 fn cancel_and_later_rearm_are_stores() {
     let harness = Harness::new(ms(1));
@@ -645,12 +639,11 @@ fn cancel_and_later_rearm_are_stores() {
     assert_eq!(harness.wakeup.armed.get(), None);
 }
 
-/// Freeing the wheel's last slot withdraws the wakeup, once: folly withdraws
-/// its `AsyncTimeout` when `count_` reaches 0. A cancel is a store and
-/// withdraws nothing, and neither does freeing a slot while another,
-/// cancelled but still linked, remains: re-armed no earlier than its link,
-/// that slot is covered by the wakeup and fires. A wakeup that fired with
-/// nothing left to cover is not withdrawn, and an arm after a withdrawal
+/// Freeing the wheel's last slot withdraws the wakeup, once. A cancel is a
+/// store and does not withdraw it, and neither does freeing a slot while a
+/// cancelled slot is still linked. Re-arming that slot no earlier than its
+/// link reuses the wakeup, and the slot fires. A wakeup that has already fired
+/// is not withdrawn when the last slot is freed, and an arm after a withdrawal
 /// requests a new one.
 #[test]
 fn freeing_the_last_slot_withdraws_the_wakeup() {
@@ -708,8 +701,8 @@ fn freeing_the_last_slot_withdraws_the_wakeup() {
     assert_eq!(harness.now(), start + ms(200));
 }
 
-/// `extend_to` changes only an armed timeout: it does nothing before the
-/// first schedule or after a cancel.
+/// `extend_to` changes only an armed timeout. It is a no-op before the first
+/// schedule or after a cancel.
 #[test]
 fn extend_to_needs_an_armed_timeout() {
     let harness = Harness::new(ms(1));
@@ -730,8 +723,7 @@ fn extend_to_needs_an_armed_timeout() {
 }
 
 /// One late expiry wakes due slots bucket by bucket in tick order, and within
-/// a bucket in link order (HHWheelTimer's `timeoutsToRunNow_` order), not by
-/// exact deadline.
+/// a bucket in link order, not by exact deadline.
 #[test]
 fn one_expiry_wakes_in_tick_order_then_fifo() {
     let harness = Harness::new(ms(1));
@@ -801,8 +793,8 @@ fn inline_waker(wake: impl FnMut() + 'static) -> Waker {
     Waker::from(Arc::new(InlineWaker(id)))
 }
 
-/// Port of `HHWheelTimerTest.TestSchedulingWithinCallback`: a timeout
-/// scheduled from an expiry fires on time and leaves the wheel consistent.
+/// A timeout scheduled from an expiry fires on time and leaves the wheel
+/// consistent.
 #[test]
 fn test_scheduling_within_callback() {
     let harness = Harness::new(ms(1));
@@ -877,10 +869,9 @@ fn reentrant_schedule_and_cancel_during_expire() {
     assert_eq!(harness.armed(), 0);
 }
 
-/// Port of `HHWheelTimerTest.DeleteWheelInTimeout`, as a `Timeout` dropped
-/// during expiry (an owner cannot destroy the wheel from inside `expire`,
-/// whose caller holds it): t1's waker cancels t2 and drops t3. The dropped
-/// slot is unlinked and freed, and the wheel stays consistent.
+/// A `Timeout` dropped during expiry: t1's waker cancels t2 and drops t3. The
+/// dropped slot is unlinked and freed, and the wheel stays consistent. A waker
+/// cannot drop the wheel itself, because the caller of `expire` holds it.
 #[test]
 fn timeout_dropped_during_expiry() {
     let harness = Harness::new(ms(1));
@@ -985,9 +976,9 @@ std::thread_local! {
     static HOOKED_LIVE: RefCell<Vec<usize>> = RefCell::default();
 }
 
-/// A waker whose next clone runs the hook armed by `arm_clone_hook`, as a
-/// waker's `clone` is arbitrary code. It counts its wakes and its live
-/// clones. Returns its id with it.
+/// Returns a waker and its id. The waker's next clone runs the hook armed by
+/// `arm_clone_hook`, since a waker's `clone` may run arbitrary code. Its wakes
+/// and live clones are counted under its id.
 fn clone_hook_waker() -> (usize, Waker) {
     fn raw(id: *const ()) -> RawWaker {
         static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_waker);
@@ -1019,10 +1010,10 @@ fn clone_hook_waker() -> (usize, Waker) {
     });
     HOOKED_WAKES.with(|wakes| wakes.borrow_mut().push(0));
     HOOKED_LIVE.with(|live| live.borrow_mut().push(1));
-    // SAFETY: `RawWaker`'s contract holds: the data is an index carried as an
-    // address that no callback dereferences, every clone is valid on its own,
-    // nothing is owned, and the callbacks are safe code over thread-locals, so
-    // calling them from any thread is sound.
+    // SAFETY: This meets `RawWaker`'s contract. The data is an index carried
+    // as an address that the callbacks never dereference. Every clone is valid
+    // on its own and owns no resources, and the callbacks are safe code over
+    // thread-locals, so calling them from any thread is sound.
     let waker = unsafe { Waker::from_raw(raw(std::ptr::without_provenance(id))) };
     (id, waker)
 }
@@ -1202,7 +1193,7 @@ fn waker_clone_panic_during_stop_leaves_the_wheel_consistent() {
 }
 
 /// A waker clone may re-enter the wheel during `stop`: a schedule made from
-/// it completes as stopped at once.
+/// it completes as stopped immediately.
 #[test]
 fn waker_clone_reentering_the_wheel_during_stop() {
     let harness = Harness::new(ms(1));
@@ -1385,10 +1376,9 @@ fn poll_expired_wakes_the_latest_waker() {
     assert_eq!(timeout.poll_expired(&mut first_context), Poll::Pending);
 }
 
-/// Port of `HHWheelTimerTest.cancelAll`, as `stop`: two timeouts expire in
-/// one expiry and each owner stops the wheel when it observes its expiry.
-/// The first stop completes the other, still unobserved, timeout as stopped
-/// (folly cancels `timeoutsToRunNow_`), so exactly one is stopped.
+/// Two timeouts expire in one expiry, and each owner stops the wheel when it
+/// observes its expiry. The first stop completes the other, still unobserved,
+/// timeout as stopped, so exactly one is stopped.
 #[test]
 fn cancel_all_as_stop() {
     let harness = Harness::new(ms(1));
@@ -1412,10 +1402,10 @@ fn cancel_all_as_stop() {
     assert_eq!(stopped.get(), 1);
 }
 
-/// `stop` is `~HHWheelTimer`'s `cancelAll`: armed slots, on any level,
-/// complete as stopped and are woken; a cancelled slot stays silent; the
-/// wakeup is withdrawn; later expiries do nothing; and later schedules
-/// complete as stopped at once.
+/// `stop` completes armed slots on every level as stopped and wakes them, but
+/// not a cancelled slot, and withdraws the wakeup. Later expiries neither fire
+/// a timeout nor re-arm the wakeup, and later schedules complete as stopped
+/// immediately.
 #[test]
 fn stop_completes_armed_slots_and_later_schedules_as_stopped() {
     let harness = Harness::new(ms(1));
@@ -1468,8 +1458,8 @@ impl SplitMix {
 
 /// The reference for one owner: its armed deadline, and the tick the wheel
 /// had processed when the owner armed it. A deadline of an already processed
-/// tick is linked into that tick's bucket (folly's `diff < 0` case), so that
-/// tick is the slot's place in the wake order.
+/// tick is linked into that tick's bucket, so that tick is the slot's place
+/// in the wake order.
 #[derive(Clone, Copy)]
 struct ModelTimeout {
     deadline: Instant,
@@ -1501,10 +1491,9 @@ fn model_deadline(
 
 /// Random schedule, extend, cancel, drop and advance against a `BTreeMap`
 /// reference. The host fires the wakeup whenever the clock reaches it, and
-/// sometimes spuriously. Each expiry must wake exactly the reference's due
-/// set (never early, and never late at the host's resolution, which is
-/// stricter than folly's one-tick bound), in tick order; and the wakeup must
-/// never be armed after a due deadline.
+/// sometimes spuriously. Each expiry must wake exactly the reference's due set
+/// in tick order, never early and never late at the host's resolution. The
+/// wakeup must never be armed after a due deadline.
 fn run_model(seed: u64, tick: Duration, span_ticks: u64, steps: usize) {
     const OWNERS: usize = 12;
     let mut rng = SplitMix(seed);
@@ -1652,8 +1641,7 @@ fn model_one_microsecond_tick_past_the_largest_slot() {
     (31..=34).for_each(|seed| run_model(seed, Duration::from_micros(1), 1 << 33, 20_000));
 }
 
-/// Counts heap allocations made on a thread while its counter is enabled
-/// (the pattern of `benchmarks/src/runtime_task_wrapping.rs`).
+/// Counts heap allocations made on a thread while its counter is enabled.
 struct CountingAllocator;
 
 std::thread_local! {
@@ -1706,10 +1694,10 @@ unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-/// The allocations `operation` makes on this thread, or `None` where they are
-/// not observable: dev builds link a shared std whose internal allocations
-/// bypass this crate's `#[global_allocator]`, so counts are complete only when
-/// an allocation made inside std is observed.
+/// Returns the number of allocations `operation` makes on this thread, or
+/// `None` where they are not observable. When std is linked as a shared
+/// library, its internal allocations bypass this crate's `#[global_allocator]`,
+/// so counts are complete only when an allocation made inside std is observed.
 pub(crate) fn count_allocations(operation: impl FnOnce()) -> Option<usize> {
     ALLOCATIONS.with(|count| count.set(0));
     COUNTING.with(|counting| counting.set(true));
@@ -1739,7 +1727,7 @@ impl WheelWakeup for LatestWakeup {
 
 /// After warm-up, schedule, extend (later and earlier), cancel, expiry with
 /// fires, cascades and re-slots, observation, and replacing a dropped
-/// timeout allocate nothing: slots come from the slab's free list and the
+/// timeout do not allocate. Slots come from the slab's free list and the
 /// wake list keeps its capacity.
 #[test]
 fn timer_operations_allocate_nothing_after_warm_up() {
@@ -1802,8 +1790,8 @@ fn timer_operations_allocate_nothing_after_warm_up() {
 struct SleepClock {
     now: Cell<Instant>,
     /// How long before its deadline a sleep resolves. An early sleep never
-    /// resolves at the instant it was made, as an EventBase timer fires at a
-    /// later tick.
+    /// resolves at the instant it was made, as a tick-based host timer fires
+    /// at a later tick.
     early: Duration,
     now_calls: Cell<usize>,
     sleeps_made: Cell<usize>,
@@ -1982,7 +1970,7 @@ fn fallback_makes_one_host_sleep_for_1000_later_extends() {
     assert_eq!(clock.sleeps_made.get(), 2);
 }
 
-/// An earlier deadline replaces the fallback's host sleep at once.
+/// An earlier deadline replaces the fallback's host sleep immediately.
 #[test]
 fn fallback_earlier_deadline_rearms() {
     let (host, clock) = sleep_host(Duration::ZERO);
@@ -2001,9 +1989,9 @@ fn fallback_earlier_deadline_rearms() {
     assert_eq!(timeout.take_expired(), Some(Expiry::Elapsed));
 }
 
-/// A host sleep that resolves before the deadline (an EventBase timer may
-/// fire up to a tick early) is a hint: the fallback re-arms for the
-/// remainder and never reports an early expiry.
+/// A host sleep that resolves before the deadline (a host timer may fire up
+/// to a tick early) is a hint: the fallback re-arms for the remainder and
+/// never reports an early expiry.
 #[test]
 fn fallback_early_host_fire_rearms_the_remainder() {
     let (host, clock) = sleep_host(ms(2));
@@ -2025,7 +2013,7 @@ fn fallback_early_host_fire_rearms_the_remainder() {
 }
 
 /// A cancel is a store on the fallback: the host sleep is kept, a later
-/// re-arm reuses it, and its stale resolution reports nothing.
+/// re-arm reuses it, and its stale resolution does not report an expiry.
 #[test]
 fn fallback_cancel_is_a_store_and_a_later_rearm_reuses_the_sleep() {
     let (host, clock) = sleep_host(Duration::ZERO);
@@ -2135,8 +2123,8 @@ fn fallback_poll_expired_wakes_the_latest_waker() {
     );
 }
 
-/// A deadline already past on the fallback completes at once and wakes the
-/// owner, as the wheel's wakeup would fire at once.
+/// A deadline already past on the fallback completes immediately and wakes
+/// the owner, as the wheel's wakeup would fire immediately.
 #[test]
 fn fallback_past_deadline_wakes_at_once() {
     let (host, clock) = sleep_host(Duration::ZERO);
@@ -2151,9 +2139,8 @@ fn fallback_past_deadline_wakes_at_once() {
     assert_eq!(timeout.take_expired(), Some(Expiry::Elapsed));
 }
 
-/// The zero-config guard: a timeout that is never scheduled takes no slot,
-/// makes no host sleep, reads no clock and allocates nothing, on either
-/// backend.
+/// On either backend, a timeout that is never scheduled does not take a slot,
+/// make a host sleep, read the clock or allocate.
 #[test]
 fn an_unscheduled_timeout_takes_nothing() {
     let (host, clock) = sleep_host(Duration::ZERO);
@@ -2215,9 +2202,9 @@ fn stats_count_schedules_and_fires() {
     assert_eq!(harness.wheel.stats().fired, 2);
 }
 
-/// A sleep kept across a cancel can resolve while the timeout is idle, and
-/// its owner need not look. Re-arming later than that sleep must not store
-/// onto the resolved sleep, which would never wake again.
+/// A sleep kept across a cancel can resolve while the timeout is idle, without
+/// its owner polling it. Re-arming later than that sleep must not store onto
+/// the resolved sleep, which would never wake again.
 #[test]
 fn fallback_rearm_after_an_unobserved_stale_resolution_fires() {
     let (host, clock) = sleep_host(Duration::ZERO);

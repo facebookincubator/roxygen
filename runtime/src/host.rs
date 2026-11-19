@@ -58,11 +58,12 @@ pub trait LocalHost {
         false
     }
 
-    /// The owner-local wheel timer this host drives, if any (a Roxygen-only
-    /// capability, `DIV-003`). A [`Timeout`] takes a slot on
-    /// it; without one, a `Timeout` keeps at most one `sleep_until` future.
-    /// The host calls [`WheelTimer::expire`] when the wheel's wakeup fires.
-    /// The default, `None`, keeps every timer on `sleep_until`.
+    /// The owner-local wheel timer this host drives, if any.
+    ///
+    /// A [`Timeout`] takes a slot on it. Without one, a `Timeout` keeps at most
+    /// one `sleep_until` future. The host calls [`WheelTimer::expire`] when the
+    /// wheel's wakeup fires. The default, `None`, keeps every timer on
+    /// `sleep_until`.
     fn wheel_timer(&self) -> Option<Rc<WheelTimer>> {
         None
     }
@@ -118,8 +119,9 @@ impl Host {
         }
     }
 
-    /// Uses the current Tokio runtime and LocalSet when capabilities are used.
-    /// Calls on one thread share one implementation.
+    /// Returns a host backed by the current Tokio runtime and `LocalSet`, which
+    /// are looked up when its capabilities are used. Calls on one thread share
+    /// one implementation.
     pub fn tokio() -> Self {
         TOKIO_HOST.try_with(Self::clone).unwrap_or_else(|_| {
             #[cfg(test)]
@@ -251,25 +253,22 @@ fn tokio_sleep_until(deadline: Instant) -> tokio::time::Sleep {
     tokio::time::sleep_until(tokio::time::Instant::from_std(deadline))
 }
 
-/// The Tokio host's sleep on a worker's wheel timer: one [`Timeout`],
-/// scheduled at the first poll and released when it expires. The worker
-/// expires its wheel from one Tokio `Sleep` on Tokio's clock, so the sleep
-/// resolves when a Tokio sleep with the same deadline would; it then stays
-/// resolved. A deadline already past at the first poll is a Tokio sleep, so
-/// it is ready at that poll exactly when a Tokio sleep is. If the wheel stops
-/// first (`~HHWheelTimer`'s `cancelAll`, at the worker's teardown), the sleep
-/// continues as a Tokio sleep with the same deadline.
+/// The Tokio host's sleep on a worker's wheel timer.
+///
+/// It holds one [`Timeout`], scheduled at the first poll and released when it
+/// expires. The worker expires its wheel from one Tokio `Sleep` on Tokio's
+/// clock, so this sleep resolves when a Tokio sleep with the same deadline
+/// would, and then stays resolved. A deadline already past at the first poll
+/// uses a Tokio sleep, so it is ready at that poll exactly when a Tokio sleep
+/// is. If the wheel stops first, at the worker's teardown, the sleep continues
+/// as a Tokio sleep with the same deadline.
 struct WheelSleep {
     deadline: Instant,
     state: WheelSleepState,
 }
 
 enum WheelSleepState {
-    /// On the wheel, scheduled once first polled.
-    Wheel {
-        timeout: Timeout,
-        scheduled: bool,
-    },
+    Wheel { timeout: Timeout, scheduled: bool },
     Elapsed,
     Tokio(Pin<Box<tokio::time::Sleep>>),
 }
