@@ -57,8 +57,9 @@ pub(crate) struct CompletionPauseForTest {
     pub(crate) release: tokio::sync::oneshot::Receiver<()>,
 }
 
-/// Explicit protocol, trusted security/routing data, and existing server policies.
-/// No handshake or worker-lifecycle notifications are synthesized by attachment.
+/// Options for [`serve_transport`]: the wire protocol, trusted security and routing data,
+/// and the server policies to apply. Attachment does not emit handshake or worker-lifecycle
+/// notifications.
 pub struct ServeTransportOptions {
     #[cfg(test)]
     pub(crate) completion_pause_for_test: Option<CompletionPauseForTest>,
@@ -74,7 +75,8 @@ pub struct ServeTransportOptions {
 }
 
 impl ServeTransportOptions {
-    /// Requires an explicit wire protocol and immediate-hop security assertion.
+    /// Creates options for the given wire protocol and immediate-hop security, with defaults
+    /// for everything else.
     pub fn new(protocol: CodecProtocol, security: TransportSecurity) -> Self {
         Self {
             #[cfg(test)]
@@ -91,8 +93,9 @@ impl ServeTransportOptions {
     }
 }
 
-/// Owns admission and cancellation for one local downstream session.
-/// Dropping it cancels; the worker still owns and joins the session cleanup.
+/// Controls admission and cancellation for one downstream session on the local worker.
+/// Dropping it before the session finishes cancels the session. The worker still owns and
+/// joins the session cleanup.
 pub struct ServerConnection {
     control: SessionControl,
     cancellation: CancellationSource,
@@ -101,7 +104,8 @@ pub struct ServerConnection {
 }
 
 impl ServerConnection {
-    /// Returns transferable data without transferring any session capability.
+    /// Returns the connection's metadata, which can be shared across threads and grants no
+    /// control over the session.
     pub fn connection_context(&self) -> &Arc<ConnectionContext> {
         &self.connection
     }
@@ -124,7 +128,8 @@ impl ServerConnection {
         }
     }
 
-    /// Cancels owner-locally without ordinary worker admission.
+    /// Cancels the session immediately and resets its transport, even after the worker stops
+    /// admitting work.
     pub fn cancel(&self) {
         self.cancellation.request_cancellation();
         let _ = catch_unwind(AssertUnwindSafe(|| self.control.force_stop()));
@@ -138,9 +143,9 @@ impl ServerConnection {
         )
     }
 
-    /// Observes session finalization. Dropping the observation never detaches work.
-    /// Scheduled transport flush/shutdown is joined by runtime quiescence, not by
-    /// this session-only receipt.
+    /// Waits for the session to finish and returns its result. Dropping the future does not
+    /// affect the session. A transport flush or shutdown that is still scheduled is joined by
+    /// runtime quiescence, not by this future.
     pub fn wait_closed(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<UniplexRunSummary, HttpError>> + 'static>> {
@@ -169,12 +174,13 @@ impl Drop for ServerConnection {
     }
 }
 
-/// Attaches a transport already established by the caller on this exact worker.
+/// Serves a transport that the caller has already established on this worker.
 ///
-/// Admission filters and observers see actual endpoints and transport identity.
-/// Immediate security and upstream origin are trusted configuration, never
-/// inferred from headers. The caller retains its I/O reactor through runtime
-/// quiescence. Attachment does not authenticate supplied identity or own a listener.
+/// Must be called on the worker's owner thread. Admission filters and observers see the
+/// transport's real endpoints and peer identity. Immediate-hop security and upstream origin
+/// are trusted configuration from `options`, never inferred from headers. The caller keeps
+/// its I/O reactor running until the runtime quiesces. Attachment does not authenticate the
+/// supplied identity.
 pub fn serve_transport(
     worker: &WorkerContext,
     transport: OwnedByteStream,
@@ -339,11 +345,11 @@ impl HttpHandler for AdmissionHandler {
     }
 }
 
-/// Polls one served session while observing its cancellation and worker
-/// quiescence. External cancellation wins over local cancellation, and either
-/// wins over quiescence, which a cancellation still follows. The cancellation
-/// listeners are updated only when the task's waker changes, so a wake reads
-/// their flags and polls the quiescence observation and the session.
+/// Polls one served session while watching its cancellation and worker quiescence.
+/// External cancellation takes precedence over local cancellation, and either over
+/// quiescence. A cancellation that arrives after quiescence still aborts. The
+/// cancellation listeners are updated only when the task's waker changes, so each wake
+/// checks their flags, then polls the quiescence signal and the session.
 ///
 /// Fields drop in declaration order: the stop observers, then the session
 /// future, then its control.
@@ -409,8 +415,8 @@ impl ServerSessionRun {
     }
 
     /// Points both cancellation listeners at `waker`, and caches it only once
-    /// both hold it. A listener that observes its cancellation stops the
-    /// update; the flag checks then abort.
+    /// both hold it. If a listener is already cancelled, the update stops and
+    /// the flag checks in `poll_stop` abort.
     #[inline(never)]
     fn register(&mut self, waker: &Waker) {
         drop(self.waker.take());

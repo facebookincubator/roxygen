@@ -5,8 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! A response source that polls its body events in place (`DIV-039`), served
-//! over loopback TCP, with the worker thread's heap allocations counted
+//! A response source that polls its body events in place, served over loopback
+//! TCP, with the worker thread's heap allocations counted
 //! (`crate::allocation_count`).
 
 use std::cell::Cell;
@@ -154,8 +154,7 @@ impl HttpHandler for TokenHandler {
 /// Serves one `events`-token response on a `HostedWorker` and returns the
 /// heap allocations its worker thread made between the request and the
 /// response's end, with the body the client received. `router_settings` adds
-/// the router's server options: `abort_exchanges_on_eof` (`DIV-053`) and
-/// `non_abortive_close` (`DIV-038`).
+/// `abort_exchanges_on_eof` and `non_abortive_close`, as `router_session` does.
 fn serve_tokens(events: usize, polling: bool, router_settings: bool) -> (usize, Vec<u8>) {
     serve_tokens_on(events, polling, router_settings, Serving::Uniplex)
 }
@@ -165,7 +164,7 @@ fn serve_tokens(events: usize, polling: bool, router_settings: bool) -> (usize, 
 enum Serving {
     /// `UniplexSession`, over HTTP/1.1.
     Uniplex,
-    /// The owned HTTP/1.1 driver (`owned_http1`, `DIV-029`).
+    /// The owned HTTP/1.1 driver (`owned_http1`).
     OwnedHttp1,
     /// The owned HTTP/2 driver (`owned_http2`), over h2c with prior knowledge.
     OwnedHttp2,
@@ -355,14 +354,15 @@ fn a_polling_response_source_streams_over_owned_http1() {
     }
 }
 
-/// On the owned HTTP/1.1 driver, the exchange polls a polling response source
-/// through its holder in place (`HttpSourceHolder::poll_body_event_exclusive`),
-/// so polling saves the source's boxed read future, one heap allocation per
-/// body event; the exchange holds a read-future source's holder read inline, so
-/// there is no boxed holder read to save. The driver's own allocations are not
-/// a whole number per event, so the two modes are compared at each length and
-/// the saving differenced across lengths. The saved allocation is made by code
-/// compiled into this test crate, so Buck counts it too.
+/// On the owned HTTP/1.1 driver, polling in place
+/// (`HttpSourceHolder::poll_body_event_exclusive`) saves the source's boxed
+/// read future, one heap allocation per body event. For a source read through
+/// futures, the exchange already holds the holder's read inline, so the driver
+/// does not allocate the boxed wrapper that polling saves under
+/// `UniplexSession`. The driver's own allocations are not a whole number per
+/// event, so the two modes are compared at two lengths and the saving
+/// differenced. The saved allocation is made by code compiled into this test
+/// crate, so shared-library test builds count it too.
 #[test]
 fn a_polling_response_source_saves_one_allocation_per_body_event_over_owned_http1() {
     let saved = |events| {
@@ -380,13 +380,11 @@ fn a_polling_response_source_saves_one_allocation_per_body_event_over_owned_http
     );
 }
 
-/// The owned HTTP/2 driver shares the owned HTTP/1.1 exchange
-/// (`handler_application.rs`), so it too polls a polling response source in
-/// place and holds a read-future source's holder read inline: polling saves
-/// the source's boxed read future, one heap allocation per body event, counted
-/// as in the owned HTTP/1.1 test, after a first connection that takes
-/// the HTTP/2 path's one-time allocations (about 100 on the first connection a
-/// process serves).
+/// The owned HTTP/2 driver shares the owned HTTP/1.1 exchange, which also holds
+/// the holder's read inline, so polling saves the same one heap allocation per
+/// body event, counted as in the owned HTTP/1.1 test. A first connection takes
+/// the HTTP/2 path's one-time allocations (about 100 per process) before
+/// counting.
 #[test]
 fn a_polling_response_source_streams_over_owned_http2_without_read_futures() {
     serve_tokens_on(1, false, false, Serving::OwnedHttp2);
@@ -405,9 +403,9 @@ fn a_polling_response_source_streams_over_owned_http2_without_read_futures() {
     );
 }
 
-/// Batching (`DIV-034`) polls a token stream's source once without waiting
-/// before each flush; with the router's settings that attempt must still cost
-/// a polling source no allocation, so polling keeps its saving.
+/// HTTP/1.1 egress batching polls a token stream's source once without waiting
+/// before each flush. With `router_session`'s settings that poll must not
+/// allocate for a polling source, so polling keeps its saving.
 #[test]
 #[cfg_attr(
     fbcode_build,
@@ -466,8 +464,8 @@ fn polled_fed_body(header: HttpHeaderEvent, feed: Rc<RefCell<Feed>>) -> Box<dyn 
     })
 }
 
-/// The router's server settings (`abort_exchanges_on_eof`, `non_abortive_close`,
-/// timers off).
+/// Server settings for a streaming router: `abort_exchanges_on_eof`,
+/// `non_abortive_close`, and timers off.
 fn router_session() -> ServerSessionConfig {
     ServerSessionConfig {
         abort_exchanges_on_eof: true,
@@ -476,8 +474,8 @@ fn router_session() -> ServerSessionConfig {
     }
 }
 
-/// With the router's settings, a polling source fed token by token is polled
-/// once pending before each flush and once ready after its wake (`DIV-034`).
+/// With `router_session`'s settings, a polling source fed token by token is
+/// polled once pending before each flush and once ready after its wake.
 #[test]
 fn a_polling_fed_token_stream_polls_its_source_twice_per_body_event() {
     let (polls, _) = fed_token_costs_per_event(router_session(), polled_fed_body);
@@ -487,10 +485,10 @@ fn a_polling_fed_token_stream_polls_its_source_twice_per_body_event() {
     );
 }
 
-/// With the router's server settings, a fed token stream polled in place costs
-/// two heap allocations per body event fewer than the same stream read through
-/// futures (the source's read future and the session's exchange wrapper), and
-/// no source poll more (`DIV-039`).
+/// With `router_session`'s settings, a fed token stream polled in place makes
+/// two fewer heap allocations per body event than the same stream read through
+/// futures (the source's read future and the session's exchange wrapper), with
+/// the same number of source polls.
 #[test]
 fn a_polling_fed_token_stream_saves_two_allocations_per_body_event_with_the_router_settings() {
     let (boxed_polls, boxed_allocations) =

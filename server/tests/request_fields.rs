@@ -5,10 +5,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! llhttp HTTP/1 methods, opt-in exact HTTP/2 method tokens (`DIV-040`), and
-//! verbatim HTTP/2 field values (`DIV-041`) over `serve_transport` and loopback TCP, on a `RuntimeOwner`
-//! worker and a `HostedWorker`, for HTTP/1.1 and h2c, next to hyper's server
-//! answering the same bytes.
+//! Tests llhttp's HTTP/1 method table, opt-in exact HTTP/2 method tokens and verbatim
+//! HTTP/2 field values. Cases run over `serve_transport` and loopback TCP, on a
+//! `RuntimeOwner` worker and a `HostedWorker`, for HTTP/1.1 and h2c, and compare the
+//! result with hyper's server given the same bytes.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -85,7 +85,7 @@ fn fields(fields: &[(&[u8], &[u8])]) -> Vec<(Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
-/// Records what each request carried as the application reads it, and answers 200.
+/// Records what each request carried as the application reads it, and responds with 200.
 struct RecordingHandler;
 
 impl HttpHandler for RecordingHandler {
@@ -726,7 +726,7 @@ thread_local! {
     static HEADS_READ: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Reads each request to its end and records what it saw; answers 200, or fails
+/// Reads each request to its end and records what it saw. Responds with 200, or fails
 /// the exchange if a read failed.
 struct BodyRecordingHandler;
 
@@ -936,9 +936,9 @@ fn an_empty_h2c_content_length_followed_by_data_fails_the_request_as_a_zero_one_
             "{value:?}"
         );
     }
-    // Roxygen fails both as it fails any overrun of a declared length that arrives
-    // with the head: the error discards the head before the handler reads it, and
-    // the stream is reset with INTERNAL_ERROR (`DIV-041`).
+    // Roxygen fails both, as it fails any overrun of a declared length that arrives
+    // with the head. The error discards the head before the handler reads it, and
+    // the stream is reset with INTERNAL_ERROR.
     on_worker(move |context| async move {
         for request in [&empty, &zero] {
             assert_eq!(
@@ -950,8 +950,8 @@ fn an_empty_h2c_content_length_followed_by_data_fails_the_request_as_a_zero_one_
 }
 
 /// What the application recorded of `request` over h2c, if it read anything, and the frames
-/// (with RST_STREAM codes) the server sent on stream 1. A request the session refuses before
-/// its head reaches the handler records nothing.
+/// (with RST_STREAM codes) the server sent on stream 1. A request that the session rejects
+/// before its head reaches the handler leaves the record empty.
 async fn serve_body_recorded(
     context: &WorkerContext,
     session: ServerSessionConfig,
@@ -1002,7 +1002,7 @@ fn an_empty_h2c_content_length_followed_by_data_fails_the_request_as_a_zero_one_
             serve_body_recorded(&context, owned_h2_verbatim_session(true), &zero).await;
         let (empty_seen, empty_frames) =
             serve_body_recorded(&context, owned_h2_verbatim_session(true), &empty).await;
-        // As over the managed session
+        // As on `UniplexSession`
         // (`an_empty_h2c_content_length_followed_by_data_fails_the_request_as_a_zero_one_does`),
         // the overrun fails the request before the application reads its head, and the stream
         // is reset with INTERNAL_ERROR.
@@ -1017,10 +1017,10 @@ fn an_empty_h2c_content_length_followed_by_data_fails_the_request_as_a_zero_one_
     });
 }
 
-/// What the application saw of an h2c POST with `content-length: <content_length>` whose
-/// HEADERS frame leaves the stream open and whose one DATA frame, `abc` without END_STREAM,
-/// is sent once the application has read the head; and each frame (type, flags, payload)
-/// the server sent on stream 1.
+/// What the application saw of an h2c POST with `content-length: <content_length>`, and each
+/// frame (type, flags, payload) the server sent on stream 1. The HEADERS frame leaves the
+/// stream open, and one DATA frame, `abc` without END_STREAM, is sent once the application
+/// has read the head.
 async fn serve_split_overrun(
     context: &WorkerContext,
     session: ServerSessionConfig,
@@ -1063,11 +1063,10 @@ async fn serve_split_overrun(
 }
 
 /// A body read that fails while the request is still open, after the application has read
-/// the head, here on DATA overrunning the declared length: the handler's failure becomes a
-/// 500 on both drivers, then the managed session sends that 500's body with END_STREAM and
-/// `owned_http2` resets the stream with INTERNAL_ERROR (`DIV-028`). This holds for any
-/// declared length, and an empty one with `verbatim_http2_header_values` fails on each
-/// driver as `0` does (`DIV-041`).
+/// the head, here on DATA overrunning the declared length. The handler's failure becomes a
+/// 500 on both drivers. `UniplexSession` then sends that 500's body with END_STREAM, and
+/// `owned_http2` resets the stream with INTERNAL_ERROR. This holds for any declared length,
+/// and an empty one with `verbatim_http2_header_values` fails on each driver as `0` does.
 #[test]
 fn an_h2c_overrun_after_the_head_gets_a_500_then_its_body_or_over_owned_http2_a_reset() {
     on_worker(|context| async move {
@@ -1118,7 +1117,7 @@ fn an_h2c_overrun_after_the_head_gets_a_500_then_its_body_or_over_owned_http2_a_
 }
 
 /// Without `verbatim_http2_header_values` an empty `content-length` leaves the body unchecked
-/// on both drivers (`DIV-041`): the application reads the DATA and answers 200.
+/// on both drivers, so the application reads the DATA and the server responds with 200.
 #[test]
 fn an_empty_h2c_content_length_leaves_the_body_unchecked_by_default_on_both_drivers() {
     let request = h2c_content_length_request(b"", Some(b"abc"));

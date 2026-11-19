@@ -73,7 +73,7 @@ pub struct ConnectionInfo {
     pub secure: bool,
     pub peer_identity: Option<Box<[u8]>>,
     pub zero_copy_enabled: bool,
-    /// The actual immediate connection, distinct from any logical origin.
+    /// The immediate connection, not any logical origin behind it.
     pub context: Arc<ConnectionContext>,
 }
 
@@ -91,23 +91,24 @@ where
 }
 
 pub trait TlsHandshakeObserver: Send + Sync + 'static {
-    /// Reports a successful native TLS transport accept before connection metadata
-    /// or admission. It does not imply session construction or subsequent I/O, and
-    /// excludes handshakes whose post-cryptographic transport setup failed.
+    /// Called when a native TLS accept succeeds, before connection metadata is read and
+    /// before admission. If transport setup fails after the handshake, `on_error` is called
+    /// instead.
     fn on_handshake_success(&self) {}
 
+    /// Called after a successful native TLS accept, once connection metadata is available.
     fn on_success(&self, _connection: &ConnectionInfo) {}
 
-    /// Reports a failed native TLS transport accept. `READ_TIMEOUT` means the handshake missed
-    /// its deadline (`ServerSessionConfig::tls_handshake_timeout`).
+    /// Called when a native TLS accept fails. `READ_TIMEOUT` means the handshake missed its
+    /// deadline (`ServerSessionConfig::tls_handshake_timeout`).
     fn on_error(&self, _error: &HttpError) {}
 }
 
 pub trait AcceptedConnectionObserver: Send + Sync + 'static {
     fn on_accepted(&self, connection: &ConnectionInfo);
 
-    /// Reports standalone HttpServer session admission and control registration,
-    /// before transport run. Embedded serve_transport does not emit this event.
+    /// Called once `HttpServer` has admitted the session and registered its control, before
+    /// the session runs. `serve_transport` does not call it.
     fn on_registered(&self) {}
 }
 
@@ -124,105 +125,112 @@ pub struct ServerSessionConfig {
     pub connection_idle_timeout: Duration,
     pub write_timeout: Duration,
     /// Bounds a native TLS accept from the start of the handshake. The default is 60 seconds,
-    /// matching wangle's `sslHandshakeTimeout`; zero leaves the handshake untimed. A missed deadline
-    /// fails the accept with `READ_TIMEOUT`, which `TlsHandshakeObserver::on_error` receives.
-    /// Both owned modes accept it. `serve_transport`, whose transport is already established,
-    /// ignores it.
+    /// and zero leaves the handshake untimed. A missed deadline fails the accept with
+    /// `READ_TIMEOUT`, which `TlsHandshakeObserver::on_error` receives. Both owned modes accept
+    /// it. `serve_transport` ignores it because its transport is already established.
     pub tls_handshake_timeout: Duration,
     /// How long an HTTP/2 drain holds its final GOAWAY after GOAWAY(2^31-1), so that streams
     /// the peer opened before the first GOAWAY reached it are still served. Zero sends both
-    /// GOAWAYs at once. The default is `UniplexSession`'s one second. Both HTTP/2 drivers
-    /// honor it (`DIV-028`); HTTP/1.1 connections ignore it.
+    /// GOAWAYs immediately. The default is one second, as for `UniplexSession`. Both HTTP/2
+    /// drivers apply it. HTTP/1.1 connections ignore it.
     pub goaway_timeout: Duration,
     pub read_allocation_size: usize,
     pub byte_stream_limits: ByteStreamLimits,
     pub lifecycle_observer_factory:
         Option<Arc<dyn Fn() -> Rc<dyn LifecycleObserver> + Send + Sync>>,
-    /// Optional owner-local recorder for the actual accepted H1 or H2 session.
-    /// None preserves the ordinary session construction path.
+    /// Builds an owner-local statistics recorder for each accepted HTTP/1.1 or HTTP/2
+    /// session. `None` records no statistics.
     pub stats_factory:
         Option<Arc<dyn Fn(&ConnectionInfo) -> Rc<dyn Http2SessionStats> + Send + Sync>>,
     /// HTTP/2 flood limits for both downstream drivers, using `Http2RateLimitConfig::default()`
     /// unless overridden. Each category can be disabled with an unbounded threshold.
     pub http2_rate_limits: Http2RateLimitConfig,
-    /// Experimental, default off (`DIV-029`): serves HTTP/1.1 connections on the owned
-    /// driver (`roxygen_session::owned_h1`) instead of `UniplexSession`, with no task per
-    /// request. HTTP/2 connections are unchanged. The owned mode is untimed: the caller keeps
-    /// timeout responsibility, and `stream_read_timeout`, `connection_idle_timeout` and
-    /// `write_timeout` must be zero, which also leaves HTTP/2 sessions untimed apart from
-    /// `goaway_timeout`. TLS handshakes use their independent `tls_handshake_timeout`. It
-    /// records no statistics and observes no lifecycle, so `stats_factory` and
-    /// `lifecycle_observer_factory` must be `None`. Server construction refuses anything else
-    /// with the reason, as `HttpServerError::InvalidConfig` (or, for `serve_transport`,
-    /// `INVALID_STATE_TRANSITION`).
+    /// Serves HTTP/1.1 connections on the owned driver (`roxygen_session::owned_h1`) instead
+    /// of `UniplexSession`, with no task per request. Experimental; off by default. HTTP/2
+    /// connections are unchanged.
+    ///
+    /// The owned mode is untimed, so the caller is responsible for timeouts.
+    /// `stream_read_timeout`, `connection_idle_timeout` and `write_timeout` must be zero,
+    /// which also leaves HTTP/2 sessions untimed apart from `goaway_timeout`. TLS handshakes
+    /// still use `tls_handshake_timeout`. The mode records no statistics and observes no
+    /// lifecycle, so `stats_factory` and `lifecycle_observer_factory` must be `None`. Server
+    /// construction rejects any other configuration with `HttpServerError::InvalidConfig`
+    /// (`INVALID_STATE_TRANSITION` from `serve_transport`), naming the reason.
     pub owned_http1: bool,
-    /// Experimental, default off: serves HTTP/2 connections on the owned driver
-    /// (`roxygen_session::owned_h2`) instead of `UniplexSession`, with no task per
-    /// request. HTTP/1.1 connections are unchanged. The owned mode honors
-    /// `connection_idle_timeout`, which drains an idle connection with GOAWAY
-    /// (`DIV-028`), `write_timeout`, which bounds a stalled transport
-    /// write and a response's wait for flow-control credit (`DIV-028`), and
-    /// `stream_read_timeout`, which bounds each wait for request body and answers 408
-    /// while the response head is unsent (`DIV-028`). Its drains hold the final GOAWAY for
-    /// `goaway_timeout`, as the managed session's do (`DIV-028`). It is stat-less:
-    /// `stats_factory` must be `None`. Server construction refuses anything else with the
-    /// reason, as `HttpServerError::InvalidConfig` (or, for `serve_transport`,
-    /// `INVALID_STATE_TRANSITION`). It applies `http2_rate_limits`, as the managed driver does.
-    /// A `lifecycle_observer_factory` observer
-    /// sees the connection's lifecycle as under `UniplexSession`, with the differences
-    /// recorded in `DIV-051`: among them, events arrive at the end of each driver poll, and
-    /// a stream detaches when it retires. The driver requires the configured
-    /// stream receive window to equal the advertised `INITIAL_WINDOW_SIZE`; the acceptor
-    /// aligns the two (see `owned_http2_session_config`). It honors
-    /// `abort_http2_streams_on_eof` (`DIV-055`), `exact_method_tokens` (`DIV-040`) and
-    /// `verbatim_http2_header_values` (`DIV-041`).
+    /// Serves HTTP/2 connections on the owned driver (`roxygen_session::owned_h2`) instead of
+    /// `UniplexSession`, with no task per request. Experimental; off by default. HTTP/1.1
+    /// connections are unchanged.
+    ///
+    /// The owned mode applies the session timeouts. `connection_idle_timeout` drains an idle
+    /// connection with GOAWAY. `write_timeout` bounds a stalled transport write and a
+    /// response's wait for flow-control credit. `stream_read_timeout` bounds each wait for
+    /// request body, and sends 408 if the response head is not yet sent. It also applies
+    /// `goaway_timeout`, `http2_rate_limits`, `abort_http2_streams_on_eof`,
+    /// `exact_method_tokens` and `verbatim_http2_header_values` as `UniplexSession` does. It
+    /// records no statistics, so `stats_factory` must be `None`. Server construction rejects
+    /// any other configuration with `HttpServerError::InvalidConfig` (`INVALID_STATE_TRANSITION`
+    /// from `serve_transport`), naming the reason.
+    ///
+    /// A `lifecycle_observer_factory` observer sees the connection's lifecycle as under
+    /// `UniplexSession`, with some differences. Among them, events arrive at the end of each
+    /// driver poll, a stream detaches when the driver retires it, and an observer panic aborts
+    /// the connection with `INTERNAL_ERROR`. The driver requires the stream receive window to
+    /// equal the advertised `INITIAL_WINDOW_SIZE`, so the stream window follows the advertised
+    /// setting, not `stream_flow_control`.
     pub owned_http2: bool,
-    /// Experimental, default off (`DIV-053`): when a downstream HTTP/1.1 peer's EOF arrives
-    /// while a transaction other than an established tunnel is open, fail the connection as a
-    /// reset does, cancelling every handler and discarding unwritten egress. Reads go on past
-    /// a request that closes the connection, discarding what they return, to see its EOF. The
-    /// default ends only incomplete requests and keeps serving one whose request completed, so
-    /// a half-closed client still gets its response. The EOF is seen only while reads run, so
-    /// an ingress pause (flow control, pipelining) defers it. HTTP/2 connections are
-    /// unchanged by it (`abort_http2_streams_on_eof`, `DIV-055`, is their counterpart), and
-    /// `owned_http1` applies it by the same rules.
+    /// Fails a downstream HTTP/1.1 connection, as a reset does, when the peer's EOF arrives
+    /// while a transaction other than an established tunnel is open. Experimental; off by
+    /// default.
+    ///
+    /// The failure cancels every handler and discards unwritten egress. Reads continue past a
+    /// request that closes the connection, discarding the data, so that the EOF is seen. With
+    /// the option off, only incomplete requests end and a completed request is still served,
+    /// so a half-closed client still gets its response. The EOF is seen only while reads run,
+    /// so an ingress pause (flow control, pipelining) defers it. HTTP/2 connections use
+    /// `abort_http2_streams_on_eof` instead. `owned_http1` applies this option by the same
+    /// rules.
     pub abort_exchanges_on_eof: bool,
-    /// Experimental, default off (`DIV-055`): when a downstream HTTP/2 peer's EOF arrives
-    /// while a stream is open (its response's END_STREAM not yet serialized, or its request
-    /// head still arriving), fail the connection with `TRANSPORT_EOF`, as a transport read
-    /// error does: every stream's handler is cancelled and its sources stopped, no error
-    /// response is sent, a GOAWAY follows the output already serialized, which is still
-    /// written, and the transport is reset (closed with FIN under `non_abortive_close`). The
-    /// default ends only streams whose request is incomplete and keeps serving the others, so
-    /// a half-closed client still gets their responses. An EOF on a connection with no open
-    /// stream closes it as before. Both HTTP/2 drivers honor it; HTTP/1.1 connections ignore
-    /// it (their option is `abort_exchanges_on_eof`, `DIV-053`).
+    /// Fails a downstream HTTP/2 connection with `TRANSPORT_EOF` when the peer's EOF arrives
+    /// while a stream is open. Experimental; off by default.
+    ///
+    /// A stream is open while its response's END_STREAM is unserialized or its request head is
+    /// still arriving. The failure works like a transport read error. Every stream's handler is
+    /// cancelled and its sources stopped, and no error response is sent. Output already
+    /// serialized is still written, followed by a GOAWAY, and the transport is reset (closed
+    /// with FIN under `non_abortive_close`). With the option off, only streams with an
+    /// incomplete request end and the others are still served, so a half-closed client still
+    /// gets their responses. An EOF with no open stream closes the connection normally. Both
+    /// HTTP/2 drivers apply it. HTTP/1.1 connections use `abort_exchanges_on_eof` instead.
     pub abort_http2_streams_on_eof: bool,
-    /// Roxygen-only, default off (`DIV-038`): a connection the session resets (an
-    /// HTTP/1.1 stream reset, such as a response body error, after writing what it
-    /// already serialized; a connection error; `ServerConnection::cancel`) closes its
-    /// socket without `SO_LINGER` zero, as hyper's server, which never
-    /// resets, closes one by dropping it: the kernel still sends the bytes already
-    /// written, then FIN, or RST only if received bytes are unread. An HTTP/1.1 response
-    /// body error also abandons the output serialized but not yet written, as hyper drops
-    /// its unflushed buffer, so the close never waits on a peer that stopped reading.
-    /// Everything else about the reset is unchanged. Plaintext only: `HttpServer` refuses
-    /// it with TLS credentials, and `serve_transport` for a transport declared TLS.
+    /// When the session resets a connection, closes its socket without `SO_LINGER` zero.
+    /// Off by default.
+    ///
+    /// Resets include an HTTP/1.1 stream reset (such as a response body error, after writing
+    /// what was already serialized), a connection error and `ServerConnection::cancel`. The
+    /// socket is closed by dropping it, as hyper's server does (hyper never resets a
+    /// connection). The kernel still sends the bytes already written, then FIN, or RST only if
+    /// received bytes are unread. An HTTP/1.1 response body error also discards output that is
+    /// serialized but not yet written, as hyper drops its unflushed buffer, so the close never
+    /// waits on a peer that stopped reading. The reset is otherwise unchanged. Plaintext only:
+    /// `HttpServer` rejects it with TLS credentials, and `serve_transport` rejects it for a
+    /// transport declared TLS.
     pub non_abortive_close: bool,
-    /// Roxygen-only, default off (`DIV-040`): downstream HTTP/2 request methods
-    /// are kept as exact, case-sensitive RFC tokens. HTTP/1 always uses llhttp's
-    /// recognized method table (`DIV-057`), independently of this option.
+    /// Keeps downstream HTTP/2 request methods as exact, case-sensitive RFC tokens. Off by
+    /// default. HTTP/1 always uses llhttp's table of recognized methods, whatever this is set
+    /// to.
     pub exact_method_tokens: bool,
-    /// Roxygen-only, default off (`DIV-041`): an HTTP/2 connection hands the application
-    /// each request field value exactly as decoded, surrounding spaces and tabs included,
-    /// as h2 and hyper's server do, instead of trimmed; values h2 refuses (a control byte
-    /// other than HTAB, DEL, a `content-length` that is not decimal digits, a `te` other
-    /// than `trailers`) make the request malformed. An empty `content-length` reaches the
-    /// application as an empty field and the body is checked against zero, as h2 reads it.
-    /// Response heads are encoded with their values as stored, so values inserted with
-    /// `HttpHeaders::add_verbatim` reach the client byte for byte, as hyper writes a
-    /// `HeaderValue`. HTTP/1.1 connections still trim optional request whitespace, as
-    /// `httparse` does, and write every stored value unchanged. `owned_http2` applies it.
+    /// Passes each HTTP/2 request field value to the application exactly as decoded,
+    /// surrounding spaces and tabs included, as h2 and hyper's server do. Off by default, in
+    /// which case the values are trimmed.
+    ///
+    /// Values that h2 rejects make the request malformed: a control byte other than HTAB, DEL,
+    /// a `content-length` that is not decimal digits, or a `te` other than `trailers`. An empty
+    /// `content-length` reaches the application as an empty field, and the body is checked
+    /// against zero, as h2 reads it. Response heads are encoded with their values as stored, so
+    /// values inserted with `HttpHeaders::add_verbatim` reach the client byte for byte, as
+    /// hyper writes a `HeaderValue`. HTTP/1.1 connections still trim optional request
+    /// whitespace, as `httparse` does, and write every stored value unchanged. `owned_http2`
+    /// applies it.
     pub verbatim_http2_header_values: bool,
     #[cfg(test)]
     pub(crate) accepted_socket_profile: Option<Arc<AcceptedSocketProfile>>,
@@ -279,7 +287,7 @@ impl Default for ServerSessionConfig {
 pub(crate) const NON_ABORTIVE_CLOSE_WITH_TLS: &str = "non_abortive_close does not support TLS";
 
 impl ServerSessionConfig {
-    /// Refuses what the owned HTTP/1.1 mode cannot honor, instead of ignoring it.
+    /// Rejects settings that the owned HTTP/1.1 mode does not support.
     pub(crate) fn check_owned_http1(&self) -> Result<(), &'static str> {
         if !self.owned_http1 {
             return Ok(());
@@ -302,7 +310,7 @@ impl ServerSessionConfig {
         Ok(())
     }
 
-    /// Refuses what the owned HTTP/2 mode cannot honor, instead of ignoring it.
+    /// Rejects settings that the owned HTTP/2 mode does not support.
     pub(crate) fn check_owned_http2(&self) -> Result<(), &'static str> {
         if !self.owned_http2 {
             return Ok(());
@@ -313,7 +321,7 @@ impl ServerSessionConfig {
         Ok(())
     }
 
-    /// Refuses what either owned mode cannot honor.
+    /// Rejects settings that either owned mode does not support.
     pub(crate) fn check_owned(&self) -> Result<(), &'static str> {
         self.check_owned_http1()?;
         self.check_owned_http2()
@@ -910,14 +918,11 @@ pub(crate) fn http2_session_config(config: &ServerSessionConfig) -> Http2Session
     }
 }
 
-/// The owned driver's HTTP/2 configuration: the managed session's, with the parts
-/// the driver cannot honor turned off instead of silently kept. It records no
-/// statistics, so stats and ping probes are `None`. Both drivers use the same flood limits.
-/// The GOAWAY timeout is the managed session's, `goaway_timeout`. The driver
-/// also requires its stream receive window to equal the advertised
-/// `INITIAL_WINDOW_SIZE`, so the window follows the advertised setting (the
-/// protocol default when `settings` carries none); where the setting is present,
-/// as the parity server sets it, this is the managed value unchanged.
+/// The owned driver's HTTP/2 configuration. It differs from `http2_session_config` in two
+/// ways. Stats and ping probes are `None`, because the driver records no statistics. The
+/// driver also requires its stream receive window to equal the advertised
+/// `INITIAL_WINDOW_SIZE`, so the window is the last advertised value of that setting, or
+/// the protocol default when `settings` has none.
 pub(crate) fn owned_http2_session_config(config: &ServerSessionConfig) -> Http2SessionConfig {
     let mut http2 = http2_session_config(config);
     let advertised = http2

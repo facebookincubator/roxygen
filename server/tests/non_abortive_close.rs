@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! `ServerSessionConfig::non_abortive_close` (`DIV-038`) over loopback TCP.
+//! `ServerSessionConfig::non_abortive_close` over loopback TCP.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -115,8 +115,8 @@ fn session(non_abortive_close: bool, owned_http1: bool) -> ServerSessionConfig {
     }
 }
 
-/// Serves one accepted HTTP/1.1 loopback connection whose server send buffer
-/// is large and whose client receive buffer is small, and returns its client.
+/// Serves one accepted HTTP/1.1 loopback connection with a large server send
+/// buffer and a small client receive buffer, and returns its client.
 async fn serve_loopback(
     context: &WorkerContext,
     session: ServerSessionConfig,
@@ -219,7 +219,7 @@ fn chunked_body(wire: &[u8]) -> (Vec<u8>, bool) {
 
 #[derive(Default)]
 struct Failure {
-    /// The session asked for the event after the body.
+    /// The session started reading the event after the body.
     awaited: Cell<bool>,
     fail: Notify,
 }
@@ -301,9 +301,9 @@ async fn until_body_arrives(client: &TcpStream) {
     }
 }
 
-/// Serves a response whose body fails after `BODY` bytes while the client reads
-/// nothing, waits until the session has closed the connection, then reads it:
-/// returns the response body the client received, whether it ended with the
+/// Serves a response whose body fails after `BODY` bytes while the client is
+/// not reading, waits until the session has closed the connection, then reads
+/// it. Returns the response body the client received, whether it ended with the
 /// last chunk, and whether the connection ended with a reset.
 async fn body_failure(context: WorkerContext, session: ServerSessionConfig) -> (usize, bool, bool) {
     let failure = Rc::new(Failure::default());
@@ -332,9 +332,9 @@ fn non_abortive_close_is_off_by_default() {
     assert!(!ServerSessionConfig::default().non_abortive_close);
 }
 
-/// A transport that `serve_transport`'s caller declares TLS refuses the option,
-/// as `HttpServer` refuses it with TLS credentials: the TLS adapter's own
-/// failure paths still reset.
+/// `serve_transport` rejects the option for a transport that the caller
+/// declares TLS, as `HttpServer` does with TLS credentials. It is rejected
+/// because the TLS adapter's own failure paths still reset.
 #[test]
 fn non_abortive_close_refuses_an_attached_tls_transport() {
     on_worker(|context| async move {
@@ -368,8 +368,8 @@ fn non_abortive_close_refuses_an_attached_tls_transport() {
     });
 }
 
-/// Pins the default: the session resets the connection after a body error, and
-/// the abortive close discards what the client had not received yet.
+/// Checks the default: the session resets the connection after a body error,
+/// and the abortive close discards what the client had not received yet.
 #[test]
 fn http1_body_error_resets_by_default() {
     let _spawn = CHILD_SPAWN.lock().unwrap_or_else(PoisonError::into_inner);
@@ -439,7 +439,7 @@ async fn cancelled(context: WorkerContext, session: ServerSessionConfig) -> (Vec
     read_until_closed(&mut client).await
 }
 
-/// Pins the default: cancelling a connection resets it.
+/// Checks the default: cancelling a connection resets it.
 #[test]
 fn http1_cancelled_connection_resets_by_default() {
     on_worker(|context| async move {
@@ -450,7 +450,7 @@ fn http1_cancelled_connection_resets_by_default() {
     });
 }
 
-/// As hyper, whose connection future a server drops: the client sees EOF.
+/// As when a hyper server drops its connection future, the client sees EOF.
 #[test]
 fn http1_cancelled_connection_closes_with_eof_when_enabled() {
     on_worker(|context| async move {
@@ -489,7 +489,7 @@ async fn owned_http2_cancelled(context: WorkerContext, non_abortive_close: bool)
     read_until_closed(&mut client).await.1
 }
 
-/// `owned_http2` honors the option as `owned_http1` does: the acceptor sets
+/// `owned_http2` applies the option as `owned_http1` does. The acceptor sets
 /// the transport flag before it picks the driver, so the reset that ends a
 /// cancelled owned HTTP/2 connection (RST by default) ends it with EOF.
 #[test]
@@ -572,9 +572,9 @@ async fn owned_http2_reset_flood(
     (goaway_codes(&wire), reset)
 }
 
-/// `DIV-052` with `DIV-038`: a reset-flood breach on `owned_http2` fails the
-/// connection with GOAWAY(`CANCEL`), and `non_abortive_close` turns the reset
-/// that follows into a FIN.
+/// A reset-flood breach on `owned_http2` fails the connection with
+/// GOAWAY(`CANCEL`), and `non_abortive_close` turns the reset that follows into
+/// a FIN.
 #[test]
 fn owned_http2_reset_flood_closes_with_eof_when_enabled() {
     on_worker(|context| async move {
@@ -592,8 +592,8 @@ fn owned_http2_reset_flood_closes_with_eof_when_enabled() {
 }
 
 /// A streamed 200 whose body is `READY_BODY` bytes in one event, then an
-/// error, all ready at once, so that batching (`DIV-034`) serializes the body
-/// and takes the error before anything is flushed.
+/// error, all ready together, so that HTTP/1.1 egress batching serializes the
+/// body and takes the error before any output is flushed.
 struct ReadyFailingBody {
     header: Option<HttpHeaderEvent>,
     body_sent: bool,
@@ -701,12 +701,12 @@ async fn ready_body_failure(
     (closed, wire, reset)
 }
 
-/// As hyper, which drops the output it has not flushed when a response body
-/// fails and closes the connection: with batching, a body and its error that
-/// are ready together abandon the serialized response, which the peer is not
-/// taking, and the connection closes at once with FIN (no last chunk, no wait
-/// on a peer that stopped reading, despite the zero write timeout). The owned
-/// HTTP/1.1 driver, which writes a turn's output together, does the same.
+/// Matches hyper, which drops its unflushed output and closes the connection
+/// when a response body fails. With batching, a body and its error that are
+/// ready together discard the serialized response, which the peer is not
+/// reading, and the connection closes immediately with FIN (no last chunk, no
+/// wait on a peer that stopped reading, despite the zero write timeout). The
+/// owned HTTP/1.1 driver, which writes a turn's output together, does the same.
 #[test]
 fn http1_ready_body_error_abandons_unwritten_output_when_non_abortive() {
     for owned in [false, true] {
@@ -727,7 +727,7 @@ fn http1_ready_body_error_abandons_unwritten_output_when_non_abortive() {
     }
 }
 
-/// Pins the default: the session writes what it serialized before resetting,
+/// Checks the default: the session writes what it serialized before resetting,
 /// so with a zero write timeout it holds the connection while the peer does
 /// not read; once the peer reads, the body ends without a last chunk, then
 /// the abortive reset.

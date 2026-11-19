@@ -1408,8 +1408,8 @@ fn wait_until(condition: impl Fn() -> bool) -> bool {
     true
 }
 
-/// Counts of an API-Proxy-shaped open-connection gauge: up when its observer attaches, down at
-/// `Destroy`.
+/// Counts of an open-connection gauge as a proxy might keep one: up when its observer attaches,
+/// down at `Destroy`.
 #[derive(Default)]
 struct GaugeCounts {
     open: AtomicUsize,
@@ -2377,8 +2377,8 @@ fn tls_zero_copy_force_stop_is_bounded() {
         "the integration exercises kernel zero-copy when supported and its explicit fallback otherwise"
     );
 
-    // Transport tests establish backing retention across kernel completion. This
-    // server-level oracle covers response progress and bounded forced shutdown.
+    // Transport tests check that send buffers are retained until kernel completion.
+    // This server-level test covers response progress and bounded forced shutdown.
     server.force_stop("TLS zero-copy smoke");
 }
 
@@ -2509,7 +2509,7 @@ fn http2_defaults_match_server_session_limits() {
 }
 
 #[test]
-fn http2_first_initial_window_setting_matches_frozen_server_precedence() {
+fn http2_first_initial_window_setting_takes_precedence() {
     let mut server = crate::acceptor::ServerSessionConfig::default();
     server.settings.extend([
         CodecSetting {
@@ -3629,7 +3629,7 @@ impl Drop for AdmissionHandler {
 }
 
 /// Echoes each request body and records whether its handler context carried an exchange
-/// completion receipt and a response proposer.
+/// completion and a response proposer.
 struct EchoHandler {
     receipts: Arc<Mutex<Vec<(bool, bool)>>>,
 }
@@ -3723,7 +3723,8 @@ fn normalize_date(wire: &[u8]) -> Vec<u8> {
 }
 
 /// Sends three keep-alive requests with bodies on one connection, the last one closing it,
-/// and returns every response byte and each handler context's receipt and proposer.
+/// and returns every response byte and whether each handler context had an exchange
+/// completion and a response proposer.
 fn serve_three_requests(owned_http1: bool) -> (Vec<u8>, Vec<(bool, bool)>) {
     let receipts = Arc::new(Mutex::new(Vec::new()));
     let config = ServerConfig {
@@ -3772,8 +3773,8 @@ fn owned_http1_serves_requests_through_the_handler() {
         String::from_utf8_lossy(&owned_wire),
         String::from_utf8_lossy(&default_wire)
     );
-    // The owned driver gives the handler no completion receipt or response proposer
-    // (`DIV-029`).
+    // The owned driver does not give the handler an exchange completion or a response
+    // proposer.
     assert_eq!(default_receipts, [(true, true); 3]);
     assert_eq!(owned_receipts, [(false, false); 3]);
 }
@@ -3879,7 +3880,7 @@ fn owned_http1_leaves_http2_unchanged() {
     assert_eq!(stats.requests.load(Ordering::Relaxed), 1);
 }
 
-/// Answers `/gated` only once released; answers every other request at once.
+/// Responds to `/gated` only once released, and to every other request immediately.
 struct DrainHandler {
     started: mpsc::SyncSender<()>,
     release: Arc<tokio::sync::Notify>,
@@ -4009,7 +4010,7 @@ fn owned_http1_drain_and_shutdown_are_clean() {
     }
 }
 
-/// Fails each request as its path says: with an error, a read timeout, or a panic in the
+/// Fails each request according to its path: with an error, a read timeout, or a panic in the
 /// handler future; or, with `panic_call`, panics in the handler call itself.
 struct FailingHandler {
     panic_call: bool,
@@ -4094,8 +4095,8 @@ impl Drop for PanicsOnDrop {
     }
 }
 
-/// Answers `200 OK`, or with `timeout` fails with a read timeout, from a future whose
-/// destructor panics.
+/// Responds with `200 OK`, or fails with a read timeout when `timeout` is set, from a future
+/// whose destructor panics.
 struct DropPanickingHandler {
     timeout: bool,
 }
@@ -4175,7 +4176,8 @@ impl HttpSource for PanickingResponse {
     fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {}
 }
 
-/// Answers `/panic` with a response source whose read panics, anything else `200 OK`.
+/// Responds to `/panic` with a response source whose read panics, and to anything else with
+/// `200 OK`.
 struct ResponsePanicHandler;
 
 impl HttpHandler for ResponsePanicHandler {
@@ -4197,7 +4199,7 @@ impl HttpHandler for ResponsePanicHandler {
 }
 
 /// Starts a server on its one worker and sends a request whose response source panics,
-/// which tears the connection down with no response.
+/// which tears the connection down without a response.
 fn server_after_a_response_panic(owned_http1: bool) -> ScopedHttpServer {
     let factory: HandlerFactory = Arc::new(|_| Rc::new(ResponsePanicHandler) as HttpHandlerRef);
     let config = ServerConfig {
@@ -4223,7 +4225,7 @@ fn server_after_a_response_panic(owned_http1: bool) -> ScopedHttpServer {
 
 #[test]
 fn owned_http1_response_source_panic_keeps_the_worker_serving() {
-    // `UniplexSession` fails the worker with the panic (`DIV-029`).
+    // `UniplexSession` fails the worker with the panic.
     let server = server_after_a_response_panic(false);
     assert!(server.drain());
     assert!(matches!(
@@ -4379,15 +4381,15 @@ fn exhaust_descriptors_with_a_queued_connection() {
     assert_ok_response(&get_request(address));
 }
 
-/// Events of the pushed `/sse` response, as the parity benchmark's conformance check sends.
+/// Events in the pushed `/sse` response.
 const PUSHED_EVENTS: usize = 5;
 const PUSHED_EVENT_SIZE: usize = 64;
-/// Larger than the request window and one read, as the conformance check's `/echo` body.
+/// Larger than the request window and one read.
 const ECHO_BODY_SIZE: usize = 1_000_003;
 
-/// The parity benchmark's `/sse` and `/echo` shapes: `/sse` pushes its events from a task
-/// into a response source with no `Content-Length`, and `/echo` streams the request body back
-/// as it arrives, with the request's `Content-Length` if it has one.
+/// Serves `/sse` and `/echo`. `/sse` pushes its events from a task into a response source
+/// without a `Content-Length`, and `/echo` streams the request body back as it arrives, with
+/// the request's `Content-Length` if it has one.
 struct StreamingHandler {
     producer_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
@@ -4481,7 +4483,7 @@ impl Drop for ProducerTasks {
     }
 }
 
-/// A server with the parity benchmark's HTTP/1.1 windows, untimed so both modes accept it.
+/// A server with 256 KiB stream and 5 MiB connection windows, untimed so both modes accept it.
 fn streaming_server(owned_http1: bool, producers: &ProducerTasks) -> ScopedHttpServer {
     let config = ServerConfig {
         session: crate::acceptor::ServerSessionConfig {

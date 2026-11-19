@@ -60,11 +60,11 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-/// Whether the counts cover every crate's allocations. Buck's fbcode test
-/// builds link each Rust crate, `std` and `alloc` included, as a shared library
-/// whose allocations do not reach this binary's global allocator, so there a
-/// count covers only code compiled into the test crate, and tests skip their
-/// allocation assertions.
+/// Whether the counts cover every crate's allocations. Some test builds link
+/// each Rust crate, `std` and `alloc` included, as a shared library whose
+/// allocations bypass this binary's global allocator. There a count covers
+/// only code compiled into the test crate, so tests skip their allocation
+/// assertions.
 pub(crate) const COUNTS_EVERY_CRATE: bool = cfg!(not(fbcode_build));
 
 /// Starts counting this thread's allocations from zero.

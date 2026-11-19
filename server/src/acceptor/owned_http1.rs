@@ -47,9 +47,9 @@ pub(crate) struct OwnedHttp1Session {
     cleanup: Cleanup,
 }
 
-/// A worker cleanup task reserved at construction. Activated when the run ends, or when the
-/// session or its run future is dropped, it finishes an abandoned run (after cancelling it),
-/// then finalizes the handler contexts' liveness owner once every context is released.
+/// A worker cleanup task reserved at construction, activated when the run ends or when the
+/// session or its run future is dropped. It finishes an abandoned (already cancelled) run,
+/// then finalizes the owner of the handler contexts once every context is released.
 struct Cleanup {
     registration: WorkerCleanupTaskRegistration,
     abandoned: Rc<Cell<Option<RunFuture>>>,
@@ -80,8 +80,8 @@ impl OwnedHttp1Session {
                 let finished = Rc::clone(&finished);
                 async move {
                     if let Some(mut run) = abandoned.take() {
-                        // The run was cancelled when it was abandoned. Nothing awaits its
-                        // outcome any more, so its error, or a callback panic the driver
+                        // The run was cancelled when it was abandoned. Its outcome is
+                        // unobserved, so its error, or a callback panic that the driver
                         // resumes as it completes, is discarded.
                         std::future::poll_fn(|context| {
                             match catch_unwind(AssertUnwindSafe(|| run.as_mut().poll(context))) {
@@ -153,8 +153,8 @@ impl Future for OwnedHttp1Run {
                 Ok(Poll::Pending) => return Poll::Pending,
                 Ok(Poll::Ready(result)) => result,
                 Err(panic) => {
-                    // The driver rethrows a callback panic only after its cleanup joined, so
-                    // the run is finished; dropping the registration finalizes the owner.
+                    // The driver rethrows a callback panic only after its cleanup has joined,
+                    // so the run is finished. Dropping the registration finalizes the owner.
                     this.run = None;
                     if let Some(cleanup) = this.cleanup.take() {
                         cleanup.finished.set(true);

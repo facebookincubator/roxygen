@@ -6,15 +6,16 @@
  */
 
 //! Opt-in abort of open exchanges on a downstream HTTP/1.1 peer's EOF
-//! (`ServerSessionConfig::abort_exchanges_on_eof`, `DIV-053`), and of open
-//! streams on a downstream HTTP/2 peer's EOF
-//! (`ServerSessionConfig::abort_http2_streams_on_eof`, `DIV-055`).
+//! (`ServerSessionConfig::abort_exchanges_on_eof`), and of open streams on a
+//! downstream HTTP/2 peer's EOF
+//! (`ServerSessionConfig::abort_http2_streams_on_eof`).
 //!
 //! Each HTTP/1.1 case runs in every server mode in `HTTP1_MODES`, and each
-//! HTTP/2 case in every mode in `H2_MODES`, on both workers. HTTP/2 connections
-//! are unchanged by `abort_exchanges_on_eof`, on `UniplexSession` and on the
-//! owned driver (`ServerSessionConfig::owned_http2`) alike;
-//! `abort_http2_streams_on_eof` aborts their open streams on both drivers.
+//! HTTP/2 case in every mode in `H2_MODES`, on both workers.
+//! `abort_exchanges_on_eof` leaves HTTP/2 connections unchanged, on
+//! `UniplexSession` and on the owned driver
+//! (`ServerSessionConfig::owned_http2`) alike. `abort_http2_streams_on_eof`
+//! aborts their open streams on both drivers.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -230,7 +231,7 @@ impl Drop for DropProbe {
     }
 }
 
-/// Holds each exchange until released, then answers 200 with `held`.
+/// Holds each exchange until released, then responds with 200 and `held`.
 struct HeldHandler(Rc<Held>);
 
 impl HttpHandler for HeldHandler {
@@ -262,9 +263,9 @@ struct SourceProbe {
     produced: Cell<usize>,
 }
 
-/// A streamed response whose body never ends: with `endless`, each read yields
-/// a chunk at once, so the response fills a peer that stops reading; otherwise
-/// no body ever arrives.
+/// A streamed response whose body never ends. With `endless`, each read yields
+/// a chunk immediately, so the response fills a peer that stops reading.
+/// Otherwise the body never arrives.
 struct StreamingBody {
     header: Option<HttpHeaderEvent>,
     probe: Rc<SourceProbe>,
@@ -461,7 +462,7 @@ impl HttpHandler for ConsumingHandler {
 }
 
 /// Reads the request head, stops the upload with `NO_ERROR` and holds the
-/// exchange until released, as a handler that answers without the body does.
+/// exchange until released, as a handler that responds without the body does.
 struct StoppingHandler(Rc<Held>);
 
 impl HttpHandler for StoppingHandler {
@@ -485,7 +486,8 @@ impl HttpHandler for StoppingHandler {
     }
 }
 
-/// Reads the request body and answers 413 when it fails, as an upload limit does.
+/// Reads the request body and responds with 413 when it fails, as an upload
+/// limit does.
 struct UploadHandler;
 
 impl HttpHandler for UploadHandler {
@@ -536,7 +538,8 @@ impl HttpHandler for RouteHandler {
     }
 }
 
-/// Answers `/held` as `ConsumingHandler` does and anything else at once with `ok`.
+/// Serves `/held` as `ConsumingHandler` does, and anything else immediately
+/// with `ok`.
 struct KeepAliveHandler(Rc<Held>);
 
 impl HttpHandler for KeepAliveHandler {
@@ -821,16 +824,16 @@ fn http1_eof_aborts_a_held_http10_exchange_when_enabled() {
     http1_eof_aborts_a_held_exchange(HTTP10_REQUEST, false);
 }
 
-/// With `non_abortive_close` (`DIV-038`), the abort's reset closes the socket
+/// With `non_abortive_close`, the abort's reset closes the socket
 /// without `SO_LINGER` zero, so the client reads EOF.
 #[test]
 fn http1_eof_aborts_a_held_exchange_with_a_fin_under_non_abortive_close() {
     http1_eof_aborts_a_held_exchange(REQUEST, true);
 }
 
-/// The EOF fails the connection as a reset does (`DIV-053`): the handler future
-/// is cancelled, nothing is written, and the transport is reset, which
-/// `non_abortive_close` turns into a FIN.
+/// The EOF fails the connection as a reset does. The handler future is
+/// cancelled, the session does not write to the client, and the transport is
+/// reset, which `non_abortive_close` turns into a FIN.
 fn http1_eof_aborts_a_held_exchange(request: &'static [u8], non_abortive_close: bool) {
     in_both_modes(move |context, owned| async move {
         let held = Rc::new(Held::default());
@@ -911,7 +914,7 @@ fn http1_eof_aborts_a_handler_that_read_its_body_when_enabled() {
     });
 }
 
-/// A request whose reader stopped its upload with `NO_ERROR` still owes its
+/// A request whose reader stopped its upload with `NO_ERROR` still needs its
 /// response, so the EOF aborts it.
 #[test]
 fn http1_eof_aborts_a_no_error_stopped_upload_when_enabled() {
@@ -943,7 +946,7 @@ fn http1_eof_aborts_a_no_error_stopped_upload_when_enabled() {
 }
 
 /// By default, a request whose reader stopped its upload with `NO_ERROR` gets
-/// its response, then the owned driver's staged close (`DIV-054`) shuts the
+/// its response, then the owned driver's staged close shuts the
 /// write side down and reads the rest of the upload through the TCP reader:
 /// chunks that trickle in after the response, then the peer's FIN, which ends
 /// the connection cleanly.
@@ -984,8 +987,8 @@ fn owned_http1_staged_close_reads_a_trickled_upload_to_peer_eof_over_tcp() {
     });
 }
 
-/// The EOF waits behind the pipelined request: the first exchange is answered,
-/// then the second, open when the EOF is read, is aborted.
+/// The EOF waits behind the pipelined request: the first exchange gets its
+/// response, then the second, open when the EOF is read, is aborted.
 #[test]
 fn http1_eof_behind_a_pipelined_request_answers_the_first_and_aborts_the_second_when_enabled() {
     in_both_modes(|context, owned| async move {
@@ -1119,10 +1122,10 @@ fn http1_closing_exchange_completes_cleanly_when_enabled() {
     });
 }
 
-/// Reads go on past a request that closes the connection, so its EOF is seen:
-/// the bytes behind it, those read with it and more than the session buffers
-/// (`connection_flow_control`) read later, are discarded unparsed, and the EOF
-/// aborts it.
+/// Reads continue past a request that closes the connection, so that its EOF
+/// is seen. The bytes after the request are discarded unparsed, both those read
+/// with it and more than `connection_flow_control` read later, and the EOF then
+/// aborts the request.
 #[test]
 fn http1_bytes_after_a_closing_request_are_discarded_and_its_eof_aborts_when_enabled() {
     in_both_modes(|context, owned| async move {
@@ -1260,9 +1263,9 @@ fn http1_reset_stops_a_closing_streaming_response_when_enabled() {
     });
 }
 
-/// The abort cancels the exchange at once even while a write is blocked on a
-/// peer that stopped reading; once the client goes away, the session ends with
-/// the EOF's error.
+/// The abort cancels the exchange immediately even while a write is blocked on
+/// a peer that stopped reading. Once the client goes away, the session ends
+/// with the EOF's error.
 #[test]
 fn http1_eof_with_a_blocked_write_cancels_the_exchange_at_once_when_enabled() {
     in_both_modes(|context, owned| async move {
@@ -1302,7 +1305,7 @@ fn http1_eof_keeps_flushing_a_serialized_closing_response_when_enabled() {
     http1_eof_keeps_flushing_a_serialized_response(CLOSING_REQUEST);
 }
 
-/// A response whose end the session serialized is no longer open: its
+/// A response whose end the session serialized is not open: its
 /// transaction ended at serialization, so the EOF does not abort it, and it is
 /// written whole to the half-closed peer once that reads. Had every byte reached
 /// the kernel before the EOF, the test could not tell, so it requires a blocked
@@ -1480,10 +1483,10 @@ fn assert_writes_the_response_then_resets(outcomes: &[(bool, usize, bool, Option
     );
 }
 
-/// With `non_abortive_close` (`DIV-038`), the close that follows a mid-upload EOF
-/// no longer discards the response's tail:
-/// the session writes the whole response, then the client reads all of it and
-/// EOF, since the session read everything the client sent.
+/// With `non_abortive_close`, the close that follows a mid-upload EOF does not
+/// discard the response's tail. The session writes the whole response, and the
+/// client reads all of it, then EOF, since the session read every byte that the
+/// client sent.
 #[test]
 fn http1_eof_mid_upload_with_an_early_response_arrives_whole_when_non_abortive() {
     for &owned in HTTP1_MODES {
@@ -1579,9 +1582,9 @@ fn http1_eof_after_the_response_closes_cleanly_when_enabled() {
     });
 }
 
-/// The exchanges a keep-alive connection completed before the held one leave
-/// nothing behind that changes how its EOF is judged, and a chunked request
-/// body counts as complete once its last chunk arrives.
+/// The exchanges that a keep-alive connection completed before the held one do
+/// not change how its EOF is handled, and a chunked request body counts as
+/// complete once its last chunk arrives.
 #[test]
 fn http1_eof_aborts_a_held_chunked_exchange_after_keep_alive_exchanges_when_enabled() {
     in_both_modes(|context, owned| async move {
@@ -1788,9 +1791,9 @@ fn abort_http2_streams_on_eof_is_off_by_default_and_reaches_both_http2_configs()
     assert!(crate::acceptor::owned_http2_session_config(&enabled).abort_streams_on_eof);
 }
 
-/// With `abort_http2_streams_on_eof` (`DIV-055`), a peer EOF while a stream is
-/// open fails the connection with `TRANSPORT_EOF`: the handler future is
-/// cancelled, nothing is written on the stream, and the transport is reset.
+/// With `abort_http2_streams_on_eof`, a peer EOF while a stream is open fails
+/// the connection with `TRANSPORT_EOF`. The handler future is cancelled, the
+/// session does not write on the stream, and the transport is reset.
 #[test]
 fn http2_eof_aborts_a_held_stream_when_enabled() {
     in_both_h2_modes(|context, owned| async move {
@@ -1823,9 +1826,8 @@ fn http2_eof_aborts_a_held_stream_when_enabled() {
     });
 }
 
-/// Two complete POSTs that the application holds, then the client's
-/// half-close with its read side still open, as the router's h2c half-close
-/// test drives the connection: both handlers are cancelled.
+/// Two complete POSTs that the application holds, then a client half-close
+/// with its read side still open. Both handlers are cancelled.
 #[test]
 fn http2_eof_aborts_every_open_stream_when_enabled() {
     in_both_h2_modes(|context, owned| async move {
@@ -1907,9 +1909,9 @@ fn http2_eof_stops_a_streaming_response_when_enabled() {
     });
 }
 
-/// An EOF inside a request body: by default the incomplete request fails with
-/// `TRANSPORT_EOF` and both drivers answer 500; with the option the stream is
-/// open, so the EOF aborts it with no response.
+/// An EOF inside a request body. By default the incomplete request fails with
+/// `TRANSPORT_EOF` and both drivers respond with 500. With the option the
+/// stream is open, so the EOF aborts it without a response.
 #[test]
 fn http2_eof_mid_upload_aborts_without_the_500_when_enabled() {
     let outcomes: Vec<_> = H2_MODES
@@ -2085,7 +2087,7 @@ struct StopProbe {
     stopped: Cell<bool>,
 }
 
-/// A response whose head never arrives and whose `stop_reading` panics.
+/// A response that never delivers its head and panics in `stop_reading`.
 struct PanickingStop(Rc<StopProbe>);
 
 impl HttpSource for PanickingStop {
@@ -2122,11 +2124,10 @@ impl HttpHandler for PanickingStopHandler {
     }
 }
 
-/// `DIV-055` with `DIV-056`: on the owned driver, the EOF abort's cancellation reaches a
-/// response source whose `stop_reading` panics. The driver contains and counts the panic as an
-/// exchange's, and the abort still writes its one GOAWAY and closes with a FIN under
-/// `non_abortive_close`, failing the connection with `TRANSPORT_EOF`. The worker serves the next
-/// connection.
+/// On the owned driver, the EOF abort's cancellation reaches a response source whose
+/// `stop_reading` panics. The driver contains the panic and counts it as an exchange panic.
+/// The abort still writes its one GOAWAY and closes with a FIN under `non_abortive_close`,
+/// failing the connection with `TRANSPORT_EOF`. The worker serves the next connection.
 #[cfg(panic = "unwind")]
 #[test]
 fn owned_http2_eof_abort_contains_a_stop_panic_and_ends_with_a_fin_under_non_abortive_close() {
@@ -2295,7 +2296,7 @@ fn http2_request_and_eof_in_one_write_abort_when_enabled() {
     });
 }
 
-/// Under `non_abortive_close` (`DIV-038`) the abort's reset is a FIN, so the
+/// Under `non_abortive_close` the abort's reset is a FIN, so the
 /// client reads the abort's GOAWAY: one, with INTERNAL_ERROR and the held
 /// stream as the last.
 #[test]
@@ -2396,9 +2397,9 @@ fn http2_eof_during_a_drain_aborts_the_open_streams_when_enabled() {
     }
 }
 
-/// With `goaway_timeout` zero a drain sends its final GOAWAY at once. A peer
-/// EOF after it still aborts the open stream, and no further GOAWAY follows
-/// the final one.
+/// With `goaway_timeout` zero a drain sends its final GOAWAY immediately. A
+/// peer EOF after it still aborts the open stream, and the session does not
+/// send another GOAWAY.
 #[test]
 fn http2_eof_after_the_final_goaway_aborts_without_another_goaway_when_enabled() {
     in_both_h2_modes(|context, owned| async move {
@@ -2441,8 +2442,8 @@ fn http2_eof_after_the_final_goaway_aborts_without_another_goaway_when_enabled()
     });
 }
 
-/// A peer GOAWAY announces no new streams; it does not ask for the open ones
-/// to finish over a half-closed transport, so its EOF still aborts them.
+/// A peer GOAWAY only stops new streams. It does not mean the open ones should
+/// finish over a half-closed transport, so the peer's EOF still aborts them.
 #[test]
 fn http2_eof_after_a_peer_goaway_aborts_the_open_streams_when_enabled() {
     in_both_h2_modes(|context, owned| async move {
@@ -2473,10 +2474,10 @@ fn http2_eof_after_a_peer_goaway_aborts_the_open_streams_when_enabled() {
     });
 }
 
-/// A HEADERS frame without END_HEADERS opens no stream in the session until its
-/// CONTINUATION frames end the block, but the request it begins is open: by
-/// default its EOF closes the connection as an idle one, and with the option
-/// the EOF aborts.
+/// A HEADERS frame without END_HEADERS does not open a stream in the session
+/// until its CONTINUATION frames end the block, but the request it begins is
+/// open. By default its EOF closes the connection as an idle one, and with the
+/// option the EOF aborts.
 #[test]
 fn http2_eof_inside_a_request_head_aborts_when_enabled() {
     for abort in [false, true] {
@@ -2605,16 +2606,15 @@ fn http2_eof_keeps_open_streams_by_default() {
     }
 }
 
-/// `abort_exchanges_on_eof` alone leaves HTTP/2 unchanged (`DIV-053`; the
-/// HTTP/2 option is `DIV-055`): the half-closed stream keeps running.
+/// `abort_exchanges_on_eof` alone leaves HTTP/2 unchanged (the HTTP/2 option
+/// is `abort_http2_streams_on_eof`), so the half-closed stream keeps running.
 #[test]
 fn http2_eof_keeps_open_streams_when_enabled() {
     http2_eof_keeps_an_open_stream(session(false, true));
 }
 
-/// The owned HTTP/2 driver accepts `abort_exchanges_on_eof` and ignores it, as
-/// API Proxy's owned engine runs it: `abort_exchanges_on_eof` alone leaves
-/// HTTP/2 unchanged (`DIV-053`; the HTTP/2 option is `DIV-055`).
+/// The owned HTTP/2 driver accepts `abort_exchanges_on_eof` and ignores it, so
+/// the option alone leaves HTTP/2 unchanged there too.
 #[test]
 fn owned_http2_eof_keeps_open_streams_when_enabled() {
     http2_eof_keeps_an_open_stream(ServerSessionConfig {

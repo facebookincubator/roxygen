@@ -5,14 +5,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The router prototype's ingress combination: `serve_transport` with
-//! `abort_exchanges_on_eof` (`DIV-053`), `abort_http2_streams_on_eof`
-//! (`DIV-055`), `non_abortive_close` (`DIV-038`), `exact_method_tokens`
-//! (`DIV-040`) and `verbatim_http2_header_values` (`DIV-041`), serving a
-//! response source that polls its body events in place
-//! (`DIV-039`) under a head whose values the handler inserts with
-//! `HttpHeaders::add_verbatim`, over HTTP/1.1 and h2c on loopback TCP, on a
-//! `RuntimeOwner` worker and a `HostedWorker`.
+//! The ingress options that a streaming router combines: `serve_transport` with
+//! `abort_exchanges_on_eof`, `abort_http2_streams_on_eof`, `non_abortive_close`,
+//! `exact_method_tokens` and `verbatim_http2_header_values`. The handler serves a
+//! response source that polls its body events in place, under a head whose values
+//! it inserts with `HttpHeaders::add_verbatim`. The tests run over HTTP/1.1 and h2c
+//! on loopback TCP, on a `RuntimeOwner` worker and a `HostedWorker`.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -140,7 +138,7 @@ impl Drop for PollingResponse {
     }
 }
 
-/// Reads the request head, as the router does, and answers with a streamed 200
+/// Reads the request head, as the router does, and responds with a streamed 200
 /// whose head echoes the request's `x-request-id` and carries `x-padded`, each
 /// inserted with `add_verbatim`, as the router copies `http::HeaderValue` bytes.
 struct PollingHandler(Rc<Script>);
@@ -190,7 +188,7 @@ impl HttpHandler for PollingHandler {
     }
 }
 
-/// The router's server settings, round 8.
+/// The router's server settings.
 fn router_session() -> ServerSessionConfig {
     ServerSessionConfig {
         stream_read_timeout: Duration::ZERO,
@@ -286,9 +284,9 @@ async fn within<Work: Future>(what: &str, work: Work) -> Work::Output {
 
 const HEAD_END: &[u8] = b"\r\n\r\n";
 
-/// A client that half-closes mid-stream (hyper's `half_close(false)` 499 path):
-/// the polling source chain is stopped and dropped within a bound and the client
-/// sees EOF, without the response's last chunk; `read_body_event` is never used.
+/// A client that half-closes mid-stream, as on hyper's `half_close(false)` 499 path.
+/// The polling source chain is stopped and dropped within a bound, and the client
+/// sees EOF without the response's last chunk. `read_body_event` is never used.
 #[test]
 fn router_ingress_eof_mid_stream_drops_the_polling_source_and_ends_with_eof() {
     on_worker(move |context| async move {
@@ -367,7 +365,7 @@ fn router_ingress_body_error_delivers_the_written_body_then_fin() {
     });
 }
 
-/// Reads each request's head, holds the request with its body unread, and answers it with a
+/// Reads each request's head, holds the request with its body unread, and responds with a
 /// bodiless 200 once `respond` is notified.
 struct HoldingHandler {
     held: Rc<RefCell<Vec<HttpSourceHolder>>>,
@@ -432,16 +430,14 @@ fn queue_without_yielding(
     }
 }
 
-/// `DIV-058`: a request body event stops where it would take the unread body past the request
-/// window at `connection_flow_control`, or `read_allocation_size` or more past the pause at
-/// `stream_flow_control`, however large the read's buffers, so the owned and the default HTTP/1.1
-/// drivers pause without overflowing the window at any margin. With 8_000 body bytes unread, one
-/// read gathers a 16_384-byte burst as 1_000, 1_000, 2_000, 4_000, 8_000 and 384 bytes
-/// (`DIV-017`). The first four take the unread body to 16_000 bytes, under the pause at 16_384;
-/// the next event stops in the 8_000-byte buffer at the window or at 17_383 bytes, 999 past the
-/// pause, whichever comes first. With margins of 0, 998 and 999 bytes the session pauses with
-/// exactly 16_384 plus the margin buffered, and once the request is released it answers it and
-/// ends at the client's EOF.
+/// A request body event stops before the unread body passes the request window
+/// (`connection_flow_control`) or reaches `read_allocation_size` past the pause
+/// (`stream_flow_control`), however large the read's buffers. With 8_000 body bytes unread, one
+/// read gathers a 16_384-byte burst in doubling buffers of 1_000, 1_000, 2_000, 4_000, 8_000 and
+/// 384 bytes. The first four take the unread body to 16_000 bytes, under the pause at 16_384. The
+/// next event stops in the 8_000-byte buffer at the window or at 17_383 bytes (999 past the
+/// pause), whichever comes first. So with margins of 0, 998 and 999 bytes, both HTTP/1.1 drivers
+/// pause with exactly 16_384 plus the margin buffered, then respond once the request is released.
 #[test]
 fn http1_request_body_events_stop_within_the_window_and_one_allocation_of_the_pause() {
     for owned_http1 in [true, false] {
@@ -723,8 +719,8 @@ struct Frame {
     payload: Vec<u8>,
 }
 
-/// The whole frames at the start of `wire`, after the server's connection
-/// preface (none: a server sends no preface beyond its SETTINGS frame).
+/// The whole frames at the start of `wire`. A server's connection preface is
+/// just its SETTINGS frame, so the frames start at the first byte.
 fn h2_frames(mut wire: &[u8]) -> Vec<Frame> {
     let mut frames = Vec::new();
     while wire.len() >= 9 {
@@ -772,11 +768,11 @@ fn has_stream_1_headers(wire: &[u8]) -> bool {
         .any(|frame| frame.stream == 1 && frame.kind == 0x1)
 }
 
-/// A client that half-closes an h2c connection mid-stream: a transport EOF
-/// aborts every open stream (`DIV-055`), as hyper's h2 server does, so the
-/// polling source chain is stopped and dropped within a bound and the
-/// connection ends with EOF (`non_abortive_close`), the stream never ended;
-/// `read_body_event` is never used.
+/// A client that half-closes an h2c connection mid-stream. A transport EOF
+/// aborts every open stream, as hyper's h2 server does, so the polling source
+/// chain is stopped and dropped within a bound and the connection ends with EOF
+/// (`non_abortive_close`) without ending the stream. `read_body_event` is never
+/// used.
 #[test]
 fn router_ingress_h2c_eof_mid_stream_drops_the_polling_source_and_ends_with_eof() {
     on_worker(move |context| async move {
@@ -827,10 +823,10 @@ fn router_ingress_h2c_eof_mid_stream_drops_the_polling_source_and_ends_with_eof(
 }
 
 /// Without `abort_http2_streams_on_eof`, a client that half-closes an h2c
-/// connection mid-stream keeps the stream: `abort_exchanges_on_eof` alone
-/// leaves HTTP/2 unchanged (`DIV-053`), so the stream and its polling source
-/// stay open, the rest of the response reaches the client, and the connection
-/// then closes cleanly; `read_body_event` is never used.
+/// connection mid-stream keeps the stream, because `abort_exchanges_on_eof` alone
+/// leaves HTTP/2 unchanged. The stream and its polling source stay open, the rest
+/// of the response reaches the client, and the connection then closes cleanly.
+/// `read_body_event` is never used.
 #[test]
 fn router_ingress_h2c_half_close_mid_stream_keeps_the_stream_without_abort_http2_streams_on_eof() {
     on_worker(move |context| async move {
@@ -890,9 +886,9 @@ fn router_ingress_h2c_half_close_mid_stream_keeps_the_stream_without_abort_http2
     });
 }
 
-/// A response body error after some events on h2c: the stream is reset with
-/// INTERNAL_ERROR, as hyper's h2 server resets it, after every event written,
-/// and the connection stays open (it answers a PING); `read_body_event` is never
+/// A response body error after some events on h2c resets the stream with
+/// INTERNAL_ERROR after every written event, as hyper's h2 server does. The
+/// connection stays open and still responds to a PING. `read_body_event` is never
 /// used.
 #[test]
 fn router_ingress_h2c_body_error_resets_the_stream_and_keeps_the_connection() {

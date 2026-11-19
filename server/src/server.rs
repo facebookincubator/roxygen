@@ -69,7 +69,7 @@ pub use crate::connection::serve_transport;
 
 const DEFAULT_COMMAND_CAPACITY: usize = 1_024;
 const DEFAULT_BACKLOG: i32 = 1_024;
-/// Matches folly `AsyncServerSocket`'s accept backoff.
+/// Pause before accepting again after a persistent accept error such as `EMFILE`.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
@@ -751,7 +751,7 @@ impl HttpServer {
     }
 
     /// Starts a server whose handlers are constructed with their owning worker.
-    /// Existing worker cleanup scopes retire application resources before join.
+    /// Worker cleanup scopes release application resources before the workers are joined.
     pub fn start_with_worker_factory(
         mut config: ServerConfig,
         handler_factory: WorkerHandlerFactory,
@@ -1532,7 +1532,7 @@ async fn worker_loop(
 }
 
 /// Returns how long the acceptor waits before accepting again after `error`,
-/// or `None` to retry at once.
+/// or `None` to retry immediately.
 ///
 /// accept(2) reports some errors of a single pending connection (the peer
 /// aborted, a firewall refused it, a network error was already pending), and

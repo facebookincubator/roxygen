@@ -40,8 +40,8 @@ use roxygen_runtime::panic::discard_panic;
 use roxygen_session::owned::OwnedApplication;
 use roxygen_session::owned::OwnedExchange;
 
-/// As `UniplexSession`, a handler failure becomes an error response that closes the
-/// connection: `408` for a read timeout, `500` otherwise.
+/// Turns a handler failure into an error response that closes the connection, as
+/// `UniplexSession` does: `408` for a read timeout, `500` otherwise.
 fn handler_response(
     result: Result<HttpSourceHolder, HttpError>,
 ) -> Result<HttpSourceHolder, HttpError> {
@@ -90,9 +90,10 @@ impl OwnedApplication for HandlerApplication {
 
 /// A started response body read.
 enum BodyRead {
-    /// A polling source's read (`DIV-039`), polled through the exclusively owned
-    /// holder with the allowance it started with.
+    /// A read from a source that polls its body events in place. It is polled through the
+    /// exclusively owned holder with the allowance it started with.
     InPlace(u32),
+    /// A read through the source's read future, held inline.
     Future(HolderBodyRead),
 }
 
@@ -245,8 +246,8 @@ impl OwnedExchange for HandlerExchange {
                 b"owned body polled before its head",
             )));
         };
-        // A pending read keeps the allowance it started with: while it waits the
-        // driver serializes nothing more for this exchange, so its allowance can
+        // A pending read keeps the allowance it started with. While it waits, the
+        // driver serializes no more output for this exchange, so the allowance can
         // only grow.
         let read = body_read.get_or_insert_with(|| {
             if response.polls_body_events() {
@@ -292,8 +293,8 @@ mod tests {
 
     const AVAILABLE: &[u8] = b"0123456789";
 
-    /// Answers each body read with one `Pending`, then at most `maximum` of
-    /// `AVAILABLE`, through `poll_body_event` when `polling`, else through the
+    /// Returns `Pending` once for each body read, then at most `maximum` bytes of
+    /// `AVAILABLE`, through `poll_body_event` when `polling`, or else through the
     /// read future, which keeps the `maximum` its read started with.
     struct OnePendingBody {
         polling: bool,

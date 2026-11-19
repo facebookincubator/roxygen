@@ -1365,7 +1365,7 @@ pub(crate) fn session_kind_on_worker(
     kind
 }
 
-/// Records its invocation and never answers.
+/// Records its invocation and never responds.
 struct PendingHandler(Rc<std::cell::Cell<bool>>);
 
 impl HttpHandler for PendingHandler {
@@ -1604,7 +1604,7 @@ impl Drop for PendingPanicsOnDrop {
     }
 }
 
-/// Records its invocation and never answers, from a future whose destructor panics.
+/// Records its invocation and never responds, from a future whose destructor panics.
 struct PendingDropPanickingHandler(Rc<std::cell::Cell<bool>>);
 
 impl HttpHandler for PendingDropPanickingHandler {
@@ -1692,7 +1692,7 @@ struct ResponseProgress {
     stopped: std::cell::Cell<bool>,
 }
 
-/// A response source whose header read never finishes and whose `stop_reading` panics.
+/// A response source that never finishes its header read and panics in `stop_reading`.
 struct PendingStopPanicsResponse(Rc<ResponseProgress>);
 
 impl HttpSource for PendingStopPanicsResponse {
@@ -1720,7 +1720,7 @@ impl HttpSource for PendingStopPanicsResponse {
     }
 }
 
-/// Answers with a [`PendingStopPanicsResponse`].
+/// Responds with a [`PendingStopPanicsResponse`].
 struct PendingStopPanicsHandler(Rc<ResponseProgress>);
 
 impl HttpHandler for PendingStopPanicsHandler {
@@ -1833,7 +1833,7 @@ fn owned_http2_dispatches_by_protocol() {
         session_kind_on_worker(CodecProtocol::Http2, untimed_owned(false, true)),
         ServerSessionKind::OwnedHttp2
     );
-    // Each owned flag leaves the other protocol on the managed session.
+    // Each owned flag leaves the other protocol on `UniplexSession`.
     assert_eq!(
         session_kind_on_worker(CodecProtocol::Http11, untimed_owned(false, true)),
         ServerSessionKind::Uniplex
@@ -1904,7 +1904,7 @@ fn owned_http2_attachment_rejects_unsupported_configuration() {
     assert_eq!(owner.join().expect("physical join").workers_forced, 0);
 }
 
-/// `owned_http2` honors `connection_idle_timeout`: an idle HTTP/2 connection gets the drain's
+/// `owned_http2` applies `connection_idle_timeout`: an idle HTTP/2 connection gets the drain's
 /// GOAWAYs and is closed, and the session ends cleanly.
 #[test]
 fn owned_http2_reaps_an_idle_connection() {
@@ -1967,9 +1967,9 @@ fn owned_http2_reaps_an_idle_connection() {
     assert_eq!(owner.join().expect("physical join").workers_forced, 0);
 }
 
-/// `owned_http2` honors `stream_read_timeout`: a handler blocked on a request body that stalls
-/// is answered 408, as in the managed mode, the stream is not reset after it, and the
-/// connection then drains cleanly.
+/// `owned_http2` applies `stream_read_timeout`. When a handler is blocked on a request body
+/// that stalls, the client gets a 408, as under `UniplexSession`. The stream is not reset after
+/// it, and the connection then drains cleanly.
 #[test]
 fn owned_http2_answers_a_stalled_request_body_with_408() {
     let mut owner = RuntimeOwner::start(RuntimeConfig {
@@ -2042,9 +2042,9 @@ fn owned_http2_answers_a_stalled_request_body_with_408() {
     assert_eq!(owner.join().expect("physical join").workers_forced, 0);
 }
 
-/// A handler that catches its request body's read timeout, awaits a cleanup and then answers
-/// with its own 408 keeps that work and that response on `owned_http2`, as in the managed mode
-/// (`UniplexSession` waits for an active handler and keeps a handler's 408).
+/// A handler that catches its request body's read timeout, awaits a cleanup and then responds
+/// with its own 408 keeps that work and that response on `owned_http2`. `UniplexSession` does
+/// the same: it waits for an active handler and keeps the handler's 408.
 #[test]
 fn owned_http2_keeps_a_handlers_own_408_after_its_cleanup_like_the_managed_mode() {
     let mut owner = RuntimeOwner::start(RuntimeConfig {
@@ -2127,7 +2127,7 @@ fn owned_http2_keeps_a_handlers_own_408_after_its_cleanup_like_the_managed_mode(
     );
 }
 
-/// Reads the request body; when a read times out, awaits a 30 ms cleanup and answers with its
+/// Reads the request body; when a read times out, awaits a 30 ms cleanup and responds with its
 /// own 408 carrying the body `late`.
 struct CleanupThen408 {
     cleaned: Rc<std::cell::Cell<bool>>,
@@ -2166,7 +2166,7 @@ impl HttpHandler for CleanupThen408 {
     }
 }
 
-/// Answers every request with a fixed body, after draining it.
+/// Responds to every request with a fixed body, after draining it.
 struct FixedHandler;
 
 impl HttpHandler for FixedHandler {
@@ -2440,7 +2440,7 @@ fn a_served_connection_updates_its_cancellation_listeners_once() {
 }
 
 /// A served HTTP/1.1 connection whose handler dropped its request unread, which stops
-/// the request with `NO_ERROR`, still answers a malformed chunk with the codec's 400 and
+/// the request with `NO_ERROR`, still responds to a malformed chunk with the codec's 400 and
 /// ends.
 #[test]
 fn a_malformed_chunk_after_a_dropped_request_sends_400_and_ends_the_connection() {
@@ -2860,7 +2860,7 @@ fn owned_http2_enforces_configured_rate_limits() {
     assert_eq!(owner.join().expect("physical join").workers_forced, 0);
 }
 
-/// Answers every request with `LargeHandler::BODY` bytes, after draining it.
+/// Responds to every request with `LargeHandler::BODY` bytes, after draining it.
 struct LargeHandler;
 
 impl LargeHandler {
@@ -2892,9 +2892,8 @@ impl HttpHandler for LargeHandler {
     }
 }
 
-/// `owned_http2` honors `write_timeout`: a response blocked on a stream window the client never
-/// reopens is reset with FLOW_CONTROL_ERROR, as Proxygen's write-event timeout resets a
-/// flow-blocked stream, and the connection serves on.
+/// `owned_http2` applies `write_timeout`. A response blocked on a stream window that the client
+/// never reopens is reset with FLOW_CONTROL_ERROR, and the connection keeps serving.
 #[test]
 fn owned_http2_resets_a_flow_blocked_stream_at_its_write_timeout() {
     const WINDOW: usize = 1024;
@@ -3108,7 +3107,7 @@ impl RawH2Peer {
     }
 }
 
-/// Answers each request with `owned-http2` once `release` is notified, after recording that it
+/// Responds to each request with `owned-http2` once `release` is notified, after recording that it
 /// was called.
 struct GatedHandler {
     called: Rc<std::cell::Cell<bool>>,
@@ -3160,7 +3159,7 @@ async fn raw_owned_h2(
     (accepted.control, run, peer)
 }
 
-/// `owned_http2` honors `goaway_timeout`, as `UniplexSession` does: a drain sends GOAWAY(2^31-1)
+/// `owned_http2` applies `goaway_timeout`, as `UniplexSession` does: a drain sends GOAWAY(2^31-1)
 /// and holds the final GOAWAY for the timeout, so a request that races the drain, here one sent
 /// after the first GOAWAY, is served instead of refused. The final GOAWAY covers it.
 #[test]
@@ -3202,9 +3201,9 @@ fn owned_http2_drain_serves_a_request_inside_the_goaway_timeout() {
     });
 }
 
-/// A zero `goaway_timeout` keeps the owned mode's drain as it was: both GOAWAYs at once, then
-/// the connection closes. A connection with every timeout zero arms no timer, through its drain
-/// too.
+/// With a zero `goaway_timeout`, the owned mode's drain sends both GOAWAYs immediately, then the
+/// connection closes. A connection with every timeout zero does not arm a timer, even during its
+/// drain.
 #[test]
 fn owned_http2_zero_goaway_timeout_sends_both_goaways_at_once() {
     on_worker(|context, _runtime| async move {
@@ -3235,9 +3234,10 @@ fn owned_http2_zero_goaway_timeout_sends_both_goaways_at_once() {
     });
 }
 
-/// The default `goaway_timeout`, `UniplexSession`'s second, now applies to `owned_http2`. It arms
-/// nothing until a drain, so a connection with every other timeout zero serves requests without
-/// a timer; the drain arms the one GOAWAY slot, and the final GOAWAY follows the default timeout.
+/// `owned_http2` applies the default `goaway_timeout` of one second, as `UniplexSession` does. It
+/// does not arm a timer until a drain, so a connection with every other timeout zero serves
+/// requests without a timer. The drain arms the one GOAWAY slot, and the final GOAWAY follows
+/// the default timeout.
 #[test]
 fn owned_http2_default_goaway_timeout_arms_no_timer_until_a_drain() {
     on_worker(|context, _runtime| async move {
@@ -3277,7 +3277,7 @@ fn owned_http2_default_goaway_timeout_arms_no_timer_until_a_drain() {
 }
 
 /// A stream active when a drain starts outlives both GOAWAYs of a nonzero `goaway_timeout` and
-/// is answered; the connection closes after it.
+/// gets its response. The connection closes after it.
 #[test]
 fn owned_http2_drain_completes_an_active_stream_after_the_goaway_timeout() {
     const GRACE: Duration = Duration::from_millis(300);
@@ -3333,9 +3333,8 @@ fn owned_http2_drain_completes_an_active_stream_after_the_goaway_timeout() {
     });
 }
 
-/// A header-rate breach's one final GOAWAY (`DIV-052`) is not held for `goaway_timeout`: the
-/// breach drains at once with no GOAWAY(2^31-1), and the connection closes long before the
-/// timeout.
+/// A header-rate breach's single final GOAWAY is not held for `goaway_timeout`. The breach
+/// drains immediately without GOAWAY(2^31-1), and the connection closes long before the timeout.
 #[test]
 fn owned_http2_header_rate_breach_skips_the_goaway_timeout() {
     on_worker(|context, _runtime| async move {

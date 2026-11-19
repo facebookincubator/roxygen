@@ -5,10 +5,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! HTTP/1.1 egress batching (`DIV-034`): an HTTP/1.1 server
-//! session writes a response head with the body ready with it, body events that
-//! are ready together, and a streamed response's last data with its end, in one
-//! write each, as hyper's server coalesces them; the bytes are unchanged.
+//! HTTP/1.1 egress batching. An HTTP/1.1 server session writes a response head
+//! with the body that is ready with it, body events that are ready together,
+//! and a streamed response's last data with its end, in one write each, as
+//! hyper's server coalesces them. The bytes are unchanged.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -288,8 +288,8 @@ impl HttpHandler for ScriptedHandler {
 }
 
 /// Serves one loopback connection with `serve_transport` on this worker and
-/// answers one GET with `handler`'s response; returns the server's writes and
-/// the bytes the client read up to `response_end`.
+/// responds to one GET with `handler`'s response. Returns the server's writes
+/// and the bytes the client read up to `response_end`.
 async fn serve_one(
     context: WorkerContext,
     handler: ScriptedHandler,
@@ -668,9 +668,9 @@ fn token_allocations_per_event() -> usize {
     (long - short) / 200
 }
 
-/// Batching tries the next event without waiting while bytes are queued; for a
-/// token stream that attempt finds the source pending before each flush, and
-/// must not cost an allocation per event.
+/// Batching tries the next event without waiting while bytes are queued. For a
+/// token stream the source is pending at that attempt before each flush, and
+/// the attempt must not cost an allocation per event.
 #[test]
 #[cfg_attr(
     fbcode_build,
@@ -817,10 +817,10 @@ pub(crate) struct FedTokens {
 const TOKEN_CHUNK: usize = 22;
 
 /// Serves one response of `events` fed tokens from `source` with `session`'s
-/// settings on a `HostedWorker`, whose thread also runs the client, which
-/// pushes each token once it has read the previous one, and then the end:
-/// every token arrives after the session flushed the previous one, as tokens
-/// paced by an engine do.
+/// settings on a `HostedWorker`. The worker thread also runs the client, which
+/// pushes each token after it has read the previous one, and finally the end.
+/// So every token arrives after the session has flushed the previous one, as
+/// in a paced token stream.
 pub(crate) fn serve_fed_tokens(
     events: usize,
     session: ServerSessionConfig,

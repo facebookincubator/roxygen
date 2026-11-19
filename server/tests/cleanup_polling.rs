@@ -46,7 +46,7 @@ use crate::server::WorkerPollStats;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Reads each request to its end and answers `200 OK`.
+/// Reads each request to its end and responds with `200 OK`.
 struct OkHandler;
 
 impl HttpHandler for OkHandler {
@@ -212,7 +212,7 @@ fn read_to_eof(stream: &mut TcpStream) -> Vec<u8> {
     rest
 }
 
-/// The roles of the sessions that one worker serves at once.
+/// The roles of the sessions that one worker serves concurrently.
 const KEEP_ALIVE: usize = 0;
 const IDLE: std::ops::RangeInclusive<usize> = 1..=8;
 const TIMED_OUT: usize = 9;
@@ -448,7 +448,8 @@ fn woken_worker_resources_drop_before_thread_stop_callback() {
     );
 }
 
-/// Answers `/gated` only once released; answers every other request at once.
+/// Responds to `/gated` only once released, and to every other request
+/// immediately.
 struct GatedHandler {
     started: mpsc::SyncSender<()>,
     release: Arc<tokio::sync::Notify>,

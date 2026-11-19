@@ -601,9 +601,11 @@ impl H1IngressBound {
         let maximum = (session.stream_flow_control as usize)
             .min(session.byte_stream_limits.maximum_read_size());
         let allocation = session.read_allocation_size.min(maximum);
-        // `DIV-017`: a TCP read's largest buffer is its first offer or at most half the read.
+        // Read continuations double their buffer, so a TCP read's largest buffer is its first
+        // offer or at most half the read.
         let segment = i64::try_from(allocation.max(maximum / 2))?;
-        // `DIV-058`: the body event that crosses F carries it less than one allocation past.
+        // The body event that crosses the pause at F (`stream_flow_control`) carries the
+        // unread body less than one allocation past F.
         let ceiling = flow
             .checked_add(i64::try_from(allocation)?)
             .and_then(|sum| sum.checked_sub(1))
