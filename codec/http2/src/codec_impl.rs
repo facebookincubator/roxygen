@@ -2408,6 +2408,16 @@ impl HttpCodec for Http2Codec {
                         );
                         break;
                     }
+                    if header.frame_type == FrameType::DATA && self.header_block.is_some() {
+                        self.connection_error(
+                            H2ErrorCode::PROTOCOL_ERROR,
+                            b"expected CONTINUATION for the active header block",
+                            callback,
+                            callback_egress,
+                            &mut result,
+                        );
+                        break;
+                    }
                     self.ingress_state = if header.frame_type == FrameType::DATA {
                         IngressState::Data(DataState {
                             header,

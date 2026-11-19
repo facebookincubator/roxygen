@@ -3485,6 +3485,34 @@ fn missing_continuation() {
 }
 
 #[test]
+fn missing_continuation_data_frame() {
+    let encoded = HpackCodec::new().encode(&request_fields(b"/"));
+    let mut output = BufQueue::new(1024);
+    frame::write_headers(&mut output, queue(&encoded[..1]), 1, None, false, false).unwrap();
+    frame::write_data(&mut output, queue(b"abc"), 1, None, false, false).unwrap();
+    let wire = bytes(&output);
+    let (codec, trace, _) = run_downstream_wire(&wire);
+    assert!(!codec.is_reusable());
+    assert!(
+        !trace
+            .events
+            .iter()
+            .any(|event| matches!(event, Seen::Begin(_) | Seen::Body(..) | Seen::Complete(_)))
+    );
+    assert_eq!(
+        trace
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                Seen::Error(0, Some(H2ErrorCode::PROTOCOL_ERROR), _, false)
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn missing_continuation_bad_frame() {
     let encoded = HpackCodec::new().encode(&request_fields(b"/big"));
     let mut output = BufQueue::new(1024);
