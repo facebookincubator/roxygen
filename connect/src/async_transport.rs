@@ -7,10 +7,9 @@
 
 //! `HttpConnectAsyncTransport`, the Tokio adapter over a CONNECT stream.
 //!
-//! Folly read and write callbacks become poll readiness (`DIV-012`): one body
-//! read is stored across `poll_read` calls, and a write that closes the egress
-//! window holds back the next write, flush, or shutdown until its bytes are
-//! processed.
+//! One body read is stored across `poll_read` calls. A write that closes the
+//! egress window holds back the next write, flush, or shutdown until its
+//! bytes are processed.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -46,8 +45,8 @@ use tokio::io::ReadBuf;
 
 use crate::stream::HttpConnectStream;
 
-/// A tokio `AsyncRead` and `AsyncWrite` over a CONNECT tunnel
-/// (`HTTPConnectAsyncTransport`). It is owner-local and `!Send`.
+/// A tokio `AsyncRead` and `AsyncWrite` over a CONNECT tunnel. It is
+/// owner-local and `!Send`.
 pub struct HttpConnectAsyncTransport {
     stream: HttpConnectStream,
     writes: Rc<WriteState>,
@@ -69,19 +68,18 @@ struct Remainder {
     eom: bool,
 }
 
-/// The outstanding window-closing write (`writeCallbacks_`), at most one.
+/// The outstanding write that closed the egress window. There is at most one.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum DeferredWrite {
     #[default]
     None,
-    /// Completes once `bytesProcessed` reaches `end`.
+    /// Completes once the processed egress offset reaches `end`.
     Pending { end: u64 },
-    /// `errorWrites` failed it; the next writer poll reports the failure.
+    /// Failed by `error_writes`. The next writer poll returns the error.
     Failed,
 }
 
-/// The write side that the egress source's callbacks reach
-/// (`bytesProcessed`, `sourceComplete`).
+/// Write-side state that the egress source's callbacks update.
 #[derive(Default)]
 struct WriteState {
     flushed_offset: Cell<u64>,
@@ -97,14 +95,15 @@ impl WriteState {
         }
     }
 
-    /// `errorWrites`.
+    /// Fails the deferred write, if any, and wakes its writer.
     fn error_writes(&self) {
         if let Some(waker) = self.fail_deferred() {
             waker.wake();
         }
     }
 
-    /// `errorWrites` that returns the parked writer's waker instead of waking it.
+    /// Like `error_writes`, but returns the parked writer's waker instead of
+    /// waking it.
     fn fail_deferred(&self) -> Option<Waker> {
         if !self.is_pending() {
             return None;
@@ -223,7 +222,7 @@ impl HttpConnectAsyncTransport {
         self.stream.peer_address()
     }
 
-    /// `shutdownRead`: ends reads with EOF and stops the CONNECT response source.
+    /// Ends reads with EOF and stops the CONNECT response source.
     pub fn shutdown_read(&mut self) {
         drop(self.read.stored.take());
         self.read.remainder = None;
@@ -234,8 +233,9 @@ impl HttpConnectAsyncTransport {
         }
     }
 
-    /// `shutdownWriteNow`: without a deferred write this is `shutdownWrite`;
-    /// otherwise it fails the deferred write and aborts the egress.
+    /// Ends the write side immediately. Without a deferred write it sends EOM
+    /// if the stream is writable. Otherwise it fails the deferred write and
+    /// aborts the egress with `CANCEL`.
     pub fn shutdown_write_now(&mut self) {
         if !self.writes.is_pending() {
             self.shutdown_write();
@@ -245,13 +245,15 @@ impl HttpConnectAsyncTransport {
         self.stream.egress_abort(HttpErrorCode::CANCEL);
     }
 
-    /// `close`: `shutdownWrite`, then `shutdownRead`.
+    /// Sends EOM if the stream is writable, then calls
+    /// [`shutdown_read`](Self::shutdown_read).
     pub fn close(&mut self) {
         self.shutdown_write();
         self.shutdown_read();
     }
 
-    /// `closeNow`: `shutdownWriteNow`, then `shutdownRead`.
+    /// Calls [`shutdown_write_now`](Self::shutdown_write_now), then
+    /// [`shutdown_read`](Self::shutdown_read).
     pub fn close_now(&mut self) {
         self.shutdown_write_now();
         self.shutdown_read();
@@ -263,12 +265,12 @@ impl HttpConnectAsyncTransport {
         }
     }
 
-    /// The proposed `closeWithReset` that resets after egress EOM (`DIV-023`).
-    /// Reads keep a source error that arrived first, such as a proxy reset
-    /// that no read reported yet. Deferred writes fail before the reset
-    /// discards the egress bytes that would otherwise complete them. The
-    /// parked reader, then the parked writer, wake after the reset; the first
-    /// panic of the reset or a wake resumes last.
+    /// Resets the stream with `CANCEL`, even after egress EOM. Reads keep a
+    /// source error that arrived first, such as a proxy reset that a read has
+    /// not reported yet. Deferred writes fail before the reset discards the
+    /// egress bytes that would otherwise complete them. After the reset, the
+    /// parked reader wakes, then the parked writer. The first panic from the
+    /// reset or a wake resumes at the end.
     pub(crate) fn abort_with_reset(&mut self) {
         drop(self.read.stored.take());
         self.read.remainder = None;
@@ -297,7 +299,8 @@ impl HttpConnectAsyncTransport {
         }
     }
 
-    /// `writeChain` for one submission.
+    /// Submits one write. A write that closes the egress window becomes the
+    /// deferred write.
     fn poll_submit(
         &mut self,
         context: &mut Context<'_>,
@@ -328,7 +331,8 @@ impl HttpConnectAsyncTransport {
         Poll::Ready(Ok(length))
     }
 
-    /// `read()` for one `poll_read` (HTTPConnectAsyncTransport.cpp:58-119).
+    /// Polls the stored body read, starting one if needed, and copies its
+    /// bytes into `buf`. Bytes that do not fit become the remainder.
     fn poll_read_body(
         &mut self,
         context: &mut Context<'_>,
@@ -375,7 +379,7 @@ impl HttpConnectAsyncTransport {
                     }
                     return Poll::Ready(Ok(()));
                 }
-                // Only BODY is allowed in CONNECT; other events, including the
+                // CONNECT allows only body events. Other events, including the
                 // suspend that precedes the first wait, are ignored.
                 _ if eom => {
                     self.read.eof = true;
@@ -450,7 +454,7 @@ impl AsyncWrite for HttpConnectAsyncTransport {
         self.writes.poll_deferred(context)
     }
 
-    /// `shutdownWrite`: sends EOM at once, then waits for a deferred write.
+    /// Sends EOM immediately, then waits for the deferred write, if any.
     fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         this.shutdown_write();

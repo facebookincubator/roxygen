@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Frozen `HTTPConnectTransportTest` cases and oracles for `HttpConnectTransport`.
+//! Tests for `HttpConnectTransport`.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -133,13 +133,12 @@ const SMALL_EGRESS_BUFFER: u32 = 4096;
 /// egress window stays closed until the proxy reads.
 const STALL: usize = 2 * PROXY_WINDOW + 4 * SMALL_EGRESS_BUFFER as usize;
 const READ_TIMEOUT: Duration = Duration::from_millis(50);
-/// How long an oracle waits to show that something does not happen.
+/// How long a test waits to show that something does not happen.
 const QUIET: Duration = Duration::from_millis(200);
 
 type ReadFuture = LocalTransportFuture<Result<TransportRead, HttpError>>;
 type WriteFuture = LocalTransportFuture<Result<WriteInfo, TransportWriteError>>;
 
-// ---------------------------------------------------------------------------
 // Transport calls.
 
 fn read_with(
@@ -160,8 +159,7 @@ fn read_with(
     )
 }
 
-/// `read(MutableByteRange, timeout)`: the range's size is both the maximum and
-/// the allocation size.
+/// A read whose maximum is also its allocation size.
 fn read(
     transport: &HttpConnectTransport,
     context: &WorkerContext,
@@ -203,7 +201,7 @@ fn write(
     )
 }
 
-/// `readAll` (HTTPConnectTransportTest.cpp:24-37).
+/// Reads until `length` bytes have arrived.
 async fn read_all(
     transport: &HttpConnectTransport,
     context: &WorkerContext,
@@ -277,9 +275,8 @@ fn assert_written(result: Result<WriteInfo, TransportWriteError>, length: usize)
     assert_eq!(info.bytes_written, length);
 }
 
-/// The ingress `HttpError` of a `TRANSPORT_READ_ERROR`
-/// (`AsyncSocketException::INTERNAL_ERROR` around `describe()`,
-/// HTTPConnectTransport.cpp:52-57).
+/// The ingress `HttpError` that a `TRANSPORT_READ_ERROR` wraps. The outer
+/// message is the cause's `describe()`.
 fn read_error_cause(result: Result<TransportRead, HttpError>) -> HttpError {
     let error = result.expect_err("the read fails with the ingress error");
     assert_eq!(
@@ -311,7 +308,6 @@ fn assert_read_timeout(result: Result<TransportRead, HttpError>) {
     assert_eq!(error.message(), b"Timed out waiting for body event");
 }
 
-// ---------------------------------------------------------------------------
 // Polling helpers.
 
 /// Polls `future` once with the current task's waker.
@@ -423,7 +419,7 @@ thread_local! {
     static ON_DROP: Hook = const { RefCell::new(None) };
 }
 
-/// A waker that owns nothing. On the worker, its first wake after
+/// A waker with a null data pointer. On the worker, its first wake after
 /// `on_next_wake`, its first clone after `on_next_clone`, and its first drop
 /// after `on_next_drop` run the caller code those installed, as waking,
 /// cloning, or releasing a waker can run caller code inline.
@@ -562,7 +558,6 @@ fn cancel_from_another_thread(cancel: &Arc<CancellationSource>) {
     .expect("cancelling thread");
 }
 
-// ---------------------------------------------------------------------------
 // Client-side observers.
 
 /// Counts tunnel bytes that a client session buffered and consumed for a
@@ -662,10 +657,9 @@ impl Observed {
     }
 }
 
-// ---------------------------------------------------------------------------
 // `ConnectHandler` proxy tunnels.
 
-/// `HTTPConnectTransportTest::connect()` on a new proxy session.
+/// Opens a new proxy session and a unique CONNECT tunnel on it.
 async fn connect(
     context: &WorkerContext,
     proxy: &H2cProxy,
@@ -690,7 +684,7 @@ async fn connect(
     (session, HttpConnectTransport::new(context, stream))
 }
 
-/// `HTTPConnectTransportTest::connect(session)`: a shared CONNECT.
+/// Opens a shared CONNECT tunnel on `session`.
 async fn connect_shared(
     context: &WorkerContext,
     session: &ClientSession,
@@ -721,7 +715,6 @@ fn current_resp_source(proxy: &H2cProxy) -> HttpStreamSourceProducer {
         .expect("a live tunnel")
 }
 
-// ---------------------------------------------------------------------------
 // Test-driven proxy tunnels.
 
 /// The proxy side of one CONNECT stream, driven by the test.
@@ -789,7 +782,7 @@ impl ProxyTunnel {
         received
     }
 
-    /// Asserts that nothing arrives within `QUIET`.
+    /// Asserts that the tunnel stays quiet for `QUIET`.
     async fn assert_quiet(&self) {
         let next = tokio::time::timeout(QUIET, self.next()).await;
         assert!(next.is_err(), "nothing reaches the proxy: {next:?}");
@@ -999,7 +992,6 @@ async fn stall(transport: &HttpConnectTransport, context: &WorkerContext) -> Vec
     stalled
 }
 
-// ---------------------------------------------------------------------------
 // A `ConnectSession` that keeps the egress holder.
 
 /// Keeps the tunnel's egress request holder for the test, which reads it in
@@ -1074,7 +1066,8 @@ impl ConnectSession for CapturingSession {
 }
 
 /// A tunnel whose egress holder the test reads. Without `response`, the proxy
-/// accepts the CONNECT; with it, `response` answers in place of the proxy.
+/// accepts the CONNECT. With it, `response` stands in for the proxy's
+/// response.
 async fn captured_transport(
     context: &WorkerContext,
     proxy: &TunnelProxy,
@@ -1342,8 +1335,9 @@ impl SourceStep {
     }
 }
 
-/// One `stop_reading` with no error and no live body read, or none when the
-/// body read's event at `step` ended the source.
+/// Asserts that the source stopped once, without an error and after its body
+/// reads dropped. If the body read's event at `step` ended the source, asserts
+/// that it never stopped.
 fn assert_stopped_once(
     step: SourceStep,
     stops: &RefCell<Vec<Option<HttpErrorCode>>>,
@@ -1368,8 +1362,9 @@ fn assert_stopped_once(
     );
 }
 
-/// What a read whose step found Drop returns: what its body read gave at
-/// `step`, or else `CORO_CANCELLED`.
+/// Asserts the result of a read after caller code at `step` dropped the
+/// handle. The read returns what its body read gave at `step`, or else
+/// `CORO_CANCELLED`.
 fn assert_body_read_result(step: SourceStep, result: Result<TransportRead, HttpError>) {
     match step {
         SourceStep::BodyReadDataReady => assert_data(result, BODY_READ_DATA),
@@ -1383,12 +1378,11 @@ fn assert_body_read_result(step: SourceStep, result: Result<TransportRead, HttpE
     }
 }
 
-/// A caller-provided CONNECT response source with a 200 head, as a caller's
-/// `ConnectSession` can supply. It runs `caller_code` at `step`, which the
-/// CONNECT itself also reaches for `set_read_timeout` and
-/// `ingress_completion`, and `drop_code`, if any, as each body read drops. It
-/// records each `stop_reading`, with how many of its body reads were not yet
-/// dropped then.
+/// A CONNECT response source with a 200 head, as a caller's `ConnectSession`
+/// can supply. It runs `caller_code` at `step`, including when the CONNECT
+/// itself calls `set_read_timeout` or `ingress_completion`. It runs
+/// `drop_code`, if any, as each body read drops. It records each
+/// `stop_reading` call and how many body reads were still live at that point.
 struct CallerSource {
     step: SourceStep,
     caller_code: Rc<dyn Fn()>,
@@ -1637,8 +1631,7 @@ impl ScriptedResponse {
     }
 
     /// Queues a body event with EOM, then one more body event, which the
-    /// source rejects with `INVALID_STATE_TRANSITION`
-    /// (HTTPStreamSource.h:224-242).
+    /// source rejects with `INVALID_STATE_TRANSITION`.
     fn error_after_eom(&self) {
         self.producer.body(queue(b"last"), 0, true);
         self.producer.body(queue(b"extra"), 0, false);
@@ -1653,7 +1646,6 @@ impl ScriptedResponse {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Scripted HTTP/1.1 proxies.
 
 const H1_CONNECTED: &[u8] =
@@ -1736,7 +1728,7 @@ async fn h1_tunnel(
 }
 
 /// An HTTP/1.1 `ClientSession` over an in-memory duplex whose peer the test
-/// scripts, in place of `TestCoroTransport`.
+/// scripts.
 fn duplex_h1_session(
     context: &WorkerContext,
     session: SessionParams,
@@ -1757,7 +1749,6 @@ fn duplex_h1_session(
     (session, scripted)
 }
 
-// ---------------------------------------------------------------------------
 // A scripted h2c proxy that reads and writes HTTP/2 frames.
 
 const FRAME_DATA: u8 = 0x0;
@@ -1839,8 +1830,8 @@ async fn h2c_accept_connect(socket: &mut TcpStream, settings: &[(u16, u32)]) -> 
     }
 }
 
-/// Answers the CONNECT with `status`: a literal `:status` field whose name is
-/// HPACK static-table entry 8.
+/// Responds to the CONNECT with `status`, sent as a literal `:status` field
+/// whose name is HPACK static-table entry 8.
 async fn h2c_respond(socket: &mut TcpStream, stream: u32, status: u16) {
     let status = status.to_string();
     let mut block = vec![0x08, u8::try_from(status.len()).expect("status length")];
@@ -1884,7 +1875,7 @@ impl RawH2cProxy {
         Self { listener, address }
     }
 
-    /// A `connect_unique` tunnel that the socket answered with `status`.
+    /// A `connect_unique` tunnel to which the socket responds with `status`.
     async fn tunnel(
         &self,
         context: &WorkerContext,
@@ -1941,7 +1932,7 @@ impl HttpByteEventCallback for CancelledByteEvents {
 }
 
 /// Forwards to a tunnel's transport and records each read an inner session
-/// makes: the maximum and allocation size it asks for, and the bytes and EOF
+/// makes: the maximum and allocation size it requests, and the bytes and EOF
 /// it gets.
 struct RecordingTransport {
     inner: Rc<HttpConnectTransport>,
@@ -2037,8 +2028,7 @@ impl ByteStreamTransport for RecordingTransport {
     }
 }
 
-// ---------------------------------------------------------------------------
-// group-134: the frozen cases.
+// Basic tunnel cases.
 
 #[test]
 fn connect_success_reports_x_connected_to_peer() {
@@ -2268,7 +2258,7 @@ fn h1_scripted_connect_response_with_eom() {
                 transport.shutdown_write(&context).expect("shutdown_write");
             };
             let scripted = async {
-                // `observer.requestWritten`.
+                // Wait for the CONNECT request.
                 read_h1_head(&mut peer).await;
                 peer.write_all(
                     b"HTTP/1.1 200 Connection Established\r\nX-Connected-To: 1.2.3.4\r\n\r\n",
@@ -2312,7 +2302,7 @@ fn read_write_fills_h2_window() {
                 read_all(&transport, &context, BUFFER_SIZE, Duration::ZERO).await,
                 sent
             );
-            // A read with 0 length returns at once, without EOF.
+            // A read with 0 length returns immediately, without EOF.
             let empty = read(&transport, &context, 0, Duration::ZERO)
                 .await
                 .expect("zero-length read");
@@ -2343,7 +2333,7 @@ fn read_with_allocation_size_then_double_eof() {
                 write(&transport, &context, &sent, Duration::from_millis(100)).await,
                 BUFFER_SIZE,
             );
-            // `read(rcvBuf, 1000, 1000, 0ms)`: one read buffer of 1_000 bytes.
+            // Each read allocates 1_000 bytes, so it returns at most 1_000.
             let mut received = Vec::new();
             while received.len() < BUFFER_SIZE {
                 let read = read_with(
@@ -2395,7 +2385,7 @@ fn read_cancelled() {
                 EGRESS_BUFFER_SIZE,
             )
             .await;
-            // `collectAll` runs `requestCancellation` before the read starts.
+            // The token is cancelled before the read starts.
             let cancel = cancelled_source();
             for _ in 0..2 {
                 assert_cancelled(
@@ -2430,7 +2420,7 @@ fn read_timeout_is_read_timeout() {
             )
             .await;
             assert_read_timeout(read(&transport, &context, 1024, READ_TIMEOUT).await);
-            // The tunnel stays readable (ERR-002).
+            // The tunnel stays readable after a read timeout.
             assert_written(
                 write(&transport, &context, b"ping", Duration::ZERO).await,
                 4,
@@ -2463,7 +2453,7 @@ fn queued_event_survives_read_timeout() {
                 write(&transport, &context, &sent, Duration::ZERO).await,
                 1024,
             );
-            // Stands in for MockHTTPSessionStats: the echo is buffered.
+            // Wait until the session has buffered the echo.
             observed.buffered(1024).await;
             let read = read(&transport, &context, 1024, READ_TIMEOUT)
                 .await
@@ -2506,8 +2496,8 @@ fn peer_abort_fails_read() {
                 .take()
                 .expect("a live tunnel");
             response.abort(HttpErrorCode::CANCEL, b"");
-            // Frozen's 50 ms read can time out under load before the abort
-            // reaches the client.
+            // A 50 ms read can time out under load before the abort reaches
+            // the client, so this read waits longer.
             let cause = read_error_cause(read(&transport, &context, 1024, WAIT_DEADLINE).await);
             assert_eq!(cause.code(), HttpErrorCode::CANCEL, "{cause:?}");
             drop(transport);
@@ -2574,7 +2564,7 @@ fn write_cancelled() {
     run_on_worker(|context| {
         Box::pin(async move {
             let proxy = H2cProxy::start().await;
-            // Reduce the send buffer so the write would not complete at once.
+            // Reduce the send buffer so the write cannot complete immediately.
             let (session, transport) = connect(
                 &context,
                 &proxy,
@@ -2583,7 +2573,7 @@ fn write_cancelled() {
             )
             .await;
             let sent = vec![b'a'; 65_536];
-            // `collectAll` runs `requestCancellation` before the write starts.
+            // The token is cancelled before the write starts.
             let cancel = cancelled_source();
             for _ in 0..2 {
                 assert_write_cancelled(
@@ -2779,9 +2769,7 @@ fn blocked_write_times_out() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// group-135: oracles for frozen behavior that no frozen test covers
-// (expectation-319).
+// Edge cases of reads, writes, and teardown.
 
 #[test]
 fn endpoints_are_the_proxy_hop_including_unix_domain() {
@@ -3032,9 +3020,8 @@ fn cancelling_the_read_that_started_the_body_read_ends_ingress() {
             drop(session);
 
             // A sampled cancellation wins over a `close` that released the
-            // body read, in either order before the next poll, as frozen's
-            // cancellation removes the `bodyEvents_` waiter before the close's
-            // error is enqueued; that error goes to the next read.
+            // body read, in either order before the next poll. The close's
+            // error goes to the next read.
             for cancel_first in [true, false] {
                 let (session, transport, _tunnel) = tunnel_transport(
                     &context,
@@ -3184,7 +3171,8 @@ fn read_and_write_entry_checks_run_at_first_poll() {
             drop(transport);
             drop(session);
 
-            // A shutdown_write before the first poll finds no write in progress.
+            // A shutdown_write before the first poll runs with no write in
+            // progress.
             let (session, transport, tunnel) = tunnel_transport(
                 &context,
                 &proxy,
@@ -3208,8 +3196,8 @@ fn read_and_write_entry_checks_run_at_first_poll() {
             drop(transport);
             drop(session);
 
-            // A read whose token was cancelled before its first poll starts
-            // no body read.
+            // A read whose token was cancelled before its first poll does not
+            // start a body read.
             let (session, transport, tunnel) = tunnel_transport(
                 &context,
                 &proxy,
@@ -3236,10 +3224,10 @@ fn read_and_write_entry_checks_run_at_first_poll() {
             drop(transport);
             drop(session);
 
-            // The worker check, which has no frozen counterpart, is the one
-            // check that runs at the call. A call from another worker's
-            // context fails and changes nothing, and a read or write built
-            // there fails with it even when first polled after Drop.
+            // The worker check is the one check that runs at the call. A call
+            // from another worker's context fails without side effects, and a
+            // read or write built there fails the same way even when first
+            // polled after Drop.
             let wrong = second_worker_context().await;
             let (session, transport, tunnel) = tunnel_transport(
                 &context,
@@ -3417,8 +3405,8 @@ fn cancelled_parked_write_poisons_later_writes() {
             drop(session);
 
             // A pre-cancelled write and an uncancelled dropped parked write
-            // leave the baton unchanged; a cancelled one that is dropped
-            // poisons it.
+            // leave the baton unchanged. A cancelled parked write that is
+            // dropped poisons it.
             let (session, transport, tunnel) = tunnel_transport(
                 &context,
                 &proxy,
@@ -3623,10 +3611,9 @@ fn parked_write_carries_pending_eom() {
 
             // The resumed write's producer call wakes the egress consumer
             // inline, and that consumer's waker can end the egress through the
-            // live handle. The write carries the pending EOM as frozen's one
-            // `body(buf, 0, pendingEOM_)` does, so that call finds the egress
-            // ended: the egress gets the write's bytes and one EOM, and neither
-            // a second EOM nor an abort.
+            // live handle. The write carries the pending EOM in that call, so
+            // the inline call treats the egress as ended. The egress gets the
+            // write's bytes and one EOM, without a second EOM or an abort.
             let proxy = TunnelProxy::start().await;
             for call in [
                 SideCall::ShutdownWrite,
@@ -3698,10 +3685,10 @@ fn parked_write_carries_pending_eom() {
                 );
             }
 
-            // A write with no pending EOM leaves the EOM unseen in its producer
-            // call, as frozen `body(buf, 0, false)` does, so a `shutdown_write`
-            // or `close` that the egress consumer's waker makes there sends the
-            // EOM, and a `close_with_reset` aborts the egress.
+            // Without a pending EOM, the write's producer call does not carry
+            // an EOM. A `shutdown_write` or `close` that the egress consumer's
+            // waker makes there sends the EOM, and a `close_with_reset` aborts
+            // the egress.
             for call in [
                 SideCall::ShutdownWrite,
                 SideCall::Close,
@@ -3946,8 +3933,8 @@ fn close_with_reset_with_parked_read_and_write() {
             let cause = read_error_cause(parked_read.await);
             assert_cause(&cause, HttpErrorCode::NO_ERROR, b"Abandoned reading");
             assert_eof(read(&transport, &context, 1024, Duration::ZERO).await);
-            // No egress read completed the aborted source, so the resumed
-            // write's bytes are rejected and it reports success.
+            // An egress read has not completed the aborted source, so the
+            // resumed write's bytes are rejected and it reports success.
             assert_written(parked_write.await, 4);
             assert_write_error(
                 write(&transport, &context, b"later", Duration::ZERO).await,
@@ -3982,7 +3969,7 @@ fn producer_calls_reenter_window_open_without_panic() {
                 write(&transport, &context, b"abcd", Duration::ZERO).await,
                 4,
             );
-            // The EOM finds the body short and credits the queued bytes, which
+            // The body is short at the EOM, which credits the queued bytes and
             // runs `window_open` inside `shutdown_write`.
             transport.shutdown_write(&context).expect("shutdown_write");
             assert_eq!(
@@ -4121,18 +4108,15 @@ fn producer_calls_reenter_window_open_without_panic() {
                 drop(transport);
             }
 
-            // A caller-provided response source can close the transport inside
-            // the calls by which a read starts a body read, or inside the poll
-            // of that body read. After a start, or a poll that stays pending,
-            // the close then releases that body read and stops the source, so
-            // the read fails as a read parked on a stored read that a close
-            // released. A poll that gives an event keeps it, as Proxygen's
-            // finished body read enqueues its event after `stopReading`: the
-            // read releases the body read, applies the close, and returns the
-            // data, EOF for an EOM, or the error, or else finds nothing left
-            // to read and returns EOF. An EOM or an error ends the source,
-            // which its holder retires with no stop. A `Suspend` event's close
-            // as it drops comes after that stop.
+            // A caller-provided response source can close the transport while
+            // a read starts a body read or polls it. After a start, or a poll
+            // that leaves the body read pending, the close releases the body
+            // read and stops the source, and the read fails as if a close had
+            // released its stored read. If the poll gives an event, the read
+            // releases the body read, applies the close, and returns the data,
+            // the error, or EOF. An EOM or an error ends the source, so its
+            // holder retires it without a stop. A `Suspend` event's resume
+            // future closes again as it drops, after the stop.
             for step in [
                 SourceStep::SetReadTimeout,
                 SourceStep::ReadBodyEvent,
@@ -4253,9 +4237,9 @@ fn producer_calls_reenter_window_open_without_panic() {
             // runs it as it drops: when a cancelled starting read is polled
             // again or dropped, when the test's own close of a parked read
             // releases it (the same call twice), and when a read drops the
-            // body read that gave it data. The release keeps the source on
-            // loan, so the call takes effect once the release returns, and
-            // the source stops once, with no body read live. After a
+            // body read that gave it data. The release marks the source
+            // `Lent`, so the call takes effect once the release returns, and
+            // the source stops once, after the body read has dropped. After a
             // cancellation, that stop is the cancellation's own.
             for call in [SideCall::Close, SideCall::CloseWithReset] {
                 for release in [
@@ -4358,7 +4342,7 @@ fn producer_calls_reenter_window_open_without_panic() {
 
             // The session's own source releases the waker its body read saved
             // while it borrows its event baton's state. The same calls made in
-            // that release give the same results, with no panic.
+            // that release give the same results, without a panic.
             for call in [SideCall::Close, SideCall::CloseWithReset] {
                 for release in [
                     StoredReadRelease::CancelledStartingReadPolled,
@@ -4638,9 +4622,9 @@ fn repeated_window_cycles_complete_every_write_with_a_concurrent_reader() {
             drop(transport);
             drop(egress);
 
-            // A window that opens while no write is in progress leaves the
+            // A window that opens while a write is not in progress leaves the
             // baton signalled until a write resets it, so the next write
-            // completes at its first poll (TimedBaton.h:29, 43-56).
+            // completes at its first poll.
             let (transport, mut egress) =
                 captured_transport(&context, &proxy, 4, headers(&[("Foo", "Bar")]), None).await;
             assert_written(
@@ -4866,7 +4850,7 @@ fn inner_h1_session_over_the_tunnel_reads_allocation_sized_pieces() {
             );
 
             // Closing the idle inner session releases its stored body read and
-            // ends the tunnel's egress with no reset.
+            // ends the tunnel's egress without a reset.
             handle.close_when_idle().expect("close when idle");
             tokio::time::timeout(WAIT_DEADLINE, run)
                 .await
@@ -4883,8 +4867,7 @@ fn inner_h1_session_over_the_tunnel_reads_allocation_sized_pieces() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// group-135: oracles for the `DIV-012` differences (expectation-320).
+// Poll-driven behavior of stored body reads, the write baton, and teardown.
 
 #[test]
 fn smaller_reads_after_timeout_keep_the_remainder_before_eof() {
@@ -5079,8 +5062,8 @@ fn concurrent_read_or_write_fails_invalid_state_transition() {
             park(&mut polled_first, "the read polled first").await;
             let error = built_first.await.expect_err("a second pending read fails");
             assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
-            // Neither that rejected read nor an entry-cancelled, zero-maximum,
-            // or zero-allocation-size read ends the pending read's marking.
+            // The rejected read and an entry-cancelled, zero-maximum, or
+            // zero-allocation-size read leave the first read pending.
             assert_cancelled(
                 read_with(
                     &transport,
@@ -5134,9 +5117,9 @@ fn concurrent_read_or_write_fails_invalid_state_transition() {
                 .expect_err("a second write in progress fails");
             assert_eq!(rejected.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
             assert_eq!(rejected.bytes_written(), 0);
-            // Neither the rejected write nor an entry-cancelled one ends the
-            // parked write's marking, so `shutdown_write` sets the pending
-            // EOM, which the parked write carries.
+            // The rejected write and an entry-cancelled one leave the parked
+            // write in progress, so `shutdown_write` sets the pending EOM,
+            // which the parked write carries.
             assert_write_cancelled(
                 write_with(
                     &transport,
@@ -5432,7 +5415,8 @@ fn read_after_close_with_an_idle_stored_read_fails_then_reads_eof() {
 
             proxy.shutdown().await;
 
-            // An event that no read took is discarded, with or without EOM.
+            // An event that a read has not taken is discarded, with or without
+            // EOM.
             let proxy = TunnelProxy::start().await;
             for eom in [false, true] {
                 let observed = Observed::new();
@@ -5834,8 +5818,8 @@ fn write_baton_commits_expiry_and_cancellation_at_poll() {
                 drop(session);
             }
 
-            // A parked write dropped after an unobserved deadline commits
-            // nothing.
+            // A parked write dropped after an unobserved deadline does not
+            // commit the timeout to the baton.
             let (session, transport, tunnel) = tunnel_transport(
                 &context,
                 &proxy,
@@ -5911,7 +5895,7 @@ fn pending_eom_write_with_a_short_content_length_reenters_window_open() {
                 next_egress_bytes(&mut egress).await,
                 (b"abcd".to_vec(), false)
             );
-            // Its egress_eom finds the body short and credits the bytes, which
+            // The body is short at its egress_eom, which credits the bytes and
             // runs `window_open` inside this poll.
             assert_written(parked.await, 4);
             assert_eq!(
@@ -6082,7 +6066,7 @@ fn drop_with_parked_read_and_write_cancels_both_and_closes() {
             }
 
             // Releasing a cancelled starting read's body read can drop the
-            // only handle with no completion callback: a caller-provided
+            // only handle without a completion callback. A caller-provided
             // source's body read can run caller code as it drops, and the
             // session's own source releases the waker its body read saved
             // while it borrows its event baton. The read, in its poll or its
@@ -6285,9 +6269,9 @@ fn drop_with_parked_read_and_write_cancels_both_and_closes() {
                 }
             }
 
-            // With no stored read, the stream's close inside the handle's Drop
-            // stops the live response source, whose completion callback runs
-            // inline.
+            // Without a stored read, the stream's close inside the handle's
+            // Drop stops the live response source, whose completion callback
+            // runs inline.
             let polls = Rc::new(RefCell::new(PostDropPolls::default()));
             let (source, _producer) = scripted_source(DropThenPoll(Rc::clone(&polls)));
             let (transport, mut egress) = captured_transport(
@@ -6316,10 +6300,10 @@ fn drop_with_parked_read_and_write_cancels_both_and_closes() {
             // A caller-provided response source can drop the handle inside the
             // calls by which a read starts a body read, or inside the poll of
             // that body read. That read fails too when the body read then
-            // gives an event that ends no read or stays pending, and otherwise
-            // returns EOF for an EOM or the error the body read gave. The
-            // stream's close stops the source once, after the read drops the
-            // body read, unless that EOM or error ended it.
+            // gives an event that does not end the read or stays pending.
+            // Otherwise it returns EOF for an EOM or the error the body read
+            // gave. The stream's close stops the source once, after the read
+            // drops the body read, unless that EOM or error ended it.
             for step in [
                 SourceStep::SetReadTimeout,
                 SourceStep::ReadBodyEvent,

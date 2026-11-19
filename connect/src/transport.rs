@@ -7,9 +7,9 @@
 
 //! `HttpConnectTransport`, a `ByteStreamTransport` over a CONNECT stream.
 //!
-//! Frozen `scheduleAsyncRead` starts an eager body-read coroutine; here one
-//! body-read future is stored across `read` calls, and only a `read` polls it
-//! (`DIV-012`). The write baton is Roxygen's `TimedBaton`.
+//! Reads are lazy: one body-read future is kept across `read` calls, and only
+//! a `read` polls it. Writes wait on a `TimedBaton` that is signalled while
+//! the egress window is open.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -58,13 +58,14 @@ use roxygen_transport::byte_stream::WriteInfo;
 
 use crate::stream::HttpConnectStream;
 
-/// A `ByteStreamTransport` over a CONNECT tunnel (`HTTPConnectTransport`).
+/// A `ByteStreamTransport` over a CONNECT tunnel.
 ///
 /// Read and write futures hold the transport weakly. Dropping the transport
-/// fails a parked read or write, and any read or write first polled once the
-/// drop begins, with `CORO_CANCELLED`, then closes the stream. When the drop
-/// begins inside a stream or source call that a read or write makes, the
-/// stream closes once that call returns and the read drops its body read.
+/// fails a parked read or write with `CORO_CANCELLED`, then closes the
+/// stream. A read or write first polled after the drop begins fails the same
+/// way. If the drop begins inside a stream or source call made by a read or
+/// write, the stream closes once that call returns and the read has dropped
+/// its body read.
 pub struct HttpConnectTransport {
     state: Rc<TransportState>,
 }
@@ -72,41 +73,42 @@ pub struct HttpConnectTransport {
 struct TransportState {
     worker_id: WorkerId,
     host: Host,
-    /// The handle's Drop began. Caller code that a stored read's release runs
-    /// can drop the handle while a future still holds this state, so a future
-    /// checks this after it upgrades and after each step that can run caller
-    /// code, before it touches the stream or the baton.
+    /// Set when the handle's Drop begins. Caller code run by a stored read's
+    /// release can drop the handle while a future still holds this state, so
+    /// a future checks this after it upgrades and after each step that can
+    /// run caller code, before it touches the stream or the baton.
     dropped: Cell<bool>,
-    /// Shared, as is `window`, so that neither slot stays borrowed across a
-    /// stream call or a baton signal. Those can run caller code inline, such
-    /// as a waker, that drops the handle or calls back into the transport.
+    /// Shared, as is `window`, so that the slots do not stay borrowed across
+    /// a stream call or a baton signal. Those can run caller code inline,
+    /// such as a waker, that drops the handle or calls back into the
+    /// transport.
     stream: RefCell<Option<Rc<HttpConnectStream>>>,
-    /// `flowControlWindowOpen_`.
+    /// The write baton, signalled while the egress window is open.
     window: RefCell<Option<Rc<TimedBaton>>>,
     ingress: Cell<IngressLoan>,
-    /// `sourceComplete` ran, which frozen observes as `!egressSource_`.
+    /// The egress source has completed.
     egress_complete: Cell<bool>,
     write_in_progress: Cell<bool>,
     pending_eom: Cell<bool>,
-    /// A write's `egress_body` carries the pending EOM. Frozen passes it into
-    /// that one producer call, so a `shutdownWrite` or `abort` that the call
-    /// runs inline finds the EOM already seen.
+    /// Set while a write's `egress_body` call carries the pending EOM. A
+    /// `shutdown_write` or `close_with_reset` that the call runs inline treats
+    /// the EOM as already sent.
     eom_in_body: Cell<bool>,
     read: RefCell<ReadState>,
     next_read: Cell<u64>,
 }
 
-/// Whether the response source is on loan. A read that starts a body read
-/// takes the source out of the stream while it calls it, a read that polls the
-/// stored read holds that read outside `ReadState` while the body read and the
-/// read's timer run, and `release_stored` holds a stored read outside
-/// `ReadState` while its body read drops. Each can run caller code.
+/// Tracks whether a read or a release is using the response source while it
+/// can run caller code. A read that starts a body read takes the source out of
+/// the stream while it calls it. A read that polls the stored read holds that
+/// read outside `ReadState` while the body read and the read's timer run, and
+/// `release_stored` does the same while a stored body read drops.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IngressLoan {
     InStream,
     Lent,
-    /// `close` or `close_with_reset` ran during the loan, and takes effect once
-    /// the loan ends.
+    /// `close` or `close_with_reset` ran while `Lent`, and takes effect when
+    /// the source returns to `InStream`.
     LentAcrossClose,
 }
 
@@ -155,7 +157,7 @@ fn wrong_worker() -> HttpError {
     )
 }
 
-/// `AsyncSocketException::INTERNAL_ERROR` around an ingress error.
+/// Wraps an ingress error in a `TRANSPORT_READ_ERROR`.
 fn transport_read_error(error: HttpError) -> HttpError {
     HttpError::with_message(HttpErrorCode::TRANSPORT_READ_ERROR, error.describe())
         .with_cause(Arc::new(error))
@@ -183,7 +185,7 @@ impl TransportState {
         self.window.borrow().as_ref().map(|window| window.status())
     }
 
-    /// `shutdownWrite` (HTTPConnectTransport.cpp:226-235).
+    /// Sends EOM, or defers it while a write waits for the egress window.
     fn shutdown_write(&self) {
         if self.eom_in_body.get() {
             return;
@@ -199,7 +201,8 @@ impl TransportState {
         }
     }
 
-    /// The stream's `shutdownRead`. During a loan it only records the close.
+    /// Stops the response source. While the source is `Lent`, it only records
+    /// the close.
     fn shutdown_read(&self) {
         if self.ingress.get() != IngressLoan::InStream {
             self.ingress.set(IngressLoan::LentAcrossClose);
@@ -218,7 +221,7 @@ impl TransportState {
     /// Starts a body read, and reports whether `close` or `close_with_reset`
     /// ran meanwhile. The source is out of the stream while the read calls
     /// it, because those calls can run caller code that closes the transport
-    /// or drops its handle; `stream` keeps the stream until the source is
+    /// or drops its handle. `stream` keeps the stream until the source is
     /// back.
     fn start_body_read(
         &self,
@@ -243,13 +246,13 @@ impl TransportState {
         (stored, closed)
     }
 
-    /// Drops a stored body read with the source on loan, and returns the
-    /// source's completion snapshot and whether `close` or `close_with_reset`
-    /// ran meanwhile. The drop can run caller code: the source's completion
-    /// callback, a caller-provided source's body read, or the session's own
-    /// source's release of the waker that body read saved, which it makes
-    /// while it borrows its event baton. A close made there stops nothing until
-    /// the body read is gone.
+    /// Drops a stored body read while the source is marked `Lent`. Returns
+    /// the source's completion snapshot and whether `close` or
+    /// `close_with_reset` ran meanwhile. The drop can run caller code, such as
+    /// the source's completion callback or a caller-provided body read. The
+    /// session's own source releases the body read's saved waker, which can
+    /// run caller code too, while it borrows its event baton. A close made
+    /// during the drop does not stop the source until the body read is gone.
     fn release_stored(&self, stored: StoredRead) -> (Option<Result<Instant, HttpError>>, bool) {
         let loan = self.ingress.replace(IngressLoan::Lent);
         assert_eq!(
@@ -268,10 +271,10 @@ impl TransportState {
 
     /// Stops the response source. The holder is taken out of the stream
     /// first, because the stop can run the source's completion callback, and
-    /// with it caller code, inline. Caller code that a future's release of
-    /// its body read ran may have dropped the transport, whose Drop took the
-    /// stream. The future's clone of the stream then closes it once the
-    /// future lets it go, so a missing stream stops nothing here.
+    /// with it caller code, inline. Caller code run by a future's release of
+    /// its body read may have dropped the transport, and the transport's Drop
+    /// took the stream. The future's clone of the stream then closes it when
+    /// the future releases it, so this returns early when the stream is gone.
     fn stop_ingress(&self, error: Option<HttpErrorCode>) {
         let Some(mut ingress) = self
             .stream
@@ -284,11 +287,10 @@ impl TransportState {
         ingress.clear(error);
     }
 
-    /// Releases `stored` and ends the ingress after a cancellation of the read
-    /// that started its body read, as frozen `readBodyEvent`'s cancellation
-    /// does (HTTPStreamSource.cpp:370-384). An error the source committed
-    /// before the release goes to the next read. A close that the release
-    /// makes adds nothing, because this stop follows it.
+    /// Releases `stored` and ends the ingress after the read that started its
+    /// body read is cancelled. An error that the source committed before the
+    /// release goes to the next read. A close made during the release is
+    /// redundant, because this stop follows it.
     fn cancel_ingress(&self, stored: StoredRead) {
         let (committed, _) = self.release_stored(stored);
         self.stop_ingress(Some(HttpErrorCode::CORO_CANCELLED));
@@ -299,7 +301,7 @@ impl TransportState {
         self.read.borrow_mut().error = Some(transport_read_error(cause));
     }
 
-    /// The stream's `shutdownRead` for `close` and `close_with_reset`.
+    /// Ends the ingress for `close` and `close_with_reset`.
     fn close_ingress(&self) {
         let stored = self.read.borrow_mut().stored.take();
         match stored {
@@ -308,13 +310,14 @@ impl TransportState {
         }
     }
 
-    /// Ends the ingress of a close that found `stored`, which a read may have
-    /// on loan. The release comes before the stop, which cannot complete the
-    /// source while a read is active, and its snapshot gives the next read's
-    /// error. Both can run the source's completion callback, and with it
-    /// caller code that polls a read, so the closing state holds across both,
-    /// and the error is published before the stop. A close that the release
-    /// makes adds nothing, because this stop follows it.
+    /// Releases `stored` and ends the ingress for a close. `stored` may come
+    /// from a read that held it while the close ran. The release comes before
+    /// the stop, because the stop cannot complete the source while a read is
+    /// active. The release's snapshot gives the next read's error. Both steps
+    /// can run the source's completion callback, and with it caller code that
+    /// polls a read. So `closing` stays set across both, and the error is
+    /// published before the stop. A close made during the release is
+    /// redundant, because this stop follows it.
     fn close_stored(&self, stored: StoredRead) {
         self.read.borrow_mut().closing = true;
         let (snapshot, _) = self.release_stored(stored);
@@ -362,8 +365,9 @@ impl TransportState {
         }
     }
 
-    /// Ends read `id`'s pending marking. Its waker drops after the borrow,
-    /// because releasing a waker can drop a task that owns the handle.
+    /// Clears read `id` as the pending read and as the stored read's starter.
+    /// The saved waker drops after the borrow, because releasing a waker can
+    /// drop a task that owns the handle.
     fn finish_read(&self, id: u64) {
         let waker = {
             let mut read = self.read.borrow_mut();
@@ -383,7 +387,6 @@ impl TransportState {
 }
 
 impl HttpStreamSourceSharedCallback for TransportState {
-    /// `windowOpen`.
     fn window_open(&self, _id: StreamId) {
         if let Some(window) = self.window() {
             window.signal();
@@ -429,7 +432,7 @@ impl HttpConnectTransport {
         Rc::new(Self { state })
     }
 
-    /// The worker that owns the tunnel (`getEventBase`).
+    /// The worker that owns the tunnel.
     pub fn worker_id(&self) -> WorkerId {
         self.state.worker_id
     }
@@ -496,7 +499,8 @@ impl ByteStreamTransport for HttpConnectTransport {
         Ok(())
     }
 
-    /// `close`: `shutdownWrite`, then the stream's `shutdownRead`.
+    /// Sends EOM, deferred while a write waits for the egress window, then
+    /// stops the response source.
     fn close(&self, context: &WorkerContext) -> Result<(), HttpError> {
         self.check_context(context)?;
         self.state.shutdown_write();
@@ -504,10 +508,9 @@ impl ByteStreamTransport for HttpConnectTransport {
         Ok(())
     }
 
-    /// `closeWithReset`: aborts the egress with `CANCEL`, then closes the
-    /// stream, whose `shutdownWrite` finds the egress already ended. Inside a
-    /// write's `egress_body` that carries the EOM, frozen's `abort` finds the
-    /// EOM seen and does nothing.
+    /// Aborts the egress with `CANCEL`, then stops the response source.
+    /// Inside a write's `egress_body` call that carries the EOM, the abort is
+    /// skipped because the EOM counts as sent.
     fn close_with_reset(&self, context: &WorkerContext) -> Result<(), HttpError> {
         self.check_context(context)?;
         if !self.state.eom_in_body.get() {
@@ -540,13 +543,13 @@ impl ByteStreamTransport for HttpConnectTransport {
         Ok(self.state.stream().peer_endpoint().clone())
     }
 
-    /// `getPeerCertificate` is null.
+    /// Always `None`.
     fn peer_identity(&self, context: &WorkerContext) -> Result<Option<PeerIdentity>, HttpError> {
         self.check_context(context)?;
         Ok(None)
     }
 
-    /// `getTransport` is null.
+    /// Always `Unsupported`.
     fn byte_event_capability(
         &self,
         context: &WorkerContext,
@@ -576,8 +579,8 @@ impl ByteStreamTransport for HttpConnectTransport {
 }
 
 impl Drop for HttpConnectTransport {
-    /// `~HTTPConnectTransport` signals the baton cancelled
-    /// (HTTPConnectTransport.cpp:30-33).
+    /// Cancels a waiting write by dropping the write baton, wakes a parked
+    /// read, then releases the stream.
     fn drop(&mut self) {
         self.state.dropped.set(true);
         let window = self.state.window.borrow_mut().take();
@@ -602,7 +605,8 @@ enum ReadStage {
     Done,
 }
 
-/// What a read finds to do once no remainder, cancellation, or error ends it.
+/// The next step of a read that a remainder, cancellation, or error has not
+/// ended.
 enum NextRead {
     /// A close is releasing the stored read or stopping the source.
     AwaitClose,
@@ -610,7 +614,7 @@ enum NextRead {
     Start,
 }
 
-/// What a read's poll of the stored read and its timer gave.
+/// The result of a read's poll of the stored read and its timer.
 enum StoredPoll {
     Ready {
         result: Result<HttpBodyEvent, HttpError>,
@@ -625,8 +629,8 @@ enum StoredPoll {
     Closed,
 }
 
-/// `read` (HTTPConnectTransport.cpp:64-151), which starts at its first poll as
-/// a lazy `folly::coro::Task` does.
+/// The future returned by `HttpConnectTransport::read`. It starts at its first
+/// poll.
 struct ReadOperation {
     transport: Weak<TransportState>,
     host: Host,
@@ -642,7 +646,7 @@ struct ReadOperation {
 }
 
 impl ReadOperation {
-    /// Entry checks and the pending marking.
+    /// Runs the entry checks and marks the read pending.
     fn start(
         &mut self,
         state: &TransportState,
@@ -685,8 +689,8 @@ impl ReadOperation {
 
     /// Polls the stored read and, while it is pending, the read timer. The
     /// body read and the clock and timer of a caller-provided host can run
-    /// caller code, so the read keeps the source on loan meanwhile, and the
-    /// caller keeps the stream. A result goes to the caller also after a
+    /// caller code, so the read marks the source `Lent` meanwhile, and the
+    /// caller keeps the stream. A result goes to the caller even after a
     /// close, because dropping it can run caller code too, which must wait
     /// until the body read is released.
     fn poll_stored(
@@ -757,10 +761,9 @@ impl ReadOperation {
                     return Poll::Ready(Ok(TransportRead::new(data, false)));
                 }
                 // Only a read parked on a stored read or on a close gets here
-                // with a sampled cancellation, so no stored read means a close
-                // released it. Frozen's cancellation removes the `bodyEvents_`
-                // waiter before the close's error is enqueued, so that error
-                // stays for the next read.
+                // with a sampled cancellation, so a missing stored read means
+                // that a close released it. The cancellation wins, and the
+                // close's error stays for the next read.
                 if cancelled && read.stored.is_none() {
                     return Poll::Ready(Err(self::cancelled()));
                 }
@@ -773,9 +776,9 @@ impl ReadOperation {
                     read.stored.take().map_or(NextRead::Start, NextRead::Poll)
                 }
             };
-            // A Drop that begins inside a source call, including the release of
-            // the body read, leaves the stream's Drop to this read, after the
-            // read drops its body read.
+            // If the handle's Drop begins inside a source call, including the
+            // release of the body read, the stream's Drop runs in this read,
+            // after the read drops its body read.
             let (mut stored, stream) = match next {
                 NextRead::AwaitClose => {
                     // The close wakes the read once it has published the error.
@@ -845,10 +848,9 @@ impl ReadOperation {
                 }
                 StoredPoll::Ready { result, closed } => (result, closed),
             };
-            // A close that the poll or the release makes found no stored read,
-            // so it queues no error and the read keeps what the body read
-            // gave, as Proxygen's finished body read enqueues its event after
-            // `stopReading` (HTTPConnectTransport.cpp:45-59).
+            // A close made during the poll or the release did not see a stored
+            // read, so it did not queue an error, and the read keeps the body
+            // read's result.
             let (_, released_closed) = state.release_stored(stored);
             if closed || released_closed {
                 state.shutdown_read();
@@ -956,8 +958,8 @@ enum WriteStage {
     Done,
 }
 
-/// `write` (HTTPConnectTransport.cpp:153-214), which starts at its first poll
-/// as a lazy `folly::coro::Task` does.
+/// The future returned by `HttpConnectTransport::write`. It starts at its
+/// first poll.
 struct WriteOperation {
     transport: Weak<TransportState>,
     data: Option<BufQueue>,
@@ -990,7 +992,8 @@ impl WriteOperation {
         )))
     }
 
-    /// Entry checks, the in-progress marking, and the start of the baton wait.
+    /// Runs the entry checks, marks the write in progress, and starts the
+    /// baton wait.
     fn start(
         &mut self,
         state: &TransportState,
@@ -1036,7 +1039,7 @@ impl WriteOperation {
         None
     }
 
-    /// The write after the baton wait (HTTPConnectTransport.cpp:200-214).
+    /// Sends the data after the baton wait succeeds.
     fn commit(&mut self, state: &TransportState) -> Poll<Result<WriteInfo, TransportWriteError>> {
         if state.egress_complete.get() {
             return self.fail(
@@ -1097,9 +1100,9 @@ impl Future for WriteOperation {
             unreachable!("a started write waits on the baton");
         };
         // The wait releases a replaced waker while it borrows the baton's
-        // state, and that release can drop a task that owns the handle. The
-        // baton's Drop, which borrows that state too, then waits for the wait
-        // to return.
+        // state, and that release can drop a task that owns the handle.
+        // Holding `window` defers the baton's Drop, which borrows that state
+        // too, until the wait returns.
         let window = state.window();
         let status = std::task::ready!(Pin::new(wait).poll(context));
         drop(window);
@@ -1126,8 +1129,9 @@ impl Drop for WriteOperation {
         let state = self.transport.upgrade();
         // A dropped wait commits a requested cancellation to the baton. It
         // releases the write's waker while it borrows the baton's state, and
-        // that release can drop a task that owns the handle, so the baton,
-        // whose Drop borrows that state too, drops after the wait.
+        // that release can drop a task that owns the handle. Holding `window`
+        // defers the baton's Drop, which borrows that state too, until the
+        // wait is gone.
         let window = state.as_ref().and_then(|state| state.window());
         self.stage = WriteStage::Done;
         drop(window);

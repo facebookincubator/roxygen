@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The `HTTPSessionContext` subset plus `sendRequest` that CONNECT streams use.
+//! The proxy-session interface that CONNECT streams use.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -22,19 +22,20 @@ use roxygen_session::uniplex::UniplexResponse;
 /// An owner-local future returned by a CONNECT operation.
 pub type LocalConnectFuture<T> = Pin<Box<dyn Future<Output = T> + 'static>>;
 
-/// The proxy-session members that `HTTPConnectStream` uses
-/// (`HTTPSessionContext`, HTTPCoroSession.h:55-87, plus `sendRequest`).
+/// The proxy-session operations that
+/// [`HttpConnectStream`](crate::stream::HttpConnectStream) uses.
 ///
-/// The trait stays dyn-compatible: `HttpConnectStream::connect_unique` stores
-/// the session as `Box<dyn ConnectSession>`.
+/// The trait must stay dyn-compatible, because
+/// `HttpConnectStream::connect_unique` stores the session as
+/// `Box<dyn ConnectSession>`.
 pub trait ConnectSession: 'static {
-    /// The worker that owns the session (`getEventBase`).
+    /// The worker that owns the session.
     fn worker_id(&self) -> WorkerId;
 
-    /// The session's local address (`getLocalAddress`).
+    /// The session's local address.
     fn local_address(&self) -> SocketAddress;
 
-    /// The session's immediate peer address (`getPeerAddress`).
+    /// The session's immediate peer address.
     fn peer_address(&self) -> SocketAddress;
 
     /// The session's local transport endpoint, which can be a Unix-domain name.
@@ -44,12 +45,11 @@ pub trait ConnectSession: 'static {
     /// Unix-domain name.
     fn peer_endpoint(&self) -> TransportEndpoint;
 
-    /// Commits `request` on `reservation`
-    /// (`HTTPCoroSession::sendRequest(source, reservation)`).
+    /// Commits `request` on `reservation`.
     ///
-    /// `cancellation` covers admission and the request-head read only
-    /// (HTTPCoroSession.cpp:2242-2247). Implementations must not attach it to
-    /// the request body, which carries the tunnel's egress.
+    /// `cancellation` covers only admission and the request-head read.
+    /// Implementations must not attach it to the request body, which carries
+    /// the tunnel's egress.
     fn send_connect_request(
         &self,
         request: HttpSourceHolder,
@@ -57,6 +57,6 @@ pub trait ConnectSession: 'static {
         cancellation: CancellationToken,
     ) -> LocalConnectFuture<Result<UniplexResponse, HttpError>>;
 
-    /// Starts a graceful drain of the session (`initiateDrain`).
+    /// Starts a graceful drain of the session.
     fn initiate_drain(&self) -> Result<bool, HttpError>;
 }

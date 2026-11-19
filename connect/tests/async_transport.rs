@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Frozen `HTTPConnectTransportTest` Async cases for `HttpConnectAsyncTransport`.
+//! Tests for `HttpConnectAsyncTransport` through the echoing h2c proxy.
 
 use bytes::BytesMut;
 use roxygen_client::connector::ClientSession;
@@ -24,7 +24,8 @@ use crate::connect_stream::run_on_worker;
 
 const BUFFER_SIZE: usize = 65_536;
 
-/// `connectAsync` (HTTPConnectTransportTest.cpp:182-197).
+/// Connects a session to `proxy` and wraps a CONNECT tunnel in the async
+/// adapter.
 pub(crate) async fn connect_async(
     context: &WorkerContext,
     proxy: &H2cProxy,

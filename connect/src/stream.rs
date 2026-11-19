@@ -60,15 +60,15 @@ use crate::experimental::ConnectRejected;
 use crate::session::ConnectSession;
 use crate::session::LocalConnectFuture;
 
-/// CONNECT request headers, added in key order (`std::map`, HTTPConnectStream.h:41).
+/// CONNECT request headers, added to the request in key order.
 pub type RequestHeaderMap = BTreeMap<Box<[u8]>, Box<[u8]>>;
 
-/// The default egress buffer of a tunnel (HTTPConnectStream.h:53, 65).
+/// The default egress buffer size of a tunnel, in bytes.
 pub const DEFAULT_EGRESS_BUFFER_SIZE: u32 = 256 * 1024;
 
 type SendFuture = LocalConnectFuture<Result<UniplexResponse, HttpError>>;
 
-/// A CONNECT tunnel established on a proxy session (`HTTPConnectStream`).
+/// A CONNECT tunnel established on a proxy session.
 ///
 /// The tunnel's egress is a request body source committed to the proxy
 /// session, and its ingress is the CONNECT response source. Dropping the
@@ -76,12 +76,12 @@ type SendFuture = LocalConnectFuture<Result<UniplexResponse, HttpError>>;
 pub struct HttpConnectStream {
     state: Rc<StreamState>,
     session: Option<Box<dyn ConnectSession>>,
-    /// The final 2xx CONNECT response head (`DIV-011`).
+    /// The final 2xx CONNECT response head, until a caller takes it.
     pub(crate) connect_response: Option<Box<HttpMessage>>,
-    /// The committed stream's abort (`DIV-023`).
+    /// The abort handle of the committed stream.
     abort: Option<UniplexStreamAbort>,
-    /// Until the final head arrives, teardown aborts a committed stream
-    /// instead of closing it (`DIV-023`).
+    /// Whether teardown aborts a committed stream instead of closing it.
+    /// Cleared once the final head arrives.
     reset_on_cancel: bool,
 }
 
@@ -138,8 +138,8 @@ impl StreamState {
         }
     }
 
-    // Producer calls can run egress callbacks inline, so none of them holds a
-    // `RefCell` borrow of this state.
+    // Producer calls can run egress callbacks inline, so these methods make
+    // them without holding a `RefCell` borrow of this state.
     fn egress_body(&self, body: BufQueue) -> FlowControlState {
         let Some(producer) = self.egress_producer() else {
             return FlowControlState::Error;
@@ -164,9 +164,9 @@ impl StreamState {
     }
 }
 
-/// `HTTPStreamSource::Callback` of the egress source. It holds the stream
-/// state weakly, so neither the session's egress source nor the installed
-/// callback keeps the stream alive.
+/// The egress source's callback. It holds the stream state weakly, so the
+/// session's egress source and the installed callback do not keep the stream
+/// alive.
 struct EgressCallbacks {
     stream: Weak<StreamState>,
 }
@@ -208,10 +208,10 @@ fn cancelled() -> HttpError {
     HttpError::with_message(HttpErrorCode::CORO_CANCELLED, b"Cancelled")
 }
 
-/// `folly::SocketAddress::setFromIpPort` and `getAddressStr`: the value, read
-/// as a C string, resolved by glibc `getaddrinfo(AI_NUMERICHOST)`, and printed
-/// by `inet_ntop`. `SocketAddress` has no IPv6 zone index, so a value with one
-/// is ignored like an invalid value.
+/// Parses an `X-Connected-To` value as glibc `getaddrinfo(AI_NUMERICHOST)`
+/// does and formats it as `inet_ntop` does. The value is read as a C string,
+/// so it ends at the first NUL. A value with an IPv6 zone index is ignored
+/// like an invalid value.
 fn connected_peer(value: &[u8], port: u16) -> Option<SocketAddress> {
     let value = &value[..value
         .iter()
@@ -224,8 +224,9 @@ fn connected_peer(value: &[u8], port: u16) -> Option<SocketAddress> {
     Some(SocketAddress::new(host, port))
 }
 
-/// glibc `__inet_aton_exact`: one to four dot-separated C integers, of which
-/// each but the last is one byte and the last fills the remaining bytes.
+/// Parses an IPv4 address as glibc `__inet_aton_exact` does. The text is one
+/// to four dot-separated C integers. Each but the last is one byte, and the
+/// last fills the remaining bytes.
 fn inet_aton_exact(text: &[u8]) -> Option<Ipv4Addr> {
     let mut address = 0_u32;
     let mut rest = text;
@@ -243,8 +244,9 @@ fn inet_aton_exact(text: &[u8]) -> Option<Ipv4Addr> {
     None
 }
 
-/// `strtoul(text, &end, 0)` where `text` must start with a digit: `0x` hex,
-/// `0` octal, or decimal. Values above `u32::MAX` fail, as `inet_aton` rejects
+/// Parses a C integer as `strtoul(text, &end, 0)` does, except that `text`
+/// must start with a digit. A `0x` prefix means hex, a leading `0` octal, and
+/// anything else decimal. Values above `u32::MAX` fail, as `inet_aton` rejects
 /// them.
 fn c_number(text: &[u8]) -> Option<(u32, &[u8])> {
     if !text.first()?.is_ascii_digit() {
@@ -267,9 +269,10 @@ fn c_number(text: &[u8]) -> Option<(u32, &[u8])> {
     Some((value, &digits[length..]))
 }
 
-/// glibc `inet_ntop(AF_INET6)`: the first longest run of two or more zero
-/// words becomes `::`, and an address whose first six words are zero, or
-/// whose first five are zero and sixth is `ffff`, ends in dotted IPv4.
+/// Formats an IPv6 address as glibc `inet_ntop(AF_INET6)` does. The first
+/// longest run of two or more zero words becomes `::`. An address with
+/// exactly six leading zero words, or five followed by `ffff`, ends in dotted
+/// IPv4.
 fn ipv6_presentation(address: Ipv6Addr) -> String {
     let words = address.segments();
     let mut best: Option<(usize, usize)> = None;
@@ -316,14 +319,15 @@ fn ipv6_presentation(address: Ipv6Addr) -> String {
 
 impl HttpConnectStream {
     /// Establishes a CONNECT tunnel to `authority` on a session that another
-    /// owner, such as a pool, keeps (`HTTPConnectStream::connect`).
+    /// owner, such as a pool, keeps.
     ///
-    /// The stream keeps no session and never drains it. Because the returned
-    /// future cannot borrow `session`, this call reads the session, creates the
-    /// egress source, checks `cancellation`, and calls `send_connect_request`
-    /// before returning; the future checks `cancellation` again on its first
-    /// poll. `cancellation` covers the request commit and the wait for the
-    /// final response head, never the established tunnel.
+    /// The stream does not keep the session and never drains it. Because the
+    /// returned future cannot borrow `session`, this call reads the session,
+    /// creates the egress source, checks `cancellation`, and calls
+    /// `send_connect_request` before returning. The future checks
+    /// `cancellation` again on its first poll. `cancellation` covers the
+    /// request commit and the wait for the final response head, never the
+    /// established tunnel.
     #[expect(
         clippy::too_many_arguments,
         reason = "ports the frozen HTTPConnectStream::connect parameters one to one"
@@ -401,13 +405,13 @@ impl HttpConnectStream {
     }
 
     /// Establishes a CONNECT tunnel to `authority` and takes ownership of the
-    /// session (`HTTPConnectStream::connectUnique`).
+    /// session.
     ///
     /// Dropping the stream closes it and then drains the session, after
-    /// success and after every failure. Like the frozen lazy `Task`, the
-    /// returned future calls no session method until it is first polled.
-    /// `cancellation` covers the request commit and the wait for the final
-    /// response head, never the established tunnel.
+    /// success and after every failure. The returned future does not call a
+    /// session method until it is first polled. `cancellation` covers the
+    /// request commit and the wait for the final response head, never the
+    /// established tunnel.
     #[expect(
         clippy::too_many_arguments,
         reason = "ports the frozen HTTPConnectStream::connectUnique parameters one to one"
@@ -487,7 +491,6 @@ impl HttpConnectStream {
         })
     }
 
-    /// The constructor (HTTPConnectStream.cpp:14-31).
     fn construct(
         context: &WorkerContext,
         session: &dyn ConnectSession,
@@ -540,7 +543,7 @@ impl HttpConnectStream {
         ))
     }
 
-    /// `connectImpl` up to `sendRequest` (HTTPConnectStream.cpp:73-93).
+    /// Builds the CONNECT request and commits it on the session.
     fn begin_connect(
         &self,
         context: &WorkerContext,
@@ -584,7 +587,8 @@ impl HttpConnectStream {
         Ok((send, upstream_port))
     }
 
-    /// `connectImpl` from `sendRequest` (HTTPConnectStream.cpp:91-128).
+    /// Waits for the final response head. A non-2xx head aborts the egress
+    /// and fails the connect with `CONNECT_ERROR`.
     async fn finish_connect(
         &mut self,
         send: SendFuture,
@@ -631,7 +635,7 @@ impl HttpConnectStream {
         Ok(())
     }
 
-    /// Ends both directions: `shutdownRead`, then `shutdownWrite`.
+    /// Ends both directions: stops reading, then ends the egress with EOM.
     pub fn close(&mut self) {
         self.shutdown_read();
         self.shutdown_write();
@@ -667,8 +671,9 @@ impl HttpConnectStream {
         &self.state.local_address
     }
 
-    /// The single numeric-host `X-Connected-To` of the CONNECT response with
-    /// the authority's port, or else the proxy session's peer address.
+    /// The address from the CONNECT response's single numeric
+    /// `X-Connected-To` field, with the authority's port. Falls back to the
+    /// proxy session's peer address.
     pub fn peer_address(&self) -> &SocketAddress {
         self.state
             .connected_peer_address
@@ -700,26 +705,23 @@ impl HttpConnectStream {
         self.state.egress_buffer_size
     }
 
-    /// `egressSource_->body(buf, 0, false)`.
     pub(crate) fn egress_body(&self, body: BufQueue) -> FlowControlState {
         self.state.egress_body(body)
     }
 
-    /// `egressSource_->eom()`.
     pub(crate) fn egress_eom(&self) -> bool {
         self.state.egress_eom()
     }
 
-    /// `egressSource_->abort(error)`.
     pub(crate) fn egress_abort(&self, error: HttpErrorCode) -> bool {
         self.state.egress_abort(error)
     }
 
-    /// The proposed `closeWithReset` that resets after egress EOM (`DIV-023`):
-    /// the session resets the stream first, so the egress abort and the
-    /// stopped ingress that close both directions add no second reset. A panic
-    /// of the session abort, such as a lifecycle observer's, is returned after
-    /// both directions are closed.
+    /// Resets the stream with `CANCEL`, even after egress EOM, and closes both
+    /// directions. The session resets the stream first, so the egress abort
+    /// and the ingress stop that follow do not send a second reset. A panic
+    /// from the session abort, such as a lifecycle observer's, is returned
+    /// after both directions are closed.
     #[must_use]
     pub(crate) fn abort_with_reset(&mut self) -> Option<Box<dyn Any + Send>> {
         let panic = self
@@ -739,7 +741,8 @@ impl HttpConnectStream {
         operation(&mut self.state.ingress.borrow_mut())
     }
 
-    /// `setHTTPStreamSourceCallback`. The slot does not own the callback.
+    /// Installs the callback that egress source events are forwarded to. The
+    /// slot does not own the callback.
     pub(crate) fn set_http_stream_source_callback(
         &self,
         callback: Option<Weak<dyn HttpStreamSourceSharedCallback>>,
@@ -769,13 +772,13 @@ impl Drop for HttpConnectStream {
     }
 }
 
-/// The wait for the final CONNECT response head (HTTPConnectStream.cpp:96-101).
+/// The wait for the final CONNECT response head. Informational heads are
+/// skipped.
 ///
 /// Each poll first samples the caller's token through a wake registration, so
-/// a cancellation from any thread wakes a parked wait, as `TimedBaton::wait`'s
-/// cancellation callback signals its baton. A header read that has returned
-/// `Pending` is never polled after a sampled cancellation, because polling it
-/// could consume a head that cancellation supersedes.
+/// a cancellation from any thread wakes a parked wait. A header read that has
+/// returned `Pending` is never polled after a sampled cancellation, because
+/// polling it could consume a head that the cancellation supersedes.
 struct HeadWait<'a> {
     state: &'a StreamState,
     registration: CancellationWakeRegistration,

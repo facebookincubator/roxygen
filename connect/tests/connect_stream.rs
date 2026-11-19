@@ -5,8 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Frozen `HTTPConnectTransportTest` connect-phase cases for `HttpConnectStream`,
-//! and the h2c proxy fixture that ports its `ConnectHandler`.
+//! Connect-phase tests for `HttpConnectStream`, and the h2c proxy fixture that
+//! the CONNECT tests share.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -149,22 +149,22 @@ pub(crate) struct ProxyRequest {
 #[derive(Default)]
 pub(crate) struct ProxyLog {
     pub(crate) requests: RefCell<Vec<ProxyRequest>>,
-    /// Errors that a tunnel's request read returned to `handleConnect`.
+    /// Errors that a tunnel's request read returned to `handle_connect`.
     pub(crate) read_errors: RefCell<Vec<HttpError>>,
     /// Tunnels whose request read ended with EOM.
     pub(crate) request_eoms: RefCell<usize>,
-    /// `ConnectHandler::exceptionExpected` while it holds `true`; otherwise it
-    /// holds `false`, and no request read may fail.
+    /// Set by `expect_exceptions`. While it is `false`, a checked request read
+    /// must not fail.
     exceptions_expected: Cell<bool>,
-    /// The request read errors that `handleConnect` checks against
-    /// `exceptionExpected`: those that arrive while the response source is live
-    /// or after a CONNECT head with EOM.
+    /// The request read errors checked against `exceptions_expected`: those
+    /// that arrive while the response source is live or after a CONNECT head
+    /// with EOM.
     checked_read_errors: RefCell<Vec<HttpError>>,
     tasks: RefCell<Vec<JoinHandle<()>>>,
-    /// `ConnectHandler::curRespSource`: the latest tunnel's response producer,
-    /// cleared when any tunnel's `handleConnect` ends.
+    /// The latest tunnel's response producer, cleared when any tunnel's
+    /// `handle_connect` ends.
     pub(crate) cur_resp_source: RefCell<Option<HttpStreamSourceProducer>>,
-    /// `ConnectHandler::timeout`: the delay before a tunnel starts echoing.
+    /// The delay before a tunnel starts echoing.
     pub(crate) timeout: Cell<Duration>,
 }
 
@@ -178,7 +178,10 @@ impl ProxyLog {
     }
 }
 
-/// Test-local port of `ConnectHandler` (HTTPConnectTransportTest.h:29-134).
+/// The proxy's CONNECT handler. It sends a 1xx head, then a 200 with
+/// `X-Connected-To: 1.2.3.4`, and echoes the tunnel. The `Slow`, `Fail` and
+/// `EomOnConnect` request headers delay the final head, make it a 500, or end
+/// the response with it.
 pub(crate) struct ConnectHandler {
     pub(crate) log: Rc<ProxyLog>,
 }
@@ -201,7 +204,7 @@ impl HttpHandler for ConnectHandler {
                 HttpError::with_message(HttpErrorCode::INTERNAL_ERROR, error.to_string())
             })?;
             let producer = source.producer();
-            // 1xx response, because we can.
+            // A 1xx head first, which the client must skip.
             producer.headers(response(107), false);
             let request_headers = head.headers();
             if request_headers.exists(b"Slow") {
@@ -229,7 +232,7 @@ impl HttpHandler for ConnectHandler {
     }
 }
 
-/// `ConnectHandler::handleConnect`: echoes the tunnel until EOM or `write_fin`.
+/// Echoes the tunnel until EOM or `write_fin`, after the configured delay.
 async fn handle_connect(
     request: HttpSourceHolder,
     response: HttpStreamSourceProducer,
@@ -255,8 +258,8 @@ async fn echo_tunnel(
         let event = match event {
             Ok(event) => event,
             Err(error) => {
-                // `handleConnect` leaves before its `exceptionExpected` check
-                // once the response source is gone and incomplete.
+                // An error after the response source is gone and incomplete
+                // is not checked against `exceptions_expected`.
                 if response.is_live() || response_complete {
                     log.checked_read_errors.borrow_mut().push(error.clone());
                 }
@@ -298,8 +301,8 @@ async fn echo_tunnel(
     }
 }
 
-/// An h2c `roxygen_server` proxy on the test worker, configured as the frozen
-/// fixture's `ScopedHTTPServer` (HTTPConnectTransportTest.cpp:151-164).
+/// An h2c `roxygen_server` proxy on the test worker that serves
+/// `ConnectHandler`.
 pub(crate) struct H2cProxy {
     listener: tokio::net::TcpListener,
     address: SocketAddr,
@@ -321,7 +324,7 @@ impl H2cProxy {
         }
     }
 
-    /// `HTTPCoroConnector::connect` to the proxy with h2 as the plaintext protocol.
+    /// Connects a client session to the proxy over h2c.
     pub(crate) async fn connect(
         &self,
         context: &WorkerContext,
@@ -373,15 +376,15 @@ impl H2cProxy {
         self.address
     }
 
-    /// `ConnectHandler::expectExceptions`: every request read may fail.
+    /// Allows every request read to fail.
     pub(crate) fn expect_exceptions(&self) {
         self.log.exceptions_expected.set(true);
     }
 
     /// Joins the tunnel tasks, which end at the client's EOM or a request read
-    /// error, and checks `ConnectHandler::exceptionExpected` before the frozen
-    /// `TearDown` resets it. Then cancels every proxy session and checks the
-    /// CONNECT heads as `ConnectHandler::handleRequest`'s expectations do.
+    /// error, and checks that request reads did not fail unless failures were
+    /// expected. Then cancels every proxy session and checks each CONNECT
+    /// head's `Host`, and its `Foo` unless it carried `Fail` or `EomOnConnect`.
     pub(crate) async fn shutdown(self) {
         let tasks = std::mem::take(&mut *self.log.tasks.borrow_mut());
         for task in tasks {

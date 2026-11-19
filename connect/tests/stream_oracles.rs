@@ -5,7 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Rust-only `HttpConnectStream` and `HttpConnectAsyncTransport` oracles.
+//! Tests for `HttpConnectStream` against scripted sessions and proxies, and
+//! for `HttpConnectAsyncTransport`.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -104,7 +105,6 @@ use crate::connect_stream::socket_address;
 const HTTP2_INITIAL_WINDOW_SIZE: u16 = 4;
 const PROXY_WINDOW: usize = 64 * 1024;
 
-// ---------------------------------------------------------------------------
 // Proxy fixtures.
 
 /// The proxy side of one CONNECT stream, driven by the test.
@@ -356,8 +356,8 @@ impl TunnelProxy {
     }
 
     /// Releases every tunnel's request holder and aborts its unfinished
-    /// response, also for tunnels a test still owns, so no handler source holds
-    /// a proxy stream open, and cancels every proxy session.
+    /// response, also for tunnels a test still owns, so that handler sources
+    /// do not hold a proxy stream open, and cancels every proxy session.
     fn release(&self) {
         self.slots.tunnels.borrow_mut().clear();
         let held = std::mem::take(&mut *self.slots.held.borrow_mut());
@@ -466,7 +466,6 @@ async fn read_until_close(socket: &mut TcpStream) -> PeerClose {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Client-side observers.
 
 /// Records explicit drains and detached streams of a client session.
@@ -535,7 +534,6 @@ impl Observed {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Scripted `ConnectSession`.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -560,7 +558,7 @@ const CONSTRUCTION_READS: [Call; 5] = [
 enum SendMode {
     /// Commits through the wrapped `ClientSession`.
     Delegate,
-    /// Fails at once and keeps the egress request holder.
+    /// Fails immediately and keeps the egress request holder.
     Fail(HttpError),
     /// Never resolves; dropping it releases the reservation.
     Hold,
@@ -842,7 +840,6 @@ impl ScriptedResponse {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Polling helpers.
 
 type ConnectFuture = LocalConnectFuture<Result<HttpConnectStream, HttpError>>;
@@ -1059,8 +1056,7 @@ async fn read_egress_to_end(egress: &mut HttpSourceHolder) -> Result<Vec<u8>, Ht
     read_body_to_end(egress).await
 }
 
-// ---------------------------------------------------------------------------
-// Scripted-session oracles.
+// Scripted-session tests.
 
 #[derive(Clone, Copy, Debug)]
 enum UniqueFailure {
@@ -1111,7 +1107,7 @@ fn scripted_session_sees_construction_reads_one_token_scoped_send_and_unique_dra
                 "send_connect_request receives the caller's token"
             );
 
-            // connect_unique makes them on its first poll, as the lazy Task does.
+            // connect_unique makes them on its first poll.
             let scripted =
                 ScriptedSession::new(proxy.connect(&context, SessionParams::default()).await);
             let mut connect = unique_connect(
@@ -1993,7 +1989,8 @@ fn dropping_connect_future_before_commit_releases_reservation_and_drains_only_a_
         Box::pin(async move {
             let proxy = TunnelProxy::start(CodecProtocol::Http2).await;
 
-            // An unpolled connect_unique calls nothing; another clone keeps the session open.
+            // An unpolled connect_unique does not call the session. Another clone
+            // keeps the session open.
             let observed = Observed::new();
             let session = proxy.connect(&context, observed.params()).await;
             let scripted = ScriptedSession::new(session.clone());
@@ -2138,8 +2135,8 @@ fn ipv6_hostname_and_repeated_x_connected_to() {
             let proxy_peer = session.peer_address().clone();
             let scripted = ScriptedSession::new(session);
             let connected = |host: &str| SocketAddress::new(host, 443);
-            // `setFromIpPort` resolves the value with `getaddrinfo(AI_NUMERICHOST)`,
-            // which accepts every `inet_aton` IPv4 form and prints with `inet_ntop`.
+            // Parsing follows `getaddrinfo(AI_NUMERICHOST)`, which accepts
+            // every `inet_aton` IPv4 form. Printing follows `inet_ntop`.
             let cases: [(&[(&str, &[u8])], SocketAddress); 24] = [
                 (&[("X-Connected-To", b"::1")], connected("::1")),
                 (&[("X-Connected-To", b"0:0:0:0:0:0:0:1")], connected("::1")),
@@ -2527,8 +2524,9 @@ fn connect_101_response_is_final_and_rejected_h1_h2() {
                 .await
                 .err()
                 .expect("a 101 without an upgrade request fails");
-            // The codec rejects a 101 to a CONNECT that requested no upgrade, so
-            // the header read fails before connect_impl sees a status.
+            // The codec rejects a 101 to a CONNECT that did not request an
+            // upgrade, so the header read fails before the connect checks the
+            // status.
             assert_eq!(error.code(), HttpErrorCode::HEADER_PARSE_ERROR);
             assert_eq!(
                 error.message(),
@@ -2744,9 +2742,8 @@ fn caller_host_header_duplicates() {
                 1,
                 "one :method: {names:?}"
             );
-            // Two `Host` values leave no single authority, and Roxygen's H2
-            // encoder then omits `:authority`, where frozen
-            // `HPACKCodec::encodeHTTP` encodes it with an empty value.
+            // With two `Host` values there is not a single authority, so the H2
+            // encoder omits `:authority`.
             assert!(
                 !names
                     .iter()
@@ -2968,7 +2965,7 @@ fn stream_shutdown_close_and_egress_error_follow_the_tunnel() {
             })
             .await;
             // The session stops reading the egress source with the peer's
-            // RST_STREAM code (`stopReading`, HTTPStreamSource.cpp:288-297).
+            // RST_STREAM code.
             let error = stream.egress_error().expect("egress error");
             assert_eq!(error.code(), HttpErrorCode::CANCEL);
             assert_eq!(error.message(), b"Abandoned reading");
@@ -3254,7 +3251,7 @@ async fn stall_h2c_egress(transport: &mut HttpConnectAsyncTransport, parked: usi
 }
 
 /// Writes until a write's completion stays deferred because the proxy stopped
-/// reading its socket and the session can no longer write.
+/// reading its socket and the session cannot write.
 async fn stall_h1_egress(transport: &mut HttpConnectAsyncTransport) {
     let chunk = vec![b's'; 64 * 1024];
     for _ in 0..4096 {
@@ -3386,8 +3383,7 @@ fn dropped_unique_tunnel_with_stalled_egress_is_released_by_write_timeout_or_ses
     });
 }
 
-// ---------------------------------------------------------------------------
-// tokio-rustls over the tunnel, the production shape.
+// tokio-rustls over the tunnel.
 
 const ORIGIN_BODY_LENGTH: usize = 70_000;
 
@@ -3418,7 +3414,7 @@ fn origin_body() -> Vec<u8> {
         .collect()
 }
 
-/// A TLS origin that answers one GET with `origin_body()`.
+/// A TLS origin that responds to one GET with `origin_body()`.
 async fn serve_origin(listener: tokio::net::TcpListener, config: Arc<rustls::ServerConfig>) {
     let (socket, _) = listener.accept().await.expect("origin accept");
     let mut tls = TlsAcceptor::from(config)
@@ -3690,8 +3686,7 @@ fn h1_half_close_sends_fin_after_close_notify_and_keeps_reading() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// HttpConnectAsyncTransport oracles (DIV-012).
+// `HttpConnectAsyncTransport` tests.
 
 impl ProxyTunnel {
     fn finish(&self, bytes: &[u8]) {
@@ -3726,8 +3721,8 @@ async fn h2c_adapter(
 }
 
 /// An h2c tunnel whose egress holder the test reads in place of the session,
-/// so no egress read is active and the egress source's bytes are processed
-/// only when the test reads them.
+/// so that an egress read is not active and the egress source's bytes are
+/// processed only when the test reads them.
 async fn captured_adapter(
     context: &WorkerContext,
     proxy: &TunnelProxy,
@@ -4754,7 +4749,8 @@ fn async_producer_calls_with_no_egress_read_active_reenter_callbacks_without_pan
                 Poll::Ready(Ok(()))
             ));
 
-            // Drop leaves queued bytes and the EOM; their callbacks reach no state.
+            // Drop leaves the queued bytes and the EOM. Their callbacks run
+            // after the adapter's state is gone and have no effect.
             let (_scripted, mut transport, _tunnel, mut egress) =
                 captured_adapter(&context, &proxy, 4, headers(&[("Foo", "Bar")])).await;
             assert!(matches!(

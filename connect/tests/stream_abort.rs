@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! `DIV-023` oracles for the `roxygen_connect::experimental` tunnel abort.
+//! Tests for the tunnel abort in `roxygen_connect::experimental`.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -549,9 +549,10 @@ fn io_kind<T: std::fmt::Debug>(result: Poll<io::Result<T>>) -> io::ErrorKind {
     error.kind()
 }
 
-/// Returns once the proxy processed every frame the client wrote before the
-/// call: a round trip on a new tunnel of the same session follows them on the
-/// connection. The caller keeps the returned tunnel until it is done.
+/// Returns once the proxy has processed every frame that the client wrote
+/// before the call. A round trip on a new tunnel of the same session follows
+/// those frames on the connection. The caller keeps the returned tunnel until
+/// it is done.
 async fn barrier(
     context: &WorkerContext,
     proxy: &Proxy,
@@ -729,7 +730,7 @@ fn abort_fails_parked_read_and_deferred_write() {
             assert_eq!(proxy.peer_resets(), [(STREAM_1, CANCEL)]);
 
             // A parked writer whose waker panics wakes after the reset and the
-            // reader's wake; then its panic reaches the caller.
+            // reader's wake. Its panic then reaches the caller.
             let (mut panicking, _tunnel) = establish_adapter(&context, &proxy, &session).await;
             defer_write(&mut panicking).await;
             let writer = Waker::from(Arc::new(PanicOnWake));
@@ -925,7 +926,7 @@ fn abort_after_tunnel_completion_sends_no_frame() {
             assert_cancelled_read(poll_read_with(&mut transport, &reader.waker()));
             observed.detached(2).await;
 
-            // A proxy reset that no read reported yet keeps its code.
+            // A proxy reset that a read has not reported yet keeps its code.
             let (mut transport, tunnel) = establish_adapter(&context, &proxy, &session).await;
             tunnel.reset(HttpErrorCode::CONNECT_ERROR);
             observed.peer_reset(STREAM_5).await;
@@ -1094,7 +1095,7 @@ fn cancelled_setup_after_upgrade_resets_through_the_experimental_path() {
                 }
             }
 
-            // A setup cancelled or dropped before the proxy answers resets once.
+            // A setup cancelled or dropped before the proxy responds resets once.
             for cancel in [true, false] {
                 let session = proxy.connect(&context, SessionParams::default()).await;
                 let token = CancellationSource::new();

@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! `DIV-011` oracles for `roxygen_connect::experimental`.
+//! Tests for the response-head access in `roxygen_connect::experimental`.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -67,7 +67,6 @@ use crate::connect_stream::response;
 use crate::connect_stream::run_on_worker;
 use crate::connect_stream::socket_address;
 
-// ---------------------------------------------------------------------------
 // Fixtures.
 
 /// The proxy side of one h2c CONNECT stream, which the test drives.
@@ -205,8 +204,9 @@ impl ScriptedH2cProxy {
         Rc::clone(&self.tunnels.borrow()[next])
     }
 
-    /// Releases every tunnel's request and unfinished response, so no handler
-    /// source holds a proxy stream open, and cancels every proxy session.
+    /// Releases every tunnel's request and unfinished response, so that
+    /// handler sources do not hold a proxy stream open, and cancels every
+    /// proxy session.
     fn release(&self) {
         for tunnel in self.tunnels.borrow().iter() {
             drop(std::mem::take(&mut *tunnel.request.borrow_mut()));
@@ -411,11 +411,10 @@ fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Oracles.
+// Tests.
 
-/// A fwdproxy-style success head: two `Proxy-Status` and two
-/// `X-FB-Fwdproxy-Debug` lines, one `Proxy-Status` name in lowercase.
+/// A forward-proxy success head with two `Proxy-Status` and two debug fields,
+/// one `Proxy-Status` name in lowercase.
 const FWDPROXY_SUCCESS_FIELDS: [(&str, &str); 6] = [
     ("X-Connected-To", "1.2.3.4"),
     ("Proxy-Status", "fwdproxy-a; next-hop=\"origin\""),
@@ -453,7 +452,7 @@ fn assert_success_head(
 fn success_head_is_retained_with_ordered_duplicate_fields_h1_h2() {
     run_on_worker(|context| {
         Box::pin(async move {
-            // Common names take the table's spelling; other names keep the wire case.
+            // Common names take the table's case. Other names keep the wire case.
             let h1_expected = [
                 ("X-Connected-To", "1.2.3.4"),
                 ("Proxy-Status", "fwdproxy-a; next-hop=\"origin\""),
@@ -483,7 +482,7 @@ fn success_head_is_retained_with_ordered_duplicate_fields_h1_h2() {
                 assert_success_head(&stream, fields, &h1_expected, &format!("H1 {ownership:?}"));
             }
 
-            // Common names take the table's spelling; HPACK lowercases the others.
+            // Common names take the table's case. HPACK lowercases the others.
             let h2c_expected = [
                 ("x-connected-to", "1.2.3.4"),
                 ("Proxy-Status", "fwdproxy-a; next-hop=\"origin\""),
@@ -558,7 +557,7 @@ fn take_connect_response_empties_the_head() {
 fn informational_head_is_not_retained() {
     run_on_worker(|context| {
         Box::pin(async move {
-            // The frozen `ConnectHandler` sends a 107 before its 200.
+            // `ConnectHandler` sends a 107 before its 200.
             let proxy = H2cProxy::start().await;
             let session = proxy.connect(&context, SessionParams::default()).await;
             let stream = connect_unique(
@@ -627,7 +626,7 @@ fn rejected_head<'a>(error: &'a HttpError, case: &str) -> &'a HttpMessage {
     rejected.response()
 }
 
-/// A fwdproxy-style error head.
+/// A forward-proxy error head.
 const FWDPROXY_ERROR_FIELDS: [(&str, &str); 3] = [
     ("Proxy-Status", "fwdproxy; error=destination_ip_unroutable"),
     ("X-FB-Error-From", "fwdproxy"),
@@ -689,7 +688,7 @@ fn rejection_exposes_status_head_and_core_message() {
             assert_eq!(read.code(), HttpErrorCode::CONNECT_ERROR);
 
             // With a body, Drop's close() resets the unfinished response with
-            // CANCEL before the session sees the abort (expectation-303).
+            // CANCEL before the session sees the abort.
             let (error, read) = h2c_rejection(&context, &proxy, b"fwdproxy error body").await;
             assert_eq!(
                 server_fields(rejected_head(&error, "h2c body")),
@@ -699,8 +698,8 @@ fn rejection_exposes_status_head_and_core_message() {
             assert_eq!(read.code(), HttpErrorCode::CANCEL);
             proxy.shutdown().await;
 
-            // The frozen `ConnectHandler` answers `Fail` with a 107, then a 500
-            // with END_STREAM.
+            // `ConnectHandler` responds to `Fail` with a 107, then a 500 with
+            // END_STREAM.
             let proxy = H2cProxy::start().await;
             proxy.expect_exceptions();
             let session = proxy.connect(&context, SessionParams::default()).await;
@@ -824,7 +823,7 @@ fn timeout_cancellation_and_peer_reset_carry_no_rejection() {
             assert_eq!(
                 error.http_message().and_then(HttpMessage::response_status),
                 Some(500),
-                "the queued head rides on the error (`SRC-010`)"
+                "the queued head rides on the error"
             );
             assert!(connect_rejection(&error).is_none());
 
@@ -851,7 +850,8 @@ fn timeout_cancellation_and_peer_reset_carry_no_rejection() {
             assert!(error.http_message().is_none());
             assert!(connect_rejection(&error).is_none());
 
-            // A cancellation that carries a queued 503 head (`DIV-019`).
+            // A cancellation after a queued 503 head carries that head but not
+            // a rejection cause.
             let reads = Rc::new(BufferedReads::default());
             let session = proxy.connect(&context, observed_params(&reads)).await;
             let cancel = CancellationSource::new();
@@ -914,8 +914,8 @@ fn timeout_cancellation_and_peer_reset_carry_no_rejection() {
 }
 
 /// The CONNECT request for [`AUTHORITY`] and [`wire_connect_headers`], as
-/// `connect/src/stream.rs` sent it before the `DIV-011` extension, which must
-/// leave it unchanged.
+/// recorded before response-head retention was added. Retaining the head
+/// must not change these bytes, so do not regenerate them.
 const RECORDED_CONNECT_REQUEST: &[u8] = b"CONNECT example.com:443 HTTP/1.1\r\n\
 Host: example.com:443\r\n\
 Foo: Bar\r\n\
