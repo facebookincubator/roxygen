@@ -43,6 +43,20 @@ Pick [hyper](https://hyper.rs) instead if you need a stable release on
 crates.io, HTTP/3, Windows support, or a model in which every handler is `Send`
 and runs on a work-stealing runtime.
 
+## Performance
+
+On the HTTP/2 profiles of [HttpArena](https://github.com/MDA2AV/HttpArena),
+an `HttpServer` on the owned HTTP/2 driver serves:
+
+| Profile | Requests per second |
+| --- | --- |
+| `baseline-h2`: query parsing over TLS | 16.4M |
+| `baseline-h2c`: query parsing over cleartext HTTP/2 | 16.6M |
+| `static-h2`: static files over TLS | 2.1M |
+
+The server ran on 64 CPUs of an AMD EPYC 9004 machine, with h2load on 64
+others. Each request costs the server about 2.3 µs of CPU.
+
 ## Example
 
 A server that answers every request with a fixed body. Roxygen is not on
