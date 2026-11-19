@@ -298,7 +298,7 @@ mod byte_stream {
 
     fn drop_counted_waker(data: *const ()) {
         // SAFETY: `data` is `Arc::into_raw` of a `WakerCounts`, and the dropped (or consumed)
-        // waker owns the strong count released here, which nothing else releases.
+        // waker owns the strong count released here, which is not released anywhere else.
         unsafe { Arc::decrement_strong_count(data.cast::<WakerCounts>()) };
     }
 
@@ -896,7 +896,7 @@ mod byte_stream {
         });
     }
 
-    /// N3c: a read whose backend queue is already bounded at the read's maximum returns that
+    /// A read whose backend queue is already bounded at the read's maximum returns that
     /// queue instead of moving its bytes into a new one. The result keeps the bound, remaining
     /// capacity, backing bound and segment views that the moved copy had, and data with EOF
     /// still defers the EOF to the next read.
@@ -951,8 +951,8 @@ mod byte_stream {
         });
     }
 
-    /// `DIV-058`: a backend queue bounded at the read's maximum that holds a segment longer than
-    /// the allocation size is returned as it is, with that segment whole and its backing bound.
+    /// A backend queue bounded at the read's maximum that holds a segment longer than the
+    /// allocation size is returned as it is, with that segment whole and its backing bound.
     #[test]
     fn a_read_bounded_at_its_maximum_keeps_segments_over_the_allocation_size() {
         run_worker(|context| async move {
@@ -4069,7 +4069,7 @@ mod byte_stream {
     /// A pending read polled again with the waker it holds keeps that clone: three polls with
     /// one waker clone it once for the transport's read, once for the deadline's wait, and once
     /// per pending poll in the fake backend, which keeps each pending poll's waker. The read's
-    /// never-cancellable token clones none.
+    /// never-cancellable token does not clone it.
     #[test]
     fn a_read_polled_again_with_its_waker_clones_it_once() {
         run_worker(|context| async move {
@@ -4129,9 +4129,8 @@ mod byte_stream {
             }
         }
 
-        /// A backend whose `read` drops the transport, which leaves the read
-        /// start's upgraded `io` as the backend's last owner, and whose
-        /// destruction then panics.
+        /// A backend whose `read` drops the transport, leaving the read start's
+        /// upgraded `io` as the backend's last owner. Its destruction then panics.
         struct StartupDropIo {
             inner: FakeIo,
             transport: Rc<RefCell<Option<OwnedByteStream>>>,
@@ -4206,7 +4205,7 @@ mod byte_stream {
         }
 
         /// The backend's destruction panics after the read start admitted its
-        /// read: the read is retired during that unwind, before the panic
+        /// read. The read is retired during that unwind, before the panic
         /// leaves `start_read`, and a panic in the read's own cleanup does not
         /// replace the backend's.
         fn startup_unwind_cleans_read(panic_on_read_drop: bool) {
@@ -4308,7 +4307,7 @@ mod byte_stream {
             }
         }
 
-        /// A backend whose queued writer drops the transport at a write's start, and whose
+        /// A backend whose queued writer drops the transport at a write's start. Its
         /// destruction then panics.
         struct StartupDropWriteIo {
             inner: FakeIo,
@@ -4372,11 +4371,11 @@ mod byte_stream {
             }
         }
 
-        /// The backend's destruction panics after the write start registered its write: the
+        /// The backend's destruction panics after the write start registered its write. The
         /// write is retired during that unwind, before the panic leaves
         /// `OwnedWriteQueue::start_write`, and a panic in the write's own cleanup does not
-        /// replace the backend's. With byte events the queue's write starts through
-        /// `start_write_operation`; without them it is written through at entry and, left
+        /// replace the backend's. With byte events, the queue's write starts through
+        /// `start_write_operation`. Without them, it is written through at entry and, if left
         /// pending, registered there.
         fn startup_unwind_cleans_write(byte_events: ByteEventCapability, panic_on_retire: bool) {
             run_worker(move |context| async move {
@@ -4522,7 +4521,7 @@ mod byte_stream {
         }
 
         /// `start_read` has `read`'s entry results and clamps: the read offered to the backend,
-        /// an empty read for a zero maximum, a zero allocation size refused, and a read refused
+        /// an empty read for a zero maximum, a zero allocation size rejected, and a read rejected
         /// while another is pending.
         #[test]
         fn owned_reader_reads_keep_reads_entry_results_and_clamps() {
@@ -4585,8 +4584,8 @@ mod byte_stream {
             });
         }
 
-        /// Starting a read while one is started, or polling without one, is refused and changes
-        /// nothing.
+        /// Starting a read while one is started, or polling without one, returns an error and
+        /// leaves the reader unchanged.
         #[test]
         fn owned_reader_refuses_misuse() {
             run_worker(|context| async move {
@@ -4673,8 +4672,8 @@ mod byte_stream {
         }
 
         /// Cancelling a pending read wakes its task, as the read API's wait does, and the read
-        /// fails with `CORO_CANCELLED`; bytes that arrived first still win; a cancelled token
-        /// refuses a read at entry.
+        /// fails with `CORO_CANCELLED`. Bytes that arrived first still win. A cancelled token
+        /// rejects a read at entry.
         #[test]
         fn owned_reader_cancellation_wakes_and_fails_the_pending_read() {
             run_worker(|context| async move {
@@ -4840,8 +4839,8 @@ mod byte_stream {
             });
         }
 
-        /// `DIV-018`: because the registration outlives each read, a cancellation requested
-        /// while no read is started wakes the waker that the last pending read registered.
+        /// Because the registration outlives each read, a cancellation requested while no read is
+        /// started wakes the waker that the last pending read registered.
         #[test]
         fn a_cancellation_between_reader_reads_wakes_the_last_read_waker() {
             run_worker(|context| async move {
@@ -5105,7 +5104,7 @@ mod byte_stream {
             });
         }
 
-        /// A reader read whose poll panics stays started: a new read is refused, and the next
+        /// A reader read whose poll panics stays started: a new read is rejected, and the next
         /// poll finishes the same read with the bytes that arrive.
         #[test]
         fn a_reader_read_whose_poll_panics_stays_started() {
@@ -5178,7 +5177,7 @@ mod byte_stream {
         /// A pending reader read polled again with the waker it holds keeps that clone: three
         /// polls with one waker clone it once for the read and once per pending poll in the
         /// fake backend, which keeps each pending poll's waker. The reader's never-cancellable
-        /// token clones none.
+        /// token does not clone it.
         #[test]
         fn a_reader_read_polled_again_with_its_waker_clones_it_once() {
             run_worker(|context| async move {

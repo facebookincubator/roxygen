@@ -81,7 +81,7 @@ use crate::established::IoDropPublisher;
 use crate::tcp_zero_copy::TcpZeroCopy;
 use crate::tls::CiphertextWriteTimeout;
 
-/// Concrete TCP constructor whose public surface contains only Roxygen types.
+/// TCP transport constructors. Their signatures do not expose Tokio types.
 pub struct TcpTransport;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -253,9 +253,8 @@ impl OwnedRead {
     }
 
     /// Polls `stream` once into `capacity` bytes of a stack buffer, then
-    /// copies the returned bytes into an exact-size first buffer (`DIV-008`).
-    /// An offer above `STAGING_LIMIT` is instead polled into new uninitialized
-    /// space.
+    /// copies the returned bytes into an exact-size first buffer. An offer
+    /// above `STAGING_LIMIT` is instead polled into new uninitialized space.
     fn poll_stage<S>(
         &mut self,
         stream: &mut S,
@@ -399,8 +398,8 @@ where
         let polled = if gathered == 0 {
             first(read, stream, context, capacity)
         } else {
-            // A continuation refused for budget would end the batch early,
-            // and the read returns after a pending one, so that poll must
+            // A continuation stopped by the budget would end the batch early.
+            // The read returns after a pending continuation, so that poll must
             // not leave `context`'s waker registered.
             pin!(coop::unconstrained(poll_fn(|context| {
                 read.poll_fill(stream, context, capacity)
@@ -429,8 +428,8 @@ fn poll_tcp_first(
     context: &mut Context<'_>,
     capacity: usize,
 ) -> Poll<io::Result<usize>> {
-    // The readiness poll below spends no budget, so a task without budget is
-    // refused here, as Tokio's `poll_read` would refuse it.
+    // The readiness poll below does not spend budget, so a task that is out
+    // of budget gets `Pending` here, as it would from Tokio's `poll_read`.
     if !coop::has_budget_remaining() {
         drop(ready!(coop::poll_proceed(context)));
     }
@@ -450,15 +449,14 @@ fn poll_tcp_first(
     polled
 }
 
-/// The least tailroom that a reader read's first offer reuses: Proxygen's
-/// `kMinReadSize`, which `HTTPUniplexTransportSession::readLoop` passes to
-/// `IOBufQueue::preallocate`.
+/// The minimum tailroom that an `OwnedReader` read's first offer reuses. This
+/// matches Proxygen's minimum read size.
 const MIN_READ_SIZE: usize = 1_460;
 
-/// The buffer whose tailroom the `OwnedReader` reads of a TCP stream reuse
-/// (`DIV-018`), as Proxygen's session `IOBufQueue` keeps its tail buffer
-/// between reads. A read hands out the bytes it filled as a view of the
-/// buffer, which keeps the rest; it holds no bytes between reads.
+/// A buffer that successive `OwnedReader` reads of a TCP stream fill in turn,
+/// each in the tailroom that earlier reads left. A read hands out the bytes it
+/// filled as a view of the buffer. The buffer does not hold unread bytes
+/// between reads.
 #[derive(Default)]
 pub(crate) struct ReadRoom {
     buffer: BytesMut,
@@ -469,10 +467,9 @@ pub(crate) struct ReadRoom {
 impl ReadRoom {
     /// Readies the tailroom for a first offer of at most `capacity` bytes and
     /// returns the offer. When the tailroom is short of `capacity`, the whole
-    /// buffer is reclaimed if no view of it is left; otherwise the tailroom is
-    /// offered while it holds at least `min(MIN_READ_SIZE, capacity)` bytes, as
-    /// `IOBufQueue::preallocate` offers it, and a new buffer of `capacity`
-    /// bytes replaces it when it holds less.
+    /// buffer is reclaimed if no view of it is left. Otherwise the tailroom is
+    /// offered while it holds at least `min(MIN_READ_SIZE, capacity)` bytes,
+    /// and a new buffer of `capacity` bytes replaces it when it holds less.
     fn prepare(&mut self, capacity: usize) -> usize {
         let tailroom = self.buffer.capacity();
         if tailroom < capacity {
@@ -525,9 +522,9 @@ impl ReadRoom {
     }
 }
 
-/// `poll_tcp_first` for a reader read: the poll fills the reader's `room`,
-/// prepared only once Tokio reports the socket readable, and `Ready` carries
-/// the bytes read and the bytes offered.
+/// Like `poll_tcp_first`, but fills the reader's `room`, which is prepared
+/// only once Tokio reports the socket readable. `Ready` carries the bytes read
+/// and the bytes offered.
 fn poll_tcp_first_into_room(
     room: &mut ReadRoom,
     read: &mut OwnedRead,
@@ -553,10 +550,9 @@ fn poll_tcp_first_into_room(
     Poll::Ready(Ok((length, offered)))
 }
 
-/// The read loop of `poll_gather` for a reader read over TCP, whose first poll
-/// fills the reader's `room` (`poll_tcp_first_into_room`). A first poll that
-/// fills what it offered, which can be less than `allocation_size`, continues
-/// the read.
+/// The read loop of `poll_gather` for an `OwnedReader` read over TCP, with a
+/// first poll that fills the reader's `room`. A first poll that fills what it
+/// offered, which can be less than `allocation_size`, continues the read.
 fn poll_gather_into_room(
     stream: &mut TcpStream,
     context: &mut Context<'_>,
@@ -615,10 +611,11 @@ pub(crate) fn io_write_futures_for_test() -> usize {
 
 pub(crate) trait TokioByteStream: AsyncRead + AsyncWrite + Unpin + 'static {
     /// Whether the transport offers a [`crate::byte_stream::OwnedWriteQueue`] over this
-    /// stream: plaintext TCP.
+    /// stream. Only plaintext TCP does.
     const WRITE_QUEUE: bool = false;
 
-    /// Whether `poll_read_drained` can report a drained stream: plaintext TCP.
+    /// Whether `poll_read_drained` can report a drained stream. Only plaintext
+    /// TCP can.
     const READ_DRAINS: bool = false;
 
     fn prepare_reset(&self);
@@ -631,18 +628,18 @@ pub(crate) trait TokioByteStream: AsyncRead + AsyncWrite + Unpin + 'static {
     ///
     /// The default polls into uninitialized capacity, never a zero-filled
     /// buffer. It offers `allocation_size` bytes first and, while a poll fills
-    /// what it was offered (Folly's `READ_CONTINUE`), offers the gathered
-    /// length again, capped at the rest of `maximum`, where Folly keeps a
-    /// constant step (`DIV-017`). Once data is available a read therefore
-    /// polls at most `1 + ceil(log2(ceil(maximum /
-    /// allocation_size)))` times. It returns at a short poll, EOF, an error or
-    /// `maximum`, and never waits once it holds bytes. Only the first poll
-    /// spends Tokio's cooperative budget or registers `context`'s waker.
+    /// what it was offered, offers the gathered length again, capped at the
+    /// rest of `maximum`, so that the gathered length doubles with each filled
+    /// poll. Once data is available a read therefore polls at most
+    /// `1 + ceil(log2(ceil(maximum / allocation_size)))` times. It returns at a
+    /// short poll, EOF, an error or `maximum`, and never waits once it holds
+    /// bytes. Only the first poll spends Tokio's cooperative budget or
+    /// registers `context`'s waker.
     ///
     /// A first offer of at most `STAGING_LIMIT` bytes is polled into a stack
     /// buffer, and the bytes it returns are copied into a buffer of exactly
-    /// their length (`DIV-008`), so a pending read holds no buffer. A larger
-    /// first offer is reserved before the poll and held while the read waits.
+    /// their length, so a pending read does not hold a buffer. A larger first
+    /// offer is reserved before the poll and held while the read waits.
     fn poll_read_owned(
         &mut self,
         context: &mut Context<'_>,
@@ -661,7 +658,7 @@ pub(crate) trait TokioByteStream: AsyncRead + AsyncWrite + Unpin + 'static {
     }
 
     /// `poll_read_owned` for an `OwnedReader` read, which may first fill the
-    /// reader's `room` (`DIV-018`). The default leaves `room` unused.
+    /// reader's `room`. The default leaves `room` unused.
     fn poll_read_reusing(
         &mut self,
         context: &mut Context<'_>,
@@ -675,15 +672,15 @@ pub(crate) trait TokioByteStream: AsyncRead + AsyncWrite + Unpin + 'static {
 
     fn cancel_read(&mut self) {}
 
-    /// Called after a reader read that gathered bytes with no error or EOF:
-    /// whether the stream is drained, its read readiness cleared, in which
-    /// case this poll registered `context`'s waker for the next. The default
-    /// reports nothing.
+    /// Called after an `OwnedReader` read that gathered bytes without an error
+    /// or EOF. Returns whether the stream is drained, with its read readiness
+    /// cleared, in which case this poll has registered `context`'s waker for
+    /// the next read. The default returns `false`.
     fn poll_read_drained(&self, _context: &mut Context<'_>) -> bool {
         false
     }
 
-    /// `OwnedReader::peer_closed`. The default reports nothing.
+    /// Backs `OwnedReader::peer_closed`. The default returns `false`.
     fn peer_closed(&self) -> bool {
         false
     }
@@ -770,7 +767,7 @@ impl TokioByteStream for TcpStream {
 
     /// Reads as the default does, except that the first poll is Tokio's own
     /// `poll_read` into a buffer reserved only once the socket is readable,
-    /// so a pending read holds no buffer and the bytes are not copied.
+    /// so a pending read does not hold a buffer and the bytes are not copied.
     fn poll_read_owned(
         &mut self,
         context: &mut Context<'_>,
@@ -806,7 +803,7 @@ impl TokioByteStream for TcpStream {
     }
 
     /// Tokio clears a socket's read readiness at a read shorter than its
-    /// buffer, or one that would block; its readiness poll then registers
+    /// buffer, or one that would block. Its readiness poll then registers
     /// `context`'s waker. The budget is ignored so that the poll reports the
     /// reactor's readiness.
     fn poll_read_drained(&self, context: &mut Context<'_>) -> bool {
@@ -828,8 +825,8 @@ fn poll_tcp_drained(stream: &TcpStream, context: &mut Context<'_>) -> bool {
 
 /// Tokio keeps the waker of a pending read until the socket becomes readable
 /// or is polled again, so a read ended without data polls readiness once more
-/// with a waker that holds nothing. The budget is ignored so that this poll
-/// always reaches the reactor.
+/// with a no-op waker. The budget is ignored so that this poll always reaches
+/// the reactor.
 fn release_read_waker(stream: &TcpStream) {
     let _ = pin!(coop::unconstrained(poll_fn(|context| {
         stream.poll_read_ready(context)
@@ -1604,8 +1601,8 @@ where
     }
 }
 
-/// Ends a write: a close drain waiting for it resumes, or a shutdown requested
-/// during it is attempted once.
+/// Ends a write. A close drain waiting for it resumes, or a shutdown requested
+/// during the write is attempted once.
 fn end_write<S>(shared: &TokioIoShared<S>)
 where
     S: TokioByteStream,
@@ -1636,7 +1633,8 @@ enum IoWriteStage {
         zero_copy: bool,
     },
     Flush,
-    /// The write side was shut during the write, which shuts it after its bytes.
+    /// Shutdown was requested during the write, so the write side shuts after
+    /// its bytes.
     Shutdown,
 }
 
@@ -1749,7 +1747,7 @@ where
     }
 }
 
-/// Polls the stream once to gather at most `maximum` bytes into `read`;
+/// Polls the stream once to gather at most `maximum` bytes into `read`.
 /// `Ready` carries whether the stream reached EOF. Inlined into
 /// `TokioByteStreamIo::read`'s future, which polls once per wake.
 #[inline(always)]
@@ -1773,8 +1771,8 @@ where
 }
 
 /// Whether a read that gathered `read` and `ended` reached EOF. An error ends
-/// a read that gathered nothing; after gathered bytes it is deferred to the
-/// next read (`DIV-016`).
+/// a read that has not gathered any bytes. After gathered bytes, the error is
+/// deferred to the next read.
 fn read_eof<S>(
     shared: &TokioIoShared<S>,
     read: &OwnedRead,
@@ -1786,10 +1784,8 @@ where
     match ended {
         Ok(eof) => Ok(eof),
         Err(error) if read.is_empty() => Err(error),
-        // A socket reports a failure once, so the next read returns it
-        // after these bytes, as EOF is deferred (`deferredReadEOF_`).
-        // Folly's `Transport::read` throws instead, so Proxygen never
-        // parses these bytes (`DIV-016`).
+        // A socket reports a failure only once, so the next read returns it
+        // after these bytes are delivered, as EOF is deferred.
         Err(error) => {
             shared.read_error.set(Some(error));
             Ok(false)
@@ -1798,7 +1794,7 @@ where
 }
 
 /// A [`PolledReader`]'s state: the active read, and the room that its reads
-/// reuse (`DIV-018`).
+/// reuse.
 #[derive(Default)]
 struct PolledRead {
     read: Option<IoRead>,
@@ -1823,11 +1819,12 @@ impl IoRead {
     }
 }
 
-/// Polls a `PolledReader` read with the steps of `ByteStreamIo::read`'s
-/// future: a read error deferred from the previous read, else at most
-/// `maximum` gathered bytes (`DIV-016`), the first of them in `room` when the
-/// stream reuses it. With `arm`, gathered bytes with no error or EOF poll
-/// whether the stream is drained (`TokioByteStream::poll_read_drained`).
+/// Polls a `PolledReader` read with the same steps as the future of
+/// `ByteStreamIo::read`. It returns a read error deferred from the previous
+/// read, or else at most `maximum` gathered bytes, the first of them in `room`
+/// when the stream reuses it. With `arm`, a read that gathered bytes without
+/// an error or EOF also polls whether the stream is drained
+/// (`TokioByteStream::poll_read_drained`).
 fn poll_io_read<S>(
     shared: &TokioIoShared<S>,
     context: &mut Context<'_>,
@@ -1966,10 +1963,10 @@ where
         self.hold_queued_write(IoWrite::new(data, progress, flags, byte_events));
     }
 
-    /// Polls a write state of its own with `poll_io_write`, as the active
-    /// write, and holds it only when the attempt leaves it unfinished or
-    /// panics before it ends. An attempt that finishes the write ends it as
-    /// `poll_write` does, within the attempt.
+    /// Makes one `poll_io_write` attempt at a new active write. The write is
+    /// held as the queued write only if the attempt leaves it unfinished or
+    /// panics before it ends. A finished write ends within the attempt, as in
+    /// `poll_write`.
     fn write_through(&self, data: BufQueue, progress: &WriteProgress) -> WriteThrough {
         if let Some(stream) = self.stream.borrow_mut().as_mut() {
             stream.prepare_write_timeout(Duration::ZERO);

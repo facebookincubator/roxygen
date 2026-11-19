@@ -401,7 +401,7 @@ mod byte_event_delivery {
         }
 
         /// Arms one TX or ACK event and then cancels its registration in
-        /// place, as a stream reset leaves it; also leaves a zero-count
+        /// place, as a stream reset leaves it. Also leaves a zero-count
         /// in-flight boundary after a socket cancellation.
         fn populate_stale(
             observer: &AsyncSocketByteEventObserver,

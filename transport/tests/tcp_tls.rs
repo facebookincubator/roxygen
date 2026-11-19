@@ -358,8 +358,8 @@ mod tcp_tls {
         fn prepare_reset(&self) {}
     }
 
-    /// A stream that offers the native write queue, whose first write panics and whose later
-    /// writes take every byte into `written`.
+    /// A stream that offers the native write queue. Its first write panics and its later writes
+    /// take every byte into `written`.
     struct FirstWritePanicStream {
         panicked: bool,
         written: Rc<RefCell<Vec<u8>>>,
@@ -403,8 +403,8 @@ mod tcp_tls {
         fn prepare_reset(&self) {}
     }
 
-    /// A stream whose reads can report a drained stream, as plaintext TCP's do, whose first read
-    /// poll panics and whose later polls return `data` once.
+    /// A stream whose reads can report a drained stream, as plaintext TCP's do. Its first read
+    /// poll panics and its later polls return `data` once.
     struct FirstReadPanicStream {
         panicked: bool,
         data: Option<&'static [u8]>,
@@ -4192,8 +4192,8 @@ mod tcp_tls {
 
     #[test]
     fn tcp_read_that_returns_after_a_pending_continuation_releases_its_waker() {
-        /// Reads 1_000 queued bytes, so the continuation that follows the
-        /// filled first buffer finds the socket empty.
+        /// Reads 1_000 queued bytes, so the socket is empty for the
+        /// continuation that follows the filled first buffer.
         fn read_queued<S: TokioByteStream>(stream: &mut S, kind: &str) {
             let signal = Arc::new(WakeSignal::default());
             let waker = Waker::from(Arc::clone(&signal));
@@ -4883,8 +4883,9 @@ mod tcp_tls {
         });
     }
 
-    /// Pins the socket behavior `DIV-016` relies on: Linux returns the bytes
-    /// queued before a reset, then reports the reset once, then EOF.
+    /// Checks the socket behavior that deferred read errors rely on: Linux
+    /// returns the bytes queued before a reset, then reports the reset once,
+    /// then EOF.
     #[cfg(target_os = "linux")]
     #[test]
     fn tcp_reset_after_a_filled_buffer_fails_the_next_read_once() {
@@ -4964,8 +4965,8 @@ mod tcp_tls {
     #[cfg(target_os = "linux")]
     const UNRECEIVED_BURST: usize = 48 * 1024;
 
-    /// Writes `UNRECEIVED_BURST` bytes on an accepted stream whose peer reads
-    /// nothing until `close_with_reset` has closed it; returns how many bytes the
+    /// Writes `UNRECEIVED_BURST` bytes on an accepted stream whose peer does not
+    /// read until `close_with_reset` has closed it. Returns how many bytes the
     /// peer then read and whether the connection ended with a reset.
     #[cfg(target_os = "linux")]
     fn reset_with_bytes_in_flight(non_abortive: bool) -> (usize, bool) {
@@ -5037,7 +5038,7 @@ mod tcp_tls {
             }))
     }
 
-    /// Pins the default: the linger-zero close discards the bytes still in the
+    /// Checks the default: the linger-zero close discards the bytes still in the
     /// send buffer and resets the peer.
     #[cfg(target_os = "linux")]
     #[test]
@@ -5096,8 +5097,8 @@ mod tcp_tls {
     #[test]
     fn allocation_sized_reads_preserve_bytes_and_eof() {
         // With a 7-byte allocation size and a 64-byte maximum, a 7-byte payload
-        // fills the first buffer and its EOF ends the next poll; 64 bytes fill a
-        // whole read; 1_000 bytes take many reads.
+        // fills the first buffer and its EOF ends the next poll. 64 bytes fill a
+        // whole read, and 1_000 bytes take many reads.
         for (length, expected_sizes) in [
             (7, vec![7]),
             (64, vec![64]),
@@ -5205,9 +5206,9 @@ mod tcp_tls {
             }));
     }
 
-    /// `DIV-058`: a TLS read returns its plaintext copy as one segment, in the queue the backend
-    /// built, however small its allocation size. One 12_000-byte record comes back as one
-    /// 12_000-byte segment backed by exactly those bytes.
+    /// A TLS read returns its plaintext copy as one segment, in the queue the backend built,
+    /// however small its allocation size. One 12_000-byte record comes back as one 12_000-byte
+    /// segment backed by exactly those bytes.
     #[test]
     fn a_tls_read_returns_its_plaintext_as_one_segment() {
         Builder::new_current_thread()
@@ -7279,7 +7280,7 @@ mod tcp_tls {
                 wait_for_stream_drop(&control).await;
                 assert_eq!(*log.cancelled.borrow(), expected);
 
-                // Graceful close: the unbound registration at once, the
+                // Graceful close: the unbound registration immediately, the
                 // stream's byte events when the drain retires the stream.
                 let control = DrainControl::default();
                 let log = Rc::new(TransportMessageLog::default());
@@ -7306,7 +7307,7 @@ mod tcp_tls {
                 drop(transport);
                 assert_eq!(*log.cancelled.borrow(), expected);
 
-                // Close after a completed half-close retires the stream at once.
+                // Close after a completed half-close retires the stream immediately.
                 let control = DrainControl::default();
                 control.permit_shutdowns(1);
                 let log = Rc::new(TransportMessageLog::default());
@@ -7659,7 +7660,7 @@ mod tcp_tls {
         #[cfg(target_os = "linux")]
         use crate::tcp_zero_copy::send_iovec_arrays_for_test;
 
-        /// The send and receive buffer size both ends of a `with_accepted_tcp` connection pin.
+        /// The send and receive buffer size set on both ends of a `with_accepted_tcp` connection.
         /// Pinned buffers do not autotune, so what the connection holds while the peer does not
         /// read stays far below `STALLING_WRITE` whatever the host's TCP buffer settings and
         /// however much the connection has carried.
@@ -8433,8 +8434,7 @@ mod tcp_tls {
                     arrays,
                     "queued writes of a few segments pass their iovecs from the stack"
                 );
-                // Control: a write of more than 64 segments builds one heap iovec array, as
-                // `folly::AsyncSocket::writeChain` allocates beyond `kSmallIoVecSize`.
+                // Control: a write of more than 64 segments builds one heap iovec array.
                 let many = [&b"x"[..]; 65];
                 writer.start_write(queue(&many)).unwrap();
                 let receipt = poll_fn(|context| writer.poll_complete(context)).await;
@@ -8547,10 +8547,9 @@ mod tcp_tls {
             tokio::task::yield_now().await;
         }
 
-        /// Toward `folly::AsyncSocket::writeImpl`, which writes at once when no write is
-        /// pending: a submission to an idle queue goes out at entry when its first attempt
-        /// finishes it. Its capacity and saturation still wait for the next poll, which delivers
-        /// its receipt, as when that poll wrote it.
+        /// A submission to an idle queue goes out at entry when its first attempt finishes it.
+        /// Its capacity and saturation still wait for the next poll, which delivers its receipt,
+        /// as when that poll wrote it.
         #[test]
         fn a_submission_its_first_attempt_finishes_is_written_at_entry() {
             with_accepted_tcp(limits(), |context, transport, mut peer| async move {
@@ -8584,8 +8583,8 @@ mod tcp_tls {
             });
         }
 
-        /// A write that its first attempt finishes is never registered with the transport as
-        /// an operation.
+        /// A write finished by its first attempt is never registered with the transport as an
+        /// operation.
         #[test]
         fn writes_finished_at_entry_register_no_transport_write() {
             with_accepted_tcp(limits(), |context, transport, mut peer| async move {
@@ -8679,9 +8678,9 @@ mod tcp_tls {
             });
         }
 
-        /// A first attempt that finds the socket full (`WouldBlock`) leaves the whole write
-        /// outstanding. The poll that pends registers the polling task's waker, so the
-        /// socket's writability wakes that task and the next poll finishes the write.
+        /// A first attempt against a full socket (`WouldBlock`) leaves the whole write outstanding.
+        /// The poll that pends registers the polling task's waker, so the socket's writability
+        /// wakes that task and the next poll finishes the write.
         #[test]
         fn a_first_attempt_that_would_block_leaves_the_write_to_the_queues_polls() {
             with_observed_tcp(
@@ -8735,7 +8734,7 @@ mod tcp_tls {
         }
 
         /// A first attempt that fails delivers its failure receipt, with the bytes it wrote, at
-        /// the next poll, as a first poll's failure did; capacity waits for that poll.
+        /// the next poll. Capacity waits for that poll.
         #[test]
         fn a_first_attempt_that_fails_delivers_its_receipt_at_the_next_poll() {
             with_observed_tcp(limits(), |context, transport, peer, observer| async move {
@@ -8770,9 +8769,9 @@ mod tcp_tls {
             });
         }
 
-        /// The queue's cancellation applies to its outstanding write. A write that its first
-        /// attempt finished is no longer outstanding, so a later cancellation leaves its receipt
-        /// and refuses the next submission at entry, as for an idle queue.
+        /// The queue's cancellation applies to its outstanding write. A write finished by its
+        /// first attempt is not outstanding, so a later cancellation leaves its receipt and
+        /// rejects the next submission at entry, as for an idle queue.
         #[test]
         fn a_cancellation_after_a_write_finished_at_entry_refuses_the_next_submission() {
             with_accepted_tcp(limits(), |context, transport, mut peer| async move {
@@ -8811,9 +8810,9 @@ mod tcp_tls {
             });
         }
 
-        /// A first attempt that panics leaves the write outstanding, as a first poll that
-        /// panicked did: the panic surfaces from `start_write`, the write stays registered and
-        /// holds the queue's capacity, and the next poll continues it.
+        /// A first attempt that panics leaves the write outstanding. The panic surfaces from
+        /// `start_write`, the write stays registered and holds the queue's capacity, and the
+        /// next poll continues it.
         #[test]
         fn a_first_attempt_that_panics_leaves_the_write_outstanding() {
             Builder::new_current_thread()
@@ -8880,7 +8879,7 @@ mod tcp_tls {
                 }));
         }
 
-        /// A write that its first attempt finishes is never held as backend write state, the
+        /// A write finished by its first attempt is never held as backend write state, the
         /// record that an unfinished write keeps for the queue's polls to continue.
         #[test]
         fn writes_finished_at_entry_hold_no_backend_write_state() {
@@ -8955,8 +8954,8 @@ mod tcp_tls {
             });
         }
 
-        /// A write that its first attempt finished is not outstanding, so shutting the write
-        /// side before the queue is polled half-closes at once, after the write's bytes.
+        /// A write finished by its first attempt is not outstanding, so shutting the write side
+        /// before the queue is polled half-closes immediately, after the write's bytes.
         #[test]
         fn a_shutdown_after_a_write_finished_at_entry_half_closes_after_its_bytes() {
             with_accepted_tcp(limits(), |context, transport, mut peer| async move {
@@ -8982,8 +8981,8 @@ mod tcp_tls {
             });
         }
 
-        /// With zero-copy enabled, a submission that its first attempt finishes is still sent
-        /// with `MSG_ZEROCOPY`: its bytes stay retained until the kernel's completion.
+        /// With zero-copy enabled, a submission finished by its first attempt is still sent
+        /// with `MSG_ZEROCOPY`, and its bytes stay retained until the kernel's completion.
         #[cfg(target_os = "linux")]
         #[test]
         fn a_zero_copy_submission_finished_at_entry_retains_its_bytes_until_completion() {
@@ -9291,8 +9290,8 @@ mod tcp_tls {
         }
 
         /// A submission made while a first attempt writes, here from the drop of the owner of a
-        /// segment the attempt wrote, is refused as while the backend holds a write, so no
-        /// other write lands inside the attempt's bytes.
+        /// segment the attempt wrote, is rejected as while the backend holds a write, so another
+        /// write cannot land inside the attempt's bytes.
         #[test]
         fn a_submission_during_a_first_attempt_is_refused() {
             with_scripted_stream(usize::MAX, |context, transport, observed| async move {
@@ -9335,9 +9334,8 @@ mod tcp_tls {
         }
 
         /// A first attempt that fails, and whose unwritten bytes' owner panics as it drops,
-        /// leaves the write outstanding as a first poll whose cleanup panicked did: the panic
-        /// surfaces from `start_write`, the write stays registered, and dropping the queue
-        /// resets the transport.
+        /// leaves the write outstanding. The panic surfaces from `start_write`, the write stays
+        /// registered, and dropping the queue resets the transport.
         #[test]
         fn a_panic_dropping_a_failed_first_attempts_bytes_leaves_the_write_outstanding() {
             with_scripted_stream(0, |context, transport, observed| async move {
@@ -9420,7 +9418,7 @@ mod tcp_tls {
         use crate::tcp_tls_tests::tcp_tls::native_write_queue::with_accepted_tcp;
 
         /// As `with_accepted_tcp`, with a peer that disables Nagle's algorithm and a clone of the
-        /// accepted socket through which the test sees how many bytes are queued.
+        /// accepted socket through which the test checks how many bytes are queued.
         pub(super) fn with_observed_tcp<F, Fut>(limits: ByteStreamLimits, test: F)
         where
             F: FnOnce(WorkerContext, OwnedByteStream, TcpStream, std::net::TcpStream) -> Fut
@@ -9459,9 +9457,9 @@ mod tcp_tls {
                 }));
         }
 
-        /// `DIV-018`: once a reader read's bytes are released, the next read reclaims the same
-        /// buffer, so sequential reads make one first-buffer reservation, where a buffer per read
-        /// would make three.
+        /// Once a reader read's bytes are released, the next read reclaims the same buffer, so
+        /// sequential reads make one first-buffer reservation, where a buffer per read would make
+        /// three.
         #[test]
         fn tcp_reader_reads_reuse_one_reclaimed_buffer() {
             with_accepted_tcp(limits(), |context, transport, mut peer| async move {
@@ -9492,9 +9490,9 @@ mod tcp_tls {
             });
         }
 
-        /// N3c: the TCP backend bounds a read's queue at the read's maximum, so a reader read
-        /// whose bytes fit one allocation-size buffer returns that queue instead of moving its
-        /// bytes into a new one, with the same bound, bytes and backing.
+        /// The TCP backend bounds a read's queue at the read's maximum, so a reader read whose
+        /// bytes fit one allocation-size buffer returns that queue instead of moving its bytes into
+        /// a new one, with the same bound, bytes and backing.
         #[test]
         fn tcp_reader_reads_within_their_bounds_keep_the_backends_queue() {
             with_accepted_tcp(limits(), |context, transport, mut peer| async move {
@@ -9521,7 +9519,7 @@ mod tcp_tls {
             });
         }
 
-        /// N3c through `read`: an ordinary TCP read within its bounds also returns the queue the
+        /// Through `read`, an ordinary TCP read within its bounds also returns the queue the
         /// backend built.
         #[test]
         fn tcp_reads_within_their_bounds_keep_the_backends_queue() {
@@ -9551,10 +9549,9 @@ mod tcp_tls {
             });
         }
 
-        /// `DIV-058`: a TCP reader read that continues past its first buffer (`DIV-017`) returns
-        /// the buffers it gathered, unsplit, in the queue the backend built: a 64-byte burst read
-        /// with a 7-byte allocation size comes back as 7, 7, 14, 28 and 8 bytes, backed by the
-        /// 64 bytes offered.
+        /// A TCP reader read that continues past its first buffer returns the buffers it gathered,
+        /// unsplit, in the queue the backend built: a 64-byte burst read with a 7-byte allocation
+        /// size comes back as 7, 7, 14, 28 and 8 bytes, backed by the 64 bytes offered.
         #[test]
         fn a_tcp_reader_read_past_its_first_buffer_returns_its_gathered_buffers() {
             with_observed_tcp(
@@ -9587,10 +9584,10 @@ mod tcp_tls {
             );
         }
 
-        /// `DIV-058` through `read`: an ordinary TCP read of a 31_041-byte burst with a
-        /// 4_000-byte allocation size gathers 4_000, 4_000, 8_000 and 15_041 bytes, its last offer
-        /// of 16_000 bytes ending short, and returns those buffers, unsplit, in the queue the
-        /// backend built, backed by the 32_000 bytes offered.
+        /// Through `read`, an ordinary TCP read of a 31_041-byte burst with a 4_000-byte allocation
+        /// size gathers 4_000, 4_000, 8_000 and 15_041 bytes, its last offer of 16_000 bytes ending
+        /// short, and returns those buffers, unsplit, in the queue the backend built, backed by the
+        /// 32_000 bytes offered.
         #[test]
         fn a_tcp_read_past_its_first_buffer_returns_the_buffers_it_gathered() {
             with_observed_tcp(
@@ -9626,10 +9623,9 @@ mod tcp_tls {
             );
         }
 
-        /// `DIV-018`, toward `IOBufQueue::preallocate`: while earlier reads' bytes are held, a
-        /// reader read fills the rest of their buffer as long as at least Proxygen's
-        /// `kMinReadSize` (1_460) bytes of it are left, and otherwise takes a new
-        /// `allocation_size` buffer. Each read's view reports its whole buffer as backing.
+        /// While earlier reads' bytes are held, a reader read fills the rest of their buffer as
+        /// long as at least `MIN_READ_SIZE` (1_460) bytes of it are left, and otherwise takes a
+        /// new `allocation_size` buffer. Each read's view reports its whole buffer as backing.
         #[test]
         fn tcp_reader_reads_fill_a_retained_buffers_tailroom() {
             let limits = ByteStreamLimits::new(8_000, 1024, 8).unwrap();
@@ -9641,8 +9637,9 @@ mod tcp_tls {
                         .unwrap()
                         .unwrap();
                     let reservations = tcp_first_reservations_for_test();
-                    // 2_000 and 540 bytes leave 1_460 bytes of the 4_000-byte buffer, which the third
-                    // read still fills; its 100 bytes leave 1_360, so the fourth takes a new buffer.
+                    // 2_000 and 540 bytes leave 1_460 bytes of the 4_000-byte buffer, which the
+                    // third read still fills. Its 100 bytes leave 1_360, so the fourth takes a new
+                    // buffer.
                     let mut held = Vec::new();
                     for (seed, length) in (0u8..).zip([2_000, 540, 100, 100]) {
                         let burst = pattern(length, seed);
@@ -9684,7 +9681,7 @@ mod tcp_tls {
         }
 
         /// A first offer of partial tailroom that the read fills continues the read, as a full
-        /// first buffer does (`DIV-017`), so one read still returns the whole burst.
+        /// first buffer does, so one read still returns the whole burst.
         #[test]
         fn a_tcp_reader_read_that_fills_partial_tailroom_continues() {
             let limits = ByteStreamLimits::new(8_000, 1024, 8).unwrap();
@@ -9717,7 +9714,7 @@ mod tcp_tls {
             );
         }
 
-        /// A reader read that finds no data reserves no buffer; the first bytes reserve one.
+        /// A reader read of an empty socket does not reserve a buffer. The first bytes reserve one.
         #[test]
         fn a_pending_tcp_reader_read_reserves_nothing_before_data() {
             with_accepted_tcp(limits(), |context, transport, mut peer| async move {
@@ -9851,8 +9848,8 @@ mod tcp_tls {
             });
         }
 
-        /// `DIV-018`: dropping a reader whose read pends ends only that read. The transport keeps
-        /// the reader's buffer, so the next reader's read reclaims it instead of reserving one.
+        /// Dropping a reader whose read pends ends only that read. The transport keeps the reader's
+        /// buffer, so the next reader's read reclaims it instead of reserving one.
         #[test]
         fn dropping_a_pending_tcp_reader_read_keeps_the_readers_buffer() {
             with_accepted_tcp(limits(), |context, transport, mut peer| async move {
@@ -9935,11 +9932,11 @@ mod tcp_tls {
             unsafe { Waker::from_raw(clone_reader_waker(std::ptr::null())) }
         }
 
-        /// Parks a first reader's read under `reader_waker`, whose release while the dropped
-        /// reader cancels that read starts a second reader's read on the same transport, then
-        /// panics if `panic_after_start`. The replacement read survives the old read's cleanup
-        /// and reads the next bytes. A `cancellable` first reader's wake registration also holds
-        /// `reader_waker` clones.
+        /// Parks a first reader's read under `reader_waker`. When the dropped reader cancels that
+        /// read, releasing `reader_waker` starts a second reader's read on the same transport,
+        /// then panics if `panic_after_start`. The replacement read survives the old read's
+        /// cleanup and reads the next bytes. A `cancellable` first reader's wake registration
+        /// also holds `reader_waker` clones.
         fn replacement_during_reader_drop(panic_after_start: bool, cancellable: bool) {
             with_accepted_tcp(limits(), move |context, transport, mut peer| async move {
                 let cancellation = CancellationSource::new();
@@ -10156,7 +10153,7 @@ mod tcp_tls {
             transport.close(context).unwrap();
         }
 
-        /// Reads `one ` through a read started and polled at once with `reader_waker`, a read
+        /// Reads `one ` through a read started and polled immediately with `reader_waker`, a read
         /// that drains the socket, so that the reader's cancellation wake keeps that waker.
         async fn drain_with_reader_waker(reader: &mut OwnedReader, peer: &mut TcpStream) {
             peer.write_all(b"one ").await.unwrap();
@@ -10200,7 +10197,7 @@ mod tcp_tls {
             });
         }
 
-        /// A drained reader's next read that finds bytes and drains the socket again, with a
+        /// A drained reader's next read that gets bytes and drains the socket again, with a
         /// cancellation requested, ends its registration before the reader's cancellation wake
         /// releases its `reader_waker` clone, whose drop starts a second reader's read. The
         /// replacement read survives.
@@ -10296,7 +10293,7 @@ mod tcp_tls {
 
         /// A started read's pending poll with a new waker replaces the `reader_waker` that the
         /// reader's cancellation wake kept from an earlier read outside the transport's state,
-        /// so that waker's drop can start a second reader's read. The transport refuses it while
+        /// so that waker's drop can start a second reader's read. The transport rejects it while
         /// the first read pends.
         #[test]
         fn a_tcp_reader_poll_releases_its_replaced_cancellation_waker_outside_the_transport() {
@@ -10345,9 +10342,9 @@ mod tcp_tls {
             });
         }
 
-        /// `DIV-016` through a reader: the bytes queued before a TCP reset come first although
-        /// the read's continuation poll met the reset, the next read reports the reset once,
-        /// and the one after is EOF.
+        /// Through a reader, the bytes queued before a TCP reset come first although the read's
+        /// continuation poll met the reset, the next read reports the reset once, and the one after
+        /// is EOF.
         #[cfg(target_os = "linux")]
         #[test]
         fn tcp_reader_returns_bytes_before_a_later_reset() {
@@ -10487,8 +10484,8 @@ mod tcp_tls {
                 }));
         }
 
-        /// `DIV-018` through a reader: a TCP reader read's first buffer has the allocation size's
-        /// capacity, as `read`'s does.
+        /// Through a reader, a TCP reader read's first buffer has the allocation size's capacity,
+        /// as `read`'s does.
         #[test]
         fn tcp_reader_read_first_buffer_has_the_allocation_size() {
             with_accepted_tcp(limits(), |context, transport, mut peer| async move {
@@ -10529,7 +10526,7 @@ mod tcp_tls {
             }
         }
 
-        /// H2-L6: a read started and polled at once that ends at a short read reports the stream
+        /// A read started and polled immediately that ends at a short read reports the stream
         /// drained, and the next bytes wake the waker of the poll that returned it. A read that
         /// fills its maximum leaves the socket readable, so it does not report the stream drained.
         #[test]
@@ -10595,10 +10592,10 @@ mod tcp_tls {
             DropTransport,
         }
 
-        /// H2-L6: a drained reader keeps its read registered with the waker of the poll that
-        /// drained the socket. Closing, resetting or dropping the transport therefore wakes that
-        /// waker and releases the socket's clone of it, as for a pending read, and the next read
-        /// observes the end.
+        /// A drained reader keeps its read registered with the waker of the poll that drained the
+        /// socket. Closing, resetting or dropping the transport therefore wakes that waker and
+        /// releases the socket's clone of it, as for a pending read, and the next read observes the
+        /// end.
         fn ending_after_a_drained_read(ending: Ending) {
             with_observed_tcp(
                 limits(),
@@ -10649,9 +10646,9 @@ mod tcp_tls {
             ending_after_a_drained_read(Ending::Close);
         }
 
-        /// H2-L6: a drained reader's next drained read moves its registration to the waker of
-        /// that read's poll, as a pending read's poll moves it: a close then wakes that waker,
-        /// not an earlier one.
+        /// A drained reader's next drained read moves its registration to the waker of that
+        /// read's poll, as a pending read's poll moves it. A close then wakes that waker, not an
+        /// earlier one.
         #[test]
         fn closing_after_drained_reads_wakes_the_latest_drained_poll() {
             with_observed_tcp(
@@ -10707,8 +10704,8 @@ mod tcp_tls {
             Reset,
         }
 
-        /// `DIV-035`: `peer_closed` reports a peer's FIN or RST once it is in the socket, behind
-        /// unread bytes too, whether or not Tokio has seen it, and consumes nothing.
+        /// `peer_closed` reports a peer's FIN or RST once it is in the socket, behind unread
+        /// bytes too, whether or not Tokio has seen it, and does not consume any bytes.
         #[cfg(target_os = "linux")]
         #[test]
         fn a_tcp_reader_reports_the_peer_s_close_behind_unread_bytes() {
@@ -10764,10 +10761,10 @@ mod tcp_tls {
             }
         }
 
-        /// H2-L6: a drained reader's read stays registered, so an ordinary read is refused while
-        /// it is, as while a pending read is. Dropping the reader ends that registration as it
-        /// ends a pending read: the read is unregistered, the socket's clone of the waker is
-        /// released, and the transport's next read gets the next bytes.
+        /// A drained reader's read stays registered, so an ordinary read is rejected while it is,
+        /// as while a pending read is. Dropping the reader ends that registration as it ends a
+        /// pending read: the read is unregistered, the socket's clone of the waker is released, and
+        /// the transport's next read gets the next bytes.
         #[test]
         fn dropping_a_drained_tcp_reader_releases_its_registration() {
             with_observed_tcp(
@@ -10810,8 +10807,8 @@ mod tcp_tls {
             );
         }
 
-        /// H2-L6: `start_read` on a drained reader ends the drained registration as a cancelled
-        /// read ends, releasing the socket's clone of its waker, then starts the read it asks for.
+        /// `start_read` on a drained reader ends the drained registration as a cancelled read
+        /// ends, releasing the socket's clone of its waker, then starts the requested read.
         #[test]
         fn start_read_after_a_drained_tcp_reader_read_ends_its_registration() {
             with_observed_tcp(
@@ -10843,9 +10840,9 @@ mod tcp_tls {
             );
         }
 
-        /// H2-L6: reads started and polled at once register no read per read. The first drained
+        /// Reads started and polled immediately are not registered one by one. The first drained
         /// read registers the reader's read once and the reads after it reuse that registration
-        /// while they find bytes, where `start_read` registers each read.
+        /// while they read bytes, where `start_read` registers each read.
         #[test]
         fn tcp_reader_reads_polled_at_once_reuse_one_registration() {
             with_observed_tcp(
@@ -10889,8 +10886,8 @@ mod tcp_tls {
             );
         }
 
-        /// A read started and polled at once that finds no bytes pends registered, as a started
-        /// read does: another start is refused, and the next bytes wake and complete it.
+        /// A read started and polled immediately on an empty socket pends registered, as a
+        /// started read does: another start is rejected, and the next bytes wake and complete it.
         #[test]
         fn a_tcp_reader_read_polled_at_once_without_bytes_pends_registered() {
             with_accepted_tcp(limits(), |context, transport, mut peer| async move {
@@ -10924,10 +10921,10 @@ mod tcp_tls {
             });
         }
 
-        /// Reads started and polled at once keep `read`'s entry results and clamps: an empty read
-        /// for a zero maximum, a zero allocation size refused, a read refused while an ordinary
-        /// read pends, the maximum clamped to the transport's limit, a cancelled reader refused,
-        /// and EOF after a graceful close.
+        /// Reads started and polled immediately keep `read`'s entry results and clamps: an empty
+        /// read for a zero maximum, a zero allocation size rejected, a read rejected while an
+        /// ordinary read pends, the maximum clamped to the transport's limit, a cancelled reader
+        /// rejected, and EOF after a graceful close.
         #[test]
         fn tcp_reader_reads_polled_at_once_keep_reads_entry_results() {
             with_observed_tcp(
@@ -11015,7 +11012,7 @@ mod tcp_tls {
             );
         }
 
-        /// A read started and polled at once that pends registers its reader's cancellation
+        /// A read started and polled immediately that pends registers its reader's cancellation
         /// wake, as a pending poll of a started read does: cancelling wakes it and fails it.
         #[test]
         fn a_cancellation_wakes_and_fails_a_pending_tcp_reader_read_polled_at_once() {
@@ -11040,10 +11037,10 @@ mod tcp_tls {
             });
         }
 
-        /// H2-L6: a drained reader's cancellation wake follows the waker of the poll that
-        /// drained the socket, as it follows that of a pending poll: cancelling wakes that waker,
-        /// not an earlier one, and the next read fails with `CORO_CANCELLED`, releasing every
-        /// clone of the waker.
+        /// A drained reader's cancellation wake follows the waker of the poll that drained the
+        /// socket, as it follows that of a pending poll: cancelling wakes that waker, not an
+        /// earlier one, and the next read fails with `CORO_CANCELLED`, releasing every clone of the
+        /// waker.
         #[test]
         fn a_cancellation_wakes_a_drained_tcp_reader_and_fails_its_next_read() {
             with_observed_tcp(
@@ -11057,7 +11054,7 @@ mod tcp_tls {
                     let first = Arc::new(WakeSignal::default());
                     drain_once(&mut reader, &first, &mut peer, &observer).await;
                     // The bytes wake the first waker, so the socket is readable when the second
-                    // polls, and that poll reads them at once and drains the socket again.
+                    // polls, and that poll reads them immediately and drains the socket again.
                     peer.write_all(b"two ").await.unwrap();
                     time::timeout(Duration::from_secs(5), first.wait())
                         .await
@@ -11097,9 +11094,9 @@ mod tcp_tls {
             );
         }
 
-        /// A read started and polled at once whose first socket poll panics stays started, as a
-        /// started read whose poll panics does: it stays registered, another start is refused,
-        /// and the next poll finishes the same read.
+        /// A `poll_start_read` read whose first socket poll panics stays started, as any started
+        /// read does when its poll panics. It stays registered, another start is rejected, and
+        /// the next poll finishes the same read.
         #[test]
         fn a_reader_read_polled_at_once_whose_poll_panics_stays_started() {
             Builder::new_current_thread()
@@ -11163,10 +11160,10 @@ mod tcp_tls {
                 }));
         }
 
-        /// The state of a `hooked_waker`, whose strong count counts the waker's clones. Its wakes
-        /// set `signal`. The first clone after `cancel_on_clone` is set requests that
-        /// cancellation, and once `drops_before_panic` is set, the drop after that many more drops
-        /// panics; a wake that consumes a clone is not a drop.
+        /// The state of a `hooked_waker`. Its strong count counts the waker's clones, and its
+        /// wakes set `signal`. The first clone after `cancel_on_clone` is set requests that
+        /// cancellation. Once `drops_before_panic` is set, the drop after that many more drops
+        /// panics. A wake that consumes a clone is not a drop.
         #[derive(Default)]
         struct HookedWake {
             signal: Arc<WakeSignal>,
@@ -11245,11 +11242,11 @@ mod tcp_tls {
             }
         }
 
-        /// H2-L6: a cancellation requested before a drained reader's next read finds bytes loses
-        /// to those bytes, but that read's readiness poll registered its waker with the socket.
-        /// As the cancellation leaves the read not drained, the read ends its registration as a
-        /// cancelled read ends, which releases that clone: once the reader is dropped, the open
-        /// transport holds no clone of the waker.
+        /// A cancellation requested before a drained reader's next read gets bytes loses to
+        /// those bytes, but that read's readiness poll registered its waker with the socket. As
+        /// the cancellation leaves the read not drained, the read ends its registration as a
+        /// cancelled read ends, which releases that clone. Once the reader is dropped, the open
+        /// transport does not hold any clone of the waker.
         #[test]
         fn a_cancellation_overtaking_a_drained_tcp_reader_read_with_bytes_releases_its_waker() {
             with_observed_tcp(
@@ -11293,9 +11290,9 @@ mod tcp_tls {
             );
         }
 
-        /// H2-L6: as for a drained reader's next read, a cancellation requested before a pending
-        /// read polled at once finds bytes loses to them, and the read releases the waker that
-        /// its readiness poll registered with the socket.
+        /// As for a drained reader's next read, a cancellation requested before a pending read
+        /// polled immediately gets bytes loses to them, and the read releases the waker that its
+        /// readiness poll registered with the socket.
         #[test]
         fn a_cancellation_overtaking_a_pending_tcp_reader_read_with_bytes_releases_its_waker() {
             with_accepted_tcp(limits(), |context, transport, mut peer| async move {
@@ -11334,9 +11331,9 @@ mod tcp_tls {
             });
         }
 
-        /// H2-L6: a cancellation requested while an idle reader's read polled at once is under
-        /// way, here by its readiness poll's clone of the waker, loses to the bytes that read
-        /// found, and the read releases the waker that the poll registered with the socket.
+        /// A cancellation requested while an idle reader's read polled immediately is under way,
+        /// here by its readiness poll's clone of the waker, loses to the bytes that read returned,
+        /// and the read releases the waker that the poll registered with the socket.
         #[test]
         fn a_cancellation_during_an_idle_tcp_reader_read_with_bytes_releases_its_waker() {
             with_accepted_tcp(limits(), |context, transport, mut peer| async move {
@@ -11391,9 +11388,9 @@ mod tcp_tls {
             });
         }
 
-        /// A read started and polled at once that pends stays started when updating the reader's
-        /// cancellation wake panics, here at the drop of the waker the update replaces: the read
-        /// stays registered, another start is refused, and the next poll resumes it.
+        /// A read started and polled immediately that pends stays started when updating the
+        /// reader's cancellation wake panics, here at the drop of the waker the update replaces.
+        /// The read stays registered, another start is rejected, and the next poll resumes it.
         #[test]
         fn a_reader_read_polled_at_once_whose_cancellation_wake_update_panics_stays_started() {
             with_accepted_tcp(limits(), |context, transport, mut peer| async move {
@@ -11451,10 +11448,10 @@ mod tcp_tls {
             });
         }
 
-        /// H2-L6: a pending read polled at once whose bytes drain the socket is the reader's
-        /// drained read before it updates the reader's cancellation wake, so when that update
-        /// panics, here at the drop of the waker it replaces, the reader is drained, its read
-        /// registered, and its next read finds the next bytes.
+        /// A pending read polled immediately whose bytes drain the socket is the reader's drained
+        /// read before it updates the reader's cancellation wake, so when that update panics, here
+        /// at the drop of the waker it replaces, the reader is drained, its read registered, and
+        /// its next read returns the next bytes.
         #[test]
         fn a_drained_tcp_reader_read_whose_cancellation_wake_update_panics_stays_drained() {
             with_accepted_tcp(limits(), |context, transport, mut peer| async move {
@@ -11476,7 +11473,7 @@ mod tcp_tls {
                     .expect("the bytes wake the pending read");
 
                 // The woken read's poll first moves the read's registration off the hooked
-                // waker; the drop after that one, of the cancellation wake's clone, panics.
+                // waker. The drop after that one, of the cancellation wake's clone, panics.
                 *hooked.drops_before_panic.lock().unwrap() = Some(1);
                 let signal = Arc::new(WakeSignal::default());
                 let waker = Waker::from(Arc::clone(&signal));
@@ -11522,8 +11519,9 @@ mod tcp_tls {
         })
     }
 
-    /// A timed plaintext write whose ciphertext TCP takes at once needs no background service, so
-    /// it builds no deadline timer; one whose ciphertext is staged builds exactly one.
+    /// A timed plaintext write whose ciphertext TCP accepts immediately does not need the
+    /// background task, so it does not build a deadline timer. One whose ciphertext is staged
+    /// builds exactly one.
     #[test]
     fn tls_timed_write_builds_a_deadline_timer_only_for_staged_ciphertext() {
         Builder::new_current_thread()
@@ -11710,10 +11708,10 @@ mod tcp_tls {
         );
     }
 
-    /// A timed write whose ciphertext TCP takes at once builds no deadline timer. The next one,
-    /// whose ciphertext is staged, builds its timer only at the staging, yet the deadline still
-    /// runs from that write's start, and its expiry reports `WRITE_TIMEOUT` to the operation it
-    /// poisons.
+    /// A timed write whose ciphertext TCP accepts immediately does not build a deadline timer.
+    /// The next one, whose ciphertext is staged, builds its timer only at the staging, yet the
+    /// deadline still runs from that write's start, and its expiry reports `WRITE_TIMEOUT` to
+    /// the operation it poisons.
     #[test]
     fn tls_lazily_built_write_deadline_reports_write_timeout() {
         Builder::new_current_thread()

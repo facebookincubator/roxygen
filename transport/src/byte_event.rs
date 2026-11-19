@@ -765,8 +765,9 @@ impl AsyncSocketByteEventObserver {
     }
 
     /// Whether the observer is still registered with its worker. An observer
-    /// without byte events holds no worker cleanup, so it reports `false` once
-    /// the worker leaves `Open`, rather than once the shutdown drain closes it.
+    /// without byte events does not hold a worker cleanup registration, so it
+    /// returns `false` once the worker leaves `Open`, rather than once the
+    /// shutdown drain closes it.
     pub fn is_registered(&self) -> bool {
         !self.state.borrow().closed
             && (self.cleanup_registration.borrow().is_some()
@@ -1229,9 +1230,10 @@ impl AsyncSocketByteEventObserver {
         Ok(wait)
     }
 
-    /// Observes retirement of registrations, executing callbacks and timeout refs
-    /// for one stream. The caller must first stop producing new registrations.
-    /// One driver waiter is supported per stream; this never cancels byte events.
+    /// Returns `Ready` once the registrations, running callbacks and timeout refs
+    /// of one stream have retired. The caller must first stop producing new
+    /// registrations. Only one waiting task per stream is supported. This does
+    /// not cancel byte events.
     pub fn poll_stream_events_drained(
         &self,
         context: &WorkerContext,

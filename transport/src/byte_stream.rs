@@ -53,7 +53,7 @@ use crate::established::AdoptedIoCompletionError;
 
 pub type LocalTransportFuture<T> = Pin<Box<dyn Future<Output = T> + 'static>>;
 
-/// Failure to confirm a backend value or its registered close future retired.
+/// Error naming the transport retirement steps that could not be confirmed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
 pub enum TransportRetirementError {
     #[error("transport I/O value destruction was not confirmed")]
@@ -64,14 +64,15 @@ pub enum TransportRetirementError {
     BothUnconfirmed,
 }
 
-/// Repeatable observation of backend-value and existing close-scope retirement.
+/// Observes when a transport's I/O value and close future have been dropped.
 ///
-/// Confirmation follows destruction of the complete I/O value and its owned
-/// fields, and of the registered close future and captures. It does not certify
-/// I/O success, peer delivery, shared referents, TLS background-task retirement,
-/// zero-copy completion descriptor aliases, or physical worker joins. The
-/// original worker/reactor must remain driven. Observation retains no I/O or
-/// worker ownership; dropping it does not activate or cancel cleanup.
+/// Success means the complete I/O value, its owned fields, the registered close
+/// future and its captures have all been dropped. It does not report whether
+/// the I/O succeeded or reached the peer, and it does not cover the TLS
+/// background task. With zero-copy enabled, the duplicate socket descriptor
+/// that receives completions can stay open after success. The original worker
+/// and reactor must keep running. This value does not own the I/O or the
+/// worker, and dropping it neither starts nor cancels cleanup.
 #[derive(Clone)]
 pub struct TransportRetirement {
     completion: AdoptedIoCompletion,
@@ -82,7 +83,8 @@ impl TransportRetirement {
         Self { completion }
     }
 
-    /// Waits for both boundaries even when either is unconfirmed.
+    /// Waits for both the I/O value and the close future, even when one of them
+    /// is unconfirmed.
     pub fn wait_retired(
         &self,
     ) -> impl Future<Output = Result<(), TransportRetirementError>> + Send + 'static {
@@ -196,12 +198,13 @@ pub struct TransportRead {
 }
 
 impl TransportRead {
-    /// Builds the result of an external `ByteStreamTransport::read`, whose
-    /// contract nothing checks. `data` holds at most the `maximum` passed to
-    /// `read`. For a non-zero `maximum`, `data` is empty only with `eof`, as
-    /// `folly::coro::TransportIf` reports EOF as a 0-byte read. The session
-    /// reads again at once after an empty result without `eof`, so a transport
-    /// that returns one while idle spins instead of reaching its read timeout.
+    /// Builds the result of an external `ByteStreamTransport::read`.
+    ///
+    /// `data` must hold at most the `maximum` passed to `read`. For a non-zero
+    /// `maximum`, `data` may be empty only when `eof` is set. These rules are
+    /// not checked. The session reads again immediately after an empty result
+    /// without `eof`, so a transport that returns one while idle spins instead
+    /// of reaching its read timeout.
     pub fn new(data: BufQueue, eof: bool) -> Self {
         Self::from_io(data, eof)
     }
@@ -389,28 +392,27 @@ pub trait ByteStreamTransport: 'static {
     }
 }
 
-/// The poll-based reader of an [`OwnedByteStream`] ([`ByteStreamTransport::reader`]),
-/// through which the owned uniplex drivers read instead of with one read future
-/// per read.
+/// A poll-based reader for an [`OwnedByteStream`] ([`ByteStreamTransport::reader`]).
 ///
-/// It starts one read at a time, and its reads reuse one read operation. Each
-/// read has `read`'s entry checks, clamps, results, close and cancellation
-/// outcomes, and `DIV-016`/`DIV-017`/`DIV-018` behavior, except for timing: it
-/// has no deadline, its completion wakes no task, and over a Tokio-backed
-/// stream its I/O state lives in the backend, so it allocates no future. Over
-/// TCP its first poll fills the tailroom of a buffer that the transport keeps
-/// between reads (`DIV-018`), where a `read` starts a new buffer. A
-/// cancellation wakes a pending read, as a timed read's wait does. The reader
+/// The owned uniplex drivers read through it instead of calling `read` for
+/// each read. It starts one read at a time, and its reads reuse one read
+/// operation. Each read has the same entry checks, clamps, buffer growth,
+/// results, and close and cancellation outcomes as `read`, except for timing.
+/// It has no deadline, its completion does not wake a task, and over a
+/// Tokio-backed stream its I/O state lives in the backend, so it does not
+/// allocate a future. Over TCP its first poll fills the tailroom of a buffer
+/// that the transport keeps between reads, where a `read` starts a new buffer.
+///
+/// A cancellation wakes a pending read, as a timed read's wait does. The reader
 /// registers that wake once for all its reads, so a cancellation requested
 /// while no read is started wakes the task that last polled a pending read,
-/// or that last received a drained read (`DIV-018`). Dropping the reader with
-/// a read started, or drained, cancels that read, as dropping a read future
-/// does.
+/// or that last received a drained read. Dropping the reader with a read
+/// started, or drained, cancels that read, as dropping a read future does.
 ///
-/// Over plaintext TCP, a read started and polled at once (`poll_start_read`)
-/// registers nothing with the transport when it is ready at once. One that
-/// drains the socket (`is_drained`) stays registered until the next, so that
-/// the owner can wait for the socket without polling a new read.
+/// Over plaintext TCP, a `poll_start_read` read that completes on its first
+/// poll is never registered with the transport. One that drains the socket
+/// (`is_drained`) stays registered until the next read, so that the owner can
+/// wait for the socket without polling a new read.
 pub struct OwnedReader {
     worker: WorkerHandle,
     limits: ByteStreamLimits,
@@ -422,23 +424,24 @@ pub struct OwnedReader {
     polled: Option<Weak<dyn PolledReader>>,
     /// The operation slot. Every read reuses it, with its transport handles.
     operation: ReadOperation,
-    /// Drops after `operation`: a waker it releases can start a replacement read.
+    /// Drops after `operation`, because a waker it releases can start a
+    /// replacement read.
     cancellation: ReaderCancellation,
 }
 
 /// The read an [`OwnedReader`] has started.
 enum ReaderRead {
     Idle,
-    /// The operation slot holds the read; `arm`: `poll_start_read` started it,
-    /// so its backend reports whether it drains the stream.
+    /// The operation slot holds the read. `arm` is set when `poll_start_read`
+    /// started the read, so the backend reports whether it drains the stream.
     Reading {
         arm: bool,
     },
     /// The read ended at entry with this result.
     Finished(Result<TransportRead, HttpError>),
-    /// The read last returned drained the stream. No read is started, but the
-    /// operation slot keeps that read registered with the transport, with the
-    /// waker of the poll that returned it, as a pending read is registered.
+    /// The last returned read drained the stream. No read is started, but the
+    /// operation slot keeps that read registered with the transport under the
+    /// waker of the poll that returned it, as for a pending read.
     Drained,
 }
 
@@ -462,8 +465,8 @@ impl ReaderCancellation {
 
 impl OwnedReader {
     /// Starts a read of at most `maximum` bytes that first offers
-    /// `allocation_size` bytes, with `read`'s entry checks and clamps. An error
-    /// is interface misuse: a started read has not yet been returned.
+    /// `allocation_size` bytes, with `read`'s entry checks and clamps. Returns
+    /// an error if the previously started read has not been returned yet.
     pub fn start_read(&mut self, maximum: usize, allocation_size: usize) -> Result<(), HttpError> {
         match self.read {
             ReaderRead::Idle => {}
@@ -500,7 +503,7 @@ impl OwnedReader {
     }
 
     /// Polls the started read with `context`'s waker. Polling with no started
-    /// read is interface misuse, refused with an error.
+    /// read returns an error.
     pub fn poll_read(
         &mut self,
         context: &mut Context<'_>,
@@ -517,8 +520,9 @@ impl OwnedReader {
                     self.settle_drained(context);
                 } else {
                     self.read = ReaderRead::Idle;
-                    // A cancelled read's wake releases its waker clones once
-                    // the read has ended: their drop can start a replacement.
+                    // A cancelled read's wake releases its waker clones only
+                    // after the read has ended, because dropping them can start
+                    // a replacement read.
                     if result.is_err() && self.cancellation.token.is_cancellation_requested() {
                         self.cancellation.listener.update_waker(context.waker());
                     }
@@ -540,17 +544,16 @@ impl OwnedReader {
         }
     }
 
-    /// Starts a read as `start_read` does and polls it at once with
+    /// Starts a read as `start_read` does and polls it immediately with
     /// `context`'s waker, as `poll_read` does. Starting one while a read is
-    /// started is interface misuse, refused with an error.
+    /// started returns an error.
     ///
-    /// Over plaintext TCP, a read that is ready at once is never registered
-    /// with the transport. A drained reader's next read (`is_drained`) instead
-    /// reuses the registration that stands for the drained read, as the next
-    /// poll of a pending read would: it ends at a close, reset or drop of the
-    /// transport, observes the reader's cancellation if it pends, and otherwise
-    /// polls the socket with the bounds given here, clamped as `read` clamps
-    /// them.
+    /// Over plaintext TCP, a read that completes immediately is never
+    /// registered with the transport. After a drained read (`is_drained`), the
+    /// next read reuses the drained read's registration, as the next poll of a
+    /// pending read would. It ends at a close, reset or drop of the transport,
+    /// observes the reader's cancellation if it pends, and otherwise polls the
+    /// socket with the bounds given here, clamped as `read` clamps them.
     pub fn poll_start_read(
         &mut self,
         context: &mut Context<'_>,
@@ -610,7 +613,8 @@ impl OwnedReader {
         }
     }
 
-    /// `poll_start_read` for a drained reader, whose read is still registered.
+    /// Handles `poll_start_read` for a drained reader, whose read is still
+    /// registered.
     fn poll_drained(
         &mut self,
         context: &mut Context<'_>,
@@ -659,10 +663,10 @@ impl OwnedReader {
     }
 
     /// Leaves the registered read pending, as a pending poll of a started read
-    /// does: the reader's cancellation wake follows `context`'s waker. The read
-    /// is started before that update, which can unwind. A cancellation already
-    /// requested instead fails the read: it ends before the wake releases its
-    /// wakers, so a release that unwinds leaves the reader idle.
+    /// does, so the reader's cancellation wake follows `context`'s waker. The
+    /// read is started before that update, which can unwind. If a cancellation
+    /// was already requested, the read fails instead. It ends before the wake
+    /// releases its wakers, so a release that unwinds leaves the reader idle.
     fn pend(&mut self, context: &Context<'_>) -> Poll<Result<TransportRead, HttpError>> {
         self.read = ReaderRead::Reading { arm: true };
         if self.follow_cancellation(context.waker()) {
@@ -671,11 +675,11 @@ impl OwnedReader {
         Poll::Pending
     }
 
-    /// Settles the drained read that the reader holds registered, and returns
-    /// whether it stays drained: the reader's cancellation wake then follows
-    /// `context`'s waker, as for a pending read. A cancellation already
-    /// requested instead ends the registration as a cancelled read ends, which
-    /// releases the waker that the read's readiness poll left with the socket.
+    /// Keeps the drained read registered and returns whether it stays drained.
+    /// The reader's cancellation wake then follows `context`'s waker, as for a
+    /// pending read. If a cancellation was already requested, the registration
+    /// ends as a cancelled read ends instead, which releases the waker that the
+    /// read's readiness poll left with the socket.
     fn settle_drained(&mut self, context: &Context<'_>) -> bool {
         !self.follow_cancellation(context.waker())
     }
@@ -683,7 +687,7 @@ impl OwnedReader {
     /// Makes the reader's cancellation wake follow `waker`, or, once a
     /// cancellation is requested, ends the registered read as a cancelled read
     /// ends and returns `true`. The read ends before the wake releases its
-    /// waker clones, whose drop can start a replacement read.
+    /// waker clones, because dropping them can start a replacement read.
     #[inline]
     fn follow_cancellation(&mut self, waker: &Waker) -> bool {
         if !self.cancellation.token.is_cancellation_requested()
@@ -723,19 +727,22 @@ impl OwnedReader {
     }
 
     /// Whether the read that `poll_start_read` last returned drained the
-    /// stream: it gathered bytes, with no error or EOF, and left the socket
-    /// unreadable. The waker of the poll that returned it is then registered
-    /// for the socket's next readiness, and the read stays registered with the
-    /// transport with that waker, so a close, reset or drop of the transport,
-    /// or a cancellation, wakes it as it wakes a pending read. Only plaintext
-    /// TCP reads report it.
+    /// stream.
+    ///
+    /// A drained read gathered bytes without an error or EOF and left the
+    /// socket unreadable. The waker of the poll that returned it is then
+    /// registered for the socket's next readiness, and the read stays
+    /// registered with the transport with that waker. A close, reset or drop of
+    /// the transport, or a cancellation, wakes it as it wakes a pending read.
+    /// Only plaintext TCP reads report it.
     pub fn is_drained(&self) -> bool {
         matches!(self.read, ReaderRead::Drained)
     }
 
     /// Whether the peer's FIN or RST has reached the socket, even behind
-    /// unread bytes, as the kernel reports it now rather than as Tokio last
-    /// saw it. It consumes nothing. Only plaintext TCP on Linux reports it.
+    /// unread bytes. This checks the kernel's current state, not Tokio's last
+    /// readiness, and does not consume any bytes. Only plaintext TCP on Linux
+    /// reports it.
     pub fn peer_closed(&self) -> bool {
         self.polled
             .as_ref()
@@ -752,7 +759,7 @@ impl OwnedReader {
     }
 }
 
-/// Unconsumed receipts an [`OwnedWriteQueue`] holds before it refuses submissions.
+/// Unconsumed receipts an [`OwnedWriteQueue`] holds before it rejects submissions.
 const WRITE_QUEUE_RECEIPTS: usize = 8;
 
 /// One retired submission of an [`OwnedWriteQueue`].
@@ -764,31 +771,29 @@ pub struct QueuedWriteCompletion {
 
 /// A submission whose receipt the queue has not yet delivered.
 enum QueuedReceipt {
-    /// The physical write of this many bytes is outstanding.
+    /// A transport write of this many bytes is outstanding.
     Writing(usize),
     Done(QueuedWriteCompletion),
 }
 
 /// The native write queue of an [`OwnedByteStream`] over plaintext TCP
-/// ([`ByteStreamTransport::write_queue`]): a bounded writer with ordered
-/// completion receipts, which the owned uniplex drivers use instead of one
-/// write future per write.
+/// ([`ByteStreamTransport::write_queue`]).
 ///
-/// Like Proxygen coro's uniplex write loop, which keeps one transport write
-/// outstanding while later egress gathers in its write buffer, the queue admits
-/// a submission only while no physical write is outstanding, and holds at most
-/// `WRITE_QUEUE_RECEIPTS` unconsumed receipts. As `folly::AsyncSocket::writeImpl`
-/// writes at once when no write is pending, a submission is attempted at
-/// entry, with no waker. A write that attempt finishes is never registered with
-/// the transport, nor held by its backend. One it leaves unfinished, because
-/// the socket took only part of it or would block, is registered with the
-/// transport, and the rest of its bytes are written as
-/// [`OwnedWriteQueue::poll_complete`] polls it, with the
-/// transport's single-write semantics except for timing: the write has no
-/// deadline and allocates nothing, and its completion wakes no task. Either
-/// way the submission holds the queue's capacity until a poll observes its
-/// completion. A cancellation is observed by the outstanding write at the next
-/// poll, or by the next submission at entry; one requested from another task
+/// It is a bounded writer with ordered completion receipts, which the owned
+/// uniplex drivers use instead of one write future per write. The queue admits
+/// a submission only while a transport write is not outstanding, and holds at
+/// most `WRITE_QUEUE_RECEIPTS` unconsumed receipts. A submission is attempted
+/// at entry, with no waker. A write finished by that attempt is never
+/// registered with the transport or held by its backend. A write left
+/// unfinished, because the socket took only part of it or would block, is
+/// registered with the transport. The rest of its bytes are written as
+/// [`OwnedWriteQueue::poll_complete`] polls it, with the transport's
+/// single-write semantics except for timing. The write has no deadline, does
+/// not allocate, and its completion does not wake a task. Either way the
+/// submission holds the queue's capacity until a poll observes its completion.
+///
+/// The outstanding write observes a cancellation at its next poll, and the next
+/// submission observes it at entry. A cancellation requested from another task
 /// wakes the task that last polled the outstanding write, as a reset of the
 /// transport does. Dropping the queue with a write outstanding resets the
 /// transport, as dropping a write future does.
@@ -800,7 +805,8 @@ pub struct OwnedWriteQueue {
     maximum_write_size: usize,
     cancellation: CancellationToken,
     /// Wakes the task that last polled the outstanding write when another task
-    /// requests cancellation; it installs no listener until a write pends.
+    /// requests cancellation. It does not install a listener until a write
+    /// pends.
     cancellation_wake: CancellationWakeRegistration,
     /// The operation slot. Every write reuses it, with its transport handles
     /// and its progress cell, which counts each write's progress in turn.
@@ -816,26 +822,28 @@ enum Held {
     Free,
     /// The operation slot holds the outstanding write.
     Writing,
-    /// The submission's first attempt finished it at entry; its receipt is done.
+    /// The submission's first attempt finished it at entry, so its receipt is
+    /// done.
     WrittenThrough,
 }
 
 impl OwnedWriteQueue {
-    /// Reports capacity only, for a submission of any size up to the maximum.
+    /// Whether the queue has capacity for a submission of any size up to the
+    /// maximum.
     ///
     /// An outstanding write progresses only while `poll_complete` is polled,
     /// so capacity is withheld until a poll observes the submission's
-    /// completion, as it is for a write finished at entry. That refusal is what
-    /// arms owned HTTP/2's writer for every write the queue holds
-    /// (`UniplexWriteQueue::can_write`).
+    /// completion, as it is for a write finished at entry. Returning `false`
+    /// here is what arms the owned HTTP/2 writer for every write the queue
+    /// holds (`UniplexWriteQueue::can_write`).
     pub fn can_write(&self, _bytes: usize) -> bool {
         self.held == Held::Free && self.receipts.len() < WRITE_QUEUE_RECEIPTS
     }
 
-    /// Submits `data`, which needs capacity and at most the maximum write
-    /// size; an error is interface misuse and leaves no receipt. A submission
-    /// the transport refuses at entry, or an empty one, gets its receipt at
-    /// once, and returns its capacity at once.
+    /// Submits `data`. The queue must have capacity and `data` must fit the
+    /// maximum write size. Otherwise this returns an error and does not leave
+    /// a receipt. A submission that the transport rejects at entry, or an empty
+    /// one, gets its receipt and returns its capacity immediately.
     pub fn start_write(&mut self, data: BufQueue) -> Result<(), HttpError> {
         let requested_bytes = data.chain_length();
         if requested_bytes > self.maximum_write_size {
@@ -909,8 +917,8 @@ impl OwnedWriteQueue {
     }
 
     /// Drives the outstanding write with `context`'s waker and yields the
-    /// oldest receipt once its submission is complete. An idle queue registers
-    /// nothing.
+    /// oldest receipt once its submission is complete. An idle queue does not
+    /// register the waker.
     pub fn poll_complete(&mut self, context: &mut Context<'_>) -> Poll<QueuedWriteCompletion> {
         match self.held {
             Held::Writing => match self.operation.poll_with(context, Some(&self.cancellation)) {
@@ -952,9 +960,10 @@ impl OwnedWriteQueue {
     }
 
     /// Whether bytes submitted now would wait behind bytes the transport has
-    /// not yet accepted: a physical write is outstanding, or the transport can
-    /// no longer write. A write finished at entry counts as outstanding until
-    /// a poll observes its completion, as it withholds capacity until then.
+    /// not yet accepted. That is the case while a write is outstanding, or once
+    /// the write side is shut down or the transport is closing. A write
+    /// finished at entry counts as outstanding until a poll observes its
+    /// completion, because it withholds capacity until then.
     pub fn is_saturated(&self) -> bool {
         let state = self.operation.state.borrow();
         self.held != Held::Free || state.write_shutdown || state.close_state != CloseState::Open
@@ -1089,7 +1098,7 @@ impl ByteEventWriteState {
 /// Private seam implemented by worker-local I/O adapters in this crate.
 pub(crate) trait ByteStreamIo: 'static {
     /// Reads at most `maximum` bytes, offering `allocation_size` bytes of
-    /// capacity first; `begin_read` clamps both and keeps `allocation_size`
+    /// capacity first. `begin_read` clamps both and keeps `allocation_size`
     /// no larger than `maximum`.
     fn read(
         &self,
@@ -1119,14 +1128,14 @@ pub(crate) trait ByteStreamIo: 'static {
 
     fn close_with_reset(&self);
 
-    /// The writer of an [`OwnedWriteQueue`] over this backend; `None` offers no
-    /// queue.
+    /// The writer of an [`OwnedWriteQueue`] over this backend, or `None` if the
+    /// backend does not offer a queue.
     fn queued_writer(&self) -> Option<Rc<dyn QueuedWriter>> {
         None
     }
 
-    /// The reader of an [`OwnedReader`]'s reads over this backend; `None`
-    /// reads through `read`'s future.
+    /// The reader for [`OwnedReader`] reads over this backend, or `None` to
+    /// read through `read`'s future.
     fn polled_reader(&self) -> Option<Rc<dyn PolledReader>> {
         None
     }
@@ -1143,8 +1152,8 @@ pub(crate) trait ByteStreamIo: 'static {
         Ok(())
     }
 
-    /// Makes `close_with_reset` close the socket without the linger-zero reset;
-    /// adapters without an abortive reset ignore it.
+    /// Makes `close_with_reset` close the socket without the linger-zero reset.
+    /// Adapters without an abortive reset ignore it.
     fn enable_non_abortive_close(&self) {}
 
     #[cfg(test)]
@@ -1194,7 +1203,7 @@ enum ActiveReadIo {
 }
 
 impl ActiveReadIo {
-    /// Polls the read; `arm` as `PolledReader::poll_read`.
+    /// Polls the read, with `arm` as in `PolledReader::poll_read`.
     fn poll(
         &mut self,
         context: &mut Context<'_>,
@@ -1206,10 +1215,10 @@ impl ActiveReadIo {
         }
     }
 
-    /// Ends the read with `cancel`, which releases the socket waker. A polled
-    /// read's backend detaches the read's state and the read's guard drops
-    /// before `cancel` runs, so `cancel` can admit a replacement read that the
-    /// old read's cleanup does not retire.
+    /// Ends the read with `cancel`, which releases the socket waker. For a
+    /// polled read, the backend detaches the read's state and the read's guard
+    /// drops before `cancel` runs. That way the old read's cleanup does not
+    /// retire a replacement read that `cancel` admits.
     fn cancel(self, cancel: &mut dyn FnMut()) {
         match self {
             Self::Future(_future) => cancel(),
@@ -1226,8 +1235,8 @@ impl ActiveReadIo {
 }
 
 /// A read that a [`PolledReader`] holds. Dropping it ends the read, as
-/// dropping `ByteStreamIo::read`'s future does; after `Ready` that does
-/// nothing.
+/// dropping `ByteStreamIo::read`'s future does. After `Ready`, dropping it has
+/// no effect.
 struct PolledReadIo(Rc<dyn PolledReader>);
 
 impl Drop for PolledReadIo {
@@ -1237,22 +1246,23 @@ impl Drop for PolledReadIo {
 }
 
 /// A backend that keeps one read's state itself, so that an [`OwnedReader`]
-/// read allocates no future. Each read has the effects of
+/// read does not allocate a future. Each read has the effects of
 /// `ByteStreamIo::read`'s future.
 pub(crate) trait PolledReader {
     fn start_read(&self, maximum: usize, allocation_size: usize);
 
-    /// `Ready` ends the read. With `arm`, a read that gathered bytes with no
+    /// `Ready` ends the read. With `arm`, a read that gathered bytes without an
     /// error or EOF polls the stream's read readiness once more with
-    /// `context`'s waker; when the stream is not readable, which registers that
-    /// waker, the read is marked drained (`TransportRead::with_drained`).
+    /// `context`'s waker. If the stream is not readable, that poll registers
+    /// the waker and the read is marked drained
+    /// (`TransportRead::with_drained`).
     fn poll_read(
         &self,
         context: &mut Context<'_>,
         arm: bool,
     ) -> Poll<Result<TransportRead, HttpError>>;
 
-    /// Starts a read and polls it at once, armed as `poll_read` is.
+    /// Starts a read and polls it immediately, armed as `poll_read` is.
     fn try_read(
         &self,
         context: &mut Context<'_>,
@@ -1263,7 +1273,7 @@ pub(crate) trait PolledReader {
     /// Whether its reads can report a drained stream.
     fn reports_drained(&self) -> bool;
 
-    /// `OwnedReader::peer_closed`.
+    /// Backs `OwnedReader::peer_closed`.
     fn peer_closed(&self) -> bool;
 
     /// Detaches the unfinished read's state, then calls `cancel` once, keeping
@@ -1604,7 +1614,7 @@ struct ActiveWrite {
     waker: Option<Waker>,
 }
 
-/// The I/O of one physical write: an ordinary write's boxed future, or the
+/// The I/O of one transport write: an ordinary write's boxed future, or the
 /// backend that holds an [`OwnedWriteQueue`] write's state.
 enum ActiveIo {
     Future(LocalTransportFuture<Result<(), HttpError>>),
@@ -1621,7 +1631,8 @@ impl ActiveIo {
 }
 
 /// A write that a [`QueuedWriter`] holds. Dropping it ends the write, as
-/// dropping an ordinary write's future does; after `Ready` that does nothing.
+/// dropping an ordinary write's future does. After `Ready`, dropping it has no
+/// effect.
 struct QueuedIo(Rc<dyn QueuedWriter>);
 
 impl Drop for QueuedIo {
@@ -1631,8 +1642,8 @@ impl Drop for QueuedIo {
 }
 
 /// A backend that keeps one write's state itself, so that an
-/// [`OwnedWriteQueue`] write allocates no future. Each write has the effects of
-/// `ByteStreamIo::write`'s future.
+/// [`OwnedWriteQueue`] write does not allocate a future. Each write has the
+/// effects of `ByteStreamIo::write`'s future.
 pub(crate) trait QueuedWriter {
     fn start_write(
         &self,
@@ -1674,18 +1685,18 @@ pub(crate) enum WriteThrough {
     /// after `start_write` and a pending `poll_write`.
     Held,
     /// The attempt panicked, and the caller resumes `panic`. The backend holds
-    /// the write as for `Held`, unless the panic came as the finished write
-    /// ended, which leaves it as a `poll_write` that panicked there does.
+    /// the write as for `Held`. If the panic came as the finished write ended,
+    /// the backend is left as after a `poll_write` that panicked at that point.
     Panicked(TransportPanic),
 }
 
-/// A write's deadline, built once a backend poll leaves the write pending, as
-/// `folly::AsyncSocket::writeImpl` schedules its send timeout only then. A
-/// first backend poll that panics also builds it before the panic resumes, so
-/// that a re-poll finds the deadline and cancellation registered.
+/// A write's deadline, built only once a backend poll leaves the write
+/// pending, so a write finished by its first poll never builds one. A first
+/// backend poll that panics also builds it before the panic resumes, so that
+/// the deadline and cancellation are registered when the write is polled again.
 enum WriteWait {
     /// `started`, the first poll's time, anchors a nonzero timeout's deadline.
-    /// A zero timeout reads no clock.
+    /// A zero timeout does not read the clock.
     Unarmed {
         timeout: Duration,
         cancellation: CancellationToken,
@@ -1701,7 +1712,8 @@ enum WriteWait {
     /// at the point where an armed write's `TimedBaton::drop` wakes it.
     Retired { _wake: CompletionWake },
     /// An [`OwnedWriteQueue`]'s write: no deadline, and the queue's
-    /// cancellation is observed when the write is polled, which wakes no task.
+    /// cancellation is observed when the write is polled, which does not wake a
+    /// task.
     Untimed,
 }
 
@@ -1749,7 +1761,7 @@ fn arm_write_deadline(
         deadline,
         wait: timed_wait,
     };
-    // A completed wait cannot be polled again; the next poll reads its outcome
+    // A completed wait cannot be polled again. The next poll reads its outcome
     // from the baton.
     if let WriteWait::Armed { wait, .. } = wait
         && wait.as_mut().poll(context).is_ready()
@@ -1912,8 +1924,8 @@ impl OwnedByteStream {
         })
     }
 
-    /// The transport's worker cleanup becomes the only owner of `io`; an
-    /// error drops `io` before returning.
+    /// The transport's worker cleanup becomes the only owner of `io`. An error
+    /// drops `io` before returning.
     pub(crate) fn new<I: ByteStreamIo>(
         io: I,
         worker: WorkerHandle,
@@ -1998,10 +2010,10 @@ impl OwnedByteStream {
         self
     }
 
-    /// Returns a cached, non-owning retirement receipt when the backend supports it.
+    /// Returns a cached, non-owning retirement observer when the backend supports it.
     ///
-    /// `None` is unsupported observation, not completed cleanup. This receipt is
-    /// still available after the backend has retired.
+    /// `None` means the backend does not support the observation, not that cleanup
+    /// has completed. The observer stays available after the backend has retired.
     pub fn retirement(&self) -> Option<TransportRetirement> {
         self.assert_owner();
         self.retirement.clone()
@@ -2039,7 +2051,7 @@ impl OwnedByteStream {
         io.enable_zero_copy(context, threshold)
     }
 
-    /// Sets the Folly-style re-enable interval after `ENOBUFS`.
+    /// Sets the interval after which zero-copy is re-enabled following `ENOBUFS`.
     ///
     /// A nonzero interval `N` permits zero-copy again on the `N`th later write
     /// attempt (and therefore skips `N - 1` attempts). Zero leaves zero-copy
@@ -2056,12 +2068,14 @@ impl OwnedByteStream {
         io.set_zero_copy_reenable_threshold(threshold)
     }
 
-    /// Roxygen-only (`DIV-038`): every later reset of this stream (`close_with_reset`,
-    /// and the resets its write failures and abandoned writes cause) closes the socket
-    /// without `SO_LINGER` zero, as dropping a Tokio stream does: the kernel still sends
-    /// the bytes already written, then FIN, or RST only if received bytes are unread.
-    /// The transport-side effects of a reset are unchanged: pending reads and writes
-    /// fail, unwritten bytes are discarded, and byte events are cancelled as on a reset.
+    /// Makes every later reset of this stream close the socket without `SO_LINGER`
+    /// zero, as dropping a Tokio stream does.
+    ///
+    /// This covers `close_with_reset` and the resets that write failures and abandoned
+    /// writes cause. The kernel still sends the bytes already written, then FIN, or RST
+    /// only if received bytes are unread. The transport-side effects of a reset are
+    /// unchanged. Pending reads and writes fail, unwritten bytes are discarded, and byte
+    /// events are cancelled.
     pub fn enable_non_abortive_close(&self, context: &WorkerContext) -> Result<(), HttpError> {
         self.check_context(context)?;
         let Some(io) = self.io.upgrade() else {
@@ -2308,10 +2322,10 @@ impl ReadKind<'_> {
     }
 }
 
-/// `read`'s entry checks and clamps: the clamped bounds of a read that the
-/// transport admits, with the result of `admit`, which runs under the same
-/// borrow of the transport's state, or the result the read ends with at entry.
-/// Inlined into each caller.
+/// Runs `read`'s entry checks and clamps. Returns the clamped bounds of an
+/// admitted read with the result of `admit`, which runs under the same borrow
+/// of the transport's state, or else the result that the read ends with at
+/// entry. Inlined into each caller.
 #[inline(always)]
 fn admit_read<T>(
     target: ReadTarget<'_>,
@@ -2427,8 +2441,8 @@ fn start_read_operation(
 
 /// Releases `io`, the backend's last owner, after [`start_read_operation`]
 /// installed the read `operation`. If the backend's destruction panics, retires
-/// that read and resumes the first panic. Cold and out of line: a read start
-/// whose backend has another owner only drops its count.
+/// that read and resumes the first panic. Cold and out of line, because a read
+/// start whose backend has another owner only drops its count.
 #[cold]
 #[inline(never)]
 fn release_last_backend_owner(
@@ -2514,8 +2528,9 @@ enum WriteStart {
     /// ([`write_through`]).
     WrittenThrough(Result<WriteInfo, TransportWriteError>),
     Finished(Result<WriteInfo, TransportWriteError>),
-    /// As `Started`, for an [`OwnedWriteQueue`] write whose first attempt
-    /// panicked: the caller holds the write as outstanding, then resumes `panic`.
+    /// Like `Started`, for an [`OwnedWriteQueue`] write whose first attempt
+    /// panicked. The caller holds the write as outstanding, then resumes
+    /// `panic`.
     Unwinding {
         operation: u64,
         expected: usize,
@@ -2703,15 +2718,14 @@ fn start_write_operation(
     }
 }
 
-/// Writes an [`OwnedWriteQueue`] submission of `length` bytes through, as
-/// `folly::AsyncSocket::writeImpl` writes at once when no write is pending: one
-/// attempt at entry, polled with no waker ([`QueuedWriter::write_through`]). A
-/// write the attempt finishes is neither registered with the transport nor held
-/// by its backend. One it leaves unfinished, because the socket took only part
-/// of it or would block, or whose attempt panics, is registered as
-/// [`start_write_operation`] registers a queued write, and the queue's next poll
-/// continues it with the poller's waker. The transport offers no byte events, so
-/// no registration waits for this write.
+/// Writes an [`OwnedWriteQueue`] submission with one attempt at entry, polled
+/// with no waker ([`QueuedWriter::write_through`]). Used only when the
+/// transport does not offer byte events, so a byte-event registration never
+/// waits for this write. A write that the attempt finishes is neither
+/// registered with the transport nor held by its backend. If the attempt
+/// leaves the write unfinished or panics, the write is registered as
+/// [`start_write_operation`] registers a queued write, and the queue's next
+/// poll continues it with the poller's waker.
 fn write_through(
     target: &WriteTarget<'_>,
     data: BufQueue,
@@ -3132,11 +3146,11 @@ impl ReadOperation {
     }
 
     /// Ends `active` with `code`. The backend's cancellation releases the
-    /// socket waker, whose drop can start a replacement read, so an
-    /// [`OwnedReader`] read's state is detached and its guard dropped first;
-    /// its buffers and its waker drop after the cancellation returns or
-    /// unwinds. Cold and out of line, so that the `finish(None)` that ends
-    /// each completed read carries none of this.
+    /// socket waker, and dropping that waker can start a replacement read. So
+    /// an [`OwnedReader`] read's state is detached and its guard dropped first,
+    /// and its buffers and waker drop after the cancellation returns or
+    /// unwinds. Cold and out of line, so that the `finish(None)` that ends each
+    /// completed read stays small.
     #[cold]
     #[inline(never)]
     fn cancel_active(io: &Weak<dyn ByteStreamIo>, active: ActiveRead, code: HttpErrorCode) {
@@ -3182,7 +3196,7 @@ impl Future for ReadOperation {
 impl ReadOperation {
     /// Polls the read. An [`OwnedReader`]'s read observes `reader`'s
     /// cancellation, and with `arm` its backend reports whether the read
-    /// drained the stream (`PolledReader::poll_read`); an ordinary read passes
+    /// drained the stream (`PolledReader::poll_read`). An ordinary read passes
     /// neither. Inlined into each caller, which then compiles for its own kind
     /// of read.
     #[inline(always)]
@@ -3259,7 +3273,7 @@ impl ReadOperation {
             }
         };
         // An `OwnedReader` read's cancellation wake follows the waker once the
-        // borrow ends: a waker that the update releases can start a
+        // borrow ends, because a waker that the update releases can start a
         // replacement read.
         if let ReadPoll::Pending = outcome
             && let Some(reader) = reader
@@ -3283,8 +3297,8 @@ impl ReadOperation {
             ReadPoll::Io(result) => result,
         };
         let result = bounded_read(result, self.maximum);
-        // A read that drained its stream stays registered, for its reader to
-        // settle (`OwnedReader::settle_drained`).
+        // A read that drained its stream stays registered for its reader
+        // (`OwnedReader::settle_drained`).
         if !(arm && is_drained(&result)) {
             self.finish(None);
         }
@@ -3540,8 +3554,8 @@ impl Future for WriteOperation {
 
 impl WriteOperation {
     /// Polls the write. An [`OwnedWriteQueue`]'s write observes the queue's
-    /// `cancellation`; an ordinary write passes none. Inlined into each caller,
-    /// which then compiles for its own kind of write.
+    /// `cancellation`, and an ordinary write does not pass one. Inlined into
+    /// each caller, which then compiles for its own kind of write.
     #[inline(always)]
     fn poll_with(
         &mut self,
@@ -3591,8 +3605,8 @@ impl WriteOperation {
                                 WritePoll::Pending
                             }
                             Err(panic) => {
-                                // A re-poll after a contained backend panic
-                                // finds its deadline and cancellation armed.
+                                // Arm the deadline and cancellation before the
+                                // panic resumes, so that a re-poll has them.
                                 arm_write_deadline(&mut active.wait, started, host, context);
                                 resume_unwind(panic);
                             }
@@ -3682,9 +3696,9 @@ impl Drop for WriteOperation {
 }
 
 /// Returns a completed read's bytes in a queue bounded at `maximum`, with the segments its
-/// backend filled (`DIV-058`). A backend queue with that bound, as every Tokio-backed read's
-/// has, is returned as it is; any other is moved into one, keeping its segments and their
-/// backing.
+/// backend filled. A backend queue with that bound, which every Tokio-backed read has, is
+/// returned as it is. Any other queue is moved into a bounded one, keeping its segments and
+/// their backing.
 fn normalize_read(result: TransportRead, maximum: usize) -> Result<TransportRead, HttpError> {
     if result.bytes_read() > maximum {
         return Err(read_error(

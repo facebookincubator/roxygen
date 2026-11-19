@@ -97,7 +97,8 @@ use crate::tcp::prepare_accepted_stream;
 use crate::tcp::set_congestion_flavor_best_effort;
 use crate::tcp::setup_future;
 
-/// Owner-local post-chain-verification policy for the peer leaf certificate.
+/// Owner-local policy applied to the peer's end-entity certificate after chain
+/// verification.
 pub trait TlsPeerIdentityVerifier {
     fn verify(&self, certificate_der: &[u8]) -> Result<PeerIdentity, HttpError>;
 }
@@ -518,9 +519,9 @@ struct CiphertextState<S> {
     plaintext_complete: bool,
     next_timeout: Option<Duration>,
     deadline: Option<Pin<Box<tokio::time::Sleep>>>,
-    /// The deadline of a timed write none of whose ciphertext is staged yet. The background reads
+    /// The deadline of a timed write whose ciphertext is not staged yet. The background task reads
     /// the deadline only while ciphertext is staged, so its timer is built only when ciphertext
-    /// is first staged (`stage_deadline`), and a write that TCP takes at once builds none.
+    /// is first staged (`stage_deadline`). A write that TCP accepts immediately never builds one.
     unstaged_deadline: Option<Instant>,
     stopped: bool,
 }
@@ -575,7 +576,7 @@ where
             .or(self.unstaged_deadline)
     }
 
-    /// Builds the timer of an unstaged deadline: ciphertext is about to be staged.
+    /// Builds the timer of an unstaged deadline, just before ciphertext is staged.
     fn stage_deadline(&mut self) {
         if let Some(deadline) = self.unstaged_deadline.take() {
             #[cfg(test)]
@@ -1327,7 +1328,7 @@ where
 }
 
 /// Reports plaintext progress once ciphertext reaches TCP or the owned staging
-/// queue; queued ciphertext drains on the owner worker.
+/// queue. Queued ciphertext drains on the owner worker.
 pub(crate) struct OwnedTlsStream<T> {
     tls: Option<T>,
     write_remaining: usize,
@@ -1878,7 +1879,7 @@ impl TlsConnectionInfo {
     }
 
     /// Returns the negotiated key-exchange group, or `None` when the
-    /// handshake exchanged no key (a resumed TLS 1.2 session).
+    /// handshake did not exchange a key, as in a resumed TLS 1.2 session.
     pub fn key_exchange_group(&self) -> Option<&str> {
         self.key_exchange_group.as_deref()
     }
@@ -2115,7 +2116,8 @@ impl TlsTransport {
         self.stream
     }
 
-    /// Observes backend-value and close-scope retirement, not TLS shutdown success.
+    /// Returns an observer that reports when the I/O value and close future have
+    /// been dropped. It does not report whether TLS shutdown succeeded.
     pub fn retirement(&self) -> Option<TransportRetirement> {
         self.stream.retirement()
     }
@@ -2505,7 +2507,7 @@ mod tests {
     }
 
     /// Returns the providers of a client, a server, and a mutual-TLS server
-    /// config, none of which names an explicit provider.
+    /// config, built without an explicit provider.
     fn fallback_config_providers() -> [Arc<CryptoProvider>; 3] {
         let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
             .expect("test certificate");

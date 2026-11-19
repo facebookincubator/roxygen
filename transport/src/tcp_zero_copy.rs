@@ -39,10 +39,8 @@ use roxygen_runtime::worker::WorkerCleanupRegistration;
 use roxygen_runtime::worker::WorkerContext;
 
 const IOV_MAX: usize = 1024;
-/// Iovecs that one `sendmsg` passes from the stack, as
-/// `folly::AsyncSocket::writeChain` keeps up to `kSmallIoVecSize` (64) iovecs
-/// in a stack array; a write of more segments builds a heap array, as Folly's
-/// does.
+/// Iovecs that one `sendmsg` passes from the stack. A write of more segments
+/// builds a heap array. 64 matches the stack array in folly's `AsyncSocket`.
 #[cfg(target_os = "linux")]
 const INLINE_IOVECS: usize = 64;
 const COMPLETION_BATCH: usize = 64;
@@ -66,7 +64,7 @@ impl LoanBudget {
     }
 
     fn reserve(self: &Arc<Self>, data: &BufQueue) -> Option<Arc<LoanReservation>> {
-        // Charge full allocation provenance, not visible slices. The fixed
+        // Charge the full backing allocation, not the visible slices. The fixed
         // and per-segment charges also bound loan and metadata counts, including
         // both copies retained by the unwind guard and the pending-cookie map.
         let charge = data

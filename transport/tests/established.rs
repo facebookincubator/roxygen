@@ -3574,7 +3574,8 @@ fn pending_idle_read_holds_at_most_allocation_size() {
     });
 }
 
-/// Pins the memory shape recorded as `DIV-017`.
+/// Checks the capacity that a doubling read holds after a short last buffer
+/// and after a pending continuation.
 #[test]
 fn read_continuations_double_and_hold_under_twice_the_bytes_returned() {
     let read = |payload: usize| {
@@ -3642,9 +3643,9 @@ fn read_lengths<S: TokioByteStream>(
     .collect()
 }
 
-/// Pins the adapter cases recorded in `DIV-017`: like Folly's
-/// `processNormalRead`, a read ends at the first poll that returns less than
-/// it was offered, even if the adapter could return more.
+/// Checks that a read over a capped or buffering adapter ends at the first poll
+/// that returns less than it was offered, even if the adapter could return
+/// more.
 #[test]
 fn adopted_read_ends_at_the_first_poll_that_returns_less_than_offered() {
     let capped = ScriptedReads::default();
@@ -3681,7 +3682,7 @@ fn adopted_read_ends_at_the_first_poll_that_returns_less_than_offered() {
     assert_eq!(
         buffer.filled().len(),
         10_000,
-        "the single maximum-sized poll used before this unit bypasses the buffer",
+        "a single maximum-sized poll bypasses the buffer",
     );
 }
 
@@ -3886,7 +3887,7 @@ fn read_rejects_an_async_read_that_replaces_its_buffer() {
         assert_eq!(error.code(), HttpErrorCode::TRANSPORT_READ_ERROR);
         transport.close_with_reset(&context).unwrap();
 
-        // On a continuation the failure follows the gathered bytes (`DIV-016`).
+        // On a continuation the failure follows the gathered bytes.
         let (transport, polls) = adopt_replacing(&context, 1);
         let data = completed(read(&transport)).unwrap();
         assert_eq!(
@@ -3992,7 +3993,7 @@ fn pending_adopted_read_holds_no_buffer_and_returns_an_exact_copy() {
                 initialized: 0,
             })
             .to_vec(),
-        "a filled first offer continues with DIV-017's offers",
+        "a filled first offer continues with doubling offers",
     );
     let data = owned.into_data().unwrap();
     assert!(data_bytes(&data) == payload);

@@ -82,7 +82,7 @@ impl<Io> EstablishedIo<Io> {
 ///
 /// Neither `Send` nor `Unpin` is required. A facade transferring an
 /// `EstablishedIo` between threads must separately require `Io: Send`.
-/// Polling and destruction stay on this worker; the originating reactor must
+/// Polling and destruction stay on this worker. The originating reactor must
 /// remain alive until connection cleanup completes.
 ///
 /// Each bounded write is flushed before successful completion. Reported partial
@@ -92,11 +92,13 @@ impl<Io> EstablishedIo<Io> {
 /// operation without discarding the connection.
 ///
 /// Byte events and kernel zero-copy are unsupported. `close_with_reset` cancels
-/// and drops the I/O but cannot promise a TCP RST. Graceful close uses the
-/// existing worker-owned shutdown task to drive flush and shutdown; synchronous
-/// `close`/`shutdown_write` request that work, not certify its completion.
+/// and drops the I/O but cannot guarantee a TCP RST. Graceful close drives
+/// flush and shutdown on the worker-owned shutdown task. The synchronous
+/// `close` and `shutdown_write` request that work but do not wait for it to
+/// complete.
 /// Non-Internet endpoints remain available through `local_endpoint` and
-/// `peer_endpoint`; legacy socket-address accessors return uninitialized values.
+/// `peer_endpoint`. The socket-address accessors return uninitialized values
+/// for them.
 pub fn adopt_local<Io>(
     worker: &WorkerContext,
     established: EstablishedIo<Io>,
@@ -124,13 +126,14 @@ where
     .map(|transport| transport.with_endpoints(local_endpoint, peer_endpoint))
 }
 
-/// Adopts I/O with out-of-band cancellation and a physical retirement receipt.
+/// Adopts I/O like [`adopt_local`] and returns a handle that cancels it and
+/// reports when it has been destroyed.
 ///
-/// The I/O remains owner-local and need not be `Send` or `Unpin`. This uses the
-/// transport's existing cleanup scope, retaining cancellation through half-close,
-/// native session completion, and public transport drop. The original reactor
-/// must remain alive until retirement. All other guarantees of [`adopt_local`]
-/// apply, including its lack of peer-delivery or TCP-reset guarantees.
+/// The I/O remains owner-local and need not be `Send` or `Unpin`. Cancellation
+/// uses the transport's own cleanup scope, so it stays effective through
+/// half-close, session completion, and drop of the public transport. The
+/// original reactor must remain alive until retirement. Everything else
+/// behaves as in [`adopt_local`].
 pub fn adopt_local_with_completion<Io>(
     worker: &WorkerContext,
     established: EstablishedIo<Io>,
@@ -184,17 +187,18 @@ where
     ))
 }
 
-/// Transferable cancellation capability without I/O or worker ownership.
+/// Transferable cancellation handle that does not own the I/O or its worker.
 ///
-/// Dropping this capability does not cancel cleanup or retain its execution.
+/// Dropping this handle has no effect on cleanup.
 #[derive(Clone)]
 pub struct AdoptedIoControl {
     completion: AdoptedIoCompletion,
 }
 
 impl AdoptedIoControl {
-    /// Requests sticky owner-local disposal without ordinary worker admission.
-    /// Repeated requests are harmless; await the receipt to confirm retirement.
+    /// Requests disposal of the I/O on its owner worker, bypassing worker
+    /// admission. The request is sticky and repeated calls are harmless. Await
+    /// [`AdoptedIoCompletion::wait_retired`] to confirm retirement.
     pub fn cancel(&self) {
         let waker = {
             let mut state = self.completion.shared.lock();
@@ -212,7 +216,7 @@ impl AdoptedIoControl {
     }
 }
 
-/// Failure to confirm one or both physical adopted-I/O retirement boundaries.
+/// Error naming the adopted-I/O retirement steps that could not be confirmed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum AdoptedIoCompletionError {
     /// I/O destruction panicked or its publisher was lost.
@@ -221,17 +225,18 @@ pub enum AdoptedIoCompletionError {
     /// Destruction of the registered drain future was not confirmed.
     #[error("adopted I/O drain-scope retirement was not confirmed")]
     DrainRetirementUnconfirmed,
-    /// Neither destruction boundary could be confirmed.
+    /// Both the I/O destruction and the drain retirement are unconfirmed.
     #[error("adopted I/O destruction and drain-scope retirement were not confirmed")]
     BothUnconfirmed,
 }
 
 /// Transferable, repeatable observation of I/O destruction and drain retirement.
 ///
-/// Success confirms the adopted value and its owned fields were destroyed and
-/// the registered drain future and captures retired. It does not certify I/O
-/// success, peer delivery, external aliases, arbitrary child tasks, or worker
-/// joins. Dropping this value or its wait future does not affect cleanup.
+/// Success means the adopted value, its owned fields, the registered drain
+/// future and its captures have all been dropped. It does not report whether
+/// the I/O succeeded or reached the peer, and handles to the same connection
+/// held outside the adopted value can still be open. Dropping this value or
+/// its wait future has no effect on cleanup.
 #[derive(Clone)]
 pub struct AdoptedIoCompletion {
     shared: Arc<AdoptedIoState>,
@@ -243,7 +248,8 @@ impl AdoptedIoCompletion {
         Self { shared, scope }
     }
 
-    /// Waits for both boundaries even when either reports a failure.
+    /// Waits for both the I/O value and the drain future, even when one of them
+    /// fails.
     pub fn wait_retired(
         &self,
     ) -> impl Future<Output = Result<(), AdoptedIoCompletionError>> + Send + 'static {
