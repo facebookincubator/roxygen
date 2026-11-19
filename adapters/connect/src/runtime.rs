@@ -59,7 +59,7 @@ pub struct ConnectedIo {
 /// Why a connector produced no HTTP/2 transport.
 #[derive(Debug, thiserror::Error)]
 pub enum DialError {
-    /// The proxy completed TLS without negotiating h2. The route key fails at once with
+    /// The proxy completed TLS without negotiating h2. The route key fails immediately with
     /// `H2NotNegotiated` for `h2_unsupported_ttl`.
     #[error("proxy did not negotiate HTTP/2")]
     H2NotNegotiated,
@@ -80,9 +80,9 @@ pub trait Connector: Send + Sync + 'static {
 
     /// The immediate-hop security every transport of this connector reports.
     ///
-    /// The protocol worker calls it for every connect, so it must return at once. A connect whose
-    /// connector reports other security than the live route of its key fails with an uncommitted
-    /// `InvalidRequest` before anything is sent.
+    /// The protocol worker calls it for every connect, so it must return immediately. A connect
+    /// whose connector reports different security from the live route of its key fails with an
+    /// uncommitted `InvalidRequest` before anything is sent.
     fn security(&self) -> TransportSecurity {
         TransportSecurity::Tls
     }
@@ -120,7 +120,7 @@ impl ConnectRuntime {
             on_owner_thread_stop: None,
         })
         .map_err(|error| ConnectError::closed(false).with_source(error))?;
-        // Every queued command holds an admission permit, so admission never finds it full.
+        // Every queued command holds an admission permit, so an admitted send always finds room.
         let (commands, requests) = mpsc::channel(options.max_tunnels);
         let stats = Arc::new(Recorder::default());
         let (completed, completion) = synchronous::sync_channel(1);
@@ -183,7 +183,7 @@ impl ConnectRuntime {
         };
         self.stop.request_cancellation();
         // The owner thread cannot wait for itself; dropping the worker there starts its shutdown
-        // without a join (`DIV-003`).
+        // without a join.
         if worker.handle().owner_thread() == thread::current().id() {
             return Ok(());
         }
@@ -208,10 +208,11 @@ impl Drop for ConnectRuntime {
     }
 }
 
-/// A cloneable, transferable connect handle. Equal keys must name the same proxy, TLS
-/// configuration, and socket policy: a key's first connector serves its route until the route
-/// retires, and a later connector whose `security()` differs fails its connect with
-/// `InvalidRequest`.
+/// A cloneable, transferable connect handle.
+///
+/// Equal keys must name the same proxy, TLS configuration, and socket policy. A key's first
+/// connector serves its route until the route retires. A later connector whose `security()`
+/// differs fails its connect with `InvalidRequest`.
 pub struct ConnectClient<K> {
     commands: mpsc::Sender<worker::Command<K>>,
     admission: Arc<Semaphore>,
@@ -234,7 +235,7 @@ impl<K> ConnectClient<K>
 where
     K: Eq + Hash + Clone + Send + 'static,
 {
-    /// Establishes a tunnel through the route of `key` and returns it once the proxy answered
+    /// Establishes a tunnel through the route of `key` and returns it once the proxy returns
     /// 2xx, before its data path is chosen.
     ///
     /// A provably unprocessed CONNECT is retried up to `max_unprocessed_retries` times; an
@@ -242,7 +243,7 @@ where
     /// resets its stream if the request committed. Authorization, Proxy-Authorization, Cookie,
     /// and Set-Cookie values never enter the session's HPACK dynamic table; they are sent as
     /// literals without indexing, not as never-indexed literals. A sensitivity flag on any other
-    /// header, a duplicate header name, and HTTP/1 connection or framing headers are refused.
+    /// header, a duplicate header name, and HTTP/1 connection or framing headers are rejected.
     pub async fn connect(
         &self,
         key: K,

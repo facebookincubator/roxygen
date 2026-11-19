@@ -125,7 +125,8 @@ pub(crate) struct Command<K> {
     pub(crate) pending: Pending,
 }
 
-/// The unanswered part of an admitted connect: its reply, admission permit, and waiter gauge.
+/// The reply channel, admission permit, and waiter gauge of an admitted connect that has not
+/// been replied to yet.
 ///
 /// Fields drop in order, so a dropped connect releases its permit and waiter unit before its
 /// closed reply wakes the caller.
@@ -162,7 +163,7 @@ impl Pending {
     }
 
     /// Releases the route use and the admission permit, then delivers the error, so a caller that
-    /// retries at once finds both free.
+    /// retries immediately finds both free.
     fn fail(self, error: ConnectError, route: Option<RouteUse>) {
         let Self {
             permit,
@@ -187,7 +188,7 @@ impl Pending {
 }
 
 /// A relay's route use, `active_tunnels` count, and admission permit, released in that order and
-/// exactly once before its outcome is published, also when its job is dropped.
+/// exactly once before its outcome is published, even when its job is dropped.
 pub(crate) struct Settlement {
     route: Option<RouteUse>,
     active: GaugeHold,
@@ -217,12 +218,12 @@ impl Settlement {
         }
     }
 
-    /// What the outcome reports the relay moved.
+    /// Records what the relay moved, for the outcome to report.
     pub(crate) fn relayed(&mut self, relayed: Relayed) {
         self.publisher.relayed(relayed);
     }
 
-    /// How the relay ended, which the outcome keeps also if the settlement is dropped.
+    /// Records how the relay ended. The outcome keeps it even if the settlement is dropped.
     pub(crate) fn ended(
         &mut self,
         close: RelayClose,
@@ -261,9 +262,10 @@ impl HeaderIndexingStrategy for CredentialIndexingStrategy {
     }
 }
 
-/// A connector's I/O whose shutdown, such as a TLS `close_notify` to a peer that stopped reading,
-/// fails after `limit`. The native transport's close drain keeps the I/O until its shutdown
-/// completes or the worker stops, so an unbounded stall would keep every retired connection.
+/// Wraps a connector's I/O so that its shutdown fails after `limit`, for example when a TLS
+/// `close_notify` goes to a peer that stopped reading. The native transport's close drain keeps
+/// the I/O until its shutdown completes or the worker stops, so an unbounded stall would keep
+/// every retired connection.
 struct BoundedShutdown {
     io: Box<dyn ProxyIo>,
     limit: Duration,
@@ -456,11 +458,11 @@ pub(crate) struct StreamWatch {
     /// The peer refused the stream: an RST_STREAM(`REFUSED_STREAM`) on it, or a GOAWAY whose
     /// last-stream-id is below it.
     refused: Cell<bool>,
-    /// The stream is closed on the wire, so an abort sends nothing: it returned its outgoing
+    /// The stream is closed on the wire, so an abort sends no frame. It returned its outgoing
     /// capacity, the peer reset it, or its session ended.
     closed: Cell<bool>,
-    /// The session wrote the upload's END_STREAM (`RequestEnd`), so flow control holds none of
-    /// the upload.
+    /// The session wrote the upload's END_STREAM (`RequestEnd`), so flow control does not hold
+    /// any of the upload.
     upload_ended: Cell<bool>,
     closed_waker: Cell<Option<Waker>>,
 }
@@ -570,7 +572,8 @@ impl LifecycleObserver for SessionObserver {
     fn on_event(&self, event: LifecycleEvent) {
         let monitor = &self.0;
         match event {
-            // Transport EOF and connection-level failures; GOAWAY alone closes no transport.
+            // Transport EOF and connection-level failures. GOAWAY alone does not close the
+            // transport.
             LifecycleEvent::DrainStarted(DrainTrigger::ConnectionError)
             | LifecycleEvent::OutgoingAdmissionClosed
             | LifecycleEvent::Http2IngressEof => monitor.transport_failed.set(true),
@@ -964,7 +967,8 @@ where
             }
             command = worker.requests.recv(), if requests_open => match command {
                 Some(command) => Event::Command(command),
-                // Established tunnels outlive the last client handle; only the owner stops the worker.
+                // Established tunnels outlive the last client handle; only the owner stops the
+                // worker.
                 None => {
                     requests_open = false;
                     continue;
@@ -1040,8 +1044,8 @@ where
             options: Rc::clone(&self.options),
             stats: Arc::clone(&self.stats),
         };
-        // The group closes only at shutdown, after admission stopped; a refused setup drops its
-        // reply, which reports the connect closed.
+        // The group closes only at shutdown, after admission stopped. A rejected spawn drops the
+        // reply, which reports the connect as closed.
         let _ = self
             .tunnels
             .0
@@ -1191,7 +1195,7 @@ struct Setup {
 enum Attempted {
     Established(Established),
     Failed(ConnectError),
-    /// The caller dropped its connect; nobody awaits a reply.
+    /// The caller dropped its connect, so the reply is not awaited.
     Abandoned,
 }
 
@@ -1268,7 +1272,7 @@ async fn run_tunnel(mut setup: Setup) {
 }
 
 /// Acquires a session and establishes the CONNECT, retrying provably unprocessed attempts
-/// within the connect's acquire window (pooled CONNECT specification D8, D11).
+/// within the connect's acquire window.
 async fn establish(setup: &mut Setup) -> Attempted {
     let Setup {
         context,
@@ -1550,7 +1554,7 @@ mod tests {
         }
     }
 
-    /// The admission state the caller observes when `end` answers its pending connect.
+    /// The admission state the caller observes when `end` replies to its pending connect.
     fn admission_when_the_caller_wakes(end: impl FnOnce(Pending)) -> Option<(usize, u64)> {
         let permits = Arc::new(Semaphore::new(1));
         let stats = Arc::new(Recorder::default());

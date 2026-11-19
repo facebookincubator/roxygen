@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Two-phase connect and worker-side relay oracles against independent `h2` proxy peers.
+//! Two-phase connect and worker-side relay tests against independent `h2` proxy peers.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -103,8 +103,8 @@ async fn tokio_sockets() -> (TcpStream, TcpStream) {
     (application, relayed)
 }
 
-/// Like `sockets`, with small kernel buffers between the relay and the application, whose sizes
-/// as the kernel reports them it returns too.
+/// Like `sockets`, with small kernel buffers between the relay and the application. Also returns
+/// the sum of the receive and send buffer sizes that the kernel reports.
 async fn small_buffer_sockets(size: u32) -> (TcpStream, std::net::TcpStream, usize) {
     let listening = TcpSocket::new_v4().expect("socket");
     listening
@@ -163,7 +163,7 @@ fn assert_outcome(
     );
 }
 
-/// What a `GenericIo` saw and what it is told to do.
+/// What a `GenericIo` recorded, and the failures it is told to inject.
 #[derive(Default)]
 struct IoControl {
     read: AtomicU64,
@@ -243,7 +243,7 @@ async fn parked_reads(control: &IoControl) -> u64 {
 }
 
 /// Waits until shutdown has closed admission. Every permit must be held, so until then each
-/// connect fails at once with `Overloaded`, and afterwards with `Closed`.
+/// connect fails immediately with `Overloaded`, and afterwards with `Closed`.
 async fn admission_closed(client: &Client, proxy: &Proxy) {
     loop {
         let error = client
@@ -269,8 +269,8 @@ struct GenericIo {
     /// as an encoder's does.
     strict_shutdown: bool,
     shutdown_polled: bool,
-    /// A source whose writes each take a unit of the task's coop budget, as a Tokio resource's
-    /// do, so it is never full but runs out of budget, and that keeps what is written to it.
+    /// Each write takes a unit of the task's coop budget, as a Tokio resource's writes do. The
+    /// source is never full but runs out of budget, and it keeps what is written to it.
     coop_writes: bool,
     control: Arc<IoControl>,
 }
@@ -523,7 +523,7 @@ fn bytes_sent_before_the_choice_are_relayed_first() {
         proxy
     });
 
-    // Until the choice nothing reads the stream, so the proxy stops at the stream window.
+    // Until the choice the stream is not read, so the proxy stops at the stream window.
     const WINDOW: usize = 64 * 1024;
     const FLOOD: usize = 4 * WINDOW;
     let options = ConnectOptions {
@@ -587,7 +587,8 @@ fn dropping_an_unchosen_pending_tunnel_aborts_its_stream() {
         proxy
     });
 
-    // A stream the peer reset before the drop gets nothing and counts as neither ending.
+    // The drop does not write to a stream the peer reset before it, and the stream counts as
+    // neither ending.
     run(options.clone(), |client| async move {
         let proxy = Proxy::start().await;
         let tap = Arc::new(Tap::default());
@@ -662,8 +663,7 @@ fn dropping_an_unchosen_pending_tunnel_aborts_its_stream() {
         proxy
     });
 
-    // A peer reset before the choice reaches either path; it discarded the unread greeting
-    // (pooled CONNECT specification D3).
+    // A peer reset before the choice reaches either path, and the unread greeting is discarded.
     run(options.clone(), |client| async move {
         let proxy = Proxy::start().await;
         let tap = Arc::new(Tap::default());
@@ -1238,7 +1238,7 @@ fn proxy_connection_loss_closes_every_relayed_socket() {
     // flow control still held, also while it drains after a graceful GOAWAY, whether a TCP reset
     // or an unanswered PING probe fails it.
     for probe_drop in [false, true] {
-        // Only the probe-drop leg may drop a probe; the TCP-reset leg needs every one answered.
+        // Only the probe-drop leg may drop a probe; the TCP-reset leg needs every one acknowledged.
         let ping_timeout = Duration::from_millis(if probe_drop { 100 } else { 400 });
         let options = ConnectOptions {
             ping_interval: Duration::from_millis(100),
@@ -1381,7 +1381,7 @@ fn peer_ending_after_the_download_end_closes_a_quiet_relay() {
                         "{case}: the I/O closes before the outcome"
                     );
                 }
-                // The relay's closed socket answers a write with a reset.
+                // A write to the relay's closed socket gets a reset.
                 timeout(Duration::from_secs(5), async {
                     while application.write_all(PAYLOAD).await.is_ok() {
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1410,9 +1410,9 @@ fn peer_ending_after_the_download_end_closes_a_quiet_relay() {
     }
 }
 
-/// `download_ended()` tells a peer reset after the download's END_STREAM, which the application
-/// read to its end, from a reset before it; a finished relay's download ended, and one whose
-/// application write side failed to end did not.
+/// `download_ended()` separates a peer reset after the download's END_STREAM, which the
+/// application read to its end, from a reset before it. It is true for a finished relay and false
+/// for one whose application write half failed to shut down.
 #[test]
 fn download_ended_tells_a_reset_after_the_download_end_from_an_earlier_one() {
     let greeting = GREETING.len() as u64;
@@ -1500,9 +1500,9 @@ fn download_ended_tells_a_reset_after_the_download_end_from_an_earlier_one() {
     });
 }
 
-/// After the download's END_STREAM, `stream_reset_by_peer()` tells the proxy's RST_STREAM from a
-/// proxy connection reset, an error GOAWAY, and a PING probe drop, all of which end the relay
-/// `PeerReset` with the download ended.
+/// After the download's END_STREAM, `stream_reset_by_peer()` separates the proxy's RST_STREAM
+/// from a proxy connection reset, an error GOAWAY, and a PING probe drop, all of which end the
+/// relay `PeerReset` with the download ended.
 #[test]
 fn stream_reset_by_peer_tells_a_reset_from_a_session_ending_after_the_download_end() {
     let greeting = GREETING.len() as u64;
@@ -1560,9 +1560,9 @@ fn stream_reset_by_peer_tells_a_reset_from_a_session_ending_after_the_download_e
     }
 }
 
-/// A proxy that ends the download and at once resets the stream, as fwdproxy-hatch does when it
-/// closes first, loses no download byte to an application that reads slowly: the relay writes
-/// what it read ahead, then the end.
+/// A proxy that ends the download and immediately resets the stream, as some forward proxies do
+/// when they close first, does not lose download bytes for an application that reads slowly. The
+/// relay writes what it read ahead, then the end.
 #[test]
 fn completed_download_reaches_a_slow_application_after_a_peer_reset() {
     run(ConnectOptions::default(), |client| async move {
@@ -1605,8 +1605,8 @@ fn completed_download_reaches_a_slow_application_after_a_peer_reset() {
     });
 }
 
-/// An upload write that fails because the proxy ended the download and reset the stream loses no
-/// download byte, whether the upload flows or waits for credit.
+/// An upload write that fails because the proxy ended the download and reset the stream does not
+/// lose download bytes, whether the upload flows or waits for credit.
 #[test]
 fn completed_download_survives_an_upload_write_error() {
     const UPLOAD: usize = 1 << 20;
@@ -1656,9 +1656,9 @@ fn completed_download_survives_an_upload_write_error() {
     }
 }
 
-/// After an upload write error, a relay whose application keeps up writes a long download whose
-/// END_STREAM came before the reset: running out of the task's coop budget part way through is
-/// no application stall.
+/// After an upload write error, the relay writes a long download, whose END_STREAM came before
+/// the reset, to an application that keeps up. Running out of the task's coop budget part way
+/// through does not count as an application stall.
 #[test]
 fn coop_budget_is_no_application_stall_after_an_upload_write_error() {
     // More copy buffers than one task poll's budget of 128 writes.
@@ -1746,7 +1746,7 @@ fn cut_short_delivery_still_reports_the_proxys_download_end() {
 }
 
 /// An upload write error before the download's END_STREAM, with an application that has stopped
-/// reading, ends the relay at once: it discards the download for the read error that explains
+/// reading, ends the relay immediately: it discards the download for the read error that explains
 /// the failure instead of waiting `shutdown_timeout` for the application.
 #[test]
 fn upload_write_error_before_the_download_end_discards_at_once() {
@@ -1911,7 +1911,7 @@ fn application_io_error_aborts_the_stream() {
             .wait("the third reset", |observed| observed.cancel_resets() == 3)
             .await;
 
-        // The worker cannot register the socket: epoll refuses `/dev/null`.
+        // The worker cannot register the socket: epoll rejects `/dev/null`.
         let pending_adopt = connect_pending(&client, &proxy, "echo").await;
         let unpollable = File::open("/dev/null").expect("/dev/null");
         let socket = std::net::TcpStream::from(OwnedFd::from(unpollable));
@@ -1965,7 +1965,7 @@ fn dropping_the_relay_future_aborts_the_stream() {
     });
 
     // Dropped after both directions closed on the wire, while the shutdown that forwards the
-    // proxy's END_STREAM stalls, the relay sends nothing and counts no abort.
+    // proxy's END_STREAM stalls, the relay does not send anything or count an abort.
     run(ConnectOptions::default(), |client| async move {
         let proxy = Proxy::start().await;
         let tap = Arc::new(Tap::default());
@@ -2185,8 +2185,9 @@ fn relay_polls_only_the_shutdown_once_it_began() {
     });
 }
 
-/// A relay that has written the download of a `greet-end-gated-reset` stream and whose
-/// forwarding shutdown stalls, with the application, which has read the download, and its I/O.
+/// A relay that has written the download of a `greet-end-gated-reset` stream and is stuck in
+/// the shutdown that forwards the download's end. Also returns the application socket, which has
+/// read the download, and the control for the relay's I/O.
 async fn relay_stalled_after_the_download_end(
     client: &Client,
     proxy: &Proxy,
@@ -2366,8 +2367,8 @@ fn stalled_application_io_shutdown_is_bounded() {
     });
 
     // The shutdown that forwards the proxy's END_STREAM has no bound of its own: the upload keeps
-    // flowing past `shutdown_timeout`, or stays quiet, and a peer ending that finds the shutdown
-    // pending bounds it from then.
+    // flowing past `shutdown_timeout`, or stays quiet, and a peer ending that arrives while the
+    // shutdown is pending bounds it from then on.
     let shutdown_timeout = Duration::from_millis(300);
     let options = ConnectOptions {
         shutdown_timeout,
@@ -2605,7 +2606,7 @@ fn relay_endings_release_admission_and_route_once() {
         proxy
     });
 
-    // At the admission bound, a caller that awaited an outcome connects again at once.
+    // At the admission bound, a caller that awaited an outcome connects again immediately.
     let options = ConnectOptions {
         max_tunnels: 1,
         ..Default::default()

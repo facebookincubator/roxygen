@@ -85,15 +85,15 @@ impl Drop for AdmissionCloseGuard {
     }
 }
 
-/// A `Send` Tower facade for a service whose state is owned by one worker.
+/// A `Send` Tower service that runs a [`LocalService`] on one worker.
 ///
-/// `poll_ready` owns one real permit from the bounded admission semaphore that
-/// gates the worker command channel. Repeated readiness polls retain that
-/// permit, `call` transfers it to the command until completion or cancellation,
-/// and dropping the facade releases an unconsumed permit. Each returned call
-/// future owns a one-shot cancellation signal for its admitted command. Worker
-/// receiver destruction closes admission and wakes pending readiness even when
-/// another clone still owns the final permit.
+/// `poll_ready` takes a permit for the bounded command channel and keeps it
+/// across repeated polls. `call` hands the permit to its command until the
+/// command completes or is cancelled. It panics unless `poll_ready` has
+/// returned `Ok` since the previous `call`. Dropping an unfinished call future
+/// cancels its command, and dropping the service releases an unused permit. If
+/// the worker task ends, admission closes and pending `poll_ready` calls wake,
+/// even when another clone holds the last permit.
 pub struct RoxygenService<Request, Response, E> {
     sender: mpsc::Sender<ServiceCommand<Request, Response, E>>,
     admission: Arc<tokio::sync::Semaphore>,

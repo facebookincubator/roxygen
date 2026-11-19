@@ -277,7 +277,7 @@ fn cohosted_send_whose_deadline_passes_before_its_job_starts_times_out_without_d
         // The worker's thread stays in this task, so its driver cannot start the job before the
         // deadline passes.
         sleep_past(deadline);
-        // The driver then starts the job, which finds the deadline passed before it dials.
+        // The driver then starts the job, which fails its deadline check before dialing.
         while !job_finished() {
             tokio::task::yield_now().await;
         }

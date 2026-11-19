@@ -528,12 +528,12 @@ fn is_lws(byte: u8) -> bool {
     matches!(byte, b' ' | b'\n' | b'\t' | b'\r')
 }
 
-/// Application-local metadata kept separately from a projected network head.
+/// Application metadata that is kept apart from a network head.
 ///
-/// Keep this sidecar on the application side when sending the `HttpMessage` to
-/// a worker. Extensions are moved, never serialized or reconstructed from
-/// headers. Connector/acceptor identity and security context must be supplied
-/// explicitly by the caller. Unchanged headers retain sensitivity flags.
+/// Keep this value on the application side when sending the `HttpMessage` to a
+/// worker. Extensions are moved, never serialized or rebuilt from headers. The
+/// caller must supply connector or acceptor identity and security context
+/// explicitly. Headers that were not changed keep their sensitivity flags.
 #[derive(Debug, Default)]
 pub struct NetworkHeadContext {
     extensions: Extensions,
@@ -559,20 +559,21 @@ impl NetworkHeadContext {
         &mut self.extensions
     }
 
-    /// Recovers application context without performing a reverse projection.
+    /// Returns the extensions without converting a head back to `http`.
     pub fn into_extensions(self) -> Extensions {
         self.extensions
     }
 }
 
-/// Separates a request's network head from its application-only context.
+/// Splits a request head into a Roxygen message and its application-only context.
 ///
-/// Unlike strict `TryFrom`, extensions and header sensitivity are retained in a
-/// sidecar rather than rejected. Boundary whitespace is still rejected rather
-/// than silently trimmed. Split the body off on the application runtime before
-/// calling this function; no body ownership crosses this head-only boundary.
-/// Only a single HTTP/1.1 chunked transfer encoding is supported; a simultaneous
-/// content length is rejected. The native chunked flag follows that framing.
+/// Unlike the strict `TryFrom` conversion, extensions and header sensitivity are
+/// kept in the returned [`NetworkHeadContext`] instead of being rejected. Header
+/// values with surrounding whitespace are still rejected, not trimmed. This
+/// takes only the head, so split off the body on the application runtime first.
+/// The only supported transfer encoding is a single HTTP/1.1 `chunked`, and a
+/// `content-length` alongside it is rejected. The message's chunked flag is set
+/// to match.
 pub fn project_request_head(
     mut parts: http::request::Parts,
 ) -> Result<(HttpMessage, NetworkHeadContext), HttpAdapterError> {
@@ -595,10 +596,12 @@ pub fn project_request_head(
     Ok((message, context))
 }
 
-/// Separates a response's network head from its unchanged application context.
-/// This is a network projection, not the strict lossless `TryFrom` conversion.
-/// Transfer encoding follows the request projection policy, is rejected for
-/// 1xx/204 responses, and remains metadata without chunk framing for 304.
+/// Splits a response head into a Roxygen message and its application-only context.
+///
+/// Like [`project_request_head`], this keeps extensions instead of rejecting
+/// them as the strict `TryFrom` conversion does. Transfer encoding follows the
+/// same rules as for requests. It is rejected on 1xx and 204 responses, and on a
+/// 304 it stays a header without chunked framing.
 pub fn project_response_head(
     mut parts: http::response::Parts,
 ) -> Result<(HttpMessage, NetworkHeadContext), HttpAdapterError> {
@@ -643,20 +646,20 @@ fn network_is_chunked(version: Version, headers: &HeaderMap) -> Result<bool, Htt
     Ok(true)
 }
 
-/// Projects a worker message into an application request head and reattaches
-/// its sidecar. The original message retains native connection/framing metadata.
+/// Converts a worker's request message into an `http` request head and
+/// reattaches its [`NetworkHeadContext`].
 ///
-/// Header spelling and cross-name ordering are normalized to `HeaderMap`;
-/// duplicate-value order is retained. Native framing, address, security, and
-/// accounting fields are not synthesized as headers or trusted extensions.
-/// Origin-form targets are valid on secure connections. Upgrades and embedded
-/// trailers are rejected, not silently dropped.
-/// Exact native `h2` metadata projects validated numeric versions 1.1 and 2.0
-/// as HTTP/2. Contradictory or unknown advanced-protocol metadata is rejected.
-/// A basic H2 CONNECT with an empty native URL projects its single Host authority
-/// into an authority-only URI. This does not provide a CONNECT tunnel transport.
-/// This projects message metadata; it does not authenticate a connection or
-/// infer its protocol or security from HTTP headers or application extensions.
+/// Header names take `HeaderMap`'s spelling and its order across names, and the
+/// values of one name keep their order. Framing, address, security and
+/// accounting fields stay in the message and are not turned into headers or
+/// extensions. Origin-form targets are valid on secure connections. Upgrades
+/// and embedded trailers are rejected, not dropped.
+///
+/// A message with the `h2` advanced protocol and version 1.1 or 2.0 becomes
+/// HTTP/2. Other or contradictory advanced-protocol metadata is rejected. An
+/// HTTP/2 CONNECT with an empty URL takes its single Host header as an
+/// authority-only URI. The connection's protocol and security are never
+/// inferred from headers or extensions.
 pub fn request_head_to_http(
     message: &HttpMessage,
     context: NetworkHeadContext,
@@ -691,12 +694,13 @@ pub fn request_head_to_http(
     Ok(request.into_parts().0)
 }
 
-/// Projects a response head, retaining duplicate values and local extensions.
-/// Native framing/security metadata and reason phrases remain in the original
-/// message, not in the application head. Strict lossless conversion is unchanged.
-/// Exact native `h2` metadata projects validated numeric versions 1.1 and 2.0
-/// as HTTP/2; contradictory or unknown advanced-protocol metadata is rejected.
-/// HTTP headers and application extensions do not select protocol or security.
+/// Converts a worker's response message into an `http` response head and
+/// reattaches its [`NetworkHeadContext`].
+///
+/// Duplicate header values keep their order. Framing and security metadata and
+/// the reason phrase stay in the message and are not copied to the head. The
+/// version follows the same rules as in [`request_head_to_http`], and headers or
+/// extensions never select the protocol or security.
 pub fn response_head_to_http(
     message: &HttpMessage,
     context: NetworkHeadContext,

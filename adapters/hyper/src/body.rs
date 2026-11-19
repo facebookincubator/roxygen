@@ -52,23 +52,21 @@ use roxygen_runtime::worker::WorkerCleanupObservationError;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_runtime::worker::WorkerHandle;
 
-/// The error surface expected by Hyper-compatible body consumers.
+/// The boxed error type that hyper body consumers expect.
 ///
-/// Source errors remain available for typed inspection through `downcast_ref`
-/// on [`Error`] trait objects.
+/// Source errors can be recovered with `downcast_ref`.
 pub type BoxError = Box<dyn Error + Send + Sync>;
 
-/// Moves adapter-provided bytes into bounded Roxygen storage while preserving
-/// their immutable shared backing allocation.
+/// Moves `bytes` into a bounded [`BufQueue`] without copying, sharing their
+/// backing allocation.
 pub fn admit_owned_bytes(bytes: Bytes, limit: usize) -> Result<BufQueue, BufQueueError> {
     BufQueue::from_bytes(bytes, limit)
 }
 
-/// Copies adapter-provided bytes into bounded Roxygen storage.
+/// Copies `bytes` into a bounded [`BufQueue`].
 ///
-/// `Bytes` crossing this public boundary is not assumed to own exactly its
-/// visible range. `BufQueue::copy_from_slice` performs the required exact-sized
-/// copy before admitting the bytes.
+/// Use this when `bytes` may be a view into a larger allocation. The copy is
+/// sized to the visible range.
 pub fn admit_untrusted_bytes(bytes: Bytes, limit: usize) -> Result<BufQueue, BufQueueError> {
     BufQueue::copy_from_slice(bytes.as_ref(), limit)
 }
@@ -304,15 +302,20 @@ impl Drop for NativeEventOwner {
     }
 }
 
-/// Observation of actual body-source scope retirement and native projection disposal.
+/// Observes when a body's source has been released on its worker.
 ///
-/// This owns no task and does not confirm successful HTTP delivery, child joins,
-/// worker joins, or I/O completion. Dropping it does not cancel the body. Failed
-/// native event/registration disposal remains unconfirmed. Interrupted native
-/// `stop_reading` retirement is conservatively unconfirmed, including a callback
-/// panic followed by clean destruction. An ordinary read-poll panic with clean
-/// retirement does not itself make the receipt unconfirmed. Consumer-owned
-/// replies cannot change the outcome after the source scope retires.
+/// [`wait`](Self::wait) completes once the source scope has retired, and
+/// reports whether the source and the native events read from it were dropped
+/// cleanly. It does not report whether the body was delivered. Dropping the
+/// observer does not cancel the body.
+///
+/// The result is an error if the scope's cleanup failed or its outcome was
+/// lost. It is also an error if dropping a source-owned value, a native event
+/// or a registration panicked. A panic in the source's `stop_reading` is an
+/// error even if the source was then dropped cleanly. A panic while polling a
+/// read does not make the result an error by itself. Read replies that the
+/// consumer has accepted belong to the consumer, so dropping them cannot change
+/// the result.
 #[derive(Clone)]
 pub struct BodyCleanupObserver {
     source: SourceCleanupObserver,
@@ -320,9 +323,9 @@ pub struct BodyCleanupObserver {
 }
 
 impl BodyCleanupObserver {
-    /// Awaits actual source-scope retirement before reporting known projection
-    /// disposal failures or interrupted native stop retirement. These failures
-    /// and publisher loss are sticky.
+    /// Waits for the source scope to retire, then returns an error for any of
+    /// the failures listed on [`BodyCleanupObserver`]. Repeated calls return the
+    /// same result.
     pub fn wait(
         &self,
     ) -> impl Future<Output = Result<(), WorkerCleanupObservationError>> + Send + 'static {
@@ -343,11 +346,11 @@ type BodySource = RemoteHttpSource<UnusedHeaderEvent, RemoteBodyEvent, HttpError
 type BodyReadResult = Result<RemoteBodyEvent, RemoteSourceError<HttpError>>;
 type BodyReadFuture = Pin<Box<dyn Future<Output = (BodySource, BodyReadResult)> + Send>>;
 
-/// A bounded `http_body::Body` facade over one worker-owned Roxygen source.
+/// An `http_body::Body` that reads a Roxygen source owned by a worker.
 ///
-/// The adapter keeps at most one source read in flight and one bounded
-/// `BufQueue` event awaiting delivery. Dropping it requests owner-worker
-/// cancellation; the worker bridge performs `stop_reading` and destruction.
+/// At most one source read is in flight, and at most one bounded `BufQueue`
+/// event waits for delivery. Dropping the body sends a cancellation to the
+/// worker, which then calls `stop_reading` on the source and drops it.
 pub struct RoxygenBody {
     source: Option<BodySource>,
     read: Option<BodyReadFuture>,
@@ -366,7 +369,7 @@ pub struct LocalBodyOptions {
     pub command_capacity: usize,
     /// Maximum logical data bytes requested per source event.
     pub maximum_read: NonZeroU32,
-    /// Truthful remaining-data bounds supplied by the source owner.
+    /// Bounds on the remaining data length, which must be accurate.
     pub size_hint: SizeHint,
 }
 
@@ -380,13 +383,14 @@ impl Default for LocalBodyOptions {
     }
 }
 
-/// An owner-local, already registered body export awaiting the actual source.
+/// An owner-local, registered body export that is waiting for its source.
 ///
-/// Prepare before an exchange begins. Bind only after consuming its real native
-/// head, using that exchange's already admitted continuation. Dropping an unused
-/// preparation cancels its scope without blocking or joining. For header EOM,
-/// drop this reservation and return [`RoxygenBody::empty`]; its receipt still
-/// describes only this unused scope, not the native exchange or source.
+/// Create it with [`RoxygenBody::prepare_local`] before an exchange begins.
+/// Call [`into_body`](Self::into_body) from the exchange's continuation after
+/// reading its head. Dropping an unused preparation cancels its scope without
+/// blocking. If the head ends the message, drop this value and use
+/// [`RoxygenBody::empty`]. The observer then reports only on this unused scope,
+/// not on the exchange or its source.
 pub struct PreparedRoxygenBody {
     attachment: LocalSourceAttachment<LocalBodySource>,
     source: BodySource,
@@ -394,18 +398,20 @@ pub struct PreparedRoxygenBody {
 }
 
 impl PreparedRoxygenBody {
-    /// Returns cancellation independent of the bounded source data queues.
+    /// Returns a cancellation handle that does not go through the bounded source
+    /// queues.
     pub fn abort_handle(&self) -> SourceAbortHandle<HttpError> {
         self.source.abort_handle()
     }
 
-    /// Binds the remaining native source after its nonterminal head is known.
+    /// Binds the source after reading a head that does not end the message.
     ///
-    /// Previously admitted preparation may bind during grace, but forced
-    /// shutdown or cancellation rejects and retires the input on its owner.
-    /// Read bounds and truthful hints apply to the real body. A zero size hint
-    /// does not suppress trailers. No `Send` factory or `Sync`/`Unpin` source is
-    /// required; the resulting body is `Send`.
+    /// A preparation can still bind during the worker's shutdown grace period.
+    /// After a forced shutdown or cancellation this returns an error, and the
+    /// source is dropped on its worker. `maximum_read` and `size_hint` apply to
+    /// the body, and `size_hint` must be accurate. A zero size hint does not
+    /// suppress trailers. The source need not be `Send`, `Sync` or `Unpin`; the
+    /// returned body is `Send`.
     pub fn into_body(
         self,
         source: Box<dyn HttpSource>,
@@ -423,12 +429,12 @@ impl PreparedRoxygenBody {
 }
 
 impl RoxygenBody {
-    /// Creates an already-terminal body, including when the consumed native
-    /// header event carried EOM. No source is read, stopped, or retained, and no
-    /// worker admission is required. The caller retires its source on the owner.
+    /// Creates a body that has already ended.
     ///
-    /// Use the native event's EOM, not a zero data-size hint: a nonterminal source
-    /// with zero remaining data may still produce trailers.
+    /// Use it when the header event carried EOM. It does not read, stop or hold a
+    /// source, and it does not need a worker. The caller still drops its source
+    /// on the owner worker. Decide by the event's EOM, not by a zero size hint,
+    /// because a source with no remaining data may still produce trailers.
     pub fn empty() -> Self {
         Self {
             source: None,
@@ -444,11 +450,10 @@ impl RoxygenBody {
 
     /// Exports a source already created on this worker, without a `Send` factory.
     ///
-    /// Scope ownership survives the initializing command. Dropping the returned
-    /// Send body only requests cancellation; the worker stops and destroys the
-    /// local source before its scope completes.
-    /// After consuming a terminal native header event, use [`Self::empty`]
-    /// instead of exporting the exhausted source.
+    /// The source's scope outlives the worker command that calls this. Dropping
+    /// the returned body only requests cancellation. The worker then stops and
+    /// drops the source before its scope completes. If the header event ended the
+    /// message, use [`Self::empty`] instead of exporting the exhausted source.
     pub fn try_from_local(
         context: &WorkerContext,
         source: Box<dyn HttpSource>,
@@ -457,16 +462,13 @@ impl RoxygenBody {
         Self::try_from_local_with_observer(context, source, options).map(|(body, _observer)| body)
     }
 
-    /// Exports an owner-local source with its actual bridge-scope receipt.
+    /// Like [`Self::try_from_local`], and also returns an observer of the
+    /// source's cleanup.
     ///
-    /// The observer confirms registered future/capture retirement, not body
-    /// success, frame delivery, native exchange retirement, child/worker joins,
-    /// or I/O completion. Dropping the observer never cancels the body. A scope
-    /// destructor failure or publisher loss remains unconfirmed.
-    /// Known source-owned future and output destruction failures, and interrupted
-    /// native stop retirement, also remain unconfirmed. Once a read reply is
-    /// accepted for this body, its consumer owns that reply; later consumer
-    /// destruction cannot change the receipt.
+    /// The observer completes when the worker has dropped the source scope and
+    /// everything it captured. It does not report whether the body was
+    /// delivered, and dropping it does not cancel the body. See
+    /// [`BodyCleanupObserver`] for the failures it reports.
     pub fn try_from_local_with_observer(
         context: &WorkerContext,
         source: Box<dyn HttpSource>,
@@ -490,13 +492,15 @@ impl RoxygenBody {
         ))
     }
 
-    /// Registers a body-driving scope before an exchange starts.
+    /// Registers a body scope before an exchange starts.
     ///
-    /// Returns its owner-local, single-use handoff and actual retirement
-    /// observer before any source or native head is available. The same scope
-    /// awaits binding and drives reads; no watcher or additional task is spawned.
-    /// Preparation requires open admission and retains grace credit until scope
-    /// retirement. Keep native exchange/application joins independently owned.
+    /// Returns a single-use [`PreparedRoxygenBody`] and a cleanup observer
+    /// before the source or head exists. The same scope waits for
+    /// [`PreparedRoxygenBody::into_body`] and then drives reads, so no extra task
+    /// is spawned. Preparing fails if the worker is not accepting new work, and
+    /// the scope holds the worker's graceful shutdown open until it retires. It
+    /// does not wait for the exchange or application tasks; join those
+    /// separately.
     pub fn prepare_local(
         context: &WorkerContext,
         command_capacity: usize,
@@ -536,7 +540,7 @@ impl RoxygenBody {
         )
     }
 
-    /// Creates a body with caller-supplied truthful remaining-data bounds.
+    /// Creates a body with the given remaining-data bounds, which must be accurate.
     pub fn with_size_hint<F>(
         worker: &WorkerHandle,
         command_capacity: usize,
@@ -569,7 +573,7 @@ impl RoxygenBody {
         }
     }
 
-    /// Returns a typed, idempotent cancellation capability for this source.
+    /// Returns a handle that cancels the source. Cancelling twice is harmless.
     pub fn abort_handle(&self) -> SourceAbortHandle<HttpError> {
         self.abort.clone()
     }

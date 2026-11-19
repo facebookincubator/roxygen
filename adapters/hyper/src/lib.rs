@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Streaming Hyper and `http-body` adapters for Roxygen sources.
+//! Adapters between Roxygen body sources and `http_body::Body`, in both directions.
 
 pub mod body;
 pub mod source;

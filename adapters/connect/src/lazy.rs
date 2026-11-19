@@ -97,12 +97,12 @@ impl<K> Drop for Owner<K> {
 /// Starts one CONNECT runtime on the first call to [`Self::client`].
 ///
 /// Clones share the start and its outcome. Cancelling a caller does not cancel or restart the
-/// worker's construction. A failed or timed-out start is never retried; a runtime that finishes
+/// worker's construction. A failed or timed-out start is never retried. A runtime that finishes
 /// after the deadline is shut down on the startup thread.
 ///
 /// Shutdown and the last owner's drop block while joining owned work, so run them outside
 /// asynchronous Tokio workers. Like [`ConnectRuntime`], shutdown on the protocol worker itself
-/// starts its shutdown without joining that worker; later shutdown calls return that result
+/// starts its shutdown without joining that worker, and later shutdown calls return that result
 /// without joining it either. Client handles do not own this runtime.
 pub struct LazyConnectRuntime<K> {
     owner: Arc<Owner<K>>,

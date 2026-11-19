@@ -33,9 +33,9 @@ pub(crate) const NATIVE_CONNECT_TIMEOUT: Duration = Duration::ZERO;
 /// Bounds and deadlines shared by every route and tunnel of one runtime.
 ///
 /// Every attached session runs with its stream read, connection read, and write timeouts at
-/// zero, and every native CONNECT with a zero timeout: none of them is an option. Liveness comes
-/// from HTTP/2 PING probes (`ping_interval`, `ping_timeout`) and the connector's socket options
-/// (TCP keepalive and `TCP_USER_TIMEOUT`); setup is bounded by `acquire_timeout` and
+/// zero, and every native CONNECT with a zero timeout. These are not configurable. Liveness
+/// comes from HTTP/2 PING probes (`ping_interval`, `ping_timeout`) and the connector's socket
+/// options (TCP keepalive and `TCP_USER_TIMEOUT`). Setup is bounded by `acquire_timeout` and
 /// `response_timeout`.
 ///
 /// Buffered tunnel bytes stay below `max_tunnels × (3 × bridge_capacity + 112 KiB)` for bridges,
@@ -53,8 +53,8 @@ pub struct ConnectOptions {
     /// `Tunnel` keeps it until it is dropped and the worker has finished it (stream aborted, task
     /// ended), so a caller at the bound may briefly see `Overloaded` right after a drop, and a
     /// finished but retained `Tunnel` keeps it. A relay returns it once its work ends, before its
-    /// outcome resolves. Admission fails at once with `Overloaded` when every permit is held. At
-    /// most `u16::MAX`; the default 1024 tunnels buffer at most 304 MiB.
+    /// outcome resolves. Admission fails immediately with `Overloaded` when every permit is held.
+    /// At most `u16::MAX`; the default 1024 tunnels buffer at most 304 MiB.
     pub max_tunnels: usize,
     /// Non-retiring sessions, established or connecting, per route.
     pub max_connections: u32,
@@ -83,8 +83,8 @@ pub struct ConnectOptions {
     /// three times this plus 112 KiB, 304 KiB at the default 64 KiB, and a relay once this plus
     /// 112 KiB.
     pub bridge_capacity: usize,
-    /// How long a dial that completed TLS without h2 fails its route key at once; zero disables
-    /// the negative cache.
+    /// How long a dial that completed TLS without h2 makes its route key fail immediately; zero
+    /// disables the negative cache.
     pub h2_unsupported_ttl: Duration,
     /// Retries of a provably unprocessed CONNECT; zero disables retry.
     pub max_unprocessed_retries: u32,
@@ -94,18 +94,18 @@ pub struct ConnectOptions {
     pub shutdown_timeout: Duration,
     /// Maximum CONNECT authority plus header names and values, in bytes.
     pub max_request_bytes: usize,
-    /// Quiet time after a session's last read before it sends a PING probe (`DIV-024`); zero
-    /// disables probes. A session with no tunnel stops probing until its next read.
+    /// Quiet time after a session's last read before it sends a PING probe; zero disables probes.
+    /// A session with no tunnel stops probing until its next read.
     pub ping_interval: Duration,
     /// How long a probe may go unanswered before its session is dropped. Must be positive when
     /// `ping_interval` is.
     ///
     /// The drop fails the session's established tunnels with `TimedOut`, and their relays resolve
-    /// `TimedOut`, unless a tunnel's download already reached END_STREAM: that bridge then fails
+    /// `TimedOut`, unless a tunnel's download already reached END_STREAM. That bridge then fails
     /// with `ConnectionReset` and that relay resolves `PeerReset`. A connect still awaiting its
-    /// response head sees a transport failure (pooled CONNECT specification D8): retried once
-    /// on a reused session while `acquire_timeout` is open, otherwise `Failed`, committed,
-    /// with no HTTP/1.1 fallback.
+    /// response head gets a transport failure. It is retried once on a reused session while
+    /// `acquire_timeout` is open, and otherwise fails committed with `Failed`. There is no
+    /// HTTP/1.1 fallback.
     pub ping_timeout: Duration,
 }
 
@@ -197,7 +197,7 @@ impl ConnectOptions {
         self.max_retiring.unwrap_or(self.max_connections)
     }
 
-    /// The parameters of every attached session (pooled CONNECT specification D4, D5).
+    /// The parameters of every attached session.
     pub(crate) fn session_params(
         &self,
         lifecycle_observer: Rc<dyn LifecycleObserver>,
@@ -230,7 +230,7 @@ impl ConnectOptions {
         }
     }
 
-    /// The parameters of every route's attached pool (`DIV-025`).
+    /// The parameters of every route's attached pool.
     pub(crate) fn pool_params(&self) -> AttachedPoolParams {
         AttachedPoolParams {
             max_connections: self.max_connections,

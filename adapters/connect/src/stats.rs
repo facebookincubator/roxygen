@@ -14,7 +14,7 @@ use std::time::Duration;
 
 /// A point-in-time copy of one runtime's metrics.
 ///
-/// Counters are monotonic runtime totals; gauges return to zero after shutdown. No metric is
+/// Counters are monotonic runtime totals; gauges return to zero after shutdown. Metrics are not
 /// labeled by route, session, stream, or tunnel.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
@@ -23,7 +23,7 @@ pub struct ConnectStats {
     pub connects: u64,
     /// Connects that took an admission permit.
     pub admitted: u64,
-    /// Connects failed with `Overloaded`: full admission or a pool waiter refusal.
+    /// Connects failed with `Overloaded`, because admission was full or the pool rejected a waiter.
     pub overloaded: u64,
     /// Connects failed with `RouteCapacity`.
     pub route_capacity: u64,
@@ -39,7 +39,7 @@ pub struct ConnectStats {
     pub dial_failures: u64,
     /// The `dial_failures` whose connector returned `DialError::H2NotNegotiated`.
     pub h2_not_negotiated: u64,
-    /// Connects failed at once by a cached h2-unsupported entry, without dialing.
+    /// Connects failed immediately by a cached h2-unsupported entry, without dialing.
     pub negative_cache_hits: u64,
     /// Connects failed with `Rejected`, once per `connect()`.
     pub rejected: u64,
@@ -51,9 +51,9 @@ pub struct ConnectStats {
     pub tunnels_relayed: u64,
     /// Established tunnels that the peer ended: a bridge `Tunnel` that failed with
     /// `ConnectionReset` or a relay that ended `PeerReset`, also when the stream ended before the
-    /// choice. A PING probe drop that the stream's read reports is not counted; one after the
-    /// download's END_STREAM is, also after both directions ended while flow control held the
-    /// upload.
+    /// choice. A PING probe drop reported by the stream's read is not counted. A probe drop after
+    /// the download's END_STREAM is counted, including one after both directions ended while flow
+    /// control held the upload.
     pub tunnels_reset_by_peer: u64,
     /// Established tunnels whose stream the adapter reset before it was wire-complete: a dropped
     /// `PendingTunnel` or `Tunnel`, a dropped relay future, a relay's application I/O error, a

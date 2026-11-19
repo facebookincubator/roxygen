@@ -23,8 +23,9 @@ pub(super) fn current_slot(shared: &Arc<Shared>) -> Option<usize> {
 /// An executor for application tasks that share a Roxygen worker.
 ///
 /// The application owns and joins its tasks. This handle does not keep the
-/// worker alive; join application tasks before dropping the runtime. A worker
-/// failure cancels its Tokio tasks, which their join handles report normally.
+/// worker alive, so join application tasks before dropping the runtime. A
+/// worker failure cancels its Tokio tasks, which their join handles report
+/// normally.
 #[derive(Clone)]
 pub struct CohostExecutor {
     executor: tokio::runtime::Handle,
@@ -49,7 +50,8 @@ impl CohostExecutor {
     }
 }
 
-/// Completion of an executor lookup. Dropping it starts no application task.
+/// Completion of an executor lookup. Dropping it does not start an application
+/// task.
 pub struct CohostExecutorRequest {
     result: oneshot::Receiver<CohostExecutor>,
 }
@@ -67,8 +69,9 @@ impl Future for CohostExecutorRequest {
 }
 
 impl ExplicitRuntime {
-    /// Chooses a worker for an application probe loop and fetches its executor.
-    /// The bounded command queue admits the lookup; no application task starts.
+    /// Chooses a worker for application tasks and fetches its executor. The
+    /// lookup takes a place in the worker's bounded command queue. It does not
+    /// start an application task.
     pub fn cohost_executor(&self) -> Result<CohostExecutorRequest, ExplicitError> {
         let shared = &self.owner.shared;
         let slot = shared.candidates().choose(shared);

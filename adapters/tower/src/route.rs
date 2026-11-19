@@ -5,11 +5,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Immutable client route values and side-effect-free request-head projection.
+//! Immutable client route values, and the rewrite of a request head into the
+//! form a route sends on the wire.
 //!
-//! These values do not bind a connector generation, resolve hosts, admit work,
-//! or schedule connections. A client must bind them to its immutable connector
-//! configuration before use; request headers are never physical-hop authority.
+//! These are plain values that do not resolve hosts or open connections. A
+//! client binds them to its connector configuration before use. Request
+//! headers never choose the physical hop.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -30,7 +31,7 @@ use http::header::HOST;
 use http::header::UPGRADE;
 use http::uri::Authority;
 
-/// A route or request cannot be represented by this bounded client surface.
+/// Why a route or request was rejected.
 #[derive(Debug, thiserror::Error)]
 pub enum RouteError {
     #[error("invalid URI")]
@@ -77,9 +78,10 @@ pub enum RouteError {
 /// Hosts containing only ASCII digits and dots must be canonical dotted-decimal
 /// IPv4 literals; abbreviated and single-number forms are rejected. IPv6 literals
 /// are normalized and bracketed. Default ports are omitted, other ports retained.
-/// Trailing DNS dots remain distinct; no DNS, IDNA, or filesystem lookup occurs.
-/// Parse a string to reject fragments before `http::Uri` discards them. A
-/// conversion from an already parsed `Uri` can validate only retained metadata.
+/// Trailing DNS dots remain distinct. Parsing does not perform DNS, IDNA, or
+/// filesystem lookups. Parse a string to reject fragments before `http::Uri`
+/// discards them. A conversion from an already parsed `Uri` can validate only
+/// retained metadata.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Origin {
     scheme: &'static str,
@@ -244,17 +246,19 @@ fn normalize_host(host: &str) -> Result<String, RouteError> {
     Ok(host.to_ascii_lowercase())
 }
 
-/// Protocol selection on the immediate hop; this is not an HTTP retry policy.
+/// Protocol selection on the immediate hop.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ProtocolPolicy {
+    /// Uses H1 only.
     Http1Only,
     /// Requires HTTP/2, using prior knowledge when the immediate hop is plaintext.
     Http2Only,
-    /// TLS may select H2 or H1. Plaintext uses H1, never an invented h2c upgrade.
+    /// TLS may select H2 or H1. Plaintext uses H1 and never tries an h2c upgrade.
     Negotiate,
 }
 
-/// Required immediate-hop encryption, not a claim of authenticated peer identity.
+/// Required encryption on the immediate hop. It does not imply an authenticated
+/// peer.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum HopSecurity {
     Plaintext,
@@ -293,7 +297,7 @@ impl ProxyEndpoint {
     }
 
     /// Retains an absolute Unix path without resolving symlinks or inspecting it.
-    /// Equality and hashing retain its exact OS spelling, including separators.
+    /// Equality and hashing use the exact OS string, including separators.
     pub fn unix(path: PathBuf) -> Result<Self, RouteError> {
         if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
             return Err(RouteError::InvalidUnixPath);
@@ -313,7 +317,7 @@ impl ProxyEndpoint {
 }
 
 /// Borrowed physical dial identity. A connector must not derive it from Host.
-/// Unix identities compare and hash exact `OsStr` spelling, not path components.
+/// Unix identities compare and hash the exact `OsStr`, not path components.
 #[derive(Clone, Copy, Debug)]
 pub enum PhysicalHop<'route> {
     Tcp(&'route Origin),
@@ -344,11 +348,12 @@ impl Hash for PhysicalHop<'_> {
     }
 }
 
-/// An immutable, complete route-spec key, not yet bound to a client generation.
+/// The origin, protocol policy, and optional forward proxy a client uses for a
+/// request.
 ///
-/// Equality and hashing include logical origin, protocol, and direct versus
-/// forward endpoint identity. Security and target form are derived solely from
-/// those fields. A client must add its own configuration-generation identity.
+/// Equality and hashing cover exactly these fields. Security and target form
+/// are derived from them. [`Client::route`](crate::client::Client::route)
+/// binds a spec to one client.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct RouteSpec {
     origin: Origin,
@@ -395,7 +400,7 @@ impl RouteSpec {
         self.protocol
     }
 
-    /// The explicit proxy endpoint, or none for a direct route.
+    /// The explicit proxy endpoint, or `None` for a direct route.
     pub fn proxy(&self) -> Option<&ProxyEndpoint> {
         self.proxy.as_ref()
     }
@@ -453,25 +458,28 @@ impl RouteSpec {
         }
     }
 
-    /// Validates without moving, polling, dropping, or imposing bounds on B.
+    /// Checks that `request` can be sent on this route. Its body is not
+    /// touched, and `B` needs no trait bounds.
     ///
-    /// An absent Host is allowed: the explicit route supplies it on projection.
-    /// A present Host must be a single authority matching the logical origin's
-    /// host and effective port, even on a plaintext forward hop. CONNECT and
-    /// all upgrade indications are rejected before any projection is committed.
+    /// An absent Host is allowed, because `project_request` adds it from the
+    /// route. A present Host must be a single authority matching the logical
+    /// origin's host and effective port, even on a plaintext forward hop.
+    /// CONNECT and all upgrade indications are rejected.
     pub fn validate_request<B>(&self, request: &Request<B>) -> Result<(), RouteError> {
         self.projected_target(request).map(|_| ())
     }
 
-    /// Atomically projects only the URI and, when absent, canonical Host.
+    /// Rewrites the URI and, when Host is absent, adds the canonical Host, as
+    /// one atomic change.
     ///
     /// On error the entire request is unchanged. On success the method, version,
     /// existing headers (including sensitivity), extensions, and B are unchanged.
     /// Absolute inputs must name the logical origin; origin-form inputs use this
     /// explicit route. Direct `OPTIONS *` is supported, forward asterisk is not.
-    /// This is a wire-head projection, not a lossless or idempotent conversion:
-    /// a forwarded HTTPS head has an HTTP wire URI, not a new logical identity.
-    /// Already parsed `http::Uri` inputs cannot reveal discarded fragments.
+    /// The result is the wire head, and the rewrite is neither lossless nor
+    /// idempotent. A forwarded HTTPS head gets an HTTP wire URI, but the
+    /// route's logical origin is still HTTPS. Already parsed `http::Uri` inputs
+    /// cannot reveal discarded fragments.
     pub fn project_request<B>(&self, request: &mut Request<B>) -> Result<(), RouteError> {
         let target = self.projected_target(request)?;
         let host = if request.headers().contains_key(HOST) {

@@ -2213,7 +2213,7 @@ mod hyper_body {
         );
     }
 
-    async fn buck2_shaped_client(
+    async fn ping_pong_handler(
         request: Request<Bytes>,
         worker: &ManagedWorker,
         actions: Arc<Mutex<Vec<SourceAction>>>,
@@ -2239,14 +2239,14 @@ mod hyper_body {
     }
 
     #[test]
-    fn buck2_future_shaped_client_round_trip() {
+    fn ping_pong_handler_round_trip() {
         fn assert_send<T: Send>() {}
         assert_send::<RoxygenBody>();
 
         let worker = ManagedWorker::new(4).expect("managed worker starts");
         let actions = Arc::new(Mutex::new(Vec::new()));
         let mut response = runtime()
-            .block_on(buck2_shaped_client(
+            .block_on(ping_pong_handler(
                 Request::new(Bytes::from_static(b"ping")),
                 &worker,
                 Arc::clone(&actions),

@@ -90,10 +90,10 @@ const STREAM_LIMIT: usize = 16 * 1024;
 pub struct Request {
     /// The request target. It must begin with `/`.
     pub path_and_query: PathAndQuery,
-    /// The `Host` header, which replaces any caller `Host`. It must carry no userinfo.
+    /// The `Host` header, which replaces any caller `Host`. It must not carry userinfo.
     pub authority: Authority,
     /// Caller headers, sent in order. `Connection`, `Content-Length`, `Transfer-Encoding`, and
-    /// `Upgrade` belong to the adapter and are refused.
+    /// `Upgrade` belong to the adapter and are rejected.
     pub headers: Arc<[(HeaderName, HeaderValue)]>,
     /// Bounds dial, TLS, head, and body together, in the worker host's clock domain.
     pub deadline: Instant,
@@ -102,20 +102,24 @@ pub struct Request {
 /// The final response head and the outcome of draining its body.
 #[derive(Debug)]
 pub struct Response {
+    /// The final status code.
     pub status: u16,
-    /// Response headers in wire order; repeated names keep every value. Empty when the exchange
-    /// keeps `raw_headers` instead.
+    /// Response headers in wire order. A repeated name keeps every value. Empty when the
+    /// exchange keeps `raw_headers` instead.
     pub headers: HeaderMap,
     /// The response headers as the codec parsed them, for a client made with
-    /// `ExplicitClient::with_raw_headers`, which builds no `headers`; `None` otherwise.
+    /// `ExplicitClient::with_raw_headers`. `None` otherwise.
     pub raw_headers: Option<RawHeaders>,
     /// Response headers that `HeaderMap` could not represent and that were dropped, or that it
     /// would have dropped for `raw_headers`.
     pub dropped_headers: usize,
+    /// How the body ended.
     pub body: BodyOutcome,
+    /// The connection that carried the exchange.
     pub connection: ConnectionInfo,
+    /// When each stage of the exchange finished.
     pub timings: Timings,
-    /// A tunnel's 2xx CONNECT head; `None` for a direct target.
+    /// A tunnel's 2xx CONNECT head, or `None` for a direct target.
     pub connect_head: Option<Box<ConnectHead>>,
 }
 
@@ -134,7 +138,8 @@ pub(crate) enum TeardownWatch {
     /// A worker cleanup task awaits the stream's retirement, confirms it, and records the time
     /// from `close_when_idle`.
     CleanupTask,
-    /// The stream owns a `TeardownGuard`, which the runtime gave it, and no cleanup task waits.
+    /// The stream owns a `TeardownGuard` from the runtime, and a cleanup task does not await
+    /// its retirement.
     StreamGuard,
 }
 
@@ -145,21 +150,23 @@ impl TeardownWatch {
     }
 }
 
-/// The most headers that [`RawHeaders`] keeps as the codec parsed them, well under the 3,276
-/// that `convert_headers` could convert without a `HeaderMap` refusing an append. Sized for
-/// every header of a head, the map holds them all without growing, and it grows after hash
+/// The most headers that [`RawHeaders`] keeps as the codec parsed them. This is well under the
+/// 3,276 that `convert_headers` can convert without a `HeaderMap` rejecting an append. A map
+/// sized for every header of a head holds them all without growing. It grows after hash
 /// collisions only by doubling a table that has at most five slots per name, which stays within
 /// its limit of 2^15 slots for up to 3,276 headers.
 pub(crate) const RAW_HEADER_LIMIT: usize = 1024;
 
-/// Response headers as the codec parsed them, read as the `HeaderMap` of `Response::headers`
-/// would read them without building it. A name matches in any ASCII case, and a header whose
-/// name `HeaderName` refuses, or whose value `HeaderValue` refuses, is absent, as
-/// `convert_headers` drops it. A head of more than `RAW_HEADER_LIMIT` (1,024) headers is
-/// converted instead, so that it also loses the headers that the map has no room for.
+/// Response headers as the codec parsed them, with the lookups of a `HeaderMap`.
 ///
-/// Lookups go through `HttpHeaders`' own, as Proxygen's `forEachValueOfHeader` does: a common
-/// name is compared by its code, and only the other names by their bytes.
+/// Lookups return what `Response::headers` would hold, without building the map. A name matches
+/// in any ASCII case. A header with a name that `HeaderName` rejects, or a value that
+/// `HeaderValue` rejects, is absent, as it would be from the map. A head of more than 1,024
+/// headers is converted to a `HeaderMap` instead, so that it also loses the headers that the map
+/// has no room for.
+///
+/// Lookups use `HttpHeaders`' own search, which compares a common name by its code and only the
+/// other names by their bytes.
 #[derive(Debug)]
 pub struct RawHeaders(RawForm);
 
@@ -170,6 +177,7 @@ enum RawForm {
         headers: HttpHeaders,
         all_held: bool,
     },
+    /// A head of more than `RAW_HEADER_LIMIT` headers, converted to a map.
     Converted(Box<HeaderMap>),
 }
 
@@ -204,9 +212,9 @@ impl RawHeaders {
             }
             held
         });
-        // Only a header whose name equals `name` in ASCII case matched, and that name is a
-        // token exactly when `name` is. So when every name is held, a match proves `name` valid;
-        // otherwise a name that `HeaderName` refuses finds nothing, as in the map.
+        // A match means the header's name equals `name` in ASCII case, so it is a token exactly
+        // when `name` is. When every name is held, a match proves `name` valid. Otherwise a name
+        // that `HeaderName` rejects returns `None`, as in the map.
         first.filter(|_| all_held || valid_name(name.as_bytes()))
     }
 
@@ -302,14 +310,10 @@ const TOKEN: [bool; 256] = {
 /// How the response body ended. The body itself is counted and discarded.
 #[derive(Debug)]
 pub enum BodyOutcome {
-    Complete {
-        bytes: u64,
-    },
+    /// The body ended normally after `bytes` bytes.
+    Complete { bytes: u64 },
     /// A failure after the final head, with the body bytes read before it.
-    Truncated {
-        bytes: u64,
-        cause: ExplicitError,
-    },
+    Truncated { bytes: u64, cause: ExplicitError },
 }
 
 /// Exchange timing. Every offset is measured from the exchange's start on its worker, on the
@@ -319,7 +323,9 @@ pub struct Timings {
     /// From `send` to the exchange's start on its worker or, for a send whose deadline passed
     /// before that start, to the send's expiry.
     pub queued: Duration,
+    /// The end of the TCP connect.
     pub tcp_connect: Option<Duration>,
+    /// The end of the TLS handshake.
     pub tls_handshake: Option<Duration>,
     /// The first response head, informational heads included.
     pub first_byte: Option<Duration>,
@@ -330,13 +336,15 @@ pub struct Timings {
 /// The connection that carried an exchange.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ConnectionInfo {
+    /// The local address of the connection.
     pub local: Option<SocketAddr>,
-    /// For an exchange that `ExplicitClient::send` dialed, the address it dialed,
-    /// `Target::address` (the proxy's for a tunnel), as folly's `AsyncSocket::getPeerAddress`
-    /// reports the address it connected to, not the kernel's `getpeername`. The two differ for an
-    /// unspecified destination, which the kernel routes to loopback, and for a destination that a
-    /// cgroup connect hook rewrites. For `exchange`, the address of the stream's peer endpoint.
+    /// For an exchange that `ExplicitClient::send` dialed, the address it dialed
+    /// (`Target::address`, the proxy's for a tunnel), not the kernel's `getpeername`. The two
+    /// differ for an unspecified destination, which the kernel routes to loopback, and for a
+    /// destination that a cgroup connect hook rewrites. For `exchange`, the address of the
+    /// stream's peer endpoint.
     pub peer: Option<SocketAddr>,
+    /// The negotiated TLS version, for a TLS connection that `ExplicitClient::send` dialed.
     pub tls_version: Option<rustls::ProtocolVersion>,
 }
 
@@ -344,19 +352,24 @@ const NOT_STARTED: u8 = 0;
 const STARTED: u8 = 1;
 const HANDED: u8 = 2;
 const FINISHED: u8 = 3;
+/// The bits that hold the position.
 const POSITION: u8 = 0b11;
+/// Set by the caller to give up on an unfinished exchange.
 const CLAIMED: u8 = 0b100;
 /// Set with `HANDED` and kept by `FINISHED`.
 const REACHED: u8 = 0b1000;
 
-/// The exchange's progress, shared by its worker and its caller and changed only by
-/// compare-and-swap: not started, started, handed to the session, or finished, plus a claimed
-/// mark that the caller sets to give up on an unfinished exchange and a mark, kept once
-/// finished, that the request was handed to the session.
+/// The exchange's progress, shared by its worker and its caller.
+///
+/// An exchange moves from not started to started, may be handed to the session, and then
+/// finishes. The state changes only by compare-and-swap. The caller sets a claimed mark to give
+/// up on an unfinished exchange. A separate mark records that the request was handed to the
+/// session and stays set once finished.
 #[derive(Debug, Default)]
 pub struct ExchangeProgress(AtomicU8);
 
 impl ExchangeProgress {
+    /// Progress for an exchange that has not started.
     pub fn new() -> Self {
         Self::default()
     }
@@ -366,9 +379,9 @@ impl ExchangeProgress {
         self.swap(NOT_STARTED, STARTED)
     }
 
-    /// Claims an unfinished exchange. A core caller cancels an exchange only by winning this
-    /// claim before it cancels the exchange's token; once the exchange is finished, its token
-    /// also resets the connection that `close_when_idle` is closing.
+    /// Claims an unfinished exchange. A caller of [`exchange`] must win this claim before it
+    /// cancels the exchange's token, because once the exchange is finished, its token also
+    /// resets the connection that `close_when_idle` is closing.
     pub fn claim(&self) -> bool {
         self.update(|word| {
             (word & CLAIMED == 0 && word & POSITION != FINISHED).then_some(word | CLAIMED)
@@ -422,21 +435,24 @@ impl ExchangeProgress {
     }
 }
 
-/// Everything one core exchange takes.
+/// The inputs of one [`exchange`] call.
 pub struct ExchangeInput<Io> {
+    /// The worker that runs the exchange.
     pub worker: WorkerContext,
-    /// Established I/O; its endpoints fill `ConnectionInfo`.
+    /// Established I/O. Its endpoints fill `ConnectionInfo`.
     pub io: EstablishedIo<Io>,
     /// The connector's assertion about the immediate hop.
     pub security: TransportSecurity,
+    /// The request to send.
     pub request: Request,
     /// Cancels the exchange and, for its whole life, the attached session.
     pub cancellation: CancellationToken,
-    /// Must be started, or the exchange fails as `Phase::Submit` and `ErrorKind::Other` before
-    /// it adopts the stream; the exchange moves it to handed and then to finished.
+    /// Must be started, or the exchange fails with `Phase::Submit` and `ErrorKind::Other` before
+    /// it adopts the stream. The exchange moves it to handed and then to finished.
     pub progress: Arc<ExchangeProgress>,
     /// The exchange's start, in the worker host's clock domain.
     pub started: Instant,
+    /// The counters that the exchange updates.
     pub stats: Arc<ExplicitStats>,
 }
 
@@ -444,7 +460,7 @@ pub struct ExchangeInput<Io> {
 /// the connection with `ClientSession::close_when_idle`.
 ///
 /// A worker cleanup task awaits the connection's retirement, so teardown outlives the result.
-/// This catches no panic.
+/// This does not catch panics.
 pub async fn exchange<Io>(input: ExchangeInput<Io>) -> Result<Response, ExplicitError>
 where
     Io: AsyncRead + AsyncWrite + 'static,
@@ -452,8 +468,8 @@ where
     run_exchange(input, &ExchangeHooks::default()).await
 }
 
-/// `exchange` with test hooks. Callers await the future at once: the checks before the
-/// exchange's first await run when it is called.
+/// `exchange` with test hooks. Callers await the future immediately, because the checks before
+/// the exchange's first await run when it is called.
 pub(crate) fn run_exchange<Io>(
     input: ExchangeInput<Io>,
     hooks: &ExchangeHooks,
@@ -464,13 +480,13 @@ where
     start(input, hooks, None)
 }
 
-/// What the runtime's dial lends the exchange over the stream it dialed.
+/// What the runtime's dial passes to the exchange with the stream it dialed.
 ///
-/// `ExplicitClient::dispatch` validated the request, which is immutable, so the exchange does
-/// not validate it again.
+/// `ExplicitClient::dispatch` already validated the request, which is immutable, so the
+/// exchange does not validate it again.
 pub(crate) struct Dialed<'a> {
-    /// The exchange's one deadline sleep, which the dial's stages raced. None of them finished
-    /// it, since an expiry ends the exchange.
+    /// The exchange's single deadline sleep, which the dial's stages raced. It has not fired,
+    /// since an expiry ends the exchange.
     pub(crate) sleep: &'a mut LocalFuture,
     /// The addresses that `ConnectionInfo` reports.
     pub(crate) local: Option<SocketAddr>,
@@ -530,7 +546,8 @@ pub(crate) fn stream_limits() -> ByteStreamLimits {
 }
 
 /// The parameters of a session attached at `host.now()`: one stream, and read and write
-/// timeouts of the time left, at least 1 ms, since Uniplex reads a zero timeout as none.
+/// timeouts of the time left. Each timeout is at least 1 ms, since Uniplex treats a zero timeout
+/// as no timeout.
 pub(crate) fn session_params(host: &Host, deadline: Instant) -> SessionParams {
     let remaining = deadline
         .saturating_duration_since(host.now())
@@ -544,7 +561,7 @@ pub(crate) fn session_params(host: &Host, deadline: Instant) -> SessionParams {
     }
 }
 
-/// Refuses input that cannot make an origin-form request or that the HTTP/1.1 codec acts on.
+/// Rejects input that cannot make an origin-form request or that the HTTP/1.1 codec acts on.
 pub(crate) fn validate_request(request: &Request) -> Result<(), ExplicitError> {
     let refuse = |detail: String| {
         Err(ExplicitError::new(
@@ -685,11 +702,11 @@ impl Observer<'_> {
     }
 }
 
-/// Uses up the request when it is called, so that the exchange's futures hold only its source.
+/// Consumes the request when called, so that the exchange's futures hold only its source.
 ///
-/// The exchange runs as two futures, the second in the first's place: the first adopts the
-/// stream and hands the request to its session, and the second, which holds the attached
-/// session until the exchange ends, never holds the stream.
+/// The exchange runs as two futures, the second replacing the first. The first adopts the stream
+/// and hands the request to its session. The second holds the attached session until the
+/// exchange ends, and never holds the stream.
 fn attempt<'a, Io>(
     input: ExchangeInput<Io>,
     hooks: &'a ExchangeHooks,
@@ -755,7 +772,8 @@ where
             peer,
             tls_version: None,
         };
-        // Uniplex reads a zero timeout as none, so a stream with no time left is never attached.
+        // Uniplex treats a zero timeout as no timeout, so a stream with no time left must not be
+        // attached.
         if host.now() >= deadline {
             let phase = if security == TransportSecurity::Tls {
                 Phase::Tls
@@ -813,7 +831,8 @@ where
         });
         let control = ControlGuard(Some(control));
 
-        // The deadline can pass after the check above, and a zero timeout would disable them.
+        // The deadline can pass after the check above, so `session_params` keeps each timeout
+        // nonzero.
         let mut options = ClientAttachOptions::new(CodecProtocol::Http11, security);
         options.cancellation = cancellation.clone();
         options.session = session_params(&host, deadline);
@@ -914,7 +933,7 @@ fn read_and_close<'a>(
             Ok(_) => false,
         };
         if expired {
-            // Session-local: it resets the transport and leaves the exchange's token alone.
+            // Resets the session's transport without cancelling the exchange's token.
             attached.session.cancel();
         }
         let read = read?;
@@ -1083,20 +1102,19 @@ enum HeadEnding {
     Failed(ExplicitError),
 }
 
-/// Splits off the final head that a failed head read carries. A stream source whose stream fails
-/// with its final head still queued moves that head into the error and discards the queued body.
+/// Splits off the final head that a failed head read carries. When a stream fails with its final
+/// head still queued, the stream source moves that head into the error and discards the queued
+/// body.
 ///
-/// The codec's own errors also carry the message it was parsing. For a head it rejected, that is
-/// the partly parsed head: the HTTP/1.1 codec rejects a head with `HEADER_PARSE_ERROR`, or with
-/// `PROTOCOL_ERROR` for invalid header content, so no head on those errors is a final head. For a
-/// close inside a head, it is a message whose status line never parsed, which is no head either.
-/// Uniplex builds that codec without strict validation (`Http1xCodec::new`), so a trailer that
-/// fails validation is a `BODY_PARSE_ERROR`; strict trailer validation would make
-/// `PROTOCOL_ERROR` reachable after a head.
+/// Codec errors also carry the message being parsed. The HTTP/1.1 codec rejects a head with
+/// `HEADER_PARSE_ERROR` or `PROTOCOL_ERROR`, so the message on those errors is a partial head, and
+/// a close inside a head leaves the status line unparsed. Uniplex builds the codec without strict
+/// validation (`Http1xCodec::new`), so a bad trailer is a `BODY_PARSE_ERROR` rather than a
+/// `PROTOCOL_ERROR` after a head.
 fn final_head(mut error: HttpError) -> Result<(HttpMessage, HttpError), HttpError> {
     let rejected = error.code() == HttpErrorCode::HEADER_PARSE_ERROR
         || error.code() == HttpErrorCode::PROTOCOL_ERROR;
-    // `is_final` turns a message of no kind into a response with status 0, so check first.
+    // `is_final` turns a message without a kind into a response with status 0, so check first.
     let is_final = !rejected
         && error.http_message_mut().is_some_and(|head| {
             head.response_status().is_some() && head.is_final().unwrap_or(false)
@@ -1295,8 +1313,8 @@ fn header_name(code: HttpHeaderCode, name: &[u8]) -> Option<HeaderName> {
     Some(constant)
 }
 
-// The common headers that `http` has no constant for, spelled as the common-header table's
-// lowercase names.
+// The common headers that `http` does not have constants for, spelled as the common-header
+// table's lowercase names.
 const CLIENT_TIMEOUT: HeaderName = HeaderName::from_static("client_timeout");
 const CONTENT_DIGEST: HeaderName = HeaderName::from_static("content-digest");
 const CROSS_ORIGIN_EMBEDDER_POLICY_REPORT_ONLY: HeaderName =
@@ -1461,7 +1479,7 @@ pub(crate) struct ExchangeHooks {
     pub(crate) probe: Option<Arc<ExchangeProbe>>,
 }
 
-/// Test-only counts and records of the exchanges whose hooks carry it.
+/// Test-only counts and records from every exchange whose `ExchangeHooks` hold this probe.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct ExchangeProbe {
@@ -1574,7 +1592,7 @@ impl ExchangeHooks {
     }
 
     /// Whether the cleanup may confirm a retirement that `wait_retired` reports. A test build can
-    /// refuse, as a failed `wait_retired` does.
+    /// withhold confirmation, as a failed `wait_retired` does.
     pub(crate) fn confirms_retirement(&self) -> bool {
         #[cfg(test)]
         if self.unconfirmed_retirement {

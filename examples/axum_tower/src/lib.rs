@@ -171,7 +171,8 @@ impl Scenario {
 }
 
 #[derive(Clone, Copy, Debug)]
-/// One rejected substitution into an otherwise successful real-network report.
+/// A fault to inject into an otherwise successful network report, which the
+/// verifier must then reject.
 pub enum VerifierFault {
     WrongRuntimeStartup,
     ProjectionRun,
@@ -193,7 +194,7 @@ pub enum VerifierFault {
 }
 
 #[derive(Clone, Debug, Default)]
-/// A byte count and at most 256 bytes from an actual socket direction.
+/// The byte count and up to the first 256 bytes of one socket direction.
 pub struct WireSample {
     pub bytes: u64,
     pub prefix: Bytes,
@@ -228,7 +229,7 @@ pub struct IoProgress {
 }
 
 #[derive(Clone, Debug, Default)]
-/// Actual producer polls, gate transitions and destruction.
+/// A body producer's polls, gate transitions, and destruction.
 pub struct ProducerProgress {
     pub polls: u64,
     pub data_bytes_returned: u64,
@@ -776,7 +777,7 @@ impl Report {
         }
     }
 
-    /// Requires a valid real report, then checks rejected observations or cleanup errors.
+    /// Verifies the report, then checks that the verifier rejects it with `fault` injected.
     pub fn verify_rejects(&mut self, fault: VerifierFault) -> Result<(), BoxError> {
         self.verify()?;
         let rejected = match fault {

@@ -51,13 +51,13 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
-    /// Validates a tunnel. Performs no I/O.
+    /// Validates a tunnel. Does not perform I/O.
     ///
     /// `authority` is the CONNECT request target and its `Host`, sent as given: `host:port`,
-    /// `v4:port`, or `[v6]:port`. `connect_headers` decorate the CONNECT only; a `host` header is
-    /// dropped, because the CONNECT's `Host` is the authority. `tls_config` must offer no ALPN
-    /// protocol or exactly `http/1.1`. `tls_host` is the only name the tunnel's TLS verifies and,
-    /// unless it is an IP literal, its SNI, as for [`crate::Security::tls`].
+    /// `v4:port`, or `[v6]:port`. `connect_headers` are added to the CONNECT only. A `host` header
+    /// is dropped, because the CONNECT's `Host` is the authority. `tls_config` must offer either no
+    /// ALPN protocol or exactly `http/1.1`. `tls_host` is the only name that the tunnel's TLS
+    /// verifies and, unless it is an IP literal, its SNI, as for [`crate::Security::tls`].
     pub fn new(
         authority: Authority,
         connect_headers: impl IntoIterator<Item = (HeaderName, HeaderValue)>,
@@ -132,7 +132,7 @@ impl Tunnel {
 }
 
 /// The TLS server name for `host`: a DNS name, or an IPv4 or IPv6 literal with or without one
-/// pair of surrounding brackets, for which rustls sends no SNI.
+/// pair of surrounding brackets, for which rustls does not send SNI.
 pub(crate) fn server_name(host: &str) -> Result<ServerName<'static>, ExplicitError> {
     let literal = host
         .strip_prefix('[')
@@ -153,12 +153,14 @@ pub(crate) fn server_name(host: &str) -> Result<ServerName<'static>, ExplicitErr
 /// A final CONNECT response head: its status and its header lines in wire order, duplicates
 /// kept.
 ///
-/// Each name is as Roxygen delivered it (`DIV-011`): a common header takes the common-header
-/// table's spelling, such as `Proxy-Status`, and any other name keeps the proxy's spelling.
-/// Match names case-insensitively, as [`ConnectHead::get`] does.
+/// A common header name takes the common-header table's spelling, such as `Proxy-Status`, and
+/// any other name keeps the proxy's spelling. Match names case-insensitively, as
+/// [`ConnectHead::get`] does.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ConnectHead {
+    /// The status code.
     pub status: u16,
+    /// The header lines as `(name, value)` pairs, in wire order.
     pub lines: Vec<(Bytes, Bytes)>,
 }
 
@@ -212,8 +214,8 @@ impl ConnectHead {
 }
 
 /// Reserves the CONNECT on the proxy session and starts `connect_unique`, which takes a clone
-/// of the session and drains it once the stream drops. A reservation failure is the proxy
-/// leg's; the returned future's failures are the CONNECT's.
+/// of the session and drains it once the stream drops. A reservation failure belongs to the
+/// proxy leg, and the returned future's failures belong to the CONNECT.
 pub(crate) fn connect(
     context: &WorkerContext,
     proxy: &ClientSession,
@@ -285,7 +287,7 @@ pub(crate) struct TunnelLink {
 }
 
 impl TunnelLink {
-    /// Moves the guard into the tunnel cleanup. A cleanup that is gone drops the guard here.
+    /// Moves the guard into the tunnel cleanup. If the cleanup is gone, the guard drops here.
     pub(crate) fn hand_off(self, inner: AdoptedIoCompletion) {
         let _ = self.handoff.send(TunnelHandoff {
             inner,

@@ -5,11 +5,13 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Demand-driven application bodies with worker- or application-owned joins.
+//! Roxygen sources that read an application's `http_body::Body` on demand.
 //!
-//! Prepare on the Roxygen worker, then attach on the application's live Tokio
-//! runtime. Keep that runtime progressing through producer joins, including
-//! application-owned joins which outlive forced native-worker destruction.
+//! Prepare a source on the Roxygen worker, then attach the body on the
+//! application's Tokio runtime. The producer task is joined either by the
+//! worker or by a driver future that the application owns. Keep the application
+//! runtime running until the producer has been joined. With an
+//! application-owned driver, that can be after a forced worker shutdown.
 
 use std::any::Any;
 use std::cell::Cell;
@@ -66,15 +68,16 @@ use tokio::task::JoinSet;
 
 use crate::body::BoxError;
 
-/// Logical byte bounds for an application body bridge.
+/// Byte limits for an application body bridge.
 ///
-/// At most one accepted application frame is retained, plus one delivered
-/// demand chunk. Data is split by sharing `Bytes`, not copying it. These bounds
-/// do not constrain the producer's own allocations or a slice's backing capacity.
+/// The bridge holds at most one accepted application frame plus one chunk
+/// delivered for a read. Data is split by sharing `Bytes`, not by copying. The
+/// limits apply to visible bytes, not to the producer's own allocations or the
+/// capacity behind a slice.
 #[derive(Clone, Copy, Debug)]
 pub struct ApplicationBodyOptions {
-    /// Reject larger data frames, or trailers whose name/value bytes exceed this
-    /// ceiling. The default is 16 MiB, including the readiness 4 MiB fixtures.
+    /// Largest data frame, or total of trailer name and value bytes, that the
+    /// bridge accepts. Defaults to 16 MiB.
     pub maximum_frame_bytes: NonZeroUsize,
     /// Upper bound on a chunk delivered for any one worker read.
     pub maximum_demand_bytes: NonZeroU32,
@@ -91,34 +94,35 @@ impl Default for ApplicationBodyOptions {
     }
 }
 
-/// Failure to admit an application body, before polling or taking its ownership.
+/// Why an application body could not be attached. The body was not polled or
+/// taken.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum ApplicationBodyAttachError {
-    /// Attachment requires the live application Tokio runtime to be entered.
+    /// `attach`, or the first poll of the join driver, ran outside a Tokio runtime.
     #[error("attach must run on the live application Tokio runtime")]
     NoApplicationRuntime,
-    /// Worker admission or this source's attachment admission has closed.
+    /// The worker or this source has stopped accepting attachments.
     #[error("application body attachment is closed")]
     Closed,
 }
 
-/// Returns an unaccepted body to its application-side caller.
+/// A body that `attach` rejected, returned to the caller.
 #[derive(Debug)]
 pub struct RejectedApplicationBody<B> {
     /// The body, never polled or moved into a worker task.
     pub body: B,
-    /// The reason admission failed.
+    /// Why the attachment failed.
     pub reason: ApplicationBodyAttachError,
 }
 
-/// The physically joined application's original completion outcome.
+/// How an application body producer failed, or why its outcome was lost.
 ///
-/// Application errors retain their original boxed value for facade classification.
-/// The core source maps cancellation to `CORO_CANCELLED`, read timeout to
-/// `READ_TIMEOUT`, and producer/bridge failures to `BODY_PARSE_ERROR`.
+/// Application errors keep their original boxed value. A source read reports
+/// cancellation as `CORO_CANCELLED`, a read timeout as `READ_TIMEOUT`, and
+/// other producer or bridge failures as `BODY_PARSE_ERROR`.
 #[derive(Debug, Error)]
 pub enum ApplicationBodyError {
-    /// The producer supplied an arbitrary application error.
+    /// The application body returned an error.
     #[error("application body failed: {0}")]
     Application(#[source] BoxError),
     /// The bridge rejected an oversized frame without copying its data.
@@ -141,7 +145,7 @@ pub enum ApplicationBodyError {
     /// The application task panicked or its runtime cancelled it.
     #[error("application body task failed: {0}")]
     Task(#[source] JoinError),
-    /// Rooted cleanup could not deliver its joined outcome.
+    /// The cleanup that joins the producer ended without reporting its outcome.
     #[error("application body cleanup outcome was lost")]
     CleanupLost,
 }
@@ -159,8 +163,8 @@ impl ApplicationBodyError {
 
 type ApplicationOutcome = Result<(), ApplicationBodyError>;
 
-/// A Send observation of completion after the app task has actually been joined.
-/// Dropping this observer neither cancels nor detaches any task.
+/// Resolves to the producer's outcome once its task has been joined. Dropping
+/// it does not cancel or detach the task.
 pub struct ApplicationBodyCompletion {
     receiver: oneshot::Receiver<ApplicationOutcome>,
 }
@@ -175,9 +179,10 @@ impl Future for ApplicationBodyCompletion {
     }
 }
 
-/// An application-side join owner and its single-use attachment handshake.
-/// Register the driver with a bounded caller-owned parent before awaiting
-/// readiness. That parent must drive and separately reap the driver itself.
+/// The application side of an application-joined source: a join driver, a
+/// single-use attachment handshake and a cleanup observer. Before awaiting
+/// readiness, hand the driver to a parent that you own, such as a task group,
+/// which must poll it to completion and then reap it.
 pub struct ApplicationBodyJoinPreparation {
     driver: ApplicationBodyJoinDriver,
     ready: ApplicationBodyAttachmentReady,
@@ -185,7 +190,8 @@ pub struct ApplicationBodyJoinPreparation {
 }
 
 impl ApplicationBodyJoinPreparation {
-    /// Separates execution ownership from attachment and cleanup observation.
+    /// Splits this into the driver, the attachment handshake and the cleanup
+    /// observer.
     pub fn into_parts(
         self,
     ) -> (
@@ -197,16 +203,16 @@ impl ApplicationBodyJoinPreparation {
     }
 }
 
-/// A caller-owned application-runtime future which reaps the producer task.
+/// A future, run on the application runtime, that joins the producer task.
 ///
-/// Its first poll arms attachment; its output preserves the original producer
-/// outcome after joining. The caller must separately reap this driver and keep
-/// the attachment runtime alive. Neither this output nor cleanup observation
-/// certifies the enclosing driver's join, arbitrary children, or worker joins.
-/// Dropping this ultimate owner after acceptance requests cancellation but
-/// cannot asynchronously join: cleanup becomes unconfirmed, without a reaper.
-/// A first poll outside Tokio rejects readiness with `NoApplicationRuntime`
-/// and returns `Cancelled` without accepting a producer.
+/// Its first poll enables attachment, and it resolves to the producer's outcome
+/// after the join. Poll it to completion, and keep the application runtime
+/// alive until then. Neither its output nor the cleanup observer reports on the
+/// task that polls the driver. Dropping the driver after a body was attached
+/// requests cancellation, but the producer is then never joined and cleanup is
+/// reported as unconfirmed. If the first poll happens outside a Tokio runtime,
+/// readiness fails with `NoApplicationRuntime` and the driver returns
+/// `Cancelled` without accepting a body.
 pub struct ApplicationBodyJoinDriver {
     future: Pin<Box<dyn Future<Output = ApplicationOutcome> + Send>>,
 }
@@ -219,9 +225,9 @@ impl Future for ApplicationBodyJoinDriver {
     }
 }
 
-/// Delivers an attachment only after its application join driver is armed.
-/// Dropping an unconsumed readiness cancels admission; dropping an exhausted
-/// readiness does not cancel the attachment or an accepted producer.
+/// Resolves to the attachment once its join driver has been polled. Dropping it
+/// before it resolves cancels the attachment. Dropping it afterwards does not
+/// cancel the attachment or an attached producer.
 pub struct ApplicationBodyAttachmentReady {
     receiver: oneshot::Receiver<Result<ApplicationBodyAttachment, ApplicationBodyAttachError>>,
     pending: Option<Arc<ApplicationShared>>,
@@ -249,8 +255,9 @@ impl Drop for ApplicationBodyAttachmentReady {
     }
 }
 
-/// Missing confirmation of producer reaping, worker-scope retirement, or both.
-/// A joined producer error or panic is an operation outcome, not a missing join.
+/// Reports that the producer join, the worker scope's retirement, or both could
+/// not be confirmed. A producer that failed or panicked but was joined does not
+/// cause this error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
 #[error("application body cleanup unconfirmed (producer: {producer}, worker scope: {scope:?})")]
 pub struct ApplicationBodyCleanupError {
@@ -259,20 +266,21 @@ pub struct ApplicationBodyCleanupError {
 }
 
 impl ApplicationBodyCleanupError {
-    /// Whether no producer-join (or closed empty-group) certificate was obtained.
+    /// Whether the producer join could not be confirmed. If no body was attached,
+    /// this means the empty task group was not dropped cleanly.
     pub fn producer_join_unconfirmed(&self) -> bool {
         self.producer
     }
 
-    /// The independent registered worker-scope retirement failure, if any.
+    /// The worker scope's cleanup error, if any.
     pub fn worker_scope_error(&self) -> Option<WorkerCleanupObservationError> {
         self.scope
     }
 }
 
-/// Repeatable observation of producer reaping AND actual worker-scope retirement.
-/// It neither owns execution nor cancels it when dropped. Success excludes the
-/// enclosing driver join, shared referents, arbitrary children, I/O and workers.
+/// Observes when the producer has been joined and the worker scope has retired.
+/// It can be waited on more than once, and dropping it does not cancel
+/// anything. Success does not cover the task that polls the join driver.
 #[derive(Clone)]
 pub struct ApplicationBodyCleanupObserver {
     producer: Arc<ProducerJoinState>,
@@ -280,7 +288,8 @@ pub struct ApplicationBodyCleanupObserver {
 }
 
 impl ApplicationBodyCleanupObserver {
-    /// Waits for both boundaries even if either reports uncertainty first.
+    /// Waits for both the producer join and the worker scope, even if one of them
+    /// fails first.
     pub fn wait(
         &self,
     ) -> impl Future<Output = Result<(), ApplicationBodyCleanupError>> + Send + 'static {
@@ -343,8 +352,9 @@ fn discard_application_panic(payload: Box<dyn Any + Send>) {
     }
 }
 
-/// Notification failures cannot replace the separately owned producer outcome
-/// or prevent an independent cancellation/destruction notification attempt.
+/// Runs `action` and returns `false` if it panicked, discarding the panic, so
+/// that a failed notification cannot replace the producer outcome or prevent
+/// the next notification.
 fn application_cleanup(action: impl FnOnce()) -> bool {
     match catch_unwind(AssertUnwindSafe(action)) {
         Ok(()) => true,
@@ -508,9 +518,10 @@ impl Drop for ApplicationJoinLifetime {
     }
 }
 
-/// Admission transfers the empty group outside locks before spawning. The
-/// transfer guard returns even a partially initialized group to its app joiner.
-/// A concurrent ultimate-owner loss is explicitly unconfirmed, never rescued.
+/// Holds the empty task group outside the lock while the producer is spawned.
+/// On drop it hands the group, even a partly initialized one, to the join
+/// driver. If the driver was dropped meanwhile, the guard stops the source and
+/// drops the group without a join, so cleanup stays unconfirmed.
 struct ApplicationGroupTransfer {
     group: Option<JoinSet<ApplicationOutcome>>,
     owner: Arc<ApplicationJoinOwner>,
@@ -681,8 +692,9 @@ impl AttachmentAdmission {
     }
 }
 
-/// A Send, single-use attachment endpoint. It never owns an application body
-/// until `attach` admits that body into the pre-registered task group.
+/// A single-use, `Send` handle that attaches an application body to its source.
+/// It never holds a body. `attach` spawns the body directly into the prepared
+/// task group.
 pub struct ApplicationBodyAttachment {
     shared: Arc<ApplicationShared>,
     input: Option<ProducerInput>,
@@ -692,18 +704,21 @@ pub struct ApplicationBodyAttachment {
 }
 
 impl ApplicationBodyAttachment {
-    /// Attaches on the application's live Tokio runtime, which must continue
-    /// progressing until Roxygen quiescence completes. All body methods and its
-    /// destructor run in that runtime's task. Neither `Sync` nor `Unpin` is needed.
-    /// In app-owned mode the runtime must also progress after native-worker loss
-    /// until the caller's join driver and its parent have been reaped.
+    /// Spawns `body` on the current Tokio runtime, which must keep running until
+    /// the worker has quiesced.
     ///
-    /// Rejection returns the untouched body. Successful attachment does not
-    /// transfer task-join ownership: legacy preparation retains it on the worker;
-    /// application-join preparation retains it in the already-armed app driver.
-    /// Ordinary preparation requires admission still open at attachment. Only
-    /// response preparation reserves attachment through
-    /// graceful quiescence; forced shutdown and source cancellation still reject.
+    /// All body methods and the body's destructor run in a task on that runtime.
+    /// The body need not be `Sync` or `Unpin`. With an application-owned join,
+    /// the runtime must also keep running after the worker is gone, until the
+    /// join driver and its parent have been reaped.
+    ///
+    /// On rejection the body is returned untouched. Attaching does not change
+    /// which side joins the task. With [`ApplicationBodySource::prepare`] the
+    /// worker joins the task, and with
+    /// [`ApplicationBodySource::prepare_with_application_join`] the join driver
+    /// does. Attachment fails once the worker stops accepting new work, except
+    /// for response sources, which can still attach during graceful shutdown.
+    /// Forced shutdown and source cancellation always reject.
     pub fn attach<B>(mut self, body: B) -> Result<(), RejectedApplicationBody<B>>
     where
         B: Body<Data = Bytes> + Send + 'static,
@@ -791,33 +806,36 @@ impl Drop for ApplicationBodyAttachment {
     }
 }
 
-/// An owner-local response-body reservation made before application service work.
-/// It cannot be read until bound to the service's real response head. Dropping it
-/// cancels the attachment and releases its rooted scope after application join.
+/// A response body source reserved before the service runs. It cannot be read
+/// until [`into_source`](Self::into_source) binds the response head. Dropping it
+/// cancels the attachment, and its scope is released once the producer is joined.
 pub struct PreparedApplicationResponse {
     source: ApplicationBodySource,
 }
 
 impl PreparedApplicationResponse {
-    /// Binds the actual native response head without new worker admission.
-    /// Call on the owner through the exchange's already-rooted response delivery,
-    /// not a fresh worker command during grace. The enclosing exchange must keep
-    /// its own service work and response delivery alive through quiescence.
+    /// Binds the response head. The worker need not be accepting new work.
     ///
-    /// Cancellation remains sticky: binding a head cannot reopen the body, and
-    /// reads on a cancelled reservation report `CORO_CANCELLED`.
+    /// Call it on the owner worker from the exchange's response delivery, not
+    /// from a new worker command during graceful shutdown. The exchange must keep
+    /// its service work and response delivery alive until the worker quiesces.
+    /// Binding a head does not undo a cancellation, and reads on a cancelled
+    /// reservation fail with `CORO_CANCELLED`.
     pub fn into_source(mut self, message: HttpMessage) -> ApplicationBodySource {
         self.source.message = Some(message);
         self.source
     }
 }
 
-/// An owner-local source backed by an application-runtime body producer.
+/// A source on the worker that reads an application body running on the
+/// application's runtime.
 ///
-/// Reads have one outstanding demand. Dropping a pending read or this source
-/// requests cancellation without waiting for any queue or task join. Scope
-/// cleanup retains credit even if this source outlives its initializer. Legacy
-/// preparation joins on the worker; app-owned preparation observes its joiner.
+/// At most one read is outstanding. Dropping a pending read or the source
+/// requests cancellation without waiting for a queue or a task join. The
+/// cleanup scope holds the worker's graceful shutdown open even if the source
+/// outlives the call that created it. With [`Self::prepare`] the worker joins
+/// the producer task. With [`Self::prepare_with_application_join`] the
+/// application's join driver does.
 pub struct ApplicationBodySource {
     shared: Arc<ApplicationShared>,
     message: Option<HttpMessage>,
@@ -829,9 +847,10 @@ pub struct ApplicationBodySource {
 }
 
 impl ApplicationBodySource {
-    /// Prepares a source whose producer is joined by a caller-owned app driver.
-    /// Arm that driver before awaiting attachment; keep its parent and the app
-    /// runtime alive through producer reaping and separately reap the driver.
+    /// Prepares a source whose producer task is joined by a driver that the
+    /// caller owns. Poll the driver before awaiting the attachment. Keep its
+    /// parent and the application runtime alive until the producer is joined,
+    /// and then reap the driver.
     pub fn prepare_with_application_join(
         context: &WorkerContext,
         message: HttpMessage,
@@ -840,9 +859,10 @@ impl ApplicationBodySource {
         Self::prepare_application_join(context, Some(message), options, AttachmentAdmission::New)
     }
 
-    /// Reserves an app-owned response producer before service dispatch. Its real
-    /// head can be bound and its body attached during grace without new worker
-    /// admission. Forced shutdown/source cancellation still closes attachment.
+    /// Like [`Self::prepare_with_application_join`], for a response body reserved
+    /// before the service runs. The head can be bound and the body attached
+    /// during graceful shutdown. Forced shutdown or source cancellation still
+    /// closes attachment.
     pub fn prepare_response_with_application_join(
         context: &WorkerContext,
         options: ApplicationBodyOptions,
@@ -946,10 +966,11 @@ impl ApplicationBodySource {
         ))
     }
 
-    /// Registers ownership on the worker before exposing the application-side
-    /// attachment endpoint. No application body crosses this preparation call.
-    /// New preparation is rejected during graceful admission closure as well as
-    /// forced shutdown. The completion observer resolves only after physical join.
+    /// Prepares a source whose producer task is joined by the worker, and returns
+    /// the attachment for the application side. The body itself is passed later,
+    /// to [`ApplicationBodyAttachment::attach`]. Preparing fails once the worker
+    /// stops accepting new work, in graceful or forced shutdown. The completion
+    /// resolves only after the producer task has been joined.
     pub fn prepare(
         context: &WorkerContext,
         message: HttpMessage,
@@ -961,14 +982,14 @@ impl ApplicationBodySource {
         Self::prepare_with_admission(context, Some(message), options, AttachmentAdmission::New)
     }
 
-    /// Reserves a response-body scope and Send attachment before app service
-    /// dispatch, while worker admission is open. No placeholder head is created.
-    /// Bind the actual head later with [`PreparedApplicationResponse::into_source`].
+    /// Reserves a response-body scope and a `Send` attachment before the service
+    /// runs. The worker must be accepting new work. Bind the head later with
+    /// [`PreparedApplicationResponse::into_source`].
     ///
-    /// This single-use attachment survives graceful admission closure, but not
-    /// forced shutdown or source cancellation. Dropping either unused endpoint
-    /// cancels the reservation. All accepted app tasks are joined by the scope;
-    /// the app runtime must keep progressing until quiescence completes.
+    /// The single-use attachment stays usable during graceful shutdown, but not
+    /// after a forced shutdown or source cancellation. Dropping either unused
+    /// half cancels the reservation. The scope joins the attached task, so the
+    /// application runtime must keep running until the worker quiesces.
     pub fn prepare_response(
         context: &WorkerContext,
         options: ApplicationBodyOptions,
@@ -1060,7 +1081,7 @@ impl ApplicationBodySource {
     }
 
     /// Returns the application's remaining-data hint after task initialization.
-    /// A zero byte hint does not imply end-of-stream: trailers may still follow.
+    /// A zero hint does not mean end of stream, because trailers may still follow.
     pub fn size_hint(&self) -> Option<SizeHint> {
         *self
             .shared

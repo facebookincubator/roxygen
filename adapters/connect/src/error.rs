@@ -35,21 +35,23 @@ pub enum ConnectErrorKind {
     /// The request failed validation before admission, or its connector reports other security
     /// than the live route of its key.
     InvalidRequest,
-    /// Every admission permit is held, or the route refused another waiter.
+    /// Every admission permit is held, or the route rejected another waiter.
     Overloaded,
     /// A new route key would exceed `max_routes`, retiring routes included.
     RouteCapacity,
     /// The runtime shut down or its worker was lost, before or after commit.
     Closed,
-    /// The proxy completed TLS without negotiating h2, now or within `h2_unsupported_ttl`.
+    /// The proxy completed TLS without negotiating h2, on this attempt or within the last
+    /// `h2_unsupported_ttl`.
     H2NotNegotiated,
-    /// The connector failed after it completed: TCP refused or reset, TLS or certificate failure.
+    /// The connector failed, for example with a refused or reset TCP connection or a TLS or
+    /// certificate error.
     Connector,
     /// The acquire window closed, or the session factory timed out the dial the connect waited on.
     AcquireTimeout,
     /// No response head arrived within `response_timeout` after the request committed.
     ResponseTimeout,
-    /// The proxy answered with a final non-2xx head, available through [`ConnectError::response`].
+    /// The proxy returned a final non-2xx head, available through [`ConnectError::response`].
     Rejected,
     /// The proxy provably did not process the CONNECT and no retry remained.
     Refused,
@@ -174,9 +176,9 @@ impl ConnectError {
 
     /// Whether the proxy may have acted on the CONNECT.
     ///
-    /// False for every failure before the session accepted the request and for
-    /// [`ConnectErrorKind::Refused`]; true for `ResponseTimeout`, `Rejected`, and `Failed`;
-    /// `Closed` by phase, a phase the caller cannot observe counting as committed.
+    /// False for [`ConnectErrorKind::Refused`] and for every failure before the session accepted
+    /// the request. True for `ResponseTimeout`, `Rejected`, and `Failed`. For `Closed` it depends
+    /// on the phase, and a phase the caller cannot observe counts as committed.
     pub fn committed(&self) -> bool {
         self.committed
     }
@@ -221,7 +223,7 @@ impl fmt::Debug for ConnectError {
     }
 }
 
-/// An attempt's failure and whether the CONNECT may be retried (pooled CONNECT specification D8).
+/// An attempt's failure and whether the CONNECT may be retried.
 pub(crate) struct Classified {
     pub(crate) error: ConnectError,
     pub(crate) retryable: bool,
@@ -325,8 +327,8 @@ pub(crate) struct SessionState {
     pub(crate) peer_reset: bool,
     /// A response head, informational included, arrived for the attempt's stream.
     pub(crate) response_started: bool,
-    /// The session failed on a connection error from the peer: a protocol violation it detected,
-    /// or a GOAWAY that carried an error code. Its failure is no transport failure.
+    /// The session failed on a connection error from the peer, either a protocol violation it
+    /// detected or a GOAWAY that carried an error code. This is not a transport failure.
     pub(crate) protocol_error: bool,
     /// The peer refused the attempt's stream: an RST_STREAM(`REFUSED_STREAM`) on it, or a GOAWAY
     /// whose last-stream-id is below it.
@@ -361,7 +363,7 @@ pub(crate) fn from_native(
     }
     // A stream above a GOAWAY's last-stream-id was not processed whatever the GOAWAY's error code
     // (RFC 9113 section 6.8). That code reaches the streams the GOAWAY covers, so the code alone
-    // proves no refusal.
+    // does not prove a refusal.
     if session.refused {
         return Classified {
             error: refused("proxy session refused the CONNECT").with_source(error),
@@ -392,7 +394,7 @@ pub(crate) fn from_native(
     }
 }
 
-/// Converts a final CONNECT response head (`DIV-011`) to `http` types.
+/// Converts a final CONNECT response head to `http` types.
 pub(crate) fn response_head(
     head: &HttpMessage,
 ) -> Result<Response<()>, roxygen_http_adapter::HttpAdapterError> {
@@ -402,7 +404,7 @@ pub(crate) fn response_head(
     ))
 }
 
-/// Whether `error`, from a native transport read, is a PING probe drop (`DIV-024`).
+/// Whether `error`, from a native transport read, is a PING probe drop.
 ///
 /// The transport wraps the stream's error in `io::Error::other`, whose `source()` skips it, so
 /// the walk starts at the inner error and follows `HttpError` causes, which reach the ingress

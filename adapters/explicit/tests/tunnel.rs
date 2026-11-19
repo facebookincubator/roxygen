@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! CONNECT tunnel oracles through a loopback plaintext proxy.
+//! Tests for CONNECT tunnels through a loopback plaintext proxy.
 
 mod tunnel {
     use std::collections::VecDeque;
@@ -81,7 +81,7 @@ mod tunnel {
     use crate::tunnel::Tunnel;
     use crate::tunnel::TunnelHandoff;
 
-    /// The request authority. Nothing resolves it: the proxy dials the origin it was given.
+    /// The request authority. It is not resolved, because the proxy dials the origin it was given.
     const DESTINATION: &str = "destination.does-not-exist.invalid";
 
     const TUNNEL_200: &[u8] =
@@ -92,8 +92,8 @@ mod tunnel {
     /// A head and the first bytes of a body that the origin then holds.
     const ORIGIN_PARTIAL: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\npartial";
 
-    /// A request budget far beyond the hang guard, so an oracle bounded by the guard fails when
-    /// something waits for the deadline.
+    /// A request budget far beyond the hang guard, so that a test bounded by the guard fails if
+    /// it waits for the deadline.
     const LONG_BUDGET: Duration = Duration::from_secs(60);
 
     const OPEN: Observed = Observed {
@@ -102,7 +102,6 @@ mod tunnel {
         deadline_passed: false,
     };
 
-    // ---------------------------------------------------------------------------------------
     // Loopback proxy.
 
     /// How one side of a connection ended.
@@ -150,7 +149,7 @@ mod tunnel {
 
     impl Connection {
         /// Closed: the proxy read EOF or a reset, and a later write of its own then failed with a
-        /// reset or broken pipe, which only a client that no longer holds the socket causes.
+        /// reset or broken pipe, which happens only once the client has released the socket.
         fn closed(&self) -> bool {
             self.read_end.is_some()
                 && matches!(
@@ -161,14 +160,14 @@ mod tunnel {
     }
 
     /// What the proxy does with one accepted connection once it has read the CONNECT head. The
-    /// proxy never closes or shuts down an accepted connection unless the script says so, and
-    /// keeps reading it.
+    /// proxy never closes or shuts down an accepted connection unless the script calls for it,
+    /// and keeps reading it.
     #[derive(Clone)]
     enum Script {
-        /// Answers `head` and relays to `origin`, passing the client's FIN on to the origin as a
-        /// write shutdown. With `pass_fin`, it also passes the origin's end on to the client as
-        /// a write shutdown; a write fails after that whether or not the client still holds the
-        /// socket, so the closure probe never runs on such a connection. Once `reset` is
+        /// Responds with `head` and relays to `origin`, passing the client's FIN on to the origin
+        /// as a write shutdown. With `pass_fin`, it also passes the origin's end on to the client
+        /// as a write shutdown. A write fails after that whether or not the client still holds
+        /// the socket, so the closure probe never runs on such a connection. Once `reset` is
         /// notified, it resets the client connection.
         Tunnel {
             head: &'static [u8],
@@ -176,12 +175,12 @@ mod tunnel {
             reset: Option<Arc<Notify>>,
             pass_fin: bool,
         },
-        /// Answers `bytes` and keeps reading.
+        /// Responds with `bytes` and keeps reading.
         Answer(Vec<u8>),
-        /// Reads the CONNECT and never answers.
+        /// Reads the CONNECT and never responds.
         Silent,
-        /// Answers `bytes`, reads the client's next bytes when `after_client_bytes`, and then
-        /// closes the connection, with a reset when `reset`.
+        /// Responds with `bytes`, reads the client's next bytes when `after_client_bytes`, and
+        /// then closes the connection, with a reset when `reset`.
         End {
             bytes: &'static [u8],
             after_client_bytes: bool,
@@ -199,7 +198,7 @@ mod tunnel {
             }
         }
 
-        /// A 200 tunnel to an origin that closes as `close` says.
+        /// A 200 tunnel to an origin that closes as `close` specifies.
         fn closing(origin: &Origin, close: Close) -> Self {
             Self::Tunnel {
                 head: TUNNEL_200,
@@ -548,7 +547,6 @@ mod tunnel {
         }
     }
 
-    // ---------------------------------------------------------------------------------------
     // Loopback TLS origin.
 
     /// How an origin that closes on purpose ends its connection.
@@ -576,11 +574,11 @@ mod tunnel {
             rest: &'static [u8],
             release: Arc<AtomicBool>,
         },
-        /// Reads one request and never answers.
+        /// Reads one request and never responds.
         Hold,
-        /// Reads one request and closes before answering.
+        /// Reads one request and closes before responding.
         CloseBeforeHead(Close),
-        /// Reads the client's bytes without a TLS handshake and never answers them.
+        /// Reads the client's bytes without a TLS handshake and never responds to them.
         Silent,
     }
 
@@ -773,7 +771,6 @@ mod tunnel {
         }
     }
 
-    // ---------------------------------------------------------------------------------------
     // TLS identities, tunnels, and sends.
 
     struct Identity {
@@ -851,7 +848,7 @@ mod tunnel {
         })
     }
 
-    /// A tunnel target through `proxy` whose CONNECT names the origin's numeric address and whose
+    /// A tunnel target through `proxy`. Its CONNECT names the origin's numeric address, and its
     /// TLS verifies `localhost`.
     fn origin_target(proxy: &Proxy, origin: &Origin, identity: &Identity) -> Arc<Target> {
         let tunnel = try_tunnel(
@@ -929,8 +926,7 @@ mod tunnel {
         }
     }
 
-    // ---------------------------------------------------------------------------------------
-    // expectation-353: heads, authorities, CONNECT headers, construction, and tunnel TLS.
+    // Heads, authorities, CONNECT headers, construction, and tunnel TLS.
 
     #[test]
     fn success_carries_the_200_head_with_its_repeated_lines() {
@@ -1147,8 +1143,8 @@ mod tunnel {
         assert_eq!(inner.values("host").len(), 1, "{inner:?}");
     }
 
-    /// A refused `Tunnel` never reaches a send, so nothing connects to the proxy: only `Ok`
-    /// yields the `Tunnel` that `Security::Tunnel` needs, so no runtime check can observe it.
+    /// A rejected `Tunnel` never reaches a send, so the proxy never gets a connection. Only `Ok`
+    /// yields the `Tunnel` that `Security::Tunnel` needs, so a runtime check cannot observe it.
     fn assert_refused(result: Result<Tunnel, ExplicitError>, phase: Phase, what: &str) {
         let error = result.expect_err(what);
         assert_eq!(
@@ -1163,7 +1159,7 @@ mod tunnel {
     fn tunnel_new_refuses_bad_authorities_headers_and_alpn() {
         let identity = localhost();
         let config = &identity.client;
-        // Each parses as an `http::uri::Authority`; `Tunnel::new` refuses it.
+        // Each parses as an `http::uri::Authority`, but `Tunnel::new` rejects it.
         for authority in [
             "example.com",
             "user@example.com:443",
@@ -1306,8 +1302,7 @@ mod tunnel {
         identity(&["other.does-not-exist.invalid"], false)
     }
 
-    // ---------------------------------------------------------------------------------------
-    // expectation-354: failures, phases, kinds, and heads.
+    // Failures, phases, kinds, and heads.
 
     fn assert_failure(
         error: &ExplicitError,
@@ -1593,7 +1588,7 @@ mod tunnel {
         );
         assert_eq!(error.code, None);
 
-        // Held after the proxy attach until the deadline passed: no CONNECT is sent.
+        // Held after the proxy attach until the deadline passed: the CONNECT is not sent.
         let proxy = Proxy::start(Script::Silent);
         let pause = TestPause::new();
         let _release = ReleaseOnDrop(pause.clone());
@@ -1623,7 +1618,7 @@ mod tunnel {
         assert!(proxy.connection(0).connect.is_none(), "no CONNECT was sent");
         wait_for_teardowns(&runtime);
 
-        // Tunnel TLS: the origin never answers the ClientHello.
+        // Tunnel TLS: the origin never responds to the ClientHello.
         let silent = Origin::start(None, Serve::Silent);
         let proxy = Proxy::start(Script::tunnel(TUNNEL_200, &silent));
         let error = send(
@@ -1868,7 +1863,7 @@ mod tunnel {
         assert_eq!(probe.validations.load(Ordering::SeqCst), 1);
     }
 
-    /// A real CONNECT that the proxy answers with `answer`, classified on the worker.
+    /// A real CONNECT that the proxy responds to with `answer`, classified on the worker.
     fn classified_connect(answer: &'static [u8], observed: Observed) -> ExplicitError {
         let proxy = Proxy::start(Script::Answer(answer.to_vec()));
         let address = proxy.address;
@@ -1956,7 +1951,7 @@ mod tunnel {
             ..OPEN
         };
 
-        // Proxy dial: the Connect kind rules in ProxyConnect.
+        // Proxy dial: the Connect phase's kind rules, reported in ProxyConnect.
         for (io_kind, kind) in [
             (io::ErrorKind::ConnectionRefused, ErrorKind::Refused),
             (io::ErrorKind::ConnectionReset, ErrorKind::Reset),
@@ -2132,7 +2127,7 @@ mod tunnel {
             );
         }
 
-        // Rejections: a typed cause, or the HTTP/1.1 limit with a final non-2xx head.
+        // Rejections: a typed cause, or a CONTENT_LENGTH_MISMATCH with a final non-2xx head.
         let rejected = classified_connect(
             b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Status: fwdproxy\r\nContent-Length: 0\r\n\r\n",
             OPEN,
@@ -2276,8 +2271,7 @@ mod tunnel {
         );
     }
 
-    // ---------------------------------------------------------------------------------------
-    // expectation-355: both legs end with the exchange.
+    // Both legs end with the exchange.
 
     #[test]
     fn proxy_session_closes_after_each_exchange() {
@@ -2468,7 +2462,7 @@ mod tunnel {
         proxy.wait_closed(0);
         wait_for_teardowns(&runtime);
 
-        // A proxy reset mid-response leaves the proxy no socket to test.
+        // A proxy reset mid-response leaves the proxy without a socket to test.
         let stalling = Origin::start(Some(&identity.server), Serve::Respond(ORIGIN_PARTIAL));
         let trigger = Arc::new(Notify::new());
         let proxy = Proxy::start(Script::Tunnel {
@@ -2900,8 +2894,8 @@ mod tunnel {
     fn teardown_guards_count_both_legs_and_keep_a_stalled_inner_stream_counted() {
         let identity = localhost();
         let runtime = start(1, "rtn-tgd");
-        // A cleanup task told not to confirm would count each leg as unconfirmed; guarded streams
-        // register none.
+        // A cleanup task told not to confirm would count each leg as unconfirmed. Guarded streams
+        // do not register one.
         runtime.set_exchange_hooks(ExchangeHooks {
             unconfirmed_retirement: true,
             ..ExchangeHooks::default()

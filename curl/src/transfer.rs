@@ -5,6 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+//! Runs parsed transfers on Roxygen session pools, with retries, redirects, proxies,
+//! cookies, and response decoding.
+
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;

@@ -1436,7 +1436,7 @@ mod tests {
 
     #[test]
     fn resolution_and_connection_failures_use_curl_exit_codes() {
-        // Bound with no listener while the test runs, so no other test's listener can take
+        // Bound but not listening while the test runs, so other tests' listeners cannot take
         // the port and accept the connection.
         let reserved = tokio::net::TcpSocket::new_v4().expect("socket should open");
         reserved

@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Error classification, deadline, and cancellation oracles.
+//! Tests for error classification, deadlines, and cancellation.
 
 mod errors {
     use std::future::Future;
@@ -1019,7 +1019,7 @@ mod errors {
         assert_eq!(server.accepted(), 0);
         assert_eq!(runtime.stats().caller_cancellations, 2);
 
-        // Dropped while a peer that accepted TCP never answers the ClientHello.
+        // Dropped while a peer that accepted TCP never responds to the ClientHello.
         let (closed_tx, closed_rx) = mpsc::channel();
         let silent = TestServer::plain(move |mut conn| {
             let _ = closed_tx.send(conn.read_end(HANG_GUARD));
@@ -1054,7 +1054,7 @@ mod errors {
         let runtime = start(1, "rec");
         let budget = Duration::from_secs(60);
 
-        // Paused after the swap to finished: dropping the send requests no cancellation.
+        // Paused after the swap to finished: dropping the send does not request cancellation.
         let pause = TestPause::new();
         runtime.set_exchange_hooks(ExchangeHooks {
             before_close: Some(pause.clone()),
@@ -1305,8 +1305,8 @@ mod errors {
         });
         let runtime = start(1, "rei");
         let target = plain_target(server.address);
-        // `PathAndQuery` already rejects relative and absolute targets; these are the
-        // non-origin forms it admits.
+        // `PathAndQuery` already rejects relative and absolute targets. These are the
+        // non-origin forms it accepts.
         for path in ["*", "?query=1"] {
             rejected(request("localhost", path, HANG_GUARD), &runtime, &target);
         }
@@ -1330,7 +1330,7 @@ mod errors {
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(server.accepted(), 0);
 
-        // The core refuses the same input before adoption, and its peer reads EOF.
+        // The core rejects the same input before adoption, and its peer reads EOF.
         let (eof_tx, eof_rx) = mpsc::channel();
         let progress = started_progress();
         let core_progress = Arc::clone(&progress);

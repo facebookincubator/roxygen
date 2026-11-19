@@ -5,6 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+//! Command-line and config-file argument parsing for the curl frontend.
+
 use std::collections::VecDeque;
 use std::env;
 use std::ffi::OsString;

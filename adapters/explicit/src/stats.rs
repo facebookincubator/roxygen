@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-/// Upper bounds, in microseconds, of every histogram's buckets; a final bucket holds the rest.
+/// Upper bounds, in microseconds, of every histogram's buckets. A final bucket holds the rest.
 pub const HISTOGRAM_BUCKET_UPPER_BOUNDS_US: [u64; 16] = [
     100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
     1_000_000, 2_500_000, 5_000_000, 10_000_000,
@@ -53,8 +53,8 @@ impl Histogram {
 
 /// Counters, gauges, and histograms that exchanges and the runtime record into.
 ///
-/// Every metric is process-wide for one runtime, or for one core caller's exchanges, and carries
-/// no per-request, session, or stream label.
+/// Each metric covers one runtime, or the exchanges of one direct caller of `exchange`, and does
+/// not carry a per-request, session, or stream label.
 #[derive(Debug, Default)]
 pub struct ExplicitStats {
     sends: AtomicU64,
@@ -78,10 +78,12 @@ pub struct ExplicitStats {
 }
 
 impl ExplicitStats {
+    /// Statistics with every metric at zero.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// A point-in-time copy of every metric.
     pub fn snapshot(&self) -> RuntimeStats {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         RuntimeStats {
@@ -215,8 +217,9 @@ impl Drop for PendingTeardown {
     }
 }
 
-/// One adopted connection of a client made with `ExplicitClient::with_teardown_guard`, which its
-/// stream owns, so that it drops when the stream is destroyed. No cleanup task waits for it.
+/// One adopted connection of a client made with `ExplicitClient::with_teardown_guard`. The
+/// stream owns the guard, so that it drops when the stream is destroyed, and a cleanup task does
+/// not wait for it.
 ///
 /// The pending-teardown gauge rises at construction and falls exactly once, at drop. A drop while
 /// the thread panics, as when the stream's own destruction panics, counts an unconfirmed
@@ -248,7 +251,7 @@ pub struct RuntimeStats {
     pub sends: u64,
     /// Count of slot restarts that published a new worker.
     pub restarts: u64,
-    /// Count of admitted slot restarts that published nothing.
+    /// Count of admitted slot restarts that did not publish a worker.
     pub failed_restarts: u64,
     /// Count of exchange panics caught on a worker, including those of sends already dropped.
     pub panics: u64,
@@ -256,7 +259,7 @@ pub struct RuntimeStats {
     pub overloads: u64,
     /// Count of sends that returned `ErrorKind::WorkerLost`.
     pub worker_losses: u64,
-    /// Count of send futures dropped before they resolved that cancelled their exchange.
+    /// Count of send futures that were dropped before resolving and cancelled their exchange.
     pub caller_cancellations: u64,
     /// Count of response bodies that ended as `BodyOutcome::Truncated`, including those of sends
     /// already dropped.
@@ -285,16 +288,19 @@ pub struct RuntimeStats {
     /// Microseconds from the exchange's start to the first response head.
     pub first_byte_us: HistogramSnapshot,
     /// Microseconds from `close_when_idle` to transport retirement. A client with a teardown
-    /// guard records none.
+    /// guard does not record it.
     pub close_to_retirement_us: HistogramSnapshot,
 }
 
 /// Fixed-bucket histogram of microsecond samples.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HistogramSnapshot {
+    /// The upper bound of each bucket, [`HISTOGRAM_BUCKET_UPPER_BOUNDS_US`].
     pub bucket_upper_bounds_us: &'static [u64],
     /// One count per bucket, plus a final count of samples above every bound.
     pub counts: Vec<u64>,
+    /// The number of samples.
     pub count: u64,
+    /// The sum of the samples, in microseconds.
     pub sum_us: u64,
 }

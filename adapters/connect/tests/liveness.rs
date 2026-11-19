@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! PING probe oracles: probe options, acknowledged and unanswered probes, and probe drops.
+//! PING probe tests: probe options, acknowledged and unanswered probes, and probe drops.
 
 use std::io;
 use std::sync::Arc;

@@ -79,9 +79,9 @@ fn quiet_session_outlives_the_native_read_timeout() {
     });
 }
 
-/// A forward guard: on HTTP/2 the native session arms no stream read timeout at request EOM, so
-/// this test becomes sensitive to the adapter's zero `stream_read_timeout` only once
-/// `repair.request_stream_read_timeout` lands.
+/// The native HTTP/2 session does not arm a stream read timeout at request EOM. If it starts to,
+/// the adapter's zero `stream_read_timeout` must still keep a half-closed tunnel with a quiet
+/// download open.
 #[test]
 fn half_closed_tunnel_outlives_the_native_stream_read_timeout() {
     run(ConnectOptions::default(), |client| async move {
@@ -227,7 +227,8 @@ fn cancellation_racing_the_2xx_resets_the_stream() {
         );
         let mut after = proxy.connect_with(&client, "vm", "echo").await;
         echo(&mut after, b"every stream slot was released").await;
-        // The proxy has now seen every CONNECT; an attempt cancelled before commit sent none.
+        // Every CONNECT has reached the proxy by this point; an attempt cancelled before commit
+        // sent none.
         proxy
             .observations
             .wait("a CANCEL reset for every earlier CONNECT", |observed| {
@@ -399,8 +400,8 @@ fn dropping_half_closed_tunnel_releases_native_stream_capacity() {
         proxy
     });
 
-    // A wire-complete stream drops without a reset and is no abort, even with most of its
-    // download unread.
+    // A wire-complete stream drops without a reset and does not count as an abort, even with
+    // most of its download unread.
     let options = ConnectOptions {
         max_streams: 1,
         max_connections: 1,
@@ -521,8 +522,8 @@ impl Wake for PanickingWaker {
     }
 }
 
-/// An application connector whose drop panics; the worker drops a connector that a live route
-/// ignores.
+/// An application connector whose drop panics. The worker drops a connector that a live route
+/// does not use.
 struct PanicsWhenDropped;
 
 impl Connector for PanicsWhenDropped {

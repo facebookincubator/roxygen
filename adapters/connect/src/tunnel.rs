@@ -75,8 +75,8 @@ pub struct TunnelInfo {
 /// An established tunnel whose data path the caller has not chosen yet.
 ///
 /// The response head belongs to CONNECT. Until [`into_tunnel`](Self::into_tunnel) or
-/// [`relay`](Self::relay) chooses, the adapter sends no tunnel byte and reads nothing from the
-/// stream: bytes the proxy sends meanwhile wait in the stream, within `stream_receive_window`,
+/// [`relay`](Self::relay) chooses, the adapter does not send tunnel bytes or read from the
+/// stream. Bytes the proxy sends meanwhile wait in the stream, within `stream_receive_window`,
 /// and reach the chosen path first. A pending tunnel has no deadline; until it is chosen or
 /// dropped it holds its stream, admission permit, and route. Dropping it unchosen is an abortive
 /// close, as dropping a [`Tunnel`] is. A stream that ends before the choice fails the chosen path
@@ -106,6 +106,7 @@ impl PendingTunnel {
         &self.response
     }
 
+    /// How the tunnel was set up.
     pub fn info(&self) -> TunnelInfo {
         self.info
     }
@@ -135,17 +136,21 @@ impl PendingTunnel {
     /// Chooses the relay: hands `io` to the protocol worker, which copies between it and the
     /// stream in the tunnel's own task, and returns the relay's outcome.
     ///
-    /// The relay starts when this is called; the returned future only reports its outcome and
+    /// The relay starts when this is called. The returned future only reports its outcome and
     /// may be awaited on any executor. Dropping the future before the stream is closed on the
     /// wire resets the stream and closes `io`. The relay forwards end of stream in each direction
-    /// as a half-close. When the proxy resets the stream, its session fails, or a PING probe
-    /// goes unanswered, the relay first writes the rest of the download to `io` if it has read
-    /// the download's END_STREAM (after an upload write error it reads on while only the stream
-    /// holds it up), then shuts down `io`'s write half, together for at most
-    /// `shutdown_timeout`, and closes it; if `io` is a socket still holding application bytes
-    /// the relay has not read, Linux then resets the connection, discarding unsent data. An error of `io`
-    /// resets the stream. The relay returns its admission permit before its outcome resolves. After the
-    /// runtime shut down, the relay closes `io` and resolves `Aborted`.
+    /// as a half-close, and returns its admission permit before its outcome resolves.
+    ///
+    /// When the proxy resets the stream, its session fails, or a PING probe goes unanswered, the
+    /// relay first writes the rest of the download to `io` if it has read the download's
+    /// END_STREAM. After an upload write error, it keeps reading while only the stream delays
+    /// the download. It then shuts down `io`'s write half and closes `io`, spending at most
+    /// `shutdown_timeout` on the writing and the shutdown together. If `io` is a socket that
+    /// still holds application bytes the relay has not read, Linux then resets the connection
+    /// and discards unsent data.
+    ///
+    /// An error of `io` resets the stream. After the runtime shut down, the relay closes `io` and
+    /// resolves `Aborted`.
     pub fn relay(
         mut self,
         io: impl Into<RelayIo>,
@@ -184,6 +189,7 @@ impl Drop for PendingTunnel {
 pub(crate) enum Choice {
     /// The worker half of the bridge.
     Bridge(DuplexStream),
+    /// The application I/O to relay and the sender for its outcome.
     Relay(RelayRequest),
 }
 
@@ -191,18 +197,19 @@ pub(crate) enum Choice {
 ///
 /// The response head belongs to CONNECT; tunnel bytes have no HTTP framing. `poll_flush`
 /// completes once the native stream accepted the written bytes, not when they reach the wire.
-/// `poll_shutdown` queues END_STREAM after the queued bytes and keeps the download open. A proxy
-/// reset or session failure fails reads with `ConnectionReset` instead of EOF, and later writes,
-/// flushes, and shutdowns too, also when it comes after the download's end of stream but before
-/// the upload's END_STREAM went out. An unanswered PING
+/// `poll_shutdown` queues END_STREAM after the queued bytes and keeps the download open.
+///
+/// A proxy reset or session failure fails reads with `ConnectionReset` instead of EOF, and fails
+/// later writes, flushes, and shutdowns too. This also holds when the failure comes after the
+/// download's end of stream but before the upload's END_STREAM went out. An unanswered PING
 /// probe (`ping_timeout`) fails reads, writes, flushes, and shutdowns with `TimedOut`, unless the
-/// download already reached END_STREAM: then the failure is `ConnectionReset`. A probe drop
-/// before the response head retries or fails the connect instead, by pooled CONNECT specification
-/// D8 and the acquire window (`ConnectOptions::ping_timeout`).
+/// download already reached END_STREAM, in which case the failure is `ConnectionReset`. A probe
+/// drop before the response head instead retries or fails the connect within the acquire window
+/// (see `ConnectOptions::ping_timeout`).
 ///
 /// Dropping the tunnel before its stream is wire-complete is an abortive close: it resets the
-/// stream, and upload bytes not yet sent may be discarded, also after `poll_shutdown` and end
-/// of stream while the proxy's flow control still holds them.
+/// stream, and upload bytes not yet sent may be discarded, even after `poll_shutdown` and end
+/// of stream, while the proxy's flow control still holds them.
 pub struct Tunnel {
     io: DuplexStream,
     response: Response<()>,
@@ -228,6 +235,7 @@ impl Tunnel {
         &self.response
     }
 
+    /// How the tunnel was set up.
     pub fn info(&self) -> TunnelInfo {
         self.info
     }
@@ -300,7 +308,7 @@ impl Drop for Tunnel {
 pub(crate) type Ending = fn(&Recorder) -> &Counter;
 
 /// Whether `connect()` returned the pending tunnel. Only returned tunnels count as established,
-/// reset, or aborted, so an ending that comes first waits for the receipt.
+/// reset, or aborted, so an ending that comes first is counted once the tunnel is received.
 enum Delivery {
     Pending(Option<Ending>),
     Received,
@@ -447,8 +455,8 @@ struct ObservedTransport {
     native: HttpConnectAsyncTransport,
     progress: Arc<Progress>,
     written: u64,
-    /// The download reached end of stream; shared, so the bridge sees it while the copy holds
-    /// this.
+    /// The download reached end of stream. Shared, so that the bridge can read it while the copy
+    /// holds this transport.
     read_ended: Rc<Cell<bool>>,
     /// A write, flush, or shutdown failed, so the stream's read error explains the failure.
     write_failed: bool,
@@ -514,7 +522,7 @@ impl AsyncWrite for ObservedTransport {
 
 /// After a native write, flush, or shutdown error, reads the stream to its end for at most
 /// `limit`, discarding what it reads, and returns the read error that explains the failure, if
-/// one arrives: a write error carries only `DROPPED`.
+/// one arrives. A write error carries only `DROPPED`.
 pub(crate) async fn read_error_after_write_error<Io>(
     native: &mut Io,
     limit: Duration,
@@ -537,7 +545,7 @@ where
 }
 
 /// Resolves once a peer reset or session failure closes the stream after the copy read the
-/// download's end: from then on the copy waits only for the application, so the stream's read
+/// download's end. From then on the copy waits only for the application, so the stream's read
 /// cannot report the ending. A stream closed after its upload's END_STREAM went out finishes
 /// through the copy instead.
 pub(crate) async fn closed_after_download(watch: &StreamWatch, download_ended: &Cell<bool>) {
@@ -545,8 +553,8 @@ pub(crate) async fn closed_after_download(watch: &StreamWatch, download_ended: &
     if watch.upload_ended() {
         return pending().await;
     }
-    // Only the copy sets `download_ended`, in the same task and just before the select that holds
-    // both polls this, so the check needs no waker of its own.
+    // Only the copy sets `download_ended`. It runs in the same task, and the biased `select!`
+    // polls it just before this future, so this check needs no waker of its own.
     poll_fn(|_| {
         if download_ended.get() {
             Poll::Ready(())
@@ -558,7 +566,7 @@ pub(crate) async fn closed_after_download(watch: &StreamWatch, download_ended: &
 }
 
 /// The failure of a stream that a peer reset or session failure closed before its upload's
-/// END_STREAM went out, also after both copy directions ended.
+/// END_STREAM went out, even after both copy directions ended.
 pub(crate) fn upload_discarded() -> io::Error {
     io::Error::new(
         io::ErrorKind::ConnectionReset,

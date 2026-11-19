@@ -420,7 +420,7 @@ pub(crate) struct TestConnector {
     /// Plaintext connections whose shutdown never completes, counted while they live.
     stalled_shutdowns: Option<Arc<AtomicUsize>>,
     send_buffer: Option<u32>,
-    /// A bound socket that never listens, held so that no other socket takes its port.
+    /// A bound socket that never listens, held so that other sockets cannot take its port.
     _reserved: Option<TcpSocket>,
     pub(crate) dropped: Arc<DroppedDials>,
 }
@@ -574,7 +574,7 @@ impl Connector for TestConnector {
     }
 }
 
-/// What a proxy saw.
+/// What a proxy observed.
 #[derive(Default)]
 pub(crate) struct Observations {
     connections: AtomicUsize,
@@ -824,7 +824,7 @@ impl Proxy {
         self.senders.closes.send_modify(|count| *count += 1);
     }
 
-    /// Stops polling every connection, so the proxy reads nothing more from its sockets.
+    /// Stops polling every connection, so the proxy stops reading from its sockets.
     pub(crate) fn stop_reading(&self) {
         self.senders.stop_reading.send_replace(true);
     }
@@ -844,13 +844,13 @@ impl Proxy {
         self.refusals.store(count, Ordering::SeqCst);
     }
 
-    /// Answers the next `count` streams by draining their connection with a graceful GOAWAY and
-    /// then refusing the stream.
+    /// Responds to the next `count` streams by draining their connection with a graceful GOAWAY
+    /// and then refusing the stream.
     pub(crate) fn drain_and_refuse_next(&self, count: usize) {
         self.drain_refusals.store(count, Ordering::SeqCst);
     }
 
-    /// Closes the connection of each of the next `count` streams instead of answering it.
+    /// Closes the connection of each of the next `count` streams instead of responding.
     pub(crate) fn close_on_next(&self, count: usize) {
         self.closings.store(count, Ordering::SeqCst);
     }
@@ -1133,7 +1133,7 @@ async fn serve_tunnel(
         return;
     }
     let mut incoming = request.into_body();
-    // The response ends at once; the upload stays open until the client ends or resets it.
+    // The response ends immediately; the upload stays open until the client ends or resets it.
     if action == "early-eof" {
         let response = Response::builder()
             .status(StatusCode::OK)
@@ -1147,7 +1147,7 @@ async fn serve_tunnel(
         }
         return;
     }
-    // The response ends at once; the upload is counted until the client ends it.
+    // The response ends immediately; the upload is counted until the client ends it.
     if action == "early-eof-sink" {
         let response = Response::builder()
             .status(StatusCode::OK)
@@ -1173,7 +1173,7 @@ async fn serve_tunnel(
         observations.bump(&observations.upload_eofs);
         return;
     }
-    // The response ends at once; the stream is reset after `GREETING_RESET_DELAY` without
+    // The response ends immediately; the stream is reset after `GREETING_RESET_DELAY` without
     // reading the upload.
     if action == "early-eof-reset" {
         let response = Response::builder()
@@ -1186,8 +1186,8 @@ async fn serve_tunnel(
         }
         return;
     }
-    // The response ends at once; the stream is reset once the gate closes, without reading the
-    // upload.
+    // The response ends immediately; the stream is reset once the gate closes, without reading
+    // the upload.
     if action == "early-eof-gated-reset" {
         let response = Response::builder()
             .status(StatusCode::OK)
@@ -1295,11 +1295,11 @@ async fn serve_tunnel(
             observations.reset(reason);
             return;
         }
-        // Speaks first, then echoes.
+        // Sends `GREETING` first, then echoes.
         ("greet", _) => {
             send_counted(&mut outgoing, Bytes::from_static(GREETING), &observations).await;
         }
-        // Speaks first and ends the download, then resets the stream once the gate closes,
+        // Sends `GREETING` and ends the download, then resets the stream once the gate closes,
         // without reading the upload.
         ("greet-end-gated-reset", _) => {
             send_counted(&mut outgoing, Bytes::from_static(GREETING), &observations).await;
@@ -1311,7 +1311,7 @@ async fn serve_tunnel(
             }
             return;
         }
-        // Speaks first, then resets the stream after `GREETING_RESET_DELAY`.
+        // Sends `GREETING` first, then resets the stream after `GREETING_RESET_DELAY`.
         ("greet-reset", _) => {
             send_counted(&mut outgoing, Bytes::from_static(GREETING), &observations).await;
             tokio::time::sleep(GREETING_RESET_DELAY).await;
@@ -1349,7 +1349,8 @@ async fn serve_tunnel(
                 return;
             }
         }
-        // `late-response:<ms>` waits that long instead of beyond the native timeouts.
+        // `late-response:<ms>` waits that long, and plain `late-response` waits past the native
+        // timeouts.
         ("late-response", delay) => {
             let delay = delay
                 .parse()
@@ -1508,44 +1509,44 @@ pub(crate) fn decode_header_blocks(written: &[u8]) -> Vec<(Vec<HpackHeader>, Vec
     blocks
 }
 
-/// A scripted connection behavior of a raw HTTP/2 proxy. Connections after the first answer
-/// every CONNECT with 200 and echo its data.
+/// A scripted connection behavior of a raw HTTP/2 proxy. Connections after the first respond
+/// to every CONNECT with 200 and echo its data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RawScript {
-    /// The first connection answers its first CONNECT with 200, then answers its second with a
+    /// The first connection responds to its first CONNECT with 200, then to its second with a
     /// GOAWAY whose last-stream-id is the first stream.
     GoawayBelowSecondStream,
     /// Like `GoawayBelowSecondStream`, but the GOAWAY carries `ENHANCE_YOUR_CALM`.
     ErrorGoawayBelowSecondStream,
-    /// The first connection waits for two CONNECTs, rejects the first with 403, and at once
-    /// sends a GOAWAY whose last-stream-id is that first stream, as fwdproxy does.
+    /// The first connection waits for two CONNECTs, rejects the first with 403, and immediately
+    /// sends a GOAWAY whose last-stream-id is that first stream, as some forward proxies do.
     RejectThenGoaway,
     /// Every CONNECT gets a 200 head with a folded header value that `http` cannot represent.
     UnconvertibleHead,
-    /// The first connection answers its first CONNECT with 200, then resets its second with
-    /// `CANCEL` and at once closes the connection.
+    /// The first connection responds to its first CONNECT with 200, then resets its second with
+    /// `CANCEL` and immediately closes the connection.
     ResetThenCloseSecondStream,
-    /// The first connection answers its first CONNECT with 200, then answers its second by
-    /// resetting the first stream with `CANCEL` and at once closing the connection.
+    /// The first connection responds to its first CONNECT with 200, then to its second by
+    /// resetting the first stream with `CANCEL` and immediately closing the connection.
     ResetSiblingThenCloseSecondStream,
-    /// The first connection answers its first CONNECT with 200, then answers its second with a
-    /// 103 head and at once closes the connection.
+    /// The first connection responds to its first CONNECT with 200, then to its second with a
+    /// 103 head, and immediately closes the connection.
     InformationalThenCloseSecondStream,
-    /// The first connection answers its first CONNECT with 200, then answers its second with a
+    /// The first connection responds to its first CONNECT with 200, then to its second with a
     /// complete header block whose second field is the invalid HPACK index 0.
     MalformedHeadOnSecondStream,
-    /// The first connection answers its first CONNECT with 200, then answers its second with a
-    /// GOAWAY whose last-stream-id is that stream and whose error is `REFUSED_STREAM`.
+    /// The first connection responds to its first CONNECT with 200, then to its second with a
+    /// GOAWAY that has that stream as its last-stream-id and `REFUSED_STREAM` as its error.
     RefusedGoawayCoveringSecondStream,
-    /// Every CONNECT gets a 200 head; the stream's first upload DATA is answered, in one write,
-    /// by `BEFORE_RESET` bytes of `pattern` and an RST_STREAM `CANCEL`.
+    /// Every CONNECT gets a 200 head. The proxy responds to the stream's first upload DATA, in
+    /// one write, with `BEFORE_RESET` bytes of `pattern` and an RST_STREAM `CANCEL`.
     DataThenReset,
     /// Like `DataThenReset`, but the RST_STREAM follows the DATA after `RESET_DELAY`.
     DataThenLateReset,
-    /// Every CONNECT gets a 200 head; the stream's first upload DATA is answered, in one write,
-    /// by this many bytes of `pattern`, END_STREAM, and an RST_STREAM `CANCEL`.
+    /// Every CONNECT gets a 200 head. The proxy responds to the stream's first upload DATA, in
+    /// one write, with this many bytes of `pattern`, END_STREAM, and an RST_STREAM `CANCEL`.
     EndThenReset(usize),
-    /// Like `EndThenReset`, but the stream's upload gets no credit, and the answer comes once a
+    /// Like `EndThenReset`, but the stream's upload gets no credit, and the response comes once a
     /// whole stream window of it has arrived.
     EndThenResetOnFullWindow(usize),
     /// Like `EndThenResetOnFullWindow`, but without END_STREAM, and the RST_STREAM follows the
@@ -1559,24 +1560,24 @@ pub(crate) enum RawScript {
     InformationalThenOk,
     /// Like `InformationalThenOk`, but the final head is a 403 that ends the stream.
     InformationalThenReject,
-    /// Every CONNECT gets a 200 head. The first connection's first stream answers its upload
-    /// END_STREAM, in one write, with `LARGE_RESPONSE` bytes of `pattern` and END_STREAM; every
+    /// Every CONNECT gets a 200 head. The first connection's first stream responds to its upload
+    /// END_STREAM, in one write, with `LARGE_RESPONSE` bytes of `pattern` and END_STREAM. Every
     /// other stream echoes.
     LargeResponseAfterUploadEnd,
-    /// The first connection answers its CONNECTs before the given ordinal (1-based) with 200 and
-    /// echoes; from that CONNECT on it sends nothing, PING acknowledgements included.
+    /// The first connection responds to its CONNECTs before the given ordinal (1-based) with 200
+    /// and echoes. From that CONNECT on it stops sending, PING acknowledgements included.
     SilentFrom(usize),
-    /// The first connection answers every CONNECT with 200 and echoes. Once its last open stream
-    /// has ended, it acknowledges no PING and sends a connection WINDOW_UPDATE every
+    /// The first connection responds to every CONNECT with 200 and echoes. Once its last open
+    /// stream has ended, it stops acknowledging PINGs and sends a connection WINDOW_UPDATE every
     /// `IDLE_FRAME_PERIOD`.
     IdleWithoutPingAcks,
     /// Every CONNECT gets a 200 head and its data is echoed, except that the first connection
-    /// answers its second upload DATA with a GOAWAY(INTERNAL_ERROR) whose last-stream-id is that
-    /// DATA's stream, then keeps its socket open and ignores every later frame.
+    /// responds to its second upload DATA with a GOAWAY(INTERNAL_ERROR) whose last-stream-id is
+    /// that DATA's stream, then keeps its socket open and ignores every later frame.
     ErrorGoawayOnSecondData,
 }
 
-/// What a raw proxy saw.
+/// What a raw proxy observed.
 #[derive(Default)]
 pub(crate) struct RawObservations {
     connections: AtomicUsize,
@@ -1674,7 +1675,7 @@ impl RawProxy {
     }
 }
 
-/// An HPACK integer with an `prefix`-bit prefix (RFC 7541 section 5.1).
+/// An HPACK integer with a `prefix`-bit prefix (RFC 7541 section 5.1).
 fn hpack_integer(prefix: u8, flags: u8, mut value: usize) -> Vec<u8> {
     let limit = (1_usize << prefix) - 1;
     if value < limit {

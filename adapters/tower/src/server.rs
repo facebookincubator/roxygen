@@ -5,11 +5,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Established-I/O Tower serving with a separately owned application parent.
+//! Serves a Tower service on established I/O, with the run owned by the caller.
 //!
 //! Reserve caller capacity before preparing a connection, drive `ServerRun` on
-//! the entered application runtime, and then start it. Reap that run before
-//! releasing caller capacity. Public handles and leaf observations are not joins.
+//! the entered application runtime, and then start it. Reap the task that
+//! drives that run before releasing caller capacity. Only `ServerRun` joins the
+//! connection's tasks; the handles and their wait methods do not.
 
 mod application;
 mod connection;
@@ -89,8 +90,8 @@ use tower_service::Service;
 
 /// A fixed, empty HTTP/1 rejection which closes rather than switches protocols.
 ///
-/// Only 4xx/5xx statuses are accepted. This does not authenticate a request or
-/// enable CONNECT, WebSocket, or HTTP/2 extended CONNECT handling.
+/// Only 4xx/5xx statuses are accepted. This does not add CONNECT, WebSocket,
+/// or HTTP/2 extended CONNECT support.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Http1ConnectionSwitchRejection {
     status: StatusCode,
@@ -133,7 +134,8 @@ impl InvalidRejectionStatus {
     }
 }
 
-/// Explicit wire/trust policy and bounded per-connection application admission.
+/// Options for one served connection, including its protocol, transport
+/// security, and limits.
 #[derive(Clone)]
 pub struct ServerOptions {
     pub protocol: CodecProtocol,
@@ -146,9 +148,10 @@ pub struct ServerOptions {
     pub response_body: ApplicationBodyOptions,
     /// Optional empty rejection for HTTP/1 CONNECT and Upgrade requests.
     ///
-    /// Default None preserves projection/service behavior. A selected rejection
-    /// drains the connection without invoking the service. HTTP/2 and unrelated
-    /// projection failures are unchanged; all existing cleanup joins still apply.
+    /// `None` (the default) leaves these requests to the usual request
+    /// conversion and service. A rejection drains the connection without
+    /// calling the service. HTTP/2 requests, and HTTP/1 requests that fail
+    /// conversion for another reason, are not affected.
     pub http1_connection_switch_rejection: Option<Http1ConnectionSwitchRejection>,
 }
 
@@ -168,7 +171,7 @@ impl ServerOptions {
     }
 }
 
-/// The first operation failure, independently of cleanup certainty.
+/// The first failure of a server operation, whether or not cleanup finished.
 #[derive(Debug, thiserror::Error)]
 pub enum ServerFailure {
     #[error("prepare/run requires the same live application Tokio runtime")]
@@ -205,7 +208,7 @@ pub enum ServerFailure {
     Cleanup(&'static str),
 }
 
-/// A retained unwind payload; formatting never invokes the application's payload.
+/// A caught panic payload. Its `Debug` output does not format the payload.
 pub struct PanicPayload(Mutex<Option<Box<dyn Any + Send>>>, u64);
 
 static NEXT_FAILURE: AtomicU64 = AtomicU64::new(1);
@@ -239,6 +242,8 @@ impl Drop for PanicPayload {
     }
 }
 
+/// A failed server operation and whether its cleanup is confirmed.
+///
 /// An operation error does not by itself mean that resource cleanup failed.
 #[derive(Clone, Debug)]
 pub struct ServerError {
@@ -288,13 +293,18 @@ impl ServerError {
             _ => false,
         }
     }
+
+    /// The failure that caused this error.
     pub fn cause(&self) -> &ServerFailure {
         self.cause.0.as_ref().expect("retained original cause")
     }
 
-    /// False requires retaining caller credit or closing its admission domain.
-    /// Startup errors are not cleanup receipts. Even a successful run result
-    /// must be separately reaped by its caller before releasing caller credit.
+    /// Whether the operation's cleanup is confirmed.
+    ///
+    /// When false, keep the caller's capacity reserved or close its admission.
+    /// A startup error does not show that cleanup finished. Even when
+    /// `ServerRun` succeeds, the caller must reap the task that drove it before
+    /// releasing caller capacity.
     pub fn cleanup_confirmed(&self) -> bool {
         self.cleanup_confirmed
     }
@@ -627,7 +637,7 @@ impl ExchangeState {
     }
 }
 
-/// Per-exchange cancellation and combined cleanup observation, not task ownership.
+/// Cancels one exchange and waits for its cleanup, without owning its tasks.
 #[derive(Clone)]
 pub struct ServerExchange {
     state: Arc<ExchangeState>,
@@ -640,12 +650,14 @@ impl fmt::Debug for ServerExchange {
 }
 
 impl ServerExchange {
+    /// Requests cancellation of the exchange.
     pub fn cancel(&self) {
         self.state.cancel();
     }
 
-    /// Includes native exchange, source scopes, service/body joins and watcher retirement.
-    /// The native handler must return before this receipt can finish.
+    /// Waits until the native exchange, its source scopes, the service and body
+    /// tasks, and the native task that watches the exchange are released. The
+    /// native handler must return before this completes.
     pub fn wait_completed(&self) -> impl Future<Output = Outcome> + Send + 'static {
         observe(
             self.state.completed.subscribe(),
@@ -661,7 +673,8 @@ impl Drop for PublicLease {
     }
 }
 
-/// Send controls; the caller's independent ServerRun owns execution and joining.
+/// `Send` controls for a connection. The caller's `ServerRun` runs and joins
+/// its work.
 #[derive(Clone)]
 pub struct ServerConnection {
     context: Arc<ConnectionContext>,
@@ -669,17 +682,22 @@ pub struct ServerConnection {
 }
 
 impl ServerConnection {
+    /// The connection's native context.
     pub fn connection_context(&self) -> &Arc<ConnectionContext> {
         &self.context
     }
+    /// Starts a graceful drain. Returns `false` if the connection was already
+    /// draining or cancelled.
     pub fn begin_drain(&self) -> bool {
         self.lease.0.change(Mode::Drain)
     }
+    /// Requests cancellation of the connection and its exchanges.
     pub fn cancel(&self) {
         self.lease.0.change(Mode::Cancel);
     }
 
-    /// Only app service/body leaves; excludes native/IO retirement and ServerRun reaping.
+    /// Waits until the application's service calls and response bodies finish.
+    /// Does not wait for native or I/O cleanup, or for `ServerRun`.
     pub fn wait_app_leaves_drained(&self) -> impl Future<Output = Outcome> + Send + 'static {
         observe(
             self.lease.0.app_leaves.subscribe(),
@@ -688,7 +706,9 @@ impl ServerConnection {
     }
 }
 
-/// Dormant startup control. Dropping it requests rollback in the living run.
+/// Starts a prepared connection. Dropping it before a successful `start`
+/// signals the run to cancel, and the run must still be polled until it
+/// returns.
 pub struct ServerStartup {
     requested: Option<oneshot::Sender<()>>,
     started: oneshot::Receiver<Result<Arc<ConnectionContext>, ServerError>>,
@@ -697,7 +717,8 @@ pub struct ServerStartup {
 }
 
 impl ServerStartup {
-    /// The caller must already own/drive the run in its bounded application parent.
+    /// Starts serving. The caller must already be driving the matching
+    /// `ServerRun` in a task it owns.
     pub async fn start(mut self) -> Result<ServerConnection, ServerError> {
         if let Some(requested) = self.requested.take() {
             self.signals
@@ -743,9 +764,11 @@ impl Drop for ServerStartup {
     }
 }
 
-/// Single-use, caller-owned execution. Keep polling on the preparation runtime.
-/// Its output is not a certificate that the caller has reaped this future/task.
-/// Arbitrary destruction of the ultimate parent cannot promise asynchronous joins.
+/// The connection's execution, which the caller owns and polls to completion.
+///
+/// Poll it on the runtime that called [`prepare_connection`]. Its output does
+/// not mean that the caller has reaped the task that polled it. Dropping the
+/// run or its runtime early cannot wait for asynchronous cleanup.
 #[must_use]
 pub struct ServerRun {
     future: Pin<Box<dyn Future<Output = Outcome> + Send>>,
@@ -961,9 +984,12 @@ impl Admission {
     }
 }
 
-/// Prepares without spawning, submitting native work, or adopting I/O.
-/// No service/body/I/O Sync or Unpin bounds are imposed. Reactor ownership stays
-/// with the caller until the run and native runtime have been physically joined.
+/// Prepares a connection without spawning tasks, submitting native work, or
+/// adopting the I/O.
+///
+/// The service, body, and I/O types need not be `Sync` or `Unpin`. The caller
+/// must keep the I/O's reactor running until the run and the native runtime
+/// have been joined.
 pub fn prepare_connection<Io, S, B>(
     worker: WorkerHandle,
     established: EstablishedIo<Io>,

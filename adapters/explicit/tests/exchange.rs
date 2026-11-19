@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Host-agnostic exchange oracles over loopback and in-memory byte streams.
+//! Tests for the host-agnostic exchange over loopback and in-memory byte streams.
 
 pub(crate) mod support {
     use std::cell::Cell;
@@ -76,7 +76,7 @@ pub(crate) mod support {
     /// Bounds a wait that only guards against a hang.
     pub(crate) const HANG_GUARD: Duration = Duration::from_secs(10);
 
-    /// A real-time deadline budget for an oracle that needs its send to reach a given point,
+    /// A real-time deadline budget for a test that needs its send to reach a given point,
     /// such as a dial, before the deadline passes: long enough for a loaded host's worker to get
     /// there well before it.
     pub(crate) const EXPIRY_BUDGET: Duration = Duration::from_secs(2);
@@ -359,7 +359,7 @@ pub(crate) mod support {
         mutex.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A server that answers every request with `response` and then waits for the close.
+    /// A server that responds to every request with `response` and then waits for the close.
     pub(crate) fn responding(response: impl Into<Vec<u8>>) -> TestServer {
         let response = response.into();
         TestServer::plain(move |mut conn| {
@@ -471,7 +471,7 @@ pub(crate) mod support {
     }
 
     /// A loopback address that refuses connections. Its port stays bound, with no listener, for
-    /// as long as the returned socket lives, so no other test's listener can take it.
+    /// as long as the returned socket lives, so that another test's listener cannot take it.
     pub(crate) fn refusing_address() -> (SocketAddr, tokio::net::TcpSocket) {
         let socket = tokio::net::TcpSocket::new_v4().expect("socket");
         socket
@@ -546,7 +546,8 @@ pub(crate) mod support {
     pub(crate) fn live_threads(prefix: &str) -> usize {
         // A listing of `/proc/self/task` ends early when the thread it is at exits, and the next
         // read resumes by position, so a thread that exits during a listing (another test's, or
-        // one just joined) can hide a live one. Two listings in a row that agree hid none.
+        // one just joined) can hide a live one. Two listings in a row that agree did not hide a
+        // thread.
         let wanted = format!("{prefix}-");
         let deadline = Instant::now() + HANG_GUARD;
         let mut previous = live_thread_ids(&wanted);
@@ -721,8 +722,8 @@ pub(crate) mod support {
     {
         // The adopted stream's transport arms its read and write timers with
         // `TimedBaton::new`, which needs a Tokio context, so the exchange runs inside this one.
-        // Nothing drives it: the exchange's deadline and the session's timers run on the manual
-        // clock, and the transport's timers never fire.
+        // This runtime is never driven. The exchange's deadline and the session's timers run on
+        // the manual clock, and the transport's timers never fire.
         let timers = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -920,7 +921,7 @@ mod exchange {
         assert_eq!(snapshot.pending_teardowns, 0);
         assert_eq!(snapshot.unconfirmed_retirements, 0);
 
-        // Shutdown begun before the cleanup reservation: the reservation is refused.
+        // Shutdown begun before the cleanup reservation: the reservation is rejected.
         let (closed_tx, closed_rx) = mpsc::channel();
         let peer = TestServer::plain(move |mut conn| {
             let _ = closed_tx.send(conn.read_end(HANG_GUARD));
@@ -1423,7 +1424,7 @@ mod exchange {
         truncated(&response, None);
         closed_rx.recv_timeout(HANG_GUARD).expect("server closed");
 
-        // A head that the codec rejects is no final head, though its status line parsed.
+        // A head that the codec rejects is not a final head, though its status line parsed.
         for (path, _, code) in MALFORMED_HEADS {
             let error = block_on(client.send(request("localhost", path, HANG_GUARD)))
                 .expect_err("malformed head");
@@ -1581,8 +1582,8 @@ mod exchange {
         assert_eq!(runtime.stats().panics, 0);
     }
 
-    /// A raw-headers client builds no `HeaderMap`, and its `RawHeaders` read what a default
-    /// client's map holds: the same first values, drops, and counted drops.
+    /// A raw-headers client does not build a `HeaderMap`, and its `RawHeaders` lookups return what
+    /// a default client's map holds: the same first values, drops, and counted drops.
     #[test]
     fn raw_headers_read_as_the_default_client_s_map() {
         let mut crowded = b"HTTP/1.1 200 OK\n".to_vec();

@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! `ExplicitRuntime` slot, restart, fail-open, TLS-ownership, and Send + Sync oracles.
+//! Tests for `ExplicitRuntime` slots, restarts, fail-open state, TLS ownership, and Send + Sync.
 
 mod runtime {
     use std::cell::RefCell;
@@ -178,7 +178,7 @@ mod runtime {
         (server, request_rx)
     }
 
-    /// A server that signals once it has read a request and answers it only on release.
+    /// A server that signals once it has read a request and responds only on release.
     fn parking_server() -> (TestServer, mpsc::Receiver<()>, Arc<TestPause>) {
         let (read_tx, read_rx) = mpsc::channel();
         let release = Arc::new(TestPause::new());
@@ -907,7 +907,7 @@ mod runtime {
         assert_eq!(runtime.stats().restarts, 1);
         assert_eq!(runtime.generation(0), new_generation);
 
-        // A stale report restarts nothing even once the newer generation is closed too.
+        // A stale report does not restart the slot, even once the newer generation is closed too.
         force_close(&runtime, 0);
         runtime.report_closed_generation(0, old_generation);
         std::thread::sleep(Duration::from_millis(100));
@@ -1311,7 +1311,7 @@ mod runtime {
     }
 
     /// A peer that accepts one connection, reports the size of the client's first read, never
-    /// answers, and then reports how its reads ended.
+    /// responds, and then reports how its reads ended.
     fn silent_peer() -> (SocketAddr, mpsc::Receiver<usize>, SilentPeer) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
         let address = listener.local_addr().expect("listener address");
@@ -1372,7 +1372,8 @@ mod runtime {
         let tls = |server: &TestServer| tls_target(server.address, &fixture.client, "localhost");
         let mut client = runtime.client(tls(&ok));
 
-        // A panic before the hand-off: the peer completed the handshake and gets no request.
+        // A panic before the hand-off: the peer completed the handshake and does not receive a
+        // request.
         let (ended_tx, ended_rx) = mpsc::channel();
         let dropped = TestServer::tls(Arc::clone(&fixture.server), move |mut conn| {
             let _ = ended_tx.send(conn.read_end(HANG_GUARD));
@@ -1464,7 +1465,7 @@ mod runtime {
         });
 
         // A send whose worker closes while its handshake is pending: the peer has read the
-        // ClientHello, so the handshake has been polled, and it never answers.
+        // ClientHello, so the handshake has been polled, and it never responds.
         let (silent, hello_rx, silent_peer) = silent_peer();
         let mut waiting = runtime.client(tls_target(silent, &fixture.client, "localhost"));
         let error = block_on(async {
@@ -1820,8 +1821,8 @@ mod runtime {
         });
         let plain = ok_server();
         let runtime = start(1, "rtg");
-        // A cleanup task told not to confirm would count each stream as unconfirmed; guarded
-        // streams register none.
+        // A cleanup task told not to confirm would count each stream as unconfirmed. Guarded
+        // streams do not register one.
         runtime.set_exchange_hooks(ExchangeHooks {
             unconfirmed_retirement: true,
             ..ExchangeHooks::default()
@@ -1945,7 +1946,7 @@ mod runtime {
         release.release();
 
         // While the drop still joins slot 0, slot 1's worker is published and open, but a send
-        // on it starts no exchange.
+        // on it does not start an exchange.
         let server = responding(OK);
         let runtime = start(2, "rdk");
         let barrier = TestPause::new();
@@ -2171,7 +2172,8 @@ mod runtime {
             assert_eq!(live_threads(prefix), 0);
         }
 
-        // A send first polled after the flag fails at once, though a restart is still in flight.
+        // A send first polled after the flag fails immediately, though a restart is still in
+        // flight.
         let server = ok_server();
         let runtime = start(1, "rly");
         let spawn = TestPause::new();
@@ -2347,8 +2349,8 @@ mod runtime {
         drop(runtime);
         assert_eq!(live_threads("rwo"), 0);
 
-        // The last drop's shutdown flag wakes every other send waiting on the flagged slot at
-        // once, long before their deadlines, and each fails as WorkerLost.
+        // The last drop's shutdown flag immediately wakes every other send waiting on the
+        // flagged slot, long before their deadlines, and each fails as WorkerLost.
         let server = ok_server();
         let runtime = start(2, "rwp");
         let spawn = TestPause::new();
@@ -2681,7 +2683,7 @@ mod runtime {
             if retiring != Retiring::Joining {
                 if extra.is_none() {
                     // The drop on the old worker's owner thread has set the shutdown flag and
-                    // waits for the held restart, which joins no worker of that thread.
+                    // waits for the held restart, which does not join a worker of that thread.
                     wait_for_state(&observer, SlotState::Closed);
                     std::thread::sleep(Duration::from_millis(100));
                     assert!(
@@ -2937,7 +2939,7 @@ mod runtime {
     /// How a sweep run's script ends after its second poll.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum SweepEnd {
-        /// The server answers, and a third poll with the second poll's waker resolves the send.
+        /// The server responds, and a third poll with the second poll's waker resolves the send.
         Resolve,
         /// The send is dropped unresolved.
         Drop,
@@ -2947,7 +2949,7 @@ mod runtime {
     struct SweepFamily {
         prefix: &'static str,
         runtime: Mutex<Option<ExplicitRuntime>>,
-        /// Clone callbacks run so far; the test's own wakers are no clones.
+        /// Clone callbacks run so far. The test's own wakers are not clones.
         clones: AtomicUsize,
         /// The armed clone, counted from 1, or 0 for an unarmed run.
         armed: usize,
@@ -2973,7 +2975,7 @@ mod runtime {
         RawWakerVTable::new(sweep_clone, sweep_wake, sweep_wake_by_ref, sweep_drop);
 
     impl SweepFamily {
-        /// A waker that the test owns, which releases nothing itself.
+        /// A waker that the test owns, which does not release the runtime itself.
         fn root(self: &Arc<Self>) -> Waker {
             let instance = Box::new(SweepInstance {
                 family: Arc::clone(self),
@@ -3230,7 +3232,7 @@ mod runtime {
                     let (thread, alive) = released.expect("released");
                     if thread.starts_with(&format!("{prefix}-")) {
                         // Only the published worker's owner thread, which `HostedWorker::drop`
-                        // leaves unjoined when it runs there (`DIV-003`).
+                        // leaves unjoined when it runs there.
                         assert_eq!((thread, alive), (format!("{prefix}-0"), 1), "{case}");
                         wait_until("the worker's exit", || live_threads(prefix) == 0);
                     } else {
@@ -3565,8 +3567,7 @@ mod runtime {
         })
     }
 
-    /// The names of the bench server's response head
-    /// (`ti/synthetic_e2e/http_backend_bench/src/server.rs`), with the `date` and
+    /// The header names of a benchmark server's response head, with the `date` and
     /// `content-length` that hyper adds.
     const BENCH_HEAD: [&str; 25] = [
         "content-type",
@@ -3607,7 +3608,7 @@ mod runtime {
                     .any(|constant| constant.as_str().as_bytes() == name)
             })
             .collect();
-        // The common-header table names 20 headers that `http` has no constant for.
+        // The common-header table names 20 headers that `http` does not have constants for.
         assert_eq!(without_constant.len(), 20, "{without_constant:?}");
         without_constant.iter().for_each(|code| {
             let mut headers = HttpHeaders::new();
@@ -3910,8 +3911,8 @@ mod runtime {
         });
     }
 
-    /// Each name of `headers` as written, in lowercase, and in uppercase, and names that no head
-    /// carries or that `HeaderName` refuses.
+    /// Each name of `headers` as written, in lowercase, and in uppercase, and names that the
+    /// head does not carry or that `HeaderName` rejects.
     fn query_names(headers: &HttpHeaders) -> Vec<String> {
         headers
             .iter()
@@ -4015,7 +4016,7 @@ mod runtime {
             assert_eq!(name_parses() - before, 0, "kept as parsed");
             assert_eq!(dropped, 0);
             assert_eq!(raw.get_str("X-Enc-Edge-Host"), Some("value-6"));
-            // The thread has parsed no bench name yet.
+            // The thread has not parsed a benchmark header name yet.
             assert_eq!(name_parses_converting(&bench), 13);
 
             let crowded = named_headers((0..=RAW_HEADER_LIMIT).map(|index| format!("x-c{index}")));
@@ -4054,7 +4055,7 @@ mod runtime {
         probe.validations.load(Ordering::SeqCst)
     }
 
-    /// A scripted peer that answers one request head with `OK` and then waits for the close.
+    /// A scripted peer that responds to one request head with `OK` and then waits for the close.
     async fn answer(mut peer: tokio::io::DuplexStream) {
         let mut head = Vec::new();
         let mut buffer = [0; 1024];
@@ -4068,7 +4069,7 @@ mod runtime {
         let _ = peer.read(&mut buffer).await;
     }
 
-    /// A scripted peer that reads and never answers.
+    /// A scripted peer that reads and never responds.
     async fn stall(mut peer: tokio::io::DuplexStream) {
         let mut buffer = [0; 1024];
         let _ = peer.read(&mut buffer).await;
@@ -4099,9 +4100,9 @@ mod runtime {
         })
     }
 
-    /// An expiry's phase, kind, and reached-wire flag; whether it truncated the body rather than
-    /// failed the send; and whether its error carries the TCP connect, TLS handshake, first byte,
-    /// and last byte timings.
+    /// Summarizes an expiry: its phase, kind, and reached-wire flag, whether it truncated the body
+    /// instead of failing the send, and which of the TCP connect, TLS handshake, first byte, and
+    /// last byte timings its error carries.
     fn expiry(
         result: Result<Response, ExplicitError>,
     ) -> (Phase, ErrorKind, bool, bool, [bool; 4]) {
@@ -4465,7 +4466,7 @@ mod runtime {
                 "{address:?}"
             );
         }
-        // As in the reference, a scoped address reports no flow label or scope.
+        // As in the reference, a scoped address loses its flow label and scope.
         let (_, reported) = dialed_endpoint(Some(scoped));
         let Some(SocketAddr::V6(reported)) = reported else {
             panic!("an IPv6 address: {reported:?}");
@@ -4533,8 +4534,8 @@ mod runtime {
         assert_eq!(reported, Some(address));
     }
 
-    /// A configuration whose workers queue at most `command_capacity` commands and whose slots
-    /// admit at most `max_sends_in_flight` sends.
+    /// A configuration with at most `command_capacity` queued commands per worker and at most
+    /// `max_sends_in_flight` sends per slot.
     fn split_config(
         workers: usize,
         command_capacity: usize,
@@ -4563,8 +4564,8 @@ mod runtime {
     }
 
     /// Starts each client's send on `caller`, one at a time, each once the previous one's request
-    /// has reached the server and its slot's queue is empty again, so that no send meets the
-    /// queue bound by racing the worker's drain.
+    /// has reached the server and its slot's queue is empty again, so that a send does not meet
+    /// the queue bound by racing the worker's drain.
     fn park_sends(
         caller: &tokio::runtime::Runtime,
         runtime: &ExplicitRuntime,
@@ -4597,8 +4598,9 @@ mod runtime {
             .collect()
     }
 
-    /// A server that signals once it has read each request and answers one request for each
-    /// token sent on the returned sender. Dropping the sender answers every other request.
+    /// A server that signals once it has read each request and responds to one request for each
+    /// token sent on the returned sender. Once the sender is dropped, it responds to every
+    /// remaining request.
     fn token_server() -> (TestServer, mpsc::Receiver<()>, mpsc::Sender<()>) {
         let (read_tx, read_rx) = mpsc::channel();
         let (token_tx, token_rx) = mpsc::channel::<()>();
@@ -4777,7 +4779,7 @@ mod runtime {
         };
         assert_eq!(observer.slot_health(), health(0, 0, 0));
 
-        // At the in-flight bound, a refusal is not reset.
+        // At the in-flight bound, the overload count is not reset.
         let clients = (0..3)
             .map(|_| runtime.client(Arc::clone(&target)))
             .collect();
@@ -4788,15 +4790,15 @@ mod runtime {
         assert_eq!(error.kind, ErrorKind::Overloaded);
         assert_eq!(observer.slot_health(), health(3, 0, 1));
 
-        // Below both bounds, it is, although the slot's sends in flight exceed the queue's
-        // capacity.
+        // Below both bounds, it is reset, although the slot's sends in flight exceed the
+        // queue's capacity.
         tokens.send(()).expect("token");
         wait_until("one send's task to finish", || {
             sends.iter().filter(|send| send.is_finished()).count() == 1
         });
         assert_eq!(observer.slot_health(), health(2, 0, 0));
 
-        // At the queue bound, below the in-flight bound, a refusal is not reset.
+        // At the queue bound, below the in-flight bound, the overload count is not reset.
         let hold = hold_worker(&runtime, 0);
         runtime
             .worker_handle(0)
@@ -4976,7 +4978,7 @@ mod runtime {
             "every slot is capped"
         );
 
-        // Creating clients admits no restart.
+        // Creating clients does not admit a restart.
         let runtime = start(2, "abf");
         force_close(&runtime, 1);
         let clients: Vec<_> = (0..8)

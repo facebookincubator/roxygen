@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Existing application connector integration, not an HTTP client or scheduler.
+//! Plugs an application's existing connector into the native session pools.
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -56,12 +56,13 @@ use crate::route::HopSecurity;
 use crate::route::ProxyEndpoint;
 use crate::route::RouteSpec;
 
-/// Caller-audited immutable aggregate connector configuration.
+/// The proxy behavior that the caller declares for its connector.
 ///
-/// Forward means exactly this plaintext, header-free, always-intercepting proxy,
-/// with no forced CONNECT or fallback. An opaque connector cannot be inspected
-/// to prove this assertion; the owner must audit its construction. Replacing its
-/// configuration requires a new client. Direct permits no proxy interception.
+/// `Forward` means the connector always sends requests through exactly this
+/// plaintext proxy, without added headers, a forced CONNECT, or a fallback.
+/// `Direct` means it never uses a proxy. The client cannot inspect an opaque
+/// connector to check this, so the caller must. Changing the policy requires a
+/// new client.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorPolicy {
     Direct,
@@ -69,6 +70,7 @@ pub enum ConnectorPolicy {
 }
 
 impl ConnectorPolicy {
+    /// Whether `route` matches this policy.
     pub fn permits(&self, route: &RouteSpec) -> bool {
         match (self, route.proxy()) {
             (Self::Direct, None) => true,
@@ -78,9 +80,12 @@ impl ConnectorPolicy {
     }
 }
 
-/// One native-pool attempt's immutable request, supplied on the app runtime.
-/// Connector errors remain original typed causes. A connector explicitly returning
-/// `AttachedConnectFailure` retains that already-classified native/cause pair.
+/// The connector's input for one native pool connection attempt, delivered on
+/// the application runtime.
+///
+/// Connector errors are kept as their original typed causes. If a connector
+/// returns an `AttachedConnectFailure`, its native error and cause are passed
+/// through unchanged.
 #[derive(Clone)]
 pub struct ConnectRequest {
     pub(super) route: RouteSpec,
@@ -106,8 +111,9 @@ impl ConnectRequest {
     }
 }
 
-/// Actual established connection metadata supplied by a trusted connector.
-/// TLS indicates encryption, not an inferred certificate/authentication result.
+/// Metadata of an established connection, reported by a trusted connector.
+/// `Tls` security means the connection is encrypted; it does not imply that
+/// the peer was authenticated.
 pub struct ConnectorMetadata {
     pub protocol: CodecProtocol,
     pub security: TransportSecurity,
@@ -116,8 +122,9 @@ pub struct ConnectorMetadata {
     pub peer_identity: Option<PeerIdentity>,
 }
 
-/// One completed attempt, with its original I/O wrappers and response extras.
-/// The route must describe the actual audited dial decision, not request Host.
+/// A completed connection attempt, with its original I/O wrappers and
+/// extensions. The route must describe where the connector actually dialed,
+/// not the request's Host.
 pub struct ConnectedIo<Io> {
     pub(super) route: RouteSpec,
     pub(super) established: EstablishedIo<Io>,
@@ -147,7 +154,7 @@ impl<Io> ConnectedIo<Io> {
         self
     }
 
-    /// Recovers the actual attempt values without unwrapping the I/O stack.
+    /// Splits into the attempt's values without unwrapping the I/O stack.
     pub fn into_parts(
         self,
     ) -> (
@@ -191,12 +198,13 @@ pub(super) fn security(route: &RouteSpec) -> TransportSecurity {
     }
 }
 
-/// Adapts the complete Hyper-compatible connector result using `TokioIo`.
+/// Adapts a hyper-util connector (a `Service<Uri>`) through `TokioIo`.
 ///
-/// No Hyper HTTP driver, resolver replacement, TLS unwrap, CONNECT or replay is
-/// introduced. The policy must match the aggregate's audited construction. The
-/// mapper supplies facts unavailable through generic Hyper `Connected`; actual
-/// ALPN/proxy flags are checked independently and response extras are retained.
+/// The adapter does not add an HTTP driver or a CONNECT tunnel, and does not
+/// unwrap TLS. `policy` must match how the connector was built. The `metadata`
+/// callback supplies what hyper's `Connected` does not expose. `Connected`'s
+/// proxied flag is checked against the route, and its negotiated-h2 flag
+/// against the callback's protocol. Its extras are kept as extensions.
 pub struct HyperConnector<C, M> {
     connector: C,
     policy: ConnectorPolicy,

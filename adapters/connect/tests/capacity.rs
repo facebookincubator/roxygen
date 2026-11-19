@@ -570,7 +570,7 @@ fn admission_is_released_before_an_error_reply() {
 }
 
 /// Parks the protocol worker in the `security()` call that creates its route until `admitted`
-/// connects were admitted, so they all queue for the worker at once.
+/// connects were admitted, so they all queue for the worker together.
 struct ParkingConnector {
     dial: Arc<TestConnector>,
     client: Client,
@@ -603,7 +603,8 @@ fn bursts_beyond_128_connects_never_see_overloaded() {
         ..Default::default()
     };
     run(options, |client| async move {
-        // fwdproxy-hatch's limit, so a session that opened a 101st stream would see a refusal.
+        // A limit some forward proxies use, so a session that opened a 101st stream would be
+        // refused.
         let proxy = Proxy::with_config(ProxyConfig {
             max_concurrent_streams: Some(100),
             ..Default::default()

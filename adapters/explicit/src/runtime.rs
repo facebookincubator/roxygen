@@ -127,20 +127,20 @@ const RESTART_WINDOW: Duration = Duration::from_secs(60);
 pub struct ExplicitRuntimeConfig {
     /// Number of slots, each with one `HostedWorker` thread.
     pub workers: NonZeroUsize,
-    /// Bounds each worker's command queue; a send whose command finds it full is `Overloaded`,
-    /// although `max_sends_in_flight` admitted it. Below `max_sends_in_flight`, it can refuse a
-    /// burst of sends between two of the worker's runs, such as those that wake together when
-    /// a restart publishes.
+    /// Bounds each worker's command queue. A send fails as `Overloaded` when the queue is full,
+    /// even after `max_sends_in_flight` admitted it. A capacity below `max_sends_in_flight` can
+    /// reject a burst of sends between two of the worker's runs, such as sends that wake
+    /// together when a restart publishes.
     pub command_capacity: NonZeroUsize,
-    /// Bounds each slot's sends in flight, each counted from its admission until it resolves or
-    /// is dropped; a send beyond it is `Overloaded`. Every target's clients share the slots, so
-    /// size it with headroom above the sum of the targets' rates times their timeout, divided
-    /// by `workers`: a target that stops answering holds each send until its timeout.
+    /// Bounds each slot's sends in flight, counted from admission until a send resolves or is
+    /// dropped. A send beyond the bound fails as `Overloaded`. Clients of every target share the
+    /// slots, and a target that stops responding holds each send until its timeout. Size this
+    /// with headroom above the sum of each target's rate times its timeout, divided by `workers`.
     pub max_sends_in_flight: NonZeroUsize,
     /// Slot `i` runs on `{prefix}-{i}`, and its restarts on `{prefix}-restart-{i}`.
     pub thread_name_prefix: &'static str,
-    /// Per slot: restarts started within the trailing minute, and restarts still joining their
-    /// old worker, are each bounded by this value.
+    /// Bounds, per slot, both the restarts started within the trailing minute and the restarts
+    /// still joining their old worker.
     pub max_restarts_per_minute: u32,
 }
 
@@ -149,14 +149,14 @@ pub struct ExplicitRuntimeConfig {
 /// Only `ExplicitRuntime` clones own the workers. Dropping the last clone joins every worker
 /// and restart thread without a deadline, so drop it from a blocking context.
 ///
-/// The one exception is a last drop from caller code, such as a send's waker, that the runtime
-/// runs on a thread its teardown would wait for: a slot's worker or restart thread, or a thread
-/// whose restart step is outstanding. That drop never waits for a restart step its own thread
-/// holds, and it joins neither its own thread nor a restart thread that is joining its thread's
-/// worker. A runtime thread that it leaves unjoined exits once its closure ends, with no join
-/// point, so an embedder that needs every thread joined drops the last clone from a thread that
-/// the runtime does not own. The drop's other waits and joins run on whichever thread runs it,
-/// a worker's included.
+/// The exception is a last drop from caller code, such as a send's waker, that the runtime runs
+/// on a thread that its teardown would wait for: a slot's worker or restart thread, or a thread
+/// with an outstanding restart step. That drop does not wait for a restart step held by its own
+/// thread. It does not join its own thread, or a restart thread that is joining its own thread's
+/// worker. A runtime thread left unjoined this way exits when its closure ends, without a join
+/// point. An embedder that needs every thread joined should drop the last clone from a thread
+/// that the runtime does not own. The drop's other waits and joins run on whichever thread runs
+/// it, including a worker's.
 #[derive(Clone)]
 pub struct ExplicitRuntime {
     owner: Arc<Owner>,
@@ -173,8 +173,8 @@ impl Drop for Owner {
 }
 
 impl ExplicitRuntime {
-    /// Spawns every slot's worker, blocking until each runs; async callers use a blocking
-    /// context.
+    /// Spawns every slot's worker and blocks until each runs, so async callers should call it
+    /// from a blocking context.
     pub fn start(config: ExplicitRuntimeConfig) -> Result<Self, ExplicitError> {
         Self::create(config, Arc::default())
     }
@@ -225,12 +225,13 @@ impl ExplicitRuntime {
         })
     }
 
-    /// Pins a client to a slot without I/O and without admitting a restart.
-    /// Inside a [`CohostExecutor::scope`] task, uses that task's worker.
+    /// Creates a client pinned to one slot, without I/O and without admitting a restart.
+    /// Inside a [`CohostExecutor::scope`] task, the client uses that task's worker.
     ///
-    /// With more than one slot, the client takes the less loaded of its round-robin slot and a
-    /// distinct pseudo-random one, by sends in flight, and a tie goes to the round-robin slot. A
-    /// `Capped` slot, which fails every send at once, is pinned only when every slot is.
+    /// With more than one slot, the client takes whichever of its round-robin slot and a distinct
+    /// pseudo-random slot has fewer sends in flight, and a tie goes to the round-robin slot. A
+    /// `Capped` slot, which fails every send immediately, is chosen only when every slot is
+    /// `Capped`.
     pub fn client(&self, target: Arc<Target>) -> ExplicitClient {
         let shared = &self.owner.shared;
         let candidates = cohost::current_slot(shared)
@@ -250,13 +251,14 @@ impl ExplicitRuntime {
         }
     }
 
+    /// A snapshot of the runtime's statistics.
     pub fn stats(&self) -> RuntimeStats {
         self.owner.shared.stats.snapshot()
     }
 
-    /// Whether every slot's worker is open, requesting a restart of each slot whose worker is
-    /// not. Performs no I/O and never blocks, apart from a waiting send's waker that it runs
-    /// when a restart thread fails to spawn (see [`ExplicitRuntime`]).
+    /// Returns whether every slot's worker is open, and requests a restart of each slot with a
+    /// worker that is not. It does not perform I/O or block, apart from running a waiting
+    /// send's waker when a restart thread fails to spawn (see [`ExplicitRuntime`]).
     pub fn is_healthy(&self) -> bool {
         let shared = &self.owner.shared;
         shared
@@ -269,18 +271,20 @@ impl ExplicitRuntime {
     }
 }
 
-/// A numeric destination: nothing below this API resolves names.
+/// A numeric destination. This API does not resolve names.
 pub struct Target {
     /// The address the exchange dials: the destination's, or a tunnel's proxy's.
     pub address: SocketAddr,
+    /// The immediate hop's security.
     pub security: Security,
 }
 
 /// The immediate hop's security.
 #[derive(Clone, Debug)]
 pub enum Security {
+    /// Plaintext TCP.
     Plaintext,
-    /// TLS with the caller's configuration, which must offer no ALPN protocol.
+    /// TLS with the caller's configuration, which must not offer an ALPN protocol.
     Tls {
         config: Arc<ClientConfig>,
         server_name: ServerName<'static>,
@@ -292,7 +296,7 @@ pub enum Security {
 
 impl Security {
     /// Builds TLS security for `host`, which may be a DNS name, or an IPv4 or IPv6 literal with
-    /// or without one pair of surrounding brackets. Performs no I/O.
+    /// or without one pair of surrounding brackets. Does not perform I/O.
     pub fn tls(config: Arc<ClientConfig>, host: &str) -> Result<Self, ExplicitError> {
         if !config.alpn_protocols.is_empty() {
             return Err(alpn_offered());
@@ -313,31 +317,37 @@ fn alpn_offered() -> ExplicitError {
     )
 }
 
-/// A slot's state, as found before any restart the query admits.
+/// A slot's state, as observed before any restart that the query admits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SlotState {
     /// The published worker is open.
     Open,
-    /// The published worker is not open and no restart is in flight.
+    /// The published worker is not open, and a restart is not in flight.
     Closed,
     /// A restart is in flight.
     Restarting,
-    /// The published worker is not open and the restart bounds refuse a restart.
+    /// The published worker is not open and the restart bounds do not allow a restart.
     Capped,
 }
 
 /// A slot's health, for an embedder that routes around unhealthy slots.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SlotHealth {
+    /// The slot's state.
     pub state: SlotState,
+    /// Sends admitted to the slot and not yet resolved or dropped.
     pub sends_in_flight: usize,
+    /// Commands waiting in the published worker's queue.
     pub queued_commands: usize,
+    /// `ExplicitRuntimeConfig::command_capacity`.
     pub command_capacity: usize,
+    /// `ExplicitRuntimeConfig::max_sends_in_flight`.
     pub max_sends_in_flight: usize,
+    /// `Overloaded` rejections since the slot last accepted a send or reported spare capacity.
     pub consecutive_overloads: u64,
 }
 
-/// Sends exchanges to one target on one pinned slot. Never owns a worker.
+/// Sends exchanges to one target on one pinned slot. It does not own a worker.
 pub struct ExplicitClient {
     shared: Arc<Shared>,
     slot: usize,
@@ -350,20 +360,20 @@ pub struct ExplicitClient {
 
 impl ExplicitClient {
     /// Makes this client's responses keep their headers as the codec parsed them, in
-    /// `Response::raw_headers`, and leave `Response::headers` empty, so that no exchange builds
-    /// a `HeaderMap`. `RawHeaders` reads what that map would hold, and `dropped_headers` counts
-    /// what it would drop.
+    /// `Response::raw_headers`, and leave `Response::headers` empty, so that exchanges do not
+    /// build a `HeaderMap`. `RawHeaders` lookups return what that map would hold, and
+    /// `dropped_headers` counts what it would drop.
     pub fn with_raw_headers(mut self) -> Self {
         self.header_form = HeaderForm::Raw;
         self
     }
 
-    /// Makes this client's adopted streams, a tunnel's proxy stream included, each own a guard
-    /// that keeps them in `RuntimeStats::pending_teardowns` until they are destroyed, instead of
-    /// registering a worker cleanup task per stream that awaits its retirement. A stream that
-    /// never retires still stays counted, but its exchanges record no `close_to_retirement_us`
-    /// sample, and a stream destroyed while its thread panics counts as an unconfirmed
-    /// retirement.
+    /// Makes each adopted stream of this client, including a tunnel's proxy stream, own a guard
+    /// that keeps it in `RuntimeStats::pending_teardowns` until it is destroyed. This replaces
+    /// the default worker cleanup task per stream that awaits its retirement. A stream that
+    /// never retires still stays counted, but its exchanges do not record a
+    /// `close_to_retirement_us` sample. A stream destroyed while its thread panics counts as an
+    /// unconfirmed retirement.
     pub fn with_teardown_guard(mut self) -> Self {
         self.teardown_watch = TeardownWatch::StreamGuard;
         self
@@ -373,11 +383,12 @@ impl ExplicitClient {
     ///
     /// Poll it inside a Tokio runtime with time enabled. A send polled off its worker's thread
     /// arms its deadline timer in the runtime of its first such poll, which must keep running
-    /// until the send resolves. Dropping the future before it resolves cancels the exchange. The
-    /// runtime runs no clone, wake, or drop of the context's waker under a lock that its
-    /// workers, restarts, or teardown take, so that waker may own the last runtime clone;
-    /// [`ExplicitRuntime`] says where its drop then runs. A panic from that waker on a worker's
-    /// thread is caught and disposed of there, so it closes no worker.
+    /// until the send resolves. Dropping the future before it resolves cancels the exchange.
+    ///
+    /// The runtime does not clone, wake, or drop the context's waker while holding a lock that
+    /// its workers, restarts, or teardown take, so that waker may own the last runtime clone.
+    /// See [`ExplicitRuntime`] for which thread that drop runs on. A panic from that waker on a
+    /// worker's thread is caught and disposed of there, so it does not close the worker.
     pub async fn send(&mut self, request: Request) -> Result<Response, ExplicitError> {
         let stats = Arc::clone(&self.shared.stats);
         stats.count_send();
@@ -511,12 +522,12 @@ impl ExplicitClient {
         let waker = Waker::from(Arc::clone(&call_waker));
         let _close = CloseCallWaker(&call_waker);
         let result = poll_fn(|context| {
-            // A passed deadline wins over a ready worker loss at every poll. It is read from the
-            // clock first, because the send may resume after its deadline before a sleep fires.
-            // Polled on its worker's thread, where that thread's timer could not fire while the
-            // send is polled, the send relies instead on the job's pre-dial expiry check and on
-            // the wake of a command that a closing worker drops. Its sleep arms at its first poll
-            // made off that thread.
+            // A passed deadline wins over a ready worker loss at every poll. The clock is read
+            // first, because the send may resume after its deadline before a sleep fires. A send
+            // polled on its worker's thread cannot use that thread's timer, which cannot fire
+            // while the send is polled. It relies instead on the job's pre-dial expiry check and
+            // on the wake from a command that a closing worker drops. Its sleep arms at its first
+            // poll off that thread.
             if !expired {
                 if tokio::time::Instant::now() >= deadline {
                     expired = true;
@@ -565,8 +576,8 @@ impl ExplicitClient {
         }
     }
 
-    /// Waits until the restart that the send found in flight, with `failures` failed restarts
-    /// before it and `seen` publication signals raised, publishes.
+    /// Waits until the in-flight restart publishes. `failures` counts the failed restarts
+    /// before it, and `seen` the publication signals already raised.
     ///
     /// A passed deadline wins over a signal already raised, as in the `WorkerCall` wait.
     async fn wait_for_publication(
@@ -602,8 +613,8 @@ impl ExplicitClient {
         }
     }
 
-    /// A send whose deadline passed before its exchange started, with its time since `send` as
-    /// its queue delay.
+    /// The error for a send whose deadline passed before its exchange started. Its queue delay
+    /// is the time since `send`.
     fn expired_before_start(&self, submitted_at: Instant) -> ExplicitError {
         let mut error = ExplicitError::expired(Phase::Submit);
         error.timings.queued = submitted_at.elapsed();
@@ -620,7 +631,7 @@ fn overloaded(detail: &str) -> ExplicitError {
     ExplicitError::new(Phase::Submit, ErrorKind::Overloaded, detail)
 }
 
-/// Records the stage timings of a resolved send; queue delays are recorded where they are
+/// Records the stage timings of a resolved send. Queue delays are recorded where they are
 /// measured.
 fn record_timings(stats: &ExplicitStats, timings: &Timings) {
     timings
@@ -699,13 +710,13 @@ impl Drop for CancelGuard {
 
 /// The waker that a send polls its `WorkerCall` with, in place of the caller's.
 ///
-/// `WorkerCall::poll` clones the waker it is given, and drops the one it replaces, with the
-/// response lock held that the worker takes to deliver or cancel the result. A caller's waker
-/// whose clone or drop released the last runtime clone there would join the worker under that
-/// lock. This waker's clone and drop only change its reference count, and the send holds its
-/// own reference throughout. The caller's waker sits in `caller`, whose lock is never held while
-/// caller code runs: the send clones and drops it on its own thread, and a wake wakes it by
-/// reference on the waking thread, each with no lock held.
+/// `WorkerCall::poll` clones the waker it is given, and drops the one it replaces, while holding
+/// the response lock that the worker takes to deliver or cancel the result. If a caller's waker
+/// released the last runtime clone there, the worker would be joined under that lock. This
+/// waker's clone and drop only change its reference count, and the send holds its own reference
+/// throughout. The caller's waker is kept in the `caller` mutex, which is never held while
+/// caller code runs. The send clones and drops the caller's waker on its own thread, and a wake
+/// wakes it by reference on the waking thread, each without a lock held.
 #[derive(Default)]
 struct CallWaker {
     caller: Mutex<CallerWaker>,
@@ -714,7 +725,7 @@ struct CallWaker {
 #[derive(Default)]
 struct CallerWaker {
     waker: Option<Waker>,
-    /// Set once the send resolves or is dropped, after which no caller's waker is stored.
+    /// Set once the send resolves or is dropped. After that, a caller's waker is not stored.
     closed: bool,
 }
 
@@ -755,13 +766,13 @@ impl Wake for CallWaker {
         self.wake_by_ref();
     }
 
-    /// Wakes the caller's waker by reference with the lock released, and then puts it back,
-    /// unless a newer registration has filled the slot or the send has closed it, in which case
-    /// it drops the waker after releasing the lock.
+    /// Wakes the caller's waker by reference with the lock released, and then puts it back. If
+    /// a newer registration has filled the slot or the send has closed it, the waker is dropped
+    /// instead, after the lock is released.
     ///
-    /// The waking thread may be a slot's worker, where a panic would unwind into the worker's
-    /// command and close the worker under every other send on it, so the caller's wake and drop
-    /// each run in their own unwind boundary and a panic is disposed of here.
+    /// The waking thread may be a slot's worker. A panic there would unwind into the worker's
+    /// command and close the worker under every other send on it. The caller's wake and drop
+    /// therefore each run in their own unwind boundary, and a panic is disposed of here.
     fn wake_by_ref(self: &Arc<Self>) {
         let Some(waker) = self.lock().waker.take() else {
             return;
@@ -827,8 +838,8 @@ fn submit_job<R: Route>(
 struct Dial<'a> {
     context: &'a WorkerContext,
     target: &'a Target,
-    /// Taken when the core starts. The core uses the request up before it returns its future,
-    /// so no other future holds it.
+    /// Taken when the core starts. The core consumes the request before it returns its future,
+    /// so that other futures do not hold it.
     request: &'a mut Option<Request>,
     deadline: Instant,
     cancellation: &'a CancellationToken,
@@ -841,8 +852,8 @@ struct Dial<'a> {
     teardown_watch: TeardownWatch,
 }
 
-/// How a job reaches its target. Each route is its own job future, so a direct send's future
-/// holds no tunnel state.
+/// How a job reaches its target. Each route is its own job future, so that a direct send's
+/// future does not hold tunnel state.
 trait Route: 'static {
     /// The phase of a worker loss or caught panic after the exchange started and before the
     /// hand-off to its session.
@@ -851,7 +862,7 @@ trait Route: 'static {
     fn dial_and_exchange(dial: Dial<'_>) -> impl Future<Output = Result<Response, ExplicitError>>;
 }
 
-/// A direct target whose immediate hop `H` secures.
+/// A direct target, with the immediate hop secured by `H`.
 struct Direct<H>(PhantomData<H>);
 
 impl<H: Hop> Route for Direct<H> {
@@ -876,8 +887,8 @@ impl Route for TunnelRoute {
 /// The job future of one exchange that `R` routes.
 ///
 /// The layers that carry the exchange's input by value are plain `fn`s that split it before
-/// they return their futures: a future keeps everything an `async fn` takes, or an `async`
-/// block captures, for its whole life.
+/// they return their futures, because a future keeps everything that an `async fn` takes, or an
+/// `async` block captures, for its whole life.
 fn run_job<R: Route>(
     context: WorkerContext,
     job: Job,
@@ -912,8 +923,9 @@ fn run_job<R: Route>(
         let caught = AssertUnwindSafe(R::dial_and_exchange(dial))
             .catch_unwind()
             .await;
-        // The job's inputs drop inside the boundary too: once the caller has dropped its client,
-        // the target may own the last reference to caller code, such as its TLS configuration.
+        // The job's inputs drop inside an unwind boundary too, because once the caller has
+        // dropped its client, the target may own the last reference to caller code, such as its
+        // TLS configuration.
         let dropped = catch_unwind(AssertUnwindSafe(move || {
             drop((cancellation, request, target, context));
         }));
@@ -969,8 +981,9 @@ enum Staged<T> {
     Cancelled,
 }
 
-/// Races dial or handshake work against the exchange's token and its deadline, whose sleep the
-/// exchange creates once for its dial and the core's races. Dropping the work drops its socket.
+/// Races dial or handshake work against the exchange's token and its deadline. The exchange
+/// creates the deadline sleep once and shares it between its dial and the core's races. Dropping
+/// the work drops its socket.
 ///
 /// A passed deadline wins even over dial or handshake work that is ready, as in the core's
 /// reads. It is read from the clock before the work is polled, because a host may fire the
@@ -1007,12 +1020,11 @@ async fn staged<Work: Future>(
 /// `ConnectionInfo` reports.
 ///
 /// The endpoint's host is the IP address's text. The reported address is that text's address,
-/// so a scoped IPv6 address reports no flow label or scope.
+/// so a scoped IPv6 address loses its flow label and scope.
 ///
 /// The peer's address is the one the exchange dialed, `Target::address` (the proxy's for a
-/// tunnel), as folly's `AsyncSocket::getPeerAddress` reports the address it connected to, not
-/// the kernel's `getpeername`. The two differ for an unspecified destination, which the kernel
-/// routes to loopback, and for a destination that a cgroup connect hook rewrites.
+/// tunnel), not the kernel's `getpeername`. The two differ for an unspecified destination, which
+/// the kernel routes to loopback, and for a destination that a cgroup connect hook rewrites.
 pub(crate) fn dialed_endpoint(
     address: Option<SocketAddr>,
 ) -> (TransportEndpoint, Option<SocketAddr>) {
@@ -1057,12 +1069,13 @@ fn write_ipv4(text: &mut [u8], ip: Ipv4Addr) -> usize {
 }
 
 /// How a job secures the TCP stream it dialed. It is a type, chosen from the target's
-/// `Security` before the job is submitted, so that a plaintext job's future holds no TLS state.
+/// `Security` before the job is submitted, so that a plaintext job's future does not hold TLS
+/// state.
 trait Hop: 'static {
     type Io: AsyncRead + AsyncWrite + Unpin + 'static;
     const SECURITY: TransportSecurity;
 
-    /// Secures `tcp`, giving the stream and its TLS version, or the failure the job reports.
+    /// Secures `tcp`, returning the stream and its TLS version, or the failure the job reports.
     fn secure(
         tcp: TcpStream,
         step: SecureStep<'_>,
@@ -1213,7 +1226,7 @@ fn dial_and_exchange<H: Hop>(
         shared.hooks.before_connect();
         let mut sleep = host.sleep_until(deadline);
         shared.hooks.deadline_sleep_created();
-        // The stream is borrowed before it moves to the hop, so it is scoped to this block: a
+        // The stream is borrowed before it moves to the hop, so it is scoped to this block. A
         // borrowed local of an `async` block stays in its future until the local's scope ends.
         let (secure, local, peer) = {
             let tcp = match staged(
@@ -1318,9 +1331,9 @@ fn add_dial_timings(dial: &Timings, core: &mut Timings) {
     core.tls_handshake = dial.tls_handshake;
 }
 
-/// The job of a `Security::Tunnel` target: it dials the proxy, attaches a plaintext HTTP/1.1
-/// session to it, opens the tunnel with `connect_unique`, runs the tunnel's TLS over it, and runs
-/// the core exchange inside, with the one deadline sleep.
+/// The job of a `Security::Tunnel` target. It dials the proxy, attaches a plaintext HTTP/1.1
+/// session to it, opens the tunnel with `connect_unique`, runs TLS over the tunnel, and runs the
+/// core exchange inside, all under a single deadline sleep.
 fn tunnel_dial_and_exchange(
     dial: Dial<'_>,
 ) -> impl Future<Output = Result<Response, ExplicitError>> {
@@ -1451,7 +1464,7 @@ fn tunnel_dial_and_exchange(
             Err(error) => return fail(error, &timings),
         };
         shared.hooks.proxy_attached().await;
-        // A CONNECT with no time left would take a zero timeout, which Roxygen reads as none.
+        // A CONNECT with no time left would get a zero timeout, which means no timeout.
         if host.now() >= deadline {
             return fail(ExplicitError::expired(Phase::TunnelConnect), &timings);
         }
@@ -1584,7 +1597,7 @@ fn tunnel_dial_and_exchange(
     }
 }
 
-/// The time left until `deadline`, at least 1 ms, since Roxygen reads a zero timeout as none.
+/// The time left until `deadline`, at least 1 ms, since a zero timeout means no timeout.
 fn remaining(host: &Host, deadline: Instant) -> Duration {
     deadline
         .saturating_duration_since(host.now())
@@ -1624,13 +1637,16 @@ pub(crate) struct ProxyLeg {
     pub(crate) completion: AdoptedIoCompletion,
     /// Set once the leg's stream has shut down its write side.
     pub(crate) mark: ShutdownMark,
+    /// The proxy stream's local address.
     pub(crate) local: Option<SocketAddr>,
+    /// The proxy's address, as dialed.
     pub(crate) peer: Option<SocketAddr>,
 }
 
-/// Adopts the proxy stream dialed at `peer`, behind a cleanup task that awaits its retirement or,
-/// for `TeardownWatch::StreamGuard`, with a guard that the stream owns, and attaches a plaintext
-/// HTTP/1.1 session to it with the exchange's token and the time left.
+/// Adopts the proxy stream dialed at `peer` and attaches a plaintext HTTP/1.1 session to it,
+/// with the exchange's token and the time left. The stream's teardown is tracked by a cleanup
+/// task that awaits its retirement or, for `TeardownWatch::StreamGuard`, by a guard that the
+/// stream owns.
 pub(crate) fn attach_proxy_leg(
     setup: &LegSetup<'_>,
     tcp: TcpStream,
@@ -1722,7 +1738,7 @@ pub(crate) fn attach_proxy_leg(
     })
 }
 
-/// Set by the proxy leg's stream at its first write shutdown that succeeds. The adopted
+/// Set by the proxy leg's stream at its first successful write shutdown. The adopted
 /// transport shuts down only after it has flushed every queued byte, so by then the inner TLS
 /// close_notify and the tunnel's FIN have been handed to the kernel.
 #[derive(Clone, Default)]
@@ -1757,9 +1773,9 @@ impl ShutdownMark {
     }
 }
 
-/// A dialed stream. A tunnel's proxy leg marks its first write shutdown that succeeds, test
-/// builds can hold either tunnel leg's write shutdown, and the stream of a client with a teardown
-/// guard owns that guard.
+/// A dialed stream. A tunnel's proxy leg marks its first successful write shutdown. Test builds
+/// can hold either tunnel leg's write shutdown. The stream of a client with a teardown guard owns
+/// that guard.
 struct WatchedStream<Io> {
     io: Io,
     mark: Option<ShutdownMark>,
@@ -1821,14 +1837,17 @@ impl<Io: AsyncWrite + Unpin> AsyncWrite for WatchedStream<Io> {
 }
 
 /// The tunnel cleanup task. It receives the proxy guard once the exchange has adopted the inner
-/// stream, and then cancels the proxy session at the first of: the proxy leg's write shutdown or
-/// retirement once the inner stream has retired, the deadline, and the worker's quiescing, since
-/// worker shutdown runs registered cleanup without a deadline. It owns the guard's handoff, so
-/// dropping it, polled or not, cancels the proxy session.
+/// stream, and then cancels the proxy session at the first of these:
 ///
-/// Quiescing cancels at once, even mid-exchange. That is safe only because a `HostedWorker`
-/// quiesces solely in `begin_shutdown`, which drops every running command; a graceful
-/// `RuntimeHandle::quiesce(grace)` would cut tunnels whose exchanges could still finish.
+/// - the proxy leg's write shutdown or retirement, once the inner stream has retired;
+/// - the deadline;
+/// - the worker's quiescing, since worker shutdown runs registered cleanup without a deadline.
+///
+/// It owns the guard's handoff, so dropping it, polled or not, cancels the proxy session.
+///
+/// Quiescing cancels immediately, even mid-exchange. That is safe only because a `HostedWorker`
+/// quiesces solely in `begin_shutdown`, which drops every running command. A graceful
+/// `RuntimeHandle::quiesce(grace)` would cut tunnels with exchanges that could still finish.
 pub(crate) fn tunnel_cleanup(
     context: &WorkerContext,
     receipt: oneshot::Receiver<TunnelHandoff>,
@@ -1926,7 +1945,7 @@ impl Shared {
         self.hooks.restart_window().unwrap_or(RESTART_WINDOW)
     }
 
-    /// A new client's candidate slots. Reads no slot.
+    /// A new client's candidate slots, chosen without reading any slot.
     fn candidates(&self) -> Candidates {
         let count = self.slots.len();
         if count == 1 {
@@ -2013,7 +2032,7 @@ fn resume(panic: Option<Box<dyn Any + Send>>) {
     }
 }
 
-/// Keeps the first of two caught panics and disposes of the later one, whose payload's
+/// Keeps the first of two caught panics and disposes of the later one, since its payload's
 /// destructor may panic as well.
 fn first_panic(
     first: Option<Box<dyn Any + Send>>,
@@ -2062,8 +2081,9 @@ struct Candidates {
 }
 
 impl Candidates {
-    /// The slot to pin. Each candidate's state is read under its slot lock alone, released
-    /// before the next lock is taken, and its load from its atomic count of sends in flight.
+    /// The slot to pin the client to. Each candidate's state is read under its own slot lock,
+    /// released before the next lock is taken. Its load is read from its atomic count of sends
+    /// in flight.
     fn choose(self, shared: &Shared) -> usize {
         let Some(second) = self.second else {
             return self.round_robin;
@@ -2088,15 +2108,15 @@ impl Candidates {
     }
 }
 
-/// A slot as found under its lock. `Restarting` and `Admitted` carry the slot's count of failed
-/// restarts at that moment.
+/// A slot as observed under its lock. `Restarting` and `Admitted` carry the slot's count of
+/// failed restarts at that moment.
 enum Observation {
     Open(WorkerHandle, u64),
     Restarting(u64),
     /// The published worker was not open, and this observation admitted its restart.
     Admitted(u64),
     Capped,
-    /// The runtime is shutting down, or the failed generation is no longer published.
+    /// The runtime is shutting down, or a restart already replaced the failed generation.
     Closed,
 }
 
@@ -2111,7 +2131,7 @@ impl Observation {
     }
 }
 
-/// How a restart that a send waits for stands after a publication signal.
+/// The state of the restart that a send waits for, after a publication signal.
 enum Waited {
     Restarting,
     Published,
@@ -2122,7 +2142,7 @@ enum Waited {
 struct Slot {
     index: usize,
     state: Mutex<SlotInner>,
-    /// Signalled as each restart step completes; only the last runtime drop waits on it.
+    /// Signalled as each restart step completes. Only the last runtime drop waits on it.
     restarts_done: Condvar,
     sends_in_flight: AtomicUsize,
     consecutive_overloads: AtomicU64,
@@ -2154,15 +2174,15 @@ struct SlotInner {
 impl SlotInner {
     /// The published worker's handle, if that worker is open.
     fn open_handle(&self) -> Option<&WorkerHandle> {
-        // A handle can refuse commands while it still reports `Open`.
+        // A handle can reject commands while it still reports `Open`.
         self.handle
             .as_ref()
             .filter(|handle| handle.state() == WorkerState::Open && handle.is_accepting())
     }
 
-    /// Whether a restart bound refuses a restart at `now`: restarts started within the trailing
-    /// window, or restarts still joining their old worker. Forgets the starts the window has
-    /// passed.
+    /// Whether a restart bound blocks a restart at `now`. The bounds cover restarts started
+    /// within the trailing window and restarts still joining their old worker. Drops the starts
+    /// that have left the window.
     fn at_restart_cap(&mut self, shared: &Shared, now: Instant) -> bool {
         let window = shared.restart_window();
         while self
@@ -2217,8 +2237,8 @@ struct RestartStep {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Step {
-    /// Held by the requester until it registers the restart thread's handle, or finds that the
-    /// thread failed to spawn.
+    /// Held by the requester until it registers the restart thread's handle, or until the
+    /// thread fails to spawn.
     Registration,
     /// Held by the requester, or by the restart thread once its closure starts or its handle is
     /// registered, until the closure ends or is dropped unrun.
@@ -2237,9 +2257,9 @@ struct Joining {
 struct Signal(Vec<(u64, Waker)>);
 
 impl Signal {
-    /// Wakes each waiting send in its own unwind boundary, so that a send's waker, which the
-    /// caller's executor supplies, cannot keep the signal from the others by panicking, and
-    /// returns the first panic for the raising step to resume after its bookkeeping.
+    /// Wakes each waiting send in its own unwind boundary, so that a panicking waker from the
+    /// caller's executor cannot keep the signal from the other sends. Returns the first panic,
+    /// for the raising step to resume after its bookkeeping.
     fn wake(self) -> Option<Box<dyn Any + Send>> {
         self.0.into_iter().fold(None, |panic, (_, waker)| {
             match catch_unwind(AssertUnwindSafe(|| waker.wake())) {
@@ -2257,9 +2277,9 @@ struct SignalWait<'a> {
 }
 
 impl SignalWait<'_> {
-    /// Ready once the slot has raised a signal since the send saw `seen` of them. Until then the
-    /// slot holds a clone of `context`'s waker. The clone, and the drop of any waker it
-    /// replaces, run with no slot lock held.
+    /// Ready once the slot's signal count differs from `seen`. Until then the slot holds a
+    /// clone of `context`'s waker. The clone, and the drop of any waker it replaces, run without
+    /// a slot lock held.
     fn poll(&mut self, seen: u64, context: &Context<'_>) -> Poll<()> {
         let waker = context.waker().clone();
         let mut inner = self.slot.lock();
@@ -2356,10 +2376,10 @@ impl Slot {
         }
     }
 
-    /// Reports the slot as found under its lock and admits a restart when the published
-    /// worker is not open, the bounds allow it, and `failed` (if any) is still published.
-    /// `seen` records the signals raised so far under the lock, so a later signal wakes its
-    /// wait.
+    /// Reports the slot's state under its lock, and admits a restart when the published worker
+    /// is not open, the bounds allow it, and `failed` (if any) is still the published
+    /// generation. `seen` records the signals raised so far under the lock, so that a later
+    /// signal wakes its wait.
     fn observe(
         &self,
         shared: &Arc<Shared>,
@@ -2410,9 +2430,9 @@ impl Slot {
         Observation::Admitted(failures)
     }
 
-    /// Rechecks under the slot lock a restart that a send found in flight after `failures`
-    /// failed restarts, recording the signals raised so far in `seen` so a later signal wakes
-    /// its wait.
+    /// Rechecks, under the slot lock, the restart that a send is waiting for, which started
+    /// after `failures` failed restarts. Records the signals raised so far in `seen`, so that a
+    /// later signal wakes the wait.
     fn waited(&self, failures: u64, seen: &mut u64) -> Waited {
         let inner = self.lock();
         *seen = inner.signals;
@@ -2480,8 +2500,8 @@ impl Drop for Registration<'_> {
     }
 }
 
-/// Ends an admitted restart's closure step. Unpublished, it ends the restarting state as a
-/// failure.
+/// Ends an admitted restart's closure step when dropped. If the restart did not publish, it
+/// also ends the restarting state as a failure.
 struct RestartAdmission {
     shared: Arc<Shared>,
     slot: usize,

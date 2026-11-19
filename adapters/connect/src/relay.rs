@@ -78,10 +78,10 @@ pub enum RelayClose {
     /// Both directions ended, the session wrote the upload's END_STREAM onto the connection's
     /// egress, and the stream is closed on the wire.
     Finished,
-    /// The proxy reset the stream, a GOAWAY ended it with an error, or its session failed, also
-    /// after both directions ended while flow control still held upload bytes or their end, and
-    /// a PING probe drop after the download reached END_STREAM.
-    /// [`RelayOutcome::stream_reset_by_peer`] tells the proxy's RST_STREAM from the rest.
+    /// The proxy reset the stream, a GOAWAY ended it with an error, or its session failed. This
+    /// includes such failures after both directions ended while flow control still held upload
+    /// bytes or their end, and a PING probe drop after the download reached END_STREAM.
+    /// [`RelayOutcome::stream_reset_by_peer`] separates the proxy's RST_STREAM from the rest.
     PeerReset,
     /// The stream's session was dropped after an unanswered PING probe before the download
     /// reached END_STREAM.
@@ -127,31 +127,34 @@ impl RelayOutcome {
     }
 
     /// Whether the relay wrote the download through its END_STREAM to the application I/O and
-    /// shut down the I/O's write half. Written is not read: on a socket the bytes and the end may
-    /// still be queued. Always true for `Finished`. Once the relay has read the END_STREAM, a
-    /// later ending gives it up to `shutdown_timeout` to finish this, so it is false only when
-    /// the ending came first, or the bound, an application I/O error, or a local abort (the
-    /// relay future dropped or the runtime's forced shutdown) cut the writing short.
+    /// shut down the I/O's write half.
+    ///
+    /// On a socket the bytes and the end may still be queued unread. Always true for `Finished`.
+    /// Once the relay has read the END_STREAM, a later ending gives it up to `shutdown_timeout`
+    /// to finish writing. So this is false only when the ending came first, or when the timeout,
+    /// an application I/O error, or a local abort (the relay future dropped or the runtime's
+    /// forced shutdown) cut the writing short.
     pub fn download_ended(&self) -> bool {
         self.relayed.download_ended
     }
 
     /// Whether the relay read the download's END_STREAM, whether or not it then wrote the whole
-    /// download to the application, also when it read it while discarding the download after an
-    /// upload write error.
+    /// download to the application. Also true when it read the END_STREAM while discarding the
+    /// download after an upload write error.
     pub fn peer_ended_download(&self) -> bool {
         self.relayed.peer_ended_download
     }
 
+    /// How the relay ended.
     pub fn close(&self) -> RelayClose {
         self.close
     }
 
     /// Whether a `PeerReset` relay ended at the proxy's RST_STREAM on its own stream, rather
     /// than at an error GOAWAY, a session failure, or a PING probe drop. A `REFUSED_STREAM`
-    /// reset never sets it: it refuses a CONNECT before it commits. With
-    /// [`peer_ended_download`](Self::peer_ended_download), it marks a proxy that ended its side
-    /// and then reset the stream, as one that closes first may.
+    /// reset never sets it, because that reset rejects a CONNECT before it commits. Together with
+    /// [`peer_ended_download`](Self::peer_ended_download), it identifies a proxy that ended its
+    /// side and then reset the stream, as a proxy that closes first may do.
     pub fn stream_reset_by_peer(&self) -> bool {
         self.stream_reset_by_peer
     }
@@ -233,9 +236,8 @@ impl Drop for Publisher {
     }
 }
 
-/// Delivers a relay choice to the tunnel's task and returns the future of its outcome. A worker
-/// that is gone refuses the choice, which closes the I/O as it drops and resolves the relay
-/// `Aborted`.
+/// Delivers a relay choice to the tunnel's task and returns the future of its outcome. If the
+/// worker is gone, the choice is dropped, which closes the I/O and resolves the relay `Aborted`.
 pub(crate) fn start(
     choice: Option<oneshot::Sender<Choice>>,
     io: RelayIo,
@@ -395,7 +397,7 @@ where
         let this = self.get_mut();
         let written = ready!(Pin::new(&mut this.io).poll_write(context, buffer));
         match &written {
-            // The copy fails a writer that accepts nothing.
+            // The copy fails when a writer accepts zero bytes.
             Ok(0) if !buffer.is_empty() => this.write_failed = true,
             Ok(written) => this.written = this.written.saturating_add(*written as u64),
             Err(_) => this.write_failed = true,
@@ -438,8 +440,8 @@ struct Pump {
     read_ended: bool,
     need_flush: bool,
     phase: Phase,
-    /// The writer held up the last poll while the task still had coop budget, so the writer
-    /// itself, not the spent budget, made it wait.
+    /// The writer returned `Pending` on the last poll while the task still had coop budget, so
+    /// the writer itself, not the spent budget, caused the wait.
     writer_pending: bool,
 }
 
@@ -599,6 +601,7 @@ impl Pump {
 enum Stop {
     /// Both directions ended.
     Done,
+    /// A direction failed.
     Failed(io::Error),
     /// A peer reset or session failure closed the stream after the download's end was read and
     /// before the upload's END_STREAM went out. From then on the relay reads only the
@@ -612,16 +615,16 @@ enum ReadAhead {
     Ended,
     /// A native read failed before it.
     Failed(io::Error),
-    /// The application held the download up first, failed, or the bound passed.
+    /// The application blocked the download first, failed, or the time bound passed.
     Stalled,
 }
 
 /// The worker side of a relay, run in its tunnel's task with one copy buffer per direction and
-/// no other buffering than the native stream's. Dropped before it settles, as by a forced
+/// no other buffering than the native stream's. If dropped before it finishes, as by a forced
 /// shutdown, it resets the stream, closes the application I/O, and resolves the relay with the
 /// ending it recorded, or `Aborted`.
 pub(crate) struct Relay {
-    /// Declared first, so the application I/O closes before the settlement releases admission.
+    /// Declared first, so the application I/O closes before `settlement` releases admission.
     application: Option<Tracked<ApplicationIo>>,
     native: Tracked<HttpConnectAsyncTransport>,
     upload: Pump,
@@ -710,7 +713,7 @@ impl Relay {
                 self.end(RelayClose::Application, Some(error));
                 return RelayClose::Application;
             }
-            // A write error carries only `DROPPED`; the download's read tells how it ended.
+            // A write error carries only `DROPPED`, so the download's read shows how it ended.
             Stop::Failed(error) if self.native.write_failed => {
                 let read = tokio::select! {
                     biased;
@@ -784,8 +787,8 @@ impl Relay {
             .is_some_and(|application| application.failed())
     }
 
-    /// Records how the relay ended, once: counts it and keeps it for the outcome, which a drop
-    /// during the writing of the download or the close that follows still publishes.
+    /// Records how the relay ended, once. Counts the ending and keeps it for the outcome, which
+    /// is still published if the relay is dropped while it writes the download or closes.
     fn end(&mut self, close: RelayClose, error: Option<io::Error>) {
         if mem::replace(&mut self.ended, true) {
             return;
@@ -823,8 +826,8 @@ impl Relay {
         })
     }
 
-    /// After a native write error, moves the download on for as long as only the native stream
-    /// holds it up, within `shutdown_timeout`.
+    /// After a native write error, keeps copying the download while only the native stream
+    /// delays it, within `shutdown_timeout`.
     async fn read_ahead(&mut self) -> ReadAhead {
         self.ending_at = Some(Instant::now());
         let limit = self.shutdown_timeout;
@@ -856,9 +859,9 @@ impl Relay {
             .unwrap_or(ReadAhead::Stalled)
     }
 
-    /// Writes the rest of a download whose END_STREAM the relay has read, and its end, to the
-    /// application after the stream failed or closed, within `shutdown_timeout` (pooled CONNECT
-    /// specification D3), and returns how to close.
+    /// After the stream failed or closed, writes the rest of the download and its end to the
+    /// application within `shutdown_timeout`, and returns how to close. The relay must already
+    /// have read the download's END_STREAM.
     async fn deliver(&mut self, dropped: CancellationToken) -> RelayClose {
         self.ending_at.get_or_insert_with(Instant::now);
         let remaining = self.remaining();
@@ -882,7 +885,8 @@ impl Relay {
     }
 
     /// Resets an unfinished stream, closes the application I/O, then releases admission and
-    /// publishes the recorded outcome, which a drop during the close keeps.
+    /// publishes the recorded outcome. The outcome is still published if the relay is dropped
+    /// during the close.
     async fn finish(mut self, close: RelayClose) {
         if close != RelayClose::Finished {
             self.native.io.abort();
@@ -890,8 +894,8 @@ impl Relay {
         let mut settlement = self.settlement.take().expect("should settle a relay once");
         let mut application = self.application.take();
         settlement.relayed(self.relayed(application.as_ref()));
-        // The close that legacy HTTP/1.1 CONNECT gives the guest socket when its proxy connection
-        // fails.
+        // On a proxy-side failure, shut down the application's write half, as an HTTP/1.1
+        // CONNECT tunnel closes its client socket when the proxy connection fails.
         if let Some(application) = application.as_mut()
             && matches!(close, RelayClose::PeerReset | RelayClose::TimedOut)
             && !application.shut_down
@@ -923,7 +927,7 @@ impl Drop for Relay {
         }
         self.native.io.abort();
         settlement.relayed(relayed);
-        // The application I/O closes as its field drops, then the settlement releases admission
+        // The application I/O closes as its field drops, then `settlement` releases admission
         // and publishes the recorded ending, or `Aborted`.
     }
 }

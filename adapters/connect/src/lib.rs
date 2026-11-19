@@ -10,11 +10,13 @@
 //!
 //! One `HostedWorker` owns an attached `HttpSessionPool` per application route key, the pool's
 //! sessions, and every CONNECT stream. Tokio callers submit through bounded admission and receive
-//! a `PendingTunnel` once the proxy answers 2xx, then choose its data path: a transferable `Tunnel`
-//! over bounded bridges, or a relay that copies between the stream and the caller's own I/O on
-//! the protocol worker. Attached sessions send HTTP/2 PING probes and drop a proxy connection that
-//! stops answering them. Application connectors own the proxy address, DNS, TLS, ALPN, and socket
-//! options, with optional request preparation, TLS handshake, and lazy runtime helpers.
+//! a `PendingTunnel` once the proxy returns 2xx. The caller then chooses the data path: a
+//! transferable `Tunnel` over bounded bridges, or a relay that copies between the stream and the
+//! caller's own I/O on the protocol worker. Attached sessions send HTTP/2 PING probes and drop a
+//! proxy connection that stops acknowledging them. Application connectors own the proxy address,
+//! DNS, TLS, ALPN, and socket options. Optional helpers prepare the request, run the TLS
+//! handshake, and start the runtime lazily.
+//!
 //! `runtime` holds the Tokio-facing owner and client handle, `worker` runs on the protocol
 //! worker, `tunnel` is the application side of an established tunnel and its choice, `relay` is
 //! the worker-side relay, and `options`, `error`, and `stats` hold its bounds, failure

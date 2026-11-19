@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Caller-owned application execution and independently composed retirement.
+//! The caller-owned client run, its shutdown handle, and exchange handles.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -317,6 +317,7 @@ impl Signal {
     }
 }
 
+/// An exchange failure, and whether the exchange's cleanup is unconfirmed.
 #[derive(Clone, Debug, thiserror::Error)]
 #[error("exchange failed or its cleanup could not be confirmed")]
 pub struct ClientCompletionError {
@@ -326,9 +327,11 @@ pub struct ClientCompletionError {
 }
 
 impl ClientCompletionError {
+    /// The failure that ended the exchange.
     pub fn cause(&self) -> &ClientError {
         &self.failure
     }
+    /// Whether the exchange's cleanup could not be confirmed.
     pub fn cleanup_unconfirmed(&self) -> bool {
         self.unconfirmed
     }
@@ -340,30 +343,30 @@ impl ClientCompletionError {
     }
 }
 
-/// The failure selected when the application-leaf snapshot was published.
+/// The failure recorded when the client's application-runtime work finished.
 ///
-/// A retained failure does not mean application tasks remain unjoined. This
-/// snapshot does not wait for native completion or certify native/I/O retirement.
+/// The error does not mean application tasks are still running. It does not
+/// cover native or I/O cleanup.
 #[derive(Clone, Debug, thiserror::Error)]
 #[error("application leaves failed to drain cleanly")]
 pub struct ClientAppDrainError(#[source] pub ClientError);
 
-/// A selected client failure reported when `ClientRun` returns.
+/// The client failure reported when `ClientRun` returns.
 ///
-/// This can retain an earlier pool/session failure, not only a failure first
-/// encountered during shutdown. `PoolError::SessionJoin` is not a Tokio task
-/// join failure and is not an alias for `ClientError::CleanupUnconfirmed`.
+/// This can be an earlier pool or session failure, not only one from shutdown.
+/// `PoolError::SessionJoin` is a session join failure, not a Tokio task join
+/// failure, and is distinct from `ClientError::CleanupUnconfirmed`.
 ///
-/// This type does not expose an independent run-wide cleanup-certainty result.
-/// Preserve the selected cause and the separate execution-parent and retirement
-/// outcomes; this error alone is not a certificate of complete cleanup.
+/// This error alone does not show whether cleanup finished. Also check the
+/// result of the task that drove the run and each exchange's `wait` result.
 #[derive(Clone, Debug, thiserror::Error)]
 #[error("client shutdown failed or has unconfirmed cleanup")]
 pub struct ClientShutdownError(#[source] pub ClientError);
 
 type ExchangePublisher = watch::Sender<Option<Result<(), ClientCompletionError>>>;
 
-/// Observation and cancellation only. Dropping an observer does not cancel.
+/// A handle that cancels or observes one exchange. Dropping it does not cancel
+/// the exchange.
 #[derive(Clone)]
 pub struct ClientExchange {
     pub(super) cancel: Arc<Signal>,
@@ -372,11 +375,12 @@ pub struct ClientExchange {
 }
 
 impl ClientExchange {
+    /// Requests cancellation of the exchange.
     pub fn cancel(&self) {
         self.cancel.cancel();
     }
-    /// Includes upload-driver destruction, native exchange and scope retirement,
-    /// and response-source retirement. Healthy pooled I/O has a separate lifetime.
+    /// Waits until the exchange's upload, native state and response body are
+    /// released. A healthy pooled connection outlives the exchange.
     pub fn wait(&self) -> impl Future<Output = Result<(), ClientCompletionError>> + Send + 'static {
         let mut result = self.result.clone();
         protect(
@@ -410,7 +414,8 @@ pub(super) fn new_exchange(shared: Weak<Shared>) -> (ClientExchange, ExchangePub
     )
 }
 
-/// Unique shutdown guard, not the parent of ClientRun or its application tasks.
+/// The client's unique shutdown handle, which shuts the client down when
+/// dropped. It does not own `ClientRun` or its application tasks.
 pub struct ClientOwner {
     shared: Arc<Shared>,
     leaves: watch::Receiver<Option<Result<(), ClientAppDrainError>>>,
@@ -425,22 +430,21 @@ impl ClientOwner {
     }
     /// Closes admission and requests cancellation of accepted exchanges.
     ///
-    /// This is a signal, not a join. It does not promise response-body completion
-    /// or a healthy `ClientRun` result. Keep the actual run driven on its captured
-    /// application runtime and collect its result even after an operation fails.
-    /// Continue collecting the separate retirement and physical-join outcomes;
-    /// neither this call nor this shutdown guard replaces the run's execution owner.
+    /// It returns without waiting. Keep driving `ClientRun` on its captured
+    /// application runtime and collect its result, even after an operation
+    /// fails.
     pub fn shutdown(&self) {
         self.shared.close();
     }
-    /// Observes a one-time snapshot after the application leaves drain.
+    /// Waits for the client's application-runtime work, including the
+    /// connector, to finish after shutdown. Returns the first failure recorded
+    /// by then.
     ///
-    /// Publication retains the failure selected at that boundary, if any. A
-    /// later native failure does not revise an earlier `Ok(())`; repeated waits,
-    /// including after `ClientRun` returns, observe the same published result.
-    /// An error can retain a failure even though the application leaves drained.
-    /// This does not certify native/source/I/O retirement or the enclosing run's
-    /// parent join. Publisher loss before a snapshot reports cleanup uncertainty.
+    /// The result is published once. A later native failure does not change an
+    /// earlier `Ok(())`, and every wait, including after `ClientRun` returns,
+    /// returns the same result. This does not wait for native or I/O cleanup,
+    /// or for the run itself. If the run is dropped before it publishes, this
+    /// returns `ClientError::CleanupUnconfirmed`.
     pub fn wait_app_leaves_drained(
         &self,
     ) -> impl Future<Output = Result<(), ClientAppDrainError>> + Send + 'static {
@@ -467,18 +471,15 @@ impl Drop for ClientOwner {
     }
 }
 
-/// Execution owned by the caller's bounded, live application lifetime scope.
-/// Never abort/drop this join parent as a substitute for signalling shutdown.
-/// Keep this future on the captured application runtime through its actual
-/// parent join. Moving or destroying the parent elsewhere is unsupported.
+/// The client's execution, which the caller owns and drives to completion.
 ///
-/// Successful session joining does not imply a healthy run result. The output
-/// may retain an earlier pool/session failure; this is distinct from failure
-/// of the Tokio task driving this future.
+/// Do not drop or abort it as a way to shut down; call
+/// [`ClientOwner::shutdown`] and keep polling it on the captured application
+/// runtime until it returns. Moving it to another runtime is unsupported.
 ///
-/// Record operation/body results, exchange cleanup and this output separately.
-/// This output does not replace native quiescence, physical worker joining or
-/// the caller's actual reap of the execution task.
+/// An `Err` output can be an earlier pool or session failure even when every
+/// session joined. That is distinct from a failure of the Tokio task that
+/// drives this future. The caller must still join that task.
 pub struct ClientRun {
     future: AppFuture<Result<(), ClientShutdownError>>,
     shared: Weak<Shared>,

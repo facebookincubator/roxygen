@@ -205,8 +205,9 @@ struct FacadeHandler {
     rejection: Option<Http1ConnectionSwitchRejection>,
 }
 
-/// Checks every non-switch network projection constraint without clearing
-/// native metadata. Keep this predicate aligned with request_head_to_http.
+/// Checks every request conversion constraint except the protocol-switch ones,
+/// without clearing native metadata. Keep this in sync with
+/// `request_head_to_http`.
 fn rejection_version(message: &HttpMessage) -> Option<Version> {
     if !message.is_request()
         || message.is_egress_websocket_upgrade()

@@ -7,10 +7,10 @@
 
 //! An application-runtime client backed by native Roxygen session pools.
 //!
-//! Register [`ClientRun`] in the caller's bounded, live application parent before
-//! calling [`ClientStartup::start`]. Keep that parent and runtime driven through
-//! shutdown and actually reap the run before destroying the runtime. Neither a
-//! public owner nor an exchange observer certifies the enclosing run's join.
+//! Start driving [`ClientRun`] in a task the caller owns before calling
+//! [`ClientStartup::start`]. Keep that task and its runtime running through
+//! shutdown, and reap the run before dropping the runtime. Only the run joins
+//! the client's work; [`ClientOwner`] and exchange handles do not.
 
 pub mod connector;
 pub mod owner;
@@ -69,7 +69,8 @@ use crate::route::RouteSpec;
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub(super) type AppFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
-/// Send-only native settings. Worker-local callbacks are deliberately absent.
+/// Native session settings that are `Send`. Worker-local callbacks cannot be
+/// set here.
 #[derive(Clone, Debug, Default)]
 pub struct SessionSettings {
     pub max_concurrent_outgoing_streams: Option<u32>,
@@ -91,8 +92,8 @@ pub struct ClientOptions {
     pub pool: AttachedPoolParams,
     pub session: SessionSettings,
     pub upload: ApplicationBodyOptions,
-    /// Queue/read limits for the exported response. The option's `size_hint`
-    /// is not an override: hints come from the actual native response head.
+    /// Queue and read limits for the response body. Its size hint comes from
+    /// the native response head, not from this option's `size_hint`.
     pub response: LocalBodyOptions,
     pub transport: ByteStreamLimits,
     #[cfg(test)]
@@ -169,14 +170,13 @@ impl Default for ClientOptions {
 }
 
 impl ClientOptions {
-    /// Uses the caller's timeout policy without additional native deadlines.
+    /// Disables native deadlines so that only the caller's timeouts apply.
     ///
-    /// Disables the attached-pool acquisition/factory-attempt timeout and the
-    /// native session connection-read, stream-read, and write timeouts. This
-    /// installs no external timers: the caller must configure its existing
-    /// connector or stream policy, including deliberately disabled timeouts.
-    /// The default configuration is unchanged unless this method is called.
-    /// Capacities, retries, protocol, and cancellation are preserved.
+    /// Disables the attached-pool acquisition and connect-attempt timeout and
+    /// the native session connection-read, stream-read, and write timeouts.
+    /// This does not install timers of its own, so these phases are bounded
+    /// only by the caller's connector or stream policy, which may leave them
+    /// unbounded. Other options are unchanged.
     #[must_use]
     pub fn with_external_timeouts(mut self) -> Self {
         self.pool.connect_timeout = Duration::ZERO;
@@ -187,8 +187,10 @@ impl ClientOptions {
     }
 }
 
-/// Classification retains native errors and selected original connector causes.
-/// Display never invokes an application's diagnostic implementation.
+/// Why a client operation failed.
+///
+/// Native errors and some original connector causes are kept as sources.
+/// `Display` never calls into application error types.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("client entry requires its captured application runtime")]
@@ -223,6 +225,7 @@ pub enum ClientError {
     CleanupUnconfirmed,
 }
 
+/// Why [`Client::prepare`] or [`ClientStartup::start`] failed.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum ClientStartError {
     #[error("prepare requires an entered application runtime")]
@@ -310,14 +313,15 @@ impl Drop for SubmissionLife {
     }
 }
 
-/// A cloneable submission handle, not the owner of application child tasks.
+/// A cloneable handle for submitting requests. It does not own the
+/// application tasks that requests start.
 #[derive(Clone)]
 pub struct Client {
     pub(super) shared: Arc<Shared>,
     _submissions: Arc<SubmissionLife>,
 }
 
-/// A route bound to an opaque client/configuration generation.
+/// A route bound to the client generation that registered it.
 #[derive(Clone)]
 pub struct Route {
     spec: RouteSpec,
@@ -339,7 +343,8 @@ impl fmt::Debug for Route {
     }
 }
 
-/// Dormant startup observation. Drop requests rollback, not abandonment of run.
+/// Starts a prepared client. Dropping it before a successful `start` closes the
+/// client, but the run must still be driven to completion.
 pub struct ClientStartup {
     shared: Arc<Shared>,
     activate: Option<oneshot::Sender<()>>,
@@ -349,12 +354,13 @@ pub struct ClientStartup {
 }
 
 impl Client {
-    /// Captures the entered app runtime without starting any worker/connector work.
+    /// Captures the entered application runtime without starting worker or
+    /// connector work.
     ///
-    /// The caller must place the run under its bounded application lifetime
-    /// parent before activation, and drive it on this runtime through shutdown.
-    /// Unadmitted C remains caller-owned: dropping an unregistered run elsewhere
-    /// is misuse, not a promise to relocate its destructor to another runtime.
+    /// The caller must start driving the run in a task it owns before calling
+    /// [`ClientStartup::start`], and keep driving it on this runtime through
+    /// shutdown. The run holds the connector, so dropping an undriven run on
+    /// another runtime runs the connector's destructor there. That is misuse.
     pub fn prepare<C, Io>(
         worker: WorkerHandle,
         connector: C,
@@ -423,7 +429,8 @@ impl Client {
         ))
     }
 
-    /// Registers an exact immutable key. Entries are retained until client shutdown.
+    /// Registers a route for `spec`, or returns the existing one. Routes are
+    /// kept until client shutdown.
     pub fn route(&self, spec: RouteSpec) -> Result<Route, ClientError> {
         if !self.shared.entered() {
             return Err(ClientError::WrongRuntime);
@@ -453,6 +460,7 @@ impl Client {
         Ok(route)
     }
 
+    /// A Tower service that sends requests on `route`.
     pub fn service<B>(&self, route: &Route) -> Result<ClientService<B>, ClientError> {
         self.shared.check(route)?;
         Ok(ClientService {
@@ -463,12 +471,13 @@ impl Client {
         })
     }
 
-    /// Fail-fast admission which returns the untouched input on any rejection.
+    /// Submits a request without waiting, and returns it unchanged if it is
+    /// rejected.
     ///
-    /// B is synchronously transferred into the already parented application's
-    /// bounded queue before success returns. Polling/dropping the response future
-    /// on another runtime cannot move B's poll or destructor there. Before
-    /// admission the caller still owns B, including WrongRuntime rejection.
+    /// On success the body has already moved into the application's bounded
+    /// queue, so polling or dropping the response future on another runtime
+    /// does not move the body's polls or destructor there. On any rejection,
+    /// including `WrongRuntime`, the caller still owns the body.
     pub fn try_request<B>(
         &self,
         route: &Route,
@@ -560,7 +569,7 @@ impl Client {
 }
 
 impl ClientStartup {
-    /// Activates only after the caller has registered and started driving the run.
+    /// Starts the client. Call this only once the run is being driven.
     pub async fn start(mut self) -> Result<(Client, ClientOwner), ClientStartError> {
         if !self.shared.entered() {
             return Err(ClientStartError::Client(ClientError::WrongRuntime));
@@ -595,6 +604,7 @@ impl Drop for ClientStartup {
     }
 }
 
+/// A request that [`Client::try_request`] rejected, returned with the reason.
 pub struct RejectedRequest<B> {
     pub request: Request<B>,
     pub error: ClientError,
@@ -628,11 +638,13 @@ enum Readiness {
     Reserved(Reservation),
 }
 
-/// Tower facade whose readiness reserves both an exchange and an app queue slot.
+/// A Tower service whose readiness reserves an exchange and an application
+/// queue slot.
 ///
-/// Call and readiness require the captured application runtime. Tower misuse
-/// (call without readiness or on another runtime) consumes the caller's B on
-/// that caller; use input-returning `try_request` instead when rejection matters.
+/// `poll_ready` and `call` must run on the captured application runtime. A
+/// misused `call` (without readiness, or on another runtime) drops the request
+/// body on the calling thread. Use [`Client::try_request`] when a rejected
+/// request must be returned.
 pub struct ClientService<B> {
     client: Client,
     route: Route,
@@ -730,7 +742,7 @@ where
     }
 }
 
-/// Send response observation; it never owns the admitted application body.
+/// The `Send` future of an exchange's response. It never owns the request body.
 pub struct ResponseFuture {
     receiver: oneshot::Receiver<Result<Response<ClientBody>, ClientError>>,
     exchange: ClientExchange,
@@ -785,7 +797,8 @@ impl Drop for ResponseFuture {
     }
 }
 
-/// A native-source body plus whole-exchange cancellation and completion.
+/// A response body read from the native source, with a handle that cancels or
+/// observes the whole exchange.
 pub struct ClientBody {
     pub(super) inner: RoxygenBody,
     pub(super) exchange: ClientExchange,

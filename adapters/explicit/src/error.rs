@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Typed exchange errors: phase, kind, Roxygen error code, and wire reachability.
+//! Typed exchange errors: phase, kind, HTTP error code, and wire reachability.
 
 use std::error::Error as _;
 use std::io;
@@ -24,16 +24,16 @@ pub enum Phase {
     /// Before the dial: input checks, slot admission, and queueing.
     Submit,
     /// TCP connect, and adoption or attachment of the established stream. A worker loss or
-    /// panic after the exchange started and before the hand-off to the session also reports
-    /// it, even during the TLS handshake. A tunnel target never reports it.
+    /// panic between the exchange's start and its hand-off to the session is also reported in
+    /// this phase, even during the TLS handshake. A tunnel target never uses this phase.
     Connect,
     /// A tunnel's proxy leg: the dial to the proxy, and its adoption, attachment, and request
     /// reservation.
     ProxyConnect,
     /// A tunnel's CONNECT, from its commit to its final head, and the inner stream's adoption
-    /// and attachment. A worker loss or panic after a tunnel exchange started and before the
-    /// hand-off to the inner session also reports it, even during the proxy dial or a
-    /// handshake.
+    /// and attachment. A worker loss or panic between a tunnel exchange's start and its
+    /// hand-off to the inner session is also reported in this phase, even during the proxy
+    /// dial or a handshake.
     TunnelConnect,
     /// The TLS handshake.
     Tls,
@@ -48,25 +48,36 @@ pub enum Phase {
 /// Why an exchange failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ErrorKind {
+    /// The deadline expired, or a dial, read or write timed out.
     Timeout,
+    /// The TCP connection was refused.
     Refused,
+    /// The connection was reset or aborted.
     Reset,
+    /// The peer closed the connection.
     RemoteClosed,
+    /// The peer's certificate failed verification.
     TlsVerification,
+    /// The TLS handshake failed for another reason.
     TlsHandshake,
+    /// The stream was refused (`REFUSED_STREAM`).
     StreamRefused,
+    /// A local resource limit was reached (`ENHANCE_YOUR_CALM`), such as a full worker command
+    /// queue.
     ExcessiveLoad,
+    /// A protocol violation, or input that this API rejects.
     Protocol,
     /// The exchange's own cancellation token was cancelled.
     Cancelled,
-    /// The slot refused the send without dialing.
+    /// The slot rejected the send without dialing.
     Overloaded,
     /// The slot's worker closed, or the runtime shut down.
     WorkerLost,
     /// The exchange panicked on its worker.
     Panicked,
-    /// The proxy answered the CONNECT with a final non-2xx head, which `connect_head` holds.
+    /// The proxy responded to the CONNECT with a final non-2xx head, held in `connect_head`.
     TunnelRejected,
+    /// Any other failure.
     Other,
 }
 
@@ -74,27 +85,32 @@ pub enum ErrorKind {
 #[derive(Debug, thiserror::Error)]
 #[error("{phase:?}/{kind:?}: {detail}")]
 pub struct ExplicitError {
+    /// Where in the exchange the failure was observed.
     pub phase: Phase,
+    /// Why the exchange failed.
     pub kind: ErrorKind,
-    /// `HttpErrorCode::as_u16` when a Roxygen error produced the failure.
+    /// `HttpErrorCode::as_u16` when an `HttpError` produced the failure.
     pub code: Option<u16>,
+    /// The kind of the underlying I/O error, if there is one.
     pub io_kind: Option<io::ErrorKind>,
+    /// A human-readable description.
     pub detail: Box<str>,
     /// False only when the request provably never reached the session, so replaying it on a
     /// fresh connection cannot duplicate it.
     pub reached_wire: bool,
-    /// The stages measured before the failure; a `BodyOutcome::Truncated` cause carries its
-    /// response's timings. A caught panic keeps only the dial's stages (`queued`,
-    /// `tcp_connect`, `tls_handshake`), and a send whose worker dropped its command, taking
-    /// the measurements with it, carries none.
+    /// The stages measured before the failure. For a `BodyOutcome::Truncated` cause these are
+    /// the response's timings. After a caught panic only the dial stages (`queued`,
+    /// `tcp_connect`, `tls_handshake`) remain. When the worker dropped the send's command,
+    /// `queued` is zero and every other stage is `None`.
     pub timings: Box<Timings>,
-    /// A tunnel's CONNECT head: the rejection's for `ErrorKind::TunnelRejected`, and the 2xx
-    /// head for every failure after it that the exchange returns. A caught panic and a send
-    /// whose worker dropped its command carry none.
+    /// A tunnel's CONNECT response head. For `ErrorKind::TunnelRejected` it is the rejection,
+    /// and for a later failure that the exchange returns as `Err` it is the 2xx head. A
+    /// `BodyOutcome::Truncated` cause does not carry it, because `Response::connect_head` does.
+    /// It is `None` after a caught panic or when the worker dropped the send's command.
     pub connect_head: Option<Box<ConnectHead>>,
 }
 
-/// Where in the exchange a Roxygen error was observed.
+/// Where in the exchange an `HttpError` was observed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Position {
     /// Adopting or attaching the established stream.
@@ -105,7 +121,9 @@ pub(crate) enum Position {
     TunnelAttach,
     /// A tunnel's CONNECT, from its commit to its final head.
     Connect,
+    /// After attachment and before the final response head.
     BeforeHead,
+    /// After the final response head.
     AfterHead,
 }
 
@@ -131,13 +149,13 @@ impl ExplicitError {
         }
     }
 
-    /// Moves the error to `phase`, as a tunnel's proxy dial reports a dial failure.
+    /// Moves the error to `phase`, for example a proxy dial failure to `Phase::ProxyConnect`.
     pub(crate) fn in_phase(mut self, phase: Phase) -> Self {
         self.phase = phase;
         self
     }
 
-    /// A worker that refused a cleanup reservation for `phase`'s stream.
+    /// The error for a worker that rejected a cleanup reservation for `phase`'s stream.
     pub(crate) fn from_cleanup_registration(
         error: &CleanupRegistrationError,
         phase: Phase,
@@ -227,9 +245,9 @@ impl ExplicitError {
         Self::classify(error, phase, reached_wire, reached_wire, observed)
     }
 
-    /// Classifies a failure of a tunnel's CONNECT. A final non-2xx head is `TunnelRejected`:
-    /// the typed `ConnectRejected` cause, or a head-wait `CONTENT_LENGTH_MISMATCH`, which the
-    /// HTTP/1.1 limit of `DIV-011` reports for a rejection with a body, carrying it.
+    /// Classifies a failure of a tunnel's CONNECT. A final non-2xx head is `TunnelRejected`.
+    /// The head comes from the typed `ConnectRejected` cause, or from a head-wait
+    /// `CONTENT_LENGTH_MISMATCH`, which the HTTP/1.1 codec reports for a rejection with a body.
     pub(crate) fn from_connect(error: &HttpError, observed: Observed) -> Self {
         let head = match connect_rejection(error) {
             Some(rejected) => Some(ConnectHead::from_message(
@@ -260,9 +278,9 @@ impl ExplicitError {
         .observed(observed)
     }
 
-    /// `from_http`'s rules in `phase`. A write failure re-anchors to `Phase::Write` when
-    /// `writes_anchor`. An I/O cause that wraps an `HttpError`, as a tunnel reports a proxy
-    /// session failure, gives the kind and I/O kind of the wrapped error and its own cause.
+    /// Applies `from_http`'s rules in `phase`. With `writes_anchor`, a write failure moves to
+    /// `Phase::Write`. When the I/O cause wraps an `HttpError`, as a tunnel's proxy session
+    /// failure does, the kind and I/O kind come from the wrapped error and its own cause.
     fn classify(
         error: &HttpError,
         phase: Phase,
