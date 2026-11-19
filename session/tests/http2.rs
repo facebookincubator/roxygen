@@ -14585,7 +14585,7 @@ pub mod h2 {
                             ..Http2SessionConfig::default()
                         },
                     )
-                    .expect("frozen single-drain upstream configuration");
+                    .expect("single-drain upstream configuration");
                     assert!(handle.initiate_drain().expect("single drain accepted"));
                     let run = tokio::time::timeout(Duration::from_secs(1), session.run()).await;
                     let wire = state.borrow().writes.concat();
@@ -18055,7 +18055,7 @@ pub mod h2 {
     }
 
     /// Reads each request body `read_size` bytes at a time, counting the bytes in `consumed`,
-    /// then answers 200 without a body.
+    /// then responds 200 without a body.
     struct ChunkedBodyReader {
         read_size: u32,
         consumed: Rc<Cell<usize>>,
@@ -18111,11 +18111,10 @@ pub mod h2 {
         frames
     }
 
-    /// The WINDOW_UPDATE frames written for a 60,000-byte upload read 8 KiB at a time, recorded
-    /// at `62d2959bb6d3`, before HTTP/1.1 streams could declare a resume threshold (`DIV-044`).
-    /// HTTP/2 streams declare none, so the frames stay byte for byte those of the parent. The
-    /// first three 16,000-byte DATA frames are read in full before the last arrives, so stream
-    /// credit is still owed while they are read.
+    /// The WINDOW_UPDATE frames written for a 60,000-byte upload read 8 KiB at a time. HTTP/2
+    /// streams have no resume threshold, so HTTP/1.1 resume thresholds must not change these
+    /// bytes. Do not update them. The first three 16,000-byte DATA frames are read in full
+    /// before the last arrives, so stream credit is still pending while they are read.
     #[test]
     fn upload_window_updates_are_unchanged_by_http1_resume_thresholds() {
         let frames = run_on_worker(|context| {
@@ -18442,8 +18441,8 @@ pub mod h2 {
         assert!(scheduler.is_empty());
     }
 
-    /// A reference model of `Http2PriorityScheduler`'s selection order, kept as a flat list and
-    /// sorted at each query: lower urgency first; at one urgency, non-incremental streams by
+    /// A reference model of `Http2PriorityScheduler`'s selection order: a flat list sorted at
+    /// each query. Lower urgency goes first. Within one urgency, non-incremental streams go by
     /// `(order_id, stream)`, then incremental streams in the order they were queued or last
     /// rotated. Paused streams keep their enqueue intent but are not selectable.
     #[derive(Default)]
@@ -18623,7 +18622,7 @@ pub mod h2 {
     }
 
     /// A lone queued stream, ordered or incremental, stays out of the urgency queues through
-    /// selection, consumption and a priority update; a second queued stream moves both into them.
+    /// selection, consumption and a priority update. A second queued stream moves both into them.
     #[test]
     fn priority_scheduler_keeps_a_lone_queued_stream_out_of_the_urgency_queues() {
         let mut scheduler = Http2PriorityScheduler::new();
@@ -19596,7 +19595,7 @@ pub mod h2 {
                     },
                 );
                 let Err(error) = zero else {
-                    panic!("a zero Proxygen HTTP/2 receive window must be rejected")
+                    panic!("a zero HTTP/2 receive window must be rejected")
                 };
                 assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
 

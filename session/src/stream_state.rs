@@ -232,8 +232,8 @@ impl StreamCallbacks {
     /// Polls one callback wait whose `Notified` lives in `slot`.
     ///
     /// Cancellation is checked first and consumes no permit. A pending event
-    /// consumes one stored permit or assigned notification. A wake that finds
-    /// no pending event rechecks cancellation and re-arms a fresh `Notified`.
+    /// consumes one stored permit or assigned notification. Otherwise a wake
+    /// rechecks cancellation and re-arms a fresh `Notified`.
     pub(crate) fn poll_wait<'a>(
         &'a self,
         mut slot: Pin<&mut Option<Notified<'a>>>,
@@ -341,9 +341,10 @@ pub enum EgressEvent {
     Body(HttpBodyEvent),
 }
 
-/// Wakes a writer's task and counts its wakes (`DIV-034`): a transfer that a
-/// batched HTTP/1.1 attempt polled with it and found pending is not polled again
-/// until the count moves, i.e. until something that poll registered with woke.
+/// Wakes a writer's task and counts its wakes. When a batched HTTP/1.1 write
+/// attempt polls a transfer with this counter and gets `Pending`, the transfer
+/// is not polled again until the count changes, that is, until a waker that
+/// poll registered has fired.
 pub(crate) struct SourceWakeCounter {
     wakes: AtomicU64,
     task: Waker,
@@ -400,8 +401,8 @@ pub struct EgressTransfer {
     // Source EOM ends capacity waits; generation retirement still follows serialization.
     production_complete: bool,
     retirement: ExchangeGuard,
-    /// The counter and its count when `poll_next_event_until_woken` last found
-    /// this transfer pending; cleared by any other poll.
+    /// The counter and its count from the last `poll_next_event_until_woken`
+    /// that returned `Pending`. Any other poll clears it.
     awaited_wake: Option<(Arc<SourceWakeCounter>, u64)>,
 }
 
@@ -509,9 +510,10 @@ impl EgressTransfer {
         poll_fn(|context| self.poll_next_event_with_limit(context, maximum_body)).await
     }
 
-    /// While the last poll was `poll_next_event_until_woken`'s pending one and
-    /// nothing it registered with has woken, polls with that counter's task
-    /// return `Pending` without polling the source (`DIV-034`).
+    /// Reads the next event as `poll_next_event_with_credit` does. Returns
+    /// `Pending` without polling the source while the last poll was a pending
+    /// `poll_next_event_until_woken` that has not been woken since, and the poll
+    /// comes from that counter's task.
     pub(crate) async fn next_event_with_credit(
         &mut self,
         maximum_body: Option<u32>,
@@ -526,11 +528,11 @@ impl EgressTransfer {
     }
 
     /// Polls like `poll_next_event_with_credit`, waking `context`'s task
-    /// through `wake`, whose task it is, and remembers a `Pending` result with
-    /// `wake`'s count: until something this poll registered with wakes, polls
-    /// from that task return `Pending` without polling the source again
-    /// (`DIV-034`: batching's attempt before a flush, then the waiting attempt
-    /// after it, poll a token-paced source once each, not twice).
+    /// through `wake`, which must wake that same task. A `Pending` result is
+    /// remembered with `wake`'s count. Until a waker this poll registered
+    /// fires, polls from that task return `Pending` without polling the source
+    /// again, so that the batching attempt before a flush and the waiting
+    /// attempt after it do not both poll a token-paced source.
     pub(crate) fn poll_next_event_until_woken(
         &mut self,
         wake: &Arc<SourceWakeCounter>,
@@ -550,9 +552,9 @@ impl EgressTransfer {
         polled
     }
 
-    /// Whether the last poll was `poll_next_event_until_woken`'s pending one,
-    /// nothing it registered with has woken since, and `context` belongs to
-    /// the task that wake would reach.
+    /// Whether the last poll was a pending `poll_next_event_until_woken` that
+    /// has not been woken since, and `context` belongs to the task that the
+    /// counter wakes.
     fn awaits_wake(&self, context: &Context<'_>) -> bool {
         self.awaited_wake
             .as_ref()
@@ -568,7 +570,7 @@ impl EgressTransfer {
         self.poll_next_event_with_credit(context, Some(maximum_body))
     }
 
-    // None blocks every body event; Some(0) permits terminal events at zero stream credit.
+    // `None` blocks every body event. `Some(0)` permits terminal events at zero stream credit.
     pub(crate) fn poll_next_event_with_credit(
         &mut self,
         context: &mut Context<'_>,

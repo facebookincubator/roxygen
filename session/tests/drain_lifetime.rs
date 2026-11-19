@@ -425,7 +425,7 @@ struct NoopLifecycleObserver;
 
 impl LifecycleObserver for NoopLifecycleObserver {}
 
-/// A transport whose reads end only when cancelled and whose writes complete at once.
+/// A transport whose reads end only when cancelled and whose writes complete immediately.
 struct CancellableReadTransport;
 
 impl UniplexTransport for CancellableReadTransport {
@@ -939,7 +939,7 @@ pub mod h1 {
                 assert!(reservation.cancel());
                 assert_eq!(labels_for(&log, detached), ["d", "c", "a"]);
 
-                // An observer added during dispatch sees only later events.
+                // An observer added during dispatch receives only later events.
                 let later_log = Rc::clone(&log);
                 let (adder, _) = order_observer(
                     "e",
@@ -1867,7 +1867,7 @@ pub mod session {
         assert!(reservation.cancel());
         assert_eq!(labels_for(&log, detached), ["d", "c", "a"]);
 
-        // An observer added during dispatch sees only later events.
+        // An observer added during dispatch receives only later events.
         let later_log = Rc::clone(&log);
         let (adder, _) = order_observer(
             "e",

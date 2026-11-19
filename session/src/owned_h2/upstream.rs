@@ -29,19 +29,19 @@ pub(super) struct Admission {
     maximum: u32,
     peer_maximum: Cell<u32>,
     pub(super) used: Cell<u32>,
-    /// Requests committed on the connection (`DIV-035`).
+    /// The number of requests committed on the connection.
     committed: Cell<u64>,
     closed: RefCell<Option<HttpError>>,
-    /// The code of the peer GOAWAY that closed admission, when one did before anything else.
+    /// The code of the peer GOAWAY that closed admission, if it was the first to close it.
     peer_goaway: Cell<Option<HttpErrorCode>>,
     observer: RefCell<Option<Rc<dyn OwnedUpstreamObserver>>>,
     queued: RefCell<VecDeque<Submission>>,
     /// Set while the owning driver is polling. A callback that panics then is contained and
-    /// reported (`DIV-056`); otherwise its panic reaches the caller.
+    /// reported. Otherwise its panic reaches the caller.
     pub(super) polling: Cell<bool>,
     /// A release inside the owning driver's poll, which the turn loop takes instead of a wake.
     release_pending: Cell<bool>,
-    /// The observer panicked while the driver polled, which drains the session (`DIV-056`).
+    /// The observer panicked while the driver polled, which drains the session.
     escalate_drain: Cell<bool>,
 }
 
@@ -67,8 +67,8 @@ impl Admission {
     }
 
     /// Runs one admission callback at `site`. While the driver polls, a panic is reported and
-    /// disposed of, and the observer's also drains the session (`DIV-056`); otherwise the first
-    /// panic is kept in `first` for `finish_panic` to raise to the caller.
+    /// disposed of, and an observer panic also drains the session. Otherwise the first panic
+    /// is kept in `first` for `finish_panic` to raise to the caller.
     #[inline(always)]
     fn contain_callback(
         &self,
@@ -240,13 +240,13 @@ impl OwnedH2UpstreamHandle {
         }
     }
 
-    /// The code of the peer GOAWAY that closed admission, if one closed it while it was open;
-    /// set before the observer's `admission_closed`.
+    /// The code of the peer GOAWAY that closed admission, if admission was still open when it
+    /// arrived. Set before the observer's `admission_closed` runs.
     pub fn peer_goaway(&self) -> Option<HttpErrorCode> {
         self.admission.peer_goaway.get()
     }
 
-    /// Reservations and streams holding an admission slot: what `available_capacity` subtracts
+    /// Reservations and streams holding an admission slot. `available_capacity` subtracts this
     /// from the stream limit.
     pub fn admitted_streams(&self) -> u32 {
         self.admission.used.get()
@@ -294,7 +294,8 @@ impl OwnedH2UpstreamHandle {
         self.control.complete.get()
     }
 
-    /// Includes response consumers, upload retirement and native write ownership.
+    /// Whether the live session has no outstanding work. Response consumers, upload
+    /// retirement and native writes count as work.
     pub fn is_idle(&self) -> bool {
         !self.is_finished() && self.control.idle.get() && self.admission.used.get() == 0
     }
@@ -334,7 +335,7 @@ enum ResponseWait {
 }
 
 impl OwnedH2UpstreamReservation {
-    /// Submits a request while preserving its fresh response read capability.
+    /// Submits a request whose response resolves to an unread `HttpResponseSource`.
     pub fn submit_exclusive(
         self,
         headers: HttpHeaderEvent,
@@ -344,26 +345,27 @@ impl OwnedH2UpstreamReservation {
         OwnedH2ExclusiveSubmission(self.submit(headers, source, cancellation))
     }
 
-    /// Submits a request and waits for its first published response head, preserving
-    /// the fresh response read capability. Codec commitment alone does not notify this
-    /// waiter. Informational heads also satisfy this interest and remain ordered in the
-    /// original source for the caller to drain. A response that ends or is reset before
-    /// any head also releases the waiter, with the same result, source outcome and wire
-    /// behavior as an ordinary submission. Upload, source and physical-write retirement
-    /// remain independent of this notification. The caller retains timeout
-    /// responsibility while waiting, including any timeout anchored to request-producer EOM.
+    /// Submits a request as `submit_exclusive` does, but resolves only once its first response
+    /// head is published.
     ///
-    /// A caller whose deadline observes the request producer's completion supplies it as
-    /// `producer_completion`, unless that producer has already succeeded: the outcome is
-    /// first-wins, so such a producer cannot fail. Until the caller takes the response or
-    /// the response ends before that producer fails, an upload that fails after that
-    /// producer has failed selects the producer's error and resets with its cancellation
-    /// code, as the caller's deadline selects it when that runs first. Otherwise a failed
+    /// Codec commitment alone does not resolve it. An informational head also resolves it and
+    /// stays queued in the original source for the caller to drain. A response that ends or is
+    /// reset before any head also resolves it, with the same result, source outcome and wire
+    /// behavior as an ordinary submission. Upload, source and transport-write retirement are
+    /// independent of it. The caller remains responsible for timeouts while waiting, including
+    /// any timeout that starts at the request producer's EOM.
+    ///
+    /// A caller whose deadline depends on the request producer's completion passes it as
+    /// `producer_completion`, unless that producer has already succeeded. The outcome is
+    /// first-wins, so a producer that succeeded cannot fail afterwards. Until the caller takes
+    /// the response, or the response ends before the producer fails, an upload that fails after
+    /// the producer failed selects the producer's error and resets with its cancellation code.
+    /// That matches what the caller's deadline selects when it runs first. Otherwise a failed
     /// upload takes the session's upload-failure reset.
     ///
     /// Dropping the submission after commitment and before it resolves cancels the request
-    /// with `CANCEL`, as an ordinary caller that took its commitment cancels by dropping its
-    /// response. Before commitment it is dropped as an ordinary submission is.
+    /// with `CANCEL`, as dropping the response of an ordinary submission does. Before
+    /// commitment, dropping it behaves as for an ordinary submission.
     pub fn submit_with_response_interest(
         self,
         headers: HttpHeaderEvent,
@@ -474,7 +476,8 @@ pub struct OwnedH2UpstreamSubmission {
 }
 
 impl OwnedH2UpstreamSubmission {
-    /// Retains the first explicit cause, including a caller's route timeout.
+    /// Cancels the request. Only the first explicit cause, such as a caller's route timeout,
+    /// is kept.
     pub fn cancel(&self, error: HttpError) {
         self.status.cancel(error);
     }
@@ -531,14 +534,14 @@ impl Future for OwnedH2UpstreamSubmission {
     }
 }
 
-/// A submission preserving the response's fresh exclusive capability.
-/// Ordinary submissions acknowledge codec commitment; response-interest
-/// submissions additionally wait for the first published response head or the
+/// A pending exclusive submission that resolves to an [`OwnedH2ExclusiveResponse`].
+/// Ordinary submissions resolve at codec commitment. Response-interest
+/// submissions also wait for the first published response head or the
 /// response's end.
 pub struct OwnedH2ExclusiveSubmission(OwnedH2UpstreamSubmission);
 
 impl OwnedH2ExclusiveSubmission {
-    /// Retains the first explicit cause through the ordinary submission owner.
+    /// Same as [`OwnedH2UpstreamSubmission::cancel`].
     pub fn cancel(&self, error: HttpError) {
         self.0.cancel(error);
     }
@@ -552,7 +555,7 @@ impl Future for OwnedH2ExclusiveSubmission {
     }
 }
 
-/// The fresh response source and the existing protocol-capacity observation.
+/// A committed request's unread response source and its request control.
 pub struct OwnedH2ExclusiveResponse {
     pub stream: StreamId,
     pub source: HttpResponseSource,
@@ -588,7 +591,7 @@ impl Drop for OwnedH2UpstreamSubmission {
     }
 }
 
-/// The original response source and a sticky protocol-capacity observation.
+/// A committed request's response source and its request control.
 pub struct OwnedH2UpstreamResponse {
     pub stream: StreamId,
     pub source: HttpStreamSourceOwner,
@@ -610,9 +613,8 @@ impl OwnedH2UpstreamRequest {
         self.0.released.get()
     }
 
-    /// Retains the first explicit cause, which resets an unfinished request. A no-op once
-    /// `capacity_released()` is true: the exchange has ended, so it records no cause and wakes
-    /// nothing.
+    /// Cancels and resets an unfinished request. Only the first explicit cause is kept. Has no
+    /// effect once `capacity_released()` is true, because the exchange has ended.
     pub fn cancel(&self, error: HttpError) {
         if self.capacity_released() {
             return;
@@ -713,10 +715,11 @@ pub(super) struct RequestStatus {
     wake: RefCell<Option<Arc<StreamWake>>>,
     /// A response head arrived.
     response_head: Cell<bool>,
-    /// Its connection refused it before commit, or the peer refused its stream before any
-    /// response head (`DIV-035`).
+    /// The request was rejected before commit because its connection's admission closed, or
+    /// the peer refused its stream before any response head.
     unprocessed: Cell<bool>,
-    /// The connection's earlier commits, fixed at commit or at a refusal before it (`DIV-035`).
+    /// The number of earlier commits on the connection, fixed at commit or at a refusal
+    /// before commit.
     sequence: Cell<Option<u64>>,
 }
 
@@ -740,14 +743,13 @@ impl RequestStatus {
         })
     }
 
-    /// Whether a cause is selected for the request, as `selected_error` reports one, without
-    /// cloning it.
+    /// Whether `selected_error` would return a cause, without cloning it.
     pub(super) fn cause_selected(&self) -> bool {
         self.error.borrow().is_some() || self.cancellation.is_cancellation_requested()
     }
 
-    /// Whether the response's source already failed, as a stream read timeout fails it before
-    /// the driver applies that failure.
+    /// Whether the response's source already failed. A stream read timeout, for example, fails
+    /// it before the driver applies that failure.
     fn response_failed(&self) -> bool {
         self.ingress
             .borrow()
@@ -755,14 +757,15 @@ impl RequestStatus {
             .is_some_and(|receipt| matches!(receipt.snapshot(), Some(Err(_))))
     }
 
-    /// The error a peer reset of the request's stream applies, and whether it failed the request
-    /// unprocessed: the request's selected cause, or else `reset`. A `refusal` is the peer's
-    /// `REFUSED_STREAM`, or a GOAWAY whose last-stream-id is below the stream, as the stream's
-    /// first reset. Before any response head, any selected cause and any failure of the response's
-    /// source, it failed the request unprocessed, and `reset` becomes the request's selected cause,
-    /// as `Submission::refuse` selects its connection's error, so a later cancel cannot replace it
-    /// (`DIV-035`). One sample of the cause decides both, as a cancellation can arrive from another
-    /// thread.
+    /// Returns the error that a peer reset of the request's stream applies, and whether the
+    /// request failed unprocessed.
+    ///
+    /// The error is the request's selected cause, or else `reset`. `refusal` means the stream's
+    /// first reset is the peer's `REFUSED_STREAM`, or a GOAWAY with a last-stream-id below the
+    /// stream. A refusal before any response head, selected cause or response-source failure
+    /// fails the request unprocessed and makes `reset` its selected cause, so a later cancel
+    /// cannot replace it. The cause is sampled once for both results, because a cancellation can
+    /// arrive from another thread.
     pub(super) fn peer_reset_error(
         &self,
         refusal: bool,
@@ -885,9 +888,9 @@ struct Submission {
 }
 
 impl Submission {
-    /// Rejects the submission because its connection's admission closed before commit: unless
-    /// its consumer selected a cause, it failed unprocessed (`DIV-035`). One sample of the cause
-    /// decides both, as a cancellation can arrive from another thread.
+    /// Rejects the submission because its connection's admission closed before commit. Unless
+    /// its consumer selected a cause, the request failed unprocessed. The cause is sampled once
+    /// for both, because a cancellation can arrive from another thread.
     fn refuse(&mut self, error: HttpError) {
         let selected = self.status.selected_error();
         #[cfg(test)]
@@ -1002,8 +1005,8 @@ impl Exchange {
     }
 
     /// Stops watching the supplied producer once it has succeeded, which is terminal, or
-    /// once the response has ended while it has not failed, where a caller's deadline
-    /// observer would finish.
+    /// once the response ended before the producer failed, which is when a caller's deadline
+    /// observer would also finish.
     fn retire_producer_watch(&mut self) {
         let Some(producer) = &self.producer else {
             return;
@@ -1225,12 +1228,12 @@ impl OwnedExchange for NoExchange {
     }
 }
 
-/// Concrete upstream role over the same codec, pump, flow control and write fences.
+/// An upstream (client) HTTP/2 session on the same owned driver as `OwnedH2Session`.
 ///
-/// It honors `UniplexConfig::deliver_ingress_before_abort` (`DIV-033`), which the downstream
-/// role refuses: a response whose stream or connection fails keeps its received head and body
-/// events for its reader, before the error, unless the request's consumer cancelled it (a
-/// cancel, a dropped submission or the cancellation token), which discards them, as
+/// It supports `UniplexConfig::deliver_ingress_before_abort`, which the downstream role
+/// rejects. A response whose stream or connection fails keeps its received head and body
+/// events for its reader, ahead of the error. A cancel by the request's consumer (a `cancel`
+/// call, a dropped submission or the cancellation token) discards them, as
 /// `UniplexStreamAbort` does.
 pub struct OwnedH2UpstreamSession(Option<Driver<UpstreamApplication, true>>);
 
@@ -1244,11 +1247,14 @@ impl Drop for OwnedH2UpstreamSession {
 }
 
 impl OwnedH2UpstreamSession {
-    /// Creates the experimental upstream session. It honors `read_timeout`, whose expiry drains
-    /// the connection, `write_timeout`, which bounds a stalled transport write and an upload's
-    /// wait for flow-control credit, and `stream_read_timeout`, which bounds each wait for
-    /// response data from the request's EOM on (`DIV-028`). It refuses
-    /// `Http2SessionConfig::abort_streams_on_eof`.
+    /// Creates the upstream session.
+    ///
+    /// When `read_timeout` expires, the connection drains. `write_timeout` bounds a stalled
+    /// transport write and an upload's wait for flow-control credit. `stream_read_timeout`
+    /// bounds each wait for response data, starting at the request's EOM. Returns an error for
+    /// options the upstream driver does not support, such as
+    /// `Http2SessionConfig::abort_streams_on_eof`, `exact_method_tokens`,
+    /// `verbatim_http2_header_values`, stats, or SETTINGS that leave push enabled.
     pub fn new(options: OwnedH2Options) -> Result<(Self, OwnedH2UpstreamHandle), HttpError> {
         let (session, handle) =
             Driver::<UpstreamApplication, true>::new(UpstreamApplication, options)?;
@@ -1268,9 +1274,10 @@ impl OwnedH2UpstreamSession {
         ))
     }
 
-    /// The run never resumes a callback panic: one that aborts the connection is counted in the
-    /// worker's `WorkerPollStats`, and the run returns `Err` once native I/O has joined
-    /// (`DIV-056`).
+    /// Runs the session to completion.
+    ///
+    /// The run never resumes a callback panic. A panic that aborts the connection is counted in
+    /// the worker's `WorkerPollStats`, and the run returns `Err` once native I/O has joined.
     pub fn run(mut self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
         self.0
             .take()
@@ -1328,9 +1335,9 @@ where
         (self.submit_upstream() || released).then_some(true)
     }
 
-    /// Drains the session after its observer panicked inside the driver's poll (`DIV-056`), as a
-    /// caller's drain does, but leaves the caller's `close_when_idle` request unset, so that call
-    /// still reports a change.
+    /// Drains the session after its observer panicked inside the driver's poll, as a caller's
+    /// drain does, but leaves the caller's `close_when_idle` request unset, so that call still
+    /// reports a change.
     #[cold]
     #[inline(never)]
     fn drain_after_observer_panic(&mut self) {
@@ -1381,7 +1388,7 @@ where
                 && admission.committed.get() != 0
                 && self.read.peer_closed()
             {
-                // The read that the peer's close wakes refuses the request unprocessed (`DIV-035`).
+                // The read woken by the peer's close fails the request as unprocessed.
                 return false;
             } else {
                 admission.queued.borrow_mut().pop_front()
@@ -1398,8 +1405,8 @@ where
         true
     }
 
-    /// Refuses a submission the driver did not commit; a panic in its callbacks is reported at
-    /// `Submission` (`DIV-056`).
+    /// Rejects a submission the driver did not commit. A panic in its callbacks is reported at
+    /// `PanicSite::Submission`.
     #[cold]
     #[inline(never)]
     fn refuse_submission(&self, mut submission: Submission, error: HttpError) {
@@ -1411,9 +1418,9 @@ where
         }
     }
 
-    /// A commit runs only Roxygen code and can leave the connection's stream accounting half
-    /// updated, so its panic is Driver scope (`DIV-056`): the per-turn catch tears the session
-    /// down without reporting the panic a second time.
+    /// A commit does not run user callbacks and can leave the connection's stream accounting
+    /// half updated, so its panic tears down the whole session. The per-turn catch does that
+    /// without reporting the panic a second time.
     #[cold]
     #[inline(never)]
     fn commit_panicked(&self, submission: Submission, panic: PanicPayload) -> ! {
@@ -1486,8 +1493,8 @@ where
             source.deliver_ingress_before_abort();
         }
         let producer = source.producer();
-        // Untimed until the request's EOM is serialized, as in Proxygen (HTTPCoroSession.cpp:816)
-        // and Uniplex's H2 deferral.
+        // Untimed until the request's EOM is serialized, as in `UniplexSession`'s HTTP/2
+        // deferral.
         producer.defer_read_timeout(DeferredReadTimeout::DeferUpdates(
             self.connection.state.config.stream_read_timeout,
         ));
@@ -1693,9 +1700,9 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
         Ok(())
     }
 
-    /// Fails the request whose response observer panicked (`DIV-056`). The caller's error path
-    /// resets the stream; a stream already closed both ways is cancelled without a reset, as
-    /// `egress_failed` decides.
+    /// Fails the request whose response observer panicked. The caller's error path resets the
+    /// stream. A stream already closed both ways is cancelled without a reset, matching
+    /// `egress_failed`.
     #[cold]
     #[inline(never)]
     pub(super) fn response_observer_panicked<E: ExchangeStorage<UPSTREAM>>(

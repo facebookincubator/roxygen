@@ -209,8 +209,8 @@ fn options(context: WorkerContext, transport: Rc<dyn UniplexTransport>) -> Owned
     }
 }
 
-/// `exact_method_tokens` (`DIV-040`) reads downstream request methods. The owned upstream
-/// driver refuses it, as the owned HTTP/1.1 upstream driver does, instead of ignoring it.
+/// `exact_method_tokens` applies to downstream request methods. The owned upstream driver
+/// rejects it, as the owned HTTP/1.1 upstream driver does, instead of ignoring it.
 #[test]
 fn owned_upstream_h2_refuses_exact_method_tokens() {
     run_on_worker(|context| {
@@ -232,8 +232,8 @@ fn owned_upstream_h2_refuses_exact_method_tokens() {
     });
 }
 
-/// `abort_streams_on_eof` (`DIV-055`) judges a downstream peer's EOF. The owned upstream
-/// driver refuses it, as the owned HTTP/1.1 upstream driver refuses `abort_exchanges_on_eof`,
+/// `abort_streams_on_eof` applies to a downstream peer's EOF. The owned upstream driver
+/// rejects it, as the owned HTTP/1.1 upstream driver rejects `abort_exchanges_on_eof`,
 /// instead of ignoring it.
 #[test]
 fn owned_upstream_h2_refuses_abort_streams_on_eof() {
@@ -252,8 +252,8 @@ fn owned_upstream_h2_refuses_abort_streams_on_eof() {
     });
 }
 
-/// The owned downstream driver applies `verbatim_http2_header_values` (`DIV-041`); the owned
-/// upstream driver still refuses it instead of ignoring it.
+/// The owned downstream driver applies `verbatim_http2_header_values`. The owned upstream
+/// driver rejects it instead of ignoring it.
 #[test]
 fn owned_upstream_h2_refuses_verbatim_http2_header_values() {
     run_on_worker(|context| {
@@ -346,10 +346,9 @@ fn cancelled(run: Result<UniplexRunSummary, HttpError>) {
     );
 }
 
-/// `DIV-043`: a worker whose teardown deadline has passed destroys an owned HTTP/2 upstream
-/// with a request in flight before its native I/O cleanup joined. That destruction is an
-/// abandonment: the driver still resets the transport, and the worker reports a clean overrun
-/// instead of a panic.
+/// A worker whose teardown deadline has passed destroys an owned HTTP/2 upstream with a request
+/// in flight before its native I/O cleanup joined. The driver treats that as abandonment. It
+/// still resets the transport, and the worker reports a clean overrun instead of a panic.
 #[test]
 fn a_forced_worker_teardown_abandons_an_owned_h2_upstream_mid_request() {
     let (inspected_tx, inspected_rx) = std::sync::mpsc::channel();
@@ -1715,8 +1714,8 @@ fn eof_and_cancellation_resolve_queued_submission_acknowledgments() {
     }
 }
 
-/// Requests onto an idle connection whose peer has closed it (`DIV-035`). Linux only: the tests
-/// wait for `POLLRDHUP`, and only Linux answers `peer_closed`.
+/// Requests onto an idle connection that the peer has closed. Linux only: the tests wait for
+/// `POLLRDHUP`, and `peer_closed` reports a close only on Linux.
 #[cfg(target_os = "linux")]
 mod idle_peer_close {
     use super::*;
@@ -1732,7 +1731,7 @@ mod idle_peer_close {
         GoawayThenFin,
         /// Resets it (`SO_LINGER` 0, then close).
         Reset,
-        /// Sends a PING, keeps it open and answers the next request.
+        /// Sends a PING, keeps it open and responds to the next request.
         Ping,
     }
 
@@ -1757,10 +1756,10 @@ mod idle_peer_close {
         peer_header_streams: Vec<u64>,
     }
 
-    /// `DIV-035` on a real loopback TCP connection that served one request. For each step the peer
-    /// acts on the idle connection, and `submissions` requests are submitted once the client's
-    /// socket shows it but before the worker's next I/O pass, which alone would wake the session's
-    /// parked read.
+    /// Replays `steps` on an idle loopback TCP connection that has served one request. For each
+    /// step the peer acts on the connection, and `submissions` requests are submitted once the
+    /// client's socket shows it but before the worker's next I/O pass, which alone would wake the
+    /// session's parked read.
     fn idle_reuse(steps: &'static [IdlePeer], submissions: usize) -> IdleReuse {
         crate::uniplex_tests::run_on_hosted_worker(move |context| {
             Box::pin(async move {
@@ -1959,7 +1958,7 @@ mod idle_peer_close {
     }
 
     /// The session reads the peer's EOF before it commits the request, which is refused unprocessed
-    /// and never written, so a caller can resend it (`DIV-035`).
+    /// and never written, so a caller can resend it.
     #[test]
     fn a_request_on_an_idle_connection_its_peer_closed_is_refused_unprocessed() {
         assert_eq!(
@@ -1998,7 +1997,7 @@ mod idle_peer_close {
         );
     }
 
-    /// The reset's read error refuses the request. The peer reads nothing after its reset, so
+    /// The reset's read error refuses the request. The peer does not read after its reset, so
     /// only the refusal, not `peer_header_streams`, shows that the head was not written.
     #[test]
     fn a_request_on_an_idle_connection_its_peer_reset_is_refused_unprocessed() {
@@ -2027,8 +2026,8 @@ mod idle_peer_close {
         );
     }
 
-    /// A peer frame read while the second request was submitted leaves nothing that lets the third
-    /// commit onto the closed connection.
+    /// A peer frame read while the second request was submitted does not let the third commit
+    /// onto the closed connection.
     #[test]
     fn a_close_after_a_served_reuse_refuses_the_next_request_unprocessed() {
         assert_eq!(
@@ -2621,7 +2620,7 @@ fn buffered_responses_survive_peer_reset_and_native_write_failure_until_consumed
                                 .await;
                         }
                         // A peer RST_STREAM(NO_ERROR) after the whole response stops the
-                        // upload with NO_ERROR (`DIV-050`).
+                        // upload with NO_ERROR.
                         assert_eq!(
                             probe.stops.borrow().as_slice(),
                             &[Some(if write_failure {
@@ -2676,7 +2675,7 @@ fn buffered_responses_survive_peer_reset_and_native_write_failure_until_consumed
     }
 }
 
-/// What a submitter sees when the origin resets its stream with RST_STREAM(NO_ERROR)
+/// What a submitter gets when the origin resets its stream with RST_STREAM(NO_ERROR)
 /// while the request upload is still open.
 struct NoErrorReset {
     /// The upload source's `stop_reading` codes.
@@ -3438,9 +3437,9 @@ fn upload_pending_token_cancellation_and_explicit_status_keep_their_retirement_o
     }
 }
 
-/// `DIV-056`: an upload source whose read panics is retired unstopped, and the panic, contained
-/// at Exchange scope, fails only its request: the response fails as an upload error fails it, the
-/// stream is reset behind its write fence, and the session keeps running until the peer's EOF.
+/// An upload source whose read panics is retired unstopped. The panic is contained at Exchange
+/// scope and fails only its request: the response fails as an upload error fails it, the stream
+/// is reset behind its write fence, and the session keeps running until the peer's EOF.
 #[cfg(panic = "unwind")]
 #[test]
 fn upload_body_poll_panic_retires_the_read_and_fails_only_its_request() {
@@ -3576,9 +3575,9 @@ impl HeaderIndexingStrategy for ArmedIndexing {
     }
 }
 
-/// `DIV-056`: a Driver-scope panic, here in the codec's header indexing strategy as a second
-/// request's head is encoded, aborts the session while the first request's upload, its write and
-/// the native read are held; the run joins that native I/O before it fails.
+/// A Driver-scope panic, here in the codec's header indexing strategy as a second request's head
+/// is encoded, aborts the session while the first request's upload, its write and the native read
+/// are held. The run joins that native I/O before it fails.
 #[cfg(panic = "unwind")]
 #[test]
 fn a_driver_panic_beside_a_held_upload_joins_native_io_before_failing_the_run() {
@@ -3693,9 +3692,9 @@ fn a_driver_panic_beside_a_held_upload_joins_native_io_before_failing_the_run() 
     });
 }
 
-/// `DIV-056`: a Driver-scope panic in an owned HTTP/2 client, here in the codec's
-/// header indexing strategy as the request head is encoded, fails the pending submission and
-/// the run with `INTERNAL_ERROR`, and is reported once.
+/// A Driver-scope panic in an owned HTTP/2 client, here in the codec's header indexing strategy
+/// as the request head is encoded, fails the pending submission and the run with `INTERNAL_ERROR`,
+/// and is reported once.
 #[cfg(panic = "unwind")]
 #[test]
 fn upstream_driver_panic_returns_err() {
@@ -4309,7 +4308,7 @@ fn fresh_upload_wait_preserves_control_early_response_and_resume_cancellation() 
     }
 }
 
-/// `DIV-056`: a fresh upload's credit callback panic, contained at Exchange scope, fails only its
+/// A fresh upload's credit callback panic is contained at Exchange scope and fails only its
 /// request: the response fails as an upload error fails it, the stream is reset behind its write
 /// fence, and the session keeps running until the peer's EOF.
 #[cfg(panic = "unwind")]
@@ -4785,10 +4784,10 @@ fn completed_upload_keeps_cancellation_wake_while_write_is_held(direct_control: 
     });
 }
 
-/// `DIV-056` for the panicking cases: a deadline poll panic is contained at Exchange scope and
-/// fails its request, and a completion panic while the observer is retired is contained at
-/// Exchange scope too. The completion panic still aborts the session, which joins its native I/O,
-/// and the run fails.
+/// Every terminal cleanup of a response observer joins the held native I/O. In the cases that
+/// panic, a deadline poll panic is contained at Exchange scope and fails its request, and a
+/// completion panic while the observer is retired is contained at Exchange scope too. The
+/// completion panic still aborts the session, which joins its native I/O, and the run fails.
 #[cfg(panic = "unwind")]
 #[test]
 fn response_observer_terminal_cleanup_joins_held_native_io() {
@@ -5041,8 +5040,8 @@ fn response_observer_terminal_cleanup_joins_held_native_io() {
     }
 }
 
-/// `DIV-056`: an upload read that panics fails only its request. Its response fails as
-/// an upload error fails it, its stream alone is reset, and the session keeps serving.
+/// An upload read that panics fails only its request. Its response fails as an upload error
+/// fails it, its stream alone is reset, and the session keeps serving.
 #[cfg(panic = "unwind")]
 fn assert_an_upload_panic_fails_only_its_request() {
     run_on_worker(|context| {
@@ -5164,9 +5163,9 @@ fn an_upload_panic_fails_only_its_request_on_a_hosted_worker() {
     crate::uniplex_tests::on_hosted_workers(assert_an_upload_panic_fails_only_its_request);
 }
 
-/// `DIV-056`: a response observer whose deadline poll panics fails only its request:
-/// the stream is reset, the observer is not polled again and completes once, with the failure,
-/// and the session keeps serving.
+/// A response observer whose deadline poll panics fails only its request. The stream is reset,
+/// the observer is not polled again and completes once with the failure, and the session keeps
+/// serving.
 #[cfg(panic = "unwind")]
 #[test]
 fn a_response_observer_deadline_panic_fails_its_request_once() {
@@ -5279,9 +5278,9 @@ fn a_response_observer_deadline_panic_fails_its_request_once() {
     });
 }
 
-/// `DIV-056`: an upstream observer that panics inside the driver's poll drains the
-/// session: the request in flight completes, admission refuses new requests, the caller's own
-/// drain request still reports a change, and the run ends `Ok` once idle.
+/// An upstream observer that panics inside the driver's poll drains the session. The request in
+/// flight completes, admission rejects new requests, the caller's own drain request still
+/// reports a change, and the run ends `Ok` once idle.
 #[cfg(panic = "unwind")]
 fn assert_an_upstream_observer_panic_drains_the_session() {
     #[derive(Default)]
@@ -5422,9 +5421,8 @@ fn an_upstream_observer_panic_drains_the_session_on_a_hosted_worker() {
     crate::uniplex_tests::on_hosted_workers(assert_an_upstream_observer_panic_drains_the_session);
 }
 
-/// `DIV-056`: a panic in a request's commit, which runs only Roxygen code, tears the
-/// session down at Driver scope with one report: the submission and the run fail with
-/// `INTERNAL_ERROR`.
+/// A panic in a request's commit, which runs only Roxygen code, tears the session down at Driver
+/// scope with one report. The submission and the run fail with `INTERNAL_ERROR`.
 #[cfg(panic = "unwind")]
 #[test]
 fn a_commit_panic_tears_down_with_one_report() {
@@ -5485,9 +5483,9 @@ fn a_commit_panic_tears_down_with_one_report() {
     });
 }
 
-/// `DIV-056`: admission callbacks that a caller's own call triggers still raise their
-/// panic to that caller, unreported: between polls of a live session, and once its run finished,
-/// normally or after a Driver-scope teardown.
+/// Admission callbacks that a caller's own call triggers raise their panic to that caller,
+/// unreported. This holds between polls of a live session and after its run finished, normally
+/// or after a Driver-scope teardown.
 #[cfg(panic = "unwind")]
 #[test]
 fn caller_triggered_admission_panics_still_reach_the_caller() {
@@ -6118,7 +6116,7 @@ fn owned_upstream_round_trip_runs_without_tokio_runtime() {
     });
 }
 
-/// Unconsumed receipts the writer-arming fixtures' queue holds before it refuses a write.
+/// Unconsumed receipts the writer-arming fixtures' queue holds before `can_write` returns false.
 const ARMING_CAPACITY: usize = 8;
 
 /// HTTP/2 frame flags the writer-arming fixtures look for.
@@ -6197,7 +6195,7 @@ async fn run_upstream_arming<T>(
     observed
 }
 
-/// Waits until the origin's SETTINGS are acknowledged and the session settles.
+/// Waits until the origin's SETTINGS are acknowledged, then yields while the session runs.
 async fn arming_settings_settle(state: &RefCell<super::owned::ScriptedWriteState>) -> bool {
     let acknowledged = super::owned::writer_drive_until(|| {
         state.borrow().frames(FrameType::SETTINGS, ARMING_ACK) == 1
@@ -6258,8 +6256,8 @@ async fn read_fetched(source: &mut HttpSourceHolder) -> Fetched {
     Ok((status, body))
 }
 
-/// Opens `gate`, behind which the origin's response waits, reads the whole response, and lets
-/// the session settle.
+/// Opens `gate`, behind which the origin's response waits, reads the whole response, and yields
+/// while the session runs.
 async fn arming_respond(
     submission: Option<crate::owned_h2::OwnedH2UpstreamSubmission>,
     gate: &tokio::sync::Notify,
@@ -6292,7 +6290,7 @@ fn arming_origin_reads() -> (Vec<FixtureRead>, [Arc<tokio::sync::Notify>; 3]) {
     (reads, gates)
 }
 
-/// A session whose writes all complete inline over the origin's reads.
+/// A transport over the origin's reads whose writes all complete inline.
 fn inline_arming_transport(
     reads: Vec<FixtureRead>,
     capacity: usize,
@@ -7246,7 +7244,7 @@ fn upstream_sessions_never_query_saturation() {
             (9, 3_188_096_049_290_309_849),
             (10, 18_252_902_388_575_904_042)
         ],
-        "the unarmed upstream transcripts recorded at da1228fe4a74"
+        "the unarmed upstream transcripts are unchanged"
     );
     super::owned::assert_transcript_scenario(&read, &written);
     assert!(idle_before_ping, "the session is idle before the PING");
@@ -7635,18 +7633,17 @@ fn idle_close_polls_the_read_again_after_cancelling_it() {
 struct ReleasedExchange {
     /// The request's capacity was released before the source was read.
     released: bool,
-    /// Session polls, wakes and in-poll wakes over a settle with nothing to do.
+    /// Session polls, wakes and in-poll wakes over `WRITER_SETTLE` scheduler turns with no work.
     quiet: [usize; 3],
-    /// The same over a settle that starts with the request's cancel, when `cancel` is set.
+    /// The same over the turns that start with the request's cancel, when `cancel` is set.
     after_cancel: [usize; 3],
-    /// The response, read after that settle.
+    /// The response, read after those turns.
     read: Fetched,
     /// The session is idle once the read response is dropped.
     idle: bool,
-    /// Session polls, wakes and in-poll wakes over a settle at idle that starts with a
-    /// second cancel, when `cancel` is set.
+    /// The same over turns at idle that start with a second cancel, when `cancel` is set.
     idle_cancel: [usize; 3],
-    /// The session is still idle after that settle.
+    /// The session is still idle after those turns.
     still_idle: bool,
     /// Every byte the session wrote.
     written: Vec<u8>,
@@ -7916,9 +7913,8 @@ fn cancel_before_release_still_resets() {
     assert!(released_after, "the retired stream releases its capacity");
 }
 
-/// An idle upstream connection drains at its read timeout, not a millisecond earlier, as
-/// Proxygen's read timeout calls `initiateDrain`: one GOAWAY, admission closes, and with no
-/// stream left the connection closes.
+/// An idle upstream connection drains at its read timeout, not a millisecond earlier: one
+/// GOAWAY, admission closes, and with no stream left the connection closes.
 #[test]
 fn upstream_idle_connection_drains_at_its_read_timeout() {
     super::owned::on_both_hosts(|host, context| {
@@ -7969,8 +7965,8 @@ struct UpstreamIdleWire {
 }
 
 /// Runs an upstream connection with `super::owned::IDLE` as its read timeout on the owned driver
-/// or on `UniplexSession`. With `response_at`, a GET goes out at the start and the origin answers
-/// it at that instant.
+/// or on `UniplexSession`. With `response_at`, a GET goes out at the start and the origin
+/// responds at that instant.
 async fn upstream_idle_wire(
     context: WorkerContext,
     owned: bool,
@@ -8103,10 +8099,9 @@ async fn upstream_idle_wire(
     }
 }
 
-/// Upstream read-timeout drains, owned against `UniplexSession` on the same paused clock: an idle
-/// connection, and one whose request is still unanswered at the timeout, send the same GOAWAY at
-/// the same instant; the late response is still delivered, and both connections then close
-/// cleanly.
+/// Upstream read-timeout drains, owned against `UniplexSession` on the same paused clock. An idle
+/// connection, and one whose request has no response at the timeout, send the same GOAWAY at the
+/// same instant. The late response is still delivered, and both connections then close cleanly.
 #[test]
 fn owned_upstream_idle_drain_matches_uniplex() {
     let idle = super::owned::IDLE.as_millis() as u64;
@@ -8160,8 +8155,8 @@ fn owned_upstream_idle_drain_matches_uniplex() {
 }
 
 /// An upload blocked on its stream's send window is reset with FLOW_CONTROL_ERROR when the write
-/// timeout passes with no activity, not a millisecond earlier, as Proxygen's
-/// `handleWriteEventTimeout` resets every flow-blocked stream, and its response fails with it.
+/// timeout passes with no activity, not a millisecond earlier. The timeout resets every
+/// flow-blocked stream, and the upload's response fails with it.
 #[test]
 fn upstream_flow_control_timeout_resets_the_blocked_upload() {
     super::owned::on_both_hosts(|host, context| {
@@ -8220,8 +8215,8 @@ fn upstream_flow_control_timeout_resets_the_blocked_upload() {
 
 /// Under a write timeout the writer's flow-control wait observes every queued write's
 /// completion. Over a capacity-only queue that still has room, the write that exhausts an
-/// upload's stream window completes while the upload awaits its response, which is no wake for
-/// an untimed session; the timed session still resets the upload at its flow-control timeout,
+/// upload's stream window completes while the upload awaits its response, which does not wake
+/// an untimed session. The timed session still resets the upload at its flow-control timeout,
 /// not a millisecond later, and is polled only on its own wakes meanwhile.
 #[test]
 fn queued_upload_exhausting_its_window_is_reset_at_its_flow_control_timeout() {
@@ -8292,9 +8287,9 @@ struct RetirementFlowWire {
 
 /// Runs upload A (stream 1), blocked on its stream window, beside GET B (stream 3), on the owned
 /// driver or on `UniplexSession`, both with `write_timeout` as their write timeout. The origin
-/// answers B with a header-only response at `respond_at`; the client consumes it at
-/// `consume_at`, which retires B without a byte read or written. The client drains the connection
-/// at `drain_at`.
+/// sends B a header-only response at `respond_at`, and the client consumes it at `consume_at`,
+/// which retires B without a byte read or written. The client drains the connection at
+/// `drain_at`.
 async fn retirement_flow_wire(
     context: WorkerContext,
     owned: bool,
@@ -8479,10 +8474,10 @@ async fn retirement_flow_wire(
 }
 
 /// A stream that retires while an upload waits on flow control restarts the upload's
-/// flow-control timeout, as Proxygen's `checkForDetach` signals the writer and Uniplex records the
-/// detach as flow activity: B's header-only response, read when it arrives, is consumed halfway
-/// through the write timeout with no byte read or written, and both drivers reset the upload a
-/// full write timeout after that, at the same instant.
+/// flow-control timeout, because both drivers record the detach as flow activity. B's
+/// header-only response, read when it arrives, is consumed halfway through the write timeout
+/// with no byte read or written, and both drivers reset the upload a full write timeout after
+/// that, at the same instant.
 #[test]
 fn owned_upstream_retirement_restarts_the_flow_control_timeout_like_uniplex() {
     const WRITE: Duration = Duration::from_secs(1);
@@ -8620,7 +8615,7 @@ struct UpstreamStallWire {
 
 /// Sends a GET on the owned driver or on `UniplexSession`, both with `STREAM_READ` as the
 /// stream read timeout and every other timeout zero, to an origin that sends only its SETTINGS
-/// (or, with `response_at`, answers 200 at that instant), then closes the connection once the
+/// (or, with `response_at`, responds 200 at that instant), then closes the connection once the
 /// response read has ended.
 async fn upstream_stall_wire(
     context: WorkerContext,
@@ -8761,8 +8756,8 @@ async fn upstream_stall_wire(
 }
 
 /// An upstream response that stalls after the request's EOM, owned against `UniplexSession` on
-/// the same paused clock: both reads fail with "Read timeout after 1000" at the stream read
-/// timeout, both write RST_STREAM(CANCEL) then, and both connections then close cleanly; a
+/// the same paused clock. Both reads fail with "Read timeout after 1000" at the stream read
+/// timeout, both write RST_STREAM(CANCEL) then, and both connections then close cleanly. A
 /// response that arrives within the timeout is delivered by both.
 #[test]
 fn owned_upstream_stream_read_timeout_matches_uniplex() {
@@ -8978,8 +8973,8 @@ fn response_published_before_the_reader_polls_beats_the_timeout() {
 /// Each wait for response data is timed afresh from the request's EOM on: a response whose head
 /// and body chunks each arrive within the stream read timeout is delivered whole, however long
 /// it takes in all. On a wheel host each armed wait is a store on the stream baton's one slot,
-/// with no host sleep; without a wheel each armed wait takes one host sleep, as before. The stream
-/// read timeout takes no connection slot.
+/// with no host sleep. Without a wheel each armed wait takes one host sleep. The stream read
+/// timeout takes no connection slot.
 #[test]
 fn trickling_response_is_timed_per_wait() {
     super::owned::on_both_hosts(|host, context| {
@@ -9072,11 +9067,12 @@ fn trickling_response_is_timed_per_wait() {
 }
 
 /// The clock reads of a GET whose response arrives after 20 s, then a close, with every timeout
-/// zero, measured on the parent commit, which did not honor stream read timeouts.
+/// zero. This is the count without any stream read timeout, so a zero timeout must not add to it.
 const ZERO_CONFIG_LATE_RESPONSE_NOW_READS: usize = 1;
 
-/// With a zero stream read timeout an upstream response read arms nothing at the request's EOM:
-/// no slot, no host sleep, and no clock read beyond the parent's, however long the origin takes.
+/// With a zero stream read timeout an upstream response read arms no timer at the request's EOM:
+/// no slot, no host sleep, and no clock read beyond `ZERO_CONFIG_LATE_RESPONSE_NOW_READS`,
+/// however long the origin takes.
 #[test]
 fn zero_stream_read_timeout_upstream_takes_no_slot_sleep_or_clock_read() {
     super::owned::on_both_hosts(|host, context| {
@@ -9134,8 +9130,7 @@ fn zero_stream_read_timeout_upstream_takes_no_slot_sleep_or_clock_read() {
     });
 }
 
-/// A finished request's error and progress (`DIV-035`): `request_unprocessed()` and
-/// `sequence_number()`.
+/// A finished request's error and progress: `request_unprocessed()` and `sequence_number()`.
 #[derive(Debug, Eq, PartialEq)]
 struct RequestProgress {
     error: Option<HttpErrorCode>,
@@ -9212,8 +9207,9 @@ enum StaleFin {
     SubmittedThenReadable,
 }
 
-/// A stale reused connection's two requests: the first, answered, and the second, submitted
-/// around the origin's FIN; the streams whose HEADERS were written; the run.
+/// The outcome of two requests on a stale reused connection. The first gets a response, and the
+/// second is submitted around the origin's FIN. Also holds the streams whose HEADERS were
+/// written and how the run ended.
 #[derive(Debug, Eq, PartialEq)]
 struct StaleOutcome {
     first: RequestProgress,
@@ -9222,8 +9218,8 @@ struct StaleOutcome {
     run: Option<HttpErrorCode>,
 }
 
-/// A GET answered with a 200 that ends stream 1, then a second GET submitted as `kind` around
-/// the origin's FIN, as `fin` orders them.
+/// Runs a GET whose 200 ends stream 1, then a second GET submitted as `kind` around the origin's
+/// FIN, as `fin` orders them.
 fn owned_stale_outcome(fin: StaleFin, kind: SubmitKind) -> StaleOutcome {
     run_on_worker(move |context| {
         Box::pin(async move {
@@ -9412,7 +9408,7 @@ fn peer_refusals_before_a_response_head_report_the_request_unprocessed() {
                     // A response head arrived before the refusal.
                     progress(false, 0),
                     progress(true, 1),
-                    // CANCEL is no refusal.
+                    // CANCEL is not a refusal.
                     progress(false, 2),
                     // Above the GOAWAY's last-stream-id.
                     progress(true, 3),
@@ -9431,9 +9427,9 @@ fn peer_refusals_before_a_response_head_report_the_request_unprocessed() {
     });
 }
 
-/// A peer refusal that reaches a stream whose earlier peer reset the driver already applied, in an
-/// earlier turn, is not the stream's first reset: the request keeps that reset's error and is not
-/// unprocessed (`DIV-035`). The held response sources retain the reset streams.
+/// A peer refusal that reaches a stream after the driver applied an earlier peer reset, in an
+/// earlier turn, is not the stream's first reset. The request keeps that reset's error and is not
+/// unprocessed. The held response sources retain the reset streams.
 #[test]
 fn a_peer_refusal_after_an_applied_peer_reset_leaves_the_request_processed() {
     run_on_worker(|context| {
@@ -9599,8 +9595,8 @@ async fn refused_after_a_stream_read_timeout(
 }
 
 /// A peer refusal that the driver reads in the turn it would apply a stream read timeout that
-/// already failed the response, before any response head, leaves the request processed: the
-/// timeout is the request's failure (`DIV-035`).
+/// already failed the response, before any response head, leaves the request processed. The
+/// timeout is the request's failure.
 #[test]
 fn a_peer_refusal_after_a_stream_read_timeout_failed_the_response_leaves_the_request_processed() {
     const TIMED_OUT: RequestProgress = RequestProgress {
@@ -9646,9 +9642,9 @@ impl crate::owned_h2::OwnedH2ResponseObserver for Completions {
 }
 
 /// The progress of `BEYOND_A_TURN_BUDGET` GETs whose streams the peer refuses in one read, each
-/// with `REFUSED_STREAM` or, with `goaway`, all with one GOAWAY, and whose response head reads
-/// time out once the driver has yielded at its turn budget with refusals still to apply; and how
-/// many of the refusals the driver applied before the timeout.
+/// with `REFUSED_STREAM` or, with `goaway`, all with one GOAWAY. Their response head reads time
+/// out once the driver has yielded at its turn budget with refusals still to apply. Also returns
+/// how many of the refusals the driver applied before the timeout.
 async fn timed_out_before_the_driver_applies_its_refusals(
     host: Rc<crate::external_host_tests::ManualHost>,
     context: WorkerContext,
@@ -9756,11 +9752,11 @@ async fn timed_out_before_the_driver_applies_its_refusals(
     (applied, outcomes)
 }
 
-/// Refusals of more streams than the driver polls stream owners in one turn budget, read at once
-/// (`REFUSED_STREAM` for every stream, or one GOAWAY), leave refusals recorded but not yet applied
-/// when the driver yields. A stream read timeout that expires then does not fail a request that its
-/// refusal failed unprocessed: every response head read fails with `REFUSED_STREAM`, and every
-/// request reports unprocessed (`DIV-035`).
+/// Refusals of more streams than the driver polls stream owners in one turn budget, read
+/// together (`REFUSED_STREAM` for every stream, or one GOAWAY), leave refusals recorded but not
+/// yet applied when the driver yields. A stream read timeout that expires then does not fail a
+/// request that its refusal failed unprocessed. Every response head read fails with
+/// `REFUSED_STREAM`, and every request reports unprocessed.
 #[test]
 fn a_stream_read_timeout_before_the_driver_applies_a_peer_refusal_keeps_the_refusal() {
     fn assert_refused((applied, outcomes): (usize, Vec<RequestProgress>), refusal: &str) {
@@ -9801,9 +9797,9 @@ fn a_stream_read_timeout_before_the_driver_applies_a_peer_refusal_keeps_the_refu
     });
 }
 
-/// A cancellation that lands right after a connection refusal samples its request's cause, as
-/// another thread's can, follows the refusal: the request reports the refusal's error and
-/// unprocessed, not the cancellation's error with the refusal's flag (`DIV-035`).
+/// A cancellation from another thread can land right after a connection refusal has sampled the
+/// request's cause. The cancellation then follows the refusal: the request reports the refusal's
+/// error and is unprocessed, not the cancellation's error with the refusal's flag.
 #[test]
 fn a_cancellation_racing_a_refusal_follows_it() {
     run_on_worker(|context| {
@@ -9863,8 +9859,8 @@ impl Submitted {
 /// How the peer refuses a committed request's stream 1.
 #[derive(Clone, Copy, Debug)]
 enum PeerRefusal {
-    /// RST_STREAM(`REFUSED_STREAM`), then a GOAWAY whose last-stream-id is 1, which refuses
-    /// nothing more and lets the connection finish.
+    /// RST_STREAM(`REFUSED_STREAM`), then a GOAWAY whose last-stream-id is 1, which refuses no
+    /// other stream and lets the connection finish.
     RefusedStream,
     /// A GOAWAY whose last-stream-id is 0.
     Goaway,
@@ -9972,7 +9968,7 @@ fn unclaimed_peer_refusal(
 }
 
 /// Each case's outcome beside the refused request's: the upload stopped with the refusal, and
-/// the claim fails with it, unprocessed, sequence 0 (`DIV-035`).
+/// the claim fails with it, unprocessed, sequence 0.
 fn peer_refusal_table(
     cases: &[(PeerRefusal, SubmitKind, RefusalCancel)],
 ) -> [Vec<(String, Vec<Option<HttpErrorCode>>, RequestProgress)>; 2] {
@@ -10015,8 +10011,9 @@ const ALL_SUBMIT_KINDS: [SubmitKind; 3] = [
 ];
 
 /// A consumer's cancel after the driver applied a peer refusal, before the consumer claimed the
-/// response, does not replace the refusal: the request stays unprocessed with the refusal's error,
-/// so the resend rule never resends a request its consumer cancelled (`DIV-035`).
+/// response, does not replace the refusal. The request stays unprocessed with the refusal's
+/// error, so a caller that resends unprocessed requests does not resend one its consumer
+/// cancelled.
 #[test]
 fn a_consumer_cancel_after_an_applied_peer_refusal_keeps_the_refusal() {
     let [outcomes, expected] = peer_refusal_table(&peer_refusal_cases(
@@ -10027,7 +10024,7 @@ fn a_consumer_cancel_after_an_applied_peer_refusal_keeps_the_refusal() {
 }
 
 /// A peer refusal is the unprocessed request's selected cause, so its unclaimed submission fails
-/// with it, as one its connection refused before commit does (`DIV-035`).
+/// with it, as one its connection refused before commit does.
 #[test]
 fn an_unclaimed_peer_refused_submission_fails_with_the_refusal() {
     let [outcomes, expected] = peer_refusal_table(&peer_refusal_cases(
@@ -10037,8 +10034,8 @@ fn an_unclaimed_peer_refused_submission_fails_with_the_refusal() {
     assert_eq!(outcomes, expected);
 }
 
-/// A cancellation that lands right after a peer refusal samples its request's cause follows the
-/// refusal: one sample decides both the flag and the error (`DIV-035`).
+/// A cancellation that lands right after a peer refusal has sampled the request's cause follows
+/// the refusal, because one sample selects both the flag and the error.
 #[test]
 fn a_cancellation_racing_a_peer_refusal_follows_it() {
     let [outcomes, expected] = peer_refusal_table(&peer_refusal_cases(
@@ -10048,8 +10045,8 @@ fn a_cancellation_racing_a_peer_refusal_follows_it() {
     assert_eq!(outcomes, expected);
 }
 
-/// The turns a session gets to apply an origin's bytes, and the end behind them, before a
-/// `DIV-033` comparison's reader starts.
+/// The turns a session gets to apply an origin's bytes, and the end behind them, before the
+/// reader starts in the `deliver_ingress_before_abort` comparisons.
 const LATE_READ_TURNS: usize = 1_000;
 
 async fn settle_late_read() {
@@ -10058,13 +10055,13 @@ async fn settle_late_read() {
     }
 }
 
-/// How the origin's response to a GET ends in the `DIV-033` comparisons.
+/// How the origin's response to a GET ends in the `deliver_ingress_before_abort` comparisons.
 #[derive(Clone, Copy, Debug)]
 enum StreamEnd {
     /// A head and `first`, then RST_STREAM(CANCEL).
     ResetMidBody,
-    /// A head and `first`, then RST_STREAM(NO_ERROR), which a response that has not ended
-    /// reads as `CANCEL`.
+    /// A head and `first`, then RST_STREAM(NO_ERROR), which counts as `CANCEL` for a response
+    /// that has not ended.
     NoErrorResetMidBody,
     /// A head, then RST_STREAM(INTERNAL_ERROR).
     ResetAfterHead,
@@ -10139,8 +10136,8 @@ impl StreamEnd {
         reads
     }
 
-    /// What a late reader gets with `DIV-033` on: every event received before the end, then
-    /// the end's error.
+    /// What a late reader gets with `deliver_ingress_before_abort` on: every event received
+    /// before the end, then the end's error.
     fn delivered(self) -> LateRead {
         let truncated = |error| LateRead {
             status: Some(200),
@@ -10285,9 +10282,9 @@ fn late_read(end: StreamEnd, owned: bool, deliver: bool) -> LateRead {
     })
 }
 
-/// `DIV-033`: with the option on, a response whose stream or connection fails after part of
-/// it arrived yields the head and bytes received, then the error, as through a
-/// `UniplexSession` HTTP/2 client; with it off, both discard them.
+/// With `deliver_ingress_before_abort` on, a response whose stream or connection fails after
+/// part of it arrived yields the head and bytes received, then the error, as through a
+/// `UniplexSession` HTTP/2 client. With it off, both discard them.
 #[test]
 fn received_response_events_precede_a_stream_abort_as_uniplex() {
     for end in StreamEnd::ALL {
@@ -10295,23 +10292,24 @@ fn received_response_events_precede_a_stream_abort_as_uniplex() {
         assert_eq!(
             owned,
             end.delivered(),
-            "{end:?}: with DIV-033 on, the received head and bytes precede the error"
+            "{end:?}: with deliver_ingress_before_abort on, the received head and bytes precede \
+             the error"
         );
         assert_eq!(
             owned,
             late_read(end, false, true),
-            "{end:?}: the owned session matches Uniplex with DIV-033 on"
+            "{end:?}: the owned session matches Uniplex with deliver_ingress_before_abort on"
         );
         assert_eq!(
             late_read(end, true, false),
             late_read(end, false, false),
-            "{end:?}: the owned session matches Uniplex with DIV-033 off"
+            "{end:?}: the owned session matches Uniplex with deliver_ingress_before_abort off"
         );
     }
 }
 
-/// How the consumer ends an owned upstream HTTP/2 exchange in the `DIV-033` cancel tests, once
-/// its response's head and `first` are queued.
+/// How the consumer ends an owned upstream HTTP/2 exchange in the `deliver_ingress_before_abort`
+/// cancel tests, once its response's head and `first` are queued.
 #[derive(Clone, Copy, Debug)]
 enum H2Cancel {
     /// `OwnedH2UpstreamRequest::cancel`, with the error `UniplexStreamAbort` selects.
@@ -10322,8 +10320,9 @@ enum H2Cancel {
     Connection,
 }
 
-/// The origin's reads in the `DIV-033` cancel tests: SETTINGS, then a head and `first`, released
-/// by `respond`, of a response that does not end; the connection then stays open.
+/// The origin's reads in the `deliver_ingress_before_abort` cancel tests: SETTINGS, then a head
+/// and `first`, released by `respond`, of a response that does not end. The connection then
+/// stays open.
 fn unfinished_h2_response(respond: &Arc<tokio::sync::Notify>) -> Vec<FixtureRead> {
     let stream = StreamId::new(1);
     let mut peer = Http2Codec::new(TransportDirection::Downstream);
@@ -10395,7 +10394,7 @@ fn owned_h2_cancel_read(cancel: H2Cancel, deliver: bool) -> LateRead {
 }
 
 /// As `owned_h2_cancel_read` for a `UniplexSession` HTTP/2 client whose consumer aborts the
-/// stream with `UniplexStreamAbort` (`DIV-023`).
+/// stream with `UniplexStreamAbort`.
 fn uniplex_h2_stream_abort_read(deliver: bool) -> LateRead {
     use crate::experimental::UniplexResponseAbortExt;
 
@@ -10450,8 +10449,8 @@ fn uniplex_h2_stream_abort_read(deliver: bool) -> LateRead {
     })
 }
 
-/// `DIV-033`: a cancel the request's consumer selects discards the response's received events,
-/// as a `UniplexStreamAbort` does, with the option on or off.
+/// A cancel that the request's consumer selects discards the response's received events, as a
+/// `UniplexStreamAbort` does, with `deliver_ingress_before_abort` on or off.
 #[test]
 fn an_owned_h2_request_cancel_discards_the_received_response_as_a_uniplex_stream_abort() {
     for deliver in [true, false] {
@@ -10472,7 +10471,8 @@ fn an_owned_h2_request_cancel_discards_the_received_response_as_a_uniplex_stream
     }
 }
 
-/// `DIV-033`: the request's cancellation token is the consumer's cancel too, so it discards.
+/// The request's cancellation token is a consumer cancel too, so it discards the received
+/// events.
 #[test]
 fn an_owned_h2_request_token_cancel_discards_the_received_response() {
     assert_eq!(
@@ -10484,8 +10484,8 @@ fn an_owned_h2_request_token_cancel_discards_the_received_response() {
     );
 }
 
-/// `DIV-033`: the connection's cancel is no cancel of the request: as an ingress abort, it
-/// keeps the received head and bytes ahead of its error.
+/// The connection's cancel does not cancel the request. Like an ingress abort, it keeps the
+/// received head and bytes ahead of its error.
 #[test]
 fn an_owned_h2_connection_cancel_keeps_the_received_response() {
     assert_eq!(
@@ -10523,8 +10523,8 @@ fn connection_credit(wire: &RefCell<FixtureTransportState>) -> u64 {
 /// read or dropped the response; the stream credit; the body bytes read; and the read's error.
 type KeptCredit = ((u64, u32), (u64, u32), u64, usize, Option<HttpErrorCode>);
 
-/// The origin, which allows one stream, answers a GET with a head and 40,000 bytes of DATA, more
-/// than half the 65,535-byte connection window (the threshold at which connection credit is
+/// The origin, which allows one stream, responds to a GET with a head and 40,000 bytes of DATA,
+/// more than half the 65,535-byte connection window (the threshold at which connection credit is
 /// returned), then RST_STREAM(CANCEL).
 fn peer_reset_connection_credit(deliver: bool, kept: KeptH2Data) -> KeptCredit {
     const UNREAD: usize = 40_000;
@@ -10606,9 +10606,9 @@ fn peer_reset_connection_credit(deliver: bool, kept: KeptH2Data) -> KeptCredit {
     })
 }
 
-/// By default a peer's reset discards the unread DATA and returns its connection credit at once.
-/// With `DIV-033` on, the kept DATA holds that credit until its reader takes it or drops the
-/// response, either of which returns all of it, as in `UniplexSession`
+/// By default a peer's reset discards the unread DATA and returns its connection credit
+/// immediately. With `deliver_ingress_before_abort` on, the kept DATA holds that credit until its
+/// reader takes it or drops the response, either of which returns all of it, as in `UniplexSession`
 /// (`h2_peer_reset_returns_connection_credit_for_kept_data_as_it_is_read`). Either way the stream
 /// keeps its admission slot until its source completes: once the reader has taken the error, and
 /// any kept events before it, or dropped the response. The reset stream sends no WINDOW_UPDATE of

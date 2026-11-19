@@ -5,9 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Group-168: an HTTP/1 session keeps no copy of an ingress message, and
-//! HTTP/2's copy, which only its `INVALID_STATE_TRANSITION` failure reads,
-//! shares the delivered message's header entries (expectation-351).
+//! An HTTP/1 session does not keep a copy of an ingress message. HTTP/2 keeps
+//! a copy that only its `INVALID_STATE_TRANSITION` failure reads, and that copy
+//! shares the delivered message's header entries.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -244,7 +244,7 @@ impl UniplexTransport for ScriptTransport {
     }
 }
 
-/// What a handler saw when its header read finished.
+/// What a handler observed when its header read finished.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Seen {
     /// The delivered message's rendering, or the header-read error's code and
@@ -257,7 +257,7 @@ struct Seen {
     shares_probe: Option<bool>,
 }
 
-/// What a handler saw when a body read after its headers failed.
+/// What a handler observed when a body read after its headers failed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Failure {
     /// The body read's error code.
@@ -279,8 +279,8 @@ struct Probe {
 }
 
 /// Maps each fixture request target to its stream, records what its header
-/// read returned, drains its body, records a failed body read, and answers
-/// 200.
+/// read returned, drains its body, records a failed body read, and responds
+/// with 200.
 struct ProbeHandler {
     probe: Rc<Probe>,
     progress: Rc<tokio::sync::Notify>,
@@ -485,8 +485,9 @@ const FORBIDDEN: &[u8] = b"TRACE /forbidden HTTP/1.1\r\nHost: example.test\r\n\
                            X-Probe: forbidden\r\nContent-Length: 5\r\n\r\nhello";
 const H1_STREAMS: &[(&[u8], u64)] = &[(b"/first", 1), (b"/second", 2), (b"/forbidden", 1)];
 
-/// A 200 with an `x-probe` header, as the server of the protocol sends it in
-/// answer to the first request: its head, then its body.
+/// The server's 200 response to the first request, with an `x-probe` header,
+/// over HTTP/2 when `http2` is set and HTTP/1.1 otherwise. Returns the head and
+/// the body.
 fn upstream_response_wire(http2: bool) -> (Vec<u8>, Vec<u8>) {
     if !http2 {
         return (
@@ -930,7 +931,8 @@ fn http2_state_failure_carries_an_equal_message() {
         &headers_wire,
     );
     // The trailers and late DATA arrive after the handler has read its headers,
-    // so no unread header in the source can stand in for the failure's message.
+    // so the source does not hold an unread header to stand in for the failure's
+    // message.
     // The source rejects the DATA with its own error, which carries no message,
     // so the failure's message is read from the stream's terminal error.
     let outcome = run_downstream(

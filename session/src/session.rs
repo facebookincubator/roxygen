@@ -103,13 +103,13 @@ pub enum LifecycleEvent {
     RequestEnd {
         stream: StreamId,
     },
-    /// The stream no longer occupies outgoing protocol capacity; its sources
-    /// and exchange cleanup may remain alive.
+    /// The stream has released its outgoing protocol capacity. Its sources
+    /// and exchange cleanup may still be alive.
     OutgoingCapacityReleased {
         stream: StreamId,
     },
-    /// No new outgoing request may be admitted, while accepted ingress can
-    /// still finish independently of the session's drain transition.
+    /// The session has stopped admitting outgoing requests. Accepted ingress
+    /// can still finish independently of the session's drain transition.
     OutgoingAdmissionClosed,
     PeerReset {
         stream: StreamId,
@@ -150,11 +150,11 @@ pub enum LifecycleEvent {
         latency: std::time::Duration,
     },
     Http2PingReplyReceived,
-    /// Experimental (`DIV-024`): an unanswered PING probe is dropping the
-    /// connection, after `Http2SessionStats::record_ping_timeout` and before
-    /// the drop fails any stream still open. On a session that already failed
-    /// it follows that failure and the session keeps the first error, so
-    /// errors are classified with `experimental::is_ping_probe_timeout`.
+    /// An unanswered PING probe (`experimental::PingProbeConfig`) is dropping
+    /// the connection. Emitted after `Http2SessionStats::record_ping_timeout`
+    /// and before the drop fails any stream still open. On a session that
+    /// already failed, it follows that failure and the session keeps the first
+    /// error, so use `experimental::is_ping_probe_timeout` to classify errors.
     Http2PingProbeTimeout,
     Http2Goaway {
         last_good_stream: StreamId,
@@ -311,8 +311,8 @@ impl OutgoingTransactionActivity {
         self.available() != 0
     }
 
-    /// Reserved and active transactions, counted before any lifecycle callback
-    /// hears of the change.
+    /// Reserved and active transactions. The count changes before lifecycle
+    /// callbacks run.
     pub fn admitted_transactions(&self) -> u32 {
         self.shared.total_transactions()
     }
@@ -524,11 +524,12 @@ pub struct OutgoingRequest {
     pub body: Option<EgressTransfer>,
 }
 
-/// Builds the request-head read that a gated send awaits, around the request
-/// source's own head read. The gate stands where a source filter in front of
-/// the request source would: when the gated read fails, the session retires
-/// the request source before it checks the caller's cancellation, as an
-/// `HttpSourceFilter` retires its source before a failure leaves it.
+/// Wraps the request source's head read for a gated send.
+///
+/// The gate acts like a source filter in front of the request source. When the
+/// gated read fails, the session retires the request source before it checks
+/// the caller's cancellation, as an `HttpSourceFilter` retires its source
+/// before passing a failure on.
 pub trait RequestHeadGate: 'static {
     type Read: Future<Output = Result<HttpHeaderEvent, HttpError>> + Unpin + 'static;
 
@@ -1145,7 +1146,8 @@ impl SessionCore {
     }
 
     /// Keep downstream ingress and receive credit alive until EOM after a graceful
-    /// request-consumer drop. Existing streams retain their creation-time policy.
+    /// request-consumer drop. Returns `false`, leaving the setting unchanged,
+    /// if the session already has streams.
     pub fn set_drain_request_body_on_drop(&mut self, enabled: bool) -> bool {
         self.assert_owner();
         if !self.streams.is_empty() {
@@ -1159,9 +1161,9 @@ impl SessionCore {
         self.drain_request_body_on_drop
     }
 
-    /// Roxygen-only (`DIV-033`): an ingress abort of a stream created after this
-    /// call leaves the events already queued on its source to be read before the
-    /// error. Existing streams retain their creation-time policy.
+    /// Sets whether an ingress abort lets the reader first read the events
+    /// already queued on the stream's source, then the error. Returns `false`,
+    /// leaving the setting unchanged, if the session already has streams.
     pub fn set_deliver_ingress_before_abort(&mut self, enabled: bool) -> bool {
         self.assert_owner();
         if !self.streams.is_empty() {
@@ -1171,9 +1173,9 @@ impl SessionCore {
         true
     }
 
-    /// Roxygen-only (`DIV-041`): a stream created after this call checks the body
-    /// of a final head whose `content-length` is present and empty against zero, as
-    /// h2 reads such a field. Existing streams retain their creation-time policy.
+    /// Sets whether a final head with an empty `content-length` value has its
+    /// body checked against zero, as h2 treats such a field. Returns `false`,
+    /// leaving the setting unchanged, if the session already has streams.
     pub fn set_empty_content_length_is_zero(&mut self, enabled: bool) -> bool {
         self.assert_owner();
         if !self.streams.is_empty() {
@@ -2097,9 +2099,11 @@ impl SessionCore {
         Ok(())
     }
 
-    /// Installs the error response that `set_error_response_status` left pending
-    /// if the request source has already completed: `apply_source_completion`
-    /// installs it otherwise, and a completed source does not complete again.
+    /// Installs the error response left pending by `set_error_response_status`
+    /// if the request source has already completed. Otherwise
+    /// `apply_source_completion` installs it when the source completes. A
+    /// source completes only once, so the already-completed case needs this
+    /// call.
     pub(crate) fn install_error_response_after_source_complete(
         &mut self,
         id: StreamId,
@@ -2521,7 +2525,8 @@ impl SessionCore {
             }
             if !state.ingress_eom_seen() || !state.egress_complete() {
                 let mapped = source_complete_reset_code(error_code);
-                // INTERNAL_ERROR marks a code outside the frozen switch (DIV-015).
+                // INTERNAL_ERROR also covers every unmapped code, so those
+                // reset upgraded streams too.
                 let resets_upgraded = matches!(
                     mapped,
                     HttpErrorCode::FLOW_CONTROL_ERROR
@@ -2949,9 +2954,9 @@ pub(crate) fn source_complete_reset_code(code: HttpErrorCode) -> HttpErrorCode {
 }
 
 /// Awaits a request head, then checks `cancellation` before the head read is
-/// dropped, as Proxygen's `sendRequest` checks its token after the head read.
-/// The cancellation wait is built only when the head is not ready on a poll.
-/// When the head read fails, `retire` is cleared before that check.
+/// dropped, so a cancellation requested during the read wins even when the head
+/// arrives. The cancellation wait is built only when the head is not ready on a
+/// poll. When the head read fails, `retire` is cleared before that check.
 async fn await_request_head<R>(
     mut head: R,
     mut retire: Option<&mut HttpSourceHolder>,

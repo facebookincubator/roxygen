@@ -5,8 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! HTTP/2 PING probe oracles (`DIV-024`): the frozen `HTTP2DownstreamSessionTest` probe cases
-//! and the Roxygen-only timer, failure, and configuration cases.
+//! Tests for HTTP/2 PING probes: probe scheduling on downstream and upstream sessions, plus
+//! timer, failure, and configuration cases.
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -183,7 +183,7 @@ fn probes(immediate: bool) -> PingProbeConfig {
     }
 }
 
-/// No connection read, stream read, or write timeout.
+/// A config with the connection read, stream read, and write timeouts disabled.
 fn untimed() -> UniplexConfig {
     UniplexConfig {
         read_timeout: Duration::ZERO,
@@ -256,8 +256,8 @@ impl Wire {
         self.readable.notify_one();
     }
 
-    /// Makes every read return `bytes` at once until `until`, as a socket the
-    /// peer keeps readable: each read spends one unit of the task's
+    /// Makes every read return `bytes` immediately until `until`, like a socket
+    /// that the peer keeps readable. Each read spends one unit of the task's
     /// cooperative budget, as a ready Tokio socket read does, and `FLOOD_READ`
     /// of virtual time.
     fn flood(&self, bytes: Vec<u8>, until: Instant) {
@@ -266,7 +266,7 @@ impl Wire {
     }
 
     /// Makes every write stay pending, whatever its cancellation, as on a
-    /// peer that accepts no bytes.
+    /// peer that does not accept bytes.
     fn stall_writes(&self) {
         self.state.borrow_mut().stall_writes = true;
     }
@@ -848,7 +848,7 @@ struct HeldResponse {
     stopped: Cell<Option<Option<HttpErrorCode>>>,
 }
 
-/// Reads each request to its end, then answers with a response that never
+/// Reads each request to its end, then returns a response source that never
 /// produces, so its stream stays open.
 struct Hold(Rc<HeldResponse>);
 
@@ -931,7 +931,7 @@ struct Tunnel {
 }
 
 impl Tunnel {
-    /// Commits a CONNECT on `stream` without answering it.
+    /// Commits a CONNECT on `stream` without responding to it.
     async fn commit(script: &mut Script, stream: StreamId) -> Self {
         let source = HttpStreamSource::new_async(None, None, 1 << 20).expect("upload source");
         let completion = UploadCompletion::default();
@@ -1049,7 +1049,7 @@ impl ParkedRead {
     }
 }
 
-/// An owned HTTP/2 application that admits no stream.
+/// An owned HTTP/2 application whose exchanges never respond.
 struct NoExchanges;
 
 struct NoExchange;
@@ -1089,7 +1089,7 @@ impl OwnedH2Application for NoExchanges {
     }
 }
 
-/// The owned driver's supported configuration, as its own oracles build it.
+/// The owned driver's supported configuration, as its own tests build it.
 fn owned_options(
     context: WorkerContext,
     upstream: bool,
@@ -1632,7 +1632,7 @@ fn matching_reply_clears_the_probe_and_rearms_the_interval() {
 fn upstream_first_transaction_starts_and_last_detach_cancels_probing() {
     run_paused(|context| {
         Box::pin(async move {
-            // Reads arm nothing, so only transactions start the interval.
+            // Reads do not arm the timer, so only transactions start the interval.
             let config = PingProbeConfig {
                 extend_interval_on_ingress: false,
                 ..probes(false)
@@ -1895,7 +1895,7 @@ fn probe_timeout_fails_the_connection_with_dropped_and_records_once() {
                 "nothing was written after the reset"
             );
 
-            // Nothing happens once `run` returned.
+            // The session does not write or time out once `run` has returned.
             let writes = script.wire.state.borrow().writes.len();
             tokio::time::sleep((INTERVAL + TIMEOUT) * 3).await;
             assert_eq!(script.recorder.ping_timeouts(), 1);
@@ -1992,8 +1992,8 @@ fn probe_timeout_fails_every_open_stream() {
             for error in &errors {
                 assert_probe_timeout(error);
             }
-            // `HttpSource::stop_reading` carries only the code to the request
-            // body, as frozen `stopReading` does.
+            // `HttpSource::stop_reading` passes only the error code, not the
+            // error, to the request body.
             let upload = blocked
                 .completion
                 .error()
@@ -2015,8 +2015,8 @@ fn probe_timeout_fails_every_open_stream() {
     });
 }
 
-/// The transport was reset once, every write left pending was dropped, and
-/// nothing was written after the reset.
+/// Asserts that the transport was reset once, that every pending write was
+/// dropped, and that the session did not write after the reset.
 fn assert_pending_writes_abandoned(wire: &Wire) {
     let state = wire.state.borrow();
     assert_eq!(state.resets, 1, "close_with_reset once");
@@ -2146,7 +2146,7 @@ fn is_ping_probe_timeout_recognizes_the_probe_drop() {
 
 #[test]
 fn probing_does_not_hold_a_draining_or_closing_session() {
-    // A drain keeps probing while its stream finishes, then completes at once.
+    // A drain keeps probing while its stream finishes, then completes immediately.
     for peer_goaway in [true, false] {
         run_paused(move |context| {
             Box::pin(async move {
@@ -2283,7 +2283,7 @@ fn probe_timer_ends_with_the_session() {
 
 #[test]
 fn probes_run_with_the_connection_read_timeout_disabled() {
-    // No read timeout: a quiet session with an open stream ends only by its probe.
+    // Without a read timeout, a quiet session with an open stream ends only by its probe.
     run_paused(|context| {
         Box::pin(async move {
             let (session, mut script) =

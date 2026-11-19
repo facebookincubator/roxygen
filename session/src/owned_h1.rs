@@ -5,45 +5,54 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Experimental owned HTTP/1.1 downstream driver, and its upstream sibling,
+//! Experimental owned HTTP/1.1 downstream driver, and its upstream counterpart,
 //! [`OwnedH1UpstreamSession`].
 //!
-//! The poll-driven sibling of [`crate::owned_h2`]: one driver future per connection runs
-//! `Http1xCodec` and the application's [`OwnedExchange`]s, with no task per request. Streams
-//! are serial: the parser pauses once a request is complete and resumes when its exchange
-//! retires. An exchange retires once its response's last byte is written, or, as DIV-028 allows
-//! for HTTP/2, when its end of message is serialized: if its request is complete, it
-//! registered no byte event, and the transport's write queue reports that it is not
-//! saturated.
+//! This is the poll-driven HTTP/1.1 counterpart of [`crate::owned_h2`]: one driver future per
+//! connection runs `Http1xCodec` and the application's [`OwnedExchange`]s, with no task per
+//! request. Streams are serial. The parser pauses once a request is complete and resumes when
+//! its exchange retires. An exchange retires once its response's last byte is written. It
+//! retires as soon as its end of message is serialized if its request is complete, it
+//! registered no byte event, and the transport's write queue is not saturated. The owned
+//! HTTP/2 driver applies the same rule.
 //!
-//! [`OwnedH1Session::new`] honors these [`UniplexConfig`] fields: `buffer_limit` (the request
-//! body window and the bound on unparsed input and on unwritten output),
-//! `ingress_buffer_limit` (parsing pauses while the unread request body is at it),
-//! `maximum_read_size`, `read_allocation_size` and `maximum_write_size` (each write, and
-//! each response body poll together with the output already queued and its chunk framing),
-//! `abort_exchanges_on_eof` (`DIV-053`: a peer EOF, judged where `UniplexSession` would see
-//! it, fails the connection while the live exchange is open, as `UniplexSession`'s does).
-//! HTTP/1 uses llhttp's method table (`DIV-057`); `exact_method_tokens` affects only HTTP/2.
-//! It fails with `INVALID_STATE_TRANSITION` for anything else: a nonzero `read_timeout`,
-//! `stream_read_timeout` or `write_timeout` (the driver is untimed; the caller keeps timeout
-//! responsibility), `drain_request_body_on_drop` false, `wait_for_http1_response_on_drain`
-//! or `deliver_ingress_before_abort` true, `maximum_write_size` above `buffer_limit` or too
-//! small to carry a chunk's framing beside one body byte, a transport with byte-event
-//! capability, or a context that is not the cancellation-free owner thread.
+//! [`OwnedH1Session::new`] supports these [`UniplexConfig`] fields:
 //!
-//! Framing, close and upgrade follow `UniplexSession`'s port of the Proxygen HTTP/1.1 session
-//! ([`Http1UpgradePolicy::Proxygen`]): trailers are carried in both directions, the
-//! application sends any `100 Continue`, a request the codec rejects gets its error response
-//! before the connection is reset, and an accepted upgrade or CONNECT carries the tunnel as
-//! the exchange's request and response bodies, with no request after it. Response byte-event
-//! registrations are cancelled, never fired. DIV-029 lists where this driver differs from
-//! `UniplexSession`. A request whose reader stops it without error (`NO_ERROR`) before it
-//! ends still gets its whole response; nothing more of its upload is parsed, and after the
-//! response the connection closes in stages: its write side first, then its read side at peer
-//! EOF or once `buffer_limit` bytes are read after the write side shut down (DIV-054). Under
-//! the Roxygen-only [`Http1UpgradePolicy::AsOrdinaryRequest`] (DIV-030), an upgrade or
-//! CONNECT request is served as an ordinary request instead, and the connection stays
-//! HTTP/1.1.
+//! - `buffer_limit`: the request body window, and the bound on unparsed input and on unwritten
+//!   output.
+//! - `ingress_buffer_limit`: parsing pauses while the unread request body is at this limit.
+//! - `maximum_read_size` and `read_allocation_size`.
+//! - `maximum_write_size`: the bound on each write, and on each response body poll together
+//!   with the output already queued and its chunk framing.
+//! - `abort_exchanges_on_eof`: a peer EOF fails the connection while the live exchange is open,
+//!   as it does under `UniplexSession`. The EOF is judged at the point where `UniplexSession`
+//!   would read it.
+//!
+//! HTTP/1 parsing uses llhttp's method table, so `exact_method_tokens` affects only HTTP/2.
+//! `new` fails with `INVALID_STATE_TRANSITION` for anything else:
+//!
+//! - a nonzero `read_timeout`, `stream_read_timeout` or `write_timeout`. The driver has no
+//!   timers, so timeouts are up to the caller.
+//! - `drain_request_body_on_drop` false, or `wait_for_http1_response_on_drain` or
+//!   `deliver_ingress_before_abort` true.
+//! - a `maximum_write_size` above `buffer_limit`, or too small to carry a chunk's framing
+//!   beside one body byte.
+//! - a transport with byte-event capability.
+//! - a context that is not on the owner thread or is already cancelled.
+//!
+//! Under the default [`Http1UpgradePolicy`], framing, close and upgrade follow
+//! `UniplexSession`. Trailers are carried in both directions, and the application sends any
+//! `100 Continue`. A request the codec rejects gets its error response before the connection
+//! is reset. An accepted upgrade or CONNECT carries the tunnel as the exchange's request and
+//! response bodies, and the connection does not carry another request after it. Under
+//! [`Http1UpgradePolicy::AsOrdinaryRequest`], an upgrade or CONNECT request is served as an
+//! ordinary request, and the connection stays HTTP/1.1. Response byte-event registrations are
+//! cancelled, never fired.
+//!
+//! If a request's reader stops it with `NO_ERROR` before it ends, the request still gets its
+//! whole response, but the rest of its upload is not parsed. After the response the connection
+//! closes in stages: the write side first, then the read side at peer EOF or once
+//! `buffer_limit` bytes are read after the write side shuts down.
 
 use std::any::Any;
 use std::cell::Cell;
@@ -156,7 +165,7 @@ pub(crate) fn fault_next_upstream_run_poll() {
 }
 
 /// Makes the next request commitment of an owned HTTP/1.1 upstream on this thread panic midway,
-/// where only a fault in Roxygen's commit code could.
+/// where only a fault in the driver's commit code could.
 #[cfg(test)]
 pub(crate) fn fault_next_upstream_commit() {
     UPSTREAM_COMMIT_FAULT.set(true);
@@ -232,9 +241,9 @@ pub(crate) fn read_write_polls_and_signal_takes() -> (usize, usize, usize) {
     )
 }
 
-/// Runs `hook` once, right after the next response body event this thread's owned HTTP/1.1
-/// downstream drivers serialize, before the driver decides what to do next: where an input
-/// from another thread, the transport or a request body read can land.
+/// Runs `hook` once, right after this thread's owned HTTP/1.1 downstream drivers serialize the
+/// next response body event and before the driver's next step. Tests use it to land input from
+/// another thread, the transport or a request body read in that window.
 #[cfg(test)]
 pub(crate) fn after_next_body_event_serialized(hook: impl FnOnce() + 'static) {
     AFTER_BODY_EVENT_SERIALIZED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
@@ -250,7 +259,7 @@ fn body_event_serialized() {
 
 /// One of a driver's wake signals, for a test that marks it from another thread, as its source's
 /// wake does first (`Signal::wake_by_ref`), while the driver consumes the wake to poll that
-/// source at once (`Signal::clear`).
+/// source immediately (`Signal::clear`).
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct SignalProbe(Arc<Signal>);
@@ -299,28 +308,28 @@ pub struct Http1DriverConfig {
 /// How an upgrade or CONNECT request is handled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Http1UpgradePolicy {
-    /// Downstream, as `UniplexSession`: parsing waits for the final response head, which
-    /// accepts the upgrade (the bytes that follow are the request body, through EOF, and the
-    /// response body is sent unframed) or refuses it (the request ends and the connection
-    /// closes after the response). Upstream, the owned driver carries no tunnel and refuses
-    /// the request before any byte (`DIV-029`).
+    /// Handle the upgrade downstream as `UniplexSession` does, and reject it upstream.
+    /// Downstream, parsing waits for the final response head. If that head accepts the
+    /// upgrade, the bytes that follow are the request body through EOF, and the response body
+    /// is sent unframed. If it rejects the upgrade, the request ends and the connection closes
+    /// after the response. Upstream, the owned driver does not carry tunnels and rejects the
+    /// request before writing any of it.
     #[default]
     Proxygen,
-    /// Roxygen-only: the request is an ordinary request, with its method, target and headers
-    /// unchanged, and no tunnel is carried. Downstream (`DIV-030`), it is handed over and
-    /// parsing continues behind it as HTTP/1.1
-    /// (`Http1xCodec::set_downstream_upgrade_as_ordinary`), and a response that switches
-    /// protocols is refused. Upstream (`DIV-031`), it is sent and its response read by their
-    /// own framing (`Http1xCodec::set_upstream_upgrade_as_ordinary`); a head that does not
-    /// frame its body as the codec writes it and the egress websocket flag are refused before
-    /// any byte, and a `101` fails the connection.
+    /// Treat the request as an ordinary request, with its method, target and headers
+    /// unchanged, and carry no tunnel. Downstream, the request is handed over and parsing
+    /// continues after it as HTTP/1.1 (`Http1xCodec::set_downstream_upgrade_as_ordinary`). A
+    /// response that switches protocols is rejected. Upstream, the request is sent and its
+    /// response read with their own framing (`Http1xCodec::set_upstream_upgrade_as_ordinary`).
+    /// A head that does not frame its body the way the codec writes it, and the egress
+    /// websocket flag, are rejected before any byte is written. A `101` fails the connection.
     AsOrdinaryRequest,
 }
 
 /// The session owner's waker, shared by every wake source of one connection, and its wake
-/// record: each wake sets it, and the owned HTTP/1.1 upstream driver clears it as each of its
-/// polls begins, so a pull-through body can tell whether one of the driver's wake sources fired
-/// since the driver's last poll (`DIV-047`).
+/// record. Each wake sets the record, and the owned HTTP/1.1 upstream driver clears it as each
+/// of its polls begins, so that a pull-through body can check whether one of the driver's wake
+/// sources fired since the driver's last poll.
 #[derive(Default)]
 struct TaskWaker {
     waker: Mutex<Option<Waker>>,
@@ -351,19 +360,19 @@ impl TaskWaker {
     }
 
     /// Clears the wake record as a poll begins. The swap acquires the store of a wake it
-    /// overwrites, so the poll sees the signal that wake marked first.
+    /// overwrites, so the poll observes the signal that wake marked first.
     #[inline]
     fn clear_wake_record(&self) {
         self.woken.swap(false, Ordering::AcqRel);
     }
 
-    /// Whether a wake happened since the last poll began (`DIV-047`).
+    /// Whether a wake happened since the last poll began.
     #[inline]
     fn woken(&self) -> bool {
         self.woken.load(Ordering::Acquire)
     }
 
-    /// Records a wake without waking (`DIV-047`'s revocation).
+    /// Records a wake without waking, for a drive revocation.
     fn note_wake(&self) {
         self.woken.store(true, Ordering::Release);
     }
@@ -392,10 +401,11 @@ impl Signal {
         self.ready.load(Ordering::Acquire)
     }
 
-    /// Consumes a wake in place of `take_ready`, by a driver that polls this signal's source at
-    /// once. As `take_ready`'s, the swap acquires the mark of a wake it overwrites, so the poll
-    /// sees what that wake's source published first; a wake after it marks the signal again. A
-    /// plain store could overwrite a mark from another thread whose publication the poll missed.
+    /// Consumes a wake in place of `take_ready`, for a driver that polls this signal's source
+    /// immediately. As in `take_ready`, the swap acquires the mark of a wake it overwrites, so
+    /// the poll observes what that wake's source published first. A later wake marks the signal
+    /// again. A plain store could overwrite another thread's mark, and the poll would then miss
+    /// what that thread published.
     #[inline]
     fn clear(&self) {
         if self.is_ready() {
@@ -458,8 +468,8 @@ struct IngressSignals {
     source_complete: Cell<bool>,
     completed: Cell<Option<Result<(), HttpError>>>,
     stream: Arc<Signal>,
-    /// A pull-through exchange's connection, whose drive returns to its run when the source
-    /// completes, before the wake that announces it (`DIV-047`).
+    /// The connection of a pull-through exchange. The source's completion returns the drive to
+    /// the connection's run before the wake that announces it.
     drive: Option<upstream::DriveLink>,
     /// An upstream connection's returning hook, armed while the exchange
     /// is published as retiring, which the source's completion runs.
@@ -513,9 +523,9 @@ impl HttpStreamSourceSharedCallback for IngressSignals {
     }
 }
 
-/// This driver tracks no byte offsets: each response byte-event registration is cancelled, with
-/// `INVALID_STATE_TRANSITION`, as soon as its event is polled. Its callbacks may cancel the
-/// session.
+/// Cancels a polled event's byte-event registrations with `INVALID_STATE_TRANSITION`, because
+/// this driver does not track byte offsets. Their callbacks may cancel the session, so a cancel
+/// is checked afterwards.
 fn refuse_byte_events(
     registrations: Vec<HttpByteEventRegistration>,
     control: &Control,
@@ -528,7 +538,7 @@ fn refuse_byte_events(
     check_cancel(control, context)
 }
 
-/// Cancels each registration with `INVALID_STATE_TRANSITION`: this driver delivers no byte
+/// Cancels each registration with `INVALID_STATE_TRANSITION`: this driver does not deliver byte
 /// events.
 fn cancel_byte_events(registrations: Vec<HttpByteEventRegistration>) {
     if registrations.is_empty() {
@@ -557,8 +567,8 @@ struct Exchange<E: OwnedExchange> {
     body_events: bool,
     /// An upgrade or CONNECT request, which parsing hands over at its final response head.
     upgrade: bool,
-    /// The request closes the connection: it does not keep it alive, or the driver refused
-    /// its upgrade (`DIV-053`'s EOF watch).
+    /// The request closes the connection, because it does not keep the connection alive or
+    /// because its upgrade was rejected.
     closing_request: bool,
     /// The upgrade completed: the exchange carries an established tunnel.
     tunnel: bool,
@@ -569,9 +579,10 @@ struct Exchange<E: OwnedExchange> {
     /// A suspended response body read's resume, awaited before the body is read again.
     resume: Option<ResumeFuture>,
     write_boundary: u64,
-    /// The response registered a byte event (each is refused); it keeps the write fence.
+    /// The response registered a byte event, which was cancelled. The exchange keeps the write
+    /// fence.
     registered_byte_events: bool,
-    /// Skips the write fence (`DIV-028`'s rule, decided as the response ends).
+    /// Skips the write fence under the early-retirement rule. Set when the response ends.
     retires_at_serialization: bool,
 }
 
@@ -615,7 +626,7 @@ fn failure(code: HttpErrorCode, message: &'static [u8]) -> HttpError {
     HttpError::with_message(code, message)
 }
 
-/// What polling the outstanding read found.
+/// The result of polling the outstanding read.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReadPoll {
     Pending,
@@ -630,8 +641,8 @@ fn cancel_requested(control: &Control, context: &WorkerContext) -> bool {
     control.cancel.get() || context.is_cancelled()
 }
 
-/// Run after each application callback: one that cancelled the session gets nothing more
-/// called, serialized or written after it.
+/// Run after each application callback. Once a callback cancels the session, the driver does
+/// not call, serialize or write anything more.
 fn check_cancel(control: &Control, context: &WorkerContext) -> Result<(), HttpError> {
     if cancel_requested(control, context) {
         return Err(cancelled());
@@ -639,8 +650,8 @@ fn check_cancel(control: &Control, context: &WorkerContext) -> Result<(), HttpEr
     Ok(())
 }
 
-/// Whether parsing paused behind the unread request body may resume: it is below
-/// `ingress_buffer_limit` (`DIV-044`), or the source no longer buffers any.
+/// Whether parsing paused behind the unread request body may resume: the body is below
+/// `ingress_buffer_limit`, or the source has stopped buffering it.
 #[inline]
 fn resumes_parsing(producer: &HttpStreamSourceProducer, ingress_buffer_limit: u32) -> bool {
     producer
@@ -649,7 +660,7 @@ fn resumes_parsing(producer: &HttpStreamSourceProducer, ingress_buffer_limit: u3
 }
 
 /// `HttpCodecCallback::ingress_body_limit` for the body `producer` receives: how far its unread
-/// body may grow before it reaches `config`'s HTTP/1.1 ceiling (`DIV-058`).
+/// body may grow before it reaches `config`'s HTTP/1.1 ceiling.
 #[inline]
 fn ingress_body_limit(
     producer: &HttpStreamSourceProducer,
@@ -674,7 +685,7 @@ impl HttpCodecCallback for NoopCallback {
 }
 
 /// As `UniplexSession`'s HTTP/1.1 drain: the codec stops keep-alive, so the next response
-/// says `Connection: close`, and the idle connection closes.
+/// carries `Connection: close`, and the idle connection closes.
 #[cold]
 fn drain_codec(codec: &mut Http1xCodec, egress: &mut BufQueue) -> Result<(), HttpError> {
     let last_stream = codec.last_incoming_stream_id();
@@ -691,21 +702,21 @@ fn drain_codec(codec: &mut Http1xCodec, egress: &mut BufQueue) -> Result<(), Htt
         .map(drop)
 }
 
-/// `DIV-054`: the request's reader stopped it without error before it ended. HTTP/1.1 cannot
-/// reset one request, so nothing more of the upload is parsed, and the codec stops keep-alive:
-/// a response head not yet serialized says `Connection: close`, and the connection closes once
-/// the response is written.
+/// Handles a request whose reader stopped it without error before it ended. HTTP/1.1 cannot
+/// reset one request, so the rest of the upload is not parsed and the codec stops keep-alive.
+/// A response head not yet serialized carries `Connection: close`, and the connection closes
+/// once the response is written.
 #[cold]
 fn stop_request_ingress(codec: &mut Http1xCodec, ingress_stopped: &mut bool) {
     *ingress_stopped = true;
     codec.generate_immediate_goaway();
 }
 
-/// A connection's codec, and whether parsing could act on what it holds: set by new input and
-/// by every change to the codec outside a parse, and cleared by a parse that consumes all of
-/// its input. Until then, a parse of the same input with the same codec would do nothing: the
-/// codec defers a message's completion only while its parser is paused, and only these changes
-/// resume it.
+/// A connection's codec, and whether a parse could act on its input. The flag is set by new
+/// input and by every change to the codec outside a parse, and cleared by a parse that consumes
+/// all of its input. Until it is set again, parsing the same input with the same codec would
+/// have no effect: the codec defers a message's completion only while its parser is paused, and
+/// only these changes resume it.
 struct IngressCodec {
     codec: Http1xCodec,
     reparse: bool,
@@ -755,7 +766,7 @@ impl<A: OwnedApplication> OwnedH1Session<A> {
 /// Drives a [`Driver`] to completion, isolating callback panics in every poll.
 struct DriverRun<A: OwnedApplication>(Option<Driver<A>>);
 
-// The driver is only ever accessed through `&mut`; nothing pins it.
+// The driver is only accessed through `&mut` and is never pinned.
 impl<A: OwnedApplication> Unpin for DriverRun<A> {}
 
 impl<A: OwnedApplication> Future for DriverRun<A> {
@@ -817,10 +828,11 @@ struct Driver<A: OwnedApplication> {
     draining: bool,
     eof: bool,
     eof_processed: bool,
-    /// `DIV-053`: the peer EOF was judged and did not abort; the codec may then see it.
+    /// The peer EOF was judged under `abort_exchanges_on_eof` and did not abort, so the codec
+    /// may take it.
     eof_judged: bool,
-    /// `DIV-053`: reads behind a complete request that closes the connection are discarded
-    /// unparsed, so its EOF is seen.
+    /// Under `abort_exchanges_on_eof`, reading continues after a complete request that closes
+    /// the connection, so that the peer's EOF is seen. Those reads are discarded unparsed.
     eof_watch: bool,
     /// A failed read, applied once what was read before it is handled (`holds_read_error`).
     read_error: Option<HttpError>,
@@ -829,18 +841,19 @@ struct Driver<A: OwnedApplication> {
     /// Parsing waits past an upgrade or CONNECT request head until its final response head
     /// resolves the upgrade in the codec, as `UniplexSession`'s upgrade pause.
     upgrade_pending: bool,
-    /// The request's reader stopped it without error before it ended: nothing more is parsed
-    /// (`DIV-054`).
+    /// The request's reader stopped it without error before it ended, so the rest of the input
+    /// is not parsed.
     ingress_stopped: bool,
-    /// The write side's shutdown, once a staged close after a stopped upload took it.
+    /// The result of shutting down the write side, once a staged close after a stopped upload
+    /// has done so.
     write_shutdown: Option<Result<(), HttpError>>,
     /// The response body was not polled because the next write must make room for it.
     body_awaits_egress: bool,
     fatal: Option<HttpError>,
     /// The connection failed with an error response queued: it resets once that is written.
     closing_error: Option<HttpError>,
-    /// A failed read whose reset waits for the serialized bytes to be written: it stays the
-    /// run's error if another failure resets first, as `UniplexSession` keeps the first error.
+    /// A failed read that resets the connection once the serialized bytes are written. As in
+    /// `UniplexSession`, it stays the run's error if another failure resets first.
     failed_read: Option<HttpError>,
     panic: Option<PanicPayload>,
     transport_reset: bool,
@@ -901,7 +914,7 @@ impl<A: OwnedApplication> CodecInput<'_, A> {
             )
         })?;
         let producer = source.producer();
-        // DIV-044: parsing resumes once the unread body is below the limit it paused at.
+        // Parsing resumes once the unread body is below the limit it paused at.
         producer.set_resume_threshold(Some(self.config.ingress_buffer_limit));
         let drain = source.drain_on_drop();
         let ingress = source
@@ -968,7 +981,7 @@ impl<A: OwnedApplication> HttpCodecCallback for CodecInput<'_, A> {
                     return actions.into();
                 }
                 // The codec marks a downstream CONNECT upgraded and a WebSocket upgrade request
-                // as one, unless it parses them as ordinary requests (`DIV-030`).
+                // as one, unless it parses them as ordinary requests.
                 let upgrade = message.is_ingress_websocket_upgrade() || message.is_upgraded();
                 exchange.upgrade = upgrade;
                 exchange.closing_request = !message.wants_keepalive();
@@ -985,7 +998,7 @@ impl<A: OwnedApplication> HttpCodecCallback for CodecInput<'_, A> {
                 };
                 exchange.body_events = true;
                 match exchange.producer.body(body, padding, false) {
-                    // Not the window: the body limit keeps body events within it (`DIV-058`).
+                    // Not a window overrun: the body limit keeps body events within the window.
                     FlowControlState::Error => self.fail(failure(
                         HttpErrorCode::FLOW_CONTROL_ERROR,
                         b"ingress source rejected body bytes",
@@ -1193,7 +1206,8 @@ impl<A: OwnedApplication> Driver<A> {
             if let Some(read) = self.poll_read(&mut turn) {
                 progress |= read;
                 self.observe_cancel();
-                // A drain requested from the read admits nothing it carried.
+                // A drain requested during the read takes effect before its input is parsed, so
+                // a request that the read carried is not admitted.
                 self.observe_drain();
             }
             self.observe_stop();
@@ -1204,7 +1218,7 @@ impl<A: OwnedApplication> Driver<A> {
                 }
             }
             // Input the parse step left paused, as behind a retiring exchange or an upgrade, is
-            // parsed before a peer EOF is judged (`DIV-053`).
+            // parsed before a peer EOF is judged.
             let paused = self.ingress_paused();
             if !self.holds_read_error()
                 && let Some(error) = self.read_error.take()
@@ -1217,7 +1231,7 @@ impl<A: OwnedApplication> Driver<A> {
                 match self.poll_exchange(&mut turn) {
                     Ok(false) => {}
                     // The exchange ran this turn's write decision, which held the write back, and
-                    // the rest of the turn would do nothing.
+                    // the rest of the turn would have no effect.
                     Ok(true) => {
                         turn += 1;
                         continue;
@@ -1232,9 +1246,10 @@ impl<A: OwnedApplication> Driver<A> {
                 self.judge_eof();
                 progress = true;
             }
-            // The write waits while a phase before it can still add to it: one that acted this
-            // turn may act again. When none would, it starts in place of the next turn, which
-            // still counts against the budget that places the write it forces and the yield.
+            // The write waits while a phase before it can still add to it, since a phase that
+            // acted this turn may act again. Otherwise the write starts in place of the next turn.
+            // That turn still counts against the budget, which sets when a write is forced and
+            // when the poll yields.
             let write_waits = progress
                 && self.egress.chain_length() < self.config.maximum_write_size
                 && turn + 1 < TURN_BUDGET
@@ -1313,8 +1328,8 @@ impl<A: OwnedApplication> Driver<A> {
                 opened = Some(progress);
                 continue;
             }
-            // A next turn that would find nothing to do would return here. After a turn that held
-            // its write back, the next is due: the phase that held the write back still is.
+            // Return here if the next turn would not act. After a turn that held its write back,
+            // the next turn is due, because the phase that held the write back still is.
             if !write_ready && !self.turn_due() {
                 return Poll::Pending;
             }
@@ -1327,9 +1342,10 @@ impl<A: OwnedApplication> Driver<A> {
         Poll::Pending
     }
 
-    /// Whether a next turn would act. Each term is the condition under which a step of the
-    /// turn acts, or a wider one, and none runs transport or application code: a phase before
-    /// the write; the write; a closing error, a failure or a reset; or the idle close.
+    /// Whether a next turn would act. The terms cover a phase before the write, the write, a
+    /// closing error, a failure or a reset, and the idle close. Each is the condition under which
+    /// that step acts, or a wider one, and evaluating them does not run transport or application
+    /// code.
     fn turn_due(&self) -> bool {
         self.transport_reset
             || self.fatal.is_some()
@@ -1343,12 +1359,12 @@ impl<A: OwnedApplication> Driver<A> {
             }
     }
 
-    /// Whether a phase before the write would act in a next turn: the write completion, the read,
-    /// the exchange, the cancel and drain checks, a read start, the parse, a held read failure,
-    /// the exchange's retirement or `DIV-053`'s EOF judgment. Each term is the condition under which
-    /// that phase acts, or a wider one, and none runs transport or application code or changes
-    /// anything, so their order sets only the cost: the signals, which most often make a turn
-    /// due, come first.
+    /// Whether a phase before the write would act in a next turn. The phases are the write
+    /// completion, the read, the exchange, the cancel and drain checks, a read start, the parse,
+    /// a held read failure, the exchange's retirement and the peer EOF judgment. Each term is the
+    /// condition under which that phase acts, or a wider one. The terms do not run transport or
+    /// application code or change state, so their order affects only cost. The signals, which
+    /// most often make a turn due, come first.
     #[inline(always)]
     fn phases_due_before_write(&self) -> bool {
         #[cfg(test)]
@@ -1372,11 +1388,11 @@ impl<A: OwnedApplication> Driver<A> {
     }
 
     /// Whether this turn, right after the exchange serialized a body event that does not end the
-    /// response, has nothing left to do up to its write decision, and that decision holds the
-    /// write back behind the exchange's signal, which the event marks (`write_waits`): the
-    /// retirement has nothing to retire before the response ends, `DIV-053`'s EOF is not due,
-    /// and the write is below the write size within the budget. Nothing after the decision acts
-    /// either, while the exchange is live.
+    /// response, has done everything before its write decision, and that decision holds the
+    /// write back behind the exchange's signal, which the event marks (`write_waits`). That is
+    /// the case when the peer EOF judgment is not due and the write is below the write size
+    /// within the budget. Retirement cannot act before the response ends, and the steps after
+    /// the decision do not act while the exchange is live.
     #[inline(always)]
     fn write_held_after_body_event(&self, turn: usize) -> bool {
         turn + 1 < TURN_BUDGET
@@ -1384,12 +1400,11 @@ impl<A: OwnedApplication> Driver<A> {
             && !self.eof_abort_due()
     }
 
-    /// Whether, after a turn whose write decision held the write back behind a body event
-    /// (`write_held_after_body_event`), the next turn would only poll the body again: no phase
-    /// other than the exchange's would act in it. That is `phases_due_before_write` without the
-    /// exchange's signal, plus the flow-control lift that precedes `poll_exchange`'s body poll;
-    /// its other preamble steps are `retire_due`'s and `eof_abort_due`'s. Each term is exact
-    /// or wider, so polling the body now runs that turn.
+    /// Whether the next turn would only poll the body again, when this turn held its write back
+    /// behind a body event (`write_held_after_body_event`). This is `phases_due_before_write`
+    /// without the exchange's signal, plus the flow-control lift before `poll_exchange`'s body
+    /// poll. `retire_due` and `eof_abort_due` cover the other steps before that poll. Each term
+    /// is exact or wider, so polling the body now runs that turn.
     #[inline(always)]
     fn body_polls_again(&self) -> bool {
         !self.write_wake.is_ready()
@@ -1403,8 +1418,8 @@ impl<A: OwnedApplication> Driver<A> {
 
     /// Whether the parse phase acts: the input or the codec changed since a parse consumed all
     /// of its input, and there is something to parse. A busy codec may hold a completion it
-    /// deferred while the parser was paused. As `UniplexSession`, an idle draining connection
-    /// admits no further request.
+    /// deferred while the parser was paused. As in `UniplexSession`, an idle draining connection
+    /// does not admit another request.
     fn parse_due(&self) -> bool {
         self.codec.reparse
             && self.fatal.is_none()
@@ -1413,7 +1428,7 @@ impl<A: OwnedApplication> Driver<A> {
             && !(self.draining && self.exchange.is_none())
             && (!self.ingress.is_empty()
                 || self.codec.is_busy()
-                // `DIV-053`: under the option the codec takes the EOF only once it is judged.
+                // Under `abort_exchanges_on_eof`, the codec takes the EOF only once it is judged.
                 || (self.eof
                     && !self.eof_processed
                     && (self.eof_judged || !self.config.abort_exchanges_on_eof)))
@@ -1460,8 +1475,9 @@ impl<A: OwnedApplication> Driver<A> {
         }
     }
 
-    /// A stop the request's reader reported since the last poll takes effect before anything
-    /// read with it is parsed (`DIV-054`); as in `poll_exchange`, not once the response ended.
+    /// A stop that the request's reader reported since the last poll takes effect before any
+    /// input read with it is parsed. As in `poll_exchange`, it has no effect once the response
+    /// has ended.
     fn observe_stop(&mut self) {
         if let Some(exchange) = &self.exchange
             && !exchange.ingress_complete
@@ -1523,7 +1539,7 @@ impl<A: OwnedApplication> Driver<A> {
         let upgrade_completed = callback.upgrade_completed;
         // The codec ignores EOF while its parser is paused, so EOF waits behind every pause:
         // an upgrade's until the final response head resolves it.
-        // `DIV-053`: under the option the codec sees the EOF only once it is judged, so a
+        // Under `abort_exchanges_on_eof`, the codec takes the EOF only once it is judged, so a
         // mid-request EOF cannot fail the request first.
         let finishing_eof = self.eof
             && !self.eof_processed
@@ -1570,8 +1586,8 @@ impl<A: OwnedApplication> Driver<A> {
         }
         if let Some((error, peer)) = failed {
             match error_status {
-                // As `UniplexSession`: a request that can still be answered gets the codec's
-                // error response before the connection is reset.
+                // As `UniplexSession`: a request whose final response head is not yet serialized
+                // gets the codec's error response before the connection is reset.
                 Some(status)
                     if !self
                         .exchange
@@ -1596,12 +1612,12 @@ impl<A: OwnedApplication> Driver<A> {
         self.exchange_pause || self.flow_pause || self.upgrade_pending || self.ingress_stopped
     }
 
-    /// Whether a failed read waits for what was read before it: `UniplexSession` reads only once
-    /// it has parsed everything read so far, so it sees the failure after that. The wait covers
-    /// a pending upgrade, bytes a pause keeps unparsed (an unfinished request's body behind flow
-    /// control, or a pipelined request behind the exchange), and a whole request the exchange
-    /// has not received: Uniplex's handler still reads a request that ended before the failure,
-    /// but not an unfinished one.
+    /// Whether a failed read waits for what was read before it. `UniplexSession` reads only once
+    /// it has parsed everything read so far, so it handles the failure after that. The wait
+    /// covers a pending upgrade, bytes a pause keeps unparsed (an unfinished request's body
+    /// behind flow control, or a pipelined request behind the exchange), and a whole request the
+    /// exchange has not received. `UniplexSession`'s handler still reads a request that ended
+    /// before the failure, but not an unfinished one.
     fn holds_read_error(&self) -> bool {
         self.upgrade_pending
             || (self.flow_pause && self.codec.is_busy())
@@ -1611,13 +1627,14 @@ impl<A: OwnedApplication> Driver<A> {
             })
     }
 
-    /// Hands the request to the exchange and serializes what its response produces. After a
-    /// response body event that does not end the response, while the rest of the turn would do
-    /// nothing but hold the write back (`write_held_after_body_event`), it runs that write
-    /// decision's capacity check, which may reenter. Then it polls the body again in place of the
-    /// next turn while that turn would do nothing else (`body_polls_again`), and counts each such
-    /// poll as that turn. Otherwise it ends the turn there: it returns `true` when this turn's
-    /// write decision has run.
+    /// Hands the request to the exchange and serializes what its response produces.
+    ///
+    /// After a response body event that does not end the response, if the rest of the turn
+    /// would only hold the write back (`write_held_after_body_event`), it runs that write
+    /// decision's capacity check, which may reenter. It then polls the body again in place of
+    /// the next turn while that turn would only do the same (`body_polls_again`), and counts
+    /// each such poll as a turn. Otherwise it ends the turn there and returns `true`, meaning
+    /// that this turn's write decision has run.
     fn poll_exchange(&mut self, turn: &mut usize) -> Result<bool, HttpError> {
         let Some(exchange) = self.exchange.as_mut() else {
             return Ok(false);
@@ -1632,8 +1649,8 @@ impl<A: OwnedApplication> Driver<A> {
             if let Some(Err(error)) = exchange.signals.completed.take()
                 && !exchange.response_complete
             {
-                // A reader that stopped an ordinary request without error leaves its response
-                // to finish (`DIV-054`).
+                // If the reader stopped an ordinary request without error, its response still
+                // finishes.
                 if error.code() != HttpErrorCode::NO_ERROR || exchange.upgrade {
                     return Err(error);
                 }
@@ -1661,16 +1678,16 @@ impl<A: OwnedApplication> Driver<A> {
                 .expect("the application remains owned")
                 .request_body(head, source, eom);
             check_cancel(&self.control, &self.context)?;
-            // As `UniplexSession`, whose read loop reaches a failed read it already holds before
-            // the handler it spawned for the request runs: the failure ends the exchange first.
+            // `UniplexSession`'s read loop handles a failed read it already holds before the
+            // request's handler runs, so here too the failure ends the exchange first.
             if self.read_error.is_some() && !self.holds_read_error() {
                 return Ok(false);
             }
         }
-        // `DIV-053`: an EOF already read is judged before another response event is serialized,
-        // as `UniplexSession`'s `handle_eof` runs in its read loop before its egress task. The
-        // application is still polled; what it returns is not serialized: the exchange is open,
-        // so the judgment aborts it.
+        // Under `abort_exchanges_on_eof`, an EOF already read is judged before another response
+        // event is serialized, as `UniplexSession`'s `handle_eof` runs in its read loop before
+        // its egress task. The application is still polled, but what it returns is not
+        // serialized, because the exchange is open and the judgment aborts it.
         let eof_due = self.eof_abort_due() && self.exchange_open();
         let mut exchange = self
             .exchange
@@ -1707,7 +1724,7 @@ impl<A: OwnedApplication> Driver<A> {
                 self.draining = true;
                 drain_codec(self.codec.get_mut(), &mut self.egress)?;
             }
-            // So does a stop the exchange's callbacks reported (`DIV-054`).
+            // So does a stop that the exchange's callbacks reported.
             if !exchange.ingress_complete && exchange.signals.stopped() {
                 stop_request_ingress(self.codec.get_mut(), &mut self.ingress_stopped);
             }
@@ -1723,12 +1740,12 @@ impl<A: OwnedApplication> Driver<A> {
             )?;
             exchange.response_headers = final_headers;
             if final_headers && self.upgrade_pending {
-                // As `UniplexSession`: the final head accepts or refuses the upgrade, and parsing
+                // As `UniplexSession`: the final head accepts or rejects the upgrade, and parsing
                 // resumes, into the tunnel or on to the request's end.
                 self.upgrade_pending = false;
                 let codec = self.codec.get_mut();
                 if codec.resolve_downstream_upgrade(headers.headers()) == Some(false) {
-                    // As `UniplexSession`, a refused upgrade closes the connection after its
+                    // As `UniplexSession`, a rejected upgrade closes the connection after its
                     // request.
                     exchange.closing_request = true;
                 }
@@ -1776,7 +1793,7 @@ impl<A: OwnedApplication> Driver<A> {
                 exchange.registered_byte_events |= !registrations.is_empty();
                 refuse_byte_events(registrations, &self.control, &self.context)?;
                 // A stop reported with this event, which may be the response's last, or from its
-                // byte events' cancellation (`DIV-054`).
+                // byte events' cancellation.
                 if !exchange.ingress_complete && exchange.signals.stopped() {
                     stop_request_ingress(self.codec.get_mut(), &mut self.ingress_stopped);
                 }
@@ -1843,8 +1860,8 @@ impl<A: OwnedApplication> Driver<A> {
                 .as_mut()
                 .expect("nothing above removes the exchange");
             exchange.response_complete = true;
-            // `DIV-028`'s rule, as OwnedH2 applies it downstream: the terms run in this order, so
-            // only an otherwise eligible exchange queries the queue.
+            // The early-retirement rule, as OwnedH2 applies it downstream. The terms run in this
+            // order so that only an otherwise eligible exchange queries the queue.
             exchange.retires_at_serialization = exchange.ingress_complete
                 && !exchange.registered_byte_events
                 && self
@@ -1894,9 +1911,9 @@ impl<A: OwnedApplication> Driver<A> {
             ));
             return true;
         }
-        // A closing connection admits no read-ahead request; the idle check closes it. Under
-        // `DIV-053` a request read before a peer EOF that is not yet judged is parsed, as
-        // `UniplexSession` parses what it read before it sees the EOF.
+        // A closing connection does not admit a read-ahead request, and the idle check closes it.
+        // Under `abort_exchanges_on_eof`, a request read before a peer EOF that is not yet judged
+        // is parsed, as `UniplexSession` parses what it read before it reads the EOF.
         if self.codec.is_reusable() || self.eof_abort_watched() {
             self.exchange_pause = false;
             self.flow_pause = false;
@@ -1905,9 +1922,9 @@ impl<A: OwnedApplication> Driver<A> {
         true
     }
 
-    /// Consumes ready reads, so peer EOF already read is seen before the next parse, as
-    /// `UniplexSession`'s read loop sees it. Each read after the first uses up one of the turn's
-    /// remaining turns, and an empty read ends the batch. `None` when nothing was polled.
+    /// Consumes ready reads, so that a peer EOF already read is handled before the next parse,
+    /// as in `UniplexSession`'s read loop. Each read after the first uses up one of the poll's
+    /// remaining turns, and an empty read ends the batch. `None` when no read was polled.
     fn poll_read(&mut self, turn: &mut usize) -> Option<bool> {
         let mut read = self.poll_read_once()?;
         let progress = read != ReadPoll::Pending;
@@ -1986,8 +2003,8 @@ impl<A: OwnedApplication> Driver<A> {
         Some(ReadPoll::Data)
     }
 
-    /// How much a new read may take: 0 while no read can start, as the connection read EOF or
-    /// a failure or is ending, or while the ingress buffer is full.
+    /// How much a new read may take: 0 while a read cannot start, because the connection read
+    /// EOF or a failure or is ending, or while the ingress buffer is full.
     fn read_capacity(&self) -> usize {
         if self.eof
             || self.read_error.is_some()
@@ -2116,7 +2133,7 @@ impl<A: OwnedApplication> Driver<A> {
         Some(progress)
     }
 
-    /// `DIV-053`: a peer EOF was read and is not yet judged, with the option on.
+    /// Whether a peer EOF was read under `abort_exchanges_on_eof` and is not yet judged.
     #[inline]
     fn eof_abort_watched(&self) -> bool {
         self.eof
@@ -2126,14 +2143,14 @@ impl<A: OwnedApplication> Driver<A> {
             && self.closing_error.is_none()
     }
 
-    /// `DIV-053`: the peer EOF is judged now. As a failed read, it waits for what was read
-    /// before it (`holds_read_error`), where `UniplexSession` would see it.
+    /// Whether the peer EOF is judged now. Like a failed read, it waits for what was read before
+    /// it (`holds_read_error`), the point where `UniplexSession` would read it.
     #[inline]
     fn eof_abort_due(&self) -> bool {
         self.eof_abort_watched() && !self.holds_read_error()
     }
 
-    /// `DIV-053`: whether the live exchange is open in `UniplexSession`'s sense: its request
+    /// Whether the live exchange is open in `UniplexSession`'s sense: its request
     /// head arrived, it carries no established tunnel, and its response's end is not yet
     /// serialized (`UniplexSession` detaches a stream once that end is serialized).
     #[inline]
@@ -2145,9 +2162,9 @@ impl<A: OwnedApplication> Driver<A> {
         })
     }
 
-    /// `DIV-053`: fails the connection for the peer's EOF while the live exchange is open, as
-    /// `UniplexSession`'s `fail_connection` does: the exchange is cancelled at once, as the
-    /// peer's, and the transport resets once the bytes already serialized are written
+    /// Fails the connection for the peer's EOF while the live exchange is open, as
+    /// `UniplexSession`'s `fail_connection` does. The exchange is cancelled immediately with the
+    /// peer as the cause, and the transport resets once the bytes already serialized are written
     /// (`fail_read`). Otherwise the EOF takes the default path.
     #[cold]
     fn judge_eof(&mut self) {
@@ -2160,7 +2177,7 @@ impl<A: OwnedApplication> Driver<A> {
         }
     }
 
-    /// `DIV-053`: as `UniplexSession`'s EOF watch, the input read behind a complete request
+    /// Starts the EOF watch, as `UniplexSession` does: the input read after a complete request
     /// that closes the connection is discarded, and so are later reads.
     #[cold]
     fn start_eof_watch(&mut self) {
@@ -2187,11 +2204,12 @@ impl<A: OwnedApplication> Driver<A> {
         Some(shutdown.map(|()| self.summary))
     }
 
-    /// RFC 9112 §9.6's staged close after a stopped upload (`DIV-054`): the write side shuts
-    /// down first, and the input read but never to be parsed is discarded, so a full input
-    /// buffer still leaves room to read; then the rest of the upload is read, unparsed, until
-    /// peer EOF or until `buffer_limit` more bytes are read. A failed shutdown ends it at once,
-    /// so the run returns that error. Whether it is still reading.
+    /// Runs RFC 9112's staged close after a stopped upload, and returns whether it is still
+    /// reading. The write side shuts down first, so that the client can receive the response
+    /// before any TCP reset. Input that will never be parsed is discarded, so a full input buffer
+    /// still leaves room to read. The rest of the upload is then read, unparsed, until peer EOF
+    /// or until `buffer_limit` more bytes are read. A failed shutdown ends the close
+    /// immediately, so the run returns that error.
     #[cold]
     fn stages_close(&mut self) -> bool {
         if self.write_shutdown.is_none() {
@@ -2234,8 +2252,8 @@ impl<A: OwnedApplication> Driver<A> {
         Ok(())
     }
 
-    /// Fails the connection for a failed read. As `UniplexSession`, the exchange is cancelled
-    /// at once, as the peer's failure, and the transport resets once the bytes already
+    /// Fails the connection for a failed read. As in `UniplexSession`, the exchange is cancelled
+    /// immediately with the peer as the cause, and the transport resets once the bytes already
     /// serialized are written.
     #[cold]
     fn fail_read(&mut self, error: HttpError) {
@@ -2276,7 +2294,8 @@ impl<A: OwnedApplication> Driver<A> {
         self.fail(error, false);
     }
 
-    /// As `abort`; `peer` is the exchange's `cancel` cause: the peer ended the connection.
+    /// Like `abort`. `peer` is true when the peer ended the connection, and is passed to the
+    /// exchange's `cancel`.
     #[cold]
     fn fail(&mut self, error: HttpError, peer: bool) {
         let first = self.failed_read.take();
@@ -2287,7 +2306,7 @@ impl<A: OwnedApplication> Driver<A> {
         self.reset_transport();
     }
 
-    /// Cancels and drops the live exchange with `error`; `peer` is its `cancel` cause.
+    /// Cancels and drops the live exchange with `error`, passing `peer` to its `cancel`.
     #[cold]
     fn cancel_exchange(&mut self, error: &HttpError, peer: bool) {
         if let Some(mut exchange) = self.exchange.take() {

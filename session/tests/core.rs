@@ -3943,8 +3943,8 @@ mod session {
         fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {}
     }
 
-    /// Proxygen's `sendRequest` reads the request head and then checks its
-    /// cancellation token; it waits on the token only while the head is pending.
+    /// Request preparation reads the request head, then checks the cancellation
+    /// token. It waits on the token only while the head is pending.
     #[test]
     fn request_preparation_checks_its_token_after_a_ready_head_and_waits_only_on_a_pending_one() {
         run_local(async {
@@ -5496,7 +5496,7 @@ mod session {
                 let mut wait = Box::pin(callbacks.wait(token));
                 assert!(wait.as_mut().poll(&mut context).is_pending());
 
-                // A wake whose event another consumer drained leaves nothing pending.
+                // A wake for an event that another consumer drained is not kept.
                 callbacks.push(StreamCallbackEvent::WindowOpen(StreamId::new(1)));
                 assert!(callbacks.pop_front().is_some());
                 assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
@@ -5765,8 +5765,8 @@ mod session {
         let mut tree = BTreeMap::<u32, u64>::new();
         assert!(small.is_inline_for_test());
 
-        // Out-of-order inserts keep ascending order inline; the third key grows a
-        // tree that stays a tree through removal down to zero and growth again.
+        // Out-of-order inserts keep ascending order inline. The third key turns the
+        // map into a tree, which stays a tree as it shrinks to zero and grows again.
         for (key, smallest, inline) in [(4, 4, true), (1, 1, true), (2, 1, false)] {
             assert_eq!(
                 small.insert(key, u64::from(key)),
@@ -6100,7 +6100,7 @@ mod session {
     }
 
     #[test]
-    #[ignore = "microbenchmark; run in @fbcode//mode/opt with --run-ignored"]
+    #[ignore = "microbenchmark; run in an optimized build with --ignored"]
     fn small_map_many_stream_operation_cost() {
         fn measure(label: &str, streams: u64, mut run: impl FnMut() -> u64) {
             let rounds = (200_000 / streams).max(10);

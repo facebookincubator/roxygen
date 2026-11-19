@@ -1125,8 +1125,9 @@ fn h1_idle_wait_and_first_poll_write_keep_the_coop_yield() {
     });
 }
 
-/// Runs an upstream session whose only read ends, by EOF or by `failed`,
-/// after yielding `yields` times, and returns the writer counts.
+/// Runs an upstream session whose only read ends after yielding `yields` times,
+/// with an error if `failed` and with EOF otherwise, and returns the writer
+/// counts.
 fn read_end_counts(failed: bool, yields: usize) -> writer_probe::WriterCounts {
     run_on_worker(move |context| {
         Box::pin(async move {
@@ -1439,7 +1440,7 @@ fn retained_handle_cannot_reach_the_cleanup_control_after_the_run() {
     });
 
     // A cleanup panic recorded by the run future's drop stays in the cleanup
-    // control while the cleanup task waits for a held response; dropping the
+    // control while the cleanup task waits for a held response. Dropping the
     // driver retires that task, which drops the payload before the retained
     // handle drops.
     let log = EventLog::default();
@@ -1857,11 +1858,10 @@ fn one_shot_h1_get_writes_its_head_in_one_batch_and_parks_once() {
     });
 }
 
-/// Proxygen's `readLoop` does not signal `writeEvent_` after `onIngress`. After
-/// a `Connection: close` response, `shouldContinueWriteLooping` turns false
-/// once the stream detaches, and `checkForDetach` signals the writer, which then
-/// shuts the write side down. Parsing the response alone leaves the writer
-/// parked.
+/// The read loop does not wake the writer after parsing ingress. After a
+/// `Connection: close` response, the stream's detach ends the writer's loop
+/// and wakes the writer, which then shuts the write side down. Parsing the
+/// response alone leaves the writer parked.
 #[test]
 fn h1_close_response_parse_leaves_the_writer_parked_until_the_detach() {
     run_on_worker(|context| {
@@ -1916,7 +1916,7 @@ fn h1_close_response_parse_leaves_the_writer_parked_until_the_detach() {
     });
 }
 
-/// What a [`ProbeOwner`] saw, shared with the test across the worker thread.
+/// What a [`ProbeOwner`] observed, shared with the test across the worker thread.
 #[derive(Default)]
 struct OwnerRecord {
     polls: AtomicUsize,

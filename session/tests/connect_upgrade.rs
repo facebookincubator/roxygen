@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! CONNECT upgrade state and abandoned upgraded-stream reset oracles.
+//! Tests for CONNECT upgrade state and for resets of abandoned upgraded streams.
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
@@ -667,7 +667,7 @@ fn websocket_accept() -> HttpMessage {
     message
 }
 
-/// A source whose header is queued now and whose body the test writes later.
+/// A source with its header already queued. The test writes the body later.
 fn streaming_source(message: HttpMessage) -> (HttpSourceHolder, HttpStreamSourceProducer) {
     let source = HttpStreamSource::new_async(None, None, 1 << 20).expect("streaming source");
     let producer = source.producer();
@@ -900,8 +900,8 @@ impl HttpHandler for TunnelHandler {
     }
 }
 
-/// An H1 downstream tunnel whose request source the handler abandons with
-/// `CANCEL` after the upgrade response, while the peer keeps sending.
+/// An H1 downstream tunnel. After the upgrade response, the handler abandons
+/// the request source with `CANCEL` while the peer keeps sending.
 fn h1_downstream_abandon(
     request: &'static [u8],
     response: HttpMessage,
@@ -974,8 +974,8 @@ fn h2_upstream_abandon_with(code: HttpErrorCode, check: fn(HttpErrorCode, &Frame
     });
 }
 
-/// Abandons an upgraded H1 CONNECT tunnel with `code`, then checks whether the
-/// session resets the connection, as `egressResetStream` does on HTTP/1.1.
+/// Abandons an upgraded H1 CONNECT tunnel with `code`, then checks that the
+/// session resets the connection exactly when `resets` is set.
 fn h1_upstream_abandon_with(code: HttpErrorCode, resets: bool) {
     run_on_worker(move |context| {
         Box::pin(async move {
@@ -1010,8 +1010,8 @@ fn h1_upstream_abandon_with(code: HttpErrorCode, resets: bool) {
 }
 
 /// Abandons an upgraded H2 tunnel after, or before, the peer's END_STREAM. The
-/// peer's later DATA only returns connection credit, as `HTTPCoroSession::onBody`
-/// does for DATA the source rejects, and the tunnel's egress still finishes.
+/// source rejects the peer's later DATA, which only returns connection credit,
+/// and the tunnel's egress still finishes.
 fn h2_late_data_after_peer_end_stream(end_before_abandon: bool) {
     run_on_worker(move |context| {
         Box::pin(async move {
@@ -1069,8 +1069,7 @@ fn h2_late_data_after_peer_end_stream(end_before_abandon: bool) {
 }
 
 /// Abandonment leaves an upgraded H2 tunnel unreset, but a malformed header
-/// block on the still-attached tunnel resets it, as `HTTPCoroSession::onError`
-/// calls `egressResetStream`.
+/// block on the still-attached tunnel resets it.
 fn h2_abandoned_tunnel_peer_protocol_error_resets() {
     run_on_worker(|context| {
         Box::pin(async move {
@@ -1122,9 +1121,9 @@ fn h2_abandoned_tunnel_peer_protocol_error_resets() {
 
 /// The reader abandons an upgraded H2 tunnel in the session's read pass that then
 /// reads the peer's EOF, before the session drives the abandonment's callbacks.
-/// `HTTPStreamSource::stopReading` completes the source synchronously, and the
-/// `readLoop` EOF branch only aborts ingress, so the tunnel's egress finishes
-/// without a RST_STREAM or a connection reset.
+/// `stop_reading` completes the source synchronously and the EOF only aborts
+/// ingress, so the tunnel's egress finishes without a RST_STREAM or a connection
+/// reset.
 fn h2_abandoned_tunnel_survives_peer_eof_in_the_same_read() {
     run_on_worker(|context| {
         Box::pin(async move {
@@ -1172,10 +1171,9 @@ fn h2_abandoned_tunnel_survives_peer_eof_in_the_same_read() {
 }
 
 /// The peer ends an upgraded H2 tunnel, then sends DATA or trailers before the
-/// reader has consumed that END_STREAM. `HTTPStreamSource::body` and `trailers`
-/// reject the frame and fail the source with INVALID_STATE_TRANSITION, which
-/// `sourceComplete` leaves unreset on an upgraded stream, and `onBody` returns
-/// only connection credit. The tunnel's egress still finishes.
+/// reader has consumed that END_STREAM. The source rejects the frame and fails
+/// with INVALID_STATE_TRANSITION, which does not reset an upgraded stream, and
+/// the DATA only returns connection credit. The tunnel's egress still finishes.
 fn h2_late_frame_before_end_stream_is_read(trailers: bool) {
     run_on_worker(move |context| {
         Box::pin(async move {
@@ -1240,9 +1238,9 @@ fn h2_late_frame_before_end_stream_is_read(trailers: bool) {
 }
 
 /// The peer ends an upgraded H2 tunnel first, and the reader consumes that
-/// END_STREAM while the tunnel's egress keeps streaming. The peer's later DATA,
-/// padding-only DATA, and trailers return only connection credit, as
-/// `HTTPStreamSource::body` rejects them, and the egress finishes.
+/// END_STREAM while the tunnel's egress keeps streaming. The source rejects the
+/// peer's later DATA, padding-only DATA, and trailers, which only return
+/// connection credit, and the egress finishes.
 fn h2_peer_ends_tunnel_before_egress() {
     run_on_worker(|context| {
         Box::pin(async move {
@@ -1473,9 +1471,9 @@ fn h2_abandoned_upgraded_stream_sends_no_rst_stream() {
     h2_push_on_abandoned_tunnel_is_cancelled();
 }
 
-/// The peer promises a push on an abandoned tunnel whose egress is still open.
-/// `HTTPStreamSource::pushPromise` stops the pushed source in sink mode, so only
-/// the pushed stream resets, with `CANCEL` and no ingress error.
+/// The peer promises a push on an abandoned tunnel with its egress still open.
+/// The abandoned source stops the pushed source, so only the pushed stream
+/// resets, with `CANCEL` and no ingress error.
 fn h2_push_on_abandoned_tunnel_is_cancelled() {
     run_on_worker(|context| {
         Box::pin(async move {
@@ -1818,7 +1816,7 @@ fn upgraded_stream_mapped_source_errors_send_no_reset() {
 }
 
 #[test]
-fn upgraded_stream_source_error_outside_frozen_switch_still_resets() {
+fn upgraded_stream_unmapped_source_error_still_resets() {
     h2_upstream_abandon_with(HttpErrorCode::INTERNAL_ERROR, |_, frames| {
         assert_eq!(frames.resets, [(STREAM_1, H2ErrorCode::INTERNAL_ERROR)]);
     });
@@ -2033,10 +2031,10 @@ impl PeerWindow<'_> {
     }
 }
 
-/// Abandons an upgraded H2 tunnel while DATA that the reader never read is still
-/// buffered in its source. `stopReading` -> `enableSinkMode` -> `updateFlowControl`
-/// returns that DATA's connection credit and acknowledges no stream credit,
-/// because `inputFinished` holds once `stopReading` sets the error.
+/// Abandons an upgraded H2 tunnel while unread DATA is still buffered in its
+/// source. `stop_reading` returns that DATA's connection credit. It acknowledges
+/// no stream credit, because the source's input counts as finished once
+/// `stop_reading` sets the error.
 fn h2_abandoned_tunnel_with_unread_data_returns_connection_credit() {
     run_on_worker(|context| {
         Box::pin(async move {
@@ -2204,8 +2202,7 @@ fn abandoned_upgraded_stream_detaches_once_egress_completes() {
                         .all(|stream| !ingress_meta_retained(&handle, *stream))
                 );
 
-                // A push promised on an erased stream is ignored, as
-                // `onPushMessageBegin` and `onHeadersComplete` ignore a missing stream.
+                // A push promised on an erased stream is ignored.
                 let pushed = peer.create_stream();
                 let mut promise = HttpMessage::new();
                 promise.set_method(HttpMethod::Get).expect("push method");
@@ -2243,8 +2240,7 @@ fn abandoned_upgraded_stream_detaches_once_egress_completes() {
                 })
                 .await;
 
-                // A malformed header block on an erased stream still draws a
-                // RST_STREAM, as `onError` calls `egressResetStream` for a missing stream.
+                // A malformed header block on an erased stream still gets a RST_STREAM.
                 observed.deliver(duplicate_status_headers(tunnels[1]));
                 ingress_consumed(&observed, &handle).await;
                 eventually("a RST_STREAM", || {
@@ -2269,7 +2265,7 @@ fn abandoned_upgraded_stream_detaches_once_egress_completes() {
     });
 }
 
-/// A HEADERS frame whose field section repeats `:status`, which is malformed.
+/// A malformed HEADERS frame that repeats `:status`.
 fn duplicate_status_headers(stream: StreamId) -> Vec<u8> {
     const HEADERS: u8 = 0x1;
     const END_HEADERS: u8 = 0x4;

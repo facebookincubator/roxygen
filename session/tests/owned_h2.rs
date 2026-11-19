@@ -163,19 +163,19 @@ struct Application {
     /// Drops the request body unread as soon as the request head arrives.
     drop_request_body: bool,
     /// Awaits the resume of each suspend event while reading the request body, as
-    /// `FixtureHandler` does, instead of reading on at once.
+    /// `FixtureHandler` does, instead of reading on immediately.
     await_request_resume: bool,
-    /// Answers with the response head at once and reads the request body before the first
+    /// Sends the response head immediately and reads the request body before the first
     /// response body event, instead of before the head.
     upload_after_head: bool,
     /// Fails the response head with this code instead of producing it.
     response_head_error: Option<HttpErrorCode>,
-    /// Answers a request body read timeout with its own 408 head, as the server's handler
-    /// adapter answers a handler's `READ_TIMEOUT` result, instead of failing the head with it.
+    /// Responds to a request body read timeout with its own 408 head, as the server's handler
+    /// adapter does for a handler's `READ_TIMEOUT` result, instead of failing the head with it.
     answer_read_timeout: bool,
     /// When a request body read times out, awaits this cleanup (a sleep, if nonzero), then
-    /// answers with this status and its reply's body, reporting itself a running handler until
-    /// it answers.
+    /// responds with this status and its reply's body. Its exchange's `handler_active` is true
+    /// until then.
     late_answer: Option<(u16, Duration)>,
     hold_headers: bool,
     empty_terminal: Option<Arc<tokio::sync::Notify>>,
@@ -838,8 +838,7 @@ fn connection_cancellation_keeps_stream_order_after_retirement() {
     });
 }
 
-/// The contained panics a worker counted since `start`, by scope: exchange, connection, driver
-/// (`DIV-056`).
+/// The contained panics a worker counted since `start`, by scope: exchange, connection, driver.
 pub(super) fn contained_panic_counts(
     worker: &WorkerHandle,
     start: &WorkerPollStats,
@@ -852,9 +851,9 @@ pub(super) fn contained_panic_counts(
     )
 }
 
-/// `DIV-056`: abandoning a started run cancels its streams in id order and drops each
-/// under its own boundary, outside any unwind, reporting every panic; the drop still reports the
-/// join its owner skipped.
+/// Abandoning a started run cancels its streams in id order and drops each under its own
+/// boundary, outside any unwind, reporting every panic. The drop still reports the join its
+/// owner skipped.
 #[cfg(panic = "unwind")]
 #[test]
 fn abandoned_streams_drop_in_order_and_report_each_panic() {
@@ -942,9 +941,9 @@ fn terminal_head_and_small_bodies_round_trip_over_fragmented_ingress() {
     }
 }
 
-/// H2-L6: after a read that drained the transport, the driver polls its reader again only once
-/// the reader's waker fires, so each read of a request that arrives in 64-byte reads is polled
-/// once, after one poll that waited for the first bytes.
+/// After a read that drained the transport, the driver polls its reader again only once the
+/// reader's waker fires, so each read of a request that arrives in 64-byte reads is polled once,
+/// after one poll that waited for the first bytes.
 #[test]
 fn owned_h2_polls_a_drained_reader_once_per_read() {
     let (counts, read_count) = run_on_worker(move |context| {
@@ -978,7 +977,7 @@ fn owned_h2_polls_a_drained_reader_once_per_read() {
     );
 }
 
-/// What an owned H2 session showed whose drained reader stayed parked while it answered four
+/// What an owned H2 session showed when its drained reader stayed parked while it served four
 /// GETs, read in one read, with 256-byte bodies in 32-byte events, before `end` ended it.
 struct ParkedH2 {
     /// Read starts the driver evaluated from the first read's wait until every exchange
@@ -1058,10 +1057,10 @@ fn parked_h2(end: ParkedEnd) -> ParkedH2 {
     })
 }
 
-/// H2-L6b: while a drained reader waits for its waker ("parked"), each driver turn leaves the
-/// read phase without evaluating a read start. Only the turn that parks the drained reader's
-/// next read evaluates one (it stamps the read's `read_idle` deadline); the turns that produce
-/// four responses in 32 body events evaluate none; without the fast exit each would evaluate one.
+/// While a drained reader waits for its waker ("parked"), each driver turn leaves the read phase
+/// without evaluating a read start. Only the turn that parks the drained reader's next read
+/// evaluates one (it stamps the read's `read_idle` deadline). The turns that produce four
+/// responses in 32 body events evaluate none.
 #[test]
 fn owned_h2_a_parked_reader_evaluates_no_read_start_while_responses_are_produced() {
     let parked = parked_h2(ParkedEnd::PeerEof);
@@ -1076,9 +1075,9 @@ fn owned_h2_a_parked_reader_evaluates_no_read_start_while_responses_are_produced
     assert_eq!(parked.run, Ok(()));
 }
 
-/// H2-L6b: a parked reader still ends. The next read's EOF or failure wakes it, and the driver's
-/// own close and abort mark its read wake in the same call (`close_idle`, `reset_transport`), so
-/// each parked session ends as it did before the fast exit.
+/// A parked reader still ends. The next read's EOF or failure wakes it, and the driver's own
+/// close and abort mark its read wake in the same call (`close_idle`, `reset_transport`), so
+/// each parked session ends.
 #[test]
 fn owned_h2_a_parked_reader_still_ends_on_its_wake_close_and_abort() {
     for (end, run, close) in [
@@ -1677,8 +1676,8 @@ fn content_length_mismatch_cancels_once_with_the_typed_error() {
     });
 }
 
-/// Records each request's method as sent (`HttpMessage::request_method`) and answers it 200,
-/// with no body.
+/// Records each request's method as sent (`HttpMessage::request_method`) and responds 200 with
+/// no body.
 struct MethodApplication(Rc<RefCell<Vec<String>>>);
 
 struct MethodExchange(Rc<RefCell<Vec<String>>>);
@@ -1774,8 +1773,8 @@ fn method_requests(methods: &[&[u8]]) -> Vec<u8> {
 
 /// What one method run produced: the methods the application read, as sent, in sorted order;
 /// each response head's status, by stream; the RST_STREAM and GOAWAY frames written; and the
-/// session's error. The order is normalized because the two sessions start and answer their
-/// streams in different orders.
+/// session's error. The order is normalized because the two sessions start their streams and
+/// send their responses in different orders.
 #[derive(Debug, PartialEq)]
 struct MethodRun {
     methods: Vec<String>,
@@ -1839,10 +1838,10 @@ fn method_run(owned: bool, exact: bool, methods: &[&[u8]]) -> MethodRun {
     })
 }
 
-/// Under `exact_method_tokens` (`DIV-040`), the owned driver hands each token `:method` to its
-/// exchange as sent: `post`, `Post` and `PURGE` as extension methods, kept byte for byte. The
-/// application reads what `UniplexSession` reads under the option, and every stream is
-/// answered as there.
+/// Under `exact_method_tokens`, the owned driver hands each token `:method` to its exchange as
+/// sent: `post`, `Post` and `PURGE` as extension methods, kept byte for byte. The application
+/// reads what `UniplexSession` reads under the option, and each stream's response matches
+/// `UniplexSession`'s.
 #[test]
 fn exact_method_tokens_reach_each_stream_as_sent_as_uniplex() {
     const METHODS: [&[u8]; 4] = [b"POST", b"post", b"Post", b"PURGE"];
@@ -1858,8 +1857,8 @@ fn exact_method_tokens_reach_each_stream_as_sent_as_uniplex() {
 }
 
 /// Under `exact_method_tokens`, a `:method` that is not a token, the empty one included, is
-/// still malformed: the owned driver answers the stream with the session's 400 and hands no
-/// request to its exchange, as `UniplexSession` does under the option.
+/// still malformed. The stream gets the session's 400 and its exchange gets no request, as on
+/// `UniplexSession` under the option.
 #[test]
 fn exact_method_tokens_still_make_a_non_token_method_malformed_as_uniplex() {
     for method in [&b"P@ST"[..], b"(GET)", b"POST ", b"", b"PO\x7fST"] {
@@ -1873,9 +1872,9 @@ fn exact_method_tokens_still_make_a_non_token_method_malformed_as_uniplex() {
     }
 }
 
-/// Without `exact_method_tokens`, the owned driver keeps the reference reading, as
-/// `UniplexSession` does: recognized methods are canonicalized without regard to case and
-/// extension methods are uppercased.
+/// Without `exact_method_tokens`, the owned driver reads methods as `UniplexSession` does:
+/// recognized methods are canonicalized without regard to case and extension methods are
+/// uppercased.
 #[test]
 fn request_methods_are_canonicalized_by_default_as_uniplex() {
     const METHODS: [&[u8]; 4] = [b"POST", b"post", b"Post", b"purge"];
@@ -1898,7 +1897,8 @@ const VERBATIM_FIELDS: [(&[u8], &[u8]); 9] = [
     (b"x-request-id", b" rid-7\t"),
 ];
 
-/// `VERBATIM_FIELDS` with surrounding whitespace removed, as the reference decoder stores them.
+/// `VERBATIM_FIELDS` with surrounding whitespace removed, as the decoder stores them without
+/// `verbatim_http2_header_values`.
 const TRIMMED_VERBATIM_FIELDS: [(&[u8], &[u8]); 9] = [
     (b"user-agent", b"ua"),
     (b"x-lead", b"leading"),
@@ -1958,7 +1958,7 @@ fn record_body_event(
 }
 
 /// A 200 head that echoes the request's `x-request-id` and carries `x-padded`, each inserted
-/// with `add_verbatim`, as the router copies `http::HeaderValue` bytes into its heads.
+/// with `add_verbatim`, as a proxy that copies `http::HeaderValue` bytes into its heads does.
 fn echo_head(request: &HttpMessage) -> HttpMessage {
     let mut response = HttpMessage::new();
     response.set_status_code(200).unwrap();
@@ -1985,7 +1985,7 @@ struct FieldsSeen {
 }
 
 /// Records what each request carried as the application reads it, reading its body to its
-/// end, and answers with `echo_head`, or fails the exchange if the body read failed. The
+/// end, and responds with `echo_head`, or fails the exchange if the body read failed. The
 /// counter counts the request heads that arrived.
 struct FieldApplication(Rc<RefCell<Vec<FieldsSeen>>>, Rc<Cell<usize>>);
 
@@ -2257,8 +2257,8 @@ fn decode_response_heads(wire: &[u8], requests: usize) -> ResponseHeads {
 
 /// What one field run produced: what the application read of each request, in sorted order;
 /// each response head, by stream; the RST_STREAM and GOAWAY frames written; and the session's
-/// error. The order is normalized because the two sessions start and answer their streams in
-/// different orders.
+/// error. The order is normalized because the two sessions start their streams and send their
+/// responses in different orders.
 #[derive(Debug, PartialEq)]
 struct FieldRun {
     seen: Vec<FieldsSeen>,
@@ -2278,7 +2278,7 @@ fn field_run(owned: bool, verbatim: bool, requests: &[FieldRequest<'_>]) -> Fiel
 
 /// As `field_run` for one request with `fields` and no body, then, in a later read released once
 /// the application has its head, one DATA frame carrying `data`, with END_STREAM if
-/// `end_stream`. Peer EOF follows END_STREAM at once; without END_STREAM it waits until the
+/// `end_stream`. Peer EOF follows END_STREAM immediately; without END_STREAM it waits until the
 /// application recorded the request (its body read failed), for at most a second.
 fn split_field_run(
     owned: bool,
@@ -2397,8 +2397,8 @@ fn serve_field_run(
     })
 }
 
-/// A field run of one request that reads `fields` and an empty body, answered 200 with the
-/// echoed request id `request_id` and the padded value `padded` (`echo_head`).
+/// A field run of one request that reads `fields` and an empty body, with a 200 response that
+/// carries the echoed request id `request_id` and the padded value `padded` (`echo_head`).
 fn answered_run(fields: &[(&[u8], &[u8])], request_id: Option<&[u8]>, padded: &[u8]) -> FieldRun {
     let mut response = Vec::new();
     if let Some(request_id) = request_id {
@@ -2418,12 +2418,11 @@ fn answered_run(fields: &[(&[u8], &[u8])], request_id: Option<&[u8]>, padded: &[
     }
 }
 
-/// Under `verbatim_http2_header_values` (`DIV-041`), the owned driver hands each request field
-/// value to its exchange exactly as decoded: surrounding spaces and tabs, empty and
-/// whitespace-only values and duplicates are kept, and `cookie` crumbs combine untrimmed. The
-/// response head it encodes keeps the values the application inserted with `add_verbatim` (the
-/// echoed request id among them) byte for byte. Everything equals `UniplexSession` under the
-/// option.
+/// Under `verbatim_http2_header_values`, the owned driver hands each request field value to its
+/// exchange exactly as decoded: surrounding spaces and tabs, empty and whitespace-only values and
+/// duplicates are kept, and `cookie` crumbs combine untrimmed. The response head it encodes keeps
+/// the values the application inserted with `add_verbatim` (the echoed request id among them)
+/// byte for byte. Everything equals `UniplexSession` under the option.
 #[test]
 fn verbatim_field_values_reach_each_stream_as_sent_as_uniplex() {
     let owned = field_run(true, true, &[(&VERBATIM_FIELDS, None)]);
@@ -2441,7 +2440,7 @@ fn verbatim_field_values_reach_each_stream_as_sent_as_uniplex() {
     assert_eq!(owned, field_run(false, true, &[(&cookies, None)]));
 }
 
-/// Request fields that h2 refuses and that the codec refuses under
+/// Request fields that h2 rejects and that the codec rejects under
 /// `verbatim_http2_header_values`.
 const H2_REFUSED_FIELDS: [(&[u8], &[u8]); 14] = [
     (b"x-value", b"a\r\n b"),
@@ -2464,10 +2463,10 @@ fn field_label(field: (&[u8], &[u8])) -> String {
     format!("{}: {}", field.0.escape_ascii(), field.1.escape_ascii())
 }
 
-/// Without `verbatim_http2_header_values`, the owned driver keeps the reference reading, as
-/// `UniplexSession` does: request field values are trimmed when decoded and response field
-/// values when encoded, and each field h2 refuses gets the same result from both sessions
-/// (folded values are accepted, as `CodecUtil::validateHeaderValue` accepts them).
+/// Without `verbatim_http2_header_values`, the owned driver trims field values as
+/// `UniplexSession` does: request field values when decoded and response field values when
+/// encoded. Each field h2 rejects gets the same result from both sessions, and folded values
+/// are accepted.
 #[test]
 fn field_values_are_trimmed_by_default_as_uniplex() {
     let owned = field_run(true, false, &[(&VERBATIM_FIELDS, None)]);
@@ -2490,12 +2489,11 @@ fn field_values_are_trimmed_by_default_as_uniplex() {
     assert_eq!(folded.responses[0].1, 200, "{folded:?}");
 }
 
-/// Under `verbatim_http2_header_values`, the owned driver still checks each value as h2 does:
-/// a control byte other than HTAB, or DEL (so no line folding), a `content-length` that is not
+/// Under `verbatim_http2_header_values`, the owned driver still checks each value as h2 does.
+/// A control byte other than HTAB, or DEL (so no line folding), a `content-length` that is not
 /// at most 19 digits, a `te` other than `trailers`, and `connection` make the request
-/// malformed, answered with the session's 400 and never handed to the exchange; obsolete text,
-/// 19 digits and `te: trailers` are accepted. Each run equals `UniplexSession`'s under the
-/// option.
+/// malformed. It gets the session's 400 and never reaches the exchange. Obsolete text, 19
+/// digits and `te: trailers` are accepted. Each run equals `UniplexSession`'s under the option.
 #[test]
 fn verbatim_field_values_refuse_what_h2_refuses_as_uniplex() {
     for field in H2_REFUSED_FIELDS {
@@ -2556,9 +2554,9 @@ const TRIMMED_VERBATIM_TRAILERS: [(&[u8], &[u8]); 5] = [
 
 /// Under `verbatim_http2_header_values`, request trailer values reach the owned driver's
 /// exchange exactly as decoded too, and without it trimmed, each equal to `UniplexSession`'s
-/// run. A trailer value h2 refuses makes the trailer section malformed, and both sessions
-/// reset the stream with PROTOCOL_ERROR; arriving with its head, the request never reaches the
-/// application.
+/// run. A trailer value h2 rejects makes the trailer section malformed, and both sessions
+/// reset the stream with PROTOCOL_ERROR. When the trailers arrive with the head, the request
+/// never reaches the application.
 #[test]
 fn verbatim_trailer_values_reach_each_stream_as_sent_as_uniplex() {
     let run = |owned, verbatim, trailers: &[(&[u8], &[u8])]| {
@@ -2644,11 +2642,10 @@ fn an_empty_content_length_reads_as_zero_with_verbatim_field_values_as_uniplex()
     assert_eq!(owned_empty, overrun(false, true, &empty));
     assert_eq!(owned_zero, overrun(false, true, &zero));
 
-    // The same overrun arriving after the application has the head, ending the request or not:
-    // its body read fails before any overrunning byte. With END_STREAM both sessions reset the
-    // stream. Without it the exchange fails while the request is open, which the owned driver
-    // answers with a reset and `UniplexSession` with its 500 (`FieldExchange` fails its head
-    // poll, `FieldHandler` its handler), for any declared length; on each session the empty
+    // The same overrun after the application has the head, with or without END_STREAM. The body
+    // read fails before any overrunning byte. With END_STREAM both sessions reset the stream.
+    // Without it the exchange fails while the request is open, for any declared length: the owned
+    // driver resets the stream and `UniplexSession` sends its 500. On each session the empty
     // length fails exactly as `0` does.
     for end_stream in [true, false] {
         let split_overrun =
@@ -2708,7 +2705,7 @@ fn an_empty_content_length_reads_as_zero_with_verbatim_field_values_as_uniplex()
     assert_eq!(owned, overrun(false, false, &empty));
 }
 
-/// Never answers, and records each exchange dropped while its response is owed.
+/// Never responds, and records each exchange dropped while its response is pending.
 struct HeldApplication(Rc<Cell<usize>>);
 
 struct HeldExchange(Rc<Cell<usize>>);
@@ -2818,7 +2815,7 @@ fn eof_reset(stream: u32) -> Vec<u8> {
 }
 
 /// What one held-request EOF run produced: the exchanges or handlers dropped while
-/// their responses were owed; each response head's status, by stream; the RST_STREAM
+/// their responses were pending; each response head's status, by stream; the RST_STREAM
 /// and GOAWAY frames written; and the session's error.
 #[derive(Debug, PartialEq)]
 struct EofRun {
@@ -2881,8 +2878,8 @@ fn eof_run(owned: bool, input: &[u8], configure: fn(&mut OwnedH2Options)) -> Eof
     })
 }
 
-/// Under `abort_streams_on_eof` (`DIV-055`), the owned driver judges an EOF read with
-/// the bytes before it as `UniplexSession` does, each case read in one segment: held
+/// Under `abort_streams_on_eof`, the owned driver handles an EOF read with the bytes
+/// before it as `UniplexSession` does, each case read in one segment: held
 /// requests are aborted with one GOAWAY(INTERNAL_ERROR) and no response, a request
 /// whose head or body is incomplete is open, a stream the peer reset is not open even
 /// before the owned driver applies the reset, and a flood breach parsed with the EOF
@@ -2970,9 +2967,9 @@ fn http2_eof_abort_matches_uniplex() {
     }
 }
 
-/// `UniplexSession` under `abort_streams_on_eof` (`DIV-055`): a REFUSED_STREAM that finds no
-/// room in the egress buffer behind a held write records its error without failing the
-/// connection, and the peer's EOF still aborts the held stream.
+/// `UniplexSession` under `abort_streams_on_eof`: a REFUSED_STREAM without room in the egress
+/// buffer behind a held write records its error without failing the connection, and the peer's
+/// EOF still aborts the held stream.
 #[test]
 fn uniplex_eof_aborts_a_held_stream_after_a_refusal_found_no_room() {
     run_on_worker(|context| {
@@ -3241,8 +3238,8 @@ fn reentrant_cancellation_stops_writes_before_returning_from_the_driver_turn() {
     }
 }
 
-/// `DIV-056`: an application callback panic is contained at Driver scope: the connection aborts,
-/// the run joins its native I/O and then returns `Err(INTERNAL_ERROR)` instead of resuming the
+/// An application callback panic is contained at Driver scope. The connection aborts, and the
+/// run joins its native I/O and then returns `Err(INTERNAL_ERROR)` instead of resuming the
 /// panic, which is reported once.
 #[cfg(panic = "unwind")]
 #[test]
@@ -3369,9 +3366,8 @@ impl HeaderIndexingStrategy for PanickingIndexing {
     }
 }
 
-/// `DIV-056`: a panic in a user callback inside the codec, encoding the response head,
-/// reaches the per-turn catch and is reported once, at Driver scope, and the run returns
-/// `Err(INTERNAL_ERROR)`.
+/// A panic in a user callback inside the codec, encoding the response head, reaches the per-turn
+/// catch and is reported once, at Driver scope, and the run returns `Err(INTERNAL_ERROR)`.
 fn assert_driver_turn_panic_is_reported_once() {
     run_on_worker(|context| {
         Box::pin(async move {
@@ -3410,7 +3406,7 @@ fn owned_h2_driver_turn_panic_is_reported_once() {
     crate::uniplex_tests::on_hosted_workers(assert_driver_turn_panic_is_reported_once);
 }
 
-/// A header indexing strategy that panics when asked about one header name.
+/// A header indexing strategy that panics when called for one header name.
 struct PanicOnHeader(&'static [u8]);
 
 impl HeaderIndexingStrategy for PanicOnHeader {
@@ -3527,9 +3523,9 @@ impl UniplexTransport for DropCountingTransport {
     }
 }
 
-/// `DIV-056`: after a Driver-scope panic, here in the codec's header indexing
-/// strategy, the run stays pending while its native read and write are held, and returns
-/// `Err(INTERNAL_ERROR)` once both completed and dropped.
+/// After a Driver-scope panic, here in the codec's header indexing strategy, the run stays
+/// pending while its native read and write are held, and returns `Err(INTERNAL_ERROR)` once both
+/// completed and dropped.
 #[cfg(panic = "unwind")]
 #[test]
 fn a_driver_panic_returns_err_after_joining_native_io() {
@@ -3650,16 +3646,16 @@ fn a_driver_panic_returns_err_after_joining_native_io() {
     });
 }
 
-/// How a `ScriptedExchange` answers.
+/// How a `ScriptedExchange` responds.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Script {
     /// Holds its response head.
     Hold,
-    /// Answers a head carrying a `KernelWrite` byte event, which fires once the head's write
-    /// completes, and whose cancellation panics; then holds its body.
+    /// Sends a head with a `KernelWrite` byte event, then holds its body. The byte event fires
+    /// once the head's write completes, and cancelling it panics.
     PanickingByteEventCancel,
-    /// Answers a head, a 4 KiB body whose bytes' owner panics when dropped, then trailers with
-    /// an `x-panic` field.
+    /// Sends a head, a 4 KiB body whose bytes' owner panics when dropped, then trailers with an
+    /// `x-panic` field.
     PanickingBodyOwner,
 }
 
@@ -3809,9 +3805,9 @@ impl Drop for ScriptedExchange {
     }
 }
 
-/// `DIV-056`: a panic inside the abort that a Driver-scope panic starts, here from the
-/// owner of body bytes the abort discards, is contained: the run still joins its held read and
-/// then fails, and its drop does not assert.
+/// A panic inside the abort that a Driver-scope panic starts, here from the owner of body bytes
+/// the abort discards, is contained. The run still joins its held read and then fails, and its
+/// drop does not assert.
 #[cfg(panic = "unwind")]
 #[test]
 fn an_abort_panic_still_joins_native_io_and_completes() {
@@ -3911,8 +3907,8 @@ impl Drop for PanickingDropApplication {
     }
 }
 
-/// `DIV-056`: a panic while the driver's fields drop after completion is reported at
-/// Driver scope, and the run still returns its result.
+/// A panic while the driver's fields drop after completion is reported at Driver scope, and
+/// the run still returns its result.
 #[cfg(panic = "unwind")]
 #[test]
 fn a_panicking_application_drop_after_completion_is_reported() {
@@ -3948,7 +3944,7 @@ fn a_panicking_application_drop_after_completion_is_reported() {
     });
 }
 
-/// `DIV-056`: polling a run after it completed returns an error.
+/// Polling a run after it completed returns an error.
 #[test]
 fn polling_a_finished_run_returns_an_error() {
     run_on_worker(|context| {
@@ -3995,12 +3991,11 @@ async fn assert_worker_serves(context: WorkerContext) {
     assert_eq!(probes.borrow()[0].completed.get(), 1);
 }
 
-/// `DIV-056`: a panic while a connection error cancels every stream is contained
-/// without replacing the connection's error: `run` returns the PROTOCOL_ERROR, its one GOAWAY is
-/// written, every other stream is still cancelled once, the panic is reported once at Exchange
-/// scope with its stream, and a second session on the worker serves. The panic comes from
-/// stream 3's `cancel`, or, in the byte-event variant, from a byte event of stream 3 that the
-/// stream's cancellation cancels.
+/// A panic while a connection error cancels every stream is contained without replacing the
+/// connection's error. `run` returns the PROTOCOL_ERROR, its one GOAWAY is written, every other
+/// stream is still cancelled once, the panic is reported once at Exchange scope with its stream,
+/// and a second session on the worker serves. The panic comes from stream 3's `cancel`, or, in
+/// the byte-event variant, from a byte event of stream 3 that the stream's cancellation cancels.
 fn assert_a_cancel_all_panic_keeps_the_original_error(byte_event: bool) {
     run_on_worker(move |context| {
         Box::pin(async move {
@@ -4110,8 +4105,8 @@ fn fail_connection_cancel_panic_keeps_the_original_error() {
     }
 }
 
-/// `DIV-055` with `DIV-056`: as `assert_a_cancel_all_panic_keeps_the_original_error`, for the
-/// connection failure of a peer EOF that aborts open streams: `run` returns `TRANSPORT_EOF`, its
+/// As `assert_a_cancel_all_panic_keeps_the_original_error`, for the connection failure of a
+/// peer EOF that aborts open streams (`abort_streams_on_eof`): `run` returns `TRANSPORT_EOF`, its
 /// GOAWAY carries INTERNAL_ERROR, and stream 3's panicking `cancel` is reported once without
 /// replacing the error.
 fn assert_an_eof_abort_cancel_panic_keeps_transport_eof() {
@@ -4191,10 +4186,10 @@ fn eof_abort_cancel_panic_keeps_transport_eof() {
     crate::uniplex_tests::on_hosted_workers(assert_an_eof_abort_cancel_panic_keeps_transport_eof);
 }
 
-/// `DIV-056`: a run whose poll unwinds, which only a fault in the run's own code can
-/// cause, is poisoned. Its next poll returns `Err(INTERNAL_ERROR)` without running the driver,
-/// and dropping it abandons the driver, cancelling its read, resetting the transport once and
-/// reporting `Destroy`, without the join assertion.
+/// A run whose poll unwinds, which only a fault in the run's own code can cause, is poisoned.
+/// Its next poll returns `Err(INTERNAL_ERROR)` without running the driver, and dropping it
+/// abandons the driver, cancelling its read, resetting the transport once and reporting
+/// `Destroy`, without the join assertion.
 #[cfg(panic = "unwind")]
 #[test]
 fn a_run_whose_poll_unwinds_is_poisoned() {
@@ -4321,8 +4316,8 @@ fn a_run_whose_poll_unwinds_is_poisoned() {
     });
 }
 
-/// `DIV-056`: a Driver-scope panic in a batch of ready owners cancels every owner once, joins
-/// native I/O and fails the run with `Err(INTERNAL_ERROR)`.
+/// A Driver-scope panic in a batch of ready owners cancels every owner once, joins native I/O and
+/// fails the run with `Err(INTERNAL_ERROR)`.
 #[cfg(panic = "unwind")]
 #[test]
 fn batched_owner_panic_preserves_unvisited_wakes_and_joins_native_io() {
@@ -4912,7 +4907,7 @@ fn split_read_peer_reset_cancels_the_started_exchange() {
 }
 
 /// A client's RST_STREAM(NO_ERROR) after its whole request reaches the exchange as
-/// `CANCEL`. Only upstream streams keep `NO_ERROR` after a complete response (`DIV-050`).
+/// `CANCEL`. Only upstream streams keep `NO_ERROR` after a complete response.
 #[test]
 fn client_no_error_reset_after_its_whole_request_cancels_the_exchange() {
     run_on_worker(|context| {
@@ -4976,7 +4971,7 @@ struct ForwardProbe {
 }
 
 /// Forwards each request to `upstream`, with the request's ingress body as the upload, and
-/// answers with the upstream response.
+/// relays the upstream response.
 struct ForwardApplication {
     upstream: OwnedH2UpstreamHandle,
     probe: Rc<ForwardProbe>,
@@ -5152,7 +5147,7 @@ fn forwarding_upstream(
 /// A downstream session forwards a POST whose upload stays open to an upstream session,
 /// with the downstream request's ingress body as the upstream upload. The origin sends
 /// the whole response with trailers, then RST_STREAM(NO_ERROR). The client gets the
-/// response head, body and trailers, then RST_STREAM(NO_ERROR) (`DIV-050`).
+/// response head, body and trailers, then RST_STREAM(NO_ERROR).
 #[test]
 fn forwarded_response_survives_an_origin_no_error_reset_after_its_trailers() {
     forwarded_origin_no_error_reset_case(OriginReset::WithTheResponse);
@@ -5162,7 +5157,7 @@ fn forwarded_response_survives_an_origin_no_error_reset_after_its_trailers() {
 /// response. The `NO_ERROR` stop reaches the client's stream after its END_STREAM, so,
 /// as for any request source stopped with `NO_ERROR` once its response ended, the client
 /// gets no reset, RST_STREAM(CANCEL) included, and the rest of its upload is read and
-/// discarded on a healthy connection (`DIV-050`).
+/// discarded on a healthy connection.
 #[test]
 fn forwarded_response_then_a_late_origin_no_error_reset_sends_the_client_no_reset() {
     forwarded_origin_no_error_reset_case(OriginReset::AfterTheForwardedResponse);
@@ -5245,7 +5240,7 @@ fn forwarded_origin_no_error_reset_case(origin_reset: OriginReset) {
                 OwnedH2Session::new(application, options(context, downstream_transport)).unwrap();
 
             let operation = async {
-                // The origin answers once the upstream request and its first upload bytes
+                // The origin responds once the upstream request and its first upload bytes
                 // are on the wire, while the client's upload is still open.
                 wait_for_written(&upstream_wire, |wire| {
                     wire.count(FrameType::HEADERS, 0) == 1 && wire.count(FrameType::DATA, 0) == 1
@@ -5377,7 +5372,7 @@ fn forwarded_origin_no_error_reset_case(origin_reset: OriginReset) {
 /// As `forwarded_response_survives_an_origin_no_error_reset_after_its_trailers`, but the
 /// client is on an owned HTTP/1.1 downstream session. HTTP/1.1 cannot reset one request, so
 /// the client gets the whole response with `Connection: close`, and the connection then
-/// closes: its write side first, then its read side at the client's EOF (`DIV-054`).
+/// closes: its write side first, then its read side at the client's EOF.
 #[test]
 fn forwarded_response_reaches_an_http1_client_after_an_origin_no_error_reset() {
     use crate::owned_h1::OwnedH1Options;
@@ -5693,9 +5688,9 @@ fn peer_reset_discards_a_malformed_head_response_parked_behind_a_held_write() {
     });
 }
 
-/// `DIV-056`: a panic in a native operation's cancellation waker, as the connection's
-/// cancellation resets the transport, is reported at Driver scope; the run still waits for both
-/// native operations to complete and returns the cancellation.
+/// A panic in a native operation's cancellation waker, as the connection's cancellation resets
+/// the transport, is reported at Driver scope. The run still waits for both native operations
+/// to complete and returns the cancellation.
 #[cfg(panic = "unwind")]
 #[test]
 fn cancellation_waker_panic_waits_for_both_native_io_completions() {
@@ -6043,7 +6038,7 @@ fn abandoning_a_started_run_signals_io_and_reports_the_missing_join() {
             assert!(probes.borrow().is_empty());
             assert!(
                 take_contained_panics().is_empty(),
-                "the skipped join is the owner's misuse, not a contained panic (`DIV-056`)"
+                "the skipped join is the owner's misuse, not a contained panic"
             );
 
             let (transport, _) = FixtureTransport::new([]);
@@ -6055,10 +6050,10 @@ fn abandoning_a_started_run_signals_io_and_reports_the_missing_join() {
     });
 }
 
-/// `DIV-043`: a worker whose teardown deadline has passed destroys a started owned HTTP/2
-/// downstream, here waiting for its client's preface, before its application and native I/O
-/// cleanup joined. That destruction is an abandonment: the driver still resets the transport,
-/// and the worker reports a clean overrun instead of a panic.
+/// A worker whose teardown deadline has passed destroys a started owned HTTP/2 downstream, here
+/// waiting for its client's preface, before its application and native I/O cleanup joined. The
+/// driver treats that as abandonment. It still resets the transport, and the worker reports a
+/// clean overrun instead of a panic.
 #[test]
 fn a_forced_worker_teardown_abandons_an_owned_h2_downstream() {
     let (inspected_tx, inspected_rx) = std::sync::mpsc::channel();
@@ -6090,10 +6085,9 @@ fn a_forced_worker_teardown_abandons_an_owned_h2_downstream() {
     );
 }
 
-/// `DIV-051` with `DIV-043`: a lifecycle observer on an owned HTTP/2 downstream that a forced
-/// `HostedWorker` teardown destroys sees its connection's destroy exactly once, as the last
-/// event: `Drop` reports it before the forced-teardown check. No panic escapes, and the worker
-/// reports a clean overrun.
+/// A lifecycle observer on an owned HTTP/2 downstream that a forced `HostedWorker` teardown
+/// destroys receives its connection's destroy exactly once, as the last event. `Drop` reports it
+/// before the forced-teardown check. The worker reports a clean overrun, not a panic.
 #[test]
 fn a_forced_worker_teardown_reports_an_owned_h2_destroy_to_its_observer_once() {
     let (events_tx, events_rx) = std::sync::mpsc::channel();
@@ -7000,8 +6994,8 @@ fn native_io_wake_during_poll_preserves_same_turn_progress_and_new_operations() 
     });
 }
 
-/// `DIV-056`: a native read that panics in the turn and again in the teardown, then completes,
-/// is joined, and the run returns `Err(INTERNAL_ERROR)`.
+/// A native read that panics in the turn and again in the teardown, then completes, is joined,
+/// and the run returns `Err(INTERNAL_ERROR)`.
 #[cfg(panic = "unwind")]
 #[test]
 fn repeated_native_read_poll_panics_still_join_before_failing_the_run() {
@@ -7062,9 +7056,9 @@ fn repeated_native_read_poll_panics_still_join_before_failing_the_run() {
     });
 }
 
-/// `DIV-056`: a native read whose every poll panics is dropped unfinished at its third
-/// panicking teardown poll, and the run fails within its deadline. So is one whose panics
-/// alternate with self-woken pending polls: teardown panics are counted in total.
+/// A native read whose every poll panics is dropped unfinished at its third panicking teardown
+/// poll, and the run fails within its deadline. So is one whose panics alternate with self-woken
+/// pending polls, because teardown panics are counted in total.
 #[cfg(panic = "unwind")]
 #[test]
 fn a_poisoned_native_read_is_abandoned_after_bounded_teardown_polls() {
@@ -7226,9 +7220,8 @@ impl LifecycleObserver for LogDestroy {
     }
 }
 
-/// `DIV-056`: a reader whose every poll panics is dropped, with the read it holds, at
-/// its third panicking teardown poll, before the observers receive `Destroy`, and the run fails
-/// within its deadline.
+/// A reader whose every poll panics is dropped, with the read it holds, at its third panicking
+/// teardown poll, before the observers receive `Destroy`, and the run fails within its deadline.
 #[cfg(panic = "unwind")]
 #[test]
 fn a_poisoned_reader_is_dropped_after_bounded_teardown_polls() {
@@ -8231,7 +8224,7 @@ pub(super) fn finish_queued_writes(probe: &Rc<RefCell<QueuedWriteProbe>>) {
 pub(super) struct QueuedFixtureTransport {
     inner: Rc<FixtureTransport>,
     pub(super) probe: Rc<RefCell<QueuedWriteProbe>>,
-    /// `Some` selects a [`ReportingWriteQueue`] that answers `is_saturated` from the cell.
+    /// `Some` selects a [`ReportingWriteQueue`] that returns `is_saturated` from the cell.
     saturation: Option<Rc<Cell<bool>>>,
     pub(super) saturation_queries: Rc<Cell<usize>>,
     panic_on_saturation_query: bool,
@@ -8242,8 +8235,8 @@ impl QueuedFixtureTransport {
         Self::reporting(reads, None, false)
     }
 
-    /// `saturation` and `panic_on_query` configure the [`ReportingWriteQueue`]; `None`
-    /// keeps the [`FixtureWriteQueue`] and its default answer.
+    /// `saturation` and `panic_on_query` configure the [`ReportingWriteQueue`]. `None`
+    /// keeps the [`FixtureWriteQueue`] and its default `is_saturated`.
     pub(super) fn reporting(
         reads: impl IntoIterator<Item = FixtureRead>,
         saturation: Option<Rc<Cell<bool>>>,
@@ -8265,8 +8258,8 @@ pub(super) struct FixtureWriteQueue {
     cancellation: CancellationToken,
 }
 
-/// Forwards to a [`FixtureWriteQueue`] and answers `is_saturated` from its cell, counting
-/// queries; it can panic when queried.
+/// Forwards to a [`FixtureWriteQueue`] and returns `is_saturated` from its cell, counting
+/// queries. It can panic when queried.
 struct ReportingWriteQueue {
     inner: FixtureWriteQueue,
     saturation: Rc<Cell<bool>>,
@@ -9234,7 +9227,7 @@ enum StraddledBlock {
 /// Holds stream 1, a GET, sends the first half of stream 3's header block, drains the session,
 /// and sends the rest of the block once the final GOAWAY is out, so the draining server refuses
 /// stream 3 itself. Returns what the server wrote, its transcript digest, the refused streams it
-/// still remembered after its last parse and the most it remembered at once, and how the run
+/// still remembered after its last parse and the most it remembered at one time, and how the run
 /// ended.
 async fn straddled_refusal(
     context: WorkerContext,
@@ -10101,7 +10094,7 @@ fn owned_h2_transcripts_are_unchanged() {
             (9, 11_231_806_118_693_533_887),
             (10, 7_227_848_528_293_173_899)
         ],
-        "downstream transcripts recorded at 775385963702; read: {read:#?}; written: {written:#?}"
+        "downstream transcripts are unchanged; read: {read:#?}; written: {written:#?}"
     );
     assert_transcript_scenario(&read, &written);
     assert_eq!(run, Ok(()), "the downstream session closes cleanly at EOF");
@@ -10112,16 +10105,16 @@ fn owned_h2_transcripts_are_unchanged() {
             (9, 3_188_096_049_290_309_849),
             (10, 2_096_194_806_515_092_526)
         ],
-        "upstream transcripts recorded at 775385963702; read: {read:#?}; written: {written:#?}"
+        "upstream transcripts are unchanged; read: {read:#?}; written: {written:#?}"
     );
     assert_transcript_scenario(&read, &written);
     assert_eq!(run, Ok(()), "the upstream session closes cleanly at EOF");
 }
 
-/// Receipts an [`InlineWriteQueue`] holds before `can_write` refuses more.
+/// Receipts an [`InlineWriteQueue`] holds before `can_write` returns false.
 const INLINE_OUTSTANDING_WRITES: usize = 8;
 
-/// What an [`InlineWriteQueue`] was given and still owes the session.
+/// What an [`InlineWriteQueue`] accepted, and the completions it has not yet reported.
 #[derive(Default)]
 pub(super) struct InlineWriteState {
     /// The bytes of each accepted write, in order.
@@ -10186,7 +10179,7 @@ impl crate::uniplex::UniplexWriteQueue for InlineWriteQueue {
         self.0.borrow().receipts.is_empty()
     }
 
-    /// The default answer, counted.
+    /// The default result, counted.
     fn is_saturated(&self) -> bool {
         let mut state = self.0.borrow_mut();
         state.saturation_queries += 1;
@@ -10396,7 +10389,7 @@ fn upstream_transcript_is_unchanged_by_unarmed_writes() {
             (9, 3_188_096_049_290_309_849),
             (10, 18_252_902_388_575_904_042)
         ],
-        "unarmed upstream transcripts recorded at da1228fe4a74; read: {read:#?}; written: {written:#?}"
+        "unarmed upstream transcripts are unchanged; read: {read:#?}; written: {written:#?}"
     );
     assert_transcript_scenario(&read, &written);
     assert!(idle_before_ping, "the session is idle before the PING");
@@ -10503,8 +10496,8 @@ impl HttpByteEventCallback for KernelWriteGate {
 
 struct KernelWriteApplication(Rc<KernelWriteGate>);
 
-/// Answers with one body byte that registers a kernel-write event, and ends the
-/// response only once that event is reported. The request stays open.
+/// Sends one body byte that registers a kernel-write event, and ends the response
+/// only once that event is reported. The request stays open.
 struct KernelWriteExchange {
     gate: Rc<KernelWriteGate>,
     sent: bool,
@@ -10636,8 +10629,8 @@ impl ScanControl {
 
 struct ScanApplication(Rc<ScanControl>);
 
-/// Holds its request body and its response until released; a released exchange
-/// stops reading its request with `NO_ERROR` and answers 200 with no body, so a
+/// Holds its request body and its response until released. A released exchange
+/// stops reading its request with `NO_ERROR` and responds 200 with no body, so a
 /// stream whose request has not ended retires without ending or resetting it.
 struct ScanExchange {
     stream: StreamId,
@@ -10716,9 +10709,9 @@ enum ScanStep {
 /// A deterministic sequence of `operations` create (HEADERS without
 /// END_STREAM), END_STREAM (empty DATA), client reset and response steps over at
 /// most 64 open streams, then responses for the streams still open. Returns the
-/// client bytes (the first is the connection preface, read at once; each later
+/// client bytes (the first is the connection preface, read immediately; each later
 /// one sits behind a gate), the steps, and the numbers of streams created,
-/// ended, reset by the client and answered.
+/// ended, reset by the client and responded to.
 fn scan_steps(operations: usize) -> (Vec<Vec<u8>>, Vec<ScanStep>, [usize; 4]) {
     let mut peer = Http2Codec::new(TransportDirection::Upstream);
     let mut preface = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
@@ -10860,7 +10853,7 @@ fn awaiting_ingress_counter_matches_a_scan() {
 /// Scheduler turns a writer-arming check may take before it reports a lost wake.
 pub(super) const WRITER_DRIVE_LIMIT: usize = 20_000;
 
-/// Scheduler turns that let a session settle before a check that nothing more happens.
+/// Scheduler turns a session gets before a check that it does no more work.
 pub(super) const WRITER_SETTLE: usize = 100;
 
 /// Yields up to `WRITER_DRIVE_LIMIT` times for `condition`, so a lost wake fails instead of
@@ -10980,13 +10973,13 @@ impl<F: Future> Future for CountedWakes<F> {
     }
 }
 
-/// How a [`ScriptedWriteQueue`] answers one accepted write.
+/// How a [`ScriptedWriteQueue`] completes one accepted write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ScriptedWrite {
-    /// Physically complete at the transport's next flush, which runs once the session's poll
-    /// returns, as a hosting event loop writes inline when it flushes after its callbacks.
+    /// Completes at the transport's next flush, which runs once the session's poll returns, as
+    /// a hosting event loop writes inline when it flushes after its callbacks.
     Complete,
-    /// Physically outstanding until the test completes or fails it.
+    /// Outstanding until the test completes or fails it.
     Pending,
 }
 
@@ -10996,17 +10989,17 @@ enum ScriptedReceipt {
     Flushing,
     /// Waits for the test.
     Pending,
-    /// Physically complete with this result.
+    /// Completed with this result.
     Settled(Result<(), HttpError>),
 }
 
-/// What a [`ScriptedWriteQueue`] was given and still owes the session.
+/// What a [`ScriptedWriteQueue`] accepted, and the completions it has not yet reported.
 pub(super) struct ScriptedWriteState {
     /// The bytes of each accepted write, in order.
     pub(super) writes: Vec<Vec<u8>>,
     script: VecDeque<ScriptedWrite>,
     after_script: ScriptedWrite,
-    /// Unconsumed receipts the queue holds before `can_write` refuses more.
+    /// Unconsumed receipts the queue holds before `can_write` returns false.
     capacity: usize,
     /// Accepted writes whose receipts are unconsumed, oldest first, with their requested
     /// sizes.
@@ -11019,7 +11012,7 @@ pub(super) struct ScriptedWriteState {
     pub(super) on_write: Option<Box<dyn FnMut()>>,
     /// The fixture's tasks (the flushes and the test's own), joined after the session.
     tasks: Vec<tokio::task::JoinHandle<()>>,
-    /// The queue's `is_saturated` answer; `true`, the trait's default, unless the test clears
+    /// The queue's `is_saturated` result. `true`, the trait's default, unless the test clears
     /// it.
     pub(super) saturated: bool,
     /// The write timeout the queue was acquired with; the fixture never times a write.
@@ -11027,12 +11020,12 @@ pub(super) struct ScriptedWriteState {
 }
 
 impl ScriptedWriteState {
-    /// Answers every write after the script with `answer`.
+    /// Applies `answer` to every write after the script.
     pub(super) fn set_after_script(&mut self, answer: ScriptedWrite) {
         self.after_script = answer;
     }
 
-    /// Accepted writes that are not yet physically complete.
+    /// Accepted writes that are not yet complete.
     pub(super) fn pending(&self) -> usize {
         self.receipts
             .iter()
@@ -11060,8 +11053,8 @@ impl ScriptedWriteState {
     }
 }
 
-/// Settles the oldest `count` physically outstanding writes with `result`, then wakes the
-/// registered writer.
+/// Completes the oldest `count` outstanding writes with `result`, then wakes the registered
+/// writer.
 fn settle_scripted_writes(
     state: &RefCell<ScriptedWriteState>,
     count: usize,
@@ -11086,12 +11079,12 @@ fn settle_scripted_writes(
     }
 }
 
-/// Completes the oldest `count` physically outstanding writes.
+/// Completes the oldest `count` outstanding writes.
 pub(super) fn complete_scripted_writes(state: &RefCell<ScriptedWriteState>, count: usize) {
     settle_scripted_writes(state, count, || Ok(()));
 }
 
-/// Fails the oldest physically outstanding write with `error`.
+/// Fails the oldest outstanding write with `error`.
 pub(super) fn fail_scripted_write(state: &RefCell<ScriptedWriteState>, error: HttpError) {
     settle_scripted_writes(state, 1, || Err(error.clone()));
 }
@@ -11149,9 +11142,9 @@ fn flush_scripted_writes(state: &RefCell<ScriptedWriteState>) {
 }
 
 /// A capacity-only queued writer: it admits writes whatever their size until `capacity`
-/// receipts are unconsumed, completes each write at the next flush or holds it physically
-/// outstanding as its script says, delivers receipts in write order, and wakes only the waker
-/// of the last `poll_complete` that found no completed receipt.
+/// receipts are unconsumed, completes each write at the next flush or holds it outstanding as
+/// its script specifies, delivers receipts in write order, and wakes only the waker of the last
+/// `poll_complete` that found no completed receipt.
 struct ScriptedWriteQueue(Rc<RefCell<ScriptedWriteState>>);
 
 impl crate::uniplex::UniplexWriteQueue for ScriptedWriteQueue {
@@ -11335,7 +11328,7 @@ impl UniplexTransport for ScriptedWriteTransport {
     }
 }
 
-/// Opens the gated [`ArmingExchange`] answers once the test releases them.
+/// Holds [`ArmingExchange`] responses until the test releases them.
 #[derive(Default)]
 struct ResponseGate {
     open: Cell<bool>,
@@ -11352,10 +11345,10 @@ impl ResponseGate {
     }
 }
 
-/// Every exchange holds its request body unread, so the body source never wakes the session,
-/// and answers `200` with a fixed date and no body, ending the response with its head. The
-/// exchange for `held` never answers; with a `gate`, every other answer waits for it. Counts
-/// the exchanges that retire after answering.
+/// Each exchange holds its request body unread, so the body source never wakes the session,
+/// and responds `200` with a fixed date and no body, ending the response with its head. The
+/// exchange for `held` never responds. With a `gate`, every other response waits for it.
+/// Counts the exchanges that retire after responding.
 struct ArmingApplication {
     completes: Rc<Cell<usize>>,
     gate: Option<Rc<ResponseGate>>,
@@ -11441,7 +11434,7 @@ impl OwnedH2Exchange for ArmingExchange {
     }
 }
 
-/// Bytes the session writes to answer with [`ArmingExchange`]: one HEADERS frame.
+/// Bytes the session writes for an [`ArmingExchange`] response: one HEADERS frame.
 const ANSWER_BYTES: usize = 34;
 
 /// The client connection preface and SETTINGS.
@@ -11575,9 +11568,9 @@ fn stream_retirement_waits_for_physical_completion() {
     });
 }
 
-/// While another request stays open, so some stream still awaits ingress, a stream that was
-/// consumed before it answered retires once its response's pending write completes. The
-/// answer comes from the application's own wake, so no self-wake follows the write.
+/// While another request stays open, so some stream still awaits ingress, a stream whose request
+/// was consumed before its response retires once its response's pending write completes. The
+/// response comes from the application's own wake, so no self-wake follows the write.
 #[test]
 fn retirement_behind_an_open_request_waits_for_physical_completion() {
     run_on_worker(|context| {
@@ -11672,7 +11665,7 @@ fn ingress_end_after_an_unarmed_write_arms_the_writer() {
             );
             let requests = Arc::new(tokio::sync::Notify::new());
             // One read takes the open request. The next, which completes when first polled,
-            // takes its END_STREAM in the turn after the one that answers it.
+            // takes its END_STREAM in the turn after the one that produces its response.
             let transport = ScriptedWriteTransport::new(
                 [
                     FixtureRead::Data(preface),
@@ -11689,7 +11682,7 @@ fn ingress_end_after_an_unarmed_write_arms_the_writer() {
                 context,
                 ArmingApplication::new(&completes),
                 transport,
-                // A write limit of exactly the answer's egress starts that write, whole, in the
+                // A write limit of exactly the response's egress starts that write, whole, in the
                 // turn that serializes it, before the turn that reads the END_STREAM.
                 |config| config.io.maximum_write_size = ANSWER_BYTES,
                 &[Arc::clone(&requests)],
@@ -11883,7 +11876,7 @@ fn order_followups(peer: &mut Http2Codec, count: usize, complete: bool) -> Vec<u
 }
 
 /// Bytes of the 65,535-byte response that takes the connection's whole send
-/// credit ahead of the 64 consumer-shaped exchanges.
+/// credit ahead of the 64 exchanges.
 const CREDIT_FILLER: usize = 65_535;
 
 #[test]
@@ -11964,7 +11957,7 @@ fn sixty_four_stream_transcript_is_unchanged() {
     assert_eq!(
         written.digest(),
         (149, 9_009_706_708_975_363_477),
-        "written transcript recorded at 3ef2675c725b; written: {written:#?}"
+        "the written transcript is unchanged; written: {written:#?}"
     );
     assert_eq!(written.count(FrameType::HEADERS, 0), 65);
     assert_eq!(written.count(FrameType::DATA, END_STREAM), 65);
@@ -12055,10 +12048,9 @@ async fn ordered_owner_eof_abort(
     )
 }
 
-/// With `abort_streams_on_eof` (`DIV-055`), an EOF read with requests whose owners
-/// hold their responses fails the connection with `TRANSPORT_EOF`: complete GETs and
-/// incomplete POSTs alike are cancelled in id order, with no 500 for the incomplete
-/// ones, and one GOAWAY carries INTERNAL_ERROR.
+/// With `abort_streams_on_eof`, an EOF read with requests whose owners hold their responses fails
+/// the connection with `TRANSPORT_EOF`. Complete GETs and incomplete POSTs alike are cancelled in
+/// id order, with no 500 for the incomplete ones, and one GOAWAY carries INTERNAL_ERROR.
 #[test]
 fn eof_abort_cancels_open_streams_in_id_order_without_500s_when_enabled() {
     run_on_worker(|context| {
@@ -12206,12 +12198,12 @@ fn eof_inside_a_request_head_above_the_final_goaway_closes_cleanly_when_enabled(
     });
 }
 
-/// Serialized output is kept only best-effort (`DIV-055`). The owned driver serializes into
-/// its egress buffer while a write is held, so an endless response can fill the buffer and
-/// leave no room for the abort's GOAWAY. The driver then aborts at once: the exchange is
-/// cancelled, the transport is reset while the write is still held, and nothing serialized
-/// after that write is written. (`UniplexSession` serializes only between writes, and
-/// ignores a GOAWAY that does not fit.)
+/// With `abort_streams_on_eof`, serialized output is kept only best-effort. The owned driver
+/// serializes into its egress buffer while a write is held, so an endless response can fill the
+/// buffer and leave no room for the abort's GOAWAY. The driver then aborts immediately: the
+/// exchange is cancelled, the transport is reset while the write is still held, and the bytes
+/// serialized after that write are never written. (`UniplexSession` serializes only between
+/// writes, and ignores a GOAWAY that does not fit.)
 #[test]
 fn eof_abort_without_room_for_its_goaway_resets_at_once() {
     run_on_worker(|context| {
@@ -12466,7 +12458,7 @@ fn initial_window_change_reaches_every_stream() {
     assert_eq!(
         written.digest(),
         (8, 8_117_510_642_420_668_309),
-        "overflow transcript recorded at 3ef2675c725b; written: {written:#?}"
+        "the overflow transcript is unchanged; written: {written:#?}"
     );
     assert_eq!(run, Err(HttpErrorCode::FLOW_CONTROL_ERROR));
 }
@@ -12483,7 +12475,7 @@ struct HeldYield {
 }
 
 /// Holds every later `yield_to_io` of a [`FoldHost`] on this thread until
-/// [`release_held_yields`], so a budget yield wakes nothing by itself.
+/// [`release_held_yields`], so a budget yield does not wake the session by itself.
 fn hold_yields() {
     HELD_YIELDS.set(Some(Vec::new()));
 }
@@ -12765,8 +12757,8 @@ fn peer_posts(bodies: &[PeerBody]) -> Vec<u8> {
 }
 
 /// Reads the retained bodies outside the session's poll, one group of back-to-back reads per
-/// step. Returns the WINDOW_UPDATEs on the wire after each step has had 16 scheduler turns to
-/// settle, and the written transcript after the last step.
+/// step. Returns the WINDOW_UPDATEs on the wire after each step has had 16 scheduler turns,
+/// and the written transcript after the last step.
 fn window_updates_after_reads(
     bodies: Vec<PeerBody>,
     reads: Vec<Vec<usize>>,
@@ -12886,7 +12878,7 @@ fn window_update_offsets_are_unchanged_around_the_threshold() {
         .collect();
     assert!(
         mismatches.is_empty(),
-        "transcripts recorded at 7eddd4a0506c: {mismatches:#?}"
+        "the transcripts are unchanged: {mismatches:#?}"
     );
 }
 
@@ -12981,8 +12973,8 @@ fn folded_credit_precedes_rejected_data_parsed_in_the_next_poll() {
                 .await;
                 assert!(reset, "R is reset, so its later DATA is rejected");
                 settle_turns(16).await;
-                // D's 1,000 B are read while the session is idle, and the session settles
-                // before R's 40,000 B arrive in the next read.
+                // D's 1,000 B are read while the session is idle, and the session finishes its
+                // work before R's 40,000 B arrive in the next read.
                 let d = Rc::clone(&probes.borrow()[0]);
                 let mut d = d.held_body.borrow_mut().take().unwrap();
                 assert_eq!(read_buffered_body(&mut d), 1_000);
@@ -13006,7 +12998,7 @@ fn folded_credit_precedes_rejected_data_parsed_in_the_next_poll() {
             vec![connection_update(41_000)],
             (4, 4_371_259_458_476_961_168)
         ),
-        "transcript recorded at 7eddd4a0506c"
+        "the transcript is unchanged"
     );
 }
 
@@ -13108,7 +13100,7 @@ fn credit_behind_a_queued_owner_is_not_folded() {
             vec![connection_update(40_000)],
             (3, 10_471_453_527_199_536_510)
         ),
-        "D's read wakes the session as before; transcript recorded at 7eddd4a0506c"
+        "D's read wakes the session; the transcript is unchanged"
     );
 }
 
@@ -13227,7 +13219,7 @@ fn late_request_data_after_a_folded_end_is_ignored() {
     assert_eq!(
         written,
         (3, 10_517_397_198_046_951_649),
-        "transcript recorded at 7eddd4a0506c"
+        "the transcript is unchanged"
     );
 }
 
@@ -13312,8 +13304,7 @@ fn completion_inside_the_owner_poll_is_not_folded() {
             vec![connection_update(40_000)],
             (5, 12_085_380_293_361_417_345)
         ),
-        "credit and completions inside owner polls keep their order; transcript recorded at \
-         7eddd4a0506c"
+        "credit and completions inside owner polls keep their order; the transcript is unchanged"
     );
     let written = run_on_fold_worker(|context| {
         Box::pin(async move {
@@ -13370,7 +13361,7 @@ fn completion_inside_the_owner_poll_is_not_folded() {
     assert_eq!(
         written,
         (3, 10_517_397_198_046_951_649),
-        "transcript recorded at 7eddd4a0506c"
+        "the transcript is unchanged"
     );
 }
 
@@ -13401,7 +13392,7 @@ fn credit_during_a_budget_yield_is_not_folded() {
                 ..OwnerPollGate::default()
             });
             // 64 one-byte bodies fill one turn budget of owner polls; then A (40,000 B) and
-            // B (20,000 B). Nothing is ever read from the 64.
+            // B (20,000 B). The 64 bodies are never read.
             let mut bodies = vec![(1, 16_384, None); 64];
             bodies.extend([(40_000, 16_384, None), (20_000, 16_384, None)]);
             let (transport, state) =
@@ -13460,7 +13451,7 @@ fn credit_during_a_budget_yield_is_not_folded() {
                 wakers[64].wake_by_ref();
 
                 // One poll spends its turn budget on the 64 and yields, with A still queued;
-                // the held yield wakes nothing.
+                // the held yield does not wake the session.
                 hold_yields();
                 poll();
                 assert_eq!(
@@ -13519,7 +13510,7 @@ fn credit_during_a_budget_yield_is_not_folded() {
             vec![connection_update(40_000)],
             (3, 10_471_453_527_199_536_510)
         ),
-        "B's read wakes the session as before; transcript recorded at 7eddd4a0506c"
+        "B's read wakes the session; the transcript is unchanged"
     );
 }
 
@@ -13799,7 +13790,7 @@ fn deferred_completion_still_sends_a_pending_error_response() {
     assert_eq!(
         written,
         (3, 9_837_321_972_108_583_545),
-        "transcript recorded at 7eddd4a0506c"
+        "the transcript is unchanged"
     );
 }
 
@@ -14174,8 +14165,8 @@ const RETIREMENT_INPUTS: [RetirementInput; 5] = [
 
 #[test]
 fn downstream_transcripts_are_unchanged_by_early_retirement() {
-    // `None` keeps the default answer, so every stream keeps its fence; `Some(false)` lets
-    // eligible streams retire at END_STREAM serialization.
+    // `None` keeps the default `is_saturated`, so every stream keeps its fence. `Some(false)`
+    // lets eligible streams retire at END_STREAM serialization.
     for (unsaturated, completed_while_held) in [(false, [0, 0, 0, 0, 0]), (true, [0, 0, 1, 2, 0])] {
         let runs: Vec<_> = RETIREMENT_INPUTS
             .into_iter()
@@ -14207,7 +14198,7 @@ fn downstream_transcripts_are_unchanged_by_early_retirement() {
                 ((8, 15_476_332_832_309_872_086), Ok(())),
                 ((6, 11_756_098_851_954_770_615), Ok(())),
             ],
-            "downstream transcripts recorded at 9d58c4aa0c67 (unsaturated: {unsaturated}); \
+            "downstream transcripts are unchanged (unsaturated: {unsaturated}); \
              written (type, flags, stream, length): {:?}",
             runs.iter()
                 .map(|(_, _, _, written)| written
@@ -14233,8 +14224,8 @@ fn write_queue_defaults_to_saturated() {
     );
 }
 
-/// A downstream session over a [`ReportingWriteQueue`] answering from `saturation`, whose
-/// writes the script releases; each exchange answers 128 bytes.
+/// A downstream session over a [`ReportingWriteQueue`] that reports `saturation`, whose
+/// writes the script releases. Each exchange responds with 128 bytes.
 fn reporting_session(
     context: WorkerContext,
     reads: Vec<FixtureRead>,
@@ -14644,13 +14635,12 @@ fn write_failure_after_retirement_leaves_the_stream_complete() {
     });
 }
 
-/// A downstream session with no stream left does not arm the writer for the completion of a
-/// write nothing waits for (`DIV-028`). Every write completes at the transport's flush, after
-/// the session's poll, and the queue is unsaturated, so each GET's stream retires when its
-/// END_STREAM is serialized. The third of three sequential GETs then takes two polls and two
-/// wakes: the read's wake, and the request source's self-wake inside the poll that reads the
-/// GET. No wake follows the response's write. The receipt it leaves is consumed before the
-/// session ends at EOF.
+/// Once every stream has retired, a downstream session does not arm the writer for the completion
+/// of a write. Every write completes at the transport's flush, after the session's poll, and the
+/// queue is unsaturated, so each GET's stream retires when its END_STREAM is serialized. The
+/// third of three sequential GETs then takes two polls and two wakes: the read's wake, and the
+/// request source's self-wake inside the poll that reads the GET. The response's write is not
+/// followed by a wake, and the receipt it leaves is consumed before the session ends at EOF.
 #[test]
 fn retired_downstream_stream_needs_no_write_completion_poll() {
     run_on_worker(|context| {
@@ -14797,8 +14787,8 @@ fn trailer_fields(wire: &[u8], stream: u32) -> Option<Vec<HpackHeader>> {
         .map(|(_, _, _, fields)| fields)
 }
 
-/// Runs one GET on stream 1 whose exchange answers `reply`, and returns the bytes written
-/// once the exchange has completed and the session has settled.
+/// Runs one GET on stream 1 whose exchange responds with `reply`, and returns the bytes written
+/// once the exchange has completed and the session has run its pending work.
 async fn single_reply_wire(context: WorkerContext, reply: Reply) -> Vec<u8> {
     let mut peer = Http2Codec::new(TransportDirection::Upstream);
     let (transport, state) =
@@ -15362,8 +15352,8 @@ fn drain_close_polls_the_read_again_after_cancelling_it() {
     });
 }
 
-/// Runs one downstream connection fed `input` then EOF, observed by a recording probe, each of
-/// `requests` requests answered with an empty 200. Returns the events and the run's outcome.
+/// Runs one downstream connection fed `input` then EOF, observed by a recording probe, with an
+/// empty 200 for each of `requests` requests. Returns the events and the run's outcome.
 async fn owned_lifecycle(
     context: WorkerContext,
     input: Vec<u8>,
@@ -15565,7 +15555,7 @@ fn owned_h2_lifecycle_order_matches_uniplex_get() {
 
 /// The events both drivers report alike: everything but writes, whose coalescing differs,
 /// flow-window transitions, and the detach and deactivation, which the owned driver reports at
-/// retirement (`DIV-051`) and which are returned separately.
+/// retirement and which are returned separately.
 fn comparable_lifecycle(events: &[LifecycleEvent]) -> (Vec<LifecycleEvent>, Vec<LifecycleEvent>) {
     events
         .iter()
@@ -15961,7 +15951,7 @@ fn owned_h2_unrun_session_reports_destroy_and_drops_observer() {
     });
 }
 
-/// Panics the first time it sees `TransactionAttached`.
+/// Panics on the first `TransactionAttached` it receives.
 struct PanicOnAttach {
     panicked: Cell<bool>,
 }
@@ -15974,8 +15964,8 @@ impl LifecycleObserver for PanicOnAttach {
     }
 }
 
-/// `DIV-051`, `DIV-056`: a lifecycle observer panic aborts the connection, and once cleanup has
-/// joined the run returns `Err(INTERNAL_ERROR)`; the panic is reported at Connection scope.
+/// A lifecycle observer panic aborts the connection, and once cleanup has joined the run
+/// returns `Err(INTERNAL_ERROR)`. The panic is reported at Connection scope.
 #[cfg(panic = "unwind")]
 #[test]
 fn owned_h2_observer_panic_aborts_after_cleanup() {
@@ -16043,7 +16033,7 @@ fn owned_h2_observer_panic_aborts_after_cleanup() {
     });
 }
 
-/// Panics the first time it sees `event`.
+/// Panics on the first `event` it receives.
 struct PanicOnEvent {
     event: LifecycleEvent,
     panicked: Cell<bool>,
@@ -16057,10 +16047,10 @@ impl LifecycleObserver for PanicOnEvent {
     }
 }
 
-/// `DIV-051`, `DIV-056`: the peer's EOF retires the one stream and closes the connection in the
-/// poll that completes the run, so its last events reach the observers only as the run
-/// completes. An observer panic on one of them still fails the run with `INTERNAL_ERROR`, as one
-/// at the end of a poll does, and is reported once at Connection scope.
+/// The peer's EOF retires the one stream and closes the connection in the poll that completes
+/// the run, so its last events reach the observers only as the run completes. An observer panic
+/// on one of them still fails the run with `INTERNAL_ERROR`, as one at the end of a poll does,
+/// and is reported once at Connection scope.
 #[cfg(panic = "unwind")]
 #[test]
 fn owned_h2_observer_panic_at_completion_fails_the_run() {
@@ -16111,7 +16101,7 @@ fn owned_h2_observer_panic_at_completion_fails_the_run() {
     }
 }
 
-/// Records each event it sees, tagged with its own number.
+/// Records each event it receives, tagged with its own number.
 struct TaggedProbe {
     tag: u8,
     seen: Rc<RefCell<Vec<(u8, LifecycleEvent)>>>,
@@ -16205,7 +16195,7 @@ fn owned_h2_default_path_has_no_observation() {
     });
 }
 
-// Opt-in flood limits (`DIV-052`).
+// Flood limits.
 
 /// Every category unbounded except the ones the caller sets.
 fn unbounded_rates() -> Http2RateLimitConfig {
@@ -16241,9 +16231,9 @@ fn exchange_outcomes(probes: &RefCell<Vec<Rc<Probe>>>) -> Vec<ExchangeOutcome> {
         .collect()
 }
 
-/// Runs one downstream connection fed `reads` with `rate_limits`, each of `requests` requests
-/// answered with an empty 200. Returns the server's frames, the exchanges' outcomes, the run's
-/// outcome and how the transport closed.
+/// Runs one downstream connection fed `reads` with `rate_limits`, with an empty 200 for each of
+/// `requests` requests. Returns the server's frames, the exchanges' outcomes, the run's outcome
+/// and how the transport closed.
 async fn rate_limited_run(
     context: WorkerContext,
     reads: Vec<FixtureRead>,
@@ -16544,7 +16534,7 @@ fn owned_header_rate_limit_drains_without_resetting_the_crossing_stream() {
     assert_eq!(
         written.goaways,
         [(StreamId::new(3), H2ErrorCode::NO_ERROR)],
-        "one final GOAWAY covers the crossing stream, as Proxygen's RateLimitFilter sends"
+        "one final GOAWAY covers the crossing stream"
     );
     assert_eq!(written.header_statuses, [(StreamId::new(1), 200)]);
     assert_eq!(probes[0].completed, 1);
@@ -17046,9 +17036,8 @@ pub(super) fn on_both_hosts(case: HostCase) {
     crate::external_host_tests::run_on_host_with(case);
 }
 
-/// An idle connection drains at its read timeout, not a millisecond earlier, as Proxygen's read
-/// timeout calls `initiateDrain`. With a zero GOAWAY timeout both GOAWAYs go out at once, then
-/// the connection closes.
+/// An idle connection drains at its read timeout, not a millisecond earlier. With a zero GOAWAY
+/// timeout both GOAWAYs go out immediately, then the connection closes.
 #[test]
 fn idle_connection_drains_at_its_read_timeout() {
     on_both_hosts(|host, context| {
@@ -17178,9 +17167,9 @@ fn data_at_the_read_deadline_beats_the_idle_timeout() {
     });
 }
 
-/// An idle drain keeps Proxygen's grace: it sends GOAWAY(2^31-1), serves a request that arrives
+/// An idle drain keeps a grace period: it sends GOAWAY(2^31-1), serves a request that arrives
 /// before the GOAWAY timeout, sends the final GOAWAY exactly at that timeout, then closes.
-/// `UniplexSession` refuses streams during an idle drain instead (`DIV-028`).
+/// `UniplexSession` refuses streams during an idle drain instead.
 #[test]
 fn idle_drain_keeps_grace_until_the_goaway_timeout() {
     on_both_hosts(|host, context| {
@@ -17238,7 +17227,7 @@ fn idle_drain_keeps_grace_until_the_goaway_timeout() {
     });
 }
 
-/// A local drain honors a nonzero downstream GOAWAY timeout. While the final GOAWAY waits, turns
+/// A local drain applies a nonzero downstream GOAWAY timeout. While the final GOAWAY waits, turns
 /// read no clock, and on a wheel host the wait creates no host sleep.
 #[test]
 fn local_drain_waits_the_goaway_timeout_without_reading_the_clock() {
@@ -17379,15 +17368,14 @@ fn active_connection_restamps_one_read_idle_slot() {
     });
 }
 
-/// The clock reads of the zero-config guard: a GET round trip, as on the parent commit, and that
-/// round trip plus a local drain with a zero GOAWAY timeout, one fewer than the parent's 3: the
-/// final GOAWAY no longer rereads the clock to find the zero timeout passed.
+/// The clock reads of the zero-config guard: a GET round trip, and that round trip plus a local
+/// drain with a zero GOAWAY timeout. The final GOAWAY does not reread the clock to check that the
+/// zero timeout passed.
 const ZERO_CONFIG_ROUND_TRIP_NOW_READS: usize = 1;
 const ZERO_CONFIG_DRAIN_NOW_READS: usize = 2;
 
 /// With every timeout zero the driver installs no timer: a request round trip and a drain take no
-/// wheel slot, create no host sleep, and read the clock no more often than before the driver
-/// honored timeouts.
+/// wheel slot, create no host sleep, and read the clock no more often than the constants above.
 #[test]
 fn zero_timeouts_take_no_slot_sleep_or_clock_read() {
     on_both_hosts(|host, context| {
@@ -17463,7 +17451,7 @@ pub(super) fn run_on_paused_worker<T: Send + 'static>(
 enum DrainStart {
     /// The connection idles until its read timeout drains it.
     Idle,
-    /// The application drains the connection at once.
+    /// The application drains the connection immediately.
     Local,
 }
 
@@ -17689,9 +17677,9 @@ fn assert_same_goaways(owned: &[(u64, StreamId)], uniplex: &[(u64, StreamId)]) {
 /// Downstream drains of an idle connection, owned against `UniplexSession` on the same paused
 /// clock: a local drain, and an idle drain with a zero and with a nonzero GOAWAY timeout, write
 /// the same GOAWAYs at the same instants, and a request inside a local drain's grace is served
-/// by both. A request inside an idle drain's grace is served by the owned driver, as Proxygen's
-/// read timeout (`initiateDrain`) keeps the grace, while `UniplexSession` keeps grace only for a
-/// local drain and refuses it (`DIV-028`).
+/// by both. A request inside an idle drain's grace is served by the owned driver, which keeps
+/// the grace for an idle drain too, while `UniplexSession` keeps grace only for a local drain and
+/// refuses it.
 #[test]
 fn owned_drain_goaways_match_uniplex_apart_from_idle_grace() {
     let half = GRACE / 2;
@@ -17735,7 +17723,7 @@ fn owned_drain_goaways_match_uniplex_apart_from_idle_grace() {
         }
         assert_eq!(owned.header_statuses, [(StreamId::new(1), 200)]);
         assert!(owned.resets.is_empty());
-        // Until `UniplexSession` keeps grace for an idle drain, it refuses the request, and with
+        // `UniplexSession` does not keep grace for an idle drain. It refuses the request, with
         // PROTOCOL_ERROR rather than REFUSED_STREAM.
         assert!(uniplex.header_statuses.is_empty());
         assert_eq!(
@@ -17766,8 +17754,8 @@ fn drains_started(events: &[LifecycleEvent]) -> Vec<LifecycleEvent> {
         .collect()
 }
 
-/// An observer sees an idle drain as `DrainStarted(IdleTimeout)`, once: the read idle expiries
-/// that follow while the drain waits out its GOAWAY timeout report nothing more.
+/// An observer receives an idle drain as `DrainStarted(IdleTimeout)`, once. The read idle
+/// expiries that follow while the drain waits out its GOAWAY timeout report no further event.
 #[test]
 fn an_idle_drain_reports_one_idle_timeout_drain() {
     on_both_hosts(|host, context| {
@@ -17813,12 +17801,11 @@ fn an_idle_drain_reports_one_idle_timeout_drain() {
     });
 }
 
-/// On a connection with a read idle timeout and a GOAWAY timeout, an observer sees a header-rate
-/// breach as `DrainStarted(HeaderRateLimit)`, and C7's one final GOAWAY is all the wire gets: it
-/// disarms nothing that could send a second one, and a later read idle expiry starts no drain.
-/// The accepted stream's response holds its end after one body byte while the clock passes the
-/// GOAWAY timeout and then the read idle timeout, so the connection is still in its final drain
-/// when both would fire.
+/// On a connection with a read idle timeout and a GOAWAY timeout, an observer receives a
+/// header-rate breach as `DrainStarted(HeaderRateLimit)`, and the wire gets only the breach's one
+/// final GOAWAY. A later read idle expiry does not start a drain. The accepted stream's response
+/// holds its end after one body byte while the clock passes the GOAWAY timeout and then the read
+/// idle timeout, so the connection is still in its final drain when both would fire.
 #[test]
 fn a_header_rate_limit_trip_on_a_timed_connection_reports_one_drain() {
     on_both_hosts(|host, context| {
@@ -17879,10 +17866,10 @@ fn a_header_rate_limit_trip_on_a_timed_connection_reports_one_drain() {
     });
 }
 
-/// A connection without an observer creates no `Observation` (C4's zero-config path), on both
-/// hosts: not for requests served to EOF or a local drain with every timeout zero, nor for an
-/// idle drain on a timed connection, whose `DrainStarted(IdleTimeout)` has nobody to go to.
-/// Adding an observer creates exactly one.
+/// A connection without an observer creates no `Observation`, on both hosts: not for requests
+/// served to EOF or a local drain with every timeout zero, nor for an idle drain on a timed
+/// connection, whose `DrainStarted(IdleTimeout)` has no observer to receive it. Adding an
+/// observer creates exactly one.
 #[test]
 fn unobserved_connections_create_no_observation() {
     on_both_hosts(|host, context| {
@@ -17931,8 +17918,8 @@ fn unobserved_connections_create_no_observation() {
     });
 }
 
-/// The write timeout of the write-timer tests: Proxygen's `writeTimeout_`, which bounds a stalled
-/// transport write and the writer's wait for flow-control credit.
+/// The write timeout of the write-timer tests. It bounds a stalled transport write and the
+/// writer's wait for flow-control credit.
 const WRITE: Duration = Duration::from_secs(1);
 
 /// How a downstream driver's session ended once its transport stopped accepting writes.
@@ -17991,7 +17978,7 @@ async fn stalled_write_end(context: WorkerContext, owned: bool) -> StalledWriteE
 }
 
 /// The owned driver hands its write timeout to the transport, which arms it only while a write
-/// pends: a transport that accepts nothing fails the connection with `WRITE_TIMEOUT` and resets
+/// pends: a transport that accepts no write fails the connection with `WRITE_TIMEOUT` and resets
 /// it, at the instant and in the way `UniplexSession` does.
 #[test]
 fn owned_write_stall_fails_the_connection_like_uniplex() {
@@ -18017,7 +18004,7 @@ fn owned_write_stall_fails_the_connection_like_uniplex() {
 /// credit the peer leaves on the blocked window.
 const FLOW_BODY: usize = 96 << 10;
 
-/// A downstream session over `reads` answering with `replies`, its other timeouts zero and
+/// A downstream session over `reads` that responds with `replies`, its other timeouts zero and
 /// `write_timeout` as given.
 fn write_timed_session(
     context: WorkerContext,
@@ -18058,8 +18045,8 @@ fn flow_blocked_get(connection_blocked: bool) -> (Http2Codec, Vec<u8>) {
 }
 
 /// A response blocked on its stream's send window is reset with FLOW_CONTROL_ERROR when the
-/// write timeout passes with no activity, not a millisecond earlier, as Proxygen's
-/// `handleWriteEventTimeout` resets every flow-blocked stream; the connection stays open.
+/// write timeout passes with no activity, not a millisecond earlier. The timeout resets every
+/// flow-blocked stream, and the connection stays open.
 #[test]
 fn stream_flow_control_timeout_resets_the_blocked_stream() {
     on_both_hosts(|host, context| {
@@ -18103,8 +18090,8 @@ fn stream_flow_control_timeout_resets_the_blocked_stream() {
 
 /// A response blocked on the connection's send window, with its body waiting, fails the
 /// connection with FLOW_CONTROL_ERROR when the write timeout passes with no activity, not a
-/// millisecond earlier: Proxygen's `handleWriteEventTimeout` raises a connection error when the
-/// connection is out of credit and a stream has queued body.
+/// millisecond earlier. The timeout raises a connection error when the connection is out of
+/// credit and a stream has queued body.
 #[test]
 fn connection_flow_control_timeout_fails_the_connection() {
     on_both_hosts(|host, context| {
@@ -18146,10 +18133,9 @@ fn connection_flow_control_timeout_fails_the_connection() {
     });
 }
 
-/// Activity restarts the flow-control timeout, as each write event restarts Proxygen's writer
-/// wait and Uniplex's `note_flow_timeout_activity` restamps its flow deadline: a PING halfway
-/// through the timeout, and the PING reply written for it, move the stream reset to a full write
-/// timeout after the PING.
+/// Activity restarts the flow-control timeout, as in `UniplexSession`. A PING halfway through the
+/// timeout, and the PING reply written for it, move the stream reset to a full write timeout
+/// after the PING.
 #[test]
 fn activity_restarts_the_flow_control_timeout() {
     on_both_hosts(|host, context| {
@@ -18195,10 +18181,9 @@ fn activity_restarts_the_flow_control_timeout() {
     });
 }
 
-/// A drain requested in the turn that observes the flow-control expiry wins, as Proxygen's
-/// `initiateDrain` signals the writer's write event: its GOAWAYs go out, the stream stays, and
-/// the still-blocked stream is reset a full write timeout later, after which the drained
-/// connection closes.
+/// A drain requested in the turn that observes the flow-control expiry wins and restarts the
+/// flow-control timeout. Its GOAWAYs go out and the stream stays. The still-blocked stream is
+/// reset a full write timeout later, and the drained connection then closes.
 #[test]
 fn a_drain_in_the_expiry_turn_restarts_the_flow_control_timeout() {
     on_both_hosts(|host, context| {
@@ -18465,13 +18450,13 @@ fn owned_flow_control_timeouts_match_uniplex() {
     }
 }
 
-/// `UniplexSession`'s H2 buffer timeout, on the owned axis (`DIV-028`). A response blocked on its
-/// stream window fills Uniplex's egress body queue, which arms a buffer deadline that activity
-/// does not move; a PING halfway through the write timeout moves only the flow deadline, so
-/// Uniplex's buffer timeout fires first and fails the stream's source with READ_TIMEOUT ("timed
-/// out waiting for buffer space"). The owned driver reads response body only within credit and
-/// has no egress body queue to time: the PING restarts its flow-control timeout, which resets the
-/// stream with FLOW_CONTROL_ERROR a full write timeout after the PING.
+/// `UniplexSession`'s HTTP/2 buffer timeout becomes a flow-control timeout on the owned driver.
+/// A response blocked on its stream window fills Uniplex's egress body queue, which arms a buffer
+/// deadline that activity does not move. A PING halfway through the write timeout moves only the
+/// flow deadline, so Uniplex's buffer timeout fires first and fails the stream's source with
+/// READ_TIMEOUT ("timed out waiting for buffer space"). The owned driver reads response body only
+/// within credit and has no egress body queue to time. The PING restarts its flow-control
+/// timeout, which resets the stream with FLOW_CONTROL_ERROR a full write timeout after the PING.
 #[test]
 fn uniplex_buffer_timeout_is_a_flow_control_timeout_on_the_owned_driver() {
     // Enough that what the window holds back fills Uniplex's 65,535-byte egress body queue.
@@ -18529,7 +18514,7 @@ fn st6b_stream_blocked_gets(streams: usize) -> (Http2Codec, Vec<u8>) {
     (peer, input)
 }
 
-/// A SETTINGS change of the initial window adjusts every stream's window at once (the table's
+/// A SETTINGS change of the initial window adjusts every stream's window together (the table's
 /// `iter_mut`, which refreshes the whole flow index). Streams that the change unblocks by one
 /// byte and that then block again keep the flow slot, restamped at the change: they are reset a
 /// full write timeout after it, not a millisecond earlier.
@@ -18676,10 +18661,10 @@ fn flow_index_overflow_refreshes_every_stream() {
     });
 }
 
-/// A SETTINGS change to an initial window that the open streams have already used up blocks
-/// every one of them on its own window, though none has a body waiting and none is polled or
-/// serialized again (the window change reaches them only through the stream table's `iter_mut`):
-/// each is reset with FLOW_CONTROL_ERROR a full write timeout after the change.
+/// A SETTINGS change to an initial window that the open streams have already used up blocks each
+/// of them on its own window. The streams have no body waiting and are not polled or serialized
+/// again, so the change reaches them only through the stream table's `iter_mut`. Each is reset
+/// with FLOW_CONTROL_ERROR a full write timeout after the change.
 #[test]
 fn initial_window_shrink_blocks_idle_open_streams_at_the_flow_timeout() {
     const STREAMS: usize = 4;
@@ -18813,8 +18798,8 @@ fn connection_credit_cut_short_by_the_stream_window_arms_the_stream_flow_timeout
 
 /// A mass unblock: one read of WINDOW_UPDATE frames, in ascending stream order, unblocks every
 /// idle stream that a SETTINGS change blocked on its own window. The next idle check refreshes
-/// the flow index in one full pass instead of taking the streams out of its sets one by one, and
-/// finds what a pass over the streams finds: nothing blocked, so no stream is reset.
+/// the flow index in one full pass instead of taking the streams out of its sets one by one. It
+/// gets the same result as a pass over the streams and does not reset any of them.
 #[test]
 fn flow_index_refreshes_in_full_after_a_mass_unblock() {
     const STREAMS: usize = 100;
@@ -18975,8 +18960,8 @@ fn staggered_blocked_streams_hold_one_flow_slot() {
 }
 
 /// A flow-blocked stream that gets credit and retires at its END_STREAM serialization, before its
-/// write completes (`DIV-028`), leaves nothing for the flow-control timeout: the slot is disarmed
-/// and never fires.
+/// write completes, leaves the flow-control timeout without a stream to reset: the slot is
+/// disarmed and never fires.
 #[test]
 fn flow_slot_disarms_when_the_blocked_stream_retires_early() {
     crate::external_host_tests::run_on_wheel_host_with(|host, context| {
@@ -19066,12 +19051,12 @@ fn queued_body_bytes(queue: &RefCell<QueuedWriteProbe>) -> usize {
 }
 
 /// The clock reads of a flow-blocked GET, a PING, the credit that unblocks the response and a
-/// drain, with every timeout zero: 2, as on the parent commit, which had no flow-control timer.
+/// drain, with every timeout zero. This is the count without any flow-control timer.
 const ZERO_CONFIG_BLOCKED_NOW_READS: usize = 2;
 
-/// With a zero write timeout a flow-blocked response arms nothing: no slot, no host sleep, and no
-/// clock read beyond the parent's, however long it stays blocked and however often the
-/// connection polls meanwhile.
+/// With a zero write timeout a flow-blocked response arms no timer: no slot, no host sleep, and
+/// no clock read beyond `ZERO_CONFIG_BLOCKED_NOW_READS`, however long it stays blocked and
+/// however often the connection polls meanwhile.
 #[test]
 fn zero_write_timeout_blocked_stream_takes_no_slot_sleep_or_clock_read() {
     on_both_hosts(|host, context| {
@@ -19134,36 +19119,36 @@ fn zero_write_timeout_blocked_stream_takes_no_slot_sleep_or_clock_read() {
 /// The stream read timeout of the stream-read-timeout tests.
 const STREAM_READ: Duration = Duration::from_secs(1);
 
-/// The cleanup a handler awaits after its request body read times out, before it answers.
+/// The cleanup a handler awaits after its request body read times out, before it responds.
 const CLEANUP: Duration = Duration::from_millis(30);
 
 /// How the request body that stalls is consumed.
 #[derive(Clone, Copy, Debug)]
 enum Stall {
-    /// The application reads the request body before answering.
+    /// The application reads the request body before responding.
     Handler,
     /// The application holds the request body, which the test reads outside the session's poll,
     /// and never produces its response head.
     HeldHeadUnsent,
     /// The application holds the request body, which the test reads outside the session's poll,
-    /// and answers a header-only 200 at once.
+    /// and immediately responds with a header-only 200.
     HeldHeadSent,
-    /// The application answers with its head at once and reads the request body before its
+    /// The application sends its head immediately and reads the request body before its
     /// one-byte response body.
     BodyAfterHead,
     /// No request body stalls: the application's response head fails with `READ_TIMEOUT`, as a
     /// response source whose head read times out does on `UniplexSession`.
     HeadError,
-    /// As `Handler`, but the owned application answers the read timeout with its own 408 head,
+    /// As `Handler`, but the owned application responds to the read timeout with its own 408 head,
     /// in the poll that observed it, as the server's handler adapter does.
     AnsweredHandler,
-    /// The handler reads the request body; when a read times out it awaits this cleanup (a
-    /// sleep, if nonzero), then answers this status with a 4-byte body.
+    /// The handler reads the request body. When a read times out it awaits this cleanup (a
+    /// sleep, if nonzero), then responds with this status and a 4-byte body.
     CleanupThenAnswer(u16, Duration),
 }
 
-/// Reads the request body as `FixtureHandler`; when a read times out, awaits `cleanup` (a sleep,
-/// if nonzero) and answers `status` with the body `rrrr`.
+/// Reads the request body as `FixtureHandler` does. When a read times out, awaits `cleanup` (a
+/// sleep, if nonzero) and responds with `status` and the body `rrrr`.
 struct CleanupThenAnswerHandler {
     status: u16,
     cleanup: Duration,
@@ -19237,7 +19222,7 @@ impl HttpSource for UnsentHead {
     fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {}
 }
 
-/// Holds the request and answers with `head_sent`'s response: a header-only 200 with
+/// Holds the request and responds with `head_sent`'s response: a header-only 200 with
 /// `Content-Length: 0`, as the fixture application's, or `UnsentHead`.
 struct HoldingHandler {
     held: Rc<RefCell<Option<HttpSourceHolder>>>,
@@ -19267,7 +19252,7 @@ impl HttpHandler for HoldingHandler {
     }
 }
 
-/// Answers a 200 with `Content-Length: 1` at once and reads the request body, awaiting each
+/// Sends a 200 with `Content-Length: 1` immediately and reads the request body, awaiting each
 /// suspend's resume, before its one body byte.
 struct BodyAfterHeadHandler;
 
@@ -19359,7 +19344,7 @@ async fn read_held_body(
 
 /// Serves `input` on the owned driver (the fixture application) or on `UniplexSession` (a
 /// handler that does the same), both with `STREAM_READ` as the stream read timeout and every
-/// other timeout zero; `stall` says how the request body is consumed. The application drains
+/// other timeout zero. `stall` selects how the request body is consumed. The application drains
 /// the connection at `drain_at` if it is still open.
 async fn stream_read_wire(
     context: WorkerContext,
@@ -19572,7 +19557,7 @@ fn assert_same_stream_read_wire(owned: &StreamReadWire, uniplex: &StreamReadWire
     assert_eq!(owned.result, uniplex.result);
 }
 
-/// A handler blocked on the request body is answered 408 at the stream read timeout, owned
+/// A request whose handler is blocked on its body gets a 408 at the stream read timeout, owned
 /// against `UniplexSession` on the same paused clock: the same frames at the same instants and
 /// the same bytes, then the same drain. Both handlers read the 5 buffered bytes, then await the
 /// source's suspend event, whose wait times out first (the handler reads on), then the next read
@@ -19599,9 +19584,9 @@ fn stalled_request_body_gets_408_like_uniplex() {
 }
 
 /// A held request body whose read times out outside the application's poll, while the response
-/// head is unsent, is answered 408 as `UniplexSession` answers it when its handler has returned
-/// a response that has not produced its head: the same frames and bytes, and the reader gets
-/// the same read timeout.
+/// head is unsent, gets a 408, as on `UniplexSession` when the handler has returned a response
+/// that has not produced its head. The frames and bytes match, and the reader gets the same read
+/// timeout.
 #[test]
 fn held_request_body_timeout_before_the_head_gets_408_like_uniplex() {
     let (owned, uniplex) = stream_read_wires(Stall::HeldHeadUnsent);
@@ -19660,7 +19645,7 @@ fn request_body_timeout_after_a_sent_head_resets_like_uniplex() {
 
 /// A `READ_TIMEOUT` response head that no request body read caused resets the stream with
 /// INTERNAL_ERROR, as `UniplexSession` resets a stream whose response source fails its head read
-/// with it: only the request body's read timeout is answered 408.
+/// with it. Only a request body read timeout leads to a 408.
 #[test]
 fn response_head_read_timeout_resets_like_uniplex() {
     let (owned, uniplex) = stream_read_wires(Stall::HeadError);
@@ -19677,7 +19662,7 @@ fn response_head_read_timeout_resets_like_uniplex() {
     assert_same_stream_read_wire(&owned, &uniplex);
 }
 
-/// An application that answers the request body's read timeout with its own 408 head in the
+/// An application that responds to the request body's read timeout with its own 408 head in the
 /// poll that observed it, as the server's handler adapter does, gets the same wire as
 /// `UniplexSession`: one 408 and no RST_STREAM after it. The read timeout is handled before the
 /// polled head, as the session core handles the source's completion before the handler result.
@@ -19688,9 +19673,9 @@ fn application_408_for_a_stalled_request_body_matches_uniplex() {
     assert_same_stream_read_wire(&owned, &uniplex);
 }
 
-/// A running handler whose request body read times out keeps running: its own 408, answered
-/// after a cleanup, goes out with its body, as `UniplexSession` waits for an active handler and
-/// keeps a 408 it answers.
+/// A running handler whose request body read times out keeps running. Its own 408 after a
+/// cleanup goes out with its body, as `UniplexSession` waits for an active handler and keeps the
+/// handler's 408.
 #[test]
 fn running_handlers_own_408_after_a_read_timeout_is_kept_like_uniplex() {
     let (owned, uniplex) = stream_read_wires(Stall::CleanupThenAnswer(408, CLEANUP));
@@ -19712,9 +19697,9 @@ fn running_handlers_own_408_after_a_read_timeout_is_kept_like_uniplex() {
     assert_same_stream_read_wire(&owned, &uniplex);
 }
 
-/// A running handler that answers its request body's read timeout with its own 408 in the poll
-/// that observed it keeps that 408 and its body, as `UniplexSession` handles the source's
-/// completion while the handler is still active, before the handler's result: the driver asks
+/// A running handler that responds to its request body's read timeout with its own 408 in the
+/// poll that observed it keeps that 408 and its body, as `UniplexSession` handles the source's
+/// completion while the handler is still active, before the handler's result. The driver checks
 /// whether the handler ran before that poll, not after it.
 #[test]
 fn running_handlers_own_408_in_the_timed_out_poll_is_kept_like_uniplex() {
@@ -19732,9 +19717,9 @@ fn running_handlers_own_408_in_the_timed_out_poll_is_kept_like_uniplex() {
     assert_same_stream_read_wire(&owned, &uniplex);
 }
 
-/// A running handler whose request body read times out and then answers anything but 408 has
-/// that answer replaced with a bare 408 when it answers, as `UniplexSession` replaces an active
-/// handler's response that is not the expected 408.
+/// If a running handler's request body read times out and the handler then responds with
+/// anything but 408, its response is replaced with a bare 408, as `UniplexSession` replaces an
+/// active handler's response that is not the expected 408.
 #[test]
 fn running_handlers_non_408_after_a_read_timeout_becomes_408_like_uniplex() {
     let (owned, uniplex) = stream_read_wires(Stall::CleanupThenAnswer(200, CLEANUP));
@@ -19756,7 +19741,7 @@ fn running_handlers_non_408_after_a_read_timeout_becomes_408_like_uniplex() {
     assert_same_stream_read_wire(&owned, &uniplex);
 }
 
-/// A downstream session over `reads`, answering with `replies`, with the given stream read
+/// A downstream session over `reads` that responds with `replies`, with the given stream read
 /// timeout and every other timeout zero.
 fn stream_read_timed_session(
     context: WorkerContext,
@@ -19778,7 +19763,7 @@ fn stream_read_timed_session(
     (session, handle, state, probes)
 }
 
-/// An application blocked on a stalled request body is answered 408 at the stream read
+/// A stalled request body that the application is blocked on gets a 408 at the stream read
 /// timeout, not a millisecond earlier, and its exchange is cancelled with the read timeout.
 #[test]
 fn stalled_request_body_gets_408_at_its_stream_read_timeout() {
@@ -19824,11 +19809,10 @@ fn stalled_request_body_gets_408_at_its_stream_read_timeout() {
     });
 }
 
-/// Each wait for request body is timed afresh, as Proxygen's per-read timeout: a body whose
-/// chunks each arrive within the stream read timeout is never answered 408, however long it
-/// takes in all. On a wheel host each armed wait is a store on the stream baton's one slot, with
-/// no host sleep; without a wheel each armed wait takes one host sleep, as before. The stream read
-/// timeout takes no connection slot.
+/// Each wait for request body is timed afresh: a body whose chunks each arrive within the stream
+/// read timeout never gets a 408, however long it takes in all. On a wheel host each armed
+/// wait is a store on the stream baton's one slot, with no host sleep. Without a wheel each armed
+/// wait takes one host sleep. The stream read timeout takes no connection slot.
 #[test]
 fn trickling_request_body_is_timed_per_wait() {
     on_both_hosts(|host, context| {
@@ -19922,11 +19906,12 @@ fn trickling_request_body_is_timed_per_wait() {
 }
 
 /// The clock reads of a POST whose body waits 20 s for its END_STREAM, then a drain, with every
-/// timeout zero, measured on the parent commit, which did not honor stream read timeouts.
+/// timeout zero. This is the count without any stream read timeout.
 const ZERO_CONFIG_WAITING_BODY_NOW_READS: usize = 2;
 
-/// With a zero stream read timeout a request body that the application waits on arms nothing:
-/// no slot, no host sleep, and no clock read beyond the parent's, however long it waits.
+/// With a zero stream read timeout a request body that the application waits on arms no timer:
+/// no slot, no host sleep, and no clock read beyond `ZERO_CONFIG_WAITING_BODY_NOW_READS`, however
+/// long it waits.
 #[test]
 fn zero_stream_read_timeout_takes_no_slot_sleep_or_clock_read() {
     on_both_hosts(|host, context| {
@@ -20049,13 +20034,13 @@ async fn read_frames_until(
 /// exchanges run on one connection, with a PING between them.
 ///
 /// - Each response's END_STREAM waits for a gate that the client releases. The first exchange
-///   then retires as its END_STREAM is serialized, so no stream is open when the write carrying
-///   it starts, and nothing else polls the session. The queue progresses only while the driver
-///   polls it, and only the queue's refusal of more capacity arms the driver's writer for that
-///   write.
+///   then retires as its END_STREAM is serialized, so every stream has retired when the write
+///   carrying it starts, and the session does not get any other wake. The queue progresses only
+///   while the driver polls it, and only a `false` from the queue's `can_write` arms the driver's
+///   writer for that write.
 /// - The second response goes out as one physical write that pends while the client does not
-///   read. That exchange retires as its END_STREAM is serialized (`DIV-028`): its `complete()`
-///   runs while the write carrying its response is still outstanding.
+///   read. That exchange retires as its END_STREAM is serialized, so its `complete()` runs while
+///   the write carrying its response is still outstanding.
 /// - Its native reader and write queue complete without waking, so the driver holds none of
 ///   their polls inline (`IoWake::poll_inline`).
 #[test]
@@ -20448,7 +20433,7 @@ struct SseFeed {
     waker: RefCell<Option<Waker>>,
 }
 
-/// Answers every request with `200 text/event-stream` and a body of the events its feed holds.
+/// Responds to every request with `200 text/event-stream` and a body of the events its feed holds.
 struct SseFeedApplication {
     feeds: Rc<RefCell<Vec<Rc<SseFeed>>>>,
 }
@@ -20571,9 +20556,9 @@ async fn cancel_spawned(
     panic!("the cancelled session did not end");
 }
 
-/// API Proxy's owned-engine session timeouts: stream read 30 s, connection idle 120 s, write
-/// 60 s, GOAWAY 1 s.
-fn api_proxy_timeouts(config: &mut OwnedH2Options) {
+/// Session timeouts typical of a proxy: stream read 30 s, connection idle 120 s, write 60 s,
+/// GOAWAY 1 s.
+fn proxy_timeouts(config: &mut OwnedH2Options) {
     config.io.stream_read_timeout = Duration::from_secs(30);
     config.io.read_timeout = Duration::from_secs(120);
     config.io.write_timeout = Duration::from_secs(60);
@@ -20620,7 +20605,7 @@ fn sse_events_over_inline_write_wakes(streams: usize, events: usize, timed: bool
             };
             let mut config = options(context, transport);
             if timed {
-                api_proxy_timeouts(&mut config);
+                proxy_timeouts(&mut config);
             }
             let (session, handle) = OwnedH2Session::new(application, config).expect("owned H2");
             let (polls, outcome) = spawn_counted(&host, session);
@@ -20672,7 +20657,7 @@ fn sse_events_over_inline_write_wakes(streams: usize, events: usize, timed: bool
 /// A write that completes on its first poll and wakes the session from inside it, as every
 /// `OwnedByteStream` write does, costs no second session poll: the poll that wrote the event
 /// consumed the completion. One session poll and one write per event, with every timeout zero
-/// and with API Proxy's.
+/// and with `proxy_timeouts`.
 #[test]
 fn inline_write_completion_wakes_cost_no_session_poll() {
     for timed in [false, true] {
@@ -20771,7 +20756,7 @@ fn inline_read_completion_wakes_cost_no_session_poll() {
 
 /// The driver holds no wake of a read through a reader, as the native reader completes without
 /// waking. A reader whose reads do wake inline loses only the saving: every wake still reaches the
-/// session, and each read costs a second session poll, as before.
+/// session, and each read costs a second session poll.
 #[test]
 fn inline_read_completion_wakes_through_a_reader_still_reach_the_session() {
     assert_eq!(
@@ -21007,8 +20992,8 @@ impl UniplexTransport for PanickingInlineWrite {
 }
 
 /// A write poll that wakes the session and panics leaves the session to abort, keep polling the
-/// write until it completes, and only then fail the run (`DIV-056`); the wake its pending re-poll
-/// asks for from inside still reaches the session.
+/// write until it completes, and only then fail the run. The wake that its pending re-poll
+/// requests from inside still reaches the session.
 #[cfg(panic = "unwind")]
 #[test]
 fn inline_waking_write_poll_panic_still_joins_the_write() {
@@ -21077,11 +21062,11 @@ async fn small_body_read_wakes_over(context: WorkerContext, inline_wakes: bool) 
     wakes.get()
 }
 
-/// A write that completed with an inline wake leaves its wake marked ready, as before the wake
-/// was held, so on a host that folds credit the session is not quiescent after it: a body read
-/// then wakes the session instead of folding its credit. Over the fixture's own transport, whose
-/// writes complete without waking, the same read folds. This pins current behavior: a change that
-/// clears the stale mark would let the first case fold too, and should invert its expectation.
+/// A write that completed with an inline wake leaves its wake marked ready, so on a host that
+/// folds credit the session is not quiescent after it: a body read then wakes the session instead
+/// of folding its credit. Over the fixture's own transport, whose writes complete without waking,
+/// the same read folds. This checks current behavior: a change that clears the stale mark would
+/// let the first case fold too, and should invert its expectation.
 #[test]
 fn credit_after_an_inline_woken_write_wakes_the_session_as_before() {
     let inline = run_on_fold_worker(|context| Box::pin(small_body_read_wakes_over(context, true)));
@@ -21104,9 +21089,9 @@ struct ServedWindow {
 }
 
 /// Serves `requests` GETs with 128-byte bodies over a transport that reads through a reader and
-/// writes through a queue, neither of whose completions wakes a task, as plaintext TCP's native
-/// reader and write queue do. Each request arrives in a gated read, followed by a connection
-/// WINDOW_UPDATE that is ready on the poll that starts its read.
+/// writes through a queue. Both complete without waking a task, as plaintext TCP's native reader
+/// and write queue do. Each request arrives in a gated read, followed by a connection WINDOW_UPDATE
+/// that is ready on the poll that starts its read.
 fn requests_over_a_reader_and_write_queue(requests: usize) -> ServedWindow {
     run_on_worker(move |context| {
         Box::pin(async move {
@@ -21170,8 +21155,8 @@ fn requests_over_a_reader_and_write_queue(requests: usize) -> ServedWindow {
 }
 
 /// A transport whose reads and writes complete without waking, as plaintext TCP's native reader
-/// and write queue do, costs what it did before `IoWake::poll_inline`: the same session polls and
-/// wakes per request, and no transport poll held inline.
+/// and write queue do, is unaffected by `IoWake::poll_inline`: the same session polls and wakes
+/// per request, and no transport poll is held inline.
 #[test]
 fn reads_and_queued_writes_that_complete_without_waking_poll_nothing_inline() {
     assert_eq!(

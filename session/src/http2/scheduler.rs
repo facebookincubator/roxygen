@@ -24,6 +24,7 @@ struct OrderedStream {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PriorityEntry {
     priority: HttpPriority,
+    // Stays set while the entry is paused, although it then sits in neither queue.
     enqueued: bool,
 }
 
@@ -31,7 +32,6 @@ pub(crate) struct PriorityEntry {
 pub(crate) struct PriorityQueue {
     ordered: [BTreeSet<OrderedStream>; URGENCY_LEVELS],
     incremental: [VecDeque<StreamId>; URGENCY_LEVELS],
-    // Paused entries retain enqueue intent without occupying either queue.
     nonempty_urgencies: u8,
     /// The only queued stream, held outside the urgency queues while they are empty.
     solo: Option<(StreamId, HttpPriority)>,

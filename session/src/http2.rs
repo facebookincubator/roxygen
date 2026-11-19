@@ -46,9 +46,9 @@ pub const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 100;
 
 /// Selects how the session derives its inbound per-stream flow-control window.
 ///
-/// `UniplexSession` and `OwnedH2Session` both honour either mode, and both advertise a
+/// `UniplexSession` and `OwnedH2Session` both support either mode, and both advertise a
 /// non-default `stream_receive_window` when no `INITIAL_WINDOW_SIZE` setting is configured.
-/// `OwnedH2Session` refuses a preserved window that differs from an advertised one.
+/// `OwnedH2Session` rejects a preserved window that differs from an advertised one.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum StreamReceiveWindowMode {
     /// Mirror the final advertised `INITIAL_WINDOW_SIZE` setting.
@@ -58,26 +58,40 @@ pub enum StreamReceiveWindowMode {
     PreserveConfigured,
 }
 
+/// HTTP/2 options for `UniplexSession` and the owned HTTP/2 drivers.
 #[derive(Clone)]
 pub struct Http2SessionConfig {
+    /// SETTINGS entries sent to the peer.
     pub settings: Vec<CodecSetting>,
+    /// The connection-level receive window.
     pub connection_receive_window: u32,
+    /// The per-stream receive window.
     pub stream_receive_window: u32,
+    /// How `stream_receive_window` relates to an advertised `INITIAL_WINDOW_SIZE`.
     pub stream_receive_window_mode: StreamReceiveWindowMode,
+    /// The maximum number of concurrent locally initiated streams.
     pub max_concurrent_outgoing_streams: u32,
+    /// Flood limits on frames the peer sends.
     pub rate_limits: Http2RateLimitConfig,
+    /// Session statistics callback.
     pub stats: Option<Rc<dyn Http2SessionStats>>,
+    /// HPACK statistics callback.
     pub header_codec_stats: Option<Rc<dyn HeaderCodecStats>>,
+    /// Chooses which header fields HPACK adds to the dynamic table.
     pub header_indexing_strategy: Option<Rc<dyn HeaderIndexingStrategy>>,
+    /// Whether a graceful drain sends two GOAWAY frames: one with the maximum stream ID,
+    /// then the final one after `goaway_timeout`.
     pub double_goaway_drain: bool,
+    /// The wait between the first and the final GOAWAY of a double-GOAWAY drain.
     pub goaway_timeout: Duration,
-    /// Experimental PING probes (`DIV-024`); `None`, the default, sends none.
+    /// PING probes that detect an unresponsive peer. `None` (the default) disables them.
     pub ping_probes: Option<PingProbeConfig>,
-    /// Downstream only, default off (`DIV-055`): a peer EOF read while a stream is open (its
-    /// response's END_STREAM not yet serialized, or its request head still arriving) fails the
-    /// connection with `TRANSPORT_EOF` instead of failing only the streams whose request is
-    /// incomplete. `UniplexSession` upstream ignores it; `OwnedH2UpstreamSession::new` refuses
-    /// it.
+    /// Fail the whole connection with `TRANSPORT_EOF` when the peer's EOF arrives while a
+    /// stream is open. Downstream only; off by default.
+    ///
+    /// A stream is open while its response END_STREAM is unserialized or its request head is
+    /// still arriving. When this is off, only the streams with an incomplete request fail.
+    /// Upstream `UniplexSession` ignores it, and `OwnedH2UpstreamSession::new` rejects it.
     pub abort_streams_on_eof: bool,
 }
 

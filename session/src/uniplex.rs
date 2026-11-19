@@ -5,11 +5,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Worker-local HTTP/1 byte-stream session driver.
+//! Worker-local HTTP/1.1 and HTTP/2 session driver over a byte stream.
 //!
 //! HTTP/1.1 writes batch ready events within the configured buffer and write limits.
-//! Upstream HTTP/1.1 polls reads before writes and rejects requests that peer EOF
-//! finds unserialized, leaving retry decisions to the caller (`DIV-035`, `DIV-042`).
+//! Upstream HTTP/1.1 polls reads before writes. A request whose head is still unserialized
+//! when the peer's EOF arrives fails, and retrying it is up to the caller.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -226,37 +226,42 @@ pub struct UniplexWriteCompletion {
     pub result: Result<WriteInfo, TransportWriteError>,
 }
 
-/// An exclusive, bounded byte writer with ordered physical completion receipts.
+/// An exclusive, bounded byte writer that reports write completions in order.
 ///
-/// Operational failures produce receipts, including zero-byte failures. A full
-/// queue retains its capacity until the caller consumes its completed receipts.
+/// Operational failures, including zero-byte failures, also produce completions. A
+/// full queue frees capacity only as the caller consumes completions.
 pub trait UniplexWriteQueue: 'static {
-    /// Reports capacity only; terminal transport state does not hide admission errors.
+    /// Returns whether a write of `bytes` can start now.
+    ///
+    /// This reports capacity only. A terminal transport state does not make it return
+    /// false, so the write is accepted and its error is delivered by `poll_complete`.
     ///
     /// A queue whose writes progress only while `poll_complete` is polled must withhold
     /// capacity while a write is outstanding. Owned HTTP/2 arms its writer for a submission
-    /// only while something waits for the receipt, and a refused capacity is that wait
+    /// only while it waits for the completion, and a `false` here counts as such a wait
     /// (`write_completion_needed`). An unarmed write on such a queue would stall until an
     /// unrelated wake polled the session.
     fn can_write(&self, bytes: usize) -> bool;
-    /// Consumes one capacity-admitted submission. Errors indicate interface misuse;
-    /// transport rejection and cancellation are delivered by `poll_complete`.
+    /// Consumes one capacity-admitted submission. An error means interface misuse.
+    /// Transport rejection and cancellation are delivered by `poll_complete`.
     fn start_write(&mut self, data: BufQueue) -> Result<(), HttpError>;
-    /// Registers the owner waker and consumes the next ordered completion receipt.
+    /// Registers the owner waker and consumes the next completion, in submission order.
     fn poll_complete(&mut self, context: &mut Context<'_>) -> Poll<UniplexWriteCompletion>;
-    /// Includes physically complete submissions whose receipts remain unconsumed.
+    /// Whether every submission's completion has been consumed. A finished write whose
+    /// completion is still unconsumed keeps the queue busy.
     fn is_idle(&self) -> bool;
     /// Whether bytes submitted now would wait behind bytes the transport has not yet accepted:
-    /// a physical write is outstanding, a whole physical write is already queued, or the
-    /// transport can no longer write. Owned HTTP/2 keeps a downstream stream's write fence while
-    /// this holds (`DIV-028`). The default keeps that fence for every queue that cannot answer.
+    /// a transport write is outstanding, a whole transport write is already queued, or the
+    /// transport cannot write anymore. Owned HTTP/2 keeps a downstream stream's write fence
+    /// while this holds. The default returns `true`, which keeps that fence for every queue that
+    /// does not implement this.
     fn is_saturated(&self) -> bool {
         true
     }
 }
 
-/// The native TCP byte stream's queue (`ByteStreamTransport::write_queue`), which answers
-/// `is_saturated` (`DIV-028`, `DIV-029`).
+/// The native TCP byte stream's queue (`ByteStreamTransport::write_queue`), which implements
+/// `is_saturated`.
 impl UniplexWriteQueue for OwnedWriteQueue {
     fn can_write(&self, bytes: usize) -> bool {
         OwnedWriteQueue::can_write(self, bytes)
@@ -282,17 +287,17 @@ impl UniplexWriteQueue for OwnedWriteQueue {
     }
 }
 
-/// An exclusive, poll-based reader: one read at a time, each with `UniplexTransport::read`'s
-/// results, through which a connection's owner reads without a future per read.
+/// An exclusive, poll-based reader that lets a connection's owner read without a future per
+/// read. One read runs at a time and returns `UniplexTransport::read`'s results.
 pub trait UniplexReader: 'static {
     /// Starts a read of at most `maximum` bytes that first offers `allocation_size` bytes. Errors
-    /// indicate interface misuse: a started read has not yet been returned; entry failures are
-    /// delivered by `poll_read`.
+    /// indicate interface misuse, such as a started read that has not been returned yet. Failures
+    /// of the read itself are delivered by `poll_read`.
     fn start_read(&mut self, maximum: usize, allocation_size: usize) -> Result<(), HttpError>;
     /// Registers the owner waker and returns the started read's result once it is ready.
     fn poll_read(&mut self, context: &mut Context<'_>) -> Poll<Result<UniplexRead, HttpError>>;
 
-    /// Starts a read as `start_read` does and polls it at once, as `poll_read` does.
+    /// Starts a read as `start_read` does and polls it immediately, as `poll_read` does.
     fn poll_start_read(
         &mut self,
         context: &mut Context<'_>,
@@ -308,13 +313,13 @@ pub trait UniplexReader: 'static {
     /// Whether the read last returned drained the transport: a read started now would pend, and
     /// the waker of the poll that returned it is woken once the transport is readable, closed,
     /// reset or dropped, or the reader's cancellation is requested. The owner then starts its
-    /// next read only once that waker fires. The default reports nothing.
+    /// next read only once that waker fires. The default returns `false`.
     fn is_drained(&self) -> bool {
         false
     }
 
-    /// Whether the peer's FIN or RST has reached the transport, even behind bytes that no read
-    /// has returned yet. It consumes nothing. The default reports nothing.
+    /// Whether the peer's FIN or RST has reached the transport, even behind bytes that a read
+    /// has not returned yet. It does not consume data. The default returns `false`.
     fn peer_closed(&self) -> bool {
         false
     }
@@ -538,15 +543,24 @@ impl<T: ByteStreamTransport> UniplexTransport for T {
     }
 }
 
+/// Byte-stream and per-stream options for `UniplexSession` and the owned drivers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UniplexConfig {
+    /// Size limit of the ingress and egress buffers, and of an HTTP/1.1 stream's unread body.
     pub buffer_limit: usize,
+    /// The buffered ingress bytes of an HTTP/1.1 stream at which parsing pauses.
     pub ingress_buffer_limit: u32,
+    /// The most bytes one transport read returns.
     pub maximum_read_size: usize,
+    /// The buffer size first offered to each transport read.
     pub read_allocation_size: usize,
+    /// The most bytes in one transport write.
     pub maximum_write_size: usize,
+    /// Idle timeout for each transport read. Zero disables it.
     pub read_timeout: Duration,
+    /// Bounds each wait for a stream's body data. Zero disables it.
     pub stream_read_timeout: Duration,
+    /// Bounds a stalled transport write and a wait for flow-control credit. Zero disables it.
     pub write_timeout: Duration,
     /// Drain unread downstream request bodies through EOM after a graceful consumer
     /// drop, including when an early HTTP/1 response selects connection closure.
@@ -555,48 +569,49 @@ pub struct UniplexConfig {
     /// response can carry `Connection: close`.
     pub wait_for_http1_response_on_drain: bool,
     /// Fail a downstream HTTP/1.1 connection, as a reset does, when the peer's EOF
-    /// arrives while a transaction other than an established tunnel is open, reading past
-    /// a request that closes the connection to see it (`DIV-053`). The owned HTTP/1.1
-    /// downstream driver applies it by the same rules; the owned upstream drivers refuse it,
+    /// arrives while a transaction other than an established tunnel is open. Reads continue
+    /// past a request that closes the connection so that the EOF is seen. The owned HTTP/1.1
+    /// downstream driver applies it by the same rules, the owned upstream drivers reject it,
     /// and owned HTTP/2 ignores it. HTTP/2 sessions use
-    /// `Http2SessionConfig::abort_streams_on_eof` (`DIV-055`).
+    /// `Http2SessionConfig::abort_streams_on_eof`.
     pub abort_exchanges_on_eof: bool,
-    /// Roxygen-only, default off (`DIV-033`): when a stream's ingress is aborted (a
-    /// peer reset, a transport EOF or read error, a connection error), the head and
-    /// body events its source already queued are delivered to the reader, in order,
-    /// before the error, as Hyper's body channel and h2 deliver received data before
-    /// a later error, instead of being discarded. Both directions; the owned HTTP/1.1
-    /// upstream driver and the owned HTTP/2 driver's upstream role honor it, and the other
-    /// owned drivers refuse it.
+    /// Deliver queued ingress before an abort. Off by default. When a stream's ingress is
+    /// aborted (a peer reset, a transport EOF or read error, a connection error), the head
+    /// and body events its source already queued reach the reader, in order, before the
+    /// error, instead of being discarded. hyper's body channel and h2 also deliver received
+    /// data before a later error. Applies in both directions. The owned HTTP/1.1 upstream
+    /// driver and the owned HTTP/2 driver's upstream role support it, and the other owned
+    /// drivers reject it.
     pub deliver_ingress_before_abort: bool,
-    /// Roxygen-only, default off (`DIV-036`): an upstream HTTP/1.1 request whose head
-    /// ends the message and carries neither `Content-Length` nor a chunked
-    /// `Transfer-Encoding` goes out with no body framing, as Hyper sends a request with
-    /// an empty body, instead of `Transfer-Encoding: chunked` and an empty last chunk
-    /// for a `POST` (`Http1xCodec::set_unframed_bodiless_requests`). Downstream and
-    /// HTTP/2 sessions ignore it; the owned HTTP/1.1 upstream driver honors it.
+    /// Send bodiless upstream HTTP/1.1 requests without body framing. Off by default. A
+    /// request whose head ends the message and carries neither `Content-Length` nor a
+    /// chunked `Transfer-Encoding` goes out unframed, as hyper sends a request with an
+    /// empty body, instead of `Transfer-Encoding: chunked` and an empty last chunk for a
+    /// `POST` (`Http1xCodec::set_unframed_bodiless_requests`). Downstream and HTTP/2
+    /// sessions ignore it, and the owned HTTP/1.1 upstream driver supports it.
     pub unframed_bodiless_http1_requests: bool,
-    /// Roxygen-only, default off (`DIV-038`): set by an owner that enabled
-    /// `OwnedByteStream::enable_non_abortive_close` on the transport. An HTTP/1.1
-    /// body-source error (after the head was serialized) then abandons the output
-    /// serialized but not yet written, so the session closes at once, as hyper drops
-    /// its unflushed buffer and the I/O, instead of draining that output to a peer that
-    /// may have stopped reading. HTTP/2 sessions and the owned drivers ignore it.
+    /// Abandon unwritten HTTP/1.1 output after a body-source error. Off by default.
+    ///
+    /// Set this when the transport has `OwnedByteStream::enable_non_abortive_close` enabled.
+    /// After the head is serialized, a body-source error drops the output that is not yet
+    /// written and the session closes immediately, as hyper drops its unflushed buffer and
+    /// the I/O. Without it, that output drains to a peer that may have stopped reading.
+    /// HTTP/2 sessions and the owned drivers ignore it.
     pub non_abortive_close: bool,
-    /// Roxygen-only, default off (`DIV-040`): HTTP/2 request methods are kept as
-    /// exact, case-sensitive RFC tokens. HTTP/1 always uses llhttp's recognized
-    /// method table (`DIV-057`), independently of this option.
+    /// Keep HTTP/2 request methods as exact, case-sensitive RFC tokens. Off by default.
+    /// HTTP/1 always uses llhttp's recognized method table, independently of this option.
     pub exact_method_tokens: bool,
-    /// Roxygen-only, default off (`DIV-041`): an HTTP/2 session's codec stores every
-    /// decoded field value exactly as decoded, surrounding spaces and tabs included, as h2
-    /// and hyper do, instead of trimming it, and checks values as h2 does (no control byte
-    /// but HTAB, no DEL, a decimal `content-length`, `te: trailers` only), so it never
-    /// accepts a value h2 refuses (`Http2Codec::set_verbatim_field_values`); it also encodes
-    /// the heads it sends with their values as stored, as h2 does. An empty `content-length`
-    /// is kept, and its stream's body is checked against zero, as h2 reads it. HTTP/1.1
-    /// sessions ignore it (they trim optional whitespace, as `httparse` does). The owned
-    /// downstream HTTP/2 driver (`OwnedH2Session`) applies it as a downstream session does;
-    /// the owned upstream HTTP/2 driver refuses it.
+    /// Keep HTTP/2 header values exactly as decoded, as h2 and hyper do. Off by default.
+    ///
+    /// The codec stores every decoded field value with its surrounding spaces and tabs
+    /// instead of trimming it (`Http2Codec::set_verbatim_field_values`), and checks values
+    /// as h2 does, so it never accepts a value that h2 rejects. A value with DEL or a control
+    /// byte other than HTAB is rejected. `content-length` must be decimal, and `te` may only be
+    /// `trailers`. Sent heads are encoded with their values as stored. An empty
+    /// `content-length` is kept, and its stream's body is checked against zero, as h2
+    /// treats it. HTTP/1.1 sessions ignore this option and trim optional whitespace, as
+    /// `httparse` does. The owned downstream HTTP/2 driver (`OwnedH2Session`) applies it as
+    /// a downstream session does, and the owned upstream HTTP/2 driver rejects it.
     pub verbatim_http2_header_values: bool,
 }
 
@@ -640,10 +655,10 @@ impl UniplexConfig {
         Ok(self)
     }
 
-    /// The unread body an HTTP/1.1 codec may take a stream to before it asks again
-    /// (`HttpCodecCallback::ingress_body_limit`): the body source's strict window,
-    /// `buffer_limit`, or `read_allocation_size - 1` past `ingress_buffer_limit`, where parsing
-    /// pauses, whichever is smaller, however large the read's buffers are (`DIV-058`).
+    /// The most unread body an HTTP/1.1 codec may buffer for a stream before it calls
+    /// `HttpCodecCallback::ingress_body_limit` again. It is the smallest of the body source's
+    /// strict window, `buffer_limit`, and `read_allocation_size - 1` past
+    /// `ingress_buffer_limit` (where parsing pauses), however large the read's buffers are.
     pub(crate) fn http1_ingress_body_ceiling(&self) -> usize {
         self.buffer_limit
             .min(self.ingress_buffer_limit as usize + self.read_allocation_size - 1)
@@ -664,14 +679,14 @@ pub enum UniplexProtocolConfig {
     Http1 {
         stats: Option<Rc<dyn Http2SessionStats>>,
     },
+    /// HTTP/2 with its session options.
     Http2(Http2SessionConfig),
 }
 
 /// The owner of a session started by [`UniplexSession::start`].
 ///
-/// The session's run task polls its owner, so no task of the owner's waits on
-/// the run, as Proxygen's connector keeps none once it calls
-/// `session->run().start()`.
+/// The session's run task polls its owner, so the owner does not need a task of
+/// its own that waits on the run.
 pub trait UniplexRunOwner {
     /// Acts on the owner's stop requests. The run task calls this before its
     /// first poll of the run, before each poll that follows a wake of the
@@ -690,9 +705,9 @@ pub struct UniplexResponse {
     pub sequence_number: u64,
     pub source: HttpSourceHolder,
     pub completion: ExchangeCompletion,
-    /// Taken through `experimental::UniplexResponseAbortExt` (`DIV-023`).
+    /// Taken through `experimental::UniplexResponseAbortExt`.
     pub(crate) abort: Option<StreamAbort>,
-    /// Read through `experimental::UniplexResponseProgressExt` (`DIV-035`).
+    /// Read through `experimental::UniplexResponseProgressExt`.
     pub(crate) exchange: ExchangeTracker,
 }
 
@@ -703,7 +718,7 @@ struct IngressMeta {
     complete: bool,
     discard: bool,
     /// Read only by HTTP/2's `INVALID_STATE_TRANSITION` failure, so HTTP/1.1
-    /// keeps none.
+    /// leaves it `None`.
     message: Option<roxygen_core::message::HttpMessage>,
     expected_content_length: Option<u64>,
     received_body_length: u64,
@@ -724,8 +739,7 @@ pub(crate) fn message_content_length(message: &roxygen_core::message::HttpMessag
 }
 
 /// The length a downstream request's body is checked against: its
-/// `content-length`, or zero for a present, empty one with `empty_is_zero`
-/// (`DIV-041`).
+/// `content-length`, or zero for a present, empty one with `empty_is_zero`.
 pub(crate) fn checked_content_length(
     message: &roxygen_core::message::HttpMessage,
     empty_is_zero: bool,
@@ -1172,8 +1186,7 @@ impl UniplexLifecycleDispatcher {
 
 impl LifecycleObserver for UniplexLifecycleDispatcher {
     fn on_event(&self, event: LifecycleEvent) {
-        // Frozen `createTransaction` and `detach` start and cancel the probes
-        // where they activate and deactivate the connection.
+        // Probes start when the connection activates and stop when it deactivates.
         if let Some(prober) = &self.ping_prober {
             match event {
                 LifecycleEvent::ActivateConnection => prober.start_probes(),
@@ -1185,9 +1198,8 @@ impl LifecycleObserver for UniplexLifecycleDispatcher {
     }
 }
 
-/// The timer of frozen `HTTPSession::PingProber` (`DIV-024`): the interval
-/// before the next probe, or the outstanding probe's timeout.
-/// `run_ping_probes` sleeps until its deadline.
+/// The PING probe timer: the interval before the next probe, or the
+/// outstanding probe's timeout. `run_ping_probes` sleeps until its deadline.
 pub(crate) struct PingProber {
     host: Host,
     interval: Duration,
@@ -1227,7 +1239,7 @@ impl PingProber {
     fn refresh_timeout(&self, on_ingress: bool) {
         if self.probe.get().is_none() && (!on_ingress || self.extend_interval_on_ingress) {
             let deadline = self.host.deadline_after(self.interval);
-            // A later deadline is found when the timer wakes for the earlier one.
+            // A later deadline is picked up when the timer wakes for the earlier one.
             if self
                 .deadline
                 .replace(Some(deadline))
@@ -1561,7 +1573,7 @@ struct DriverState {
     anti_pipeline_paused: bool,
     upgrade_paused: bool,
     close_after_ingress: bool,
-    /// Reads continue past a close-delimited request only to see the peer's EOF
+    /// Reads continue past a close-delimited request only to detect the peer's EOF
     /// (`abort_exchanges_on_eof`); what they return is discarded.
     eof_watch: bool,
     ingress_close_stream: Option<StreamId>,
@@ -1569,8 +1581,8 @@ struct DriverState {
     upgrade_stream_awaiting_detach: Option<StreamId>,
     upstream_ingress_upgraded: bool,
     zero_byte_write_pending: bool,
-    /// The writer task's wake for batched HTTP/1.1 attempts that do not wait
-    /// (`DIV-034`), made at the first and kept for the connection.
+    /// The writer task's wake for batched HTTP/1.1 attempts that do not wait,
+    /// created on the first such attempt and kept for the connection.
     batched_source_wake: Option<Arc<SourceWakeCounter>>,
     bytes_read: u64,
     bytes_scheduled: u64,
@@ -2398,8 +2410,8 @@ mod shared {
     use roxygen_runtime::cancellation::CancellationSource;
 
     /// Wakes, cancellation sources, and lifecycle flags shared by one session,
-    /// its run future, its transport loops, and its handles. It owns no driver
-    /// state, transport, observer, or cleanup task.
+    /// its run future, its transport loops, and its handles. It does not own the
+    /// driver state, transport, observer, or cleanup task.
     pub struct UniplexShared {
         pub(super) read_wake: tokio::sync::Notify,
         pub(super) write_wake: tokio::sync::Notify,
@@ -2421,16 +2433,15 @@ pub(crate) struct StreamAbort {
 }
 
 impl StreamAbort {
-    /// `egressResetStream(id, stream, CANCEL)` for a stream that is still open
-    /// in either direction. A stream whose response EOM arrived and whose
-    /// request EOM was sent is closed in both directions, so, as
-    /// `sourceComplete` does for it, only its unread response is discarded.
+    /// Resets the stream with `CANCEL` if it is still open in either direction.
+    /// A stream that has received its response EOM and sent its request EOM is
+    /// closed in both directions, so only its unread response is discarded.
     /// A session that failed or finished writing is left unchanged, but a
     /// closing session still resets a live stream, such as an HTTP/1.1 tunnel
     /// that keeps reading after its upload EOM closed the connection's writes.
     /// From a session callout, which runs while the session borrows its state
-    /// or holds its core detached, the abort cannot reach the stream and does
-    /// nothing.
+    /// or holds its core detached, the abort cannot reach the stream and has
+    /// no effect.
     ///
     /// The reset's state change and its RST_STREAM (on HTTP/1.1, the TCP reset
     /// after the drained writes) are recorded before any foreign callback
@@ -3087,7 +3098,7 @@ impl UniplexHandle {
             .ingress_producer();
         producer.defer_read_timeout(timeout);
         if driver.http2.is_none() && driver.http1_stats.is_none() {
-            // DIV-044: only the read that resumes parsing reports credit; stats count every read.
+            // Only the read that resumes parsing reports credit, unless stats need every read.
             producer.set_resume_threshold(Some(driver.ingress_buffer_limit));
         }
         driver
@@ -3184,8 +3195,7 @@ impl UniplexHandle {
     }
 
     /// Reserves capacity, then reads the request head and commits the request
-    /// in one future, as Proxygen's `sendRequest` reserves and then reads the
-    /// head inside its coroutine.
+    /// in one future.
     pub fn send_request(
         &self,
         request_source: HttpSourceHolder,
@@ -3363,8 +3373,10 @@ impl UniplexHandle {
     }
 }
 
-/// Owns one H1 codec, one session core, and one fixed-worker byte stream until
-/// both transport loops and all stream work have completed.
+/// A worker-local HTTP/1.1 or HTTP/2 session over one byte stream.
+///
+/// It owns the codec, the session core and the transport until both transport
+/// loops and all stream work have completed.
 pub struct UniplexSession {
     state: Rc<RefCell<DriverState>>,
     transport: Weak<dyn UniplexTransport>,
@@ -3550,10 +3562,8 @@ async fn catch_future_unwind<F: Future>(
 }
 
 /// The waker that a started session's run task gives its owner. A wake marks
-/// a stop request pending and wakes the run task, which then polls the owner;
-/// the run's own wakes leave the owner unpolled, as `HTTPCoroSession::readLoop`
-/// reacts to cancellation through a `CancellationCallback` rather than on
-/// each read.
+/// a stop request pending and wakes the run task, which then polls the owner.
+/// The run's own wakes, such as a completed read, do not poll the owner.
 struct OwnerWake {
     pending: AtomicBool,
     task: Mutex<Option<Waker>>,
@@ -3676,8 +3686,8 @@ async fn owned_run(cleanup: impl Future<Output = ()>, release: RunCompletion) {
     resume_first_panic(first_panic);
 }
 
-/// Contains a panic of a started session's owner as a panic of the task that
-/// awaited `run` was contained: worker shutdown begins, the run aborts, the
+/// Contains a panic of a started session's owner the way a panic of a task
+/// awaiting `run` is contained: worker shutdown begins, the run aborts, the
 /// owner drops without an outcome, and the run task resumes the panic last.
 #[cold]
 #[inline(never)]
@@ -3936,6 +3946,7 @@ impl UniplexSession {
         Ok(())
     }
 
+    /// Constructs an HTTP/1 session on the current worker.
     pub fn new(
         context: WorkerContext,
         direction: TransportDirection,
@@ -4577,7 +4588,7 @@ impl UniplexSession {
     }
 
     /// Starts the session's run on its own task, which serves `owner` until
-    /// the run completes, as Proxygen's connector calls `session->run().start()`.
+    /// the run completes.
     ///
     /// The task polls the transport loops and the session's cleanup as
     /// [`run`](Self::run)'s task does, and calls `owner` between those polls.
@@ -4807,8 +4818,8 @@ async fn run_ping_probes(
     }
 }
 
-/// `PingProber::timeoutExpired`: sends a probe, or drops the connection when
-/// the outstanding probe went unanswered.
+/// Handles the probe timer: sends a probe, or drops the connection when the
+/// outstanding probe went unanswered.
 fn expire_ping_probe(
     prober: &PingProber,
     state: &Rc<RefCell<DriverState>>,
@@ -4830,8 +4841,8 @@ fn expire_ping_probe(
     {
         let mut driver = state.borrow_mut();
         let DriverState { codec, egress, .. } = &mut *driver;
-        // As frozen `timeoutExpired` ignores `sendPing`'s result, a probe that
-        // could not be queued still times out.
+        // The result is ignored, so a probe that could not be queued still times
+        // out.
         let _ = codec.generate(
             egress,
             EgressFrame::PingRequest { data: Some(data) },
@@ -4842,9 +4853,9 @@ fn expire_ping_probe(
     shared.write_wake.notify_one();
 }
 
-/// `dropConnection` through `shutdownTransportWithReset`: records the timeout,
-/// fails every stream, discards the unsent egress, and resets the transport
-/// without waiting for the writer to drain it.
+/// Drops the connection after a probe timeout: records the timeout, fails every
+/// stream, discards the unsent egress, and resets the transport without waiting
+/// for the writer to drain it.
 fn drop_connection_for_ping_probe(
     state: &Rc<RefCell<DriverState>>,
     transport: &Rc<dyn UniplexTransport>,
@@ -4985,9 +4996,9 @@ async fn read_loop(
                     state.note_flow_timeout_activity();
                     state.http2.is_some()
                 };
-                // Proxygen's `readLoop` does not signal `writeEvent_` after
-                // `onIngress`: the HTTP/1.1 callbacks that need the writer, such
-                // as a detach or an error, signal it themselves.
+                // Only HTTP/2 wakes the writer after every parse. The HTTP/1.1
+                // callbacks that need the writer, such as a detach or an error,
+                // wake it themselves.
                 if http2 {
                     write_wake.notify_one();
                 }
@@ -5834,7 +5845,7 @@ fn parse_one_prefix(state: &Rc<RefCell<DriverState>>) -> Result<ParseOutcome, Co
         std::mem::take(&mut http2.connection_credit_to_return)
     });
     // A rejected padding-only DATA frame returns no body bytes, but its padding is
-    // pending connection credit that `HTTPCoroSession::bytesProcessed(id, 0, 0)` flushes.
+    // pending connection credit that must still be returned.
     if rejected_credit != 0 || rejected_body {
         let mut callback = NoopCodecCallback;
         let DriverState { codec, egress, .. } = &mut *state;
@@ -5946,10 +5957,9 @@ impl SessionCodecCallback<'_> {
         }
     }
 
-    /// Whether an HTTP/2 stream has left both the core and the driver. It keeps no
-    /// ingress record, and its later frames are discarded apart from connection
-    /// credit, as `HTTPCoroSession::onBody` and `onMessageComplete` ignore a stream
-    /// that `eraseStream` removed.
+    /// Whether an HTTP/2 stream has left both the core and the driver. Such a
+    /// stream has no ingress record, and its later frames are discarded apart from
+    /// their connection credit.
     fn stream_erased(&self, stream: StreamId) -> bool {
         self.http2
             .as_ref()
@@ -5958,9 +5968,9 @@ impl SessionCodecCallback<'_> {
     }
 
     /// Whether an upgraded stream's ingress source has completed while the stream
-    /// waits for its egress. `sourceComplete` leaves such a stream in place, and
-    /// `onBody` returns only connection credit for the DATA its source rejects,
-    /// including DATA after the peer's END_STREAM.
+    /// waits for its egress. Source completion leaves such a stream in place, and
+    /// DATA that its source rejects, including DATA after the peer's END_STREAM,
+    /// returns only connection credit.
     fn upgraded_source_complete(&self, stream: StreamId) -> bool {
         self.core
             .stream_if_present(stream)
@@ -5968,9 +5978,9 @@ impl SessionCodecCallback<'_> {
     }
 
     /// Whether a live stream is upgraded. DATA or trailers that its source
-    /// rejects fail only that source, with INVALID_STATE_TRANSITION, which
-    /// `sourceComplete` leaves unreset on an upgraded stream; `onBody` and
-    /// `onTrailersComplete` send no reset themselves.
+    /// rejects fail only that source, with INVALID_STATE_TRANSITION, and source
+    /// completion does not reset an upgraded stream. The body and trailer
+    /// callbacks do not send a reset themselves.
     fn stream_is_upgraded(&self, stream: StreamId) -> bool {
         self.core
             .stream_if_present(stream)
@@ -6196,8 +6206,8 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
                                 && self.http1_stats.is_none()
                                 && let Some(state) = self.core.stream_if_present(stream)
                             {
-                                // DIV-044: only the read that resumes parsing reports credit;
-                                // stats count every read.
+                                // Only the read that resumes parsing reports credit, unless
+                                // stats need every read.
                                 state
                                     .ingress_producer()
                                     .set_resume_threshold(Some(self.ingress_buffer_limit));
@@ -6422,7 +6432,7 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
                                     b"ingress source rejected body bytes",
                                 );
                                 // Not the window for HTTP/1.1: its body limit keeps body events
-                                // within it (`DIV-058`).
+                                // within it.
                                 if self.core.protocol() == CodecProtocol::Http11
                                     && self.core.direction().is_downstream()
                                     && !stream.is_unspecified()
@@ -6537,8 +6547,8 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
                                 if let Some(pending) = self.pending_stats() {
                                     pending.push(Http2StatsEvent::ContentLengthMismatch);
                                 }
-                                // `HTTPStreamSource::eom` fails only the source, which
-                                // `sourceComplete` leaves unreset on an upgraded stream.
+                                // The source's `eom` fails only the source, and source
+                                // completion does not reset an upgraded stream.
                                 if self.stream_is_upgraded(stream) {
                                     return actions.into();
                                 }
@@ -7050,10 +7060,9 @@ async fn pause_source_turn_for_test(
 ///
 /// With `discard_stored_wake`, the writer reached this wait from its checks
 /// without suspending and left no callback work, so a `write_wake` permit
-/// stored before those checks has been answered. The first poll consumes such
-/// a permit and waits for the next wake, as Proxygen's `writeLoop` resets
-/// `writeEvent_` before it waits. Only the writer waits on `write_wake`, and
-/// every notification runs on the session's worker.
+/// stored before those checks has been handled. The first poll consumes such
+/// a permit and waits for the next wake. Only the writer waits on
+/// `write_wake`, and every notification runs on the session's worker.
 fn h1_idle_wait<'a, C: Future<Output = WaitStatus>>(
     write_wake: &'a tokio::sync::Notify,
     mut notified: Pin<&mut Notified<'a>>,
@@ -7067,7 +7076,7 @@ fn h1_idle_wait<'a, C: Future<Output = WaitStatus>>(
     poll_fn(move |task_context| {
         let discard_stored_wake = std::mem::take(&mut discard_stored_wake);
         // Dropping the guard restores the budget, so, like `select!`'s gate,
-        // this consumes none and defers the wake when the budget is spent.
+        // this does not consume budget and defers the wake when the budget is spent.
         let Poll::Ready(unused_budget) = tokio::task::coop::poll_proceed(task_context) else {
             return Poll::Pending;
         };
@@ -7476,8 +7485,8 @@ async fn write_loop(
                         if http1_queued
                             .is_some_and(|remaining| !http1_event_fits(&event, remaining)) =>
                     {
-                        // Batched HTTP/1.1 (`DIV-034`): the event follows the queued
-                        // bytes once they are written, as it would unbatched.
+                        // Batched HTTP/1.1: the event follows the queued bytes once
+                        // they are written, as it would unbatched.
                         source_flow_wait = None;
                         state
                             .borrow_mut()
@@ -7525,8 +7534,8 @@ async fn write_loop(
                         } else if state.borrow().codec.protocol() == CodecProtocol::Http11
                             && !work_stream.is_unspecified()
                         {
-                            // `DIV-038`: a body error abandons the unwritten output, as
-                            // hyper drops its unflushed buffer with the connection.
+                            // With `non_abortive_close`, a body error abandons the unwritten
+                            // output, as hyper drops its unflushed buffer with the connection.
                             let abandon_output = config.non_abortive_close
                                 && state
                                     .borrow()
@@ -7835,7 +7844,7 @@ async fn write_loop(
                 );
             } else {
                 for stream in streams {
-                    // A stream reset since the blocked snapshot gets no second reset.
+                    // A stream reset since the blocked snapshot does not get a second reset.
                     let already_reset = state
                         .borrow()
                         .core()
@@ -8447,7 +8456,7 @@ impl ReadyEgressDispatch<'_> {
         let result = match readiness {
             Some(readiness) => readiness
                 .poll_with(|context| transfer.poll_next_event_with_credit(context, maximum_body)),
-            // HTTP/1.1, batching's attempt that does not wait (`DIV-034`).
+            // HTTP/1.1 batching's attempt that does not wait.
             None => {
                 let wake = {
                     let mut state = self.state.borrow_mut();
@@ -8477,7 +8486,7 @@ impl ReadyEgressDispatch<'_> {
 
 /// Whether an HTTP/1.1 codec surely serializes `event` within `remaining`
 /// bytes: body bytes or padding (none on HTTP/1.1) with the longest chunk
-/// framing and message end they can take (`DIV-034`). The size of a head or
+/// framing and message end they can take. The size of a head or
 /// trailers is known only once they are serialized, so they never join queued
 /// bytes.
 fn http1_event_fits(event: &EgressEvent, remaining: usize) -> bool {
@@ -8540,8 +8549,8 @@ async fn next_egress_event(
             };
             // A nonwaiting attempt stays on the owner through its first poll.
             // Ready callback/cancellation notifications retain their consuming wait.
-            // On HTTP/1.1 a nonwaiting attempt is batching's (`DIV-034`), made
-            // before every flush of a streamed response, so it builds no wait.
+            // On HTTP/1.1 a nonwaiting attempt is batching's, made before every
+            // flush of a streamed response, so it does not build a wait.
             let use_ready_dispatch = {
                 let state = state.borrow();
                 !wait_for_source
@@ -9301,7 +9310,7 @@ async fn write_one_batch(
             .map(|http2| Arc::clone(&http2.body_source_publications.source_ready));
         loop {
             // A write still pending when its transport was reset is abandoned,
-            // whether or not the transport honors the cancellation.
+            // whether or not the transport acts on the cancellation.
             if state.borrow().transport_reset_issued {
                 let error = state.borrow().fatal_error.clone().unwrap_or_else(|| {
                     HttpError::with_message(
@@ -10091,7 +10100,7 @@ fn handle_eof(
     read_wake: &tokio::sync::Notify,
     write_wake: &tokio::sync::Notify,
 ) {
-    // `HTTPStreamSource::stopReading` completes a source synchronously, so a source
+    // A source's `stop_reading` completes it synchronously, so a source
     // that completed in the pass that read the EOF must count before streams are
     // judged incomplete.
     if let Err(error) = drive_read_callbacks(state, read_wake, write_wake) {
@@ -10167,7 +10176,7 @@ fn handle_eof(
                     .push(CodecFailure::plain(StreamId::UNSPECIFIED, error));
             }
         }
-        // HTTP1xCodec::onIngressEOF completes any 2xx CONNECT or 101 ingress instead of
+        // At EOF the HTTP/1.1 codec completes any 2xx CONNECT or 101 ingress instead of
         // failing it, so the tunnel's egress may still finish.
         let response_pending = upstream
             && codec.is_busy()
@@ -10207,8 +10216,8 @@ fn handle_eof(
                             .is_some_and(|stream| !stream.is_upgraded())
                     })
             }
-            // `DIV-055`: a request head still arriving, or a stream whose response
-            // END_STREAM is unserialized, tunnels included.
+            // With `abort_streams_on_eof`: a request head still arriving, or a stream
+            // whose response END_STREAM is unserialized, tunnels included.
             CodecProtocol::Http2 => {
                 core.connection_error().is_none()
                     && state
@@ -10224,7 +10233,7 @@ fn handle_eof(
             _ => false,
         }
     };
-    // An unserialized HTTP/1.1 request can get no response after peer EOF.
+    // An unserialized HTTP/1.1 request cannot get a response after peer EOF.
     let upstream_request_unstarted = upstream && !upstream_response_pending && {
         let state = state.borrow();
         let streams = state.core().stream_ids();
@@ -10352,8 +10361,8 @@ fn handle_codec_failure(
                 .core()
                 .stream_if_present(failure.stream)
                 .map(|stream| stream.can_send_headers()),
-            // `sourceComplete` leaves an abandoned upgraded stream unreset while
-            // its egress is open, so `onError` still resets it.
+            // Source completion leaves an abandoned upgraded stream unreset while
+            // its egress is open, so this failure still resets it.
             discarded: state
                 .ingress_meta
                 .get(&failure.stream)

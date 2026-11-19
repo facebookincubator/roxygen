@@ -347,7 +347,8 @@ fn tcp_byte_stream_offers_its_reader_through_uniplex() {
 }
 
 /// A native TCP byte stream offers its write queue through `UniplexTransport`, and the queue
-/// answers `is_saturated`, so the owned drivers' `DIV-028` rule applies on TCP.
+/// reports `is_saturated`. On TCP, the owned drivers can therefore retire a downstream exchange
+/// once its response's end is serialized, while the queue is not saturated.
 #[test]
 fn tcp_byte_stream_offers_its_write_queue_through_uniplex() {
     use tokio::io::AsyncReadExt;

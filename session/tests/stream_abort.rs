@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! `DIV-023` oracles for the `roxygen_session::experimental` stream abort.
+//! Tests for the `roxygen_session::experimental` stream abort.
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -656,7 +656,7 @@ impl LifecycleObserver for PanicOnStreamReset {
     }
 }
 
-/// A request whose CONNECT head is queued now and whose upload the test writes.
+/// A CONNECT request with its head already queued. The test writes the upload.
 fn upload_source(
     callback: Option<Box<dyn HttpStreamSourceCallback>>,
 ) -> (HttpSourceHolder, HttpStreamSourceProducer) {
@@ -710,7 +710,7 @@ fn send(upload: &HttpStreamSourceProducer, bytes: &[u8]) {
     assert!(upload.body(queue(bytes), 0, false) != FlowControlState::Error);
 }
 
-/// One CONNECT tunnel whose 200 the reader has read.
+/// A CONNECT tunnel after the reader has read its 200 response.
 struct Tunnel {
     response: UniplexResponse,
     upload: HttpStreamSourceProducer,
@@ -1184,8 +1184,8 @@ fn h2_abort_returns_connection_credit_for_unread_data() {
     abort_returns_connection_credit_for_unread_data(UniplexConfig::default());
 }
 
-/// A local abort discards what its reader has not read, even where an ingress
-/// abort would leave it to be read first (`DIV-033`).
+/// A local abort discards unread DATA, even with `deliver_ingress_before_abort`,
+/// which keeps it readable after an ingress abort.
 #[test]
 fn h2_abort_returns_connection_credit_for_unread_data_with_ingress_before_abort() {
     abort_returns_connection_credit_for_unread_data(UniplexConfig {
@@ -1298,8 +1298,8 @@ fn abort_returns_connection_credit_for_unread_data(uniplex: UniplexConfig) {
     });
 }
 
-/// What the reader of a stream the peer reset does with the DATA that the reset
-/// left to be read first (`DIV-033`).
+/// What the reader does with the DATA that stays readable after the peer's
+/// RST_STREAM.
 #[derive(Clone, Copy, Debug)]
 enum KeptData {
     Read,
@@ -1523,7 +1523,7 @@ fn h2_abort_keeps_sibling_streams_and_session_usable() {
     // Two callbacks that the abort runs both panic: an ingress-completion
     // waker and the request source's `stop_reading`. The stream still gets
     // exactly one RST_STREAM(CANCEL), the parked reader wakes, and the stream
-    // retires; the first panic resumes last and the sibling is unaffected.
+    // retires. The first panic resumes last, and the sibling is unaffected.
     run_on_worker(|context| {
         Box::pin(async move {
             // No stream read timeout can wake the parked reader below.
@@ -2134,9 +2134,9 @@ fn h1_abort_starts_the_connection_drain() {
         })
     });
 
-    // A lifecycle observer that panics inside the abort reaches the caller
-    // after the abort finished: the reader of a complete response whose
-    // upload is open fails, and the connection resets.
+    // A lifecycle observer's panic inside the abort reaches the caller after
+    // the abort finishes. The reader of a complete response whose upload is
+    // open fails, and the connection resets.
     run_on_worker(|context| {
         Box::pin(async move {
             let (session, handle, wire, _lifecycle) = h1_session(context);
@@ -2241,9 +2241,9 @@ fn h1_abort_starts_the_connection_drain() {
     });
 }
 
-/// Core `set_owned_error`, which every ingress error runs (peer reset,
-/// connection failure, abort), signals an already-parked body reader even when
-/// an ingress-completion waker panics, then resumes that panic.
+/// Every ingress error (peer reset, connection failure, abort) goes through
+/// `set_owned_error`. It wakes an already-parked body reader even when an
+/// ingress-completion waker panics, then resumes that panic.
 #[test]
 fn ingress_error_wakes_parked_reader_after_completion_waker_panic() {
     run_on_worker(|_context| {

@@ -141,10 +141,10 @@ use crate::uniplex::UniplexWriteQueue;
 
 const TURN_BUDGET: usize = 64;
 
-/// The status of the error response that answers a downstream stream read timeout.
+/// The status of the error response sent after a downstream stream read timeout.
 const REQUEST_TIMEOUT: u16 = 408;
 
-/// Inputs selected once, before starting an experimental HTTP/2 connection.
+/// Inputs selected once, before starting an owned HTTP/2 connection.
 pub struct OwnedH2Options {
     pub context: WorkerContext,
     pub transport: Rc<dyn UniplexTransport>,
@@ -153,7 +153,7 @@ pub struct OwnedH2Options {
 }
 
 // Critical sections only push, pop or clone and drop replaced wakers after unlocking, so
-// nothing unwinds while the lock is held and a poisoning mutex would never observe poison.
+// the lock is never held during an unwind and a poisoning mutex would never be poisoned.
 #[derive(Default)]
 struct ReadyQueue {
     state: Mutex<ReadyQueueState>,
@@ -173,9 +173,9 @@ impl ReadyQueue {
         self.wake_after(|| {});
     }
 
-    /// Wakes the session after `mark`, which runs under the lock after the `busy` store:
-    /// `settle` sees both or neither, and the lock-free `Control::can_fold` never sees what
-    /// it marks without `busy`.
+    /// Wakes the session after `mark`, which runs under the lock after the `busy` store. So
+    /// `settle` observes both or neither, and the lock-free `Control::can_fold` never observes
+    /// what `mark` sets without `busy`.
     fn wake_after(&self, mark: impl FnOnce()) {
         let wake = {
             let state = self.state.lock();
@@ -188,8 +188,8 @@ impl ReadyQueue {
         }
     }
 
-    /// Clears `busy` if nothing is queued and neither I/O wake is pending; returns whether it
-    /// did. A wake or push that the lock orders after this sets `busy` again.
+    /// Clears `busy` if the queue is empty and neither I/O wake is pending, and returns whether
+    /// it did. A wake or push that the lock orders after this sets `busy` again.
     fn settle(&self, read: &IoWake, write: &IoWake) -> bool {
         let state = self.state.lock();
         let settled = state.streams.is_empty()
@@ -202,8 +202,8 @@ impl ReadyQueue {
     }
 
     // Only the session owner installs wakers, and `installed` is its copy of the current one,
-    // so a stable waker needs no lock. Pushes racing with a poll are still seen, or woken
-    // through the installed waker, because every poll pops under the lock.
+    // so a stable waker does not need the lock. Pushes racing with a poll are still seen, or
+    // woken through the installed waker, because every poll pops under the lock.
     fn register(&self, installed: &mut Option<Arc<Waker>>, context: &Context<'_>) {
         if installed
             .as_ref()
@@ -223,19 +223,20 @@ impl ReadyQueue {
     }
 }
 
-/// `IoWake::inline`: no inline poll is running; the session is polling the wake's operation; that
-/// operation woke the wake during the poll.
+/// `IoWake::inline` while an inline poll is not running.
 const INLINE_IDLE: u8 = 0;
+/// `IoWake::inline` while the session polls the wake's operation.
 const INLINE_POLLING: u8 = 1;
+/// `IoWake::inline` once that operation woke the wake during the poll.
 const INLINE_WOKEN: u8 = 2;
 
 struct IoWake {
     ready: AtomicBool,
     /// Where `poll_inline` is (`INLINE_*`).
     inline: AtomicU8,
-    /// Whether the operation can wake this from inside the poll that completes it, so that
-    /// `poll_inline` holds wakes: a read or write future can, while the native reader and write
-    /// queue complete without waking.
+    /// Whether the operation can wake this from inside the poll that completes it, in which case
+    /// `poll_inline` holds wakes. Read and write futures can. The native reader and write queue
+    /// complete without waking.
     completion_wakes: bool,
     queue: Arc<ReadyQueue>,
 }
@@ -260,18 +261,18 @@ impl IoWake {
         self.is_ready() && self.ready.swap(false, Ordering::AcqRel)
     }
 
-    /// Runs `poll`, which starts or polls the transport read or write this wake belongs to, from
-    /// the session's turn with `waker`, holding a wake that comes during the poll until it
-    /// returns. The wake of an operation that completed only marks `ready`, as it always did,
-    /// without scheduling the session again: this turn consumes the completion. `OwnedByteStream`'s
-    /// read and write futures wake on retiring from inside the completing poll (a read's
-    /// `TimedBaton::drop`, a write's `CompletionWake`), and this saves the session poll that wake
-    /// would cost. A pending operation's wake goes out as it would have. A poll that panics leaves
-    /// the state polling or woken, and until the next `poll_inline` resets it, every wake is held
-    /// rather than sent. Nothing is lost meanwhile: the session tears down, `poll_panicked` stores
-    /// both `ready` flags and wakes the session through its own context's waker, and a teardown
-    /// poll that panics does the same for its operation (`DIV-056`). Without `completion_wakes` it
-    /// only polls: there is no wake to save.
+    /// Runs `poll`, which starts or polls this wake's transport read or write, from the session's
+    /// turn with `waker`. A wake that arrives during the poll is held until the poll returns.
+    ///
+    /// If the operation completed, its wake only marks `ready` and does not schedule the session
+    /// again, because this turn consumes the completion. `OwnedByteStream`'s read and write
+    /// futures wake from inside the completing poll as they retire (a read's `TimedBaton::drop`, a
+    /// write's `CompletionWake`), so this saves a session poll. A pending operation's wake is sent
+    /// as usual. A poll that panics leaves the state polling or woken, and every wake is held
+    /// until the next `poll_inline` resets it. That is safe because the session then tears down.
+    /// `poll_panicked` stores both `ready` flags and wakes the session through its own context's
+    /// waker, and a teardown poll that panics does the same for its operation. Without
+    /// `completion_wakes` this only polls, since there is no wake to save.
     #[inline]
     fn poll_inline<T>(
         self: &Arc<Self>,
@@ -285,8 +286,8 @@ impl IoWake {
         }
     }
 
-    /// `poll_inline`'s hold. Cold and out of line, so that a driver whose transport completes
-    /// without waking keeps the code it had without it.
+    /// `poll_inline`'s hold. Cold and out of line, so that the common case, a transport that
+    /// completes without waking, stays small.
     #[cold]
     #[inline(never)]
     fn poll_holding<T>(
@@ -301,7 +302,7 @@ impl IoWake {
         if self.inline.swap(INLINE_IDLE, Ordering::AcqRel) == INLINE_WOKEN {
             if polled.is_ready() {
                 // No `busy` store: this turn cleared `quiescent`, and only its closing `settle`
-                // publishes it again, which either sees this mark or clears `busy` itself.
+                // publishes it again, which either observes this mark or clears `busy` itself.
                 self.ready.store(true, Ordering::Release);
             } else {
                 self.wake_by_ref();
@@ -310,7 +311,7 @@ impl IoWake {
         polled
     }
 
-    /// Marks the running `poll_holding` woken; false once it has returned.
+    /// Marks the running `poll_holding` woken. Returns false if it has already returned.
     #[cold]
     #[inline(never)]
     fn hold_wake(&self) -> bool {
@@ -344,18 +345,18 @@ impl Wake for IoWake {
     }
 }
 
-/// The connection's timeouts (`DIV-028`), installed when the first one is armed, so a session
-/// whose timeouts are all zero has none.
+/// The connection's timeouts, installed when the first one is armed, so a session with every
+/// timeout set to zero never creates them.
 struct ConnectionTimers {
     /// Set when a slot fires; each turn takes it once.
     wake: Arc<IoWake>,
     waker: Waker,
-    /// Proxygen's connection read timeout, which bounds each transport read: stamped when a read
-    /// is issued and observed only while that read is outstanding.
+    /// The connection read timeout, which bounds each transport read. Stamped when a read is
+    /// issued and checked only while that read is outstanding.
     read_idle: Timeout,
-    /// Proxygen's `GoawayTimeout`: `goaway_deadline` under a nonzero `goaway_timeout`.
+    /// Fires at `goaway_deadline` when `goaway_timeout` is nonzero.
     goaway: Timeout,
-    /// Proxygen's write-event wait under `writeTimeout_`, while flow control blocks egress.
+    /// The writer's `write_timeout` wait while flow control blocks egress.
     flow: Timeout,
     /// The blocked streams the `flow` slot is armed for, sorted by id; empty while it is not.
     flow_blocked: Vec<StreamId>,
@@ -387,16 +388,16 @@ impl ConnectionTimers {
 }
 
 /// The progress that restarts the `flow` wait besides a change in the blocked streams: bytes read
-/// and scheduled for writing, EOF, and stream retirement. They cover Uniplex's
-/// `note_flow_timeout_activity` points (ingress parsing, writes, PING replies, resets, drains,
-/// detaches).
+/// and scheduled for writing, EOF, and stream retirement. They cover the points where
+/// `UniplexSession` calls `note_flow_timeout_activity` (ingress parsing, writes, PING replies,
+/// resets, drains, detaches).
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 struct FlowMarks {
     bytes_read: u64,
     bytes_scheduled: u64,
     eof: bool,
-    /// The live streams, which fall when one retires, as Proxygen's `checkForDetach` signals the
-    /// writer. A stream opens only with bytes read or scheduled.
+    /// The live stream count. A retiring stream lowers it, which restarts the wait. A stream
+    /// opens only with bytes read or scheduled.
     streams: usize,
 }
 
@@ -465,7 +466,7 @@ struct IngressSignals {
     completed: Cell<Option<Result<(), HttpError>>>,
     /// The source completed with `READ_TIMEOUT`: a stream read timeout.
     read_timed_out: Cell<bool>,
-    /// Something waits on the source's completion, so it always wakes the owner.
+    /// A waiter depends on the source's completion, so it always wakes the owner.
     wake_on_completion: Cell<bool>,
 }
 
@@ -561,12 +562,12 @@ struct Control {
     upstream: Option<Rc<upstream::Admission>>,
     idle: Cell<bool>,
     host: Host,
-    /// Published by a downstream session's poll that ended with nothing left to do; cleared
-    /// when the next poll starts.
+    /// Published by a downstream session's poll that ended without pending work. Cleared when
+    /// the next poll starts.
     quiescent: Cell<bool>,
     /// The codec's connection credit headroom when `quiescent` was published.
     credit_headroom: Cell<i64>,
-    /// Credit reported while quiescent, which the next poll returns before anything else.
+    /// Credit reported while quiescent, which the next poll returns first.
     early_credit: Cell<u32>,
     /// Streams whose request source completed without error while quiescent.
     early_completed: RefCell<Vec<StreamId>>,
@@ -600,7 +601,8 @@ impl Control {
     }
 }
 
-/// Owner-local control; mutations are consumed outside codec/application callbacks.
+/// Owner-local drain and cancel control for an owned HTTP/2 session. The session applies them
+/// on its next turn, outside codec and application callbacks.
 #[derive(Clone)]
 pub struct OwnedH2Handle(Rc<Control>);
 
@@ -633,8 +635,8 @@ impl ConnectionFlowControlCallback for ConnectionWindowWake {
     }
 }
 
-/// Opt-in lifecycle observation of a downstream session (`DIV-051`), present only once an
-/// observer was added. Events queue in the dispatcher, which delivers them at the end of each
+/// Opt-in lifecycle observation of a downstream session, present only once an observer was
+/// added. Events queue in the dispatcher, which delivers them at the end of each
 /// poll and at teardown.
 struct Observation {
     lifecycle: Rc<UniplexLifecycleDispatcher>,
@@ -890,7 +892,7 @@ where
     response_complete: bool,
     write_boundary: Option<u64>,
     physically_complete: bool,
-    /// Some serialized event registered a byte event.
+    /// A serialized event registered a byte event.
     registered_byte_events: bool,
     reset: bool,
     stream_offset: u64,
@@ -913,10 +915,10 @@ where
             .and_then(<E as ExchangeStorage<UPSTREAM>>::upstream_mut)
     }
 
-    /// Records a peer reset for the owner to apply, unless one is pending: the request's selected
-    /// cause, or else `reset`. A `refusal` may fail the request unprocessed and select `reset`
-    /// (`RequestStatus::peer_reset_error`, `DIV-035`), which then also fails the response's
-    /// source at once (`fail_refused_response`).
+    /// Records a peer reset for the owner to apply, unless one is pending. The error is the
+    /// request's selected cause, or else `reset`. A `refusal` may fail the request unprocessed
+    /// and select `reset` (see `RequestStatus::peer_reset_error`), which then also fails the
+    /// response's source immediately (`fail_refused_response`).
     fn record_peer_reset(&mut self, refusal: bool, reset: impl FnOnce() -> HttpError) {
         if self.peer_reset.is_none() {
             let (error, unprocessed) = match self.upstream() {
@@ -944,8 +946,8 @@ where
     /// Fails the response's source with the peer reset just recorded, for a request that the
     /// peer's refusal failed unprocessed. The owner applies the reset only when its wake is
     /// polled, one stream per turn, so a stream read timeout that expires before then would
-    /// otherwise fail the response first (`DIV-035`). `cancel_owner`'s details keep the error
-    /// the same whichever fails the source.
+    /// otherwise fail the response first. `cancel_owner` keeps the error the same whichever of
+    /// the two fails the source.
     fn fail_refused_response(&self) {
         if let Some(error) = &self.peer_reset {
             self.producer
@@ -962,8 +964,8 @@ where
         !self.wire_ingress_complete && !self.reset
     }
 
-    /// Proxygen's `isStreamFlowControlBlocked`: the stream's egress is open and its send window
-    /// is exhausted.
+    /// Whether flow control blocks the stream: its egress is open and its send window is
+    /// exhausted.
     fn send_blocked(&self) -> bool {
         !self.reset
             && !self.response_complete
@@ -971,8 +973,8 @@ where
             && self.send_window.non_negative_size() == 0
     }
 
-    /// Proxygen's `!isBodyQueueEmpty()` for a connection out of credit: the stream's next
-    /// event is body that needs send credit.
+    /// Whether the stream's next event is body that needs send credit. Used while the
+    /// connection is out of credit.
     fn awaits_credit(&self) -> bool {
         !self.reset
             && matches!(
@@ -1036,7 +1038,7 @@ fn guarded<T>(action: impl FnOnce() -> T) -> Result<T, PanicPayload> {
     catch_unwind(AssertUnwindSafe(action))
 }
 
-/// Runs `action` under its own unwind boundary (`DIV-056`). A panic is reported at `site` with
+/// Runs `action` under its own unwind boundary. A panic is reported at `site` with
 /// `stream`, disposed of, and marks `failure` panicked.
 #[inline(always)]
 fn contain<T>(
@@ -1091,7 +1093,7 @@ fn report_panic(
 }
 
 /// Reports a panic contained at an Exchange-scope `site` of stream `id`, disposes of it, and
-/// returns the error that fails that exchange alone (`DIV-056`).
+/// returns the error that fails that exchange alone.
 #[cold]
 #[inline(never)]
 fn exchange_panicked(
@@ -1108,7 +1110,7 @@ fn exchange_panicked(
 }
 
 /// Unwinds to the per-turn catch after a Driver-scope panic its site already reported, so the
-/// catch starts the teardown without reporting it again (`DIV-056`).
+/// catch starts the teardown without reporting it again.
 struct ReportedPanic;
 
 /// Reports a panic that reached the per-turn catch, unless its site already did.
@@ -1193,8 +1195,8 @@ struct Failure {
     wire_code: Option<H2ErrorCode>,
     direction: HttpExceptionDirection,
     new_stream: bool,
-    /// Set by `CodecInput::fail`: parsing ingress found the failure, which a lifecycle
-    /// observer receives as `Http2IngressError`.
+    /// Set by `CodecInput::fail` when parsing ingress raised the failure. A lifecycle observer
+    /// receives it as `Http2IngressError`.
     ingress: bool,
     /// The stream's header block breached the header rate limit: the stream is aborted
     /// without a reset and the connection drains with one final GOAWAY.
@@ -1218,8 +1220,8 @@ impl Failure {
 
 /// Live streams by id. Peers choose stream ids, so each session draws its own seed. Iteration
 /// follows the hash, so every site whose order is observable visits the streams sorted by id.
-/// A stream is reached mutably only through the methods below, which tell the flow index which
-/// streams may have changed.
+/// A stream is reached mutably only through the methods below, which record in the flow index
+/// which streams may have changed.
 struct StreamTable<E, const UPSTREAM: bool>
 where
     E: ExchangeStorage<UPSTREAM>,
@@ -1235,10 +1237,10 @@ thread_local! {
     pub(crate) static FLOW_FULL_REFRESHES: Cell<usize> = const { Cell::new(0) };
 }
 
-/// The streams the `flow` slot can wait for, kept per stream instead of found by a pass over
-/// every stream at each idle check. `Stream::send_blocked` and `Stream::awaits_credit` read only
-/// the stream's own plain fields, which change only through a `&mut Stream`; the table hands one
-/// out only after recording its id in `touched`, and `StreamTable::refresh_flow` evaluates both
+/// The streams the `flow` slot can wait for, tracked per stream instead of by a pass over every
+/// stream at each idle check. `Stream::send_blocked` and `Stream::awaits_credit` read only the
+/// stream's own plain fields, which change only through a `&mut Stream`. The table hands one out
+/// only after recording its id in `touched`, and `StreamTable::refresh_flow` evaluates both
 /// predicates again for exactly those streams.
 #[derive(Default)]
 struct FlowIndex {
@@ -1339,9 +1341,9 @@ where
     }
 
     /// Brings the flow index up to date with every stream reached mutably since the last
-    /// refresh, and returns it; `None` without one. Many records relative to the table, such as
-    /// one read of WINDOW_UPDATE frames that unblocks every blocked stream, take one full pass
-    /// instead of a sorted-set shift per stream.
+    /// refresh, and returns it, or `None` if there is no index. Many records relative to the
+    /// table, such as one read of WINDOW_UPDATE frames that unblocks every blocked stream, take
+    /// one full pass instead of a sorted-set shift per stream.
     fn refresh_flow(&mut self) -> Option<&FlowIndex> {
         let Self { map, flow } = self;
         let flow = flow.as_deref_mut()?;
@@ -1392,8 +1394,9 @@ where
     }
 }
 
-/// Drops the remaining streams in id order, as the `BTreeMap` this table replaced did. If a
-/// stream's drop panics, the rest still drop in id order while unwinding.
+/// Drops the remaining streams in id order, since drop order is observable and the map's own
+/// order follows the hash. If a stream's drop panics, the rest still drop in id order while
+/// unwinding.
 impl<E, const UPSTREAM: bool> Drop for StreamTable<E, UPSTREAM>
 where
     E: ExchangeStorage<UPSTREAM>,
@@ -1486,8 +1489,8 @@ thread_local! {
     static DISCARDED_STREAMS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
-/// The refused streams that a downstream session on this thread still remembered after its last
-/// parse, and the most it remembered at once; resets both.
+/// The refused streams that a downstream session on this thread still tracked after its last
+/// parse, and the peak count; resets both.
 #[cfg(test)]
 pub(crate) fn take_discarded_streams() -> (usize, usize) {
     DISCARDED_STREAMS.with(|streams| streams.replace((0, 0)))
@@ -1507,11 +1510,11 @@ pub(crate) fn inline_polls() -> usize {
     INLINE_POLLS.with(Cell::get)
 }
 
-/// A concrete-exchange H2 driver, selected only by experimental opt-in integrations.
+/// A downstream HTTP/2 driver with concrete exchange owners.
 ///
-/// Policy and body futures are children owned directly by each stream. No
-/// application task is spawned; cancelling a stream retires those futures before
-/// the stream's ingress-source and physical-write fences can complete.
+/// Policy and body futures are children owned directly by each stream, and the
+/// driver does not spawn application tasks. Cancelling a stream retires those
+/// futures before the stream's ingress-source and transport-write fences can complete.
 pub struct OwnedH2Session<A: OwnedApplication>(Option<Driver<A, false>>);
 
 /// A session dropped unrun is abandoned as a run would be.
@@ -1523,8 +1526,8 @@ impl<A: OwnedApplication> Drop for OwnedH2Session<A> {
     }
 }
 
-/// Drives a [`Driver`] to completion (`DIV-056`). No poll unwinds out of driver code: a panic
-/// that reaches the per-turn boundary is reported and starts a teardown that joins native I/O,
+/// Drives a [`Driver`] to completion. A poll never unwinds out of driver code. A panic that
+/// reaches the per-turn boundary is reported and starts a teardown that joins native I/O,
 /// after which the run returns `Err`. Completion closes admission, publishes `complete` and
 /// releases the driver before returning. A run dropped unfinished is abandoned.
 struct DriverRun<A, const UPSTREAM: bool>
@@ -1553,7 +1556,7 @@ where
 
 /// Marks the upstream admission as polled by its driver while the guard lives, then restores
 /// the previous mark. It holds the admission weakly, so it never drops the last reference to
-/// it; downstream it holds nothing.
+/// it. Downstream it is `None`.
 struct AdmissionPolling(Option<(Weak<upstream::Admission>, bool)>);
 
 impl AdmissionPolling {
@@ -1601,7 +1604,7 @@ fn polled_after_completion() -> HttpError {
     )
 }
 
-// The driver is only ever accessed through `&mut`; nothing pins it.
+// The driver is only ever accessed through `&mut`, so its address need not stay fixed.
 impl<A, const UPSTREAM: bool> Unpin for DriverRun<A, UPSTREAM>
 where
     A: OwnedApplication,
@@ -1701,18 +1704,18 @@ where
     goaway_deadline: Option<Instant>,
     budget_yield: Option<roxygen_runtime::host::LocalFuture>,
     timers: Option<Box<ConnectionTimers>>,
-    /// The last `poll_read` left a drained reader's next read waiting for its waker. That read
-    /// is issued and outstanding for `read_idle`, as the read a re-poll left registered was.
+    /// The last `poll_read` left a drained reader's next read waiting for its waker. For
+    /// `read_idle`, that read counts as issued and outstanding.
     read_parked: bool,
     ready_waker: Option<Arc<Waker>>,
-    /// A queued write started without arming the writer, and no `poll_complete` has since
-    /// registered its waker or found the queue idle.
+    /// A queued write started without arming the writer, and `poll_complete` has not since
+    /// registered its waker or reported the queue idle.
     unarmed_write: bool,
-    /// Set once a Driver-scope panic started the teardown (`DIV-056`).
+    /// Set once a Driver-scope panic started the teardown.
     teardown: Option<Box<TeardownState>>,
 }
 
-/// The panicking teardown polls of each native operation, counted in total (`DIV-056`).
+/// Counts each native operation's teardown polls that panicked, in total.
 #[derive(Default)]
 struct TeardownState {
     read_panics: u8,
@@ -1743,9 +1746,9 @@ struct ConnectionState {
     awaiting_ingress: usize,
     /// Live streams with `Stream::consumed` set.
     consumed_streams: usize,
-    /// Set before the first byte-event registration; until then the observer holds no events.
+    /// Set before the first byte-event registration. Until then the observer is empty.
     byte_events_registered: bool,
-    /// Streams this session refused itself, until their header block completes; a codec
+    /// Streams this session refused itself, kept until their header block completes. A codec
     /// error for one is ignored, since the refusal already reset it.
     discarded: BTreeMap<StreamId, bool>,
     rejected_credit: usize,
@@ -1753,7 +1756,7 @@ struct ConnectionState {
     ingress_grace: bool,
     summary: UniplexRunSummary,
     observation: Option<Box<Observation>>,
-    /// Downstream flood limits (`DIV-052`); `None` while every category is unbounded.
+    /// Downstream flood limits; `None` while every category is unbounded.
     rate_limits: Option<Box<Http2RateLimiter>>,
 }
 
@@ -1761,7 +1764,7 @@ struct DriverFailure {
     failures: VecDeque<Failure>,
     fatal: Option<HttpError>,
     /// A boundary contained a panic, which aborts the connection where it would otherwise
-    /// continue (`DIV-056`).
+    /// continue.
     panicked: bool,
 }
 
@@ -1879,8 +1882,8 @@ pub(crate) fn observations_created() -> usize {
     OBSERVATIONS_CREATED.get()
 }
 
-/// A refused or rejected stream's head is reported as `UniplexSession` reports it: as an
-/// ingress message, unless it has a forbidden body.
+/// Reports a refused or rejected stream's head as an ingress message, unless it has a forbidden
+/// body, as `UniplexSession` does.
 #[cold]
 #[inline(never)]
 fn observe_rejected_head(observation: &Observation, stream: StreamId, message: &mut HttpMessage) {
@@ -1897,12 +1900,14 @@ const fn transport_direction<const UPSTREAM: bool>() -> TransportDirection {
     }
 }
 
-/// Resolves the stream receive window and whether it must be advertised, normalizing
-/// `configured` against the last advertised `INITIAL_WINDOW_SIZE` as `UniplexSession` does: a
-/// non-default window with no advertised value is advertised, and a mirrored advertised value
-/// replaces the default window. A preserved window must equal an advertised one, where
-/// `UniplexSession` keeps both, because a source window below the advertised one resets streams
-/// that stay within the peer's credit. `None` refuses the configuration.
+/// Resolves the stream receive window and whether it must be advertised.
+///
+/// As in `UniplexSession`, `configured` is normalized against the last advertised
+/// `INITIAL_WINDOW_SIZE`: a non-default window with no advertised value is advertised, and a
+/// mirrored advertised value replaces the default window. Unlike `UniplexSession`, which keeps
+/// both, a preserved window must equal an advertised one, because a source window below the
+/// advertised one resets streams that stay within the peer's credit. Returns `None` to reject
+/// the configuration.
 fn owned_receive_window(
     mode: StreamReceiveWindowMode,
     advertised: Option<u64>,
@@ -1925,14 +1930,16 @@ fn owned_receive_window(
 }
 
 impl<A: OwnedApplication> OwnedH2Session<A> {
-    /// Creates the experimental opt-in session. It honors `read_timeout`, whose expiry drains
-    /// the connection with grace, `goaway_timeout`, `write_timeout`, which bounds a stalled
-    /// transport write and the writer's wait for flow-control credit, and
-    /// `stream_read_timeout`, which bounds each wait for request body and answers 408 while
-    /// the response head is unsent (`DIV-028`). It limits only the flood categories that
-    /// `Http2SessionConfig::rate_limits` bounds (`DIV-052`). It honors
-    /// `Http2SessionConfig::abort_streams_on_eof`, which fails the connection on a peer EOF
-    /// while a stream is open (`DIV-055`).
+    /// Creates the session.
+    ///
+    /// It applies `read_timeout`, whose expiry drains the connection with grace, and
+    /// `goaway_timeout`. `write_timeout` bounds a stalled transport write and the writer's wait
+    /// for flow-control credit. `stream_read_timeout` bounds each wait for request body. If it
+    /// expires before the response head is sent, the stream gets a 408 response. Only the flood
+    /// categories that `Http2SessionConfig::rate_limits` bounds are limited.
+    /// `Http2SessionConfig::abort_streams_on_eof` fails the connection on a peer EOF while a
+    /// stream is open. Options the driver does not support, such as
+    /// `Http2SessionConfig::stats` or PING probes, make this return an error.
     pub fn new(
         application: A,
         options: OwnedH2Options,
@@ -1948,9 +1955,10 @@ impl<A: OwnedApplication> OwnedH2Session<A> {
         Self(Some(driver.with_stream_seed(seed)))
     }
 
-    /// Runs inside the caller's registered worker cleanup scope. The run never resumes a
-    /// callback panic: one that aborts the connection is counted in the worker's
-    /// `WorkerPollStats`, and the run returns `Err` once native I/O has joined (`DIV-056`).
+    /// Runs the session inside the caller's registered worker cleanup scope.
+    ///
+    /// The run never resumes a callback panic. A panic that aborts the connection is counted in
+    /// the worker's `WorkerPollStats`, and the run returns `Err` once native I/O has joined.
     pub fn run(mut self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
         self.0
             .take()
@@ -1959,9 +1967,9 @@ impl<A: OwnedApplication> OwnedH2Session<A> {
     }
 
     /// Adds an owner-local lifecycle observer, as `UniplexSession::add_lifecycle_observer`
-    /// does (`DIV-051`). Its `on_attached` runs before this returns. The run delivers events
-    /// at the end of each poll, and `Destroy` when it completes; a session dropped unrun
-    /// delivers only `Destroy`. A session without observers queues nothing.
+    /// does. Its `on_attached` runs before this returns. The run delivers events at the end of
+    /// each poll, and `Destroy` when it completes. A session dropped unrun delivers only
+    /// `Destroy`. A session without observers does not queue events.
     pub fn add_lifecycle_observer(
         &mut self,
         observer: Rc<dyn LifecycleObserver>,
@@ -2254,8 +2262,8 @@ where
         }
     }
 
-    /// Starts the teardown after a Driver-scope panic that the caller reported (`DIV-056`): the
-    /// connection aborts, and the run's next polls join native I/O.
+    /// Starts the teardown after a Driver-scope panic that the caller reported. The connection
+    /// aborts, and the run's next polls join native I/O.
     #[cold]
     #[inline(never)]
     fn poll_panicked(&mut self, panic: PanicPayload, context: &Context<'_>) {
@@ -2280,12 +2288,12 @@ where
         }
     }
 
-    /// One poll of the teardown (`DIV-056`). Native I/O is polled until it completes, timers and
-    /// the codec are not. A teardown poll that panics is polled again, and an operation whose
+    /// One poll of the teardown. Native I/O is polled until it completes; timers and the codec
+    /// are not polled. A teardown poll that panics is polled again, and an operation whose
     /// teardown polls panicked `TEARDOWN_PANIC_LIMIT` times in total is dropped unfinished. Once
-    /// no native operation is pending, the observers receive `Destroy`, and each stream is
-    /// cancelled, unless its exchange was, and dropped. Every step runs under its own unwind
-    /// boundary.
+    /// every native operation has finished or been dropped, the observers receive `Destroy`, and
+    /// each stream is cancelled (unless its exchange already was) and dropped. Every step runs
+    /// under its own unwind boundary.
     #[cold]
     #[inline(never)]
     fn poll_teardown(
@@ -2429,10 +2437,11 @@ where
         }
     }
 
-    /// Abandons a run dropped unfinished, or a session dropped unrun (`DIV-056`): the observers
-    /// receive `Destroy`, the connection aborts with `CORO_CANCELLED`, which cancels every
-    /// exchange and resets the transport, and the streams and then the driver's fields are
-    /// dropped, each under its own unwind boundary. A started run then panics, because its
+    /// Abandons a run dropped unfinished, or a session dropped unrun.
+    ///
+    /// The observers receive `Destroy`. The connection then aborts with `CORO_CANCELLED`, which
+    /// cancels every exchange and resets the transport. The streams, then the driver's fields,
+    /// are dropped, each under its own unwind boundary. A started run then panics, because its
     /// owner dropped it before its cleanup joined, unless its poll unwound (`poisoned`), its
     /// thread is unwinding, or the worker is in a forced teardown.
     #[cold]
@@ -2457,8 +2466,8 @@ where
         );
     }
 
-    /// Drops every field, in declaration order, each that can run foreign code under its own
-    /// unwind boundary, and last the worker context those boundaries report to.
+    /// Drops every field in declaration order, then the worker context that the unwind
+    /// boundaries report to. Each field that can run foreign code drops under its own boundary.
     #[cold]
     #[inline(never)]
     fn release(self) {
@@ -2520,7 +2529,7 @@ where
     }
 
     /// Delivers the queued lifecycle events. An observer panic aborts the connection and starts
-    /// the teardown, as a Driver-scope panic does (`DIV-056`).
+    /// the teardown, as a Driver-scope panic does.
     #[cold]
     #[inline(never)]
     fn flush_observation(&mut self, context: &Context<'_>) {
@@ -2535,8 +2544,9 @@ where
         }
     }
 
-    /// Reports the end of the session once: detaches the streams it still holds, then
-    /// `Destroy`, delivers everything queued and drops the observers. Panics are contained.
+    /// Reports the end of the session once. Queues `TransactionDetached` for each remaining
+    /// stream (then `DeactivateConnection`) and `Destroy`, delivers the queue and drops the
+    /// observers. Panics are contained.
     #[cold]
     #[inline(never)]
     fn observe_destroy(&mut self) {
@@ -2566,8 +2576,7 @@ where
     }
 
     /// A panic contained while the completion closes admission or delivers the last lifecycle
-    /// events fails a run that would have succeeded, as one at the end of a poll does
-    /// (`DIV-056`).
+    /// events fails a run that would have succeeded, as a panic at the end of a poll does.
     #[cold]
     #[inline(never)]
     fn finish_run(
@@ -2622,9 +2631,9 @@ where
     }
 
     // `ran` records whether a phase since the last check went past its guard. A phase that
-    // stopped at its guard ran no application code, so `control.cancel` is unchanged, and it
-    // did not act on cancellation, so skipping this check is the same as a concurrent worker
-    // cancellation arriving just after it; the next check observes it.
+    // stopped at its guard did not run application code or act on cancellation, so
+    // `control.cancel` is unchanged. Skipping this check is then the same as a concurrent worker
+    // cancellation arriving just after it, and the next check observes it.
     fn check_cancel_after(&mut self, ran: &mut bool) {
         if std::mem::take(ran) {
             self.check_cancel();
@@ -2643,7 +2652,8 @@ where
             .control
             .ready
             .register(&mut self.ready_waker, context);
-        // A completion that no waker was registered for is consumed by this poll.
+        // This poll consumes an unarmed write's completion, since its waker was never
+        // registered.
         if self.unarmed_write {
             self.write_wake.ready.store(true, Ordering::Release);
         }
@@ -2736,7 +2746,7 @@ where
             }
             self.check_cancel_after(&mut ran);
             if self.failure.fatal.is_none() && !serialized_owner {
-                // `Ok(false)` means nothing was selected, which runs no application code.
+                // On `Ok(false)` the selection was empty and did not run application code.
                 match self.serialize_next() {
                     Ok(serialized) => {
                         progress |= serialized;
@@ -2825,7 +2835,7 @@ where
             }
         }
         self.budget_yield = Some(self.context.host().yield_to_io());
-        // A yield that completes on its first poll arranged no wake.
+        // A yield that completes on its first poll did not arrange a wake.
         if self.poll_budget_yield(context).is_ready() {
             context.waker().wake_by_ref();
         }
@@ -2916,8 +2926,7 @@ where
     #[inline(never)]
     fn start_drain(&mut self, trigger: DrainTrigger) {
         self.connection.state.draining = true;
-        // Proxygen's `initiateDrain` serves both a local drain and a read timeout
-        // (HTTPCoroSession.cpp:1426-1440, 2626-2628), so either keeps the grace.
+        // A local drain and a read timeout drain the same way, so both keep the ingress grace.
         self.connection.state.ingress_grace = !UPSTREAM
             && self.h2.double_goaway_drain
             && matches!(trigger, DrainTrigger::Local | DrainTrigger::IdleTimeout);
@@ -2932,9 +2941,9 @@ where
         }
     }
 
-    /// Sends the final GOAWAY once the pending one's deadline passed: at once for a zero
-    /// `goaway_timeout`, whose deadline is the instant of the first GOAWAY, else when the `goaway`
-    /// slot fired.
+    /// Sends the final GOAWAY once the pending one's deadline passed. With a zero
+    /// `goaway_timeout` that is immediately, since the deadline is the instant of the first
+    /// GOAWAY. Otherwise it is when the `goaway` slot fires.
     #[cold]
     #[inline(never)]
     fn poll_goaway(&mut self, timer_fired: bool) {
@@ -2965,7 +2974,7 @@ where
     }
 
     /// Arms the `goaway` slot for `goaway_deadline`, or disarms it once a final GOAWAY cleared
-    /// the deadline. A zero `goaway_timeout` needs no slot.
+    /// the deadline. A zero `goaway_timeout` does not use the slot.
     fn sync_goaway_timer(&mut self) {
         let armed = self
             .goaway_deadline
@@ -3052,8 +3061,8 @@ where
         Ok(())
     }
 
-    /// `None` when an outstanding read, or a drained reader's next read, was not ready and nothing
-    /// was polled.
+    /// `None` when an outstanding read, or a drained reader's next read, was not ready, so the
+    /// transport was not polled.
     fn poll_read(&mut self) -> Option<bool> {
         // Until a parked read's waker fires, a turn checks only that waker, as for an outstanding
         // read. Every close, reset and cancellation of the read sets that wake in the same call,
@@ -3088,7 +3097,7 @@ where
             if maximum == 0 {
                 return Some(false);
             }
-            // A parked read was issued when it parked; its poll at the waker issues nothing.
+            // A parked read was issued when it parked, so its poll at the waker is not a new read.
             if !parked && !self.connection.state.config.read_timeout.is_zero() {
                 self.stamp_read_idle();
             }
@@ -3165,8 +3174,8 @@ where
             .is_some_and(|timers| timers.read_idle.take_expired().is_some())
     }
 
-    /// The outstanding read timed out: Proxygen drains the connection and reads on with a fresh
-    /// deadline (HTTPCoroSession.cpp:2626-2628). The read stays outstanding here.
+    /// Handles a timed-out outstanding read. The connection drains and keeps reading with a fresh
+    /// deadline, and the read stays outstanding.
     #[cold]
     #[inline(never)]
     fn read_idle_timeout(&mut self) {
@@ -3176,7 +3185,8 @@ where
         self.stamp_read_idle();
     }
 
-    /// Whether the writer waits for work: nothing to write and no write outstanding.
+    /// Whether the writer is waiting for work: egress is empty, every write has completed, and
+    /// the connection has not failed or been reset.
     fn writer_idle(&self) -> bool {
         self.egress.is_empty()
             && !self.connection.state.zero_write_pending
@@ -3185,11 +3195,11 @@ where
             && !self.transport_reset
     }
 
-    /// Uniplex's `h2_blocked_streams`: with the connection out of send credit, the streams whose
-    /// next body needs credit, else the streams out of stream credit, sorted by id. Returns
-    /// whether the connection is out of credit. Reads the flow index, which costs the streams
-    /// reached mutably since the last check plus the blocked streams, not a pass over every
-    /// stream.
+    /// Mirrors `UniplexSession`'s `h2_blocked_streams`. Fills `blocked`, sorted by id, with the
+    /// streams whose next body needs credit if the connection is out of send credit, and
+    /// otherwise with the streams out of stream credit. Returns whether the connection is out of
+    /// credit. Reading the flow index costs the streams reached mutably since the last check plus
+    /// the blocked streams, not a pass over every stream.
     fn flow_blocked_streams(&mut self, blocked: &mut Vec<StreamId>) -> bool {
         let connection = self.connection.codec.available_send() == 0;
         blocked.clear();
@@ -3225,10 +3235,9 @@ where
         connection
     }
 
-    /// Proxygen's writer waits for its write event with `writeTimeout_` while it has nothing to
-    /// write (HTTPCoroSession.cpp:3258-3273). The `flow` slot is that wait while flow control
-    /// blocks egress: armed for the blocked streams, kept while they stay the same, and disarmed
-    /// once nothing is blocked.
+    /// Syncs the `flow` slot, which applies `write_timeout` to an idle writer while flow control
+    /// blocks egress. The slot is armed for the blocked streams, kept while they stay the same,
+    /// and disarmed once every stream is unblocked.
     #[cold]
     #[inline(never)]
     fn sync_flow_timer(&mut self) {
@@ -3272,8 +3281,8 @@ where
         *flow_scan = blocked;
     }
 
-    /// The blocked streams of an idle writer, none while it has work, in the reused scan buffer,
-    /// and whether the connection's send window blocks them.
+    /// Returns the blocked streams of an idle writer (empty while it has work), in the reused
+    /// scan buffer, and whether the connection's send window blocks them.
     fn scan_flow_blocked(&mut self) -> (Vec<StreamId>, bool) {
         let mut blocked = self
             .timers
@@ -3293,12 +3302,13 @@ where
         }
     }
 
-    /// Consumes an expiry of the `flow` slot and returns whether there was one: the writer's
-    /// wait timed out while flow control blocked egress. Proxygen's `handleWriteEventTimeout`
-    /// fails the connection with FLOW_CONTROL_ERROR when it is out of credit with body waiting,
-    /// and otherwise resets every flow-blocked stream with it. The expiry acts only if nothing
-    /// changed since the slot was armed, as activity would have restarted the wait; otherwise
-    /// the next idle check arms the slot again.
+    /// Consumes an expiry of the `flow` slot and returns whether there was one, meaning the
+    /// writer's wait timed out while flow control blocked egress. If the connection is out of
+    /// credit with body waiting, it fails with FLOW_CONTROL_ERROR. Otherwise every flow-blocked
+    /// stream is reset with that code. The expiry acts only if the blocked set, whether the
+    /// connection window blocks it, and the progress marks are unchanged since the slot was
+    /// armed, as activity would have restarted the wait. Otherwise the next idle check arms the
+    /// slot again.
     #[cold]
     #[inline(never)]
     fn flow_timeout(&mut self) -> bool {
@@ -3372,14 +3382,13 @@ where
         }
     }
 
-    /// Whether a queued write's completion must wake the session: something waits for it
-    /// that no later poll is guaranteed to observe. While a live stream still awaits wire
-    /// ingress and nothing below holds, that ingress, or the stream's consumer, polls the
-    /// session again, and the poll consumes the completion (`unarmed_write`). A downstream
-    /// session with no streams left has nothing waiting on a receipt beyond what the other
-    /// terms arm for; its next request, EOF, cancel or drain consumes the receipt. Under a
-    /// write timeout the writer's flow-control wait starts only once the receipt is consumed,
-    /// so every completion wakes the session.
+    /// Whether a queued write's completion must wake the session, because something waits on it
+    /// and a later poll is not otherwise guaranteed. While a live stream awaits wire ingress and
+    /// every term below is false, that ingress or the stream's consumer polls the session, and
+    /// the poll consumes the completion (`unarmed_write`). A downstream session without streams
+    /// needs only what the other terms cover, since its next request, EOF, cancel or drain
+    /// consumes the completion. Under a write timeout every completion wakes the session,
+    /// because the writer's flow-control wait starts only after the completion is consumed.
     fn write_completion_needed(&self) -> bool {
         let state = &self.connection.state;
         (state.awaiting_ingress == 0 && (UPSTREAM || !self.streams.is_empty()))
@@ -3525,7 +3534,7 @@ where
                 .as_mut()
                 .expect("the queued writer is installed");
             // Polling an idle queue would register a waker that the next write's completion
-            // fires even when nothing waits for it.
+            // fires even when the session is not waiting for it.
             if queue.is_idle() {
                 break;
             }
@@ -3659,7 +3668,7 @@ where
     A: OwnedApplication,
     A::Exchange: ExchangeStorage<UPSTREAM>,
 {
-    /// The driver ignores `CodecEvent::FrameHeader` (`DIV-026`).
+    /// The driver ignores `CodecEvent::FrameHeader`.
     const OBSERVES_FRAME_HEADERS: bool = false;
 
     #[cold]
@@ -3682,7 +3691,8 @@ where
         }
     }
 
-    /// Counts one `kind` event against the downstream flood limits; whether it breached them.
+    /// Counts one `kind` event against the downstream flood limits and returns whether it
+    /// breached them.
     #[inline(always)]
     fn rate_limited(&mut self, kind: RateLimitKind) -> bool {
         !UPSTREAM
@@ -3716,8 +3726,8 @@ where
         if let Some(owner) = self.streams.get_mut(&stream) {
             owner.ingress_rejected = true;
         }
-        // Not `fail`: as in `UniplexSession`, a breach is no codec failure, so a lifecycle
-        // observer receives no `Http2IngressError` for it.
+        // Not `fail`: as in `UniplexSession`, a breach is not a codec failure, so a lifecycle
+        // observer does not receive `Http2IngressError` for it.
         self.failures.push_back(Failure {
             header_rate_limit: true,
             ..Failure::new(stream, rate_limit_exceeded(RateLimitKind::HeaderFrames))
@@ -3769,8 +3779,7 @@ where
             source.read_empty_content_length_as_zero();
         }
         let producer = source.producer();
-        // Proxygen's `HTTPStreamSource::setReadTimeout` and Uniplex time a request body from the
-        // stream's creation.
+        // As in `UniplexSession`, a request body is timed from the stream's creation.
         let stream_read_timeout = self.state.config.stream_read_timeout;
         if !stream_read_timeout.is_zero() {
             producer.set_read_timeout(stream_read_timeout);
@@ -4162,8 +4171,7 @@ where
                 let code = h2_error_code_to_http_error_code(code);
                 let peer_code = code;
                 if let Some(observation) = self.state.observation.as_deref() {
-                    // Observers are downstream-only (`DIV-051`) and see a peer's NO_ERROR
-                    // as CANCEL.
+                    // Observers are downstream-only and receive a peer's NO_ERROR as CANCEL.
                     let observed = if code == HttpErrorCode::NO_ERROR {
                         HttpErrorCode::CANCEL
                     } else {
@@ -4175,8 +4183,9 @@ where
                     });
                 }
                 if let Some(owner) = self.streams.get_mut(&stream) {
-                    // `DIV-050`: once the whole response has arrived, an upstream peer's
-                    // NO_ERROR stops the upload without error (RFC 9113 §8.1).
+                    // Once the whole response has arrived, an upstream peer's NO_ERROR stops
+                    // the upload without error. RFC 9113 lets a server that has sent a complete
+                    // response ask the client to stop sending the request this way.
                     let code = if code == HttpErrorCode::NO_ERROR
                         && !(UPSTREAM && owner.wire_ingress_complete)
                     {
@@ -4552,9 +4561,9 @@ where
         Ok(consumed != 0 || finishing_eof)
     }
 
-    /// `DIV-055`: whether a request head is still arriving, or some stream's response
-    /// END_STREAM is not yet serialized and the peer has not reset it, the reset only awaiting
-    /// its owner's turn.
+    /// Whether a request head is still arriving, or some stream's response END_STREAM is not
+    /// yet serialized and the peer has not reset it. A stream with a recorded peer reset is not
+    /// open, even before its owner applies the reset.
     fn has_open_stream(&self) -> bool {
         self.connection.codec.has_partial_request_head()
             || self
@@ -4563,8 +4572,8 @@ where
                 .any(|stream| !stream.response_complete && stream.peer_reset.is_none())
     }
 
-    /// `DIV-055`: fails the connection on a peer EOF while a stream is open, as a transport
-    /// read error does, which also skips the incomplete-stream failures that follow.
+    /// Fails the connection on a peer EOF while a stream is open, as a transport read error
+    /// does, which also skips the incomplete-stream failures that follow.
     #[cold]
     #[inline(never)]
     fn abort_open_streams_on_eof(&mut self) {
@@ -4702,7 +4711,7 @@ where
 }
 
 impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
-    /// Read only where a stream's physical completion is decided.
+    /// Read only where a stream's `physically_complete` is determined.
     fn writes_pending(&self) -> bool {
         #[cfg(test)]
         OWNER_WRITE_STATE_READS.with(|reads| reads.set(reads.get() + 1));
@@ -4931,8 +4940,9 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
     }
 
     /// Consumes the source's completion, which the shared source publishes once, before waking
-    /// this owner. Inlined: every owner poll runs it. `handler_active` is whether the handler ran
-    /// when the source completed, if known; otherwise the exchange says whether it runs now.
+    /// this owner. Inlined because every owner poll runs it. `handler_active` is whether the
+    /// handler ran when the source completed, if known. Otherwise the exchange reports whether
+    /// it runs now.
     #[inline(always)]
     fn take_completion<E: ExchangeStorage<UPSTREAM>>(
         &mut self,
@@ -4956,11 +4966,12 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
         }
     }
 
-    /// Whether a request body read timeout that the application's last poll observed has
-    /// settled the stream. The session core runs the source's completion callback, queued
-    /// inside that read, before the handler's result or the response's failure, so the timeout
-    /// decides the outcome and the poll's result is moot. `handler_active` is whether the
-    /// handler ran before that poll, so when the read timed out.
+    /// Whether a request body read timeout that the application's last poll observed has ended
+    /// the stream (`Stream::reset`), with a reset or an immediate 408. The session core runs the
+    /// source's completion callback, queued inside that read, before the handler's result or
+    /// the response's failure, so the timeout determines the outcome and the poll's result is
+    /// ignored. `handler_active` is whether the handler ran before that poll, and so when the
+    /// read timed out.
     #[cold]
     #[inline(never)]
     fn read_timeout_settled<E: ExchangeStorage<UPSTREAM>>(
@@ -4973,10 +4984,10 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
         stream.reset
     }
 
-    /// Applies the 408 that a request body read timeout expects of a running handler to its
-    /// pending head (session.rs `ExpectedStatusSource`): a final 408 goes out as answered, and
-    /// any other final head cancels the exchange and becomes a bare 408. Whether it replaced
-    /// the head.
+    /// Enforces the 408 that a request body read timeout requires of a running handler's
+    /// pending head, as the session core's `ExpectedStatusSource` does. A final 408 is sent as
+    /// written, and any other final head cancels the exchange and becomes a bare 408. Returns
+    /// whether it replaced the head.
     #[cold]
     #[inline(never)]
     fn replaced_unexpected_head<E: ExchangeStorage<UPSTREAM>>(
@@ -5044,7 +5055,7 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
             }
         } else if error.code() == HttpErrorCode::READ_TIMEOUT && !stream.response_headers {
             // The session core's stream read timeout before the response head: 408, from a
-            // running handler when it answers, otherwise at once.
+            // running handler when it responds, otherwise immediately.
             let handler_active = handler_active.unwrap_or_else(|| {
                 stream.application.as_mut().is_some_and(|application| {
                     <E as ExchangeStorage<UPSTREAM>>::downstream(application).handler_active()
@@ -5114,8 +5125,8 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
             .state
             .scheduler
             .dequeue(id, &mut stream.scheduling);
-        // `DIV-033`: a cause the request's consumer selected discards the response's queued
-        // events, as `UniplexStreamAbort` does.
+        // A cause selected by the request's consumer discards the response's queued events, as
+        // `UniplexStreamAbort` does.
         let discard = stream
             .upstream()
             .is_some_and(|exchange| exchange.status.cause_selected());
@@ -5173,8 +5184,8 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
         });
     }
 
-    /// Cancels the owner with `error` and answers with a bodiless `status` that ends the stream,
-    /// the session core's error response.
+    /// Cancels the owner with `error` and responds with a bodiless `status` that ends the
+    /// stream, like the session core's error response.
     #[cold]
     fn respond_with_error<E: ExchangeStorage<UPSTREAM>>(
         &mut self,
@@ -5252,7 +5263,7 @@ where
     }
 
     /// Aborts the stream whose header block breached the header rate limit, without a reset,
-    /// then drains with one final GOAWAY covering it, as Proxygen's `RateLimitFilter` does.
+    /// then drains with one final GOAWAY covering it.
     #[cold]
     #[inline(never)]
     fn header_rate_limit_breached(&mut self, stream: StreamId, error: HttpError) {
@@ -5260,8 +5271,8 @@ where
         self.start_final_drain(DrainTrigger::HeaderRateLimit);
     }
 
-    /// Cancels a live stream's exchange and sources as a local reset does, but writes no
-    /// RST_STREAM.
+    /// Cancels a live stream's exchange and sources as a local reset does, but does not
+    /// write RST_STREAM.
     #[cold]
     fn abort_stream_without_wire(&mut self, id: StreamId, error: HttpError) {
         let Some(mut stream) = self.streams.remove(&id) else {
@@ -5906,8 +5917,9 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
 
 impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
     /// Whether a downstream stream whose END_STREAM was just serialized skips its write
-    /// fence (`DIV-028`): it completes normally, its request has fully arrived with no
-    /// trailing RST owed, it registered no byte event, and the write queue is not saturated.
+    /// fence. It must complete normally, its request must have fully arrived with no trailing
+    /// RST pending, it must not have registered a byte event, and the write queue must not be
+    /// saturated.
     /// The terms run in this order, so only an otherwise eligible stream queries the queue.
     fn retires_at_serialization<E: ExchangeStorage<UPSTREAM>>(
         &self,
@@ -6077,7 +6089,7 @@ mod receive_window_tests {
         // (mode, last advertised INITIAL_WINDOW_SIZE, configured window, OwnedH2's window and
         // whether it adds INITIAL_WINDOW_SIZE). The comment names UniplexSession's result.
         let cases = [
-            // Uniplex: the default window, nothing added.
+            // Uniplex: the default window, without adding INITIAL_WINDOW_SIZE.
             (Mirror, None, 65_535, Some((65_535, false))),
             (Preserve, None, 65_535, Some((65_535, false))),
             // Uniplex: the configured window, and it adds INITIAL_WINDOW_SIZE.
@@ -6095,12 +6107,12 @@ mod receive_window_tests {
             (Mirror, Some(131_072), 131_072, Some((131_072, false))),
             (Preserve, Some(131_072), 131_072, Some((131_072, false))),
             (Mirror, Some(65_535), 65_535, Some((65_535, false))),
-            // Uniplex: refused as conflicting with the advertised SETTINGS.
+            // Uniplex: rejected as conflicting with the advertised SETTINGS.
             (Mirror, Some(131_072), 262_144, None),
             // Uniplex: keeps both windows.
             (Preserve, Some(131_072), 65_535, None),
             (Preserve, Some(131_072), 262_144, None),
-            // Uniplex: refused as not representable.
+            // Uniplex: rejected as not representable.
             (Mirror, Some(0), 65_535, None),
             (Mirror, Some(1 << 31), 65_535, None),
             (Mirror, Some(u64::from(u32::MAX) + 1), 65_535, None),

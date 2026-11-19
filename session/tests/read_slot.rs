@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! `ReadSlot` outcomes, pinned for the same scripted reads through each read path: one
+//! Checks `ReadSlot` outcomes for the same scripted reads through each read path: one
 //! `UniplexTransport::read` future per read, and the transport's `UniplexReader`.
 
 use std::cell::Cell;
@@ -57,7 +57,7 @@ enum Step {
     Fail(HttpErrorCode),
     /// Fails with `CORO_CANCELLED` once the read's cancellation is requested, else pends.
     Cancellable,
-    /// Refuses the read as it starts: the reader's `start_read` fails, and the future fails
+    /// Rejects the read as it starts. The reader's `start_read` fails, and the future fails
     /// at its first poll.
     Refuse(HttpErrorCode),
     Panic,
@@ -299,7 +299,7 @@ struct Case {
     wake_on_drop: bool,
 }
 
-/// A waker of its own, so that a read can tell its caller's waker from any other. It counts its
+/// A distinct waker, so that the caller's waker can be told apart from any other. It counts its
 /// wakes, so a transcript shows whether a wake landed before the slot returned.
 struct TaskWake(AtomicUsize);
 

@@ -211,7 +211,7 @@ impl ManualHost {
         self.completed_yields.get()
     }
 
-    /// How many futures this host has been asked to spawn.
+    /// How many futures have been spawned on this host.
     pub(crate) fn spawns(&self) -> usize {
         self.spawns.get()
     }
@@ -327,14 +327,16 @@ pub(crate) fn after_forced_teardown(inspect: impl FnOnce() + 'static) {
     AFTER_FORCED_TEARDOWN.set(Some(Box::new(inspect)));
 }
 
-/// Starts the future that `start` builds on the owner thread of a fresh `HostedWorker` as a
-/// worker scope, as `OwnedClientSession` runs an owned driver. Once the scope's first poll has
-/// returned `Pending`, shuts the worker down with a teardown deadline that has already passed
-/// (`DIV-043`), so its supervisor destroys the scope unfinished, and returns the worker's
-/// completion. The shutdown can land while the owner thread is still in that poll's turn, so a
-/// scope that could finish once cancelled may finish first and the worker then joins cleanly:
-/// the scope must hold something its cancellation cannot finish, such as a transport read that
-/// ignores cancellation, for the teardown to always destroy it unfinished.
+/// Runs the future that `start` builds as a worker scope on the owner thread of a fresh
+/// `HostedWorker`, as `OwnedClientSession` runs an owned driver, and returns the worker's
+/// completion.
+///
+/// Once the scope's first poll returns `Pending`, the worker shuts down with a teardown
+/// deadline that has already passed, so its supervisor destroys the scope unfinished. The
+/// shutdown can land while the owner thread is still in that first poll, so a scope that can
+/// finish once cancelled may finish first and let the worker join cleanly. For the teardown to
+/// always destroy the scope unfinished, the scope must hold something that cancellation cannot
+/// finish, such as a transport read that ignores cancellation.
 pub(crate) fn forced_teardown_of_scope(
     start: impl FnOnce(WorkerContext) -> LocalFuture + Send + 'static,
 ) -> Result<(), ManagedWorkerError> {

@@ -72,7 +72,7 @@ pub fn free_stream_send(window: &mut Window, stalled: &mut bool, amount: u32) ->
     freed
 }
 
-/// Whether peer GOAWAY refuses this locally initiated stream.
+/// Whether `stream` is locally initiated and above the peer's GOAWAY last-stream ID.
 pub fn peer_goaway_refuses(
     stream: StreamId,
     last_good_stream: StreamId,
@@ -162,14 +162,17 @@ pub struct CodecFailureContext {
 /// Protocol action to perform without moving or destroying stream-owned state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodecFailureDisposition {
+    /// Send an error response with this status on the live stream.
     Response(u16),
+    /// Ignore the failure of a discarded or unknown stream.
     Ignore,
-    /// The explicit code overrides a live reset's adapted local error code.
-    /// `fallback_wire_code` applies if no live reset update can be produced.
+    /// Reset the stream. The explicit code overrides a live reset's adapted local error
+    /// code, and `fallback_wire_code` applies when a live reset update cannot be produced.
     Reset {
         explicit_wire_code: Option<H2ErrorCode>,
         fallback_wire_code: H2ErrorCode,
     },
+    /// Fail the connection.
     Connection,
 }
 

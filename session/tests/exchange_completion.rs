@@ -1819,8 +1819,8 @@ fn exchange_completion_panic_payloads_cannot_abandon_retirement() {
     });
 }
 
-/// A source that serves body reads only through `poll_body_event` (`DIV-039`):
-/// `Pending` once, then the end of the body, or a panic on every poll.
+/// A source that serves body reads only through `poll_body_event`. It returns
+/// `Pending` once and then the end of the body, or panics on every poll.
 struct PollingSource {
     polls: Rc<Cell<usize>>,
     panic_poll: bool,
@@ -1953,11 +1953,11 @@ impl Drop for PanickingCapabilitySource {
     }
 }
 
-/// The holder asks the capability when a body read starts, before any read
-/// guard exists; a panic there must still make the exchange's cleanup
-/// unconfirmed after a caller catches it and tears down normally. The
-/// exchange's own holder, asked through the wrapper, consumes the source
-/// unstopped (`DIV-056`).
+/// The holder queries the capability when a body read starts, before any read
+/// guard exists. A panic there must still leave the exchange's cleanup
+/// unconfirmed after the caller catches it and tears down normally. The
+/// exchange's holder, queried through `ExchangeSource`, drops the source during
+/// that panic without calling `stop_reading`.
 #[test]
 fn exchange_source_polls_body_events_panic_preserves_exchange_failure() {
     run_local(async {

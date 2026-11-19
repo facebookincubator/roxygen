@@ -47,7 +47,7 @@ pub struct Http2RateLimitConfig {
 }
 
 impl Http2RateLimitConfig {
-    /// Whether no category can trip.
+    /// Whether every category is unbounded.
     pub const fn is_unbounded(&self) -> bool {
         self.control_frames.is_unbounded()
             && self.header_frames.is_unbounded()

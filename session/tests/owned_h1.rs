@@ -73,7 +73,7 @@ struct Response {
     /// Informational statuses sent, in order, before the request body is read.
     interim: Vec<u16>,
     /// The head is sent before the request body is read, and the body after it ends, as a
-    /// tunnel's answer is.
+    /// tunnel's response is.
     tunnel: bool,
     /// The head accepts a WebSocket upgrade.
     websocket: bool,
@@ -119,7 +119,7 @@ impl Response {
             .collect()
     }
 
-    /// A body-less response that declares `length`, as a response to HEAD does.
+    /// A body-less response with `Content-Length: length`, as a response to HEAD can have.
     fn declaring(status: u16, length: usize) -> Self {
         Self {
             declared_length: Some(length),
@@ -308,10 +308,10 @@ struct H1App {
     body_gate: Option<Rc<tokio::sync::Notify>>,
     /// The `maximum` of each request body read.
     body_read_size: u32,
-    /// Each exchange drops its request body unread and answers at once.
+    /// Each exchange drops its request body unread and responds immediately.
     respond_early: bool,
-    /// Each response head asks to be told its encoded size, and every response event registers
-    /// a transport-write byte event.
+    /// Each response head registers a callback for its encoded size, and every response event
+    /// registers a transport-write byte event.
     instrument: bool,
     /// Once set, each exchange cancels the session through this handle from the named
     /// callback: `new_exchange`, `request`, `poll_headers`, `poll_body`, `response_complete`,
@@ -338,13 +338,13 @@ enum StopAt {
     /// In `poll_headers`, just before it returns the response head.
     Head,
     /// In `poll_body`, once `H1App::body_gate` is notified. That poll returns `Pending`, so the
-    /// driver sees the stop before the response's next event.
+    /// driver observes the stop before the response's next event.
     Body,
     /// In `poll_body`, once `H1App::body_gate` is notified, in the poll that returns the
     /// response's last event.
     Last,
     /// In the cancellation callback of a byte event registered on the response's last event,
-    /// which the driver refuses before it serializes that event.
+    /// which the driver cancels before it serializes that event.
     Refusal,
     /// By the test, outside the driver's poll, from `H1App::script_held`. The response waits
     /// for `H1App::body_gate`.
@@ -750,7 +750,7 @@ impl OwnedExchange for H1Exchange {
         let Some(bytes) = oversized else {
             return Poll::Ready(Ok(event));
         };
-        // As the contract asks: at most `maximum` bytes now, the rest on later polls.
+        // The contract allows at most `maximum` bytes per poll. The rest goes out on later polls.
         self.body
             .push_front(HttpBodyEvent::body(queue(&bytes[maximum..]), event.eom()));
         Poll::Ready(Ok(HttpBodyEvent::body(queue(&bytes[..maximum]), false)))
@@ -798,7 +798,7 @@ struct ScriptHandler {
     served: Cell<usize>,
     /// The `maximum` of each request body read.
     body_read_size: u32,
-    /// Answers without reading the request body, dropping it.
+    /// Responds without reading the request body, dropping it.
     respond_early: bool,
     probes: Rc<RefCell<Vec<Rc<H1Probe>>>>,
 }
@@ -871,8 +871,8 @@ impl HttpHandler for ScriptHandler {
     }
 }
 
-/// Sends its informational heads at once, then reads the request body to its end before the
-/// final head (or, for a tunnel, before the body), as `H1Exchange` does.
+/// Sends its informational heads immediately, then reads the request body to its end before
+/// the final head (or, for a tunnel, before the body), as `H1Exchange` does.
 struct ScriptSource {
     request: Option<HttpSourceHolder>,
     probe: Rc<H1Probe>,
@@ -1091,9 +1091,9 @@ fn owned_h1_serves_a_get_on_a_manual_host() {
     assert!(probe.cancelled.is_empty());
 }
 
-/// H2-L6: after a read that drained the transport, the driver polls its reader again only once
-/// the reader's waker fires, so each read is polled once, after one poll that waited for the
-/// first bytes, and each request is answered on the kept-alive connection.
+/// After a read that drained the transport, the driver polls its reader again only once the
+/// reader's waker fires. Each read is polled once, after one poll that waited for the first
+/// bytes, and each request gets its response on the kept-alive connection.
 #[test]
 fn owned_h1_polls_a_drained_reader_once_per_read() {
     let request = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n";
@@ -1148,10 +1148,10 @@ fn owned_h1_polls_a_drained_reader_once_per_read() {
 }
 
 /// Serves a keep-alive GET, read in one read that drains the transport, with a chunked response
-/// whose body events the test pushes while the reader stays parked: it waits for its waker,
-/// with no read started. Returns, for each of three pushed events, the driver turns, the read
-/// starts evaluated, the read and write-completion phases entered and the wake signals taken;
-/// then the wire once the response ended and `end` ended the connection.
+/// whose body events the test pushes while the reader stays parked (waiting for its waker, with
+/// no read started). For each of three pushed events, returns the driver turns, the read starts
+/// evaluated, the read and write-completion phases entered, and the wake signals taken. Also
+/// returns the wire once the response has ended and `end` has ended the connection.
 fn parked_h1(end: ParkedEnd) -> (Vec<(usize, usize, usize, usize, usize)>, Wire) {
     run_on_host(move |context| {
         Box::pin(async move {
@@ -1213,9 +1213,9 @@ fn parked_h1(end: ParkedEnd) -> (Vec<(usize, usize, usize, usize, usize)>, Wire)
     })
 }
 
-/// H2-L6b: while a drained reader waits for its waker ("parked"), each driver turn leaves the
-/// read phase without evaluating a read start. Each pushed body event's turn evaluates none;
-/// without the fast exit the turn would evaluate one.
+/// While a drained reader waits for its waker ("parked"), each driver turn leaves the read
+/// phase without evaluating a read start. Without that fast exit, each pushed body event's turn
+/// would evaluate one.
 #[test]
 fn owned_h1_a_parked_reader_evaluates_no_read_start_while_a_response_body_is_pushed() {
     let (counts, wire) = parked_h1(ParkedEnd::Close);
@@ -1237,13 +1237,13 @@ fn owned_h1_a_parked_reader_evaluates_no_read_start_while_a_response_body_is_pus
     assert_eq!(wire.error, None);
 }
 
-/// With the reader parked, as an owned connection over TCP is between requests, each pushed body
-/// event's one turn enters the read phase once, where the parked reader's two loads end it, and
-/// the write-completion phase twice: once in the turn, where no write is ready, and once after
-/// the event's write starts, which takes its completion. It takes three wake signals: the
-/// exchange's and the write's in the turn, and the write's after it; the body's second poll
-/// clears the exchange's signal in place of taking it. A second turn would add one read phase,
-/// one write-completion phase and both of its signal takes.
+/// With the reader parked, as on an owned TCP connection between requests, each pushed body
+/// event takes one turn. That turn enters the read phase once, where the parked reader ends it
+/// after two loads. It enters the write-completion phase twice: once in the turn, when no write
+/// is ready, and once after the event's write starts, to take its completion. The three signal
+/// takes are the exchange's and the write's in the turn, and the write's after it. The body's
+/// second poll clears the exchange's signal instead of taking it. A second turn would add one
+/// read phase, one write-completion phase and two signal takes.
 #[test]
 fn owned_h1_a_pushed_body_event_enters_the_read_phase_once_and_the_write_phase_twice() {
     let (counts, _) = parked_h1(ParkedEnd::Close);
@@ -1258,9 +1258,8 @@ fn owned_h1_a_pushed_body_event_enters_the_read_phase_once_and_the_write_phase_t
     );
 }
 
-/// H2-L6b: a parked reader still ends. The next read's EOF or failure wakes it, and the driver's
-/// own idle close and abort mark its read wake in the same call (`close_idle`,
-/// `reset_transport`), so each parked connection ends as it did before the fast exit.
+/// A parked reader still ends. The next read's EOF or failure wakes it, and the driver's own
+/// idle close and abort (`close_idle`, `reset_transport`) mark its read wake in the same call.
 #[test]
 fn owned_h1_a_parked_reader_still_ends_on_its_wake_close_and_abort() {
     for (end, close, error) in [
@@ -1331,7 +1330,7 @@ fn owned_h1_reads_through_the_transport_reader() {
     assert_eq!(wire.error, direct.error);
 }
 
-/// `count` keep-alive GETs in one read; the last one asks to close the connection.
+/// `count` keep-alive GETs in one read; the last one carries `Connection: close`.
 fn pipelined_gets(count: usize) -> Vec<u8> {
     (0..count)
         .flat_map(|index| {
@@ -1435,10 +1434,10 @@ fn serial_exchanges_do_not_overlap() {
     );
 }
 
-/// `DIV-043`: a worker whose teardown deadline has passed destroys an owned downstream midway
-/// through a request body, before its application and native I/O cleanup joined. That
-/// destruction is an abandonment: the driver still cancels the exchange and resets the
-/// transport, and the worker reports a clean overrun instead of a panic.
+/// A worker whose teardown deadline has passed destroys an owned downstream midway through a
+/// request body, before its application and native I/O cleanup joined. The driver still cancels
+/// the exchange and resets the transport, and the worker reports `TeardownDeadlineExceeded`
+/// instead of a panic.
 #[test]
 fn a_forced_worker_teardown_abandons_an_owned_downstream_mid_request() {
     let (inspected_tx, inspected_rx) = std::sync::mpsc::channel();
@@ -1535,8 +1534,8 @@ fn content_length_request_body_reaches_the_exchange() {
     assert_eq!(probe.completed, 1);
 }
 
-/// Serves one byte string honoring each read's `maximum`, then parks until cancelled; records
-/// writes and how the session closed.
+/// Serves one byte string, at most each read's `maximum` at a time, then parks until cancelled.
+/// Records writes and how the session closed.
 struct ByteTransport {
     pending: RefCell<VecDeque<u8>>,
     eof: bool,
@@ -1735,8 +1734,8 @@ fn response_without_length_is_chunked_on_http11() {
     assert_eq!(owned.close, uniplex.close);
 }
 
-/// A response body read that suspends is resumed and read again, as `UniplexSession` reads
-/// it, with either framing; any resume status reads on, as Uniplex's does.
+/// A response body read that suspends is resumed and read again with either framing, as
+/// `UniplexSession` reads it. Any resume status continues the read, as in `UniplexSession`.
 #[test]
 fn a_suspended_response_body_is_read_after_it_resumes_as_uniplex() {
     let reads = || {
@@ -1770,8 +1769,8 @@ fn a_suspended_response_body_is_read_after_it_resumes_as_uniplex() {
 /// Serves one `Connection: close` GET whose response body starts with a `ResumeProbe`
 /// suspension. Once the driver has polled the resume and flushed the head, the test resumes it
 /// with `status`, or with `None` cancels the session from outside the driver. With
-/// `cancel_callback`, the resume is ready at once and the session is cancelled from that
-/// callback of it instead. Returns the wire, the exchange's observations and the resume's drops.
+/// `cancel_callback`, the resume is ready immediately and that resume callback cancels the
+/// session instead. Returns the wire, the exchange's observations and the resume's drops.
 fn suspended_response(
     status: Option<ResumeStatus>,
     cancel_callback: Option<&'static str>,
@@ -2061,7 +2060,7 @@ fn configured_wire(
 
 /// A read error that follows request body bytes the parser has not reached, because the unread
 /// body is at `ingress_buffer_limit`, fails the connection only after those bytes reach the
-/// exchange, as `UniplexSession` delivers them before it sees the failed read.
+/// exchange, as `UniplexSession` delivers them before it observes the failed read.
 #[test]
 fn bytes_read_before_a_read_error_reach_the_exchange_as_uniplex() {
     let body = patterned(4096);
@@ -2100,7 +2099,7 @@ fn bytes_read_before_a_read_error_reach_the_exchange_as_uniplex() {
         "the request head and body bytes read before the error reach the exchange"
     );
     assert_same_requests(&owned_requests, &uniplex_requests, "read error");
-    // The owned exchange learns of the failure through `cancel`; the handler through its body.
+    // The owned exchange receives the failure through `cancel`, the handler through its body.
     assert_eq!(
         owned_requests[0].cancelled,
         [(HttpErrorCode::TRANSPORT_READ_ERROR, true)]
@@ -2136,9 +2135,9 @@ fn assert_read_error_matches_uniplex(
 }
 
 /// A read error that follows a pipelined request, read while the request before it awaits its
-/// response, fails the connection only after that response, as `UniplexSession` issues no read
-/// while it holds a pipelined request back: a keep-alive request's successor is then parsed and
-/// admitted, and a closing request's connection closes without seeing the failed read.
+/// response, fails the connection only after that response. `UniplexSession` does not issue a
+/// read while it holds a pipelined request back, so a keep-alive request's successor is parsed
+/// and accepted, and a closing request's connection closes without reporting the read error.
 #[test]
 fn a_pipelined_request_read_before_a_read_error_is_served_as_uniplex() {
     let read_error = Some(HttpErrorCode::TRANSPORT_READ_ERROR);
@@ -2179,8 +2178,8 @@ fn a_pipelined_request_read_before_a_read_error_is_served_as_uniplex() {
                 "{label}: the failure cancels the pipelined request before its response"
             );
             assert_eq!(owned_requests[1].headers_polled, 0, "{label}");
-            // `UniplexSession` gives the handler no cause: it drops the pipelined request's
-            // response unread, and the read error is the run's error.
+            // `UniplexSession` does not give the handler a cause. It drops the pipelined
+            // request's response unread, and the read error is the run's error.
             assert!(uniplex_requests[0].response_stopped.is_empty(), "{label}");
             assert_eq!(
                 uniplex_requests[1].response_stopped,
@@ -2192,9 +2191,9 @@ fn a_pipelined_request_read_before_a_read_error_is_served_as_uniplex() {
 }
 
 /// A read error that follows bytes read behind an upgrade or CONNECT head fails the connection
-/// only after the final response resolves the upgrade, as `UniplexSession` issues no read while
-/// the upgrade is pending: an accepted tunnel's head is written before the reset, and a refused
-/// upgrade closes without seeing the failed read.
+/// only after the final response resolves the upgrade. `UniplexSession` does not issue a read
+/// while the upgrade is pending, so an accepted tunnel's head is written before the reset, and
+/// a rejected upgrade closes without reporting the read error.
 #[test]
 fn bytes_behind_a_pending_upgrade_precede_a_read_error_as_uniplex() {
     let mut refused = WEBSOCKET_HEAD.to_vec();
@@ -2550,7 +2549,7 @@ pub(super) fn take_ingress_credit_callbacks(owned: bool) -> usize {
     }
 }
 
-/// What one server saw of [`resume_threshold_run`]'s request.
+/// What one server observed of [`resume_threshold_run`]'s request.
 struct ResumeThresholdRun {
     wire: Wire,
     observed: Vec<Observed>,
@@ -2638,8 +2637,8 @@ fn resume_threshold_run(owned: bool, stats: bool) -> ResumeThresholdRun {
     })
 }
 
-/// Asserts that `run` received the whole body and answered it, after one pause and the one
-/// callback that resumed it (`DIV-044`).
+/// Asserts that `run` received the whole body and responded to it, after one pause and the one
+/// credit callback that resumed parsing.
 fn assert_resumed_once_below_the_threshold(run: &ResumeThresholdRun) {
     assert_eq!(run.wire.error, None);
     assert!(
@@ -2674,7 +2673,7 @@ fn owned_server_resumes_below_the_ingress_threshold() {
 }
 
 /// HTTP/1.1 session stats count buffered request bytes down on every read, so a Uniplex
-/// session that reports them keeps a callback per read (`DIV-044`).
+/// session that reports them keeps a callback per read.
 #[test]
 fn uniplex_server_with_stats_keeps_a_callback_per_read() {
     let run = resume_threshold_run(false, true);
@@ -3009,8 +3008,8 @@ fn owned_h1_rejects_a_cancelled_context() {
     assert_eq!(rejected, Some(HttpErrorCode::INVALID_STATE_TRANSITION));
 }
 
-/// The first exchange panics in `callback` at retirement: `run` resumes the panic after the
-/// connection fails, and no later request is parsed.
+/// The first exchange panics in `callback` at retirement. `run` resumes the panic after the
+/// connection fails, and later requests are not parsed.
 fn assert_retirement_panic_fails_the_connection(callback: &'static str, request: Vec<u8>) {
     let (panic, output, close, probes) = run_on_host(move |context| {
         Box::pin(async move {
@@ -3057,15 +3056,15 @@ fn a_panic_in_complete_fails_the_connection() {
 
 #[test]
 fn a_panic_dropping_the_exchange_fails_the_idle_connection() {
-    // A keep-alive connection with nothing more to read.
+    // A keep-alive connection whose input has all been read.
     assert_retirement_panic_fails_the_connection(
         "drop",
         b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec(),
     );
 }
 
-/// `DIV-056`: an exchange's panic that reaches the per-turn catch is reported once, at
-/// Driver scope. The run still resumes it.
+/// An exchange's panic that reaches the per-turn catch is reported once, at driver scope. The
+/// run still resumes it.
 #[test]
 fn owned_h1_driver_turn_panic_is_reported_once() {
     let (panic, reports, counts) = run_on_host(|context| {
@@ -3243,8 +3242,8 @@ impl WriteOutcome {
     }
 }
 
-/// Holds every write's physical completion until `open`; each write takes the next scripted
-/// outcome (then `Full`).
+/// Holds every write's completion until `open`. Each write takes the next scripted outcome
+/// (then `Full`).
 #[derive(Default)]
 struct WriteFence {
     open: Cell<bool>,
@@ -3254,8 +3253,8 @@ struct WriteFence {
     receipts: RefCell<VecDeque<(usize, WriteOutcome)>>,
     direct_writes: Cell<usize>,
     queued_writes: Cell<usize>,
-    /// What the write queue's `is_saturated` answers: `false` once set (the default answers
-    /// `true`, as `UniplexWriteQueue`'s default does).
+    /// When set, the write queue's `is_saturated` returns `false`. Otherwise it returns `true`,
+    /// as `UniplexWriteQueue`'s default does.
     unsaturated: Cell<bool>,
     saturation_queries: Cell<usize>,
     /// The write queue's `can_write` calls.
@@ -3308,7 +3307,7 @@ fn record_write(state: &RefCell<TransportState>, data: BufQueue) -> usize {
     length
 }
 
-/// A write queue whose receipts complete, in order, once the fence opens.
+/// A write queue whose writes complete, in order, once the fence opens.
 struct FenceQueue {
     fence: Rc<WriteFence>,
     state: Rc<RefCell<TransportState>>,
@@ -3498,7 +3497,7 @@ fn response_retires_only_after_its_write_completes() {
                         }
                         context.host().yield_to_io().await;
                     }
-                    // Leaves the driver turns in which it could wrongly retire the exchange.
+                    // Yields for the driver turns in which it could wrongly retire the exchange.
                     for _ in 0..8 {
                         context.host().yield_to_io().await;
                     }
@@ -3610,7 +3609,7 @@ fn read_error_during_write_wire(
                     "the response write starts"
                 );
                 failed.notify_one();
-                // Leaves the session turns in which it observes the failed read.
+                // Yields for the session turns in which it observes the failed read.
                 for _ in 0..8 {
                     context.host().yield_to_io().await;
                 }
@@ -3691,8 +3690,7 @@ fn a_read_error_during_a_response_write_fails_the_connection_as_uniplex() {
 }
 
 /// As `a_read_error_during_a_response_write_fails_the_connection_as_uniplex`, with a response
-/// body. Both sessions write the ready body serialized with the head before the
-/// read fails.
+/// body. Both sessions write the ready body serialized with the head before the read fails.
 #[test]
 fn a_read_error_during_a_response_write_writes_the_serialized_body() {
     for queued in [false, true] {
@@ -3940,7 +3938,7 @@ fn head_204_and_304_responses_have_no_body() {
 
 #[test]
 fn close_delimited_response_to_http10() {
-    // Without a length, an HTTP/1.0 client can find the body's end only at the close, keep-alive
+    // Without a length, an HTTP/1.0 client can detect the body's end only at the close, keep-alive
     // or not.
     for request in [
         &b"GET / HTTP/1.0\r\nHost: a\r\n\r\n"[..],
@@ -3985,7 +3983,7 @@ async fn first_writes(context: &WorkerContext, state: &Rc<RefCell<TransportState
 
 /// A POST whose last 7 body bytes arrive only after the first response is written, then a
 /// closing GET. Returns the wire, what was written before the rest of the body arrived, and
-/// how many requests the application saw.
+/// how many requests the application received.
 fn early_response_run(owned: bool) -> (Wire, Vec<u8>, usize) {
     run_on_host(move |context| {
         Box::pin(async move {
@@ -4217,13 +4215,13 @@ fn upgrade_under_proxygen_policy_matches_uniplex() {
 
 #[test]
 fn refused_upgrade_matches_uniplex() {
-    // A refused WebSocket upgrade with a request read behind it, and a refused CONNECT.
+    // A rejected WebSocket upgrade with a request read behind it, and a rejected CONNECT.
     let mut websocket = WEBSOCKET_HEAD.to_vec();
     websocket.extend_from_slice(b"GET /later HTTP/1.1\r\nHost: a\r\n\r\n");
     for (request, status) in [(websocket, 400), (CONNECT_HEAD.to_vec(), 403)] {
         let reads = || vec![ReadAction::Data(request.clone())];
         let label = String::from_utf8_lossy(&request[..7]).into_owned();
-        // The head answers before the request body is read: the refusal is what ends that body.
+        // The head is sent before the request body is read, and the rejection ends that body.
         let response = Response {
             tunnel: true,
             ..Response::fixed(status, b"no")
@@ -4255,11 +4253,9 @@ fn refused_upgrade_matches_uniplex() {
     }
 }
 
-/// Pins today's behavior, shared with `UniplexSession`, for a 1xx before the final response to
-/// a downstream CONNECT: the upgrade is resolved by the final head only, so a 1xx then a 2xx
-/// leaves the tunnel working. Proxygen completes the request without an upgrade instead; that
-/// defect is the queued `repair.http1_downstream_upgrade_interim_response`, which will change
-/// this expectation for both sessions.
+/// A 1xx before the final response to a downstream CONNECT does not resolve the upgrade, in
+/// the owned driver or in `UniplexSession`. Only the final head does, so a 1xx and then a 2xx
+/// leave the tunnel working.
 #[test]
 fn interim_before_upgrade_final_is_pinned() {
     let mut request = CONNECT_HEAD.to_vec();
@@ -4298,8 +4294,8 @@ struct FencedRetirement {
     wire: Wire,
 }
 
-/// Serves `CLOSING_GET` through a write queue whose completions are held, answering
-/// `is_saturated` with `!unsaturated`; `instrument` sets `H1App::instrument`.
+/// Serves `CLOSING_GET` through a write queue whose completions are held and whose
+/// `is_saturated` returns `!unsaturated`. `instrument` sets `H1App::instrument`.
 fn fenced_retirement(unsaturated: bool, instrument: bool) -> FencedRetirement {
     run_on_host(move |context| {
         Box::pin(async move {
@@ -4318,7 +4314,7 @@ fn fenced_retirement(unsaturated: bool, instrument: bool) -> FencedRetirement {
                     }
                     context.host().yield_to_io().await;
                 }
-                // Leaves the driver turns in which it could retire the exchange.
+                // Yields for the driver turns in which it could retire the exchange.
                 for _ in 0..8 {
                     context.host().yield_to_io().await;
                 }
@@ -4386,10 +4382,8 @@ fn saturated_h1_stream_keeps_its_write_fence() {
     }
 }
 
-/// Downstream entries of `FROZEN_INGRESS_ARTIFACTS` in `differential/tests/http1.rs` (the
-/// `fbcode//roxygen/differential:http1` test crate) at revision `63764d2bca63`, copied
-/// fragment by fragment: that constant is private to its crate. Each entry: the source
-/// artifact's name and its fragments.
+/// Downstream HTTP/1.1 ingress artifacts, each a name and the fragments its input arrives in.
+/// Do not change them: `ingress_artifacts_keep_their_bytes` checks their lengths and hashes.
 const COPIED_FROZEN_ARTIFACTS: &[(&str, &[&[u8]])] = &[
     (
         "fragmented_chunked_request_with_trailer",
@@ -4410,9 +4404,8 @@ const COPIED_FROZEN_ARTIFACTS: &[(&str, &[&[u8]])] = &[
 ];
 
 #[test]
-fn copied_frozen_artifacts_match_their_source() {
-    // Each source artifact's fragment lengths and the FNV-1a 64 hash of its bytes, computed
-    // from `differential/tests/http1.rs` at `63764d2bca63`.
+fn ingress_artifacts_keep_their_bytes() {
+    // Each artifact's fragment lengths and the FNV-1a 64 hash of its bytes.
     let expected: [(&str, &[usize], u64); 3] = [
         (
             "fragmented_chunked_request_with_trailer",
@@ -4479,9 +4472,9 @@ impl Split {
     }
 }
 
-/// A consumer-shaped `POST /generate`: 18 header lines and a 766-byte head, with field lengths
-/// from a downstream consumer's traffic profile (a 14-byte host, a 53-byte request ID, a
-/// 41-byte routing key and its copy, filler to the total) and generic names.
+/// A `POST /generate` shaped like real traffic: 18 header lines and a 766-byte head, with
+/// typical field lengths (a 14-byte host, a 53-byte request ID, a 41-byte routing key and its
+/// copy, filler to the total) and generic names.
 fn consumer_shaped_post() -> Vec<u8> {
     let body_length = 1536;
     let mut lines = vec![
@@ -4623,7 +4616,8 @@ fn corpus() -> Vec<Vector> {
     vectors
 }
 
-/// `Date` values come from the clock in error responses: compare them as one placeholder.
+/// Replaces every `Date` value with one placeholder, since error responses take it from the
+/// clock.
 fn without_dates(output: &[u8]) -> String {
     String::from_utf8_lossy(output)
         .split("\r\n")
@@ -4667,7 +4661,7 @@ struct CorpusRun {
 }
 
 /// Runs `vector` cut by `split` through one session. Peer EOF follows the input once the
-/// session has read all of it and settled, so EOF cannot race a response.
+/// session has read all of it and gone idle, so EOF cannot race a response.
 fn corpus_run(owned: bool, vector: &Vector, split: Split) -> CorpusRun {
     corpus_run_configured(owned, vector, split, Http1DriverConfig::default())
 }
@@ -4797,7 +4791,7 @@ fn corpus_session(
     })
 }
 
-/// `h1_config` with `exact_method_tokens` (`DIV-040`).
+/// `h1_config` with `exact_method_tokens` set.
 fn exact_methods_config() -> UniplexConfig {
     UniplexConfig {
         exact_method_tokens: true,
@@ -4805,7 +4799,7 @@ fn exact_methods_config() -> UniplexConfig {
     }
 }
 
-/// A vector of one bodiless request whose method is `method`, answered 200.
+/// A vector of one bodiless request whose method is `method`, with a 200 response.
 fn method_vector(method: &[u8]) -> Vector {
     Vector::new(
         &String::from_utf8_lossy(method),
@@ -4928,7 +4922,7 @@ fn methods_outside_llhttp_table_get_400_by_default_as_uniplex() {
     }
 }
 
-/// Both drivers answer a rejected head with the codec's status and close: 414 for a
+/// Both drivers respond to a rejected head with the codec's status and close: 414 for a
 /// request-target past the head limit, 431 for another head past it, 501 for a transfer coding
 /// under a final chunked, and 400 when chunked is not last.
 #[test]
@@ -4973,8 +4967,7 @@ fn rejected_heads_get_the_codec_status_as_uniplex() {
 }
 
 /// Every corpus vector, fed whole, in 7-byte reads and one byte at a time, writes the same
-/// bytes (dates aside) and shows the application the same events under both sessions. No
-/// vector differs; DIV-029 would list any that did, each with its own assertion here.
+/// bytes (dates aside) and shows the application the same events under both sessions.
 #[test]
 fn owned_h1_matches_uniplex_on_the_corpus() {
     let mut differences = Vec::new();
@@ -5013,10 +5006,10 @@ fn wire_fields(head: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
-/// Under `AsOrdinaryRequest` (`DIV-030`), a WebSocket upgrade request and a CONNECT request
-/// are handed over as ordinary requests: no pause for an upgrade, the request behind each is
-/// parsed and answered on the same connection, every response is framed, and no tunnel is
-/// carried. The wire equals the default policy's for two ordinary GETs with the same responses.
+/// Under `AsOrdinaryRequest`, a WebSocket upgrade request and a CONNECT request are handed
+/// over as ordinary requests. Parsing does not pause for an upgrade, the request behind each is
+/// parsed and served on the same connection, every response is framed, and neither carries a
+/// tunnel. The wire equals the default policy's for two ordinary GETs with the same responses.
 #[test]
 fn upgrade_as_ordinary_request_keeps_parsing_http() {
     const LATER: &[u8] = b"GET /later HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
@@ -5064,12 +5057,12 @@ fn upgrade_as_ordinary_request_keeps_parsing_http() {
     }
 }
 
-/// The corpus's `connect` and `websocket_upgrade` vectors under `AsOrdinaryRequest`
-/// (`DIV-030`), every split: the head reaches the exchange as an ordinary request, and the bytes
-/// behind it are parsed as the next request, which they fail as a malformed start line, with
-/// the error response and close of the corpus's `malformed_request_line` vector. Apart from the
-/// head, the run equals the default policy's on the same bytes behind an ordinary GET head, with
-/// the same response. With the default policy the vectors still equal `UniplexSession`'s.
+/// The corpus's `connect` and `websocket_upgrade` vectors under `AsOrdinaryRequest`, every
+/// split. The head reaches the exchange as an ordinary request, and the bytes behind it are
+/// parsed as the next request, which fails as a malformed start line with the error response
+/// and close of the corpus's `malformed_request_line` vector. Apart from the head, the run
+/// equals the default policy's on the same bytes behind an ordinary GET head, with the same
+/// response. With the default policy the vectors still equal `UniplexSession`'s.
 #[test]
 fn owned_h1_corpus_upgrade_vectors_parse_as_ordinary_requests() {
     const ORDINARY_HEAD: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n";
@@ -5141,13 +5134,8 @@ fn owned_h1_corpus_upgrade_vectors_parse_as_ordinary_requests() {
     }
 }
 
-/// A complete request followed by bytes that end, at peer EOF, inside the next request head
-/// (`DIV-029`): `UniplexSession` answers the request with `Connection: close`, writes no error
-/// response and shuts down its write side; the owned driver answers it keep-alive, then writes
-/// the codec's 400 and resets. The requests either application sees and the session error are
-/// the same. A malformed head that is complete before EOF gives the same wire in both.
-/// `DIV-053`: serves `request` then a peer EOF, in two reads, with `abort_exchanges_on_eof`
-/// set to `abort`, on the owned driver and on `UniplexSession`.
+/// Serves `request` then a peer EOF, in two reads, with `abort_exchanges_on_eof` set to
+/// `abort`, on the owned driver and on `UniplexSession`.
 fn eof_abort_runs(
     abort: bool,
     request: &[u8],
@@ -5164,9 +5152,9 @@ fn eof_abort_runs(
     )
 }
 
-/// `DIV-053`: the owned driver judges a peer EOF as `UniplexSession` does. Each script gives
-/// the same wire, close and error under both sessions; where the EOF aborts an exchange, the
-/// owned application sees it cancelled once, as the peer's.
+/// The owned driver handles a peer EOF as `UniplexSession` does. Each script gives the same
+/// wire, close and error under both sessions. Where the EOF aborts an exchange, the owned
+/// application gets one cancel, attributed to the peer.
 #[test]
 fn eof_abort_matches_uniplex() {
     let mut connect = CONNECT_HEAD.to_vec();
@@ -5180,8 +5168,8 @@ fn eof_abort_matches_uniplex() {
     };
     // (label, option on, request, response, whether the EOF aborts the exchange)
     let cases = [
-        // By default the codec answers the cut-short upload with 400, then resets; with the
-        // option the open exchange is aborted first, with no response.
+        // By default the codec responds to the cut-short upload with 400, then resets. With
+        // the option, the open exchange is aborted first, without a response.
         (
             "mid-upload, off",
             false,
@@ -5196,7 +5184,8 @@ fn eof_abort_matches_uniplex() {
             Response::fixed(200, b"hello"),
             true,
         ),
-        // An EOF that ends an accepted tunnel's ingress is no abort: the tunnel's answer follows.
+        // An EOF that ends an accepted tunnel's ingress does not abort it. The tunnel's
+        // response follows.
         (
             "CONNECT tunnel",
             true,
@@ -5211,8 +5200,8 @@ fn eof_abort_matches_uniplex() {
             Response::tunnel(200, &[b'y'; 100], true),
             false,
         ),
-        // A refused upgrade's response head is serialized before the EOF is judged, behind the
-        // pending upgrade; its body is not, so the abort writes the head, then resets.
+        // A rejected upgrade's response head is serialized behind the pending upgrade before
+        // the EOF is handled, but its body is not. The abort writes the head, then resets.
         (
             "refused upgrade",
             true,
@@ -5253,10 +5242,10 @@ fn eof_abort_matches_uniplex() {
     }
 }
 
-/// `DIV-053`: two pipelined requests, then a peer EOF. The EOF waits behind the second
-/// request, so the first is answered and the second aborted, as by `UniplexSession`. The owned
-/// driver reads the EOF while the first exchange is live, so that response already says
-/// `Connection: close`, with the option off as on (`UniplexSession` reads it later).
+/// Two pipelined requests, then a peer EOF. The EOF waits behind the second request, so the
+/// first gets its response and the second is aborted, as with `UniplexSession`. The owned
+/// driver reads the EOF while the first exchange is live, so that response already carries
+/// `Connection: close`, whether or not the option is set. `UniplexSession` reads it later.
 #[test]
 fn eof_behind_a_pipelined_request_answers_the_first_and_aborts_the_second_as_uniplex() {
     let get = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n";
@@ -5320,9 +5309,9 @@ fn malformed_head_behind_a_request_fails_as_uniplex() {
     }
 }
 
-/// Serves `reads`, then peer EOF once the session has read them all and settled (as
-/// `corpus_run`), with the owned driver (`owned`) or `UniplexSession`; each application drops
-/// its request body unread and answers at once.
+/// Serves `reads`, then peer EOF once the session has read them all and gone idle (as
+/// `corpus_run`), with the owned driver (`owned`) or `UniplexSession`. Each application drops
+/// its request body unread and responds immediately.
 fn dropping_bodies_wire(
     owned: bool,
     reads: Vec<Vec<u8>>,
@@ -5422,8 +5411,8 @@ fn a_dropped_request_body_with_trailers_retires() {
     }
 }
 
-/// Serves `reads` with the owned driver (`owned`) or `UniplexSession`; with `respond_early`,
-/// each application answers at once and drops its request body unread.
+/// Serves `reads` with the owned driver (`owned`) or `UniplexSession`. With `respond_early`,
+/// each application responds immediately and drops its request body unread.
 fn early_wire(
     owned: bool,
     reads: Vec<ReadAction>,
@@ -5467,7 +5456,7 @@ fn early_wire(
 
 /// Peer EOF read while an upgrade or CONNECT head waits for its final response, with no tunnel
 /// bytes, is delivered once that response resolves the upgrade: an accepted tunnel's request
-/// body ends and a refused request ends, so the exchange retires and `run` returns, with the
+/// body ends and a rejected request ends, so the exchange retires and `run` returns, with the
 /// same bytes, close and result as `UniplexSession`, however the input is cut.
 #[test]
 fn a_pending_upgrade_keeps_a_peer_eof() {
@@ -5534,8 +5523,8 @@ fn a_pending_upgrade_keeps_a_peer_eof() {
     }
 }
 
-/// Writes and closes through a [`ScriptedTransport`]; each read observes its cancellation only
-/// when polled, and arranges no wake for it.
+/// Writes and closes through a [`ScriptedTransport`]. Each read observes its cancellation only
+/// when polled, and does not arrange a wake for it.
 struct PolledCancellationTransport(Rc<ScriptedTransport>);
 
 impl UniplexTransport for PolledCancellationTransport {
@@ -5664,7 +5653,8 @@ const UPLOAD_END: &[u8] = b"5\r\nfinal\r\n0\r\n\r\n";
 const NEXT_GET: &[u8] = b"GET /2 HTTP/1.1\r\nHost: a\r\n\r\n";
 /// The end of `trailered_response`'s bytes.
 const TRAILERED_END: &str = "\r\n\r\n5\r\nreply\r\n0\r\nx-trailer: t\r\n\r\n";
-/// Yields a `stop_run` script allows the connection to finish before it offers more input.
+/// How many times a `stop_run` script yields to let the connection finish before it offers
+/// more input.
 const STOP_SETTLE: usize = 256;
 
 /// A chunked response whose trailer section ends it.
@@ -5680,11 +5670,11 @@ fn trailered_response() -> Response {
 struct StopCase {
     stop: (HttpErrorCode, StopAt),
     first: Vec<u8>,
-    /// Offered once the connection settles, if it still reads; peer EOF follows it.
+    /// Offered once the connection is idle, if it still reads. Peer EOF follows it.
     rest: Vec<u8>,
     response: Response,
     /// A write that carries these bytes completes only once `rest` was offered and the
-    /// connection settled.
+    /// connection went idle.
     hold: Option<&'static [u8]>,
 }
 
@@ -5707,9 +5697,9 @@ async fn settle_unless_done(context: &WorkerContext, done: &Cell<bool>) {
     }
 }
 
-/// Serves `case` with the owned driver; each exchange with a request body stops it with
+/// Serves `case` with the owned driver. Each exchange with a request body stops it with
 /// `case.stop`, and `StopAt::Body` or `StopAt::Last` releases the stop once the transport has
-/// written something. `StopAt::Script` releases the response, lets the connection settle, and
+/// written something. `StopAt::Script` releases the response, lets the connection go idle, and
 /// then stops the request.
 fn stop_run(case: StopCase) -> StopRun {
     run_on_host(move |context| {
@@ -5793,9 +5783,9 @@ fn assert_completed_once(probe: &Observed, label: &str) {
 }
 
 /// A request whose reader stops it without error (`NO_ERROR`) before its response begins,
-/// with its upload still open, gets its whole response, which says `Connection: close` and
-/// ends with its trailer section; then the connection closes, and no more of the upload is
-/// read as a request (`DIV-054`).
+/// with its upload still open, gets its whole response, which carries `Connection: close` and
+/// ends with its trailer section. Then the connection closes, and the rest of the upload is
+/// not read as a request.
 #[test]
 fn a_request_stopped_without_error_gets_its_response_with_connection_close() {
     let run = stop_run(StopCase {
@@ -5823,7 +5813,7 @@ fn a_request_stopped_without_error_gets_its_response_with_connection_close() {
 }
 
 /// A request whose reader stops it with `CANCEL` before its response ends still fails the
-/// connection: nothing more is written, and the transport resets.
+/// connection. The session stops writing, and the transport resets.
 #[test]
 fn a_request_stopped_with_cancel_still_fails_the_connection() {
     for at in [StopAt::Head, StopAt::Body] {
@@ -5852,7 +5842,8 @@ fn a_request_stopped_with_cancel_still_fails_the_connection() {
     }
 }
 
-/// A request read to its end, then answered, leaves the connection serving the next request.
+/// A request read to its end, then responded to, leaves the connection serving the next
+/// request.
 #[test]
 fn a_request_read_to_its_end_keeps_the_connection_alive() {
     let input = [
@@ -5881,7 +5872,8 @@ fn a_request_read_to_its_end_keeps_the_connection_alive() {
 }
 
 /// A CONNECT tunnel whose reader stops its request body without error before the tunnel's
-/// response ends still fails the connection: nothing more is written, and the transport resets.
+/// response ends still fails the connection. The session stops writing, and the transport
+/// resets.
 #[test]
 fn a_tunnel_stopped_without_error_still_fails_the_connection() {
     for at in [StopAt::Head, StopAt::Body] {
@@ -5919,8 +5911,8 @@ fn a_tunnel_stopped_without_error_still_fails_the_connection() {
 
 /// A request whose reader stops it without error after its response head went out with
 /// `Connection: keep-alive`, while its upload is still open, gets the rest of its response,
-/// chunked with its trailer section or to its fixed length, and then the connection closes;
-/// no more of the upload is read as a request (`DIV-054`).
+/// chunked with its trailer section or to its fixed length. Then the connection closes, and
+/// the rest of the upload is not read as a request.
 #[test]
 fn a_request_stopped_after_a_keep_alive_head_closes_after_its_response() {
     let fixed = Response::fixed(200, b"reply");
@@ -5959,8 +5951,8 @@ fn a_request_stopped_after_a_keep_alive_head_closes_after_its_response() {
 
 /// A request whose reader stops it without error in the same poll that returns its response's
 /// last event, after a `Connection: keep-alive` head and with its upload still open, gets the
-/// rest of its response, and then the connection closes; no more of the upload is read as a
-/// request (`DIV-054`).
+/// rest of its response. Then the connection closes, and the rest of the upload is not read as
+/// a request.
 #[test]
 fn a_request_stopped_with_its_last_response_event_closes_after_its_response() {
     for (response, end) in [
@@ -6001,10 +5993,10 @@ fn a_request_stopped_with_its_last_response_event_closes_after_its_response() {
 }
 
 /// A request whose reader stops it without error from the cancellation callback of a byte
-/// event on its response's last event, which the driver refuses before it serializes that
+/// event on its response's last event, which the driver cancels before it serializes that
 /// event, after a `Connection: keep-alive` head and with its upload still open, gets the rest
-/// of its response, and then the connection closes; no more of the upload is read as a
-/// request (`DIV-054`).
+/// of its response. Then the connection closes, and the rest of the upload is not read as a
+/// request.
 #[test]
 fn a_request_stopped_by_its_last_response_events_byte_event_refusal_closes_after_it() {
     for (response, end) in [
@@ -6043,9 +6035,9 @@ fn a_request_stopped_by_its_last_response_events_byte_event_refusal_closes_after
     }
 }
 
-/// After its reader stops a request without error, no more of its upload is parsed: input,
-/// and peer EOF inside the request, read while the response is still being written do not end
-/// the exchange, which gets its whole response before the connection closes (`DIV-054`).
+/// After its reader stops a request without error, the rest of its upload is not parsed. Input
+/// and a peer EOF inside the request, read while the response is still being written, do not
+/// end the exchange, which gets its whole response before the connection closes.
 #[test]
 fn a_stopped_upload_is_not_parsed_while_its_response_is_written() {
     let run = stop_run(StopCase {
@@ -6064,8 +6056,8 @@ fn a_stopped_upload_is_not_parsed_while_its_response_is_written() {
     assert_completed_once(&run.observed[0], "the stopped request");
 }
 
-/// A request that arrived whole before its reader stopped it without error leaves nothing of
-/// its upload unread on the connection: it gets its whole response with
+/// A request that arrived whole before its reader stopped it without error does not leave
+/// upload bytes unread on the connection. It gets its whole response with
 /// `Connection: keep-alive`, and the connection serves the next request.
 #[test]
 fn a_whole_request_stopped_without_error_keeps_the_connection_alive() {
@@ -6093,8 +6085,8 @@ fn a_whole_request_stopped_without_error_keeps_the_connection_alive() {
 }
 
 /// A request whose reader stops it without error only once its whole response was written,
-/// with its upload still open, keeps the connection as before (`DIV-054`'s "Unchanged"): the
-/// rest of the upload is read and discarded, and the next request is served.
+/// with its upload still open, keeps the connection. The rest of the upload is read and
+/// discarded, and the next request is served.
 #[test]
 fn a_request_stopped_after_its_response_ended_keeps_the_connection() {
     let run = stop_run(StopCase {
@@ -6137,13 +6129,13 @@ struct StagedClose {
     observed: Vec<Observed>,
 }
 
-/// Serves `reads` with the owned driver, configured by `configure`; each exchange with a
+/// Serves `reads` with the owned driver, configured by `configure`. Each exchange with a
 /// request body stops it without error in `poll_headers`. With `fill`, the write carrying the
 /// response's trailer section is held: `fill` is notified once that write starts, and the
-/// write completes once the connection settled. With `offer`, the stop comes from outside the
-/// driver's poll instead: once the exchange holds its request body, the script, in one step,
-/// stops it without error, notifies `offer` and releases the response, so the driver's next
-/// poll finds both the stop and whatever read `offer` completes. `go` is notified once the
+/// write completes once the connection is idle. With `offer`, the stop comes from outside the
+/// driver's poll instead. Once the exchange holds its request body, the script stops it without
+/// error, notifies `offer` and releases the response in one step, so the driver's next poll
+/// observes both the stop and any read that `offer` completes. `go` is notified once the
 /// transport's write side shuts down, or once the run ends.
 fn staged_close_run(
     reads: Vec<ReadAction>,
@@ -6242,10 +6234,10 @@ fn staged_close_run(
     })
 }
 
-/// RFC 9112 §9.6's staged close after a request's reader stops it without error while its
-/// upload is still open (`DIV-054`): once the response is written, the write side shuts down
-/// first, and the connection keeps reading the rest of the upload, without parsing it, until
-/// the peer's EOF, so it does not close with input unread.
+/// The RFC 9112 staged close after a request's reader stops it without error while its upload
+/// is still open. Once the response is written, the write side shuts down first, and the
+/// connection keeps reading the rest of the upload, without parsing it, until the peer's EOF,
+/// so that it does not close with input unread.
 #[test]
 fn a_stopped_upload_is_read_to_peer_eof_after_the_write_side_shuts_down() {
     let go = Arc::new(tokio::sync::Notify::new());
@@ -6282,9 +6274,9 @@ fn a_stopped_upload_is_read_to_peer_eof_after_the_write_side_shuts_down() {
     assert_completed_once(&run.observed[0], "the stopped request");
 }
 
-/// `DIV-054` with `DIV-053`: under `abort_exchanges_on_eof`, the staged close after a
-/// stopped upload's response is unchanged: the peer's EOF read during it is no abort, and the
-/// run ends at that EOF with no error.
+/// Under `abort_exchanges_on_eof`, the staged close after a stopped upload's response behaves
+/// the same. The peer's EOF read during it does not abort, and the run ends at that EOF without
+/// an error.
 #[test]
 fn staged_close_under_eof_abort_reads_to_peer_eof() {
     let go = Arc::new(tokio::sync::Notify::new());
@@ -6310,7 +6302,7 @@ fn staged_close_under_eof_abort_reads_to_peer_eof() {
 }
 
 /// A staged close after a stopped upload reads at most `buffer_limit` bytes after its write
-/// side shuts down, then closes with the rest of the upload unread (`DIV-054`).
+/// side shuts down, then closes with the rest of the upload unread.
 #[test]
 fn a_staged_close_reads_a_stopped_upload_only_up_to_the_buffer_limit() {
     const LIMIT: usize = 4 << 10;
@@ -6348,7 +6340,7 @@ fn a_staged_close_reads_a_stopped_upload_only_up_to_the_buffer_limit() {
 
 /// A staged close after a stopped upload still reads after the write side shuts down when the
 /// upload filled the input buffer, `buffer_limit`, while the response was still being written:
-/// the connection reads on, without parsing, until the peer's EOF (`DIV-054`).
+/// the connection reads on, without parsing, until the peer's EOF.
 #[test]
 fn a_staged_close_reads_after_the_write_side_shuts_down_when_the_upload_filled_its_buffer() {
     const LIMIT: usize = 4 << 10;
@@ -6401,8 +6393,8 @@ fn a_staged_close_reads_after_the_write_side_shuts_down_when_the_upload_filled_i
 }
 
 /// A stop reported outside the driver's poll takes effect before the input that poll reads is
-/// parsed (`DIV-054`): peer EOF inside the stopped request, read in the same poll that finds the
-/// stop, does not end the exchange, which gets its whole response before the connection closes.
+/// parsed. Peer EOF inside the stopped request, read in the same poll that observes the stop,
+/// does not end the exchange, which gets its whole response before the connection closes.
 #[test]
 fn a_stop_found_with_peer_eof_in_the_same_poll_still_gets_its_response() {
     let offer = Arc::new(tokio::sync::Notify::new());
@@ -6435,9 +6427,9 @@ fn a_stop_found_with_peer_eof_in_the_same_poll_still_gets_its_response() {
 }
 
 /// A stop reported outside the driver's poll takes effect before the input that poll reads is
-/// parsed (`DIV-054`): the rest of the stopped upload and a next request, read in the same poll
-/// that finds the stop, are not parsed, so the request does not end and the connection is not
-/// kept. The response says `Connection: close`, and the staged close follows it.
+/// parsed. The rest of the stopped upload and a next request, read in the same poll that
+/// observes the stop, are not parsed, so the request does not end and the connection is not
+/// kept. The response carries `Connection: close`, and the staged close follows it.
 #[test]
 fn a_stop_found_with_the_rest_of_the_upload_in_the_same_poll_closes_after_the_response() {
     let offer = Arc::new(tokio::sync::Notify::new());
@@ -6536,9 +6528,9 @@ impl UniplexTransport for FailedShutdownTransport {
     }
 }
 
-/// A staged close after a stopped upload whose write shutdown fails returns that error at once
-/// (`DIV-054`): it does not wait for the peer's EOF or for `buffer_limit` more bytes from a peer
-/// that sends nothing more.
+/// A staged close after a stopped upload whose write shutdown fails returns that error
+/// immediately. It does not wait for the peer's EOF or for `buffer_limit` more bytes from a
+/// peer that has stopped sending.
 #[test]
 fn a_staged_close_returns_a_failed_write_shutdown_without_waiting_for_the_peer() {
     let (wire, returned_before_cancel, observed) = run_on_host(|context| {
@@ -6609,7 +6601,7 @@ struct PushedBody {
     /// drops it.
     keep_request: bool,
     request: RefCell<Option<HttpSourceHolder>>,
-    /// When set, a poll that returns an event wakes its waker first, as a source that finds more
+    /// When set, a poll that returns an event wakes its waker first, as a source with more data
     /// ready behind the event may.
     wake_with_event: bool,
     /// Run once by the next poll that returns `Pending`, after it keeps its waker.
@@ -6628,8 +6620,8 @@ impl PushedBody {
     }
 }
 
-/// Answers each request at once with a chunked `200` head, then with the events pushed to
-/// `body`.
+/// Responds to each request immediately with a chunked `200` head, then with the events pushed
+/// to `body`.
 struct PushedApp {
     body: Rc<PushedBody>,
 }
@@ -6703,18 +6695,18 @@ impl OwnedExchange for PushedExchange {
     fn complete(self) {}
 }
 
-/// Serves a keep-alive GET whose chunked response head is written at once, then pushes each of
-/// `chunks` to its body and polls the driver once; returns the driver turns, codec parses, phase
-/// checks and body polls each push took, and every write.
+/// Serves a keep-alive GET whose chunked response head is written immediately, then pushes each
+/// of `chunks` to its body and polls the driver once. Returns the driver turns, codec parses,
+/// phase checks and body polls each push took, and every write.
 fn pushed_body_turns(
     chunks: &'static [&'static [u8]],
 ) -> (Vec<(usize, usize, usize, usize)>, Vec<Vec<u8>>) {
     pushed_body_turns_through(false, chunks)
 }
 
-/// As [`pushed_body_turns`]; every write completes when first polled, as a socket write does
-/// when the socket takes it whole: a direct [`ScriptedTransport`] write, or, when `queued`, a
-/// write through an open [`FenceQueue`], the write queue path an owned connection over TCP takes.
+/// As [`pushed_body_turns`], with every write completing when first polled, as a socket write
+/// does when the socket accepts all of it. Writes go directly to a [`ScriptedTransport`], or,
+/// when `queued`, through an open [`FenceQueue`], the write queue path of an owned TCP connection.
 fn pushed_body_turns_through(
     queued: bool,
     chunks: &'static [&'static [u8]],
@@ -6770,12 +6762,12 @@ fn pushed_body_turns_through(
 }
 
 /// Each response body event pushed to a waiting exchange takes one driver turn. The turn
-/// serializes it and, as no phase other than the exchange's has work left, polls the body again
-/// in place of the next turn, and counts it as that turn; the body is pending, so the event's
-/// write starts, and the write's completion is taken where the next turn would have taken it
-/// first. The body is still polled twice per event, once for the event and once until it is
-/// pending; no turn runs only to poll it again or to take the write's completion, directly or
-/// through a write queue, and the parser, paused behind the request, is handed nothing.
+/// serializes the event and, since only the exchange's phase has work left, polls the body
+/// again in place of the next turn and counts that poll as the next turn. The body is pending,
+/// so the event's write starts, and the write's completion is taken where the next turn would
+/// have taken it. The body is still polled twice per event: once for the event and once until
+/// it is pending. A turn never runs only to poll it again or to take the write's completion,
+/// directly or through a write queue, and the parser, paused behind the request, gets no input.
 #[test]
 fn a_pushed_response_body_event_takes_one_driver_turn() {
     for queued in [false, true] {
@@ -6807,13 +6799,13 @@ fn a_pushed_response_body_event_takes_one_driver_turn() {
     }
 }
 
-/// The driver checks whether a phase before the write would act at most once per turn, and once
-/// after a write it started. A turn that could start a write either finds such a phase due, which
-/// holds the write back and is due in the next turn too, so the turn ends without a second check;
-/// or starts the write, after which the next turn's first phases, up to the write's completion,
-/// run at once and one check decides whether the rest of that turn would act. So each pushed body
-/// event checks twice in its one turn: the write check, and once after its write. The check
-/// before the body is polled again in the turn is a separate one, which leaves out the exchange.
+/// The driver checks at most once per turn whether a phase before the write would act, and once
+/// more after it starts a write. If such a phase is due, it holds the write back and stays due
+/// in the next turn, so the turn ends without a second check. Otherwise the turn starts the
+/// write. The next turn's first phases, up to the write's completion, then run immediately, and
+/// one check determines whether the rest of that turn would act. So each pushed body event
+/// checks twice in its one turn: the write check, and once after its write. The check before
+/// the body is polled again is separate and leaves out the exchange.
 #[test]
 fn a_pushed_response_body_event_checks_the_phases_twice() {
     for queued in [false, true] {
@@ -6869,9 +6861,9 @@ fn fenced_pushed_body_turns(queued: bool) -> ((usize, usize), Vec<Vec<u8>>) {
 }
 
 /// A pushed body event whose write does not complete when first polled takes one driver turn
-/// as well: it serializes the event, polls the body again until it is pending, starts the write
-/// and finds its completion pending where the next turn would have, and the poll ends. The poll
-/// that the write's completion wakes takes it in one turn.
+/// as well. The turn serializes the event, polls the body again until it is pending, and starts
+/// the write. The write's completion is still pending where the next turn would have taken it,
+/// so the poll ends. The poll that the write's completion wakes takes it in one turn.
 #[test]
 fn a_pushed_body_event_whose_write_waits_takes_one_driver_turn() {
     for queued in [false, true] {
@@ -6932,9 +6924,9 @@ fn a_cancel_landing_after_a_body_event_is_serialized_gets_no_further_body_poll()
 }
 
 /// A read that completes right after a body event is serialized, here the peer's EOF under
-/// `abort_exchanges_on_eof` (`DIV-053`), is handled before the body is polled again, as when it
-/// completed before the next turn: the EOF finds the exchange open and aborts it, so the event
-/// queued behind the serialized one is never serialized; the serialized one is written, then the
+/// `abort_exchanges_on_eof`, is handled before the body is polled again, as when it completed
+/// before the next turn. The exchange is still open, so the EOF aborts it and the event queued
+/// behind the serialized one is never serialized. The serialized one is written, then the
 /// connection resets.
 #[test]
 fn a_read_landing_after_a_body_event_is_serialized_is_handled_before_the_body_is_polled_again() {
@@ -6979,11 +6971,11 @@ fn a_read_landing_after_a_body_event_is_serialized_is_handled_before_the_body_is
     );
 }
 
-/// A request body read that lands right after a response body event is serialized, as an
-/// exchange that reads its request body while it streams its response makes, and that takes the
-/// unread body below `ingress_buffer_limit` (`DIV-044`), lifts the flow-control pause before the
-/// body is polled again, as when it landed before the next turn: parsing resumes in that poll,
-/// and the request's end, which waited behind the pause, reaches the exchange.
+/// A request body read that lands right after a response body event is serialized, and takes
+/// the unread body below `ingress_buffer_limit`, lifts the flow-control pause before the body is
+/// polled again, as when it lands before the next turn. An exchange that reads its request body
+/// while it streams its response makes such reads. Parsing resumes in that poll, and the
+/// request's end, which waited behind the pause, reaches the exchange.
 #[test]
 fn a_request_body_read_landing_after_a_body_event_is_serialized_resumes_parsing_in_that_poll() {
     let (read, parses, end) = run_on_host(|context| {
@@ -7057,10 +7049,10 @@ fn a_request_body_read_landing_after_a_body_event_is_serialized_resumes_parsing_
     assert!(end, "the request's end reaches the exchange in that poll");
 }
 
-/// A body whose poll wakes its own waker as it returns each event, as a source that finds more
-/// ready behind the event may, is still polled twice per event, as before: the poll that follows
-/// the event consumes that wake, finds the body pending, and the event is written alone in one
-/// turn. The wake is not left to hold the write back for a further turn and poll.
+/// A body whose poll wakes its own waker as it returns each event, as a source with more data
+/// ready behind the event may, is still polled twice per event. The poll that follows the event
+/// consumes that wake and gets `Pending` from the body, so the event is written alone in one
+/// turn. The wake does not hold the write back for a further turn and poll.
 #[test]
 fn a_body_that_wakes_its_waker_with_each_event_is_polled_twice_per_event() {
     let (counts, writes) = run_on_host(|context| {
@@ -7191,18 +7183,18 @@ impl Jitter {
     }
 }
 
-/// A wake flag of its own cache line, so racing flags do not share one.
+/// A wake flag on its own cache line, so that racing flags do not share one.
 #[repr(align(128))]
 struct Flag(AtomicBool);
 
 /// The driver clears the exchange's wake signal before it polls the body again in its turn
-/// (`poll_exchange`), in place of the next turn's take. A wake from another thread, whose
-/// publication the poll after the clear misses, still stands once both are done, so the driver
-/// polls the body again. Each round marks every signal, as a wake during the event's own poll
-/// does; then one thread clears each signal and reads its body's state, while the other
-/// publishes that state (a release store, as a lock-free source makes) and marks the signal, as
-/// the source's wake does. A clear that lands after the mark in the signal's order while the
-/// read misses the publication loses the wake.
+/// (`poll_exchange`), instead of taking it in the next turn. A wake from another thread whose
+/// publication the poll after the clear misses must still stand once both are done, so that the
+/// driver polls the body again. Each round marks every signal, as a wake during the event's own
+/// poll does. Then one thread clears each signal and reads its body's state, while the other
+/// publishes that state (a release store, as a lock-free source does) and marks the signal, as
+/// the source's wake does. A clear ordered after the mark, together with a read that misses the
+/// publication, would lose the wake.
 #[test]
 fn clearing_a_wake_signal_keeps_a_wake_from_another_thread_whose_publication_the_poll_misses() {
     const ROUNDS: usize = 20_000;
@@ -7260,10 +7252,10 @@ fn clearing_a_wake_signal_keeps_a_wake_from_another_thread_whose_publication_the
     );
 }
 
-/// A body event that becomes ready while the body is polled again after the event before it,
-/// whose producer wakes the waker that poll left, is polled and written with that event, as
-/// when it became ready during the poll of the next turn: the poll consumed the earlier wake
-/// before it ran, so this wake stands.
+/// A body event that becomes ready while the body is polled again after the previous event is
+/// polled and written with that event, as when it becomes ready during the next turn's poll.
+/// Its producer wakes the waker that the poll left. The poll consumed the earlier wake before it
+/// ran, so this wake stands.
 #[test]
 fn a_body_event_ready_during_the_poll_after_an_event_is_written_with_it() {
     let writes = run_on_host(|context| {
@@ -7301,7 +7293,7 @@ fn a_body_event_ready_during_the_poll_after_an_event_is_written_with_it() {
     );
 }
 
-/// Pushes `events` body events of 40 bytes at once to a `PushedApp` exchange whose head was
+/// Pushes `events` body events of 40 bytes together to a `PushedApp` exchange whose head was
 /// written, under a 32-byte write size, and polls the driver once. The exchange ignores the
 /// `maximum` each poll offers, which the driver tolerates: each event fills a write on its own.
 /// Returns that poll's host yields and the length of every write.
@@ -7336,9 +7328,9 @@ fn oversized_events_in_one_poll(events: usize) -> (usize, Vec<usize>) {
 }
 
 /// Body events that each reach the write size are each written before the body is polled
-/// again, in the same turn, so they spend the budget as before (recorded from the driver at
-/// `b5789b56aee8`): a body polled again before such an event's write would spend one more turn
-/// per event, and the driver would yield sooner.
+/// again, in the same turn, so they spend the turn budget as recorded below. Polling the body
+/// again before such an event's write would spend one more turn per event, and the driver would
+/// yield sooner.
 #[test]
 fn oversized_body_events_ready_at_once_yield_as_before() {
     let recorded: &[(usize, usize, usize)] = &[(16, 0, 29), (21, 0, 37), (22, 0, 38), (32, 1, 53)];
@@ -7361,7 +7353,7 @@ fn oversized_body_events_ready_at_once_yield_as_before() {
     );
 }
 
-/// Pushes `events` one-byte body events at once to a `PushedApp` exchange whose head was
+/// Pushes `events` one-byte body events together to a `PushedApp` exchange whose head was
 /// written, and polls the driver once. Returns that poll's driver turns and host yields, and the
 /// length of every write.
 fn pushed_events_in_one_poll(events: usize) -> (usize, usize, Vec<usize>) {
@@ -7393,14 +7385,14 @@ fn pushed_events_in_one_poll(events: usize) -> (usize, usize, Vec<usize>) {
     })
 }
 
-/// Body events ready at once are serialized one per turn, each poll of the body after the first
-/// counting as a turn even when it runs inside the turn before, and written together once the
-/// body is pending. When that write starts in the turn before the budget's last, the budget
-/// still runs out after the write's completion is taken, and the driver yields, as when a whole
-/// turn took that completion (recorded from the driver at `5e14be54f168`): 61 events take turns
-/// 1 to 61, the write counts as turns 62 and 63, and the completion uses the 64th. One event
-/// fewer ends the poll without a yield; one more starts the write in the last turn, which
-/// yields at once.
+/// Body events that are ready together are serialized one per turn, each poll of the body
+/// after the first counting as a turn even when it runs inside the turn before, and written
+/// together once the body is pending. When that write starts in the turn before the budget's
+/// last, the budget still runs out after the write's completion is taken, and the driver
+/// yields, as when a whole turn took that completion. In the recorded values, 61 events take
+/// turns 1 to 61, the write counts as turns 62 and 63, and the completion uses the 64th. One
+/// event fewer ends the poll without a yield; one more starts the write in the last turn, which
+/// yields immediately.
 #[test]
 fn a_write_started_at_the_turn_budget_edge_yields_as_before() {
     let recorded: &[(usize, usize, &[usize])] = &[
@@ -7427,8 +7419,8 @@ fn a_write_started_at_the_turn_budget_edge_yields_as_before() {
     );
 }
 
-/// A cancel or a drain that the retiring exchange's `complete` requests, when nothing else is
-/// left to do, ends the connection within the poll that retired the exchange: the driver
+/// A cancel or a drain that the retiring exchange's `complete` requests, when the connection has
+/// no other work, ends the connection within the poll that retired the exchange. The driver
 /// observes it before returning, without waiting to be polled again.
 #[test]
 fn a_cancel_or_drain_from_complete_ends_the_connection_in_that_poll() {
@@ -7500,7 +7492,7 @@ fn large_response_writes(content_length: bool) -> Vec<usize> {
 }
 
 /// The write lengths of the owned driver serving three pipelined GETs through an unsaturated
-/// write queue, whose exchanges retire at serialization (`DIV-028`).
+/// write queue, whose exchanges retire at serialization.
 fn unsaturated_pipelined_writes() -> Vec<usize> {
     run_on_host(|context| {
         Box::pin(async move {
@@ -7621,7 +7613,7 @@ impl BurstBody {
     }
 }
 
-/// Answers each request at once with a chunked `200` head, then with `body`.
+/// Responds to each request immediately with a chunked `200` head, then with `body`.
 struct BurstApp {
     body: Rc<BurstBody>,
 }
@@ -7689,8 +7681,8 @@ impl OwnedExchange for BurstExchange {
 }
 
 /// The write lengths of the owned driver that, under a 64-byte write size and with writes that
-/// complete at once, writes a chunked response head, then streams one-byte chunks, each ready
-/// at once, until the `cancel_at`th body poll cancels the connection.
+/// complete immediately, writes a chunked response head, then streams one-byte chunks, each
+/// ready when polled, until the `cancel_at`th body poll cancels the connection.
 fn burst_writes(cancel_at: usize) -> Vec<usize> {
     run_on_host(move |context| {
         Box::pin(async move {
@@ -7728,10 +7720,9 @@ fn burst_writes(cancel_at: usize) -> Vec<usize> {
 }
 
 /// A burst of ready response body events that runs past the turn budget, and a cancel that
-/// discards what is not yet written, write the same pieces as the driver did before its turns
-/// skipped phases with nothing to do (recorded from the driver at `48eb3af27ed4`): a turn the
-/// driver no longer runs still counts against the budget, so the write the budget forces at its
-/// last turn holds the same bytes.
+/// discards what is not yet written, write the recorded pieces. Do not change them. A turn that
+/// is skipped because no phase has work still counts against the budget, so the write that the
+/// budget forces at its last turn holds the recorded bytes.
 #[test]
 fn a_cancelled_body_burst_past_the_turn_budget_writes_the_recorded_pieces() {
     let recorded: &[(usize, &[usize])] = &[
@@ -7777,7 +7768,7 @@ fn a_cancelled_body_burst_past_the_turn_budget_writes_the_recorded_pieces() {
     assert_eq!(actual, expected, "write lengths:\n{}", actual.join("\n"));
 }
 
-/// The response body of the TCP early-retirement tests, sent as one physical write that the
+/// The response body of the TCP early-retirement tests, sent as one transport write that the
 /// shrunken loopback buffers cannot hold while the client does not read.
 const TCP_BODY: usize = 2 << 20;
 /// `SO_SNDBUF` of the session's socket and `SO_RCVBUF` of the client's.
@@ -7785,7 +7776,7 @@ const TCP_SOCKET_BUFFER: u32 = 64 << 10;
 /// The session's write and buffer bound, so that one write carries the whole response.
 const TCP_WRITE_LIMIT: usize = 4 << 20;
 
-/// What the client and the owned HTTP/1.1 session saw in `h1_retirement_over_tcp`.
+/// What the client and the owned HTTP/1.1 session observed in `h1_retirement_over_tcp`.
 struct TcpRetirement {
     /// The exchange's `complete()` ran before the client read anything.
     retired_before_read: bool,
@@ -7796,9 +7787,9 @@ struct TcpRetirement {
 }
 
 /// Serves one GET with owned HTTP/1.1 over an accepted plaintext TCP `OwnedByteStream`, whose
-/// native write queue answers `is_saturated`, with a `TCP_BODY`-byte response. The client reads
-/// nothing until the exchange's `complete()` has run, or for 5 seconds. Then it reads the whole
-/// response and ends the connection, or, when `reset_after_complete`, resets it.
+/// native write queue reports `is_saturated`, with a `TCP_BODY`-byte response. The client does
+/// not read until the exchange's `complete()` has run, or for 5 seconds. Then it reads the
+/// whole response and ends the connection, or, when `reset_after_complete`, resets it.
 fn h1_retirement_over_tcp(reset_after_complete: bool) -> TcpRetirement {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
@@ -7910,10 +7901,9 @@ fn h1_retirement_over_tcp(reset_after_complete: bool) -> TcpRetirement {
         }))
 }
 
-/// On plaintext TCP the native write queue answers `is_saturated`, so the `DIV-028` rule
-/// applies: a response's exchange retires once its end is serialized and handed to the
-/// saturated queue, and its `complete()` runs before the client reads any of the one write
-/// that carries it.
+/// On plaintext TCP the native write queue reports `is_saturated`, so an exchange can retire at
+/// serialization. It retires once its response's end is serialized and handed to the queue,
+/// and its `complete()` runs before the client reads any of the one write that carries it.
 #[test]
 fn owned_h1_retires_a_response_at_serialization_over_tcp() {
     let outcome = h1_retirement_over_tcp(false);
@@ -7939,8 +7929,8 @@ fn owned_h1_retires_a_response_at_serialization_over_tcp() {
 }
 
 /// A write failure after an early retirement on TCP fails the connection, and does not reach the
-/// retired exchange: the client resets after `complete()`, the run fails, and the exchange sees
-/// no `cancel`.
+/// retired exchange. The client resets after `complete()`, the run fails, and the exchange does
+/// not get a `cancel`.
 #[test]
 fn a_write_failure_after_an_early_retirement_over_tcp_fails_only_the_connection() {
     let outcome = h1_retirement_over_tcp(true);

@@ -554,7 +554,7 @@ pub(crate) struct ReadGate {
     /// The waker of the reader's last pending poll, or of the poll that returned a drained read.
     waker: RefCell<Option<std::task::Waker>>,
     /// `poll_read` calls, one per `poll_start_read`, that found the gate closed or returned a
-    /// read; a poll that waits only for `inner`'s own read future is not counted.
+    /// read. A poll that waits only for `inner`'s own read future is not counted.
     pub(crate) polls: Cell<usize>,
     /// Reads returned.
     pub(crate) reads: Cell<usize>,
@@ -2234,8 +2234,8 @@ impl HttpHandler for RequestStopHandler {
 
 /// Sends the incomplete `request`, lets the handler apply `stop` after the head, then
 /// delivers the peer's EOF (`more` is `None`) or the bytes `more`. The clock is paused, so
-/// it advances only while every task is idle: a session still running an hour later has
-/// nothing left that can end it, and the result is `None`.
+/// it advances only while every task is idle. A session still running an hour later
+/// cannot end, and the result is `None`.
 fn request_stop_then_ingress_failure(
     request: &'static [u8],
     stop: RequestStop,
@@ -9615,9 +9615,9 @@ mod h1 {
         assert_eq!(outcome.close, CloseKind::Reset);
     }
 
-    /// `DIV-058`: with 400 bytes of a 700-byte request window unread and the pause at 500, the
-    /// next 400-byte read is parsed only up to the window, and parsing pauses there, with 700
-    /// bytes unread, instead of failing the request.
+    /// With 400 bytes of a 700-byte request window unread and the pause at 500, the next
+    /// 400-byte read is parsed only up to the window. Parsing pauses there with 700 bytes
+    /// unread instead of failing the request.
     #[test]
     fn h1_ingress_body_events_stop_at_the_request_window() {
         let config = UniplexConfig {
@@ -10001,7 +10001,7 @@ pub(crate) fn ready_dispatch_transport() -> Rc<dyn UniplexTransport> {
 }
 
 /// The writes an upstream HTTP/1.1 session makes for a POST of `hello`
-/// answered by the peer once it has the request.
+/// that the peer responds to once it has the request.
 fn upstream_post_writes(config: UniplexConfig) -> Vec<Vec<u8>> {
     run_on_worker(move |context| {
         Box::pin(async move {
@@ -10153,7 +10153,7 @@ fn batched_h1_egress_writes_the_head_without_waiting_for_the_body() {
     });
 }
 
-/// The writes a downstream HTTP/1.1 session makes answering one GET with a
+/// The writes a downstream HTTP/1.1 session makes to respond to one GET with a
 /// fixed three-byte body.
 fn downstream_response_writes(config: UniplexConfig) -> Vec<Vec<u8>> {
     struct Fixed;
@@ -10254,7 +10254,7 @@ const BOUNDARY_BUFFER: usize = 64 << 10;
 /// cannot be mistaken for body bytes.
 const BOUNDARY_BYTE: u8 = b'z';
 
-/// A request whose body events, `(length, eom)` each, are all ready at once.
+/// A request whose body events, `(length, eom)` each, are all ready immediately.
 struct ReadyRequest {
     head: Option<HttpHeaderEvent>,
     events: VecDeque<(usize, bool)>,
@@ -10284,10 +10284,10 @@ impl HttpSource for ReadyRequest {
     fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {}
 }
 
-/// The writes of an upstream HTTP/1.1 POST whose body events are all ready, on
-/// a session whose egress buffer and write size are both `BOUNDARY_BUFFER`,
-/// with a `Content-Length` of `content_length` or, without one, chunked; and the
-/// response status, or the error that failed the exchange instead.
+/// Sends an upstream HTTP/1.1 POST with all body events ready, on a session with
+/// egress buffer and write size both `BOUNDARY_BUFFER`. The request has a
+/// `Content-Length` of `content_length`, or is chunked without one. Returns the
+/// writes and the response status, or the error that failed the exchange.
 fn boundary_post(
     content_length: Option<usize>,
     events: &'static [(usize, bool)],
@@ -10436,9 +10436,9 @@ fn batched_h1_egress_writes_a_chunk_that_no_longer_fits_next() {
     assert_boundary_post(None, &[(40_000, false), (40_000, true)], 2);
 }
 
-/// Whether an upstream request was started, read before and after its stream
-/// fails: aborted at once, or failed by the peer's EOF once its head was
-/// written (`DIV-035`).
+/// Returns `request_started()` before and after an upstream request fails, and
+/// the number of writes. The request is aborted immediately, or with
+/// `write_first` it is failed by the peer's EOF after its head is written.
 fn request_started_around_a_failure(write_first: bool) -> (bool, bool, usize) {
     use crate::experimental::UniplexResponseAbortExt;
     use crate::experimental::UniplexResponseProgressExt;
@@ -10502,13 +10502,12 @@ enum PeerFailure {
     ReadError,
 }
 
-/// An upstream request whose session the peer fails (EOF or read error) after
-/// the request is committed and before the writer serializes its head, held by
-/// a test hook as when the failure and the commit fall in one turn: the
-/// request's sequence number (1 when an earlier exchange reused the session),
-/// whether it was started before and after the failure, the bytes written for
-/// it, and the error its head read returned within a bound (`DIV-035`). The
-/// session's timers are off, as the router sets them.
+/// The peer fails an upstream session (EOF or read error) after a request is
+/// committed and before the writer serializes its head. A test hook holds the
+/// writer, as when the failure and the commit fall in one turn. Returns the
+/// request's sequence number (1 when `reused`), whether it was started before
+/// and after the failure, the bytes written for it, and the error its head read
+/// returned within a bound. The session's timers are off.
 fn request_started_when_the_peer_fails_first(
     failure: PeerFailure,
     reused: bool,
@@ -10614,8 +10613,9 @@ fn a_request_on_a_fresh_session_failed_by_an_eof_before_its_head_was_not_started
     );
 }
 
-/// The retry case of `DIV-035`: a reused session (`sequence_number != 0`) that
-/// failed before it serialized the request (`!request_started()`).
+/// The case that a hyper-util-style client retries: a reused session
+/// (`sequence_number != 0`) that failed before it serialized the request
+/// (`!request_started()`).
 #[test]
 fn a_request_on_a_reused_session_failed_by_an_eof_before_its_head_was_not_started() {
     assert_eq!(
@@ -10667,11 +10667,10 @@ struct LoopbackStaleReuse {
     peer_received: Vec<u8>,
 }
 
-/// The pool-level stale-connection case of `DIV-035` on a real loopback TCP
-/// connection: an upstream HTTP/1.1 session carries one exchange, then the
-/// next request is committed while the session's writer is held (the in-crate
-/// test hook) and the peer closes its side (FIN), as when that FIN and the
-/// commit fall in one turn. Session timers are off, as the router sets them.
+/// A stale reused connection over real loopback TCP. An upstream HTTP/1.1
+/// session carries one exchange. The next request is then committed while a
+/// test hook holds the session's writer, and the peer closes its side (FIN), as
+/// when that FIN and the commit fall in one turn. Session timers are off.
 fn stale_reused_loopback_connection() -> LoopbackStaleReuse {
     use crate::experimental::UniplexResponseProgressExt;
     run_on_io_worker(move |context| {
@@ -10834,8 +10833,8 @@ fn a_request_on_a_reused_session_failed_by_a_read_error_before_its_head_was_not_
     );
 }
 
-/// What a request committed on a reused upstream HTTP/1.1 session met when the
-/// peer's EOF was already readable, the session not yet polled since.
+/// The outcome of a request committed on a reused upstream HTTP/1.1 session
+/// while the peer's EOF was already readable and the session was not yet polled.
 #[derive(Debug, PartialEq)]
 struct ReadableEofCommit {
     sequence_number: u64,

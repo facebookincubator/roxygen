@@ -53,7 +53,7 @@ struct ExchangeState {
     driver_applied: Cell<bool>,
     driver_complete: Cell<bool>,
     unconfirmed: Cell<bool>,
-    /// The session began serializing the exchange's outgoing head (`DIV-035`).
+    /// The session began serializing the exchange's outgoing head.
     egress_started: Cell<bool>,
     wake: Rc<dyn Fn()>,
 }
@@ -364,8 +364,8 @@ impl HttpSource for ExchangeSource {
             .set_read_timeout(timeout);
     }
 
-    /// A holder asks this before any read guard exists, so a panic in the
-    /// application's answer marks the cleanup unconfirmed here.
+    /// A holder calls this before any read guard exists, so a panic in the
+    /// application's implementation marks the cleanup unconfirmed here.
     fn polls_body_events(&self) -> bool {
         let polls = catch_unwind(AssertUnwindSafe(|| {
             self.inner

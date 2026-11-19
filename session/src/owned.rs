@@ -34,18 +34,19 @@ use crate::uniplex::UniplexRead;
 use crate::uniplex::UniplexReader;
 use crate::uniplex::UniplexTransport;
 
-/// An application exchange remains owned until ingress consumption, application
-/// body retirement, and physical write completion have all been observed, except where a
-/// driver documents an early-retirement exception. The owned HTTP/2 driver's exception
-/// (`DIV-028`): a downstream exchange that is not reset, whose request fully arrived with no
-/// trailing RST owed, and that registered no byte event skips physical write completion when
-/// the write queue reports it is not saturated as its END_STREAM is serialized.
+/// One application exchange served by an owned driver.
+///
+/// The exchange stays owned until its request ingress is consumed, its response body is
+/// retired, and its writes have completed. The owned drivers make one exception. A downstream
+/// exchange that has received its whole request and registered no byte event does not wait for
+/// its writes if the write queue is not saturated when its end of message is serialized. On
+/// HTTP/2 the stream must also not be reset and must have no trailing RST_STREAM pending.
 pub trait OwnedExchange: 'static {
     /// Supplies a validated owned request head and its existing body source.
     /// `eom` implies the terminal empty-body read was consumed before handoff.
     fn request(&mut self, head: Box<HttpMessage>, body: HttpStreamSourceOwner, eom: bool);
     /// Supplies a fresh ingress body without exposing an independent reader.
-    /// The default preserves the general source API for existing applications.
+    /// The default converts the body into a source and calls `request`.
     fn request_body(&mut self, head: Box<HttpMessage>, body: HttpIngressBody, eom: bool) {
         self.request(head, body.into_source_owner(), eom);
     }
@@ -56,19 +57,21 @@ pub trait OwnedExchange: 'static {
         &mut self,
         context: &mut Context<'_>,
     ) -> Poll<Result<HttpHeaderEvent, HttpError>>;
-    /// Produces at most `maximum` data bytes, the driver's allowance for one data event
-    /// (HTTP/2: flow-control credit and frame size; HTTP/1.1: the driver's write allowance).
-    /// Preserve source terminal handling, byte-event registrations, padding, and suspension
-    /// events.
+    /// Produces at most `maximum` data bytes, the driver's allowance for one data event. On
+    /// HTTP/2 the allowance follows flow-control credit and frame size, on HTTP/1.1 the driver's
+    /// write allowance. Preserve source terminal handling, byte-event registrations, padding,
+    /// and suspension events.
     fn poll_body(
         &mut self,
         context: &mut Context<'_>,
         maximum: u32,
     ) -> Poll<Result<HttpBodyEvent, HttpError>>;
-    /// Whether the exchange's handler is still running, so it has not yet returned its response.
-    /// When the request body's read times out before the final response head, as in
-    /// `UniplexSession`, the driver waits for a running handler and sends a final 408 it answers
-    /// (any other final response becomes a bare 408), and otherwise sends a bare 408 at once.
+    /// Whether the exchange's handler is still running and has not returned its response.
+    ///
+    /// When a request body read times out before the final response head, the driver waits for
+    /// a running handler and sends its final response if that is a 408. Any other final response
+    /// becomes a bare 408. Without a running handler the driver sends a bare 408 immediately.
+    /// `UniplexSession` behaves the same way.
     fn handler_active(&self) -> bool {
         false
     }
@@ -79,16 +82,17 @@ pub trait OwnedExchange: 'static {
     fn cancel(&mut self, error: &HttpError, peer_reset: bool);
     /// Records codec-accepted response completion, independently of native write completion.
     fn response_complete(&mut self);
-    /// Retires the exchange after the driver's full fence, or earlier under the driver's
-    /// documented exception (HTTP/2: END_STREAM serialization under `DIV-028`); the
-    /// application determines success.
+    /// Retires the exchange once the conditions in the trait docs hold, or without waiting for
+    /// its writes under the early-retirement exception described there. The application
+    /// determines success.
     fn complete(self);
 }
 
-/// The caller supplies one concrete exchange owner per admitted stream.
+/// Creates the application's exchange for each admitted stream.
 pub trait OwnedApplication: 'static {
     type Exchange: OwnedExchange;
-    /// Begins accounting before decoded head validation can report a stream error.
+    /// Creates the exchange for `stream`. It is called before the decoded head is validated, so
+    /// accounting begins before a stream error can be reported.
     fn new_exchange(&self, stream: StreamId, ingress: IngressCompletion) -> Self::Exchange;
 }
 
@@ -103,10 +107,10 @@ pub trait OwnedUpstreamObserver: 'static {
     fn released_submission_retired(&self) {}
     fn capacity_available(&self) {}
     fn admission_closed(&self) {}
-    /// The peer reset a live stream, on HTTP/2: with an RST_STREAM carrying `code`, or with a
-    /// GOAWAY that refused the stream, as `REFUSED_STREAM`. Once per stream, at its first
-    /// peer reset; not for a `NO_ERROR` reset after the stream's whole response, which stops
-    /// only its upload (`DIV-050`).
+    /// The HTTP/2 peer reset a live stream, with an RST_STREAM carrying `code` or with a GOAWAY
+    /// whose last-stream-id excludes the stream, reported as `REFUSED_STREAM`. Called once per
+    /// stream, at its first peer reset. Not called for a `NO_ERROR` reset after the stream's
+    /// whole response, which only stops its upload.
     fn peer_reset(&self, _code: HttpErrorCode) {}
 }
 
@@ -121,7 +125,7 @@ pub trait OwnedResponseObserver: 'static {
     fn response_complete(self: Box<Self>, completed: Result<Instant, HttpError>);
 }
 
-/// Where an owned driver contained a panic (`DIV-056`).
+/// Where an owned driver contained a panic.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PanicSite {
     /// A driver turn, outside any narrower boundary.
@@ -147,7 +151,7 @@ pub(crate) enum PanicSite {
     Submission,
     /// The transport's close or a cancellation waker.
     Transport,
-    /// A client request's commitment, which runs only Roxygen code.
+    /// A client request's commitment, which runs no application code.
     Commit,
     /// A step of the teardown that follows a Driver-scope panic, or a field dropped as the
     /// driver is released.
@@ -189,7 +193,7 @@ impl PanicSite {
 }
 
 /// Reports a contained panic to the worker: its `WorkerPollStats` count and, under the runtime's
-/// `observability` feature, an error event (`DIV-056`). The caller still disposes of `payload`.
+/// `observability` feature, an error event. The caller still disposes of `payload`.
 #[cold]
 #[inline(never)]
 pub(crate) fn report_contained_panic(
@@ -228,8 +232,8 @@ pub(crate) fn take_contained_panics() -> Vec<(PanicSite, Option<StreamId>, Optio
 }
 
 /// An owned driver's read: through the transport's [`UniplexReader`] when it offers one, else
-/// through one `UniplexTransport::read` future per read. The reader picks the path at the call
-/// site, and each path runs out of line, so neither carries the other's code.
+/// through one `UniplexTransport::read` future per read. The path is chosen at each call site
+/// and each path is out of line, so neither inlines the other's code.
 pub(crate) struct ReadSlot {
     reader: Option<Box<dyn UniplexReader>>,
     timeout: Duration,
@@ -243,6 +247,7 @@ pub(crate) struct ReadSlot {
 
 /// A started read.
 enum SlotRead {
+    /// A `UniplexTransport::read` future.
     Future(LocalTransportFuture<Result<UniplexRead, HttpError>>),
     /// The reader's started read.
     Reader,
@@ -291,7 +296,7 @@ impl ReadSlot {
     }
 
     /// Starts a read of at most `maximum` bytes that first offers `allocation_size` bytes, and
-    /// polls it at once; `Ready` returns it.
+    /// polls it immediately. A `Ready` result ends the started read.
     #[inline(always)]
     pub(crate) fn poll_start(
         &mut self,
@@ -314,7 +319,7 @@ impl ReadSlot {
         }
     }
 
-    /// Polls the started read; `Ready` returns it.
+    /// Polls the started read. A `Ready` result ends it.
     #[inline(always)]
     pub(crate) fn poll(
         &mut self,
@@ -401,8 +406,8 @@ impl ReadSlot {
         self.note_drained(Poll::Ready(result))
     }
 
-    /// Drops the started read unfinished after its polls panicked (`DIV-056`): its future, or the
-    /// reader that holds it, so no later poll reaches it.
+    /// Drops the started read unfinished after its polls panicked: its future, or the reader that
+    /// holds it, so no later poll reaches it.
     pub(crate) fn abandon(&mut self) {
         self.read = None;
         drop(self.reader.take());

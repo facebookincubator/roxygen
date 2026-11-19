@@ -7,75 +7,82 @@
 
 //! Experimental owned HTTP/1.1 upstream session.
 //!
-//! The poll-driven HTTP/1.1 sibling of [`crate::owned_h2::OwnedH2UpstreamSession`], with the
-//! same admission contract: reserve a slot, submit a head and its body source, and read the
-//! response from a source the caller owns. One driver future runs the connection's upstream
-//! `Http1xCodec`, the request upload and the response source, with no task per request.
+//! This is the poll-driven HTTP/1.1 counterpart of
+//! [`crate::owned_h2::OwnedH2UpstreamSession`], with the same admission contract: reserve a slot,
+//! submit a head and its body source, and read the response from a source the caller owns. One
+//! driver future runs the connection's upstream `Http1xCodec`, the request upload and the
+//! response source, with no task per request.
 //!
-//! Capacity is one. Capacity is released once the request is serialized and the response's EOM
-//! is parsed; once the response's reader is done and the request's bytes are written, a
+//! # Capacity and reuse
+//!
+//! Capacity is one. It is released once the request is serialized and the response's EOM is
+//! parsed. After the response's reader is done and the request's bytes are written, a
 //! connection that `Http1xCodec` leaves reusable, between messages, returns its slot
-//! (`capacity_available`, and the connection is idle), and any other connection closes admission
-//! and shuts down its write side. Response bytes behind a finished response fail the connection
-//! before a next request is committed. An HTTP/1.1 exchange cannot be reset alone, so a cancel
-//! before both messages end resets the connection. A request body that does not match its declared `Content-Length` fails the
+//! (`capacity_available`) and is idle. Any other connection closes admission and shuts down
+//! its write side. Response bytes after a finished response fail the connection before the
+//! next request is committed. Peer EOF closes admission.
+//!
+//! A slot is returning (`OwnedH1UpstreamHandle::returning_capacity`) once its reader's
+//! completion is all that keeps the driver from retiring a finished exchange on a reusable
+//! connection. The connection admits the next request immediately, and the driver commits it
+//! once its next turn has retired the exchange. If the slot is already taken by then, that
+//! retirement does not announce capacity.
+//!
+//! Each turn reads before it commits a queued request, so a peer EOF or a failed read that is
+//! already readable closes admission first. A request rejected because admission closed reports
+//! `OwnedRequestProgressExt::request_unprocessed`.
+//!
+//! # Requests
+//!
+//! An HTTP/1.1 exchange cannot be reset alone, so a cancel before both messages end resets the
+//! connection. A request body that does not match its declared `Content-Length` fails the
 //! request with `CONTENT_LENGTH_MISMATCH`, and no byte past that length or after a short end is
-//! written. Trailers on a `Content-Length` request have no HTTP/1.1 encoding and are dropped.
-//! Peer EOF closes admission. Under [`Http1UpgradePolicy::Proxygen`] a request that can switch
-//! protocols (CONNECT, an `Upgrade` header or the egress websocket flag) is refused. Under
-//! [`Http1UpgradePolicy::AsOrdinaryRequest`] CONNECT and `Upgrade` requests are sent as
-//! ordinary requests, a head that does not frame its body as the codec writes it is refused, a
-//! `101` fails the connection, and the egress websocket flag is still refused (`DIV-031`).
-//! Byte events are cancelled, never fired, and the driver is untimed. A cancel from any
-//! callback the driver runs, including a request body's resume future and a waker that a
-//! response event's publication runs, is observed at the end of that phase, before it reads
-//! more of the request, parses the next response event, writes or closes normally. As in
-//! `UniplexSession`, a failed read fails the connection only after every byte read before it is
-//! parsed, flow control included, and resets the transport
-//! only once the request bytes already serialized are written.
-//! [`OwnedH1UpstreamSession::new`] validates [`UniplexConfig`] as [`OwnedH1Session::new`]
-//! does, except that `drain_request_body_on_drop` must be false,
-//! `unframed_bodiless_http1_requests` (`DIV-036`) is honored: a request whose head ends it and
-//! carries no framing header goes out with no body framing, as through `UniplexSession`, and
-//! `deliver_ingress_before_abort` (`DIV-033`) is honored: a response that fails keeps its
-//! received head and body events for its reader, before the error, unless the request's
-//! consumer cancelled it (a cancel, a dropped submission or the cancellation token), which
-//! discards them, as `UniplexStreamAbort` does. DIV-029 lists where this driver differs from
-//! `UniplexSession`'s client. Each turn reads before it commits a queued request, so a peer EOF
-//! already readable, or a failed read, closes admission first; a request that admission refuses
-//! reports `OwnedRequestProgressExt::request_unprocessed` (`DIV-035`).
+//! written. Trailers on a `Content-Length` request cannot be encoded in HTTP/1.1 and are
+//! dropped. Under the default [`Http1UpgradePolicy`], a request that can switch protocols
+//! (CONNECT, an `Upgrade` header or the egress websocket flag) is rejected. Under
+//! [`Http1UpgradePolicy::AsOrdinaryRequest`], CONNECT and `Upgrade` requests are sent as
+//! ordinary requests, a head that does not frame its body the way the codec writes it is
+//! rejected, a `101` fails the connection, and the egress websocket flag is still rejected. Byte
+//! events are cancelled, never fired, and the driver has no timers.
 //!
-//! A slot is returning (`OwnedH1UpstreamHandle::returning_capacity`, `DIV-029`) from the moment
-//! its reader's completion is all that keeps the driver from retiring a finished exchange on a
-//! reusable connection: the connection admits the next request at once, which the driver
-//! commits once its next turn has retired the exchange, and that retirement announces no
-//! capacity once the slot is taken.
+//! A cancel from any callback the driver runs, including a request body's resume future and a
+//! waker run while a response event is published, takes effect at the end of that phase, before
+//! the driver reads more of the request, parses the next response event, writes or closes
+//! normally. As in `UniplexSession`, a failed read fails the connection only after every byte
+//! read before it is parsed, flow control included, and resets the transport only once the
+//! request bytes already serialized are written.
 //!
-//! The driver contains the panics of the code it runs and counts each in its worker's
-//! `WorkerPollStats` (`DIV-056`). A panic in a request's upload or response observer, or in the
-//! encoded-headers callback of a head with a body to follow, fails that request, which closes its
-//! connection as a failed upload does; one in a byte-event callback, the encoded-headers
-//! callback of a head that ends its request, or a retiring exchange is only counted. One in the
-//! connection's observer while the driver polls closes admission, so the connection closes once
-//! idle. Any other panic in the driver's poll tears the connection down: its native read and
-//! writes are cancelled and joined, one whose teardown polls panic three times in total is
-//! dropped unfinished, and the run returns `Err(INTERNAL_ERROR)`. A run never resumes a panic.
+//! [`OwnedH1UpstreamSession::new`] validates [`UniplexConfig`] as [`OwnedH1Session::new`] does,
+//! with these differences:
 //!
-//! Pull-through exchanges (`DIV-047`, experimental): under
-//! [`OwnedH1UpstreamSession::run_pull_through`], the body of a
+//! - `drain_request_body_on_drop` must be false.
+//! - `unframed_bodiless_http1_requests` is supported: a request whose head ends it and that has
+//!   no framing header is sent without body framing, as through `UniplexSession`.
+//! - `deliver_ingress_before_abort` is supported: a response that fails keeps its received head
+//!   and body events for its reader, ahead of the error. If the request's consumer cancelled it
+//!   (a cancel, a dropped submission or the cancellation token), the events are discarded, as
+//!   `UniplexStreamAbort` does.
+//!
+//! # Panic containment
+//!
+//! The driver contains panics from the code it runs and counts each in its worker's
+//! `WorkerPollStats`. A panic in a request's upload or response observer, or in the
+//! encoded-headers callback of a head with a body to follow, fails that request, which closes
+//! its connection as a failed upload does. A panic in a byte-event callback, in the
+//! encoded-headers callback of a head that ends its request, or in a retiring exchange is only
+//! counted. A panic in the connection's observer while the driver polls closes admission, so the
+//! connection closes once idle. Any other panic in the driver's poll tears the connection down:
+//! its native read and writes are cancelled and joined, an operation whose teardown polls panic
+//! three times in total is dropped unfinished, and the run returns `Err(INTERNAL_ERROR)`. A run
+//! never resumes a panic.
+//!
+//! # Pull-through exchanges
+//!
+//! Under [`OwnedH1UpstreamSession::run_pull_through`], the body of a
 //! [`OwnedH1UpstreamReservation::submit_pull_through`] exchange holds the driver's drive from its
 //! first read after the request is written until the response is fully produced or its source
-//! completes, and polls the driver inline from its reads; the run's future does not poll it
-//! meanwhile. A body polls the driver only when the wake record of the driver's task waker shows
-//! that one of the driver's wake sources fired since its last poll. So every input of the driver
-//! must wake that task waker (through a `Signal` or `task.wake()`, which set the record), be
-//! covered by a term of the body's check (a pending budget yield), or reach the run's future,
-//! which takes the drive back (the held request's cancellation token, worker cancellation): an
-//! input that does none of these is lost while a body holds the drive. Timers added to this
-//! driver must wake its task waker, and must take a held drive back before pull-through accepts
-//! them. Taking the drive back (hand-back and revocation) touches only `Shared`'s drive state,
-//! the task waker and wakers, never the driver, so it is safe from a callback inside an inline
-//! drive.
+//! completes. While it holds the drive, the body polls the driver inline from its reads, and the
+//! run's future does not poll it. `Drive` documents the wake rule this depends on.
 
 use std::cell::OnceCell;
 use std::cell::RefCell;
@@ -117,26 +124,26 @@ struct Shared {
     spent: Cell<bool>,
     /// The live exchange's response signals once only its consumer's completion keeps the
     /// driver from retiring it and returning the slot. From that completion on, the slot is
-    /// returning, and admission counts it free (`DIV-029`).
+    /// returning, and admission counts it free.
     retiring: RefCell<Option<Rc<IngressSignals>>>,
     /// Run whenever the slot turns returning
     /// (`OwnedH1UpstreamHandle::set_returning_hook`).
     returning_hook: RefCell<Option<Rc<dyn Fn()>>>,
-    /// Requests committed on the connection (`DIV-035`).
+    /// Requests committed on the connection.
     committed: Cell<u64>,
     closed: RefCell<Option<HttpError>>,
     observer: RefCell<Option<Rc<dyn OwnedUpstreamObserver>>>,
     queued: RefCell<Option<Submission>>,
-    /// Set while the driver polls. A callback that panics then is contained and reported
-    /// (`DIV-056`); otherwise its panic reaches the caller.
+    /// Set while the driver polls. A callback that panics then is contained and reported.
+    /// Otherwise its panic reaches the caller.
     polling: Cell<bool>,
-    /// The observer panicked while the driver polled, which drains the connection (`DIV-056`).
+    /// The observer panicked while the driver polled, which drains the connection.
     escalate_drain: Cell<bool>,
-    /// Who polls the driver of a session run with `run_pull_through` (`DIV-047`).
+    /// Who polls the driver of a session run with `run_pull_through`.
     drive: Drive,
 }
 
-/// Who polls a pull-through connection's driver (`DIV-047`).
+/// Who polls a pull-through connection's driver.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum DriveState {
     /// The run future, on each of its polls.
@@ -149,8 +156,22 @@ enum DriveState {
     Revoked(StreamId),
 }
 
-/// A pull-through connection's drive state. It lives in `Shared`, so hand-back and revocation
-/// reach it without borrowing the driver (`DIV-047`).
+/// A pull-through connection's drive state. It lives in `Shared`, so that hand-back and
+/// revocation reach it without borrowing the driver.
+///
+/// A body that holds the drive polls the driver only when the wake record of the driver's task
+/// waker shows that one of the driver's wake sources fired since its last poll. So every input
+/// of the driver must do one of these, or it is lost while a body holds the drive:
+///
+/// - wake the task waker, through a `Signal` or `task.wake()`, which set the record;
+/// - be covered by a term of the body's check, such as a pending budget yield;
+/// - reach the run's future, which takes the drive back, as the held request's cancellation
+///   token and worker cancellation do.
+///
+/// Timers added to this driver must wake its task waker, and must take a held drive back before
+/// pull-through can accept them. Taking the drive back (hand-back and revocation) touches only
+/// this state, the task waker and wakers, never the driver, so it is safe from a callback inside
+/// an inline drive.
 #[derive(Default)]
 struct Drive {
     state: Cell<DriveState>,
@@ -180,7 +201,7 @@ impl Shared {
     }
 
     /// Returns `stream`'s held or revoked drive to the run, before the wake that announces it:
-    /// the driver's task waker is the run future's again. Borrows no driver (`DIV-047`).
+    /// the driver's task waker is the run future's again. It does not borrow the driver.
     /// Returns whether the drive changed hands.
     fn hand_back(&self, stream: StreamId) -> bool {
         let (DriveState::Held(held) | DriveState::Revoked(held)) = self.drive.state.get() else {
@@ -196,9 +217,9 @@ impl Shared {
     }
 
     /// Takes a held drive, `stream`'s or any, back to the run future, which applies what
-    /// revoked it: every cancel input and connection failure revokes. Borrows no driver, so it
-    /// is safe from a callback inside an inline drive, whose holder it does not wake: that
-    /// read continues after its drive (`DIV-047`).
+    /// revoked it. Every cancel input and connection failure revokes. It does not borrow the
+    /// driver, so it is safe from a callback inside an inline drive. It does not wake that
+    /// drive's holder, whose read continues after its drive.
     fn revoke(&self, stream: Option<StreamId>) {
         let DriveState::Held(held) = self.drive.state.get() else {
             return;
@@ -230,7 +251,7 @@ impl Shared {
     }
 
     /// The live exchange's consumer completed it once only that completion kept the driver from
-    /// retiring it and returning the slot (`DIV-029`).
+    /// retiring it and returning the slot.
     #[inline]
     fn returning(&self) -> bool {
         self.retiring
@@ -239,7 +260,7 @@ impl Shared {
             .is_some_and(|signals| signals.source_complete.get())
     }
 
-    /// The connection takes no request: admission closed, or a cancel.
+    /// Whether the connection rejects requests because admission closed or it was cancelled.
     #[inline]
     fn refuses(&self) -> bool {
         self.cancel.get() || self.closed.borrow().is_some() || self.context.is_cancelled()
@@ -255,7 +276,7 @@ impl Shared {
         }
     }
 
-    /// `available`, counting a returning slot free: what a reservation may take (`DIV-029`).
+    /// `available`, counting a returning slot free: what a reservation may take.
     fn admits(&self) -> u32 {
         if (self.spent.get() && !self.returning()) || self.refuses() {
             0
@@ -265,9 +286,8 @@ impl Shared {
     }
 
     /// Runs one admission callback at `site`. While the driver polls, a panic is reported and
-    /// disposed of, and an observer's or the returning hook's also drains the connection
-    /// (`DIV-056`); otherwise the first panic is kept in `first` for `finish_panic` to raise to
-    /// the caller.
+    /// disposed of, and an observer's or the returning hook's also drains the connection.
+    /// Otherwise the first panic is kept in `first` for `finish_panic` to raise to the caller.
     #[inline(always)]
     fn contain_callback(
         &self,
@@ -330,7 +350,8 @@ impl Shared {
                 self.contain_callback(&mut panic, site, stream, || observer.capacity_available());
             }
         }
-        // The slot is returning again, which nothing announces.
+        // The slot is returning again. Capacity callbacks do not announce that, so the
+        // returning hook does.
         if self.available() == 0 && self.admits() != 0 {
             let hook = self.returning_hook.borrow().clone();
             if let Some(hook) = hook {
@@ -428,7 +449,7 @@ fn teardown_panicked(context: &WorkerContext, panic: PanicPayload) {
 }
 
 /// Reports a panic contained at an Exchange-scope `site` of the exchange `id`, disposes of it,
-/// and returns the error that fails that exchange, and with it the connection (`DIV-056`).
+/// and returns the error that fails that exchange, and with it the connection.
 #[cold]
 #[inline(never)]
 fn exchange_panicked(
@@ -453,7 +474,7 @@ fn release_field<T>(context: &WorkerContext, field: T) {
 }
 
 /// Unwinds to the per-turn catch after a Driver-scope panic its site already reported, so the
-/// catch starts the teardown without reporting it again (`DIV-056`).
+/// catch starts the teardown without reporting it again.
 struct ReportedPanic;
 
 /// Reports a panic that reached the per-turn catch, unless its site already did.
@@ -465,7 +486,7 @@ fn report_turn_panic(context: &WorkerContext, panic: &PanicPayload) {
     }
 }
 
-/// The panicking teardown polls of each native operation, counted in total (`DIV-056`).
+/// The panicking teardown polls of each native operation, counted in total.
 #[derive(Default)]
 struct TeardownState {
     read_panics: u8,
@@ -478,7 +499,7 @@ const TEARDOWN_PANIC_LIMIT: u8 = 3;
 
 /// Marks the connection as polled by its driver while the guard lives, then restores the
 /// previous mark. It holds the connection's state weakly, so it never drops the last reference
-/// to it (`DIV-056`).
+/// to it.
 struct SharedPolling(Weak<Shared>, bool);
 
 impl SharedPolling {
@@ -516,8 +537,7 @@ fn polled_after_completion() -> HttpError {
 
 /// Cancels each request byte-event registration of the exchange `id` with
 /// `INVALID_STATE_TRANSITION`, as `cancel_byte_events` does, each under its own unwind boundary:
-/// a panicking callback is reported, and the other registrations still get that error
-/// (`DIV-056`).
+/// a panicking callback is reported, and the other registrations still get that error.
 fn refuse_request_byte_events(
     context: &WorkerContext,
     id: StreamId,
@@ -541,7 +561,7 @@ fn refuse_request_byte_events(
 
 /// Runs the request head's encoded-headers callback with the head's encoded size, then drops
 /// the head event, under one unwind boundary when it carries a callback. A panic is reported; it
-/// fails the request only when the head leaves a body to follow (`DIV-056`).
+/// fails the request only when the head leaves a body to follow.
 fn finish_head_event(
     context: &WorkerContext,
     id: StreamId,
@@ -586,13 +606,15 @@ impl OwnedH1UpstreamHandle {
         }
     }
 
-    /// Roxygen-only (`DIV-029`): 1 while the slot is held only by an exchange whose request is
-    /// written and whose response is complete and read to its end (its source completed), on a
-    /// connection that `Http1xCodec` left reusable after that response, with admission open
-    /// and no reservation taken on the slot. The slot admits the next request meanwhile: the
-    /// driver's next turn, which the source's completion woke, retires the exchange, then
-    /// commits a request submitted on the slot, unless the connection fails first. Otherwise 0:
-    /// once a reservation takes the slot, the retirement announces no capacity.
+    /// 1 while the slot is returning, otherwise 0.
+    ///
+    /// A slot is returning while it is held only by an exchange with its request written and
+    /// its response complete and read to its end (its source completed), on a connection
+    /// that `Http1xCodec` left reusable after that response, with admission open and no
+    /// reservation taken on the slot. The slot admits the next request meanwhile. The driver's
+    /// next turn, which the source's completion woke, retires the exchange and then commits a
+    /// request submitted on the slot, unless the connection fails first. Once a reservation
+    /// takes the slot, this reads 0 and the retirement does not announce capacity.
     pub fn returning_capacity(&self) -> u32 {
         let shared = &self.0;
         u32::from(
@@ -603,20 +625,21 @@ impl OwnedH1UpstreamHandle {
         )
     }
 
-    /// For a pool's selection index: `hook` runs whenever the slot turns
-    /// returning (`returning_capacity` reads 1 when it runs), which no observer callback
-    /// announces: inside the consumer's completion of a finished exchange, before the driver's
-    /// next turn, and at the release of a reservation taken on the returning slot. A connection
-    /// that closes first does not run it. It must not panic or act on the connection. Replaces
-    /// an earlier hook.
+    /// Sets a hook that runs whenever the slot becomes returning, for a pool's selection index.
+    ///
+    /// Observer callbacks do not announce that change. The hook runs inside the consumer's
+    /// completion of a finished exchange, before the driver's next turn, and at the release of a
+    /// reservation taken on the returning slot. `returning_capacity` reads 1 while it runs. A
+    /// connection that closes first does not run it. The hook must not panic or act on the
+    /// connection. It replaces any earlier hook.
     #[doc(hidden)]
     pub fn set_returning_hook(&self, hook: Rc<dyn Fn()>) {
         *self.0.returning_hook.borrow_mut() = Some(hook);
     }
 
     /// Installs the connection's one observer. Fails with `INVALID_STATE_TRANSITION` once an
-    /// observer is installed or the session has finished; when admission is already closed,
-    /// the observer gets `admission_closed` before this returns.
+    /// observer is installed or the session has finished. If admission is already closed, the
+    /// observer gets `admission_closed` before this returns.
     pub fn set_observer(&self, observer: Rc<dyn OwnedUpstreamObserver>) -> Result<(), HttpError> {
         if self.0.complete.get() || self.0.observer.borrow().is_some() {
             return Err(failure(
@@ -635,9 +658,9 @@ impl OwnedH1UpstreamHandle {
         self.0.complete.get()
     }
 
-    /// Includes response consumers, upload retirement and native write ownership. The driver
-    /// recomputes it on each quiescent turn, so a slot returned uncommitted leaves the
-    /// connection idle again once the driver has run.
+    /// Whether the connection is idle. Idleness accounts for response consumers, upload
+    /// retirement and native write ownership. The driver recomputes it on each quiescent turn,
+    /// so a slot returned uncommitted leaves the connection idle again once the driver has run.
     pub fn is_idle(&self) -> bool {
         !self.is_finished() && self.0.idle.get() && self.0.used.get() == 0
     }
@@ -708,13 +731,15 @@ impl OwnedH1UpstreamReservation {
         OwnedH1ExclusiveSubmission(self.submit(headers, source, cancellation))
     }
 
-    /// Roxygen-only (`DIV-047`): submits a request whose response body may drive this
-    /// connection from inside its reads, with `submit_exclusive`'s commitment semantics. Its
-    /// connection must run with [`OwnedH1UpstreamSession::run_pull_through`]: under `run`, the
-    /// driver refuses it at commit with `INVALID_STATE_TRANSITION`, before any byte is written,
-    /// and the refusal does not report `request_unprocessed`. A `cancellation` token that can be
-    /// cancelled is honored while the body holds the drive: its cancel wakes the run's future,
-    /// which takes the drive back and applies it. The request refuses `observe_response`.
+    /// Submits a request whose response body may drive this connection from inside its reads,
+    /// with `submit_exclusive`'s commitment semantics.
+    ///
+    /// The connection must run with [`OwnedH1UpstreamSession::run_pull_through`]. Under `run`,
+    /// the driver rejects the request at commit with `INVALID_STATE_TRANSITION`, before any byte
+    /// is written, and the rejection does not report `request_unprocessed`. A `cancellation`
+    /// token that can be cancelled still takes effect while the body holds the drive: its cancel
+    /// wakes the run's future, which takes the drive back and applies it. The request rejects
+    /// `observe_response`.
     pub fn submit_pull_through(
         self,
         headers: HttpHeaderEvent,
@@ -735,16 +760,16 @@ impl OwnedH1UpstreamReservation {
     /// `OwnedH2UpstreamReservation::submit_with_response_interest`. Codec commitment alone does
     /// not notify this waiter. Informational heads also satisfy this interest and remain
     /// ordered in the original source for the caller to drain. A response that ends or fails
-    /// before any head also releases the waiter. Upload, source and physical-write retirement
-    /// remain independent of this notification. The caller retains timeout responsibility
-    /// while waiting, including any timeout anchored to request-producer EOM.
+    /// before any head also releases the waiter. Upload, source and native write retirement
+    /// remain independent of this notification. The caller must enforce its own timeouts while
+    /// waiting, including any measured from the request producer's EOM.
     ///
-    /// A caller whose deadline observes the request producer's completion supplies it as
-    /// `producer_completion`, unless that producer has already succeeded: the outcome is
-    /// first-wins, so such a producer cannot fail. Until the caller takes the response or the
-    /// response ends before that producer fails, an upload that fails after that producer has
-    /// failed selects the producer's error for the request. Otherwise a failed upload fails the
-    /// response with the session's upload-failure outcome. Either way the connection closes.
+    /// If the caller's deadline depends on the request producer's completion, pass that
+    /// completion as `producer_completion`, unless the producer has already succeeded, since it
+    /// then cannot fail. If the upload fails after the producer has failed, the request fails
+    /// with the producer's error, provided that the caller has not taken the response and the
+    /// producer failed before the response ended. Otherwise a failed upload fails the response
+    /// with the session's upload-failure outcome. Either way the connection closes.
     pub fn submit_with_response_interest(
         self,
         headers: HttpHeaderEvent,
@@ -1008,13 +1033,12 @@ impl OwnedH1UpstreamRequest {
 
     /// Attaches one response observer, or immediately delivers an already-published result.
     /// Callbacks run outside request-state borrows. Repeated attachment is rejected, and so is
-    /// observation of a pull-through exchange (`DIV-047`).
+    /// observation of a pull-through exchange.
     pub fn observe_response(
         &self,
         observer: Box<dyn OwnedResponseObserver>,
     ) -> Result<(), HttpError> {
-        // A pull-through exchange's deadline would be processed only on its body's reads
-        // (`DIV-047`).
+        // A pull-through exchange's deadline would be processed only on its body's reads.
         if self.0.pull_through {
             return Err(failure(
                 HttpErrorCode::INVALID_STATE_TRANSITION,
@@ -1081,7 +1105,7 @@ impl OwnedRequestProgressExt for OwnedH1UpstreamRequest {
     }
 }
 
-/// A pull-through submission (`DIV-047`): an acknowledgment of the driver's request commitment,
+/// A pull-through submission: an acknowledgment of the driver's request commitment,
 /// as [`OwnedH1ExclusiveSubmission`] for an ordinary submission. Dropping it before it resolves
 /// cancels the request as dropping that submission does.
 pub struct OwnedH1PullThroughSubmission(OwnedH1UpstreamSubmission);
@@ -1129,8 +1153,7 @@ impl OwnedRequestProgressExt for OwnedH1PullThroughSubmission {
     }
 }
 
-/// A pull-through exchange's response (`DIV-047`): its body and the request's capacity
-/// observation.
+/// A pull-through exchange's response: its body and the request's capacity observation.
 pub struct OwnedH1PullThroughResponse {
     pub stream: StreamId,
     pub body: OwnedH1PullThroughBody,
@@ -1138,13 +1161,13 @@ pub struct OwnedH1PullThroughResponse {
 }
 
 /// What a pull-through exchange's body reads through: its connection's run and its response
-/// source's signals (`DIV-047`).
+/// source's signals.
 struct PullThroughLink {
     run: Rc<PullThrough>,
     signals: Rc<IngressSignals>,
 }
 
-/// A pull-through exchange's response source's link to its connection's drive (`DIV-047`).
+/// The link from a pull-through exchange's response source to its connection's drive.
 pub(super) struct DriveLink(Weak<Shared>);
 
 impl DriveLink {
@@ -1163,20 +1186,21 @@ enum WaitingRead {
     Body(u32),
 }
 
-/// A pull-through exchange's response body (`DIV-047`): it owns the response's exclusive reader
-/// and its source owner, declared and retired in that order.
+/// A pull-through exchange's response body. It owns the response's exclusive reader and its
+/// source owner, declared and retired in that order.
 ///
 /// Once the request's bytes are written, the first read of a live exchange whose response is
-/// still being produced takes the connection's drive, retiring any pending or armed read, unless
-/// it is nested in a callback of the run's future's poll or the connection or the request is
-/// already cancelled, where it waits as below. While it holds the drive, each read polls the
-/// driver, with its waker, if one of the driver's wake sources fired since the driver's last
-/// poll, a budget yield is pending or the waker changed, then takes the ready event without
-/// waiting; a read that finds none leaves its waker with the driver. The drive returns to the
-/// run's future when the response is fully produced or the source completes, and a cancel input
-/// or a connection failure revokes it. Before the drive is taken, after it returns and after a
-/// revocation, reads take a ready event or wait for one with a suspend-free read (`DIV-045`). No
-/// read returns `HttpBodyEvent::suspend`.
+/// still being produced takes the connection's drive, retiring any pending or armed read. It
+/// waits as described below instead if it is nested in a callback of the run future's poll, or
+/// if the connection or the request is already cancelled. While it holds the drive, each read
+/// polls the driver with its waker if one of the driver's wake sources fired since the driver's
+/// last poll, a budget yield is pending or the waker changed. It then takes the ready event
+/// without waiting. If no event is ready, a read that still holds the drive leaves its waker
+/// with the driver.
+/// The drive returns to the run's future when the response is fully produced or the source
+/// completes, and a cancel input or a connection failure revokes it. Before the drive is taken,
+/// after it returns and after a revocation, reads take a ready event or wait for one with a
+/// suspend-free read. Reads never return `HttpBodyEvent::suspend`.
 pub struct OwnedH1PullThroughBody {
     reader: HttpResponseReader,
     owner: HttpResponseSourceOwner,
@@ -1240,7 +1264,7 @@ impl OwnedH1PullThroughBody {
             if let Some(result) = self.reader.try_read_body(&self.owner, maximum) {
                 return Poll::Ready(result);
             }
-            // While the body holds the drive, its waker is the driver's (I4).
+            // While the body holds the drive, its waker is the driver's.
             if self.holds() {
                 return Poll::Pending;
             }
@@ -1277,8 +1301,8 @@ impl OwnedH1PullThroughBody {
     /// incomplete: the reader's pending or armed read retires, and the next drive is
     /// unconditional. A read nested in a callback of the run future's poll does not take it:
     /// it could not drive, and the driver's wakes would reach only the run future. Nor does a
-    /// read after a connection cancel or a request's error: that cancel's revocation found the
-    /// drive idle, so the run future must apply it.
+    /// read after a connection cancel or a request's error: that cancel's revocation ran while
+    /// the drive was idle, so the run future must apply it.
     fn acquire(&mut self) -> bool {
         let drive = &self.run.shared.drive;
         if drive.state.get() != DriveState::Idle
@@ -1360,8 +1384,8 @@ impl OwnedH1PullThroughBody {
         false
     }
 
-    /// Reads without the drive: a ready event first, else a suspend-free waiting read
-    /// (`DIV-045`) that the producer wakes.
+    /// Reads without the drive: a ready event first, else a suspend-free waiting read that the
+    /// producer wakes.
     fn wait_header(
         &mut self,
         context: &mut Context<'_>,
@@ -1430,13 +1454,13 @@ struct RequestStatus {
     /// The exchange is live in the driver, which polls an attached observer.
     live: Cell<bool>,
     waiter: RefCell<Option<Waker>>,
-    /// Its connection refused it before commit (`DIV-035`).
+    /// Its connection rejected it before commit.
     unprocessed: Cell<bool>,
-    /// The connection's earlier commits, fixed at commit or at that refusal (`DIV-035`).
+    /// The connection's earlier commits, fixed at commit or at that rejection.
     sequence: Cell<Option<u64>>,
-    /// A committed pull-through exchange's link, until its submission resolves (`DIV-047`).
+    /// A committed pull-through exchange's link, until its submission resolves.
     link: Cell<Option<PullThroughLink>>,
-    /// Submitted with `submit_pull_through` (`DIV-047`).
+    /// Submitted with `submit_pull_through`.
     pull_through: bool,
 }
 
@@ -1551,9 +1575,10 @@ struct Submission {
 }
 
 impl Submission {
-    /// Rejects the submission because its connection's admission closed before commit: unless
-    /// its consumer selected a cause, it failed unprocessed (`DIV-035`). One sample of the cause
-    /// decides both, as a cancellation can arrive from another thread.
+    /// Rejects the submission because its connection's admission closed before commit. Unless
+    /// its consumer selected a cause, it failed unprocessed. One read of the selected cause
+    /// determines both the flag and the error, because a cancellation can arrive from another
+    /// thread.
     fn refuse(&mut self, error: HttpError) {
         let selected = self.status.selected_error();
         #[cfg(test)]
@@ -1813,7 +1838,7 @@ impl Exchange {
     }
 
     /// Fails the response with `error` and stops the upload. A cancel the request's consumer
-    /// selected discards the response's queued events, as `UniplexStreamAbort` does (`DIV-033`).
+    /// selected discards the response's queued events, as `UniplexStreamAbort` does.
     fn cancel(&mut self, error: &HttpError) {
         let retirement = self
             .transfer
@@ -1938,19 +1963,20 @@ impl OwnedH1UpstreamSession {
         }
     }
 
-    /// Roxygen-only (`DIV-047`): [`Self::run`] for a connection whose
-    /// [`OwnedH1UpstreamReservation::submit_pull_through`] exchanges may hold its drive. It is
-    /// rooted as `run` is, and is `run` while no pull-through exchange holds the drive; plain
-    /// submissions behave as under `run`. While a body holds the drive, this future does not
-    /// poll the driver; a cancel input, a connection failure or this future's drop takes the
-    /// drive back, after which it polls the driver at once. A run that completes inside a body's
-    /// read is left to this future, which marks the run finished, releases the driver and
-    /// returns the result.
+    /// Runs the session like [`Self::run`], for a connection whose
+    /// [`OwnedH1UpstreamReservation::submit_pull_through`] exchanges may hold its drive.
     ///
-    /// Worker cancellation is not one of the driver's wake sources, as under `run`. Its root
-    /// must therefore poll this future at worker quiescence, and poll or drop it at worker
-    /// cancellation, as `RunScope` does: a held drive is otherwise taken back only at the
-    /// body's next read.
+    /// It is rooted as `run` is, and behaves as `run` while no pull-through exchange holds the
+    /// drive. Plain submissions behave as under `run`. While a body holds the drive, this future
+    /// does not poll the driver. A cancel input, a connection failure or this future's drop takes
+    /// the drive back, after which it polls the driver immediately. If the run completes inside a
+    /// body's read, this future marks the run finished, releases the driver and returns the
+    /// result.
+    ///
+    /// Worker cancellation is not one of the driver's wake sources, as under `run`. The future's
+    /// root must therefore poll it at worker quiescence, and poll or drop it at worker
+    /// cancellation, as the owned client's run scope does. Otherwise a held drive is taken back
+    /// only at the body's next read.
     pub fn run_pull_through(
         mut self,
     ) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
@@ -1971,14 +1997,13 @@ impl OwnedH1UpstreamSession {
 }
 
 /// A pull-through connection's driver, and the result an inline poll reached, which only the
-/// run future takes (`DIV-047`).
+/// run future takes.
 struct PullThrough {
     shared: Rc<Shared>,
     task: Arc<TaskWaker>,
     driver: RefCell<Option<UpstreamDriver>>,
     outcome: RefCell<Option<Result<UniplexRunSummary, HttpError>>>,
-    /// Set while a poll of the driver runs and cleared as it returns, as `UpstreamRun`'s
-    /// (`DIV-056`).
+    /// Set while a poll of the driver runs and cleared as it returns, as `UpstreamRun`'s is.
     poisoned: Cell<bool>,
 }
 
@@ -2114,7 +2139,7 @@ impl Drop for PullThroughRun {
     }
 }
 
-/// Makes the poll of a run panic outside the driver's boundaries when the test asked for it.
+/// Makes the poll of a run panic outside the driver's boundaries once a test has armed it.
 #[cfg(test)]
 fn fault_upstream_run_poll(polled: &Poll<Result<UniplexRunSummary, HttpError>>) {
     if polled.is_pending() && UPSTREAM_RUN_FAULT.take() {
@@ -2122,7 +2147,7 @@ fn fault_upstream_run_poll(polled: &Poll<Result<UniplexRunSummary, HttpError>>) 
     }
 }
 
-/// Drives an [`UpstreamDriver`] to completion (`DIV-056`). No poll unwinds out of driver code: a
+/// Drives an [`UpstreamDriver`] to completion. Polls never unwind out of driver code: a
 /// panic that reaches the per-turn boundary is reported and starts a teardown that joins native
 /// I/O, after which the run returns `Err`. Completion publishes `complete` and releases the
 /// driver before returning. A run dropped unfinished is abandoned.
@@ -2195,12 +2220,12 @@ struct UpstreamDriver {
     eof_processed: bool,
     /// A failed read, applied once the bytes read before it are parsed.
     read_error: Option<HttpError>,
-    /// An applied failed read whose connection resets once the request bytes already
-    /// serialized are written; the run's error.
+    /// An applied failed read, which is the run's error. The connection resets once the
+    /// request bytes already serialized are written.
     failed_read: Option<HttpError>,
     /// Parsing waits while the unread response body is at `ingress_buffer_limit`.
     flow_pause: bool,
-    /// The response ended; nothing more is parsed on this connection.
+    /// The response ended. Parsing stays paused until the next request is committed.
     response_pause: bool,
     /// The request body was not polled because the next write must make room for it.
     body_awaits_egress: bool,
@@ -2211,16 +2236,16 @@ struct UpstreamDriver {
     budget_yield: Option<LocalFuture>,
     started: bool,
     /// `Http1UpgradePolicy::AsOrdinaryRequest`: CONNECT and `Upgrade` requests are sent as
-    /// ordinary requests (`DIV-031`).
+    /// ordinary requests.
     ordinary_upgrades: bool,
-    /// The run of a session run with `run_pull_through` (`DIV-047`).
+    /// The run of a session run with `run_pull_through`.
     pull_through: Weak<PullThrough>,
-    /// Set once a Driver-scope panic started the teardown (`DIV-056`).
+    /// Set once a Driver-scope panic started the teardown.
     teardown: Option<Box<TeardownState>>,
 }
 
 /// What a commitment leaves to run outside its unwind boundary, because it runs caller code:
-/// the request head's callbacks and the submitter's acknowledgment (`DIV-056`).
+/// the request head's callbacks and the submitter's acknowledgment.
 struct Committed {
     headers: HttpHeaderEvent,
     header_size: Option<HttpHeaderSize>,
@@ -2358,7 +2383,7 @@ impl HttpCodecCallback for ResponseInput<'_> {
         #[cfg(test)]
         count_response_delivery(std::panic::Location::caller());
         // The response ignores chunk boundaries: one acts only to stop the parse, for a failure,
-        // a missing exchange or a cancel, so a boundary with none of them returns at once.
+        // a missing exchange or a cancel, so a boundary without any of them returns immediately.
         if let CodecEvent::ChunkHeader {
             stream: _,
             length: _,
@@ -2370,8 +2395,8 @@ impl HttpCodecCallback for ResponseInput<'_> {
                 .as_ref()
                 .is_some_and(|exchange| !exchange.cancel_requested())
         {
-            // The patterns name every field, all plain data: a boundary owns nothing to drop, and
-            // forgetting it spares the call to `CodecEvent`'s drop glue.
+            // The patterns name every field. All are plain data, so a boundary does not need
+            // dropping, and forgetting it spares the call to `CodecEvent`'s drop glue.
             std::mem::forget(event);
             return CodecCallbackActions::new();
         }
@@ -2493,8 +2518,8 @@ impl UpstreamDriver {
         ))
     }
 
-    /// Polls the driver (`DIV-056`): in its teardown, native I/O only; otherwise a turn, whose
-    /// panic is reported and starts the teardown.
+    /// Polls the driver. During teardown this polls native I/O only. Otherwise it runs a turn,
+    /// and a panic in that turn is reported and starts the teardown.
     #[inline(always)]
     fn poll_contained(
         &mut self,
@@ -2514,8 +2539,8 @@ impl UpstreamDriver {
         }
     }
 
-    /// Starts the teardown after a Driver-scope panic that the caller reported (`DIV-056`): the
-    /// connection aborts, and the run's next polls join native I/O.
+    /// Starts the teardown after a Driver-scope panic that the caller reported: the connection
+    /// aborts, and the run's next polls join native I/O.
     #[cold]
     #[inline(never)]
     fn poll_panicked(&mut self, panic: PanicPayload) {
@@ -2534,19 +2559,20 @@ impl UpstreamDriver {
         self.wake_teardown();
     }
 
-    /// Wakes the run for its next teardown poll, through the task waker, as every wake of the
-    /// driver goes (`DIV-047`).
+    /// Wakes the run for its next teardown poll through the task waker, which every wake of
+    /// the driver goes through.
     fn wake_teardown(&self) {
         if let Err(panic) = guarded(|| self.task.wake()) {
             teardown_panicked(&self.context, panic);
         }
     }
 
-    /// One poll of the teardown (`DIV-056`). Native I/O is polled until it completes; the codec,
-    /// the exchange and admission are not. A teardown poll that panics is polled again on the
-    /// next wake, and an operation whose teardown polls panicked `TEARDOWN_PANIC_LIMIT` times in
-    /// total is dropped unfinished. Once no native operation is pending, the run fails with the
-    /// connection's first error. Every step runs under its own unwind boundary.
+    /// One poll of the teardown. Native I/O is polled until it completes, but the codec, the
+    /// exchange and admission are not. An operation whose teardown poll panics is polled again
+    /// on the next wake, and one whose teardown polls panicked `TEARDOWN_PANIC_LIMIT` times in
+    /// total is dropped unfinished. Once every native operation has completed or been dropped,
+    /// the run fails with the connection's first error. Every step runs under its own unwind
+    /// boundary.
     #[cold]
     #[inline(never)]
     fn poll_teardown(
@@ -2644,7 +2670,7 @@ impl UpstreamDriver {
         false
     }
 
-    /// Completes a run: the session is finished, and the driver is released (`DIV-056`).
+    /// Completes a run: the session is finished, and the driver is released.
     #[cold]
     #[inline(never)]
     fn finish_run(
@@ -2656,7 +2682,7 @@ impl UpstreamDriver {
         result
     }
 
-    /// Abandons a run dropped unfinished, or a session dropped unrun (`DIV-056`): the connection
+    /// Abandons a run dropped unfinished, or a session dropped unrun. The connection
     /// aborts with `CORO_CANCELLED`, which closes admission, cancels and drops the exchange and
     /// resets the transport, and the driver's fields are dropped, each step under its own unwind
     /// boundary. A started run then panics, because its owner dropped it before its cleanup
@@ -2807,10 +2833,10 @@ impl UpstreamDriver {
                 progress = true;
                 self.observe_cancel();
             }
-            // The write waits while a phase before it can still add to it: one that acted this
-            // turn may act again. When none would, it starts in place of the next turn, which
-            // still counts against the budget that places the write it forces, the idleness it
-            // notes and the yield.
+            // The write waits while a phase before it can still add to it, since a phase that
+            // acted this turn may act again. Otherwise the write starts in place of the next turn.
+            // That turn still counts against the budget, which sets when a write is forced, when
+            // idleness is noted and when the poll yields.
             let write_waits = progress
                 && self.egress.chain_length() < self.config.maximum_write_size
                 && turn + 1 < TURN_BUDGET;
@@ -2848,7 +2874,8 @@ impl UpstreamDriver {
                     .take()
                     .expect("a reset connection retains its cause")));
             }
-            // Bytes behind a retired response fail the connection on the next turn instead.
+            // Bytes after a retired response skip the idle close and fail the connection on the
+            // next turn.
             if self.fatal.is_none()
                 && self.exchange.is_none()
                 && self.ingress.is_empty()
@@ -2878,9 +2905,10 @@ impl UpstreamDriver {
                 return Poll::Pending;
             }
             turn += 1;
-            // A next turn that would find nothing to do would note idleness and return here. After
-            // a turn ready to write, the next is due: the phase that held the write back still is,
-            // or the write marked its signal, or a failure reset the connection.
+            // A next turn that would not act would note idleness and return, so that happens here
+            // instead. After a turn ready to write, the next turn is due: the phase that held the
+            // write back still is, or the write marked its signal, or a failure reset the
+            // connection.
             if turn < TURN_BUDGET && !write_ready && !self.turn_due() {
                 self.update_idle();
                 return Poll::Pending;
@@ -2888,7 +2916,7 @@ impl UpstreamDriver {
         }
         self.budget_yield = Some(self.context.host().yield_to_io());
         // A yield that completes on its first poll arranged no wake. The driver wakes itself
-        // through its task waker, which records the wake (`DIV-047`).
+        // through its task waker, which records the wake.
         if self.poll_budget_yield(context).is_ready() {
             self.task.wake();
         }
@@ -2908,9 +2936,9 @@ impl UpstreamDriver {
         );
     }
 
-    /// Whether a next turn would act. Each term is the condition under which a step of the
-    /// turn acts, or a wider one, and none runs transport or application code: a phase before
-    /// the write; the write; a failure or a reset; or the idle close.
+    /// Whether a next turn would act. The terms cover a phase before the write, the write, a
+    /// failure or a reset, and the idle close. Each is the condition under which that step acts,
+    /// or a wider one, and evaluating them does not run transport or application code.
     fn turn_due(&self) -> bool {
         self.transport_reset
             || self.fatal.is_some()
@@ -2927,12 +2955,12 @@ impl UpstreamDriver {
             }
     }
 
-    /// Whether a phase before the write would act in a next turn: the write completion, the read,
-    /// the exchange, the cancel check, a read start, admission, the check for a response without
-    /// a request, the parse, a held read failure or the exchange's settlement. Each term is the
-    /// condition under which that phase acts, or a wider one, and none runs transport or
-    /// application code or changes anything, so their order sets only the cost: the signals,
-    /// which most often make a turn due, come first.
+    /// Whether a phase before the write would act in a next turn. The phases are the write
+    /// completion, the read, the exchange, the cancel check, a read start, admission, the check
+    /// for a response without a request, the parse, a held read failure and `settle_exchange`.
+    /// Each term is the condition under which that phase acts, or a wider one. The terms do not
+    /// run transport or application code or change state, so their order affects only cost. The
+    /// signals, which most often make a turn due, come first.
     #[inline(always)]
     fn phases_due_before_write(&self) -> bool {
         #[cfg(test)]
@@ -2953,8 +2981,8 @@ impl UpstreamDriver {
             || (self.fatal.is_none() && self.settle_due())
     }
 
-    /// Whether `poll_admission` acts: a drain an observer's panic requested or EOF closes
-    /// admission, or a queued submission can commit.
+    /// Whether `poll_admission` acts: an observer panic's drain or a peer EOF closes admission,
+    /// or a queued submission can commit.
     fn admission_due(&self) -> bool {
         self.shared.escalate_drain.get()
             || (self.eof && self.shared.closed.borrow().is_none())
@@ -3015,8 +3043,9 @@ impl UpstreamDriver {
         poll
     }
 
-    /// Closes admission once the connection can take no request, and otherwise commits a
-    /// queued submission when no exchange is live. Returns whether either happened.
+    /// Closes admission once the connection cannot take another request, and otherwise commits a
+    /// queued submission once the live exchange, if any, has retired. Returns whether either
+    /// happened.
     fn poll_admission(&mut self) -> bool {
         if self.shared.escalate_drain.get() {
             self.drain_after_observer_panic();
@@ -3027,7 +3056,7 @@ impl UpstreamDriver {
                 .close(failure(HttpErrorCode::TRANSPORT_EOF, b"transport EOF"));
             return true;
         }
-        // Bytes behind a retired response are no response to the next request: they fail the
+        // Bytes after a retired response are not a response to the next request. They fail the
         // connection before anything is committed, and a failed read closes admission first.
         if self.exchange.is_some() || !self.ingress.is_empty() || self.read_error.is_some() {
             return false;
@@ -3036,7 +3065,7 @@ impl UpstreamDriver {
             && self.shared.queued.borrow().is_some()
             && self.read.peer_closed()
         {
-            // The read that the peer's close wakes refuses the request unprocessed (`DIV-035`).
+            // The read that the peer's close wakes rejects the request as unprocessed.
             return false;
         }
         let Some(mut submission) = self.shared.queued.borrow_mut().take() else {
@@ -3051,7 +3080,7 @@ impl UpstreamDriver {
     }
 
     /// Closes admission after an observer panicked inside the driver's poll, as
-    /// `close_when_idle` closes it, without recording a caller's drain request (`DIV-056`).
+    /// `close_when_idle` closes it, without recording a caller's drain request.
     #[cold]
     #[inline(never)]
     fn drain_after_observer_panic(&self) {
@@ -3062,8 +3091,7 @@ impl UpstreamDriver {
         ));
     }
 
-    /// Rejects a submission the driver did not commit, under its own unwind boundary
-    /// (`DIV-056`).
+    /// Rejects a submission the driver did not commit, under its own unwind boundary.
     #[cold]
     #[inline(never)]
     fn reject_uncommitted(&self, submission: &mut Submission, error: HttpError) {
@@ -3072,9 +3100,9 @@ impl UpstreamDriver {
         }
     }
 
-    /// Reports a panic committing a request, which runs only Roxygen code and can leave the
+    /// Reports a panic committing a request, which runs no application code and can leave the
     /// connection's state half updated, rejects the submission, then unwinds to the per-turn
-    /// catch, which tears the connection down without reporting the panic again (`DIV-056`).
+    /// catch, which tears the connection down without reporting the panic again.
     #[cold]
     #[inline(never)]
     fn commit_panicked(&self, submission: &mut Submission, panic: PanicPayload) -> ! {
@@ -3091,7 +3119,7 @@ impl UpstreamDriver {
 
     /// Runs what a commitment left: the head's byte-event refusals and its encoded-headers
     /// callback, each under its own unwind boundary, then the acknowledgment, which wakes the
-    /// submitter (`DIV-056`). A head with a body to follow whose callback panicked fails the
+    /// submitter. A head with a body to follow whose callback panicked fails the
     /// request, and the connection with it.
     fn finish_commit(&mut self, committed: Committed) {
         let Committed {
@@ -3116,9 +3144,9 @@ impl UpstreamDriver {
             return Err(error);
         }
         // A pull-through exchange's body may hold the drive only of a session run with
-        // `run_pull_through` (`DIV-047`); under `run` it is refused before any byte is written.
+        // `run_pull_through`. Under `run` it is rejected before any byte is written.
         let pull_through = if submission.status.pull_through {
-            // Defensive: with capacity one, no exchange holds the drive at a commit.
+            // Defensive: with capacity one, an exchange cannot hold the drive at a commit.
             if self.shared.drive.state.get() != DriveState::Idle {
                 return Err(failure(
                     HttpErrorCode::INVALID_STATE_TRANSITION,
@@ -3137,7 +3165,7 @@ impl UpstreamDriver {
             .headers
             .as_mut()
             .expect("queued submission owns headers");
-        // As `UniplexSession`, a body on a method that forbids one is refused for HTTP/2 only.
+        // As in `UniplexSession`, only HTTP/2 rejects a body on a method that forbids one.
         if !headers.headers().is_request() {
             return Err(failure(
                 HttpErrorCode::HEADER_PARSE_ERROR,
@@ -3145,12 +3173,11 @@ impl UpstreamDriver {
             ));
         }
         let method = headers.headers_mut().method().ok().flatten();
-        // This driver carries no tunnel: a request that can switch protocols is refused before
-        // any byte is written (`DIV-029`). The codec switches on a CONNECT method, on an
-        // `Upgrade` header that a `101` accepts, and on the egress websocket flag, for which it
-        // writes the `Upgrade` header itself. Under `AsOrdinaryRequest` the codec sends CONNECT
-        // and `Upgrade` requests as ordinary requests (`DIV-031`), but the flag still asks for
-        // a handshake.
+        // This driver does not carry tunnels, so a request that can switch protocols is rejected
+        // before any byte is written. The codec switches on a CONNECT method, on an `Upgrade`
+        // header that a `101` accepts, and on the egress websocket flag, for which it writes the
+        // `Upgrade` header itself. Under `AsOrdinaryRequest` the codec sends CONNECT and
+        // `Upgrade` requests as ordinary requests, but the flag still requests a handshake.
         if headers.headers().is_egress_websocket_upgrade()
             || (!self.ordinary_upgrades
                 && (method == Some(HttpMethod::Connect)
@@ -3162,12 +3189,12 @@ impl UpstreamDriver {
             ));
         }
         let expected_request_length = crate::uniplex::message_content_length(headers.headers());
-        // A head that ends the request cannot carry the body it declares (`DIV-029`).
+        // A head that ends the request cannot carry the body it declares.
         if headers.eom() && expected_request_length.is_some_and(|expected| expected != 0) {
             return Err(request_length_mismatch());
         }
-        // `DIV-031`: a CONNECT or `Upgrade` request sent as ordinary whose head does not frame
-        // its body as the codec writes it is refused before any byte.
+        // Under `AsOrdinaryRequest`, a CONNECT or `Upgrade` request whose head does not frame its
+        // body the way the codec writes it is rejected before any byte is written.
         if self.ordinary_upgrades
             && !self
                 .codec
@@ -3208,7 +3235,7 @@ impl UpstreamDriver {
             source.deliver_ingress_before_abort();
         }
         let producer = source.producer();
-        // DIV-044: parsing resumes once the unread body is below the limit it paused at.
+        // Parsing resumes once the unread body is below the limit it paused at.
         producer.set_resume_threshold(Some(self.config.ingress_buffer_limit));
         if pull_through.is_some() && !producer.enable_inline_reads() {
             return Err(failure(
@@ -3342,8 +3369,8 @@ impl UpstreamDriver {
                 .codec
                 .on_ingress_eof(&mut callback, &mut self.egress);
             egress_results.extend(result.egress_results);
-            // Before a response begins, the codec raises nothing at EOF, as `UniplexSession`
-            // fails the request then.
+            // The codec does not report an EOF before a response begins, so the request fails
+            // here, as it does in `UniplexSession`.
             if callback.failure.is_none()
                 && callback
                     .exchange
@@ -3487,9 +3514,9 @@ impl UpstreamDriver {
                     },
                     &mut NoopCallback,
                 )?;
-                // On a `Content-Length` request the codec writes nothing for trailers and leaves
-                // its message open, though the request is complete on the wire (DIV-029): the
-                // message ends here, writing nothing, so the connection can carry the next one.
+                // On a `Content-Length` request the codec does not write trailers and leaves its
+                // message open, though the request is complete on the wire. Ending the message
+                // here does not write anything, and lets the connection carry the next one.
                 if generated.bytes_written == 0 {
                     self.codec.get_mut().generate(
                         &mut self.egress,
@@ -3521,7 +3548,7 @@ impl UpstreamDriver {
                     },
                     &mut NoopCallback,
                 )?;
-                // Padding writes nothing in HTTP/1.1, so its EOM ends the message on its own.
+                // HTTP/1.1 does not encode padding, so its EOM ends the message on its own.
                 if eom {
                     self.codec.get_mut().generate(
                         &mut self.egress,
@@ -3553,7 +3580,7 @@ impl UpstreamDriver {
     }
 
     /// Notes that a pull-through exchange's request bytes are all written, after which its body
-    /// may take the drive (`DIV-047`).
+    /// may take the drive.
     #[inline]
     fn note_request_written(&self) {
         if let Some(exchange) = &self.exchange
@@ -3565,11 +3592,11 @@ impl UpstreamDriver {
         }
     }
 
-    /// Releases capacity once the request is serialized and the response produced, and
-    /// retires the exchange once its response is consumed and its request written: a reusable
-    /// connection then returns its slot, and any other closes admission. Until the consumption,
-    /// once it is all the retirement of a reusable connection's exchange waits for, the exchange
-    /// is published as retiring (`Shared::retiring`).
+    /// Releases capacity once the request is serialized and the response produced. Retires the
+    /// exchange once its response is consumed and its request written. A connection that the
+    /// codec leaves reusable between messages then returns its slot, and any other closes
+    /// admission. On such a connection, while only the consumer's completion is left, the
+    /// exchange is published as retiring (`Shared::retiring`).
     fn settle_exchange(&mut self) -> bool {
         let Some(exchange) = self.exchange.as_mut() else {
             return false;
@@ -3579,7 +3606,7 @@ impl UpstreamDriver {
             && exchange.status.ingress_succeeded();
         if produced {
             // The response is fully produced: a held drive returns to the run before the
-            // release's wake, which then reaches only the run (`DIV-047`).
+            // release's wake, which then reaches only the run.
             self.shared.hand_back(exchange.id);
             exchange.status.release();
         }
@@ -3589,8 +3616,8 @@ impl UpstreamDriver {
             && exchange.consumed
             && written)
         {
-            // Only the consumer's completion is left: from it on, the slot admits the next
-            // request, which the turn it wakes commits after retiring this one (`DIV-029`).
+            // Only the consumer's completion is left. From then on, the slot admits the next
+            // request, which the turn that the completion wakes commits after retiring this one.
             if produced
                 && written
                 && self.codec.is_reusable()
@@ -3641,8 +3668,8 @@ impl UpstreamDriver {
         Some(progress)
     }
 
-    /// How much a new read may take: 0 while no read can start, as the connection read EOF or
-    /// a failure or is ending, or while the ingress buffer is full.
+    /// How much a new read may take: 0 while a read cannot start, because the connection read
+    /// EOF or a failure or is ending, or while the ingress buffer is full.
     fn read_capacity(&self) -> usize {
         if self.eof
             || self.read_error.is_some()
@@ -3659,8 +3686,8 @@ impl UpstreamDriver {
 
     fn poll_read_once(&mut self) -> Option<ReadPoll> {
         // Until a drained reader's waker fires, a call checks only that waker, as for an
-        // outstanding read; inside a pull-through body's drive too (`DIV-047`), whose holder
-        // that waker wakes.
+        // outstanding read. This also applies inside a pull-through body's drive, where that
+        // waker wakes the holder.
         if self.read.is_drained() && !self.read_wake.is_ready() {
             return None;
         }
@@ -3862,10 +3889,9 @@ impl UpstreamDriver {
         }
     }
 
-    /// Fails the connection for a failed read. As `UniplexSession`, admission closes and the
-    /// live exchange is cancelled at once, nothing more is read, and the transport resets once
-    /// the request bytes already serialized are written, even when a callback panics on the
-    /// way (`DIV-056`).
+    /// Fails the connection for a failed read. As in `UniplexSession`, admission closes, the
+    /// live exchange is cancelled immediately, reading stops, and the transport resets once the
+    /// request bytes already serialized are written, even if a callback panics along the way.
     #[cold]
     fn fail_read(&mut self, error: HttpError) {
         if self.fatal.is_some() || (self.egress.is_empty() && !self.writes_pending()) {
@@ -3890,18 +3916,18 @@ impl UpstreamDriver {
     }
 
     /// Closes admission with `error`, then cancels and drops the live exchange with it. Each
-    /// step runs under its own unwind boundary (`DIV-056`).
+    /// step runs under its own unwind boundary.
     #[cold]
     fn close_and_cancel(&mut self, error: &HttpError) {
         // A held drive returns to the run future first: the polls the run still needs must not
-        // wait for the holder's reads, and the wakes below reach only the run (`DIV-047`).
+        // wait for the holder's reads, and the wakes below reach only the run.
         if let Some(exchange) = &self.exchange {
             let stream = exchange.id;
             if let Err(panic) = guarded(|| self.shared.revoke(Some(stream))) {
                 report_panic(&self.context, PanicSite::Transport, None, panic);
             }
         }
-        // Admission closes first, so the exchange's capacity release announces no capacity.
+        // Admission closes first, so the exchange's capacity release does not announce capacity.
         if let Err(panic) = guarded(|| self.shared.close(error.clone())) {
             report_panic(&self.context, PanicSite::UpstreamObserver, None, panic);
         }
@@ -3923,7 +3949,7 @@ impl UpstreamDriver {
 
 /// Reports a panic in a request's response observer and returns the error that fails the
 /// request, unless both of its messages ended: a finished exchange keeps its readable response,
-/// as it does a request cancel (`DIV-056`).
+/// as it does a request cancel.
 #[cold]
 #[inline(never)]
 fn response_observer_panicked(
