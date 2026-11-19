@@ -1,7 +1,7 @@
 # Roxygen
 
 [![CI](https://github.com/facebookincubator/roxygen/actions/workflows/ci.yml/badge.svg)](https://github.com/facebookincubator/roxygen/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)][license]
 
 Roxygen is an HTTP/1.1 and HTTP/2 client and server library for Rust. It
 brings the design of [Proxygen](https://github.com/facebook/proxygen), Meta's
@@ -9,8 +9,7 @@ C++ HTTP library, to Rust: every connection belongs to one worker thread, and
 a request or response is a stream of header and body events that the
 connection pulls when it is ready for more.
 
-Roxygen is under active development. It is not published on crates.io yet, and
-its APIs will change.
+Roxygen is under active development, and its APIs will change before 1.0.
 
 ## Why Roxygen
 
@@ -59,13 +58,12 @@ others. Each request costs the server about 2.3 µs of CPU.
 
 ## Example
 
-A server that answers every request with a fixed body. Roxygen is not on
-crates.io yet, so depend on it from git:
+A server that answers every request with a fixed body:
 
 ```toml
 [dependencies]
-ferroxygen_core = { git = "https://github.com/facebookincubator/roxygen" }
-ferroxygen_server = { git = "https://github.com/facebookincubator/roxygen" }
+ferroxygen_core = "0.1"
+ferroxygen_server = "0.1"
 tokio = { version = "1", features = ["rt", "signal"] }
 ```
 
@@ -166,8 +164,8 @@ On the client, `roxygen_client::experimental::owned` provides
 `OwnedClientSession` and a pool, `OwnedHttpSessionPool`. You reserve a slot,
 submit a request head and body, and read the response from the
 `HttpResponseSource` that the submission returns. See
-[`examples/owned_server.rs`](examples/owned_server.rs) and
-[`examples/owned_client.rs`](examples/owned_client.rs).
+[`examples/owned_server.rs`][owned-server] and
+[`examples/owned_client.rs`][owned-client].
 
 Current limits of the owned drivers:
 
@@ -191,25 +189,27 @@ Current limits of the owned drivers:
 
 ## More examples
 
-The [`examples`](examples) directory has complete programs. Run one with
+The [`examples`][examples-dir] directory has complete programs. Run one with
 `cargo run --bin <name>`.
 
 | Example | What it shows |
 | --- | --- |
-| [`hello_server`](examples/hello_server.rs) | The handler API, over HTTP/1.1 or HTTP/2 with prior knowledge |
-| [`owned_server`](examples/owned_server.rs) | The `hello_server` handler on the experimental owned drivers, without a task per request |
-| [`streaming_server`](examples/streaming_server.rs) | A streamed response, and echoing a request body as it arrives |
-| [`tls_server`](examples/tls_server.rs) | HTTPS with ALPN choosing HTTP/2 or HTTP/1.1 |
-| [`client_get`](examples/client_get.rs) | Fetching a URL with the client |
-| [`owned_client`](examples/owned_client.rs) | Fetching a URL with the experimental owned client session |
-| [`axum_router`](examples/axum_router.rs) | An Axum router served by Roxygen through the Tower adapter |
+| [`hello_server`][hello-server] | The handler API, over HTTP/1.1 or HTTP/2 with prior knowledge |
+| [`owned_server`][owned-server] | The `hello_server` handler on the experimental owned drivers, without a task per request |
+| [`streaming_server`][streaming-server] | A streamed response, and echoing a request body as it arrives |
+| [`tls_server`][tls-server] | HTTPS with ALPN choosing HTTP/2 or HTTP/1.1 |
+| [`client_get`][client-get] | Fetching a URL with the client |
+| [`owned_client`][owned-client] | Fetching a URL with the experimental owned client session |
+| [`axum_router`][axum-router] | An Axum router served by Roxygen through the Tower adapter |
 
-The [`curl`](curl) crate is a larger client: a command-line tool that accepts a
+The [`curl`][curl-dir] crate is a larger client: a command-line tool that accepts a
 subset of curl's options.
 
 ```sh
 cargo run --bin ferroxygen_curl -- -sS -L https://example.com/
 ```
+
+`cargo install ferroxygen_curl` installs it from crates.io.
 
 ## Crates
 
@@ -257,13 +257,27 @@ HTTP/3, QUIC and WebTransport are out of scope for now.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Roxygen is developed in Meta's internal
+See [CONTRIBUTING.md][contributing]. Roxygen is developed in Meta's internal
 repository and exported here; pull requests are imported and land there first.
-Report security issues as described in [SECURITY.md](SECURITY.md). Everyone
+Report security issues as described in [SECURITY.md][security]. Everyone
 taking part in the project is expected to follow the
-[code of conduct](CODE_OF_CONDUCT.md).
+[code of conduct][code-of-conduct].
 
 ## License
 
-Roxygen is licensed under the [MIT license](LICENSE). The HTTP/1 parser is
+Roxygen is licensed under the [MIT license][license]. The HTTP/1 parser is
 derived from llhttp, which is also MIT licensed.
+
+[axum-router]: https://github.com/facebookincubator/roxygen/blob/main/examples/axum_router.rs
+[client-get]: https://github.com/facebookincubator/roxygen/blob/main/examples/client_get.rs
+[code-of-conduct]: https://github.com/facebookincubator/roxygen/blob/main/CODE_OF_CONDUCT.md
+[contributing]: https://github.com/facebookincubator/roxygen/blob/main/CONTRIBUTING.md
+[curl-dir]: https://github.com/facebookincubator/roxygen/tree/main/curl
+[examples-dir]: https://github.com/facebookincubator/roxygen/tree/main/examples
+[hello-server]: https://github.com/facebookincubator/roxygen/blob/main/examples/hello_server.rs
+[license]: https://github.com/facebookincubator/roxygen/blob/main/LICENSE
+[owned-client]: https://github.com/facebookincubator/roxygen/blob/main/examples/owned_client.rs
+[owned-server]: https://github.com/facebookincubator/roxygen/blob/main/examples/owned_server.rs
+[security]: https://github.com/facebookincubator/roxygen/blob/main/SECURITY.md
+[streaming-server]: https://github.com/facebookincubator/roxygen/blob/main/examples/streaming_server.rs
+[tls-server]: https://github.com/facebookincubator/roxygen/blob/main/examples/tls_server.rs
