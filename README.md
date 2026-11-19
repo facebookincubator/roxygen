@@ -38,14 +38,11 @@ Roxygen is under active development, and its APIs will change before 1.0.
   types, serve a Tower service such as an Axum router, and provide a Tower
   client.
 
-Pick [hyper](https://hyper.rs) instead if you need a stable release on
-crates.io, HTTP/3, Windows support, or a model in which every handler is `Send`
-and runs on a work-stealing runtime.
-
 ## Performance
 
-On the HTTP/2 profiles of [HttpArena](https://github.com/MDA2AV/HttpArena),
-an `HttpServer` on the owned HTTP/2 driver serves:
+Roxygen is in the top 3 on the HTTP/2 profiles of
+[HttpArena](https://github.com/MDA2AV/HttpArena). An `HttpServer` on the owned
+HTTP/2 driver serves:
 
 | Profile | Requests per second |
 | --- | --- |
@@ -127,7 +124,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Session drivers
 
-Roxygen has two drivers for a connection.
+Roxygen has two drivers for a connection. The owned variants are recommended
+for higher performance, subject to the limits below.
 
 - **`UniplexSession`** is the default, and `HttpServer` and `ClientSession` use
   it. On the server, it runs each request's handler as a separate task on the
