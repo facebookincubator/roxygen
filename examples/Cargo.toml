@@ -4,10 +4,21 @@
 name = "ferroxygen_examples"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 description = "Example programs for Roxygen"
+readme = "../README.md"
 repository = "https://github.com/facebookincubator/roxygen"
 license = "MIT"
+keywords = ["client", "http", "http2", "proxygen", "server"]
+categories = ["network-programming", "web-programming::http-client", "web-programming::http-server"]
 publish = false
+
+[package.metadata]
+
+[package.metadata.docs]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 
 [[bin]]
 name = "axum_router"

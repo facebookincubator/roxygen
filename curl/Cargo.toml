@@ -4,11 +4,21 @@
 name = "ferroxygen_curl"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 description = "A curl-like command-line client built on Roxygen"
+readme = "../README.md"
 repository = "https://github.com/facebookincubator/roxygen"
 license = "MIT"
-publish = false
+keywords = ["client", "http", "http2", "proxygen", "server"]
+categories = ["network-programming", "web-programming::http-client", "web-programming::http-server"]
 autotests = false
+
+[package.metadata]
+
+[package.metadata.docs]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 
 [lib]
 name = "roxygen_curl"
@@ -19,10 +29,10 @@ base64 = { version = "0.23.1", features = ["alloc"] }
 brotli = "9.1.1"
 bytes = "1.12.1"
 cookie = { version = "0.18.2", features = ["percent-encode"] }
-ferroxygen_client = { path = "../client" }
-ferroxygen_core = { path = "../core" }
-ferroxygen_runtime = { path = "../runtime" }
-ferroxygen_transport = { path = "../transport" }
+ferroxygen_client = { version = "0.1.0", path = "../client" }
+ferroxygen_core = { version = "0.1.0", path = "../core" }
+ferroxygen_runtime = { version = "0.1.0", path = "../runtime" }
+ferroxygen_transport = { version = "0.1.0", path = "../transport" }
 flate2 = { version = "1.1.11", features = ["rust_backend"], default-features = false }
 futures = "0.3.34"
 hickory-resolver = { version = "0.26.3", features = ["system-config", "tokio"] }

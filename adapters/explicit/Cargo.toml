@@ -4,22 +4,32 @@
 name = "ferroxygen_explicit"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 description = "An experimental HTTP/1.1 client for connections the application dials"
+readme = "../../README.md"
 repository = "https://github.com/facebookincubator/roxygen"
 license = "MIT"
-publish = false
+keywords = ["client", "http", "http2", "proxygen", "server"]
+categories = ["network-programming", "web-programming::http-client", "web-programming::http-server"]
 autotests = false
+
+[package.metadata]
+
+[package.metadata.docs]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 
 [lib]
 name = "roxygen_explicit"
 
 [dependencies]
 bytes = "1.12.1"
-ferroxygen_client = { path = "../../client" }
-ferroxygen_connect = { path = "../../connect" }
-ferroxygen_core = { path = "../../core" }
-ferroxygen_runtime = { path = "../../runtime" }
-ferroxygen_transport = { path = "../../transport" }
+ferroxygen_client = { version = "0.1.0", path = "../../client" }
+ferroxygen_connect = { version = "0.1.0", path = "../../connect" }
+ferroxygen_core = { version = "0.1.0", path = "../../core" }
+ferroxygen_runtime = { version = "0.1.0", path = "../../runtime" }
+ferroxygen_transport = { version = "0.1.0", path = "../../transport" }
 futures = "0.3.34"
 http = "1.5.0"
 rustls = { version = "0.23.46", features = ["ring", "std", "tls12"], default-features = false }
