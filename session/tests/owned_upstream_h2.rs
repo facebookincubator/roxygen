@@ -8533,7 +8533,8 @@ fn owned_upstream_retirement_restarts_the_flow_control_timeout_like_uniplex() {
 const STREAM_READ: Duration = Duration::from_secs(1);
 
 /// An upstream session over the origin's SETTINGS followed by `reads`, with `STREAM_READ` as
-/// its stream read timeout and every other timeout zero.
+/// its stream read timeout, every other timeout zero, and room for `BEYOND_A_TURN_BUDGET`
+/// concurrent requests.
 fn stream_read_timed_upstream(
     context: WorkerContext,
     reads: impl IntoIterator<Item = FixtureRead>,
@@ -8548,6 +8549,7 @@ fn stream_read_timed_upstream(
         FixtureTransport::new(std::iter::once(FixtureRead::Data(settings)).chain(reads));
     let mut config = options(context, Rc::new(super::owned::UntimedReads(fixture)));
     config.io.stream_read_timeout = STREAM_READ;
+    config.http2.max_concurrent_outgoing_streams = BEYOND_A_TURN_BUDGET as u32;
     let (session, handle) =
         OwnedH2UpstreamSession::new(config).expect("stream-read-timed owned upstream H2");
     (session, handle, wire)
@@ -9624,8 +9626,8 @@ fn a_peer_refusal_after_a_stream_read_timeout_failed_the_response_leaves_the_req
     });
 }
 
-/// More streams than the driver polls stream owners in one turn budget.
-const BEYOND_A_TURN_BUDGET: usize = 100;
+/// More streams than the driver polls stream owners in one poll.
+const BEYOND_A_TURN_BUDGET: usize = super::owned::OWNER_POLL_BUDGET + 1;
 
 /// Counts the response completions the driver delivers, which it does as it polls a stream's
 /// owner.
@@ -9643,7 +9645,7 @@ impl crate::owned_h2::OwnedH2ResponseObserver for Completions {
 
 /// The progress of `BEYOND_A_TURN_BUDGET` GETs whose streams the peer refuses in one read, each
 /// with `REFUSED_STREAM` or, with `goaway`, all with one GOAWAY. Their response head reads time
-/// out once the driver has yielded at its turn budget with refusals still to apply. Also returns
+/// out once the driver has yielded at its owner budget with refusals still to apply. Also returns
 /// how many of the refusals the driver applied before the timeout.
 async fn timed_out_before_the_driver_applies_its_refusals(
     host: Rc<crate::external_host_tests::ManualHost>,
@@ -9710,8 +9712,8 @@ async fn timed_out_before_the_driver_applies_its_refusals(
         assert_eq!(completed.get(), 0);
         let yields = host.yields();
         refuse.notify_one();
-        // The driver reads the refusals, polls one stream owner per turn and yields at its turn
-        // budget before it has polled every refused stream's owner.
+        // The driver reads the refusals and yields at its turn budget before it has polled every
+        // refused stream's owner.
         assert!(
             super::owned::drive_until(64, || host.yields() > yields).await,
             "the driver yields at its turn budget"
@@ -9752,7 +9754,7 @@ async fn timed_out_before_the_driver_applies_its_refusals(
     (applied, outcomes)
 }
 
-/// Refusals of more streams than the driver polls stream owners in one turn budget, read
+/// Refusals of more streams than the driver polls stream owners in one poll, read
 /// together (`REFUSED_STREAM` for every stream, or one GOAWAY), leave refusals recorded but not
 /// yet applied when the driver yields. A stream read timeout that expires then does not fail a
 /// request that its refusal failed unprocessed. Every response head read fails with

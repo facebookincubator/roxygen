@@ -145,7 +145,12 @@ use crate::uniplex::UniplexRunSummary;
 use crate::uniplex::UniplexTransport;
 use crate::uniplex::UniplexWriteQueue;
 
-const TURN_BUDGET: usize = 64;
+/// The turns that one poll runs before it yields to the host. Each turn runs every phase once.
+pub(crate) const TURN_BUDGET: usize = 64;
+/// The most stream owners that one turn polls. Like folly's `EventBase::runLoopCallbacks`, which
+/// runs only the callbacks queued before it starts, a turn polls only owners queued before its
+/// owner phase: an owner queued during the phase, by its own poll or another's, waits a turn.
+pub(crate) const OWNER_POLLS_PER_TURN: usize = 16;
 
 /// The status of the error response sent after a downstream stream read timeout.
 const REQUEST_TIMEOUT: u16 = 408;
@@ -224,8 +229,14 @@ impl ReadyQueue {
         drop(previous);
     }
 
-    fn pop(&self) -> Option<StreamId> {
-        self.state.lock().streams.pop_front()
+    /// Moves the oldest queued streams into `batch`, up to its length, and returns how many.
+    fn pop_batch(&self, batch: &mut [StreamId]) -> usize {
+        let mut state = self.state.lock();
+        let count = batch.len().min(state.streams.len());
+        for (slot, stream) in batch.iter_mut().zip(state.streams.drain(..count)) {
+            *slot = stream;
+        }
+        count
     }
 }
 
@@ -951,9 +962,9 @@ where
 
     /// Fails the response's source with the peer reset just recorded, for a request that the
     /// peer's refusal failed unprocessed. The owner applies the reset only when its wake is
-    /// polled, one stream per turn, so a stream read timeout that expires before then would
-    /// otherwise fail the response first. `cancel_owner` keeps the error the same whichever of
-    /// the two fails the source.
+    /// polled, which the turn budget can defer to a later poll, so a stream read timeout that
+    /// expires before then would otherwise fail the response first. `cancel_owner` keeps the
+    /// error the same whichever of the two fails the source.
     fn fail_refused_response(&self) {
         if let Some(error) = &self.peer_reset {
             self.producer
@@ -2742,7 +2753,10 @@ where
             }
             self.check_cancel_after(&mut ran);
             let mut serialized_owner = false;
-            if let Some(stream) = self.connection.state.control.ready.pop() {
+            let mut owners = [StreamId::default(); OWNER_POLLS_PER_TURN];
+            let polled = self.connection.state.control.ready.pop_batch(&mut owners);
+            // Owners are polled after a connection failure too: only their polls retire streams.
+            for &stream in &owners[..polled] {
                 match self.poll_stream(stream) {
                     Ok(OwnerPollResult::Polled) => {}
                     Ok(OwnerPollResult::Serialized(result)) => {
@@ -2753,10 +2767,11 @@ where
                     }
                     Err(error) => self.reset_polled_stream(stream, error),
                 }
-                progress = true;
                 ran = true;
+                // A cancel that this poll raised resets the later owners before their polls.
+                self.check_cancel_after(&mut ran);
             }
-            self.check_cancel_after(&mut ran);
+            progress |= polled != 0;
             if self.failure.fatal.is_none() && !serialized_owner {
                 // On `Ok(false)` the selection was empty and did not run application code.
                 match self.serialize_next() {
@@ -6086,6 +6101,44 @@ mod ready_queue_tests {
              `busy`, or a quiescent session could fold credit ahead of a pending read"
         );
         assert!(read.ready.load(Ordering::Acquire) && queue.busy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pop_batch_takes_the_oldest_streams_up_to_the_batch_length() {
+        let queue = ReadyQueue::default();
+        let queued = OWNER_POLLS_PER_TURN as u64 + 4;
+        queue
+            .state
+            .lock()
+            .streams
+            .extend((1..=queued).map(StreamId::new));
+        let mut batch = [StreamId::default(); OWNER_POLLS_PER_TURN];
+
+        assert_eq!(
+            queue.pop_batch(&mut batch),
+            OWNER_POLLS_PER_TURN,
+            "a full batch takes as many streams as it holds"
+        );
+        assert!(
+            batch
+                .iter()
+                .copied()
+                .eq((1..=OWNER_POLLS_PER_TURN as u64).map(StreamId::new)),
+            "the batch holds the oldest streams in queue order"
+        );
+        assert_eq!(
+            queue.pop_batch(&mut batch),
+            4,
+            "the next batch takes the four streams left over"
+        );
+        assert!(
+            batch[..4]
+                .iter()
+                .copied()
+                .eq((queued - 3..=queued).map(StreamId::new)),
+            "the batch holds the remaining streams in queue order"
+        );
+        assert_eq!(queue.pop_batch(&mut batch), 0, "the queue is empty");
     }
 }
 

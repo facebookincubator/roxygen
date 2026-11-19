@@ -33,6 +33,7 @@ use crate::external_host_tests::forced_teardown_of_scope;
 use crate::http2::StreamReceiveWindowMode;
 use crate::owned::PanicSite;
 use crate::owned::take_contained_panics;
+use crate::owned_h2::OWNER_POLLS_PER_TURN;
 use crate::owned_h2::OwnedH2Application;
 use crate::owned_h2::OwnedH2Exchange;
 use crate::owned_h2::OwnedH2Handle;
@@ -42,12 +43,16 @@ use crate::owned_h2::OwnedH2UpstreamHandle;
 use crate::owned_h2::OwnedH2UpstreamRequest;
 use crate::owned_h2::OwnedH2UpstreamSession;
 use crate::owned_h2::OwnedH2UpstreamSubmission;
+use crate::owned_h2::TURN_BUDGET;
 use crate::owned_h2::fault_next_run_poll;
 use crate::owned_h2::stream_seed_order;
 use crate::owned_h2::take_discarded_streams;
 use crate::uniplex::UniplexReader;
 use crate::uniplex::UniplexRunSummary;
 use crate::uniplex_tests::ParkedEnd;
+
+/// The most stream owner polls that one driver poll runs before it yields.
+pub(super) const OWNER_POLL_BUDGET: usize = TURN_BUDGET * OWNER_POLLS_PER_TURN;
 
 #[derive(Clone, Copy)]
 enum Reply {
@@ -6403,13 +6408,14 @@ fn ready_owner_suffix_precedes_later_cross_thread_wake_after_yield() {
                 pending_visits: Some(RefCell::new(Vec::new())),
                 ..OwnerPollGate::default()
             });
-            let (_, input) = ready_owner_requests(66);
+            let owners = OWNER_POLL_BUDGET + 2;
+            let (_, input) = ready_owner_requests(owners);
             let (transport, state) = FixtureTransport::new([
                 FixtureRead::SegmentedData(queue(&input)),
                 FixtureRead::WaitDataEof(Arc::clone(&release_read), Vec::new()),
             ]);
             state.borrow_mut().write_gate = Some(Arc::clone(&release_write));
-            let (mut application, probes) = Application::new(vec![Reply::Body(0); 66]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0); owners]);
             application.owner_poll_gate = Some(Rc::clone(&gate));
             let (session, handle) =
                 OwnedH2Session::new(application, options(context, transport)).unwrap();
@@ -6449,7 +6455,7 @@ fn ready_owner_suffix_precedes_later_cross_thread_wake_after_yield() {
                     .iter()
                     .map(|waker| waker.as_ref().expect("each owner registered").clone())
                     .collect();
-                assert_eq!(wakers.len(), 66);
+                assert_eq!(wakers.len(), owners);
                 let late = wakers.pop().unwrap();
                 gate.ready.set(true);
                 for waker in &wakers {
@@ -6458,7 +6464,7 @@ fn ready_owner_suffix_precedes_later_cross_thread_wake_after_yield() {
                 poll_pending();
                 let prefix = gate.pending_visits.as_ref().unwrap().borrow().clone();
                 assert!(
-                    (1..65).contains(&prefix.len()),
+                    (1..=OWNER_POLL_BUDGET).contains(&prefix.len()),
                     "the ready batch spans a yield"
                 );
                 assert_eq!(prefix, (0..prefix.len()).collect::<Vec<_>>());
@@ -6493,7 +6499,7 @@ fn ready_owner_suffix_precedes_later_cross_thread_wake_after_yield() {
                 );
                 assert_eq!(
                     *gate.pending_visits.as_ref().unwrap().borrow(),
-                    (0..66).collect::<Vec<_>>()
+                    (0..owners).collect::<Vec<_>>()
                 );
             })
             .await;
@@ -6512,7 +6518,7 @@ fn ready_owner_suffix_precedes_later_cross_thread_wake_after_yield() {
             }
             assert_eq!(result.unwrap_err().code(), HttpErrorCode::CORO_CANCELLED);
             let probes = probes.borrow();
-            assert_eq!(probes.len(), 66);
+            assert_eq!(probes.len(), owners);
             for probe in probes.iter() {
                 assert_eq!(probe.requested.get(), 1);
                 assert_eq!(probe.body_polls.get(), 0);
@@ -6644,7 +6650,7 @@ fn continuously_ready_owners_do_not_starve_control_input() {
                     .iter()
                     .map(|probe| probe.body_polls.get())
                     .sum();
-                assert!((1..=64).contains(&polls_at_yield));
+                assert!((1..=OWNER_POLL_BUDGET).contains(&polls_at_yield));
                 let decoded =
                     decode_server_frames_with_requests(&state.borrow().writes.concat(), 17);
                 assert!(decoded.body_bytes > 0);
@@ -6667,7 +6673,7 @@ fn continuously_ready_owners_do_not_starve_control_input() {
                     .iter()
                     .map(|probe| probe.body_polls.get())
                     .sum();
-                assert!((1..=64).contains(&(polls_after_control - polls_at_yield)));
+                assert!((1..=OWNER_POLL_BUDGET).contains(&(polls_after_control - polls_at_yield)));
                 assert!(gate.control_read.borrow().is_none());
                 assert_eq!(
                     probes.borrow()[16].cancelled.borrow().as_slice(),
@@ -6721,6 +6727,154 @@ fn continuously_ready_owners_do_not_starve_control_input() {
             assert!(decoded.body_data.iter().all(|byte| *byte == b'r'));
             assert!(decoded.resets.is_empty());
             assert!(decoded.errors.is_empty());
+        })
+    });
+}
+
+/// One read's worth of ready requests is served without a budget yield: the head, body and
+/// retirement polls of 100 streams fit in one poll's owner budget.
+#[test]
+fn a_ready_batch_is_served_within_one_poll() {
+    crate::external_host_tests::run_on_host_with(|host, context| {
+        Box::pin(async move {
+            let release_eof = Arc::new(tokio::sync::Notify::new());
+            let (_, input) = ready_owner_requests(100);
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(input),
+                FixtureRead::WaitDataEof(Arc::clone(&release_eof), Vec::new()),
+            ]);
+            let (application, probes) = Application::new(vec![Reply::Body(1); 100]);
+            let (session, _handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let (run, ()) = futures::join!(session.run(), async {
+                complete_credit_wait(|| {
+                    let probes = probes.borrow();
+                    probes.len() == 100 && probes.iter().all(|probe| probe.dropped.get() == 1)
+                })
+                .await;
+                assert_eq!(
+                    host.yields(),
+                    0,
+                    "the driver served the batch without yielding at its turn budget"
+                );
+                release_eof.notify_one();
+            });
+            run.expect("the connection closes cleanly at the peer's EOF");
+            for probe in probes.borrow().iter() {
+                assert_eq!(probe.completed.get(), 1);
+                assert!(probe.cancelled.borrow().is_empty());
+            }
+            let decoded = decode_server_frames_with_requests(&state.borrow().writes.concat(), 100);
+            assert_eq!(decoded.header_statuses.len(), 100);
+            assert!(
+                decoded
+                    .header_statuses
+                    .iter()
+                    .all(|(_, status)| *status == 200)
+            );
+            assert_eq!(decoded.body_data, vec![b'r'; 100]);
+            assert!(decoded.resets.is_empty());
+            assert!(decoded.errors.is_empty());
+        })
+    });
+}
+
+/// A turn polls only the owners queued before its owner phase: two continuously ready bodies are
+/// each polled at most once per turn, so neither runs more than one turn budget of body polls
+/// before the driver yields, and both make progress.
+#[test]
+fn continuously_ready_owners_are_polled_once_per_turn() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (_, input) = ready_owner_requests(2);
+            let (transport, _state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::DataEof(Vec::new()),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(1024); 2]);
+            application.body_chunk = 1;
+            let mut config = options(context, transport);
+            config.io.buffer_limit = 64 << 10;
+            config.io.ingress_buffer_limit = 64 << 10;
+            config.io.maximum_write_size = 64 << 10;
+            config.io.maximum_read_size = 4096;
+            config.io.read_allocation_size = 4096;
+            let (session, _) = OwnedH2Session::new(application, config).unwrap();
+            let mut run = Box::pin(session.run());
+            let first = poll_fn(|context| Poll::Ready(run.as_mut().poll(context))).await;
+            assert!(first.is_pending(), "two 1024-chunk bodies outlast one poll");
+            let polls_at_yield: Vec<_> = probes
+                .borrow()
+                .iter()
+                .map(|probe| probe.body_polls.get())
+                .collect();
+            assert_eq!(polls_at_yield.len(), 2);
+            for polls in &polls_at_yield {
+                assert!(
+                    (1..=TURN_BUDGET).contains(polls),
+                    "each owner is polled at most once per turn: {polls_at_yield:?}"
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .unwrap()
+                .unwrap();
+            for probe in probes.borrow().iter() {
+                assert_eq!(probe.body_polls.get(), 1024);
+                assert_eq!(probe.completed.get(), 1);
+                assert_eq!(probe.dropped.get(), 1);
+            }
+        })
+    });
+}
+
+/// A cancel raised inside one owner's poll resets the owners polled after it, in the same turn
+/// and later ones, before their polls run application code, and every stream still retires.
+#[test]
+fn a_cancel_inside_an_owner_poll_resets_the_later_owners_of_the_turn() {
+    let streams = OWNER_POLLS_PER_TURN + 1;
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let (_, input) = ready_owner_requests(streams);
+            let (transport, state) = FixtureTransport::new([FixtureRead::Data(input)]);
+            let cancel = Rc::new(ReentrantCancel {
+                at: CancelAt::BodyPoll,
+                handle: RefCell::new(None),
+                transport: Rc::clone(&state),
+                writes_at_cancel: Cell::new(None),
+            });
+            let (mut application, probes) = Application::new(vec![Reply::Body(1); streams]);
+            application.reentrant_cancel = Some(Rc::clone(&cancel));
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            *cancel.handle.borrow_mut() = Some(handle);
+            let error = tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .expect("every owner retires after the cancel")
+                .unwrap_err();
+            assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+            assert_eq!(
+                Some(state.borrow().writes.len()),
+                cancel.writes_at_cancel.get(),
+                "nothing is written after the cancel"
+            );
+            let probes = probes.borrow();
+            assert_eq!(probes.len(), streams);
+            let body_polls: Vec<_> = probes.iter().map(|probe| probe.body_polls.get()).collect();
+            assert_eq!(
+                body_polls.iter().sum::<usize>(),
+                1,
+                "only the cancelling owner polls its body: {body_polls:?}"
+            );
+            for probe in probes.iter() {
+                assert_eq!(
+                    probe.cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::CORO_CANCELLED, false)]
+                );
+                assert_eq!(probe.response_complete.get(), 0);
+                assert_eq!(probe.completed.get(), 0);
+                assert_eq!(probe.dropped.get(), 1);
+            }
         })
     });
 }
@@ -13394,9 +13548,9 @@ fn credit_during_a_budget_yield_is_not_folded() {
                 pending_visits: Some(RefCell::new(Vec::new())),
                 ..OwnerPollGate::default()
             });
-            // 64 one-byte bodies fill one turn budget of owner polls; then A (40,000 B) and
-            // B (20,000 B). The 64 bodies are never read.
-            let mut bodies = vec![(1, 16_384, None); 64];
+            // One poll's owner budget of one-byte bodies, never read; then A (40,000 B) and
+            // B (20,000 B).
+            let mut bodies = vec![(1, 16_384, None); OWNER_POLL_BUDGET];
             bodies.extend([(40_000, 16_384, None), (20_000, 16_384, None)]);
             let (transport, state) =
                 FixtureTransport::new([FixtureRead::Data(peer_posts(&bodies))]);
@@ -13440,33 +13594,33 @@ fn credit_during_a_budget_yield_is_not_folded() {
                     .iter()
                     .map(|waker| waker.as_ref().expect("each owner registered").clone())
                     .collect();
-                assert_eq!(wakers.len(), 66);
+                assert_eq!(wakers.len(), OWNER_POLL_BUDGET + 2);
 
-                // Queue the 64, then read A outside the poll: its 40,000 B cross the 32,767 B
-                // threshold, so its owner is queued behind them with that credit.
+                // Queue the one-byte bodies, then read A outside the poll: its 40,000 B cross
+                // the 32,767 B threshold, so its owner is queued behind them with that credit.
                 gate.ready.set(true);
-                for waker in &wakers[..64] {
+                for waker in &wakers[..OWNER_POLL_BUDGET] {
                     waker.wake_by_ref();
                 }
-                let a = Rc::clone(&probes.borrow()[64]);
+                let a = Rc::clone(&probes.borrow()[OWNER_POLL_BUDGET]);
                 let mut a = a.held_body.borrow_mut().take().unwrap();
                 assert_eq!(read_buffered_body(&mut a), 40_000);
-                wakers[64].wake_by_ref();
+                wakers[OWNER_POLL_BUDGET].wake_by_ref();
 
-                // One poll spends its turn budget on the 64 and yields, with A still queued;
+                // One poll spends its owner budget on the bodies and yields, with A still queued;
                 // the held yield does not wake the session.
                 hold_yields();
                 poll();
                 assert_eq!(
                     *gate.pending_visits.as_ref().unwrap().borrow(),
-                    (0..64).collect::<Vec<_>>()
+                    (0..OWNER_POLL_BUDGET).collect::<Vec<_>>()
                 );
                 assert!(updates().is_empty());
                 assert!(!wake.woken.load(Ordering::SeqCst));
 
                 // B is read during the yield. A's credit still waits in its owner, so B's
                 // 20,000 must reach the codec behind it.
-                let b = Rc::clone(&probes.borrow()[65]);
+                let b = Rc::clone(&probes.borrow()[OWNER_POLL_BUDGET + 1]);
                 let mut b = b.held_body.borrow_mut().take().unwrap();
                 let before = wake.wakes.load(Ordering::SeqCst);
                 assert_eq!(read_buffered_body(&mut b), 20_000);
@@ -13486,7 +13640,7 @@ fn credit_during_a_budget_yield_is_not_folded() {
                 assert!(settled, "A and B stop waking the session");
                 assert_eq!(
                     *gate.pending_visits.as_ref().unwrap().borrow(),
-                    (0..65).collect::<Vec<_>>()
+                    (0..=OWNER_POLL_BUDGET).collect::<Vec<_>>()
                 );
                 drop((a, b));
                 (wakes, updates())
