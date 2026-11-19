@@ -777,7 +777,7 @@ impl HttpSourceHolder {
         poll
     }
 
-    fn unavailable_error() -> HttpError {
+    pub(crate) fn unavailable_error() -> HttpError {
         HttpError::with_message(HttpErrorCode::DROPPED, b"HTTP source is no longer readable")
     }
 

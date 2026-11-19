@@ -94,6 +94,20 @@ pub trait OwnedApplication: 'static {
     /// Creates the exchange for `stream`. It is called before the decoded head is validated, so
     /// accounting begins before a stream error can be reported.
     fn new_exchange(&self, stream: StreamId, ingress: IngressCompletion) -> Self::Exchange;
+    /// Creates the exchange as `new_exchange` does. `ingress` returns the completion that
+    /// `new_exchange` takes, and an application that does not use the completion can skip
+    /// that call and the allocation of its handle. The default calls `ingress`, then
+    /// `new_exchange`.
+    fn new_exchange_with(
+        &self,
+        stream: StreamId,
+        ingress: impl FnOnce() -> IngressCompletion,
+    ) -> Self::Exchange
+    where
+        Self: Sized,
+    {
+        self.new_exchange(stream, ingress())
+    }
 }
 
 /// Admission notifications run on the session owner, outside state borrows.

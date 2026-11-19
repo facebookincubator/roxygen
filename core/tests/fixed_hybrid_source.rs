@@ -404,6 +404,33 @@ mod hybrid_source {
     }
 
     #[test]
+    fn header_event_only_reads_as_an_empty_upstream() {
+        let header = || HttpHeaderEvent::new(request(b"/"), true).unwrap();
+        for only in [false, true] {
+            let mut hybrid = if only {
+                HttpHybridSource::from_header_event_only(header())
+            } else {
+                HttpHybridSource::from_header_event(header(), HttpSourceHolder::empty())
+            };
+            assert!(!hybrid.has_upstream());
+            assert_eq!(hybrid.get_stream_id(), None);
+            assert!(hybrid.ingress_completion().is_none());
+            hybrid.set_read_timeout(Duration::from_millis(5));
+            assert!(ready(hybrid.read_header_event()).unwrap().eom());
+            let errors = [
+                ready(hybrid.read_header_event()).err(),
+                ready(hybrid.read_body_event(1)).err(),
+            ];
+            for error in errors {
+                let error = error.expect("the empty upstream fails the read");
+                assert_eq!(error.code(), HttpErrorCode::DROPPED, "only {only}");
+                assert_eq!(error.message(), b"HTTP source is no longer readable");
+            }
+            hybrid.stop_reading(None);
+        }
+    }
+
+    #[test]
     fn attached_stop_forwards_once_and_destroys_upstream() {
         let observations = Rc::new(RefCell::new(SourceObservations::default()));
         let upstream = HttpSourceHolder::new(Box::new(ObservedBodySource {

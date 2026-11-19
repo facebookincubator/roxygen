@@ -21,6 +21,7 @@ use std::task::Poll;
 use std::task::Waker;
 use std::thread::ThreadId;
 use std::time::Duration;
+use std::time::Instant;
 
 use roxygen_runtime::cancellation::CancellationToken;
 use roxygen_runtime::host::Host;
@@ -1188,11 +1189,12 @@ impl HttpIngressBody {
     /// retires the source as terminal. Otherwise the source is stopped as usual
     /// when it is dropped.
     pub fn retire_empty_body(mut self, context: &mut Context<'_>) -> Result<Self, HttpError> {
-        let mut terminal = self
-            .owner
-            .source()
-            .expect("a fresh source is owned")
-            .read_body_event_unboxed(1, CancellationToken::never());
+        let source = self.owner.source().expect("a fresh source is owned");
+        if take_terminal_empty_body(&source.shared) {
+            self.owner.retire_terminal();
+            return Ok(self);
+        }
+        let mut terminal = source.read_body_event_unboxed(1, CancellationToken::never());
         let poll = Pin::new(&mut terminal).poll(context);
         if let Poll::Ready(result) = &poll
             && result.as_ref().is_ok_and(HttpBodyEvent::eom)
@@ -1861,6 +1863,18 @@ impl HttpStreamSourceProducer {
     }
 
     pub fn eom(&self) -> bool {
+        self.eom_impl(None)
+    }
+
+    /// Accepts EOM as [`Self::eom`] does, with `completed_at` as the producer's completion
+    /// time in place of a host clock read. `completed_at` must come from the host clock and
+    /// must not precede the arrival of the EOM. A caller that completes several messages from
+    /// one read can then share one clock read among them.
+    pub fn eom_at(&self, completed_at: Instant) -> bool {
+        self.eom_impl(Some(completed_at))
+    }
+
+    fn eom_impl(&self, completed_at: Option<Instant>) -> bool {
         let Some(shared) = self.shared.upgrade() else {
             return false;
         };
@@ -1874,7 +1888,7 @@ impl HttpStreamSourceProducer {
             let mut state = shared.state.borrow_mut();
             if state.sink_mode {
                 drop(state);
-                record_ingress_eom(&shared);
+                record_ingress_eom_at(&shared, completed_at);
                 return true;
             }
             if let Some(body) = state.body_queue.back_mut() {
@@ -1889,7 +1903,7 @@ impl HttpStreamSourceProducer {
                 signal = true;
             }
         }
-        record_ingress_eom(&shared);
+        record_ingress_eom_at(&shared, completed_at);
         if signal {
             shared.signal_event();
         }
@@ -2957,6 +2971,43 @@ fn take_ready_event(
     Some(result)
 }
 
+/// Reads the empty terminal body event that EOM queues for a header-only message,
+/// completing the source as a body read of that event does, and returns true.
+/// Returns false without a change unless that event is the only one queued and
+/// such a read would start and return it at once.
+fn take_terminal_empty_body(shared: &Rc<StreamShared>) -> bool {
+    shared.assert_owner();
+    let taken = {
+        let mut state = shared.state.borrow_mut();
+        let state = &mut *state;
+        if state.draining
+            || state.error.is_some()
+            || state.read_state != ReadState::BodyEvents
+            || state.active_read.is_some()
+            || state.suspend_wait_active
+        {
+            return false;
+        }
+        let IngressQueue::Inline(slot) = &mut state.body_queue else {
+            return false;
+        };
+        match slot {
+            Some(QueuedBody {
+                kind: QueuedBodyKind::Body(body),
+                eom: true,
+            }) if body.is_empty() => {
+                state.body_segment_hint = state.body_segment_hint.max(body.segment_growth_hint());
+            }
+            _ => return false,
+        }
+        state.next_read_id = state.next_read_id.wrapping_add(1);
+        slot.take()
+    };
+    maybe_complete(shared, true);
+    drop(taken);
+    true
+}
+
 /// Whether a queued event kept by an ingress abort is the next one for a valid
 /// read of `kind`. That is a header while headers are read, and a body event
 /// after that.
@@ -3237,13 +3288,16 @@ fn set_owned_error(
 }
 
 fn record_ingress_eom(shared: &Rc<StreamShared>) {
+    record_ingress_eom_at(shared, None);
+}
+
+/// Publishes the producer's EOM, completed at `completed_at` or else now.
+fn record_ingress_eom_at(shared: &Rc<StreamShared>, completed_at: Option<Instant>) {
     let _completion = CompleteDrainedSource(shared);
-    let outcome = shared
-        .state
-        .borrow()
-        .error
-        .as_ref()
-        .map_or_else(|| Ok(shared.host.now()), |error| Err(error.error.clone()));
+    let outcome = shared.state.borrow().error.as_ref().map_or_else(
+        || Ok(completed_at.unwrap_or_else(|| shared.host.now())),
+        |error| Err(error.error.clone()),
+    );
     shared.ingress_completion.finish(outcome);
 }
 

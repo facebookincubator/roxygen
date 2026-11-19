@@ -74,17 +74,29 @@ impl HandlerApplication {
     pub(crate) fn new(handler: HttpHandlerRef, base: HandlerSessionContext) -> Self {
         Self { handler, base }
     }
+
+    fn exchange(&self) -> HandlerExchange {
+        HandlerExchange {
+            handler: Rc::clone(&self.handler),
+            context: Some(self.base.clone()),
+            state: ExchangeState::AwaitingRequest,
+        }
+    }
 }
 
 impl OwnedApplication for HandlerApplication {
     type Exchange = HandlerExchange;
 
     fn new_exchange(&self, _stream: StreamId, _ingress: IngressCompletion) -> HandlerExchange {
-        HandlerExchange {
-            handler: Rc::clone(&self.handler),
-            context: Some(self.base.clone()),
-            state: ExchangeState::AwaitingRequest,
-        }
+        self.exchange()
+    }
+
+    fn new_exchange_with(
+        &self,
+        _stream: StreamId,
+        _ingress: impl FnOnce() -> IngressCompletion,
+    ) -> HandlerExchange {
+        self.exchange()
     }
 }
 
@@ -191,10 +203,12 @@ impl OwnedExchange for HandlerExchange {
             .expect("an exchange receives one request");
         let future = match HttpHeaderEvent::from_boxed_headers(head, eom) {
             Ok(head) => {
-                let request = HttpSourceHolder::new(Box::new(HttpHybridSource::from_header_event(
-                    head,
-                    body.into_source_holder(),
-                )));
+                let source = if body.source().is_some() {
+                    HttpHybridSource::from_header_event(head, body.into_source_holder())
+                } else {
+                    HttpHybridSource::from_header_event_only(head)
+                };
+                let request = HttpSourceHolder::new(Box::new(source));
                 catch_unwind(AssertUnwindSafe(|| {
                     self.handler.handle_request(context, request)
                 }))

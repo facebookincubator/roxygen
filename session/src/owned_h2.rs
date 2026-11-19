@@ -3688,6 +3688,7 @@ where
     receive_window: u32,
     peer_goaway_pending: bool,
     peer_goaway_generated: bool,
+    header_only_eom_time: Option<Instant>,
 }
 
 impl<A, const UPSTREAM: bool> CodecInput<'_, A, UPSTREAM>
@@ -3812,10 +3813,11 @@ where
             producer.set_read_timeout(stream_read_timeout);
         }
         let drain = source.drain_on_drop();
-        let ingress = source
-            .ingress_completion()
-            .expect("a stream source has an ingress receipt");
-        let application = self.application.new_exchange(id, ingress);
+        let application = self.application.new_exchange_with(id, || {
+            source
+                .ingress_completion()
+                .expect("a stream source has an ingress receipt")
+        });
         let send_window =
             Window::new(self.state.peer_initial_window).expect("peer initial window was validated");
         // Allocating before the value is built lets it be written in place instead of copied.
@@ -4120,9 +4122,19 @@ where
                     }
                     if !owner.wire_ingress_complete {
                         owner.wire_ingress_complete = true;
+                        let accepted = if UPSTREAM || owner.request_body_events {
+                            owner.producer.eom()
+                        } else {
+                            // Header-only requests that one parse completes share a clock read.
+                            let context = self.context;
+                            let now = *self
+                                .header_only_eom_time
+                                .get_or_insert_with(|| context.host().now());
+                            owner.producer.eom_at(now)
+                        };
                         // A rejected EOM (e.g. before any head) leaves the response source
                         // terminal, and the caller reads that error from the source.
-                        if !owner.producer.eom()
+                        if !accepted
                             && UPSTREAM
                             && let Some(exchange) = owner.upstream()
                         {
@@ -4463,6 +4475,7 @@ where
             receive_window: self.h2.stream_receive_window,
             peer_goaway_pending: false,
             peer_goaway_generated: false,
+            header_only_eom_time: None,
         };
         let (consumed, mut egress_results) = if input.is_empty() {
             (0, Vec::new())

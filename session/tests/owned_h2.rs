@@ -17577,6 +17577,48 @@ fn zero_timeouts_take_no_slot_sleep_or_clock_read() {
     });
 }
 
+/// Header-only requests that one read completes share one clock read for the time of their
+/// ingress completions.
+#[test]
+fn header_only_requests_in_one_read_share_a_completion_clock_read() {
+    const REQUESTS: usize = 3;
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, input) = ready_owner_requests(REQUESTS);
+            let (session, handle, state, probes) = timed_session(
+                context,
+                [FixtureRead::Data(input)],
+                vec![Reply::Body(0); REQUESTS],
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+            let reads_before = host.now_reads();
+            let (run, round_trip) = futures::join!(session.run(), async {
+                complete_credit_wait(|| {
+                    written_frames(&state, REQUESTS).header_statuses.len() == REQUESTS
+                })
+                .await;
+                settle_turns(32).await;
+                let round_trip = host.now_reads() - reads_before;
+                assert!(handle.initiate_drain().unwrap());
+                round_trip
+            });
+            run.expect("the drained connection closes cleanly");
+            assert_eq!(round_trip, ZERO_CONFIG_ROUND_TRIP_NOW_READS);
+            let completed: Vec<_> = probes
+                .borrow()
+                .iter()
+                .map(|probe| {
+                    let ingress = probe.ingress.borrow();
+                    let completion = ingress.as_ref().expect("an observed completion");
+                    completion.snapshot().expect("a completed request").unwrap()
+                })
+                .collect();
+            assert_eq!(completed, [completed[0]; REQUESTS]);
+        })
+    });
+}
+
 /// Runs `test` on a caller-driven worker over a current-thread runtime whose clock is paused, so
 /// Tokio sleeps, the fixture's read timeouts and a host without a wheel all advance together.
 pub(super) fn run_on_paused_worker<T: Send + 'static>(

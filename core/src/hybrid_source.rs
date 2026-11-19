@@ -22,7 +22,7 @@ use crate::source_holder::HttpSourceHolder;
 /// Supplies a fixed header event before forwarding to an owned upstream source.
 pub struct HttpHybridSource {
     header_event: Option<HttpHeaderEvent>,
-    upstream: HttpSourceHolder,
+    upstream: Option<HttpSourceHolder>,
 }
 
 impl HttpHybridSource {
@@ -39,7 +39,16 @@ impl HttpHybridSource {
     pub fn from_header_event(header_event: HttpHeaderEvent, upstream: HttpSourceHolder) -> Self {
         Self {
             header_event: Some(header_event),
-            upstream,
+            upstream: Some(upstream),
+        }
+    }
+
+    /// Supplies only `header_event`, as [`Self::from_header_event`] does with an empty
+    /// upstream, without allocating that holder.
+    pub fn from_header_event_only(header_event: HttpHeaderEvent) -> Self {
+        Self {
+            header_event: Some(header_event),
+            upstream: None,
         }
     }
 
@@ -48,7 +57,9 @@ impl HttpHybridSource {
     }
 
     pub fn has_upstream(&self) -> bool {
-        self.upstream.readable()
+        self.upstream
+            .as_ref()
+            .is_some_and(HttpSourceHolder::readable)
     }
 }
 
@@ -56,8 +67,12 @@ impl HttpSource for HttpHybridSource {
     fn read_header_event(&mut self) -> LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
         if let Some(header_event) = self.header_event.take() {
             Box::pin(std::future::ready(Ok(header_event)))
+        } else if let Some(upstream) = &mut self.upstream {
+            upstream.read_header_event()
         } else {
-            self.upstream.read_header_event()
+            Box::pin(std::future::ready(Err(
+                HttpSourceHolder::unavailable_error(),
+            )))
         }
     }
 
@@ -65,24 +80,35 @@ impl HttpSource for HttpHybridSource {
         &mut self,
         maximum: u32,
     ) -> LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
-        self.upstream.read_body_event(maximum)
+        match &mut self.upstream {
+            Some(upstream) => upstream.read_body_event(maximum),
+            None => Box::pin(std::future::ready(Err(
+                HttpSourceHolder::unavailable_error(),
+            ))),
+        }
     }
 
     fn stop_reading(&mut self, error: Option<HttpErrorCode>) {
-        if self.upstream.readable() {
-            self.upstream.stop_reading(error);
+        if let Some(upstream) = self
+            .upstream
+            .as_mut()
+            .filter(|upstream| upstream.readable())
+        {
+            upstream.stop_reading(error);
         }
     }
 
     fn get_stream_id(&self) -> Option<StreamId> {
-        self.upstream.get_stream_id()
+        self.upstream.as_ref()?.get_stream_id()
     }
 
     fn ingress_completion(&self) -> Option<IngressCompletion> {
-        self.upstream.ingress_completion()
+        self.upstream.as_ref()?.ingress_completion()
     }
 
     fn set_read_timeout(&mut self, timeout: Duration) {
-        self.upstream.set_read_timeout(timeout);
+        if let Some(upstream) = &mut self.upstream {
+            upstream.set_read_timeout(timeout);
+        }
     }
 }

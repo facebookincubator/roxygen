@@ -923,10 +923,11 @@ impl<A: OwnedApplication> CodecInput<'_, A> {
         // Parsing resumes once the unread body is below the limit it paused at.
         producer.set_resume_threshold(Some(self.config.ingress_buffer_limit));
         let drain = source.drain_on_drop();
-        let ingress = source
-            .ingress_completion()
-            .expect("a fresh request source has an ingress receipt");
-        let application = self.application.new_exchange(id, ingress);
+        let application = self.application.new_exchange_with(id, || {
+            source
+                .ingress_completion()
+                .expect("a fresh request source has an ingress receipt")
+        });
         *self.exchange = Some(Box::new(Exchange {
             application: Some(application),
             signals,

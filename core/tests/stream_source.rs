@@ -524,6 +524,91 @@ fn ingress_completion_passes_through_native_adaptation() {
     assert!(ready(completion.wait()).is_ok());
 }
 
+#[test]
+fn eom_at_reports_the_supplied_completion_time() {
+    let completed_at = Instant::now() + Duration::from_secs(3600);
+    let (source, producer, _) = session_source(8);
+    let completion = source.ingress_completion().unwrap();
+    assert!(source.initialize_body_only(&mut request(None), false));
+    assert!(producer.eom_at(completed_at));
+    assert_eq!(completion.snapshot().unwrap().unwrap(), completed_at);
+
+    let (source, producer, _) = session_source(8);
+    let completion = source.ingress_completion().unwrap();
+    assert!(source.initialize_body_only(&mut request(Some(b"3")), false));
+    assert!(producer.eom_at(completed_at));
+    assert_eq!(
+        completion.snapshot().unwrap().unwrap_err().code(),
+        HttpErrorCode::CONTENT_LENGTH_MISMATCH
+    );
+}
+
+/// A header-only request's body retires its source before handoff, completing it once with the
+/// terminal empty read. A source error fails the retirement with that error, and a body that holds
+/// more than the empty EOM fails it as an invalid state transition.
+#[test]
+fn retire_empty_body_completes_a_header_only_source() {
+    let mut context = Context::from_waker(Waker::noop());
+    let header_only = |content_length: Option<&[u8]>| {
+        let log = Rc::new(RefCell::new(CallbackLog::default()));
+        let ingress = HttpIngressBody::new(
+            StreamId::new(7),
+            RecordingCallback(Rc::clone(&log)),
+            8,
+            Host::tokio(),
+        )
+        .unwrap();
+        assert!(ingress.initialize_body_only(&mut request(content_length), false));
+        (ingress, log)
+    };
+
+    for drained in [false, true] {
+        let (ingress, log) = header_only(None);
+        let producer = ingress.producer();
+        let completion = ingress.ingress_completion().unwrap();
+        let drain = drained.then(|| ingress.drain_on_drop());
+        assert!(producer.eom());
+        assert!(log.borrow().completions.is_empty());
+        let ingress = ingress
+            .retire_empty_body(&mut context)
+            .expect("the terminal empty read");
+        assert_eq!(log.borrow().completions, vec![None]);
+        assert!(ingress.into_source_owner().source().is_none());
+        assert_eq!(producer.is_live(), drained);
+        drop(drain);
+        assert!(!producer.is_live());
+        assert_eq!(log.borrow().completions, vec![None]);
+        assert!(completion.snapshot().unwrap().is_ok());
+    }
+
+    let (ingress, log) = header_only(Some(b"3"));
+    assert!(ingress.producer().eom());
+    let error = ingress
+        .retire_empty_body(&mut context)
+        .err()
+        .expect("the length mismatch");
+    assert_eq!(error.code(), HttpErrorCode::CONTENT_LENGTH_MISMATCH);
+    assert_eq!(
+        log.borrow().completions,
+        vec![Some(HttpErrorCode::CONTENT_LENGTH_MISMATCH)]
+    );
+
+    let (ingress, log) = header_only(None);
+    let producer = ingress.producer();
+    assert_eq!(producer.body(body(b"ab"), 0, false), FlowControlState::Open);
+    assert!(producer.eom());
+    let error = ingress
+        .retire_empty_body(&mut context)
+        .err()
+        .expect("the body bytes");
+    assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+    assert!(!producer.is_live());
+    assert_eq!(
+        log.borrow().completions,
+        vec![Some(HttpErrorCode::NO_ERROR)]
+    );
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("owned source failure")]
 struct SourceCause;
