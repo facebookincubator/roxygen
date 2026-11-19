@@ -27,6 +27,7 @@
 //! - `abort_exchanges_on_eof`: a peer EOF fails the connection while the live exchange is open,
 //!   as it does under `UniplexSession`. The EOF is judged at the point where `UniplexSession`
 //!   would read it.
+//! - `add_date_header_to_response`.
 //!
 //! HTTP/1 parsing uses llhttp's method table, so `exact_method_tokens` affects only HTTP/2.
 //! `new` fails with `INVALID_STATE_TRANSITION` for anything else:
@@ -1138,6 +1139,7 @@ impl<A: OwnedApplication> Driver<A> {
         codec.set_downstream_upgrade_as_ordinary(
             http1.upgrade_policy == Http1UpgradePolicy::AsOrdinaryRequest,
         );
+        codec.set_add_date_header_to_response(io.add_date_header_to_response);
         Ok((
             Self {
                 context,

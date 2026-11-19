@@ -2179,6 +2179,7 @@ where
         }
         codec.set_exact_methods(io.exact_method_tokens && !UPSTREAM);
         codec.set_verbatim_field_values(io.verbatim_http2_header_values && !UPSTREAM);
+        codec.set_add_date_header_to_response(io.add_date_header_to_response);
         codec.generate(
             &mut egress,
             EgressFrame::ConnectionPreface,

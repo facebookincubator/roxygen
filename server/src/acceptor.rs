@@ -165,10 +165,10 @@ pub struct ServerSessionConfig {
     /// response's wait for flow-control credit. `stream_read_timeout` bounds each wait for
     /// request body, and sends 408 if the response head is not yet sent. It also applies
     /// `goaway_timeout`, `http2_rate_limits`, `abort_http2_streams_on_eof`,
-    /// `exact_method_tokens` and `verbatim_http2_header_values` as `UniplexSession` does. It
-    /// records no statistics, so `stats_factory` must be `None`. Server construction rejects
-    /// any other configuration with `HttpServerError::InvalidConfig` (`INVALID_STATE_TRANSITION`
-    /// from `serve_transport`), naming the reason.
+    /// `exact_method_tokens`, `verbatim_http2_header_values` and `add_date_header_to_response`
+    /// as `UniplexSession` does. It records no statistics, so `stats_factory` must be `None`.
+    /// Server construction rejects any other configuration with `HttpServerError::InvalidConfig`
+    /// (`INVALID_STATE_TRANSITION` from `serve_transport`), naming the reason.
     ///
     /// A `lifecycle_observer_factory` observer sees the connection's lifecycle as under
     /// `UniplexSession`, with some differences. Among them, events arrive at the end of each
@@ -232,6 +232,10 @@ pub struct ServerSessionConfig {
     /// whitespace, as `httparse` does, and write every stored value unchanged. `owned_http2`
     /// applies it.
     pub verbatim_http2_header_values: bool,
+    /// Adds a `Date` header to each response that lacks one. On by default, because RFC 9110
+    /// requires an origin server with a clock to send `Date`. A `Date` that the handler sets is
+    /// sent unchanged either way. `owned_http1` and `owned_http2` apply it.
+    pub add_date_header_to_response: bool,
     #[cfg(test)]
     pub(crate) accepted_socket_profile: Option<Arc<AcceptedSocketProfile>>,
 }
@@ -278,6 +282,7 @@ impl Default for ServerSessionConfig {
             non_abortive_close: false,
             exact_method_tokens: false,
             verbatim_http2_header_values: false,
+            add_date_header_to_response: true,
             #[cfg(test)]
             accepted_socket_profile: None,
         }
@@ -723,6 +728,7 @@ pub(crate) fn attach_session(
         non_abortive_close: config.session.non_abortive_close,
         exact_method_tokens: config.session.exact_method_tokens,
         verbatim_http2_header_values: config.session.verbatim_http2_header_values,
+        add_date_header_to_response: config.session.add_date_header_to_response,
     };
     if let Some(limits) = transport_limits {
         uniplex.maximum_read_size = uniplex.maximum_read_size.min(limits.maximum_read_size());

@@ -9252,6 +9252,61 @@ fn a_bodiless_post_with_caller_chunked_framing_closes_the_connection_when_enable
     assert_eq!(bodiless_post_with_chunked_transfer_encoding(true), expected);
 }
 
+/// The head of a 200 that a downstream codec generates for a GET, with `add_date` passed to
+/// `set_add_date_header_to_response` and `date` as the response's own `Date`.
+fn generate_ok_head(add_date: bool, date: Option<&[u8]>) -> String {
+    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+    codec.set_add_date_header_to_response(add_date);
+    let request = b"GET / HTTP/1.1\r\nHost: h\r\n\r\n";
+    assert_eq!(
+        parse(&mut codec, &mut Recorder::default(), request),
+        request.len()
+    );
+    let mut message = response(200, (1, 1));
+    message
+        .headers_mut()
+        .set(HttpHeaderCode::ContentLength, b"0");
+    if let Some(date) = date {
+        message.headers_mut().set(HttpHeaderCode::Date, date);
+    }
+    let head = generate(
+        &mut codec,
+        EgressFrame::Headers {
+            stream: StreamId::new(1),
+            message: &message,
+            end_stream: true,
+            extra_headers: None,
+        },
+    );
+    String::from_utf8(head).expect("an ASCII head")
+}
+
+#[test]
+fn the_implicit_date_is_added_by_default_and_omitted_when_disabled() {
+    let head = generate_ok_head(true, None);
+    let date = head
+        .split("\r\n")
+        .find_map(|line| line.strip_prefix("Date: "))
+        .expect("an implicit Date");
+    assert!(date.len() == 29 && date.ends_with(" GMT"), "{head}");
+    assert_eq!(
+        head.replace(date, "<date>"),
+        "HTTP/1.1 200 OK\r\nDate: <date>\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n"
+    );
+    assert_eq!(
+        generate_ok_head(false, None),
+        "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n"
+    );
+}
+
+#[test]
+fn a_response_date_is_kept_whether_or_not_the_implicit_date_is_added() {
+    let expected =
+        "HTTP/1.1 200 OK\r\nDate: fixed\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+    assert_eq!(generate_ok_head(true, Some(b"fixed")), expected);
+    assert_eq!(generate_ok_head(false, Some(b"fixed")), expected);
+}
+
 #[test]
 fn llhttp_rejections_have_fragmentation_independent_error_offsets() {
     for wire in [

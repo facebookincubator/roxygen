@@ -242,6 +242,7 @@ pub struct Http1xCodec {
     /// response is read as an ordinary response.
     ordinary_request_sent: bool,
     release_egress_after_request: bool,
+    add_date_to_response: bool,
     parser: Option<Box<Parser>>,
     phase: IngressPhase,
     header_name: Vec<u8>,
@@ -333,6 +334,7 @@ impl Http1xCodec {
             upstream_upgrade_as_ordinary: false,
             ordinary_request_sent: false,
             release_egress_after_request: false,
+            add_date_to_response: true,
             parser: Some(Box::new(Parser::new(if direction.is_downstream() {
                 ParserType::Request
             } else {
@@ -429,6 +431,12 @@ impl Http1xCodec {
     /// Releases upstream egress ownership as soon as the request completes.
     pub fn set_release_egress_after_request(&mut self, release: bool) {
         self.release_egress_after_request = release;
+    }
+
+    /// Sets whether a downstream codec adds a `Date` header to a response that lacks one. On by
+    /// default. It has no effect on an upstream codec.
+    pub fn set_add_date_header_to_response(&mut self, enabled: bool) {
+        self.add_date_to_response = enabled;
     }
 
     /// Resolves a downstream upgrade paused after request headers.
@@ -1066,7 +1074,7 @@ impl Http1xCodec {
                 self.keepalive = false;
             }
         }
-        if !upstream && !has_date {
+        if !upstream && !has_date && self.add_date_to_response {
             output.extend_from_slice(b"Date: ");
             output.extend_from_slice(HttpMessage::format_date_header().as_bytes());
             output.extend_from_slice(b"\r\n");

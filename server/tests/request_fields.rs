@@ -5,10 +5,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Tests llhttp's HTTP/1 method table, opt-in exact HTTP/2 method tokens and verbatim
-//! HTTP/2 field values. Cases run over `serve_transport` and loopback TCP, on a
-//! `RuntimeOwner` worker and a `HostedWorker`, for HTTP/1.1 and h2c, and compare the
-//! result with hyper's server given the same bytes.
+//! Tests llhttp's HTTP/1 method table, opt-in exact HTTP/2 method tokens, verbatim
+//! HTTP/2 field values and the implicit `Date` response header. Cases run over
+//! `serve_transport` and loopback TCP, on a `RuntimeOwner` worker and a `HostedWorker`,
+//! for HTTP/1.1 and h2c, and the request cases compare the result with hyper's server
+//! given the same bytes.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -28,6 +29,7 @@ use roxygen_core::handler::HandlerSessionContext;
 use roxygen_core::handler::HttpHandler;
 use roxygen_core::handler::HttpHandlerRef;
 use roxygen_core::handler::LocalHandlerFuture;
+use roxygen_core::headers::HttpHeaderCode;
 use roxygen_core::http::CodecProtocol;
 use roxygen_core::source::HttpSource;
 use roxygen_core::source_holder::HttpSourceHolder;
@@ -188,8 +190,8 @@ fn http1_request_with_fields(fields: &[(&[u8], &[u8])]) -> Vec<u8> {
     wire
 }
 
-/// Reads one HTTP/1.1 response head and returns its status code.
-async fn http1_status(client: &mut TcpStream) -> u16 {
+/// Reads one HTTP/1.1 response head, and any bytes read behind it.
+async fn http1_head(client: &mut TcpStream) -> Vec<u8> {
     let mut head = Vec::new();
     while !head.windows(4).any(|window| window == b"\r\n\r\n") {
         let mut chunk = [0; 512];
@@ -197,6 +199,12 @@ async fn http1_status(client: &mut TcpStream) -> u16 {
         assert_ne!(read, 0, "a response arrives before close: {head:?}");
         head.extend_from_slice(&chunk[..read]);
     }
+    head
+}
+
+/// Reads one HTTP/1.1 response head and returns its status code.
+async fn http1_status(client: &mut TcpStream) -> u16 {
+    let head = http1_head(client).await;
     std::str::from_utf8(&head[9..12])
         .expect("status digits")
         .parse()
@@ -1138,6 +1146,147 @@ fn an_empty_h2c_content_length_leaves_the_body_unchecked_by_default_on_both_driv
                 ),
                 "owned_http2 {owned_http2}"
             );
+        }
+    });
+}
+
+const HANDLER_DATE: &[u8] = b"Sun, 06 Nov 1994 08:49:37 GMT";
+
+/// Responds with 200, with `HANDLER_DATE` as its `Date` header when `dated` is set.
+struct DateHandler {
+    dated: bool,
+}
+
+impl HttpHandler for DateHandler {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        mut request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        let dated = self.dated;
+        Box::pin(async move {
+            request.read_header_event().await?;
+            let mut response = HttpFixedSource::make_fixed_response(200, None).expect("response");
+            if dated {
+                response
+                    .message_mut()
+                    .expect("a new response has its message")
+                    .headers_mut()
+                    .set(HttpHeaderCode::Date, HANDLER_DATE);
+            }
+            Ok(HttpSourceHolder::new(Box::new(response)))
+        })
+    }
+}
+
+/// The four server paths, HTTP/1.1 and h2c each on `UniplexSession` and on its owned
+/// driver, with `add_date_header_to_response`.
+fn date_paths(
+    add_date_header_to_response: bool,
+) -> [(&'static str, CodecProtocol, ServerSessionConfig); 4] {
+    let uniplex = ServerSessionConfig {
+        add_date_header_to_response,
+        ..session(false)
+    };
+    let owned = ServerSessionConfig {
+        owned_http1: true,
+        owned_http2: true,
+        ..uniplex.clone()
+    };
+    [
+        ("HTTP/1.1", CodecProtocol::Http11, uniplex.clone()),
+        ("owned HTTP/1.1", CodecProtocol::Http11, owned.clone()),
+        ("h2c", CodecProtocol::Http2, uniplex),
+        ("owned h2c", CodecProtocol::Http2, owned),
+    ]
+}
+
+/// The `Date` values of the response to one GET, served over `protocol` with `session` and
+/// a `DateHandler`.
+async fn response_dates(
+    context: &WorkerContext,
+    protocol: CodecProtocol,
+    session: ServerSessionConfig,
+    dated: bool,
+) -> Vec<Vec<u8>> {
+    let handler = Rc::new(DateHandler { dated });
+    let (_connection, mut client) = connect_served_with(context, protocol, session, handler).await;
+    if protocol == CodecProtocol::Http11 {
+        client
+            .write_all(&http1_request(b"GET"))
+            .await
+            .expect("request written");
+        let head = http1_head(&mut client).await;
+        let end = head
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("a complete head");
+        return head[..end]
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| {
+                let colon = line.iter().position(|byte| *byte == b':')?;
+                line[..colon]
+                    .eq_ignore_ascii_case(b"date")
+                    .then(|| line[colon + 1..].trim_ascii().to_vec())
+            })
+            .collect();
+    }
+    let (sender, connection) = h2::client::handshake(client).await.expect("h2 handshake");
+    let mut connection = std::pin::pin!(connection);
+    let exchange = async move {
+        let mut sender = sender.ready().await.expect("stream capacity");
+        let request = http::Request::builder()
+            .uri("http://localhost/generate")
+            .body(())
+            .expect("request");
+        let (response, _) = sender.send_request(request, true).expect("request sent");
+        response.await.expect("response head")
+    };
+    let response = tokio::select! {
+        response = tokio::time::timeout(Duration::from_secs(5), exchange) => {
+            response.expect("the response arrives within the bound")
+        }
+        ended = &mut connection => panic!("the h2 connection ended first: {ended:?}"),
+    };
+    assert_eq!(response.status(), 200);
+    response
+        .headers()
+        .get_all("date")
+        .iter()
+        .map(|value| value.as_bytes().to_vec())
+        .collect()
+}
+
+#[test]
+fn every_server_path_adds_a_date_to_responses_by_default() {
+    assert!(ServerSessionConfig::default().add_date_header_to_response);
+    on_worker(|context| async move {
+        for (path, protocol, session) in date_paths(true) {
+            let dates = response_dates(&context, protocol, session, false).await;
+            assert!(
+                matches!(dates.as_slice(), [date] if date.len() == 29 && date.ends_with(b" GMT")),
+                "{path}: {dates:?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn every_server_path_omits_the_implicit_date_when_disabled() {
+    on_worker(|context| async move {
+        for (path, protocol, session) in date_paths(false) {
+            let dates = response_dates(&context, protocol, session, false).await;
+            assert!(dates.is_empty(), "{path}: {dates:?}");
+        }
+    });
+}
+
+#[test]
+fn every_server_path_keeps_a_handler_date_when_the_implicit_date_is_disabled() {
+    on_worker(|context| async move {
+        for (path, protocol, session) in date_paths(false) {
+            let dates = response_dates(&context, protocol, session, true).await;
+            assert_eq!(dates, [HANDLER_DATE], "{path}");
         }
     });
 }

@@ -613,6 +613,11 @@ pub struct UniplexConfig {
     /// `httparse` does. The owned downstream HTTP/2 driver (`OwnedH2Session`) applies it as
     /// a downstream session does, and the owned upstream HTTP/2 driver rejects it.
     pub verbatim_http2_header_values: bool,
+    /// Add a `Date` header to each response that lacks one
+    /// (`Http1xCodec::set_add_date_header_to_response`,
+    /// `Http2Codec::set_add_date_header_to_response`). On by default. Upstream sessions ignore
+    /// it, and the owned downstream drivers apply it as a downstream session does.
+    pub add_date_header_to_response: bool,
 }
 
 impl Default for UniplexConfig {
@@ -634,6 +639,7 @@ impl Default for UniplexConfig {
             non_abortive_close: false,
             exact_method_tokens: false,
             verbatim_http2_header_values: false,
+            add_date_header_to_response: true,
         }
     }
 }
@@ -4144,6 +4150,7 @@ impl UniplexSession {
             }
             codec.set_exact_methods(config.exact_method_tokens && direction.is_downstream());
             codec.set_verbatim_field_values(config.verbatim_http2_header_values);
+            codec.set_add_date_header_to_response(config.add_date_header_to_response);
             let mut callback = NoopCodecCallback;
             codec.generate(&mut egress, EgressFrame::ConnectionPreface, &mut callback)?;
             codec.generate_configured_settings(&mut egress, &mut callback)?;
@@ -4163,6 +4170,7 @@ impl UniplexSession {
         } else {
             let mut codec = Http1xCodec::new(direction);
             codec.set_unframed_bodiless_requests(config.unframed_bodiless_http1_requests);
+            codec.set_add_date_header_to_response(config.add_date_header_to_response);
             (DriverCodec::Http1(codec), None)
         };
         let http2_state = http2_config.clone().map(|config| {
