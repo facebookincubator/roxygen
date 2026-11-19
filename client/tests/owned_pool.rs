@@ -2451,7 +2451,7 @@ const CHECKOUT_LEAVES_EXPIRED_TO_THE_SWEEP: &[Step] = &[
 /// Run on exact times, the model keeps open the connections that each schedule
 /// expects.
 #[test]
-fn hyper_util_model_follows_the_differential_schedules() {
+fn hyper_util_model_follows_the_sweep_schedules() {
     for steps in [
         FIRST_RELEASE_STARTS_SWEEPS,
         BUSY_SWEEP_KEEPS_THE_PERIOD,
@@ -3183,7 +3183,7 @@ impl Drop for OneConnectionOrigin {
 /// on it, that request is refused unprocessed, and the next acquisition dials a replacement or
 /// fails with the dial's error.
 #[test]
-fn an_acquisition_waiting_for_a_returning_session_that_fails_dials_or_errors_as_before() {
+fn an_acquisition_waiting_for_a_returning_session_that_fails_dials_or_errors() {
     {
         let origin = Origin::start(CodecProtocol::Http11);
         let address = origin.address;
@@ -3285,7 +3285,7 @@ fn an_acquisition_waiting_for_a_returning_session_that_fails_dials_or_errors_as_
 /// set to 0, since the acquisition does not wait, and a 1 ns idle timeout, since a session
 /// reserved again while its slot is returning is never idle between exchanges.
 #[test]
-fn pool_limits_and_idle_retirement_bound_a_back_to_back_acquisition_as_before() {
+fn pool_limits_and_idle_retirement_allow_a_back_to_back_acquisition() {
     let cases = [
         (
             "at max_connections",

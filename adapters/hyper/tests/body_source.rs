@@ -197,9 +197,7 @@ fn run_case<Work: Future<Output = ()>>(case: impl FnOnce(WorkerHandle, RuntimeHa
             .expect("scope cleanup bounded")
             .expect("all app tasks joined before quiescence");
     });
-    owner
-        .join()
-        .expect("worker physically joined outside Tokio");
+    owner.join().expect("worker thread joined outside Tokio");
 }
 
 fn message() -> HttpMessage {
@@ -296,9 +294,7 @@ fn application_runtime_body() {
         );
         assert!(body.is_end_stream());
         assert!(body.frame().await.is_none());
-        completion
-            .await
-            .expect("application task physically joined");
+        completion.await.expect("application task joined");
         assert_dropped(&actions);
         assert_eq!(
             actions
@@ -710,7 +706,7 @@ fn preadmitted_response_binds_real_head_and_attaches_during_grace() {
         head.send(message).unwrap();
         let chunks = response
             .await
-            .expect("previously admitted response completes");
+            .expect("the earlier-admitted response completes");
         assert_eq!(
             chunks,
             vec![Bytes::from_static(b"la"), Bytes::from_static(b"te")]
@@ -719,7 +715,7 @@ fn preadmitted_response_binds_real_head_and_attaches_during_grace() {
         assert_eq!(chunks[1].as_ptr(), pointer.wrapping_add(2));
         completion
             .await
-            .expect("late-attached application task physically joined");
+            .expect("late-attached application task joined");
         quiescence
             .await
             .expect("scope credit released before the long deadline");
@@ -1257,7 +1253,7 @@ fn run_manual_join_case<Work: Future<Output = ()>>(case: impl FnOnce(ManualJoinW
     }));
     native
         .join()
-        .expect("native thread physically joined while app runtime lives");
+        .expect("native thread joined while app runtime lives");
     if let Err(payload) = outcome {
         resume_unwind(payload);
     }
@@ -1338,7 +1334,7 @@ fn application_owned_join_requires_parent_before_attachment() {
             cleanup
                 .wait()
                 .await
-                .expect("unarmed rejection certifies the empty group");
+                .expect("unarmed rejection completes cleanup with no tasks");
             assert_eq!(cleanup.reaped(), 0);
             drop(body);
             runtime.quiesce(TEST_TIMEOUT).await.unwrap();
@@ -1398,7 +1394,7 @@ fn application_owned_join_unused_endpoints_retire_without_spawn() {
             cleanup
                 .wait()
                 .await
-                .expect("empty-group certification is sticky");
+                .expect("a repeated wait on empty-group cleanup also succeeds");
             assert_eq!(cleanup.reaped(), 0);
             drop(body);
         }
@@ -1585,7 +1581,7 @@ async fn parked_join_after_native_loss(native: ManualJoinWorker, gate_reaping: b
         let mut observation = Box::pin(cleanup.wait());
         assert!(
             futures::poll!(&mut observation).is_pending(),
-            "actual native scope is gone but producer join remains owed"
+            "cleanup waits for the producer join after the native scope is gone"
         );
         drop(observation);
     }
@@ -1734,7 +1730,7 @@ fn application_owned_join_preserves_original_error_and_task_panic() {
             assert_eq!(cleanup.reaped(), 1);
             observation
                 .await
-                .expect("joined failure is not uncertain cleanup");
+                .expect("a joined failure still completes cleanup");
             assert_dropped(&actions);
             drop(body);
         });
@@ -2047,7 +2043,7 @@ fn application_owned_join_loss_is_sticky_unconfirmed() {
             let mut observation = Box::pin(cleanup.wait());
             assert!(
                 futures::poll!(&mut observation).is_pending(),
-                "scope failure cannot short-circuit the producer certificate"
+                "cleanup waits for producer confirmation after scope failure"
             );
             if producer_lost {
                 drop(publisher);

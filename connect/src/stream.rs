@@ -330,7 +330,7 @@ impl HttpConnectStream {
     /// established tunnel.
     #[expect(
         clippy::too_many_arguments,
-        reason = "ports the frozen HTTPConnectStream::connect parameters one to one"
+        reason = "every argument is a distinct tunnel input with no natural grouping"
     )]
     pub fn connect<S: ConnectSession>(
         context: &WorkerContext,
@@ -414,7 +414,7 @@ impl HttpConnectStream {
     /// established tunnel.
     #[expect(
         clippy::too_many_arguments,
-        reason = "ports the frozen HTTPConnectStream::connectUnique parameters one to one"
+        reason = "takes the same distinct tunnel inputs as connect"
     )]
     pub fn connect_unique<S: ConnectSession>(
         context: &WorkerContext,

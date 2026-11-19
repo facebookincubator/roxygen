@@ -101,7 +101,7 @@ fn check_attempt(attempt: Attempt, direct: bool) {
                     .send_prepared_request(prepared)
                     .expect("request starts"),
             );
-            drive_core_callbacks(&session.state, &handle.read_wake).expect("callbacks settle");
+            drive_core_callbacks(&session.state, &handle.read_wake).expect("callbacks run");
             let stream = session
                 .state
                 .borrow()
@@ -491,7 +491,7 @@ fn an_empty_h2_egress_order_skips_the_stream_scan() {
                 let response = handle.send_request(source, cancellation.token()).await;
                 responses.push(response.expect("request starts"));
             }
-            drive_core_callbacks(&session.state, &handle.read_wake).expect("callbacks settle");
+            drive_core_callbacks(&session.state, &handle.read_wake).expect("callbacks run");
             let mut queued = session.state.borrow_mut().take_egress_work();
             assert_eq!(queued.len(), 3);
             {

@@ -3277,7 +3277,7 @@ fn h1_publication_case(case: H1PublicationCase) -> H1PublicationOutcome {
                     let mut receipt = completion.wait();
                     h1_require(
                         poll_fn(|context| Poll::Ready(receipt.as_mut().poll(context).is_pending())).await,
-                        "early response certified an incomplete upload",
+                        "completion was ready before the upload finished",
                     )?;
                     drop(receipt);
                     if let Some(policy) = timeout_policy {
@@ -3934,7 +3934,7 @@ fn h1_header_eom_phase_case(case: H1HeaderEomCase) {
                 tokio::time::advance(timer_tick).await;
                 h1_require(
                     tokio::time::Instant::now() == deadline + timer_tick,
-                    "timer settlement exceeded one backend tick",
+                    "the timer took more than one backend tick",
                 )?;
                 h1_retained_header_error(&mut read).await
             }
@@ -8981,7 +8981,7 @@ async fn h1_ingress_retirement_operation(context: WorkerContext, state: Rc<H1Ing
             .is_ready()
         {
             return Err(SelectedCloseStageError::EarlyRun(
-                "held write certified cleanup",
+                "completion was ready while a write was held",
             ));
         }
         if !handle

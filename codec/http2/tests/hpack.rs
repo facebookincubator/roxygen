@@ -1518,7 +1518,7 @@ mod huffman {
         assert_eq!(
             (fnv1a64(&stream), stream.len()),
             (0x7a64_e577_303d_2b80, 216_726),
-            "recorded before any Huffman decoder change"
+            "the Huffman decoder output matches the golden digest"
         );
     }
 
@@ -1531,7 +1531,7 @@ mod huffman {
         assert_eq!(
             (fnv1a64(&stream), stream.len()),
             (0xdb17_3cbf_ef1a_576e, 86_374),
-            "recorded before any Huffman encoder change"
+            "the Huffman encoder output matches the golden digest"
         );
     }
 
@@ -2690,7 +2690,7 @@ mod hpack_context {
         assert_eq!(
             (fnv1a64(&wire), wire.len(), fnv1a64(&stream), stream.len()),
             (0xce16_dfde_03cd_71f5, 572, 0xf681_d188_c263_467d, 732),
-            "recorded before any Huffman decoder change"
+            "the consumer-shaped wire and decoded fields match the golden digests"
         );
     }
 
@@ -2874,7 +2874,7 @@ mod hpack_context {
                     153
                 ),
             ],
-            "recorded before any literal-scratch change"
+            "the consumer-shaped wire, decoded fields and table match the golden digests"
         );
     }
 
@@ -3926,7 +3926,7 @@ mod hpack_codec {
         assert_eq!(
             (fnv1a64(&wire), wire.len()),
             (0x134a_2162_91b5_f740, 80_249),
-            "the golden HPACK sequence's FNV-1a digest and length, recorded at 4194b6f17524"
+            "the golden HPACK sequence's FNV-1a digest and length"
         );
     }
 
@@ -3953,7 +3953,7 @@ mod hpack_codec {
         assert_eq!(
             (fnv1a64(&stream), stream.len()),
             (0x08b7_4c32_9f1c_0fef, 467_144),
-            "the decoded golden blocks' length-prefixed name/value stream, recorded at 1ab7e556f82e"
+            "the decoded golden blocks' length-prefixed name/value stream"
         );
     }
 
@@ -4246,8 +4246,7 @@ mod hpack_codec {
             (digest.hash, digest.length),
             (0x62ba_44e6_5f2e_f974, 82_210_029),
             "the RFC 7541 Appendix C and golden blocks decoded contiguously, split, from a cut \
-             queue and truncated: every decode's events and final decoder state, recorded at \
-             e56cb47a8dee"
+             queue and truncated: every decode's events and final decoder state"
         );
     }
 
@@ -4393,8 +4392,7 @@ mod hpack_codec {
         assert_eq!(
             (fnv1a64(&stats), stats.len()),
             (0x8b42_4ea3_0089_f126, 18_000),
-            "the borrowed-input golden blocks' (encoded length, uncompressed, fields) triples, \
-             recorded at 29a715fcd667"
+            "the borrowed-input golden blocks' (encoded length, uncompressed, fields) triples"
         );
     }
 
@@ -4698,7 +4696,7 @@ mod hpack_codec {
         assert_eq!(
             (fnv1a64(&stream), stream.len()),
             (0x6a50_2f26_3134_ebfc, 7_601_938),
-            "the encoder-equivalence sequence's wire bytes and table states, recorded at 3e8f525cff27"
+            "the encoder-equivalence sequence's wire bytes and table states"
         );
     }
 
@@ -4909,7 +4907,7 @@ mod hpack_codec {
             (fnv1a64(&stream), stream.len()),
             (0x8387_ef6b_0f53_633d, 234_833),
             "the encoder-memo sequence's wire bytes, table states, encoded sizes and compression \
-             info, recorded at 167176432c6d"
+             info"
         );
     }
 
@@ -4951,7 +4949,7 @@ mod hpack_codec {
         assert_eq!(
             (fnv1a64(&wire), wire.len()),
             (0xb9c0_cbae_6936_703c, 55),
-            "the HTTP/1-sourced blocks' FNV-1a digest and length, recorded at 692435845855"
+            "the HTTP/1-sourced blocks' FNV-1a digest and length"
         );
     }
 
@@ -5023,7 +5021,7 @@ mod hpack_codec {
         assert_eq!(
             (fnv1a64(&wire), wire.len()),
             (0x847d_c5cd_416f_3e71, 2_292),
-            "the mixed-case query blocks' FNV-1a digest and length, recorded at e9d82bf3157a"
+            "the mixed-case query blocks' FNV-1a digest and length"
         );
     }
 
@@ -5534,7 +5532,7 @@ mod hpack_codec {
             (digest.hash, digest.length),
             (0x3b59_51bf_3754_2cb7, 1_595_913),
             "the golden and literal-name blocks' decoded codes, names, values, results and \
-             decoder states, recorded at df5729995574"
+             decoder states"
         );
     }
 

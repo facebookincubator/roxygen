@@ -2532,13 +2532,13 @@ mod connector {
 
     #[test]
     fn unknown_tls_alpn_falls_back_to_http1() {
-        let (server, certificate) = start_tls_server(&[b"proxygen-test"]);
+        let (server, certificate) = start_tls_server(&[b"roxygen-test"]);
         let address = server.address().expect("server has an address");
         let protocol = run_on_worker(move |context| {
             Box::pin(async move {
                 let mut tls = TlsClientOptions::new("localhost");
                 tls.add_root_certificate(certificate);
-                tls.set_alpn_protocols([b"proxygen-test".as_slice()]);
+                tls.set_alpn_protocols([b"roxygen-test".as_slice()]);
                 HttpConnector::connect(
                     &context,
                     socket_address(address),

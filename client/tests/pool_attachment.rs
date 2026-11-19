@@ -2365,7 +2365,7 @@ fn attached_pool_acquisition_after_drain_dials_a_replacement() {
             let replacement = pool
                 .get_session_with_reservation(CancellationToken::never())
                 .await
-                .expect("the draining session no longer holds the only slot");
+                .expect("the draining session does not hold the only slot");
             assert!(!replacement.session.is_same_session(&first));
             assert_eq!(fixture.calls.get(), 2);
             assert!(!first.is_finished(), "the in-flight request keeps it open");
@@ -4327,7 +4327,7 @@ fn attached_pool_completed_factory_drop_preserves_handoff() {
         pending(joined.as_mut()).await;
         assert!(
             !leased.session.is_finished(),
-            "failure cannot certify an outstanding session lease"
+            "a cleanup failure does not finish a leased session"
         );
         drop(leased.reservation);
         assert!(matches!(joined.await, Err(PoolError::CleanupPanicked)));

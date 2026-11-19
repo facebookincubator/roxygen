@@ -433,7 +433,7 @@ mod runtime {
 
     #[expect(
         clippy::manual_noop_waker,
-        reason = "the oracle drives this waker's drop, which `Waker::noop()` cannot carry"
+        reason = "the test checks where this waker is dropped, which `Waker::noop()` cannot report"
     )]
     impl Wake for OwningWaker {
         fn wake(self: Arc<Self>) {}

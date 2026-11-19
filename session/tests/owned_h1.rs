@@ -7332,7 +7332,7 @@ fn oversized_events_in_one_poll(events: usize) -> (usize, Vec<usize>) {
 /// again before such an event's write would spend one more turn per event, and the driver would
 /// yield sooner.
 #[test]
-fn oversized_body_events_ready_at_once_yield_as_before() {
+fn oversized_body_events_ready_together_yield() {
     let recorded: &[(usize, usize, usize)] = &[(16, 0, 29), (21, 0, 37), (22, 0, 38), (32, 1, 53)];
     let actual: Vec<String> = [16, 21, 22, 32]
         .into_iter()
@@ -7394,7 +7394,7 @@ fn pushed_events_in_one_poll(events: usize) -> (usize, usize, Vec<usize>) {
 /// event fewer ends the poll without a yield; one more starts the write in the last turn, which
 /// yields immediately.
 #[test]
-fn a_write_started_at_the_turn_budget_edge_yields_as_before() {
+fn a_write_started_at_the_turn_budget_edge_yields() {
     let recorded: &[(usize, usize, &[usize])] = &[
         (60, 0, &[106, 360, 13]),
         (61, 1, &[106, 366, 13]),

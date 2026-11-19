@@ -1540,7 +1540,7 @@ impl PressureState {
                 let pair = pair.ok_or(FixtureError::Assertion("both socket pairs recorded"))?;
                 require(
                     target.ledger()?.socket_profile == Some(pair.receiver),
-                    "frozen receiver profile belongs to the actual target recorder",
+                    "captured receiver profile belongs to the actual target recorder",
                 )?;
             }
             require(
@@ -7984,7 +7984,7 @@ async fn pressure_matrix(
         if let Some(pair) = socket_profile {
             require(
                 target.ledger()?.socket_profile == Some(pair.receiver),
-                "body target binds the frozen socket profile before healthy progress",
+                "body target binds the captured socket profile before healthy progress",
             )?;
         }
         pressure_probe(endpoint, &mut healthy, &target, upload.as_mut(), addresses).await?;

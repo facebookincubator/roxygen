@@ -6434,7 +6434,7 @@ fn ready_owner_suffix_precedes_later_cross_thread_wake_after_yield() {
                 }
                 assert!(
                     !wake.0.load(Ordering::SeqCst),
-                    "initial owner readiness settles"
+                    "initial owner readiness stops waking the session"
                 );
                 assert!(state.borrow().reads.is_empty());
                 assert!(
@@ -6487,7 +6487,10 @@ fn ready_owner_suffix_precedes_later_cross_thread_wake_after_yield() {
                         break;
                     }
                 }
-                assert!(!wake.0.load(Ordering::SeqCst), "the ready owners settle");
+                assert!(
+                    !wake.0.load(Ordering::SeqCst),
+                    "the ready owners stop waking the session"
+                );
                 assert_eq!(
                     *gate.pending_visits.as_ref().unwrap().borrow(),
                     (0..66).collect::<Vec<_>>()
@@ -13427,7 +13430,7 @@ fn credit_during_a_budget_yield_is_not_folded() {
                         }
                     }
                 }
-                assert!(settled, "the requests settle");
+                assert!(settled, "the requests stop waking the session");
                 assert!(bodies.iter().enumerate().all(|(ordinal, (length, ..))| {
                     held_body_buffered(&probes, ordinal, *length as u64)
                 }));
@@ -13480,7 +13483,7 @@ fn credit_during_a_budget_yield_is_not_folded() {
                         }
                     }
                 }
-                assert!(settled, "A and B settle");
+                assert!(settled, "A and B stop waking the session");
                 assert_eq!(
                     *gate.pending_visits.as_ref().unwrap().borrow(),
                     (0..65).collect::<Vec<_>>()
@@ -18777,10 +18780,7 @@ fn connection_credit_cut_short_by_the_stream_window_arms_the_stream_flow_timeout
                     frames.resets.is_empty(),
                     "the flow-control timeout came early"
                 );
-                assert!(
-                    frames.goaways.is_empty(),
-                    "the connection is no longer blocked"
-                );
+                assert!(frames.goaways.is_empty(), "the connection is unblocked");
                 host.advance(Duration::from_millis(1));
                 settle_turns(32).await;
                 let frames = written_frames(&state, 1);
@@ -21068,7 +21068,7 @@ async fn small_body_read_wakes_over(context: WorkerContext, inline_wakes: bool) 
 /// the same read folds. This checks current behavior: a change that clears the stale mark would
 /// let the first case fold too, and should invert its expectation.
 #[test]
-fn credit_after_an_inline_woken_write_wakes_the_session_as_before() {
+fn credit_after_an_inline_woken_write_wakes_the_session() {
     let inline = run_on_fold_worker(|context| Box::pin(small_body_read_wakes_over(context, true)));
     let fixture =
         run_on_fold_worker(|context| Box::pin(small_body_read_wakes_over(context, false)));

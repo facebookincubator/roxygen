@@ -180,7 +180,7 @@ mod ingress_state {
     }
 
     #[test]
-    fn every_non_datagram_transition_matches_the_frozen_table() {
+    fn every_non_datagram_event_matches_the_transition_table() {
         const STATES: [IngressState; 11] = [
             IngressState::Start,
             IngressState::NonFinalHeadersReceived,

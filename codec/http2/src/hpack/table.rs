@@ -1831,7 +1831,7 @@ mod tests {
     }
 
     #[test]
-    fn lookup_matches_frozen_linear_scan_over_random_operations() {
+    fn lookup_matches_a_linear_scan_over_random_operations() {
         for (base, operations) in [(256, 20_000), (4096, 20_000), (65536, 3_000)] {
             let seed = 0x9E37_79B9_7F4A_7C15 ^ u64::from(base);
             run_against_linear_scan(base, operations, seed, true);

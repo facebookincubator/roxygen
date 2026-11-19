@@ -197,7 +197,7 @@ impl RuntimeHandle {
 
 /// Resolves once every worker's cleanup has finished. Dropping it does not
 /// stop that cleanup.
-#[must_use = "await quiescence before physically joining the runtime at its root"]
+#[must_use = "await quiescence before joining the runtime at its root"]
 pub struct QuiesceFuture {
     inner: Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + 'static>>,
 }

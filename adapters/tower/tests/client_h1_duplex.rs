@@ -515,7 +515,7 @@ async fn exercise(
     let mut completion = Box::pin(exchange.wait());
     require(
         poll_fn(|context| Poll::Ready(completion.as_mut().poll(context).is_pending())).await,
-        "early response cannot certify pending upload",
+        "early response does not complete the exchange before the upload ends",
     )?;
     if cancel {
         require(

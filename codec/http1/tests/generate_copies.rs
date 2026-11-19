@@ -1966,7 +1966,7 @@ fn static_body(segments: &[&'static [u8]]) -> BufQueue {
 }
 
 #[test]
-fn chunk_size_prefixes_match_the_frozen_format() {
+fn chunk_size_prefixes_match_format_hex() {
     let mut codec = chunked_response_codec();
     let stream = StreamId::new(1);
     for length in (1..=4_096)

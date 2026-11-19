@@ -1396,7 +1396,7 @@ const CHECKOUT_LEAVES_EXPIRED_TO_THE_SWEEP: &[Step] = &[
 /// Run on exact times, the model keeps open the connections that each schedule
 /// expects.
 #[test]
-fn hyper_util_model_follows_the_differential_schedules() {
+fn hyper_util_model_follows_the_sweep_schedules() {
     for steps in [
         FIRST_RELEASE_STARTS_SWEEPS,
         BUSY_SWEEP_KEEPS_THE_PERIOD,

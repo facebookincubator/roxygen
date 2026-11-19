@@ -208,7 +208,7 @@ mod egress_state {
     }
 
     #[test]
-    fn every_non_datagram_transition_matches_the_frozen_table() {
+    fn every_non_datagram_event_matches_the_transition_table() {
         const STATES: [EgressState; 9] = [
             EgressState::Start,
             EgressState::HeadersSent,

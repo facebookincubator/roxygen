@@ -8615,11 +8615,11 @@ fn owned_h1_upstream_encoded_headers_panic_fails_only_a_request_with_a_body() {
 #[cfg(panic = "unwind")]
 #[test]
 fn owned_h1_upstream_run_whose_poll_unwinds_is_poisoned() {
-    for mode in [n8::Mode::Run, n8::Mode::PullThrough] {
+    for mode in [pull_through::Mode::Run, pull_through::Mode::PullThrough] {
         run_on_host(move |context| {
             Box::pin(async move {
                 take_contained_panics();
-                let mut fixture = n8::Fixture::new(context, mode, |_| {});
+                let mut fixture = pull_through::Fixture::new(context, mode, |_| {});
                 crate::owned_h1::fault_next_upstream_run_poll();
                 let unwound = catch_unwind(AssertUnwindSafe(|| fixture.poll_run()));
                 let Err(panic) = unwound else {
@@ -8657,10 +8657,10 @@ fn owned_h1_upstream_run_whose_poll_unwinds_is_poisoned() {
 /// `run_pull_through` alike.
 #[test]
 fn polling_a_finished_owned_upstream_run_returns_an_error() {
-    for mode in [n8::Mode::Run, n8::Mode::PullThrough] {
+    for mode in [pull_through::Mode::Run, pull_through::Mode::PullThrough] {
         run_on_host(move |context| {
             Box::pin(async move {
-                let mut fixture = n8::Fixture::new(context, mode, |_| {});
+                let mut fixture = pull_through::Fixture::new(context, mode, |_| {});
                 assert!(fixture.poll_run().is_pending());
                 assert!(fixture.handle.close_when_idle().unwrap());
                 fixture
@@ -10061,7 +10061,7 @@ fn owned_h1_upstream_runs_sequential_exchanges_over_a_tcp_byte_stream() {
 
 /// Pull-through exchanges, whose response body drives its connection's driver from inside its
 /// reads.
-mod n8 {
+mod pull_through {
     use roxygen_core::stream_source::HttpResponseReader;
     use roxygen_core::stream_source::HttpResponseSource;
     use roxygen_core::stream_source::HttpResponseSourceOwner;
@@ -10350,7 +10350,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_differential_content_length() {
+    fn matches_run_content_length() {
         let outcome = assert_pull_through_matches_run(Case::get("content-length", |gates| {
             answer(gates, OK_RESPONSE)
         }));
@@ -10361,7 +10361,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_differential_chunked_with_trailers() {
+    fn matches_run_chunked_with_trailers() {
         let outcome = assert_pull_through_matches_run(Case::get("chunked", |gates| {
             answer(
                 gates,
@@ -10376,7 +10376,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_differential_close_delimited() {
+    fn matches_run_close_delimited() {
         let outcome = assert_pull_through_matches_run(Case::get("close-delimited", |gates| {
             answer(gates, b"HTTP/1.1 200 OK\r\n\r\nok")
         }));
@@ -10387,7 +10387,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_differential_eof_inside_a_response() {
+    fn matches_run_eof_inside_a_response() {
         let outcome = assert_pull_through_matches_run(Case::get("eof inside", |gates| {
             answer(gates, b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nok")
         }));
@@ -10395,7 +10395,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_differential_informational_heads() {
+    fn matches_run_informational_heads() {
         let outcome = assert_pull_through_matches_run(Case::get("informational", |gates| {
             answer(
                 gates,
@@ -10406,7 +10406,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_differential_bodiless_responses() {
+    fn matches_run_bodiless_responses() {
         let mut head = Case::get("HEAD", |gates| {
             answer(gates, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
         });
@@ -10437,7 +10437,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_differential_connection_close() {
+    fn matches_run_connection_close() {
         for case in [
             Case::get("Connection: close", |gates| answer(gates, CLOSE_RESPONSE)),
             Case::get("HTTP/1.0", |gates| {
@@ -10450,7 +10450,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_differential_bytes_behind_a_response() {
+    fn matches_run_bytes_behind_a_response() {
         let outcome = assert_pull_through_matches_run(Case::get("bytes behind", |gates| {
             answer(
                 gates,
@@ -10475,7 +10475,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_differential_large_body_with_a_flow_pause() {
+    fn matches_run_large_body_with_a_flow_pause() {
         let mut case = Case::get("flow pause", large_response_reads);
         case.configure = |config| config.ingress_buffer_limit = 16 << 10;
         case.maximum = 4 << 10;
@@ -10485,7 +10485,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_differential_early_response_with_an_unfinished_upload() {
+    fn matches_run_early_response_with_an_unfinished_upload() {
         let case = Case {
             request: || (post_head(Some(5), false), Vec::new()),
             gated_upload: true,
@@ -10503,7 +10503,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_differential_large_upload() {
+    fn matches_run_large_upload() {
         let case = Case {
             request: large_request,
             ..Case::get("large upload", |gates| answer(gates, OK_RESPONSE))
@@ -10523,7 +10523,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_differential_cancel_from_a_settle_callback() {
+    fn matches_run_cancel_from_a_settle_callback() {
         for (callback, response) in [
             ("capacity_released", OK_RESPONSE),
             ("capacity_available", OK_RESPONSE),
@@ -10544,7 +10544,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_differential_read_error_after_a_flow_pause() {
+    fn matches_run_read_error_after_a_flow_pause() {
         let mut case = Case::get("read error", |gates| {
             let body = patterned(24 << 10);
             let mut first =
@@ -10636,7 +10636,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_differential_keep_alive_reuse() {
+    fn matches_run_keep_alive_reuse() {
         let run = reuse_outcome(false, [false, false]);
         assert_eq!(run.0[1].body, b"two");
         for kinds in [[true, true], [true, false], [false, true]] {
@@ -10692,7 +10692,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_plain_submissions_on_a_pull_through_session_behave_as_run() {
+    fn plain_submissions_on_a_pull_through_session_behave_as_run() {
         for case in matrix() {
             assert_eq!(
                 exchange_outcome(Mode::PlainOnPullThrough, case),
@@ -10704,7 +10704,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_submit_pull_through_is_refused_on_a_session_run_with_run() {
+    fn submit_pull_through_is_refused_on_a_session_run_with_run() {
         run_on_host(|context| {
             Box::pin(async move {
                 let (transport, state) = ScriptedTransport::new([]);
@@ -11236,7 +11236,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_each_event_is_taken_in_the_read_that_parses_it() {
+    fn each_event_is_taken_in_the_read_that_parses_it() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -11276,7 +11276,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_run_future_does_not_poll_a_held_driver() {
+    fn run_future_does_not_poll_a_held_driver() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -11296,7 +11296,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_the_run_is_polled_only_after_a_wake() {
+    fn the_run_is_polled_only_after_a_wake() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -11334,7 +11334,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_acquisition_retires_a_pending_waiting_read() {
+    fn acquisition_retires_a_pending_waiting_read() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -11379,7 +11379,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_a_read_nested_in_the_run_s_drive_waits_without_taking_the_drive() {
+    fn a_read_nested_in_the_run_s_drive_waits_without_taking_the_drive() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -11431,7 +11431,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_an_unfinished_upload_keeps_the_run_driving_until_the_request_is_written() {
+    fn an_unfinished_upload_keeps_the_run_driving_until_the_request_is_written() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -11484,7 +11484,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_a_fatal_abort_while_held_and_unread_completes_the_run() {
+    fn a_fatal_abort_while_held_and_unread_completes_the_run() {
         run_on_host(|context| {
             Box::pin(async move {
                 take_contained_panics();
@@ -11537,7 +11537,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_an_inline_completion_leaves_the_driver_to_the_run() {
+    fn an_inline_completion_leaves_the_driver_to_the_run() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -11627,7 +11627,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_eof_while_held_and_unread_is_applied_at_the_next_read() {
+    fn eof_while_held_and_unread_is_applied_at_the_next_read() {
         for deliver in [false, true] {
             let (run_events, run_error, run_closed) = eof_while_unread(Mode::Run, deliver);
             let (events, error, closed) = eof_while_unread(Mode::PullThrough, deliver);
@@ -11688,7 +11688,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_an_unread_body_stops_the_upstream_reading() {
+    fn an_unread_body_stops_the_upstream_reading() {
         assert_eq!(
             reads_while_unread(Mode::Run),
             3,
@@ -11701,7 +11701,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_the_eom_read_wakes_only_the_run() {
+    fn the_eom_read_wakes_only_the_run() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -11751,7 +11751,7 @@ mod n8 {
     /// run retires the exchange. One poll of the run then retires the exchange, commits the
     /// pull-through request submitted meanwhile and writes it.
     #[test]
-    fn n8_the_eom_read_admits_the_next_request_before_the_run_retires_the_exchange() {
+    fn the_eom_read_admits_the_next_request_before_the_run_retires_the_exchange() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -11801,7 +11801,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_a_source_completion_while_held_wakes_only_the_run() {
+    fn a_source_completion_while_held_wakes_only_the_run() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -11830,7 +11830,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_a_body_read_after_its_response_ended_does_not_take_the_drive() {
+    fn a_body_read_after_its_response_ended_does_not_take_the_drive() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -11889,7 +11889,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_eof_after_the_response_end_is_applied_at_once() {
+    fn eof_after_the_response_end_is_applied_immediately() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -11931,7 +11931,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_a_producer_abort_completes_the_source_at_once_and_returns_the_drive() {
+    fn a_producer_abort_completes_the_source_immediately_and_returns_the_drive() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -11960,7 +11960,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_an_immediately_ready_budget_yield_is_not_lost() {
+    fn an_immediately_ready_budget_yield_is_not_lost() {
         run_on_host_with(|host, context| {
             Box::pin(async move {
                 host.set_yield_mode(crate::external_host_tests::YieldMode::Immediate);
@@ -12000,7 +12000,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_a_connection_cancel_while_held_and_unread_is_applied_by_the_run() {
+    fn a_connection_cancel_while_held_and_unread_is_applied_by_the_run() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -12034,7 +12034,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_a_third_party_request_cancel_while_held_is_applied_by_the_run() {
+    fn a_third_party_request_cancel_while_held_is_applied_by_the_run() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -12125,17 +12125,17 @@ mod n8 {
     }
 
     #[test]
-    fn n8_a_connection_cancel_before_acquisition_with_a_pending_yield_is_applied_by_the_run() {
+    fn a_connection_cancel_before_acquisition_with_a_pending_yield_is_applied_by_the_run() {
         cancel_before_acquisition_with_a_pending_yield(false, HttpErrorCode::CORO_CANCELLED);
     }
 
     #[test]
-    fn n8_a_request_cancel_before_acquisition_with_a_pending_yield_is_applied_by_the_run() {
+    fn a_request_cancel_before_acquisition_with_a_pending_yield_is_applied_by_the_run() {
         cancel_before_acquisition_with_a_pending_yield(true, HttpErrorCode::CANCEL);
     }
 
     #[test]
-    fn n8_a_token_cancel_while_held_and_unread_is_applied_by_the_run() {
+    fn a_token_cancel_while_held_and_unread_is_applied_by_the_run() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -12174,7 +12174,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_a_cancel_from_an_inline_callback_revokes_without_borrowing_the_driver() {
+    fn a_cancel_from_an_inline_callback_revokes_without_borrowing_the_driver() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -12213,7 +12213,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_worker_cancellation_while_held_completes_the_run_on_its_scope() {
+    fn worker_cancellation_while_held_completes_the_run_on_its_scope() {
         run_on_host(|context| {
             Box::pin(async move {
                 let worker = context.handle().clone();
@@ -12243,7 +12243,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_dropping_the_run_while_held_revokes_and_aborts() {
+    fn dropping_the_run_while_held_revokes_and_aborts() {
         let (inspected_tx, inspected_rx) = std::sync::mpsc::channel();
         let completion = forced_teardown_of_scope(move |context| {
             let gate = Arc::new(tokio::sync::Notify::new());
@@ -12320,7 +12320,7 @@ mod n8 {
     /// abort, no join assertion, and a panic the driver contained in that drive (here the
     /// transport's reset) is counted, not resumed.
     #[test]
-    fn n8_dropping_the_run_with_a_stashed_completion_neither_aborts_nor_asserts() {
+    fn dropping_the_run_with_a_stashed_completion_neither_aborts_nor_asserts() {
         for panics in [false, true] {
             let (dropped, reports) = run_on_host(move |context| {
                 Box::pin(async move {
@@ -12373,7 +12373,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_response_observation_is_refused_on_a_pull_through_exchange() {
+    fn response_observation_is_refused_on_a_pull_through_exchange() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -12394,7 +12394,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_a_second_pull_through_exchange_is_refused() {
+    fn a_second_pull_through_exchange_is_refused() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -12415,7 +12415,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_a_drain_while_held_finishes_the_exchange_then_closes() {
+    fn a_drain_while_held_finishes_the_exchange_then_closes() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -12491,7 +12491,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_one_holder_read_buffers_at_most_the_ingress_limit() {
+    fn one_holder_read_buffers_at_most_the_ingress_limit() {
         let run = first_read_after_a_stall(Mode::Run);
         let pull_through = first_read_after_a_stall(Mode::PullThrough);
         assert_eq!(
@@ -12505,7 +12505,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_a_slow_reader_gets_the_whole_body_after_flow_pauses() {
+    fn a_slow_reader_gets_the_whole_body_after_flow_pauses() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |config| {
@@ -12588,7 +12588,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_eof_while_idle_is_applied_at_once() {
+    fn eof_while_idle_is_applied_immediately() {
         let pull_through = eof_while_idle(Mode::PullThrough);
         assert_eq!(pull_through, eof_while_idle(Mode::Run));
         assert!(pull_through.0, "admission closes at once");
@@ -12637,7 +12637,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_an_upstream_reset_mid_response_delivers_kept_events_then_the_error() {
+    fn an_upstream_reset_mid_response_delivers_kept_events_then_the_error() {
         let pull_through = reset_mid_response(Mode::PullThrough);
         assert_eq!(pull_through, reset_mid_response(Mode::Run));
         assert_eq!(
@@ -12706,7 +12706,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_dropping_the_body_mid_response_closes_the_connection_as_run_does() {
+    fn dropping_the_body_mid_response_closes_the_connection_as_run_does() {
         for gated in [false, true] {
             for point in [DropPoint::Pending, DropPoint::Armed] {
                 let run = dropped_mid_response(Mode::Run, gated, point);
@@ -12721,7 +12721,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_dropping_the_body_from_an_inline_callback_does_not_poll_the_run() {
+    fn dropping_the_body_from_an_inline_callback_does_not_poll_the_run() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut a = Fixture::new(context.clone(), Mode::PullThrough, |_| {});
@@ -12759,7 +12759,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_a_body_dropped_while_unwinding_does_not_poll_the_run() {
+    fn a_body_dropped_while_unwinding_does_not_poll_the_run() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -12802,7 +12802,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_inline_drives_run_under_the_holder_s_runtime_context() {
+    fn inline_drives_run_under_the_holder_s_runtime_context() {
         run_on_host(|context| {
             Box::pin(async move {
                 let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
@@ -12842,7 +12842,7 @@ mod n8 {
     /// A Driver-scope panic inside an inline drive tears the connection down; the run future
     /// finishes the teardown and fails with `INTERNAL_ERROR`, and the panic is counted once.
     #[test]
-    fn n8_a_callback_panic_in_an_inline_drive_fails_the_run() {
+    fn a_callback_panic_in_an_inline_drive_fails_the_run() {
         run_on_host(|context| {
             Box::pin(async move {
                 take_contained_panics();
@@ -13048,7 +13048,7 @@ mod n8 {
     }
 
     #[test]
-    fn n8_a_downstream_cancel_from_an_inline_callback_serializes_nothing_more() {
+    fn a_downstream_cancel_from_an_inline_callback_serializes_nothing_more() {
         let run = downstream_cancel_outcome(Mode::Run);
         let pull_through = downstream_cancel_outcome(Mode::PullThrough);
         assert!(

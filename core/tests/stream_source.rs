@@ -895,7 +895,7 @@ mod stream_source {
     }
 
     #[test]
-    fn content_length_accepts_all_folly_c_whitespace() {
+    fn content_length_accepts_c_whitespace() {
         for content_length in [b"\x0b5\x0c".as_slice(), b"\x0c5\x0b".as_slice()] {
             assert_content_length_mismatch(content_length, b"body");
         }

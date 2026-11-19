@@ -2802,7 +2802,7 @@ fn forced_native_drop_during_startup_and_io_claim_retains_disposition() {
 }
 
 #[test]
-fn app_leaf_drain_cannot_certify_run_parent_join() {
+fn app_leaf_drain_does_not_complete_parent_join() {
     for mode in 0..3 {
         terminal_waker_case(mode);
     }

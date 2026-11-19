@@ -1388,7 +1388,7 @@ fn set_expected_content_length(state: &Rc<RefCell<QueueState>>, content_length: 
         state.borrow_mut().should_validate_content_length = false;
         return;
     }
-    let Some(content_length) = parse_folly_u64(content_length) else {
+    let Some(content_length) = parse_content_length(content_length) else {
         state.borrow_mut().should_validate_content_length = false;
         return;
     };
@@ -1424,7 +1424,7 @@ fn notify_content_length_mismatch(state: &Rc<RefCell<QueueState>>, eom: bool) {
     }
 }
 
-fn parse_folly_u64(value: &[u8]) -> Option<u64> {
+fn parse_content_length(value: &[u8]) -> Option<u64> {
     let start = value
         .iter()
         .position(|byte| !matches!(*byte, b' ' | b'\t'..=b'\r'))

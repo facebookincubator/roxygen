@@ -558,7 +558,7 @@ pub(crate) mod support {
             }
             assert!(
                 Instant::now() < deadline,
-                "the threads named {wanted}* never settled"
+                "the count of threads named {wanted}* did not stabilize"
             );
             previous = listed;
         }

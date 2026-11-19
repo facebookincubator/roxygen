@@ -1222,7 +1222,7 @@ fn shared_token_queued_submissions_keep_survivor_wake_after_first_unregisters() 
                             return;
                         }
                     }
-                    panic!("held I/O must allow incidental readiness to settle");
+                    panic!("incidental readiness stops waking the session while its I/O is held");
                 };
                 poll_to_quiescence();
                 assert_eq!(
@@ -1638,7 +1638,7 @@ fn reservations_survive_settings_zero_but_cannot_commit_after_goaway() {
                         )
                         .await
                         .err()
-                        .expect("GOAWAY refuses a previously reserved request");
+                        .expect("GOAWAY refuses a request reserved before it");
                     assert_eq!(error.code(), HttpErrorCode::REFUSED_STREAM);
                     assert_eq!(probe.reads.get(), 0);
                     assert_eq!(probe.drops.get(), 1);
@@ -4673,7 +4673,7 @@ fn completed_upload_keeps_cancellation_wake_while_write_is_held(direct_control: 
                             return;
                         }
                     }
-                    panic!("held I/O must allow incidental readiness to settle");
+                    panic!("incidental readiness stops waking the session while its I/O is held");
                 };
                 let mut submission = handle.reserve_request().unwrap().submit(
                     request_head(HttpMethod::Post, false, Some(1)),
@@ -7078,7 +7078,7 @@ fn release_outside_the_poll_still_wakes() {
     });
     assert_eq!(
         woken, 1,
-        "dropping a reservation outside the session's poll wakes the session, as before"
+        "dropping a reservation outside the session's poll wakes the session once"
     );
 }
 
@@ -7752,7 +7752,7 @@ fn cancel_after_release_schedules_no_wake() {
         assert_eq!(
             exchange.quiet,
             [0, 0, 0],
-            "a settled session holding an unread, ended response is neither polled nor woken \
+            "a quiet session holding an unread, ended response is neither polled nor woken \
              (polls, wakes, in-poll wakes)"
         );
     }

@@ -7884,7 +7884,7 @@ mod tcp_tls {
                 transport.shutdown_write(&context).unwrap();
                 assert!(
                     writer.is_saturated(),
-                    "a transport whose write side is shut can no longer write"
+                    "a transport whose write side is shut cannot write"
                 );
                 assert!(
                     writer.can_write(5),
@@ -7927,10 +7927,7 @@ mod tcp_tls {
                     "the receipt reports the bytes the socket took before the reset: {}",
                     error.bytes_written(),
                 );
-                assert!(
-                    writer.is_saturated(),
-                    "a reset transport can no longer write"
-                );
+                assert!(writer.is_saturated(), "a reset transport cannot write");
                 writer.start_write(queue(&[b"late"])).unwrap();
                 let late = poll_fn(|context| writer.poll_complete(context)).await;
                 assert_eq!(late.result.unwrap_err().bytes_written(), 0);

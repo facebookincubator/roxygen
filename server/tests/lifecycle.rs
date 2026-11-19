@@ -2854,7 +2854,10 @@ impl SessionRetirementTrace {
         session.backend_retired = true;
     }
 
-    fn r3_s(&self, session_id: u64) -> Result<&SessionRunOutcome, SessionRetirementEvidenceError> {
+    fn retired_outcome(
+        &self,
+        session_id: u64,
+    ) -> Result<&SessionRunOutcome, SessionRetirementEvidenceError> {
         if self.probe.failed() || !(1..=2).contains(&session_id) {
             return Err(SessionRetirementEvidenceError::Unconfirmed);
         }
@@ -2878,8 +2881,8 @@ impl SessionRetirementTrace {
             last_session as usize
         );
         for session in 1..=last_session {
-            self.r3_s(session)
-                .expect("every selected session has actual R3-S evidence");
+            self.retired_outcome(session)
+                .expect("every selected session is fully retired");
         }
         let reaped = self.sessions[last_session as usize - 1]
             .as_ref()
@@ -3036,11 +3039,11 @@ fn panicked_session_does_not_stop_worker_or_leak_control() {
         trace.wait_for(1, SessionBoundary::Reaped);
         trace.await_backend(1, &runtime);
         let first_outcome = trace
-            .r3_s(1)
+            .retired_outcome(1)
             .expect("first session was actually reaped and its backend retired");
         let first_completion = classify_failed_operation(first_outcome);
         eprintln!(
-            "native-session known failed first operation R3-S classification: {first_completion:?}; actual outcome: {first_outcome:?}"
+            "native-session known failed first operation classification: {first_completion:?}; actual outcome: {first_outcome:?}"
         );
         assert!(
             first_completion.is_some(),
@@ -3050,7 +3053,7 @@ fn panicked_session_does_not_stop_worker_or_leak_control() {
         assert_session_worker_running(&server, &observer);
         assert!(
             matches!(
-                trace.r3_s(2),
+                trace.retired_outcome(2),
                 Err(SessionRetirementEvidenceError::ParentNotReaped(key))
                     if key == trace.sessions[1].as_ref().expect("second session registered").key
             ),
@@ -3062,7 +3065,11 @@ fn panicked_session_does_not_stop_worker_or_leak_control() {
             .send(())
             .expect("the actual session task still owns its gate");
         trace.wait_for(2, SessionBoundary::Reaped);
-        assert_healthy_session_outcome(trace.r3_s(2).expect("second session reaches actual R3-S"));
+        assert_healthy_session_outcome(
+            trace
+                .retired_outcome(2)
+                .expect("second session is fully retired"),
+        );
         trace.assert_empty_after(2);
         assert_session_worker_running(&server, &observer);
     }));
@@ -3155,7 +3162,7 @@ fn graceful_drain_waits_for_active_request() {
                 .run_returned
         );
         assert!(matches!(
-            trace.r3_s(1),
+            trace.retired_outcome(1),
             Err(SessionRetirementEvidenceError::ParentNotReaped(_))
         ));
         assert!(server.drain());
@@ -3170,7 +3177,11 @@ fn graceful_drain_waits_for_active_request() {
         );
         trace.wait_for(1, SessionBoundary::Reaped);
         trace.await_backend(1, &runtime);
-        assert_healthy_session_outcome(trace.r3_s(1).expect("drained session reaches actual R3-S"));
+        assert_healthy_session_outcome(
+            trace
+                .retired_outcome(1)
+                .expect("drained session is fully retired"),
+        );
         trace.assert_empty_after(1);
         assert!(server.wait_for_stop().unwrap());
         assert_eq!(server.state(), HttpServerState::Stopped);

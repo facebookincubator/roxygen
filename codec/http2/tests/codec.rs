@@ -8793,7 +8793,7 @@ fn header_frames_transcript_is_unchanged() {
     assert_eq!(
         (fnv1a64(&wire), wire.len(), fnv1a64(events.as_bytes())),
         (0x1f55_d3cc_2269_4bbf, 1_988_138, 0x365c_9c94_c3d0_0445),
-        "the HEADERS framing golden, recorded at 0e711498a9a4"
+        "the HEADERS framing golden"
     );
     let shapes = frame_shapes(&wire);
     let headers = FrameType::HEADERS.as_u8();
@@ -9292,7 +9292,7 @@ fn consumer_shaped_heads_decode_and_reencode_identically() {
             [0xd1b2_28b5_9e60_f70e, 22_834, 0xcf15_344b_8f99_2d7a, 15_974],
             [0x5cda_4c4c_cb54_073c, 18_048, 0x9e92_dae2_96f8_4ff5, 11_789],
         ),
-        "recorded before any header-map pre-size"
+        "the delivered and re-encoded heads match the golden digests"
     );
     let origin = (
         HttpHeaderCode::Other,

@@ -3035,7 +3035,7 @@ fn validate_headers(shared: &Rc<StreamShared>, message: &mut HttpMessage, eom: b
         let content_length = if empty_is_zero {
             Some(0)
         } else {
-            parse_folly_u64(content_length)
+            parse_content_length(content_length)
         };
         if let Some(content_length) = content_length {
             {
@@ -3051,13 +3051,13 @@ fn validate_headers(shared: &Rc<StreamShared>, message: &mut HttpMessage, eom: b
     true
 }
 
-fn parse_folly_u64(value: &[u8]) -> Option<u64> {
+fn parse_content_length(value: &[u8]) -> Option<u64> {
     let mut start = 0;
-    while start < value.len() && is_folly_c_whitespace(value[start]) {
+    while start < value.len() && is_c_whitespace(value[start]) {
         start += 1;
     }
     let mut end = value.len();
-    while end > start && is_folly_c_whitespace(value[end - 1]) {
+    while end > start && is_c_whitespace(value[end - 1]) {
         end -= 1;
     }
     let value = &value[start..end];
@@ -3067,7 +3067,7 @@ fn parse_folly_u64(value: &[u8]) -> Option<u64> {
     std::str::from_utf8(value).ok()?.parse().ok()
 }
 
-const fn is_folly_c_whitespace(byte: u8) -> bool {
+const fn is_c_whitespace(byte: u8) -> bool {
     byte == b' ' || (byte >= b'\t' && byte <= b'\r')
 }
 

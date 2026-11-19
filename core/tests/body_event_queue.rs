@@ -2145,7 +2145,7 @@ mod body_event_queue {
     }
 
     #[test]
-    fn folly_unsigned_content_length_whitespace_and_overflow() {
+    fn content_length_trims_c_whitespace_and_ignores_overflow() {
         let callback = Rc::new(QueueObservations::default());
         let mut queue = HttpBodyEventQueue::new(StreamId::new(1), &callback);
         queue.set_expected_egress_content_length(b"\x0b5\x0c", false);

@@ -426,7 +426,7 @@ mod poll_stats {
 
     #[cfg(feature = "observability")]
     #[test]
-    fn a_panicking_subscriber_is_discarded() {
+    fn a_subscriber_panic_drops_only_that_event() {
         let (handle, driver) = WorkerDriver::new(4).expect("worker starts");
         let context = driver.context().clone();
         let (recorder, _subscriber) = EventRecorder::install(true);

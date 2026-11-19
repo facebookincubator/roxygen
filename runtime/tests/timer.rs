@@ -1130,7 +1130,7 @@ fn waker_clone_rescheduling_its_own_timeout_keeps_the_new_waker() {
     assert_eq!(
         hooked_live(first_id),
         1,
-        "the slot no longer holds the first waker"
+        "the slot does not hold the first waker"
     );
 }
 

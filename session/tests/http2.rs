@@ -3768,7 +3768,7 @@ pub mod h2 {
                     assert_eq!(handle.outgoing_transaction_activity().available(), 0);
                     assert!(
                         handle.reserve_request().is_err(),
-                        "peer zero wins over previously released capacity"
+                        "peer zero wins over capacity released before it"
                     );
                     reopen.notify_one();
                     while !handle.outgoing_transaction_activity().supports_more() {

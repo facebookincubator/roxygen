@@ -7149,7 +7149,7 @@ fn ingress_phase_controls() {
         .store(limit + CHUNK - 1, Ordering::SeqCst);
     assert!(
         !signals.held_ingress_ready(route, CHUNK),
-        "positive stale credit cannot certify pause"
+        "positive stale credit does not count as a pause"
     );
     signals.read_received.store(limit + CHUNK, Ordering::SeqCst);
     assert!(
@@ -9108,6 +9108,8 @@ fn retention_parent_route(route: Route, started: Instant) -> RetentionResult<()>
         .stdin(Stdio::null())
         .stdout(child_stdout)
         .stderr(child_stderr);
+    // SAFETY: the hook does nothing, so it is async-signal-safe in the forked
+    // child. Registering it makes std fork and exec instead of posix_spawn.
     unsafe {
         command.pre_exec(|| Ok(()));
     }

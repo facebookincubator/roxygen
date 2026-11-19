@@ -3206,7 +3206,7 @@ impl Fixture {
             if let PeerOutcome::Idle { result, trace } = result {
                 assert!(
                     trace.snapshot().drain.unwrap().validated,
-                    "negative path must finish its exact oracle and joins"
+                    "the failing idle path must finish its drain checks and joins"
                 );
                 let error = result.as_ref().expect_err("retain actual Hyper error");
                 assert_idle_write_error(trace, error);
