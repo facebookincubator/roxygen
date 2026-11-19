@@ -42,35 +42,43 @@ pub trait HttpSource: 'static {
         None
     }
 
-    /// Observes producer arrival independently of reads, when the source supports it.
-    /// Obtain this before consuming the source; wrappers may retire it at EOM.
+    /// Returns a handle that reports producer completion independently of reads, if the
+    /// source supports it. Obtain it before consuming the source, because wrappers may
+    /// retire it at EOM.
     fn ingress_completion(&self) -> Option<IngressCompletion> {
         None
     }
 
     fn set_read_timeout(&mut self, _timeout: Duration) {}
 
-    /// Roxygen-only, default `false` (`DIV-039`): whether this source serves body
-    /// reads through [`Self::poll_body_event`], polled in place, instead of the boxed
-    /// future [`Self::read_body_event`] returns, as tokio's `is_write_vectored`
-    /// selects `poll_write_vectored`. [`HttpSourceHolder`] asks once per read, when the
-    /// read starts, and the sessions' exchange wrapper forwards it, so a response source
-    /// that answers `true` costs no allocation per body read.
+    /// Whether this source serves body reads through [`Self::poll_body_event`], polled in
+    /// place, instead of the boxed future that [`Self::read_body_event`] returns. Defaults
+    /// to `false`.
+    ///
+    /// This plays the role of tokio's `is_write_vectored` for `poll_write_vectored`.
+    /// [`HttpSourceHolder`] calls it once per read, when the read starts, and the sessions'
+    /// exchange wrapper forwards it, so a response source that returns `true` avoids an
+    /// allocation per body read.
     ///
     /// [`HttpSourceHolder`]: crate::source_holder::HttpSourceHolder
     fn polls_body_events(&self) -> bool {
         false
     }
 
-    /// Polls for the next body event of at most `maximum` bytes, with the meaning of a
-    /// [`Self::read_body_event`] future's poll: `Pending` registers `context`'s waker,
-    /// and a terminal event or an error ends the source's reads. Called only while
-    /// [`Self::polls_body_events`] is `true`, from inside a read its consumer started;
-    /// a read dropped while pending just stops polling, and the next read may ask for a
-    /// different `maximum`. The holder's state is borrowed during the call, so the source
-    /// must not use the holder reading it: a read started from inside the call fails with
-    /// `INVALID_STATE_TRANSITION`, and a call that stops, clears, replaces, or releases
-    /// its source panics. The default refuses with `INVALID_STATE_TRANSITION`.
+    /// Polls for the next body event of at most `maximum` bytes.
+    ///
+    /// A poll means the same as polling a [`Self::read_body_event`] future. `Pending`
+    /// registers the waker from `context`, and a terminal event or an error ends the
+    /// source's reads. This is called only while [`Self::polls_body_events`] is `true`,
+    /// from inside a read that the consumer started. A read dropped while pending just
+    /// stops polling, and the next read may pass a different `maximum`.
+    ///
+    /// The holder's state is borrowed during the call, so the source must not use the
+    /// holder that is reading it. A read started from inside the call fails with
+    /// `INVALID_STATE_TRANSITION`, and stopping, clearing, replacing, or releasing the
+    /// source from inside the call panics.
+    ///
+    /// The default returns an `INVALID_STATE_TRANSITION` error.
     fn poll_body_event(
         &mut self,
         _context: &mut Context<'_>,

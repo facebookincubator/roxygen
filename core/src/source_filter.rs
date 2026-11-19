@@ -406,7 +406,7 @@ impl Drop for HookLease {
 ///
 /// Replacing or dropping an unfinished downstream source stops it exactly
 /// once. A terminal event or error retires it before the event leaves this
-/// node, matching the lifetime behavior of the C++ filter base.
+/// node.
 pub struct HttpSourceFilter {
     state: Rc<FilterState>,
 }

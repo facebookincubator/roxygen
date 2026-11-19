@@ -38,7 +38,7 @@ pub struct HttpPriority {
 }
 
 impl HttpPriority {
-    /// Constructs a priority, clamping urgency to the source's three-bit range.
+    /// Constructs a priority, clamping urgency to `0..=7`.
     pub const fn new(
         urgency: u8,
         incremental: bool,
@@ -59,7 +59,7 @@ impl HttpPriority {
         }
     }
 
-    /// Constructs a priority with the source defaults for optional extensions.
+    /// Constructs a priority with default values for the optional extensions.
     pub const fn from_urgency_and_incremental(urgency: u8, incremental: bool) -> Self {
         Self::new(
             urgency,
@@ -83,11 +83,10 @@ impl Default for HttpPriority {
     }
 }
 
-/// Static header-access seam implemented by the concrete HTTP message type.
+/// Access to the `Priority` header, implemented by the concrete HTTP message type.
 ///
-/// The source priority helper observes only the unique `Priority` header and
-/// replaces that header when setting priority. Keeping those two operations in
-/// this trait lets the priority unit remain independent of message state.
+/// The priority helpers read only the unique `Priority` header and replace it when
+/// setting a priority, so this trait keeps them independent of message state.
 pub trait HttpPriorityHeaderAccess: Sized {
     /// Returns the unique `Priority` value or an empty byte string.
     fn priority_header_value(&self) -> &[u8];
@@ -115,7 +114,8 @@ pub trait HttpPriorityHeaderAccess: Sized {
     }
 }
 
-/// Renders a priority dictionary in the same fixed member order as Proxygen.
+/// Renders a priority dictionary with its members in the fixed order `u`, `i`, `o`,
+/// `p`, `r`.
 pub fn http_priority_to_string(priority: HttpPriority) -> String {
     let urgency = priority.urgency.min(MAX_HTTP_PRIORITY_URGENCY);
     let mut rendered = format!("u={urgency}");
@@ -143,7 +143,7 @@ pub fn http_priority_from_http_message(
     http_priority_from_string(message.priority_header_value())
 }
 
-/// Parses Proxygen's structured-dictionary form of an HTTP priority.
+/// Parses the structured-field dictionary form of an HTTP priority.
 pub fn http_priority_from_string(priority: impl AsRef<[u8]>) -> Option<HttpPriority> {
     let priority = priority.as_ref();
     if priority.is_empty() {

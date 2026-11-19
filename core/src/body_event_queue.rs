@@ -811,9 +811,9 @@ pub struct HttpBodyEventQueue {
 
 /// Owns the effects extracted from one stopped queue generation.
 ///
-/// Preparation is not completion of any outstanding read or task. Retire this
-/// record after releasing all queue and holder borrows. Retirement never accesses
-/// a replacement generation; dropping the record also attempts every effect.
+/// Preparing the record does not complete outstanding reads or tasks. Retire it
+/// after releasing all queue and holder borrows. Retirement never accesses a
+/// replacement generation, and dropping the record also attempts every effect.
 #[must_use]
 pub struct HttpBodyQueueRetirement {
     source: Option<BodySourceRetirement>,
@@ -895,7 +895,7 @@ impl HttpBodyQueueRetirement {
     }
 
     /// Attempts all extracted effects and returns the first original panic.
-    /// This does not certify retirement of independently owned read futures.
+    /// Read futures owned elsewhere are not retired by this.
     pub fn retire(mut self) -> std::thread::Result<()> {
         self.retire_inner().map_or(Ok(()), Err)
     }

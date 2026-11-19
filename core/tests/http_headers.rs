@@ -153,7 +153,7 @@ fn removed_common_names_keep_their_spelling() {
 
 #[test]
 fn added_common_names_use_the_table_spelling() {
-    // Each name's code is its line in `HTTPCommonHeaders.txt` plus one.
+    // Each name's code is its line in `COMMON_HEADER_LIST` plus one.
     let added: [(&[u8], u8, &[u8]); 3] = [
         (b"No-Vary-Search", 45, b"no-vary-search"),
         (b"Reporting-Endpoints", 57, b"reporting-endpoints"),
@@ -179,7 +179,7 @@ fn added_common_names_use_the_table_spelling() {
     assert_eq!(printed, expected);
 }
 
-/// Proxygen's `HTTPCommonHeaders.txt` at `9d6c281ba22e`, verbatim.
+/// Proxygen's list of common header names, verbatim.
 const COMMON_HEADER_LIST: &str = "\
 :Authority
 :Method
@@ -1065,8 +1065,7 @@ fn header_conversion_panics_preserve_publication_order() {
     );
 }
 
-/// The header names of the synthetic HTTP backend benchmark's response and
-/// request heads.
+/// The header names of a typical response head and request head.
 const BENCH_HEADER_NAMES: [&str; 33] = [
     "content-type",
     "x-fb-debug",
@@ -1448,8 +1447,8 @@ fn first_insert_into_unallocated_headers_reserves_sixteen() {
 
     assert_eq!(HttpHeaders::new().capacity(), 16);
     assert_eq!(HttpHeaders::default().capacity(), 16);
-    // Taking moves the storage out, as Proxygen's move constructor leaves the
-    // source with capacity 0; the source's next insert reserves 16 again.
+    // Taking moves the storage out and leaves the source with capacity 0. The
+    // source's next insert reserves 16 again.
     let mut taken = HttpHeaders::unallocated();
     taken.add("x-a", "1");
     let moved = taken.take();

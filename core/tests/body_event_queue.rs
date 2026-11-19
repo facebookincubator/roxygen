@@ -1975,8 +1975,8 @@ mod body_event_queue {
         }
     }
 
-    /// A source whose read panics is consumed as by an error (`DIV-056`), and
-    /// the failed read's admission is released before that read is dropped.
+    /// A source whose read panics is consumed as by an error, and the failed
+    /// read's admission is released before that read is dropped.
     #[test]
     fn source_poll_panic_retires_the_source_and_releases_admission_before_failed_future_drop() {
         let observations = Rc::new(SourceObservations::default());

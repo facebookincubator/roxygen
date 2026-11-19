@@ -16,8 +16,8 @@ macro_rules! define_common_headers {
     ($(($variant:ident, $code:literal, $camel:literal, $lower:literal)),+ $(,)?) => {
         /// Stable generated code for a common HTTP header name.
         ///
-        /// The discriminants follow `HTTPCommonHeaders.txt` exactly, after the
-        /// two reserved `None` and `Other` values.
+        /// The discriminants follow Proxygen's common-header list in order, after
+        /// the reserved `None` (0) and `Other` (1), and must not change.
         #[repr(u8)]
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         pub enum HttpHeaderCode {
@@ -381,8 +381,8 @@ struct CommonHeaderEntry {
     ends: [CommonHeaderWord; 2],
 }
 
-/// A perfect hash of the common names: each name has its own slot, which
-/// holds the index of its entry; every other slot is empty.
+/// A perfect hash of the common names. Each name has its own slot, which holds
+/// the index of its entry, and every other slot is empty.
 struct CommonHeaderLookup {
     slots: [u8; COMMON_HEADER_SLOTS],
     entries: [CommonHeaderEntry; COMMON_HEADER_DEFINITIONS.len()],
@@ -486,7 +486,8 @@ pub(crate) fn take_common_header_lookup_work() -> CommonHeaderLookupWork {
 /// Selects one of the generated common-header spelling tables.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum HttpCommonHeaderTable {
-    /// Spellings from `HTTPCommonHeaders.txt`.
+    /// Mostly capitalized spellings, such as `Content-Type`. Some names, such as
+    /// `no-vary-search`, are lowercase.
     CamelCase,
     /// ASCII-lowercase spellings.
     Lowercase,
@@ -538,8 +539,7 @@ impl HttpCommonHeaders {
 
     /// Returns the static spelling for `code` in the selected table.
     ///
-    /// The two reserved codes map to an empty byte string, matching the generated
-    /// C++ tables.
+    /// The two reserved codes map to an empty byte string.
     pub fn name(code: HttpHeaderCode, table: HttpCommonHeaderTable) -> &'static [u8] {
         common_name_table(table)[usize::from(code.as_u8())].as_ref()
     }
@@ -551,9 +551,8 @@ impl HttpCommonHeaders {
 
     /// Reverse-maps a reference obtained from the selected name table.
     ///
-    /// Content-equal byte strings from outside the table return [`HttpHeaderCode::Other`],
-    /// preserving the pointer-identity contract of the generated C++ API. `None`
-    /// represents a null pointer and returns [`HttpHeaderCode::None`].
+    /// The lookup is by pointer identity, so content-equal byte strings from outside the
+    /// table return [`HttpHeaderCode::Other`]. `None` returns [`HttpHeaderCode::None`].
     pub fn code_from_table_name(
         name: Option<&[u8]>,
         table: HttpCommonHeaderTable,
@@ -813,7 +812,7 @@ impl HttpHeaders {
 
     const INITIAL_CAPACITY: usize = 16;
 
-    /// Creates an empty collection with Proxygen's initial capacity.
+    /// Creates an empty collection with room for 16 headers.
     pub fn new() -> Self {
         Self {
             entries: HeaderEntries::Owned(Vec::with_capacity(Self::INITIAL_CAPACITY)),
@@ -821,8 +820,8 @@ impl HttpHeaders {
         }
     }
 
-    /// Creates an empty collection that allocates Proxygen's initial capacity
-    /// on its first insert.
+    /// Creates an empty collection that allocates the initial capacity on its
+    /// first insert.
     pub(crate) fn unallocated() -> Self {
         Self {
             entries: HeaderEntries::Owned(Vec::new()),
@@ -831,7 +830,7 @@ impl HttpHeaders {
     }
 
     /// Reserves room for at least `additional` more headers, and for at least
-    /// Proxygen's initial capacity.
+    /// the initial capacity.
     ///
     /// This is a performance hint with no observable effect. A collection that
     /// already has room is left as it is, even when its entries are shared. A
@@ -850,8 +849,8 @@ impl HttpHeaders {
 
     /// Makes subsequent clones share immutable entries until either collection is mutated.
     ///
-    /// Promotion retains the current vector and its capacity. Ordinary construction and
-    /// append remain directly owned; promotion allocates one shared ownership block.
+    /// Promotion keeps the current vector and its capacity and allocates one shared block.
+    /// Construction and appends otherwise use directly owned entries.
     pub fn share_entries(&mut self) {
         if let HeaderEntries::Owned(entries) = &mut self.entries {
             self.entries = HeaderEntries::Shared(Arc::new(std::mem::take(entries)));
@@ -889,10 +888,10 @@ impl HttpHeaders {
         self.entries_for_push().push(entry);
     }
 
-    /// Roxygen-only (`DIV-041`): adds a header with its value exactly as given, surrounding
-    /// whitespace included, as h2 and hyper keep an HTTP/2 field value; `add` trims it.
+    /// Adds a header without trimming whitespace around its value, as h2 and hyper keep an
+    /// HTTP/2 field value.
     ///
-    /// Otherwise the same as `add`.
+    /// Otherwise the same as [`Self::add`].
     pub fn add_verbatim<'a>(
         &mut self,
         name: impl Into<HttpHeaderName<'a>>,
@@ -904,7 +903,7 @@ impl HttpHeaders {
         self.entries_for_push().push(entry);
     }
 
-    /// `add_uncommon`, keeping the value exactly as given (`add_verbatim`).
+    /// Like `add_uncommon`, but keeps the value exactly as given, like `add_verbatim`.
     #[doc(hidden)]
     pub fn add_uncommon_verbatim(&mut self, name: &[u8], value: &[u8]) {
         assert!(!name.is_empty(), "HTTP header names must not be empty");
@@ -918,7 +917,7 @@ impl HttpHeaders {
         self.entries_for_push().push(entry);
     }
 
-    /// Adds every header from an initializer-style sequence in sequence order.
+    /// Adds every header from `headers`, in order.
     pub fn add_all<'a, I, V>(&mut self, headers: I)
     where
         I: IntoIterator<Item = (HttpHeaderName<'a>, V)>,
@@ -1072,9 +1071,8 @@ impl HttpHeaders {
 
     /// Visits matching values in insertion order until `visitor` returns true.
     ///
-    /// Each value is lent for as long as the headers are, as
-    /// `forEachValueOfHeader` hands its function a reference into the headers.
-    /// Returns true when visitation stopped early.
+    /// Each value is borrowed for as long as the headers are. Returns true when
+    /// visitation stopped early.
     pub fn for_each_value<'headers, 'a>(
         &'headers self,
         name: impl Into<HttpHeaderName<'a>>,
@@ -1129,7 +1127,7 @@ impl HttpHeaders {
         self.present_codes.fill(0);
     }
 
-    /// Alias for [`Self::clear`] matching the source operation name.
+    /// Alias for [`Self::clear`].
     pub fn remove_all(&mut self) {
         self.clear();
     }
@@ -1206,16 +1204,14 @@ impl HttpHeaders {
 
     /// Moves all headers out while leaving this collection reusable and empty.
     ///
-    /// As after Proxygen's move constructor, the emptied collection holds no
-    /// storage until its next insert allocates Proxygen's initial capacity.
+    /// The emptied collection does not allocate until the next insert.
     pub fn take(&mut self) -> Self {
         std::mem::replace(self, Self::unallocated())
     }
 
     /// Replaces this collection by moving all headers out of `source`.
     ///
-    /// As Proxygen's move assignment does, `source` is left with this
-    /// collection's storage, emptied.
+    /// `source` is left empty, holding this collection's storage.
     pub fn move_from(&mut self, source: &mut Self) {
         self.clear();
         std::mem::swap(self, source);
@@ -1258,8 +1254,8 @@ impl HttpHeaders {
         }
     }
 
-    /// The owned entries for an insert, with Proxygen's initial capacity
-    /// allocated when they have none.
+    /// The owned entries for an insert, with the initial capacity allocated when
+    /// they have none.
     fn entries_for_push(&mut self) -> &mut Vec<HeaderEntry> {
         let entries = self.entries.make_mut();
         if entries.capacity() == 0 {

@@ -135,8 +135,8 @@ impl KeptContainers {
         self.slots[count].take()
     }
 
-    /// Moves `container` here and returns `true`, unless this thread already
-    /// keeps the most.
+    /// Moves `container` here and returns `true`, unless this thread already keeps
+    /// `KEPT_CONTAINERS` containers.
     fn keep(&self, container: &mut VecDeque<Bytes>) -> bool {
         let count = self.count.get();
         let Some(slot) = self.slots.get(count) else {
@@ -343,11 +343,11 @@ impl Segments {
         Self::Many(prefix, 0)
     }
 
-    /// Before `source` is appended, gives a container that the append would
-    /// allocate or grow room for at least `preferred` segments. Appends that
-    /// allocate nothing keep their shape: an unallocated queue adopts the
-    /// source container, and an inline segment moves into a source container
-    /// with room.
+    /// Before `source` is appended, makes sure that any container the append
+    /// would allocate or grow has room for at least `preferred` segments. Appends
+    /// that do not allocate keep their shape. An unallocated queue adopts the
+    /// source container, and an inline segment moves into a source container with
+    /// room.
     fn grow_for(&mut self, source: &Self, preferred: usize) {
         let incoming = match source {
             Self::Inline(..) => 1,
@@ -854,9 +854,9 @@ impl BufQueue {
     /// Moves at most `amount` front bytes of `other` onto this queue, sharing
     /// a split boundary segment's backing, and returns how many moved.
     ///
-    /// Both queues end as `other.split_at_most(amount)` followed by appending
-    /// the result leaves them, including the conservative backing bounds. When
-    /// this queue lacks capacity, neither queue changes.
+    /// Both queues end in the same state as after `other.split_at_most(amount)`
+    /// followed by appending the result, including the conservative backing
+    /// bounds. When this queue lacks capacity, neither queue changes.
     pub fn append_prefix_from(
         &mut self,
         other: &mut Self,
@@ -1117,13 +1117,13 @@ mod tests {
 
     static STATIC_BYTES: [u8; 20_000] = [0x5a; 20_000];
 
-    /// The take this module used before queues kept a refill hint.
+    /// A plain `take` without the refill hint, for comparison.
     fn reference_take(queue: &mut BufQueue) -> BufQueue {
         let limit = queue.limit;
         std::mem::replace(queue, BufQueue::new(limit))
     }
 
-    /// The segment-by-segment split this module used before bulk splitting.
+    /// A segment-by-segment split, for comparison with the bulk split.
     fn reference_split_at_most(queue: &mut BufQueue, amount: usize) -> BufQueue {
         if amount == 0 || queue.is_empty() {
             return BufQueue::new(queue.limit);
@@ -1160,8 +1160,8 @@ mod tests {
         result
     }
 
-    /// The append this module used before moving an inline destination into
-    /// the source container.
+    /// An append that does not move an inline destination into the source
+    /// container, for comparison.
     fn reference_append(
         queue: &mut BufQueue,
         other: &mut BufQueue,
@@ -1336,8 +1336,8 @@ mod tests {
                             observe(&expected_prefix),
                             "step {step}"
                         );
-                        // Refill the split-off prefix so later operations see
-                        // both representations again.
+                        // Refill the split-off prefix so that later operations
+                        // exercise both representations again.
                         let mut extra = random_queue(&mut rng, 4, 200);
                         let mut extra_twin = extra.clone_shared();
                         actual_prefix.append(&mut extra).unwrap();
@@ -1423,7 +1423,7 @@ mod tests {
         }
     }
 
-    /// The `from_bytes` this module used before it built its queue in place.
+    /// A `from_bytes` built from `new` and `push_bytes`, for comparison.
     fn reference_from_bytes(bytes: Bytes, limit: usize) -> Result<BufQueue, super::BufQueueError> {
         let mut queue = BufQueue::new(limit);
         queue.push_bytes(bytes)?;
@@ -1537,8 +1537,8 @@ mod tests {
         );
     }
 
-    /// The trim this module used before whole-queue trims skipped its general
-    /// loop.
+    /// A trim that always runs the general loop, for comparison with whole-queue
+    /// trims.
     fn reference_trim_start_at_most(queue: &mut BufQueue, amount: usize) -> usize {
         let trim_length = amount.min(queue.length);
         let mut remaining = trim_length;
@@ -2572,7 +2572,7 @@ mod tests {
     }
 
     /// Counts heap allocations made on a thread while its counter is enabled,
-    /// and sees whether one watched allocation is freed. It serves every test
+    /// and checks whether one watched allocation is freed. It serves every test
     /// in this crate and only counts inside [`count_allocations`] and
     /// [`frees_allocation`].
     struct CountingAllocator;
@@ -2654,8 +2654,8 @@ mod tests {
         WATCHED_FREED.with(Cell::get)
     }
 
-    /// Whether this build's std allocates through [`ALLOCATOR`]. Dev builds
-    /// link a shared std whose own allocations, `Vec` growth among them,
+    /// Whether this build's std allocates through [`ALLOCATOR`]. With a
+    /// dynamically linked std, std's own allocations, including `Vec` growth,
     /// bypass it.
     fn std_allocations_observable() -> bool {
         count_allocations(|| drop(black_box(Vec::<u8>::with_capacity(4_096)))).1 == 1
@@ -2728,9 +2728,7 @@ mod tests {
         if std_allocations_observable() {
             assert_eq!(allocations, 0, "8 chunked body events after the first");
         } else {
-            eprintln!(
-                "allocation count needs a static std (@fbcode//mode/opt); counted {allocations}"
-            );
+            eprintln!("allocation count needs a statically linked std; counted {allocations}");
         }
     }
 
@@ -2779,9 +2777,7 @@ mod tests {
         if std_allocations_observable() {
             assert_eq!(allocations, 12, "8 of 20 spills reuse a kept container");
         } else {
-            eprintln!(
-                "allocation count needs a static std (@fbcode//mode/opt); counted {allocations}"
-            );
+            eprintln!("allocation count needs a statically linked std; counted {allocations}");
         }
     }
 
@@ -2824,7 +2820,7 @@ mod tests {
         if std_allocations_observable() {
             assert!(freed, "the container is freed while the panic unwinds");
         } else {
-            eprintln!("the free needs a static std (@fbcode//mode/opt); observed {freed}");
+            eprintln!("the free needs a statically linked std; observed {freed}");
         }
     }
 

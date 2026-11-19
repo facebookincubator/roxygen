@@ -34,8 +34,8 @@ impl HttpErrorCode {
     pub const INADEQUATE_SECURITY: Self = Self(12);
     pub const HTTP_1_1_REQUIRED: Self = Self(13);
 
-    // This protocol-independent library error retains its established value,
-    // which lies inside the otherwise excluded HTTP/3 numeric range.
+    // This protocol-independent library error keeps its established value, even
+    // though it lies in the HTTP/3 numeric range that the other codes avoid.
     pub const MESSAGE_ERROR: Self = Self(0x10e);
 
     pub const INVALID_STATE_TRANSITION: Self = Self(0x1000);
@@ -188,7 +188,7 @@ impl HttpError {
     /// Retains this error's original typed cause without including it in diagnostics.
     ///
     /// Clones share the cause. Changing HTTP context preserves it, while
-    /// `clone_from` replaces or clears it. Cause ownership is not a cleanup receipt.
+    /// `clone_from` replaces or clears it.
     #[cold]
     #[inline(never)]
     pub fn with_cause(mut self, cause: Arc<dyn std::error::Error + Send + Sync>) -> Self {
@@ -284,8 +284,8 @@ impl Clone for HttpError {
             let target = self.details_mut();
             target.message.clone_from(&source.message);
             target.cause.clone_from(&source.cause);
-            // Frozen copy assignment preserves a destination partial message
-            // when the source has none, unlike copy construction.
+            // Unlike `clone`, this keeps the destination's partial message when the
+            // source has none.
             if let Some(message) = &source.http_message {
                 target.http_message = Some(message.clone());
             }

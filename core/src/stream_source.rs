@@ -285,8 +285,6 @@ struct StreamState {
     active_read: Option<ReadActivity>,
     next_read_id: u64,
     sink_mode: bool,
-    /// Roxygen-only (`DIV-033`): an ingress abort leaves queued events to be
-    /// read before its error.
     deliver_ingress_before_abort: bool,
     /// An ingress abort left the queued events to be read before its error.
     keeps_queued_events: bool,
@@ -295,17 +293,14 @@ struct StreamState {
     source_complete: bool,
     strict_flow_control: bool,
     should_validate_content_length: bool,
-    /// Roxygen-only (`DIV-041`): a present, empty `content-length` is checked as
-    /// zero.
     empty_content_length_is_zero: bool,
     can_suspend: bool,
     suspend_wait_active: bool,
     /// The largest growth hint of a body that left the queue, so coalescing
     /// grows a body container once instead of doubling it.
     body_segment_hint: u16,
-    /// The producer's resume threshold (`DIV-044`).
+    /// The buffered-ingress level below which a paused producer resumes.
     resume_threshold: Option<u32>,
-    /// The producer declared that the exclusive reader drives it (`DIV-047`).
     inline_reads: bool,
 }
 
@@ -436,10 +431,11 @@ impl StreamShared {
         )
     }
 
-    /// Applies a timeout update to a direct wait as `TimedBaton::set_timeout`
-    /// applies it to a registered `TimedWait`: it wakes the waiter, and an
-    /// enabled timeout counts from now. For that, an unsignalled wait moves to
-    /// the `TimedWait` it stands in for, registered with the same waker.
+    /// Applies a timeout update to a direct wait the same way
+    /// `TimedBaton::set_timeout` does for a registered `TimedWait`. It wakes the
+    /// waiter, and an enabled timeout counts from now. For that, an unsignalled
+    /// wait moves to the `TimedWait` it stands in for, registered with the same
+    /// waker.
     #[cold]
     #[inline(never)]
     fn retime_direct_wait(&self, timeout: Duration) {
@@ -493,8 +489,8 @@ impl StreamShared {
         }
     }
 
-    /// Whether the producer refuses `timeout`: inline reads (`DIV-047`) have
-    /// no wait that could time out.
+    /// Whether a nonzero `timeout` must be rejected because inline reads are
+    /// enabled. Inline reads have no wait that could time out.
     fn refuses_read_timeout(&self, timeout: Duration) -> bool {
         !timeout.is_zero() && self.state.borrow().inline_reads
     }
@@ -572,7 +568,8 @@ impl Drop for HttpStreamSourceOwner {
     }
 }
 
-/// A fresh response source that has never exposed an independently owned read.
+/// A new response source, before any read. Split it with [`Self::split`] or
+/// convert it with [`Self::into_source_owner`].
 pub struct HttpResponseSource {
     owner: HttpStreamSourceOwner,
 }
@@ -639,9 +636,8 @@ impl HttpResponseSource {
             .skip_content_length_validation();
     }
 
-    /// Roxygen-only (`DIV-033`): makes a later ingress abort leave the queued
-    /// header and body events to be read before its error, as
-    /// [`HttpStreamSource::deliver_ingress_before_abort`] does.
+    /// Makes a later ingress abort leave queued events to be read before its error.
+    /// See [`HttpStreamSource::deliver_ingress_before_abort`].
     pub fn deliver_ingress_before_abort(&self) {
         self.owner
             .source()
@@ -657,7 +653,7 @@ impl HttpResponseSource {
             .initialize_body_only(message, eom)
     }
 
-    /// Separates the detachable source owner from its unique read capability.
+    /// Splits the source into its owner and its single reader.
     pub fn split(self) -> (HttpResponseSourceOwner, HttpResponseReader) {
         let shared = Rc::downgrade(
             &self
@@ -683,7 +679,8 @@ impl HttpResponseSource {
         )
     }
 
-    /// Consumes fresh exclusivity before exposing the general source API.
+    /// Converts into an [`HttpStreamSourceOwner`] for the general source API,
+    /// instead of splitting off a reader.
     pub fn into_source_owner(self) -> HttpStreamSourceOwner {
         self.owner
     }
@@ -742,7 +739,8 @@ impl HttpResponseSourceOwner {
     }
 }
 
-/// A unique response read phase, weak between operations and stationary while pending.
+/// The single reader of a response source. Between reads it holds only a weak
+/// reference to the source state, and a pending read keeps that state alive.
 pub struct HttpResponseReader {
     shared: Weak<StreamShared>,
     active: Option<Rc<StreamShared>>,
@@ -752,10 +750,10 @@ pub struct HttpResponseReader {
     admitted: bool,
     completed: bool,
     body_started: bool,
-    /// Empty body reads wait instead of suspending (`DIV-045`).
+    /// Empty body reads wait instead of suspending.
     suspend_free: bool,
     /// A suspend-free body read stays armed after a non-terminal event,
-    /// holding only `shared` until its next poll (`DIV-045`).
+    /// holding only `shared` until its next poll.
     armed_idle: bool,
 }
 
@@ -765,27 +763,26 @@ impl HttpResponseReader {
     }
 
     /// Whether a read is armed or pending. A pending operation retains the
-    /// original source state; a suspend-free reader that stays armed between
-    /// body events holds only its weak reference (`DIV-045`).
+    /// original source state. A suspend-free reader that stays armed between
+    /// body events holds only its weak reference.
     pub fn is_active(&self) -> bool {
         self.active.is_some() || self.armed_idle
     }
 
     /// Makes an empty body read wait in place for the next event instead of
-    /// returning `HttpBodyEvent::suspend`, the ported `SUSPEND` (`DIV-045`).
-    /// The default, `false`, keeps the ported protocol. The setting belongs to
-    /// this reader: header reads and a source converted by
-    /// `try_into_source_holder` are unchanged. A change does not interrupt a
-    /// read that is already waiting: that read still completes with its next
-    /// event, error or read timeout, and the setting applies when a body read
-    /// next finds no event queued.
+    /// returning [`HttpBodyEvent::suspend`]. Defaults to `false`.
+    ///
+    /// The setting belongs to this reader. Header reads and a source converted
+    /// by `try_into_source_holder` are unaffected. Changing it does not affect a
+    /// read that is already waiting. The setting applies the next time a body
+    /// read is polled with no event queued.
     ///
     /// With it set, a body read that returns a non-terminal event leaves the
-    /// reader armed for the next body read with the same maximum: it stays
-    /// active, and `poll_body` reads on without `arm_body`, which still re-arms
-    /// it with a new maximum. Between events it holds only its weak reference,
-    /// so if the owner releases the source, that next poll fails as `arm_body`
-    /// would. Terminal events and errors retire the read.
+    /// reader armed for the next body read with the same maximum. The reader
+    /// stays active, and `poll_body` reads on without `arm_body`, which can
+    /// still re-arm it with a new maximum. Between events it holds only its weak
+    /// reference, so if the owner releases the source, the next poll fails as
+    /// `arm_body` would. Terminal events and errors retire the read.
     pub fn set_suspend_free(&mut self, suspend_free: bool) {
         self.suspend_free = suspend_free;
     }
@@ -880,9 +877,8 @@ impl HttpResponseReader {
         result
     }
 
-    /// Whether a completed read leaves this reader armed for the next body read
-    /// (`DIV-045`). The owner's reference makes dropping the read's reference
-    /// trivial.
+    /// Whether a completed read leaves this reader armed for the next body read.
+    /// The owner's reference makes dropping the read's reference trivial.
     fn stays_armed(&self, output: &Result<StreamReadOutput, HttpError>) -> bool {
         self.suspend_free
             && matches!(output, Ok(StreamReadOutput::Body(event)) if !event.eom())
@@ -970,19 +966,25 @@ impl HttpResponseReader {
         finish_retirement_panic(first, unwinding);
     }
 
-    /// Roxygen-only (`DIV-047`): takes the next queued header event without
-    /// waiting, for a source whose producer enabled inline reads
+    /// Takes the next queued header event without waiting, for a source whose
+    /// producer enabled inline reads
     /// ([`HttpStreamSourceProducer::enable_inline_reads`]).
     ///
-    /// The read is validated and admitted as an armed read is, takes the event
-    /// as that read's first poll would, events an ingress abort kept
-    /// (`DIV-033`) included, and completes as it would, completing the source
-    /// when it can. `None` means nothing is queued: no read stays admitted, and
-    /// no wait or waker is registered, so the producer wakes nothing when it
-    /// queues the next event. The caller polls the producer before reading
-    /// again. A source without inline reads, an armed or pending read, and the
-    /// owner of another source refuse the read with `INVALID_STATE_TRANSITION`,
-    /// changing nothing; a released source fails it with `DROPPED`.
+    /// The read is validated and admitted as an armed read is. It takes the
+    /// event as that read's first poll would, including events kept by an
+    /// ingress abort, and completes as it would, completing the source when it
+    /// can.
+    ///
+    /// `None` means the queue is empty. The read does not stay admitted and does
+    /// not register a wait or waker, so queueing the next event does not wake
+    /// anything. The caller polls the producer before reading again.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `INVALID_STATE_TRANSITION`, without changing anything, if the
+    /// source does not have inline reads enabled, a read is armed or pending, or
+    /// `owner` owns another source. Fails with `DROPPED` if the source was
+    /// released.
     pub fn try_read_header(
         &mut self,
         owner: &HttpResponseSourceOwner,
@@ -996,11 +998,10 @@ impl HttpResponseReader {
             })
     }
 
-    /// Roxygen-only (`DIV-047`): takes the next queued body event, of at most
-    /// `maximum` body bytes, without waiting, as
-    /// [`Self::try_read_header`] takes a header event, with an armed read's
-    /// splitting and flow-control credit. It never returns
-    /// `HttpBodyEvent::suspend`.
+    /// Takes the next queued body event, of at most `maximum` body bytes,
+    /// without waiting, like [`Self::try_read_header`]. Bodies are split and
+    /// credited as for an armed read. It never returns
+    /// [`HttpBodyEvent::suspend`].
     #[inline]
     pub fn try_read_body(
         &mut self,
@@ -1069,8 +1070,8 @@ impl Drop for HttpResponseReader {
     }
 }
 
-/// Retires an inline read whose event take unwinds, as a panicking armed read
-/// is retired (`DIV-047`).
+/// Retires an inline read if taking its event unwinds, as a panicking armed
+/// read is retired.
 struct InlineReadAdmission<'a> {
     shared: &'a Rc<StreamShared>,
     admitted: bool,
@@ -1165,8 +1166,8 @@ impl HttpIngressBody {
             .drain_on_drop()
     }
 
-    /// Roxygen-only (`DIV-041`): checks the body of a head whose `content-length` is
-    /// present and empty against zero (`HttpStreamSource::read_empty_content_length_as_zero`).
+    /// Makes the source treat a present but empty `content-length` as zero when it
+    /// checks the body. See [`HttpStreamSource::read_empty_content_length_as_zero`].
     pub fn read_empty_content_length_as_zero(&self) {
         self.owner
             .source()
@@ -1183,8 +1184,9 @@ impl HttpIngressBody {
     }
 
     /// Consumes the terminal empty event before a header-only request handoff.
-    /// Success returns an empty capability. Only a genuine EOM retires the
-    /// source as terminal; a read error takes the normal stop path on drop.
+    /// On success the returned body does not hold a source. Only a real EOM
+    /// retires the source as terminal. Otherwise the source is stopped as usual
+    /// when it is dropped.
     pub fn retire_empty_body(mut self, context: &mut Context<'_>) -> Result<Self, HttpError> {
         let mut terminal = self
             .owner
@@ -1386,7 +1388,7 @@ impl HttpStreamSource {
         }
     }
 
-    /// Preserve ingress through producer EOM when the consumer stops without an error.
+    /// Preserves ingress through producer EOM when the consumer stops without an error.
     ///
     /// The returned owner must remain alive until ingress completes or is aborted.
     /// Only one drain owner may be installed for a source at a time.
@@ -1415,15 +1417,17 @@ impl HttpStreamSource {
         )
     }
 
-    /// Roxygen-only (`DIV-033`): makes a later ingress abort (`abort` or
-    /// `abort_with_error` on the producer: a peer reset, transport EOF or
-    /// connection error) leave the header and body events already queued to be
-    /// read, in order, before its error, as Hyper's body channel and h2 deliver
-    /// received data before a later error. The source completes once the
-    /// consumer has taken them; stopping or dropping it releases them. Errors the
-    /// source detects itself (flow control, content length, state transitions,
-    /// read timeouts) and consumer stops still discard queued events, also those
-    /// an ingress abort kept, whose error stays the one reads return.
+    /// Makes a later ingress abort leave the header and body events already queued
+    /// to be read, in order, before its error, as hyper's body channel and h2 deliver
+    /// received data before a later error.
+    ///
+    /// An ingress abort is `abort` or `abort_with_error` on the producer, such as for
+    /// a peer reset, transport EOF or connection error. The source completes once the
+    /// consumer has taken the kept events, and stopping or dropping it releases them.
+    /// Errors the source detects itself (flow control, content length, state
+    /// transitions, read timeouts) and consumer stops still discard queued events,
+    /// including those kept by an ingress abort. Reads then still return the abort's
+    /// error.
     pub fn deliver_ingress_before_abort(&self) {
         self.shared.assert_owner();
         self.shared.state.borrow_mut().deliver_ingress_before_abort = true;
@@ -1442,10 +1446,10 @@ impl HttpStreamSource {
             .should_validate_content_length = false;
     }
 
-    /// Roxygen-only (`DIV-041`): a final head whose `content-length` is present
-    /// and empty has its body checked against a length of zero, as h2 reads such
-    /// a field, instead of going unchecked as an unparseable length does. The
-    /// field itself is left as it is.
+    /// Makes the source check the body of a final head with a present but empty
+    /// `content-length` against a length of zero, as h2 does. Without this, such a
+    /// body goes unchecked, as for any unparseable length. The field itself is
+    /// unchanged.
     pub fn read_empty_content_length_as_zero(&self) {
         self.shared.assert_owner();
         self.shared.state.borrow_mut().empty_content_length_is_zero = true;
@@ -1624,7 +1628,8 @@ impl Drop for HttpStreamSource {
     }
 }
 
-/// A weak, owner-local producer capability for existing source state.
+/// The producer side of a stream source. It holds a weak reference to the
+/// source state and is owner-local.
 #[derive(Clone)]
 pub struct HttpStreamSourceProducer {
     shared: Weak<StreamShared>,
@@ -1897,15 +1902,15 @@ impl HttpStreamSourceProducer {
 
     /// Aborts unfinished ingress with an owned error, preserving its typed cause.
     ///
-    /// The first error wins. Diagnostics use the existing code/details format,
-    /// and a queued final header is attached exactly as for `abort`.
+    /// The first error wins. The diagnostic message has the same format as for
+    /// `abort`, and a queued final header is attached exactly as for `abort`.
     pub fn abort_with_error(&self, error: HttpError, details: impl AsRef<[u8]>) -> bool {
         self.abort_owned(error, details.as_ref(), true)
     }
 
     /// Aborts as `abort_with_error` does, but discards queued events even when
-    /// the source delivers ingress before an abort (`DIV-033`): for an abort the
-    /// consumer itself requested.
+    /// the source delivers ingress before an abort. Use it for an abort that the
+    /// consumer requested.
     pub fn abort_discarding_queued(&self, error: HttpError, details: impl AsRef<[u8]>) -> bool {
         self.abort_owned(error, details.as_ref(), false)
     }
@@ -1942,15 +1947,15 @@ impl HttpStreamSourceProducer {
         stop_reading(&shared, error)
     }
 
-    /// Roxygen-only (`DIV-044`): declares the buffered-ingress level at which the producer
-    /// pauses its input, and below which it resumes it.
+    /// Sets the buffered-ingress level at which the producer pauses its input, and below
+    /// which it resumes it.
     ///
     /// With a threshold, `bytes_processed` reports only a read that takes the buffered body
-    /// bytes from at or above it to below it, with that read's amount and acknowledgement;
-    /// other reads report nothing, so a producer that sets one must not need per-read credit.
+    /// bytes from at or above it to below it, with that read's amount and acknowledgement.
+    /// Other reads are not reported, so a producer that sets one must not need per-read credit.
     /// `window_open` is unchanged. `None`, the default, reports every read. A threshold of
-    /// zero reports no read, as buffered ingress never falls below zero. Returns false if the
-    /// source state has retired.
+    /// zero does not report any read, because buffered ingress never falls below zero.
+    /// Returns false if the source state has retired.
     pub fn set_resume_threshold(&self, threshold: Option<u32>) -> bool {
         let Some(shared) = self.shared.upgrade() else {
             return false;
@@ -1960,16 +1965,18 @@ impl HttpStreamSourceProducer {
         true
     }
 
-    /// Roxygen-only (`DIV-047`): declares that the source's exclusive reader
-    /// drives this producer, so that [`HttpResponseReader::try_read_header`]
-    /// and [`HttpResponseReader::try_read_body`] may take its events without
-    /// waiting. Afterwards the producer refuses a nonzero read timeout, which
-    /// a read that never waits could not honor: `set_read_timeout` and
-    /// `defer_read_timeout` with one return false and change nothing.
+    /// Enables inline reads, for a producer driven by the source's exclusive
+    /// reader. [`HttpResponseReader::try_read_header`] and
+    /// [`HttpResponseReader::try_read_body`] can then take its events without
+    /// waiting.
     ///
-    /// Returns false, changing nothing, if the source has a read timeout or a
-    /// deferred one, if a read or a suspend's resume wait is in progress, or if
-    /// the source state has retired.
+    /// Afterwards the producer rejects a nonzero read timeout, because a read
+    /// that never waits cannot time out. `set_read_timeout` and
+    /// `defer_read_timeout` with one return false without changing anything.
+    ///
+    /// Returns false without changing anything if the source has a read timeout
+    /// or a deferred one, if a read or a suspend's resume wait is in progress, or
+    /// if the source state has retired.
     pub fn enable_inline_reads(&self) -> bool {
         let Some(shared) = self.shared.upgrade() else {
             return false;
@@ -1986,9 +1993,9 @@ impl HttpStreamSourceProducer {
         true
     }
 
-    /// Sets the read timeout at once. Returns false, changing nothing, if the
-    /// source state has retired, or if the timeout is nonzero and inline reads
-    /// are enabled (`DIV-047`).
+    /// Sets the read timeout immediately. Returns false without changing anything
+    /// if the source state has retired, or if the timeout is nonzero and inline
+    /// reads are enabled.
     pub fn set_read_timeout(&self, timeout: Duration) -> bool {
         let Some(shared) = self.shared.upgrade() else {
             return false;
@@ -2005,8 +2012,8 @@ impl HttpStreamSourceProducer {
     ///
     /// Producer `set_read_timeout` remains immediate and bypasses this policy.
     /// Returns false if the source state has retired, or if the deferred
-    /// timeout is nonzero and inline reads are enabled (`DIV-047`); both change
-    /// nothing.
+    /// timeout is nonzero and inline reads are enabled. Neither case changes
+    /// anything.
     pub fn defer_read_timeout(&self, timeout: DeferredReadTimeout) -> bool {
         let Some(shared) = self.shared.upgrade() else {
             return false;
@@ -2020,7 +2027,8 @@ impl HttpStreamSourceProducer {
         true
     }
 
-    /// Applies the pending timeout once; returns false if none remains or the state retired.
+    /// Applies the pending timeout once. Returns false if there is no pending timeout
+    /// or the source state has retired.
     pub fn arm_read_timeout(&self) -> bool {
         let Some(shared) = self.shared.upgrade() else {
             return false;
@@ -2263,7 +2271,7 @@ trait OperationWait {
     /// Starts waiting on the reset event.
     fn start(&mut self, shared: &StreamShared, cancellation: CancellationToken);
 
-    /// Polls the wait; it is no longer waiting once ready.
+    /// Polls the wait. After it returns `Ready`, `is_waiting` returns false.
     fn poll(&mut self, shared: &StreamShared, context: &mut Context<'_>) -> Poll<WaitStatus>;
 
     /// Ends an unfinished wait without reading the event status.
@@ -2949,8 +2957,9 @@ fn take_ready_event(
     Some(result)
 }
 
-/// Whether an event an ingress abort left queued is the next one for a valid
-/// read of `kind`: a header while headers are read, a body event once they are.
+/// Whether a queued event kept by an ingress abort is the next one for a valid
+/// read of `kind`. That is a header while headers are read, and a body event
+/// after that.
 fn kept_event_ready(state: &StreamState, kind: ReadKind, maximum: u32) -> bool {
     if !state.keeps_queued_events {
         return false;
@@ -3164,7 +3173,7 @@ fn set_error(
 /// Installs the first error. `keep_queued` lets an ingress abort leave queued
 /// events to be read first on a source that delivers ingress before an abort.
 /// A later error does not replace the first, but one that would have discarded
-/// queued events still discards those an ingress abort left (`DIV-033`).
+/// queued events still discards those an ingress abort left.
 fn set_owned_error(
     shared: &Rc<StreamShared>,
     mut error: HttpError,
@@ -3372,7 +3381,7 @@ fn stop_reading(shared: &Rc<StreamShared>, error: Option<HttpErrorCode>) -> bool
     true
 }
 
-/// Whether events an ingress abort left queued (`deliver_ingress_before_abort`)
+/// Whether events kept by an ingress abort (`deliver_ingress_before_abort`)
 /// remain to be read.
 fn has_queued_events(state: &StreamState) -> bool {
     state.keeps_queued_events && (!state.header_queue.is_empty() || !state.body_queue.is_empty())

@@ -150,9 +150,9 @@ fn finish_callback_panic(first: Option<CallbackPanic>, already_unwinding: bool) 
 
 /// Owner-local registration metadata for one or more byte-event kinds.
 ///
-/// `fire` is a completion seam for a later transport/session owner. It does
-/// not schedule transport delivery. Unresolved kinds are cancelled in source
-/// order when the registration is explicitly cancelled or dropped.
+/// The transport or session owner calls [`Self::fire`] when a milestone
+/// completes. `fire` does not schedule transport delivery. Pending kinds are
+/// cancelled in milestone order when the registration is cancelled or dropped.
 #[derive(Default)]
 pub struct HttpByteEventRegistration {
     stream_id: Option<StreamId>,

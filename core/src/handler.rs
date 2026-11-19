@@ -29,17 +29,20 @@ use crate::error::HttpErrorCode;
 use crate::exchange::ExchangeCompletion;
 use crate::source_holder::HttpSourceHolder;
 
-/// Cumulative accepted shared-response counts: completed, then status classes 1–5.
+/// Cumulative counts of accepted shared responses, in total and by status class.
 ///
-/// Updates wrap and snapshots load each counter independently. This bank owns no
-/// callbacks or request/session state and may be shared with an exporter.
+/// Index 0 counts every response and indexes 1 to 5 count the 1xx to 5xx classes.
+/// Counters wrap on overflow, and a snapshot loads each one independently. The
+/// counters do not hold request or session state, so they can be shared with an
+/// exporter.
 #[derive(Default)]
 pub struct ResponseCounters {
     values: [AtomicU64; 6],
 }
 
 impl ResponseCounters {
-    /// Loads completed followed by the five status-class totals independently.
+    /// Returns the total followed by the five status-class counts, each loaded
+    /// independently.
     pub fn snapshot(&self) -> [u64; 6] {
         std::array::from_fn(|index| self.values[index].load(Ordering::Relaxed))
     }
@@ -53,8 +56,8 @@ impl ResponseCounters {
     }
 }
 
-/// One shared response awaiting its session's live-generation acceptance gates.
-/// Its status describes the shared response, not a later wire-status override.
+/// A shared response waiting to be counted once its session accepts it.
+/// The status is the shared response's, not a later wire-status override.
 pub struct HandlerResponseProposal {
     counters: Arc<ResponseCounters>,
     status: u16,
@@ -62,7 +65,7 @@ pub struct HandlerResponseProposal {
 
 impl HandlerResponseProposal {
     /// Records this proposal once, after the session has accepted its generation
-    /// and before fallible response setup. Dropping it records nothing.
+    /// and before fallible response setup. Dropping it does not record it.
     pub fn accept(self) {
         self.counters.record(self.status);
     }
@@ -73,10 +76,11 @@ enum ProposalState {
     Sealed,
 }
 
-/// The existing owner-local cancellation owner for one handler invocation.
+/// The owner-local cancellation owner for one handler invocation.
 ///
-/// Session task/control owners retain this payload. Contexts expose only Weak
-/// proposal views, so retaining one cannot prolong the cancellation source.
+/// The session's task and control owners hold this value. Handler contexts hold
+/// only weak proposal handles, so retaining a context does not keep the
+/// cancellation source alive.
 pub struct HandlerInvocation {
     cancellation: CancellationSource,
     proposal: RefCell<ProposalState>,
@@ -97,24 +101,26 @@ impl HandlerInvocation {
         }
     }
 
-    /// Returns the existing invocation cancellation token.
+    /// Returns the invocation's cancellation token.
     pub fn token(&self) -> CancellationToken {
         self.cancellation.token()
     }
 
-    /// Requests cancellation with the cancellation source's existing wake semantics.
+    /// Requests cancellation through the invocation's [`CancellationSource`].
     pub fn request_cancellation(&self) -> bool {
         self.cancellation.request_cancellation()
     }
 
-    /// Returns a Weak proposal view of this exact invocation allocation.
+    /// Returns a weak proposal handle for this invocation.
     pub fn response_proposer(self: &Rc<Self>) -> HandlerResponseProposer {
         HandlerResponseProposer(Rc::downgrade(self))
     }
 
-    /// Permanently closes proposal submission, transferring at most one proposal.
-    /// The task must seal on normal completion and on unpolled/aborted destruction;
-    /// ineligible completion discards the returned proposal without accepting it.
+    /// Closes proposal submission for good and returns the proposal, if any.
+    ///
+    /// The task must call this when it completes and when it is dropped unpolled or
+    /// aborted. A completion that should not be counted drops the returned proposal
+    /// without accepting it.
     pub fn seal_response_proposal(&self) -> Option<HandlerResponseProposal> {
         let state = std::mem::replace(&mut *self.proposal.borrow_mut(), ProposalState::Sealed);
         match state {
@@ -124,13 +130,13 @@ impl HandlerInvocation {
     }
 }
 
-/// A non-owning view of one invocation's one-shot shared-response proposal slot.
+/// A non-owning handle to an invocation's one-shot shared-response proposal slot.
 #[derive(Clone)]
 pub struct HandlerResponseProposer(Weak<HandlerInvocation>);
 
 impl HandlerResponseProposer {
-    /// Submits the first response only. Expired, sealed, and duplicate submission
-    /// return false without replacing a proposal or changing handler behavior.
+    /// Submits a response for counting. Returns `false` without replacing the
+    /// proposal if the invocation has expired, is sealed, or already has one.
     pub fn propose(&self, counters: Arc<ResponseCounters>, status: u16) -> bool {
         let Some(invocation) = self.0.upgrade() else {
             return false;
@@ -145,7 +151,7 @@ impl HandlerResponseProposer {
     }
 }
 
-/// A nonempty owner-local session-liveness capability for one handler call.
+/// An owner-local handle that keeps the session alive for one handler call.
 #[derive(Clone)]
 pub struct HandlerSessionContext {
     _keep_alive: KeepAlivePtr<()>,
@@ -183,8 +189,8 @@ impl HandlerSessionContext {
         self.peer_identity.as_deref()
     }
 
-    /// Adds trusted connection metadata without replacing the session's identity
-    /// or its owner-local liveness capability. Conflicting enrichment fails closed.
+    /// Adds trusted connection metadata. Fails with `INADEQUATE_SECURITY` if its peer
+    /// identity differs from this context's or if different metadata is already attached.
     pub fn with_connection_context(
         mut self,
         connection: Arc<ConnectionContext>,
@@ -204,13 +210,13 @@ impl HandlerSessionContext {
         Ok(self)
     }
 
-    /// Returns transferable metadata, never a transferable session capability.
+    /// Returns the connection metadata. Holding it does not keep the session alive.
     pub fn connection_context(&self) -> Option<&Arc<ConnectionContext>> {
         self.connection.as_ref()
     }
 
-    /// Attaches sticky cleanup observation for this exchange. Reattaching a
-    /// different exchange fails closed; this receipt does not own cleanup.
+    /// Attaches this exchange's cleanup completion. Fails with
+    /// `INVALID_STATE_TRANSITION` if a different exchange is already attached.
     pub fn with_exchange_completion(
         mut self,
         completion: ExchangeCompletion,
@@ -229,8 +235,8 @@ impl HandlerSessionContext {
         Ok(self)
     }
 
-    /// Binds the invocation's non-owning proposal view. A different invocation,
-    /// including an expired one, cannot replace an existing binding.
+    /// Binds the invocation's proposal handle. Fails with `INVALID_STATE_TRANSITION`
+    /// if a different invocation, even an expired one, is already bound.
     pub fn with_response_proposer(
         mut self,
         proposer: HandlerResponseProposer,
@@ -249,15 +255,16 @@ impl HandlerSessionContext {
         Ok(self)
     }
 
-    /// Extracts the proposal view without retaining session or cancellation ownership.
+    /// Returns the proposal handle, which keeps neither the session nor the invocation
+    /// alive.
     pub fn response_proposer(&self) -> Option<HandlerResponseProposer> {
         self.response_proposer.clone()
     }
 
     /// Returns this exchange's cleanup observation, if attached.
     ///
-    /// A handler must not await its own receipt: its retirement contributes to
-    /// the completion being observed.
+    /// A handler must not await its own exchange's completion, because the
+    /// handler's retirement is part of that completion.
     pub fn exchange_completion(&self) -> Option<&ExchangeCompletion> {
         self.exchange.as_ref()
     }

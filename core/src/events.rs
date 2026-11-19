@@ -114,8 +114,8 @@ impl HttpHeaderEvent {
 
     /// Invokes the one-shot callback with the size reported by serialization.
     ///
-    /// Taking the callback before invocation keeps panic and repeated-call
-    /// paths exactly once.
+    /// The callback is taken before it runs, so it runs at most once even if it
+    /// panics or this is called again.
     pub fn on_headers_encoded(&mut self, encoded_size: HttpHeaderSize) -> bool {
         let Some(callback) = self.egress_headers_callback.take() else {
             return false;
@@ -191,7 +191,8 @@ pub enum HttpBodyEventKind {
     Padding(u16),
 }
 
-/// A post-header HTTP event. EOM remains common metadata rather than a kind.
+/// An HTTP event that follows the header block. EOM is a flag on every event, not a
+/// separate kind.
 pub struct HttpBodyEvent {
     kind: HttpBodyEventKind,
     eom: bool,
@@ -280,7 +281,7 @@ impl HttpBodyEvent {
             ..
         } = self;
         if byte_event_registrations.capacity() == 0 {
-            // Without capacity the vector owns no allocation and no registrations.
+            // A vector without capacity has no allocation and no registrations to drop.
             std::mem::forget(byte_event_registrations);
         } else {
             drop_byte_event_registrations(byte_event_registrations);
@@ -335,7 +336,7 @@ fn drop_byte_event_registrations(registrations: Vec<HttpByteEventRegistration>) 
 
 /// Returns the mutable body buffer when `event` is a body event.
 ///
-/// This free-function spelling mirrors Proxygen's `asBodyEv` helper.
+/// A free-function form of [`HttpBodyEvent::as_body_mut`].
 pub fn as_body_ev(event: &mut HttpBodyEvent) -> Option<&mut BufQueue> {
     event.as_body_mut()
 }

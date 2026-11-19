@@ -1602,16 +1602,15 @@ fn default_message_headers_allocate_on_first_insert() {
 
     assert_eq!(HttpHeaders::new().capacity(), 16);
     assert_eq!(HttpHeaders::default().capacity(), 16);
-    // Taking moves the storage out, as Proxygen's move constructor leaves the
-    // source with none; the next insert allocates the initial capacity.
+    // Taking moves the storage out and leaves the source with none. The next
+    // insert allocates the initial capacity.
     let mut headers = HttpHeaders::new();
     headers.add("x-a", "1");
     let taken = headers.take();
     assert_eq!((headers.capacity(), taken.capacity()), (0, 16));
     headers.add("x-b", "2");
     assert_eq!(headers.capacity(), 16);
-    // Move assignment leaves the source with the destination's storage, emptied,
-    // as Proxygen's swaps it.
+    // Move assignment leaves the source with the destination's storage, emptied.
     let mut destination = HttpHeaders::new();
     (0..20).for_each(|index| destination.add(format!("x-{index}").as_str(), "v"));
     let capacity = destination.capacity();

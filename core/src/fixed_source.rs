@@ -140,14 +140,13 @@ impl HttpFixedSource {
         Ok(Self::new(message, body))
     }
 
-    /// Mirrors the source copy constructor: message and body are copied while
-    /// queued pushes and trailers are not part of the copy.
+    /// Copies the message and body. Queued pushes and trailers are not copied.
     pub fn copy_fixed(&self) -> Self {
         Self::from_message_and_body(self.message.clone(), self.body.clone_shared())
     }
 
-    /// Mirrors the source move constructor while keeping the moved-from value
-    /// inspectable: only message and body move; pushes and trailers remain.
+    /// Moves the message and body out. Queued pushes and trailers stay behind, and
+    /// the moved-from value can still be inspected.
     pub fn take_fixed(&mut self) -> Self {
         Self::from_message_and_body(self.message.take(), self.body.take())
     }

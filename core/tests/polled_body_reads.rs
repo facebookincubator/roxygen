@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! `HttpSource::poll_body_event` (`DIV-039`) through `HttpSourceHolder`.
+//! Tests for `HttpSource::poll_body_event` through `HttpSourceHolder`.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -47,7 +47,7 @@ struct Log {
 }
 
 /// Serves scripted body results, one per `poll_body_event` call (a `Pending`
-/// entry answers one poll) or per `read_body_event` call.
+/// entry serves one poll) or per `read_body_event` call.
 struct ScriptedSource {
     log: Rc<Log>,
     polls_body_events: bool,
@@ -1045,8 +1045,8 @@ fn pending_read_waker_drop_can_admit_same_generation_successor() {
     assert_eq!(log.drops.get(), 1);
 }
 
-/// A release whose pending forwarded poll's wake panics cannot hand the source
-/// out: it stops and drops it, then resumes the panic.
+/// If waking a pending forwarded poll panics during a release, the source is
+/// stopped and dropped instead of returned, and the panic resumes.
 #[test]
 fn release_wake_panic_stops_and_drops_detached_source() {
     let log = Rc::new(Log::default());
@@ -1261,10 +1261,10 @@ fn an_exclusive_poll_of_an_empty_holder_fails_dropped() {
     assert_eq!(error.code(), HttpErrorCode::DROPPED);
 }
 
-/// Only the owner can end the generation an exclusive poll polls, so a
-/// `Pending` exclusive poll keeps no clone of its task, ending the generation
-/// wakes nothing, and a source the owner installs after that poll serves the
-/// next one; a forwarded poll registers its task, as before.
+/// Only the owner can end the generation that an exclusive poll polls, so a
+/// `Pending` exclusive poll does not keep a clone of its task. Ending the
+/// generation does not wake anything, and a source that the owner installs after
+/// that poll serves the next one. A forwarded poll still registers its task.
 #[test]
 fn a_pending_exclusive_poll_registers_no_task_and_leaves_no_orphan() {
     let wake = Arc::new(CountingWake::default());
@@ -1375,10 +1375,10 @@ fn an_exclusive_poll_keeps_the_forwarded_poll_guarantees_otherwise() {
     assert!(!probe());
 }
 
-/// `DIV-056`: an in-place read whose source poll panics consumes the
-/// generation as an error does: the source is dropped without `stop_reading`,
-/// then the task its earlier `Pending` poll registered, outside the holder's
-/// borrow, and the panic continues.
+/// An in-place read whose source poll panics consumes the generation as an
+/// error does. The source is dropped without `stop_reading`. Then the task that
+/// its earlier `Pending` poll registered is dropped outside the holder's borrow,
+/// and the panic continues.
 #[cfg(panic = "unwind")]
 #[test]
 fn a_panicking_in_place_read_retires_its_source_without_stop_reading() {
@@ -1434,9 +1434,9 @@ enum SourcePoll {
     ThroughOuterHolder,
 }
 
-/// `DIV-056`: a source poll that panics under an exclusive poll, or
-/// under the holder polled as a source (directly, or by an outer holder's
-/// in-place read), consumes the source as a panicking read does.
+/// A source poll that panics under an exclusive poll, or under the holder
+/// polled as a source (directly, or by an outer holder's in-place read),
+/// consumes the source as a panicking read does.
 #[cfg(panic = "unwind")]
 #[test]
 fn a_panicking_exclusive_or_forwarded_poll_retires_its_source() {

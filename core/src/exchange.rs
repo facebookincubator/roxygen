@@ -11,7 +11,8 @@ use std::rc::Rc;
 
 use thiserror::Error;
 
-/// Failure to certify cleanup, independent of the HTTP exchange's outcome.
+/// Error returned when exchange cleanup cannot be confirmed. It does not depend
+/// on the HTTP exchange's outcome.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ExchangeCompletionError {
     #[error("native exchange cleanup could not be confirmed")]
@@ -21,15 +22,17 @@ pub enum ExchangeCompletionError {
 pub type LocalExchangeCompletionFuture =
     Pin<Box<dyn Future<Output = Result<(), ExchangeCompletionError>> + 'static>>;
 
-/// Observation supplied by the worker-local exchange owner, not cleanup ownership.
+/// Implemented by the worker-local exchange owner to report when cleanup
+/// finishes. It does not own the cleanup.
 pub trait ExchangeCompletionObserver: 'static {
     fn wait(&self) -> LocalExchangeCompletionFuture;
 }
 
-/// A sticky native-cleanup observation. Dropping it never cancels cleanup.
+/// Reports when an exchange's native cleanup has finished. Once complete, it
+/// stays complete. Dropping it does not cancel the cleanup.
 ///
-/// Success does not imply HTTP success, transport flush or closure, application
-/// task joins, or physical worker joins. A handler must not await its own receipt.
+/// Success does not mean that the HTTP exchange succeeded or that the transport
+/// was flushed or closed. A handler must not await its own exchange's completion.
 #[derive(Clone)]
 pub struct ExchangeCompletion(Rc<dyn ExchangeCompletionObserver>);
 

@@ -21,8 +21,8 @@ use super::parse_non_fully_formed;
 /// bytes `validate_url` rejects (space, DEL, and non-ASCII in strict mode).
 const ALPHABET: &[u8] = b"/:ah1?#@[].%\x20\x7f\x80";
 
-/// `parse_components` as it dispatched before leading-slash targets skipped
-/// the `://` search.
+/// A `parse_components` that searches for `://` even in leading-slash targets,
+/// for comparison with the dispatch that skips that search.
 fn scheme_scanning_parse(url: &[u8], strict: bool) -> Components {
     if url == b"/" {
         return Components {

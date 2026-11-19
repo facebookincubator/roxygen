@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Producer completion observation independent of source consumption.
+//! Reports when a source's producer finishes, independently of source consumption.
 
 use std::cell::RefCell;
 use std::future::poll_fn;
@@ -32,11 +32,12 @@ struct CompletionState {
     waiters: Vec<Weak<Waiter>>,
 }
 
-/// Observes when a source's producer admitted EOM, independently of consumption.
+/// Reports when a source's producer finishes, independently of consumption.
 ///
-/// Success records the producer's monotonic completion time. It does not imply
-/// body consumption, transport writes, or exchange cleanup. Observations retain
-/// terminal state only; they do not keep the source or buffered body alive.
+/// Success means that the source accepted the producer's EOM, and carries the
+/// producer's monotonic completion time. It does not mean that the body was
+/// consumed or that exchange cleanup finished. A handle keeps only the outcome
+/// alive, not the source or its buffered body.
 #[derive(Clone)]
 pub struct IngressCompletion(Rc<RefCell<CompletionState>>);
 
@@ -93,7 +94,7 @@ impl IngressCompletion {
     }
 }
 
-// Nothing between `finish` entry and this call can begin or end unwinding, so
+// Unwinding cannot begin or end between entry to `finish` and this call, so
 // sampling `panicking()` here matches sampling it on entry.
 #[inline(never)]
 fn wake_waiters(waiters: Vec<Weak<Waiter>>) {

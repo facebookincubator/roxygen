@@ -1112,7 +1112,7 @@ mod stream_source {
             read_body(&source, 4 << 10).unwrap();
         }
         assert_eq!(log.borrow().processed, [(StreamId::new(7), 4 << 10, 0)]);
-        // Below the threshold, neither more input nor reads report anything.
+        // Below the threshold, more input and reads are not reported.
         assert_eq!(
             producer.body(sized_body(2 << 10), 0, true),
             FlowControlState::Open
@@ -2927,7 +2927,7 @@ mod stream_source {
         });
     }
 
-    /// A Tokio host whose references a test counts.
+    /// A Tokio host that a test wraps in an `Rc` to count references to it.
     struct CountedHost;
 
     impl LocalHost for CountedHost {
@@ -3219,7 +3219,7 @@ mod stream_source {
     }
 
     /// A response source with recorded callbacks, split after its producer
-    /// enabled inline reads (`DIV-047`) unless `inline` is false.
+    /// enabled inline reads, unless `inline` is false.
     fn inline_response(
         receive_window: u32,
         inline: bool,
@@ -3411,9 +3411,9 @@ mod stream_source {
         Read(u32),
     }
 
-    /// Reads a 200 response from an 8-byte window with a resume threshold of 6
-    /// (`DIV-044`), inline or with suspend-free waiting reads, producing as
-    /// `steps` say. Returns each step's outcome followed by the callback log.
+    /// Reads a 200 response from an 8-byte window with a resume threshold of 6,
+    /// inline or with suspend-free waiting reads, running `steps` in order.
+    /// Returns each step's outcome followed by the callback log.
     fn credit_transcript(inline: bool, steps: &[CreditStep]) -> Vec<String> {
         let (owner, mut reader, producer, log) = inline_response(8, inline, false);
         reader.set_suspend_free(true);
@@ -3488,9 +3488,10 @@ mod stream_source {
             let inline = credit_transcript(true, &steps);
             let id = StreamId::new(1);
             // The first read crosses the threshold (8 to 5 buffered) and opens
-            // the closed window; the window owes no update until 4 bytes are
-            // read. The fifth read crosses it again (6 to 3) and acknowledges
-            // the 5 bytes read since the last update. The EOM read completes.
+            // the closed window. The window does not need an update until 4
+            // bytes are read. The fifth read crosses it again (6 to 3) and
+            // acknowledges the 5 bytes read since the last update. The EOM read
+            // completes.
             assert_eq!(
                 inline.last().unwrap(),
                 &format!(
@@ -3505,7 +3506,8 @@ mod stream_source {
     }
 
     /// Reads a response whose head and body were queued before an ingress
-    /// abort, inline or with waiting reads, with `DIV-033` on or off.
+    /// abort, inline or with waiting reads, with or without delivery of ingress
+    /// before the abort.
     fn kept_events_transcript(inline: bool, keep: bool) -> Vec<String> {
         let (owner, mut reader, producer, log) = inline_response(64, true, keep);
         reader.set_suspend_free(true);
@@ -3591,7 +3593,7 @@ mod stream_source {
             assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
             assert!(!reader.is_active());
 
-            // The refusal changes nothing: a waiting read takes the head.
+            // The refusal has no effect, so a waiting read takes the head.
             let mut context = Context::from_waker(Waker::noop());
             reader.arm_header(&owner).unwrap();
             assert!(matches!(
@@ -3644,7 +3646,7 @@ mod stream_source {
                 Poll::Ready(Ok(_))
             ));
 
-            // A suspend-free reader armed between body events (`DIV-045`).
+            // A suspend-free reader armed between body events.
             reader.arm_body(&owner, 64).unwrap();
             assert_eq!(
                 producer.body(body(b"one"), 0, false),
@@ -3681,7 +3683,7 @@ mod stream_source {
                 reader.try_read_header(&owner),
                 Some(Err(error)) if error.code() == HttpErrorCode::INVALID_STATE_TRANSITION
             ));
-            // The refusal changes nothing: a waiting read still times out.
+            // The refusal has no effect, so a waiting read still times out.
             reader.arm_header(&owner).unwrap();
             let mut context = Context::from_waker(Waker::noop());
             assert!(reader.poll_header(&mut context).is_pending());
@@ -3750,7 +3752,7 @@ mod stream_source {
             assert!(producer.defer_read_timeout(DeferredReadTimeout::DeferUpdates(Duration::ZERO)));
             assert!(producer.arm_read_timeout());
 
-            // The refusals changed nothing: a waiting read does not time out.
+            // The refusals had no effect, so a waiting read does not time out.
             reader.set_suspend_free(true);
             reader.arm_header(&owner).unwrap();
             let mut context = Context::from_waker(Waker::noop());
@@ -4244,10 +4246,10 @@ fn dropping_the_source_releases_events_kept_after_an_ingress_abort() {
     assert!(!producer.is_live());
 }
 
-/// A body read before the kept final head is a state error the source detects
-/// itself: it returns the ingress error that stays first, discards the kept head
-/// and body, credits the body once and completes the source, so no later read in
-/// the right order can still return them.
+/// A body read before the kept final head is a state error that the source
+/// detects itself. It returns the ingress error, which stays first, discards the
+/// kept head and body, credits the body once and completes the source, so a later
+/// read in the right order cannot return them.
 #[test]
 fn an_early_body_read_discards_events_kept_after_an_ingress_abort() {
     let (source, producer, log) = session_source(65_535);
@@ -4336,8 +4338,8 @@ fn a_consumer_requested_abort_discards_queued_events_when_enabled() {
     assert_eq!(log.borrow().completions, [None]);
 }
 
-/// A fresh response source, which an owned upstream session builds, takes the
-/// `DIV-033` policy before it is split or converted.
+/// A fresh response source, as an owned upstream session builds it, can enable
+/// `deliver_ingress_before_abort` before it is split or converted.
 #[test]
 fn a_response_source_delivers_ingress_before_abort_when_enabled() {
     run_paused(async {

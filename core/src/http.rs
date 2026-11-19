@@ -19,7 +19,8 @@ pub struct HttpHeaderSize {
     pub compressed_block: u32,
 }
 
-/// HTTP methods recognized by Proxygen.
+/// The HTTP methods that have named variants, including the non-standard `SUB`,
+/// `PUB` and `UNSUB`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum HttpMethod {
     Get,
@@ -52,7 +53,7 @@ impl HttpMethod {
         Self::Unsub,
     ];
 
-    /// Recognizes a standard method without imposing RFC case sensitivity.
+    /// Matches a known method case-insensitively.
     pub fn from_bytes(method: &[u8]) -> Option<Self> {
         Self::ALL
             .iter()
@@ -88,10 +89,11 @@ impl fmt::Display for HttpMethod {
     }
 }
 
-/// An owned method token and its optional recognized Proxygen method.
+/// An owned method token and its [`HttpMethod`], if it has one.
 ///
-/// Both recognized and extension methods use Proxygen's canonical uppercase
-/// spelling. Extension methods have no recognized enum value.
+/// [`Self::from_name`] and the `From` conversions match known methods
+/// case-insensitively and uppercase extension methods. [`Self::from_exact_token`]
+/// matches case-sensitively and keeps the token as received.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Method {
     name: MethodName,
@@ -119,12 +121,13 @@ impl Method {
         }
     }
 
-    /// Roxygen-only (`DIV-040`): the method that the request-line or `:method` token `token`
-    /// names when methods are case-sensitive (RFC 9110 section 9.1), as
-    /// `http::Method::from_bytes` reads it: exactly a recognized method's canonical spelling
-    /// is that method, and any other token is an extension method spelled byte for byte, so
-    /// `post` and `Post` are extension methods distinct from `POST`. `None` unless `token` is
-    /// an RFC 9110 `token` (one or more `tchar`).
+    /// Parses a request-line or `:method` token case-sensitively, as RFC 9110 requires and
+    /// `http::Method::from_bytes` does.
+    ///
+    /// Only a known method's exact canonical spelling maps to that method. Any other token is
+    /// an extension method kept byte for byte, so `post` and `Post` are extension methods
+    /// distinct from `POST`. Returns `None` unless `token` is an RFC 9110 `token` (one or
+    /// more `tchar`).
     pub fn from_exact_token(token: &[u8]) -> Option<Self> {
         if token.is_empty() || !token.iter().copied().all(is_tchar) {
             return None;
@@ -238,7 +241,7 @@ pub enum CodecProtocol {
 pub enum TransportDirection {
     /// The codec receives requests from clients.
     Downstream = 0,
-    /// The codec sends requests to origin applications or data.
+    /// The codec sends requests to origin servers.
     Upstream = 1,
 }
 

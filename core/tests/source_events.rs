@@ -578,7 +578,7 @@ mod source_holder {
     }
 }
 
-/// A holder read that panics consumes its source generation unstopped (`DIV-056`).
+/// A holder read that panics consumes its source generation without stopping it.
 #[cfg(panic = "unwind")]
 mod panicking_reads {
     use std::marker::PhantomData;
@@ -594,7 +594,7 @@ mod panicking_reads {
     enum ReadPanic {
         /// `read_header_event` or `read_body_event` panics.
         Start,
-        /// `polls_body_events`, which a body read asks first, panics.
+        /// `polls_body_events`, which a body read calls first, panics.
         PollsBodyEvents,
         /// The future the read returned panics when polled.
         Poll,
@@ -761,10 +761,10 @@ mod panicking_reads {
         }
     }
 
-    /// `polls_body_events` asked of the holder itself outside a read, as an
-    /// owned exchange asks it before its body read, or as an outer holder
-    /// asks it of a nested holder when a body read starts, consumes the source
-    /// unstopped when the source's answer panics.
+    /// Calling `polls_body_events` on the holder itself outside a read, as an
+    /// owned exchange does before its body read or an outer holder does on a
+    /// nested holder when a body read starts, consumes the source without
+    /// stopping it when the source's `polls_body_events` panics.
     #[test]
     fn a_panicking_polls_body_events_asked_of_the_holder_retires_its_source() {
         for nested in [false, true] {
@@ -849,7 +849,7 @@ mod events {
         ));
         assert_eq!(take_registration_drops_for_test(), 0);
 
-        // Taken registrations leave nothing behind, and the taker still owns them.
+        // Taking the registrations empties the event, and the taker still owns them.
         let mut taken = body(b"b", false);
         taken.byte_event_registrations_mut().push(registration());
         let kept = taken.take_byte_event_registrations();

@@ -31,11 +31,11 @@ use crate::source::LocalSourceFuture;
 struct SourceEntry {
     identity: Rc<()>,
     source: Box<dyn HttpSource>,
-    /// The task of this generation's last in-place read poll that returned
-    /// `Pending` (`DIV-039`), woken if the generation goes away while that read
-    /// is still active, since the source it was polling may never wake it. A
-    /// task it replaces, and the reader of a generation that is retired or
-    /// finished, are dropped outside the holder's borrow.
+    /// The task of the last in-place poll of this generation that returned
+    /// `Pending`. It is woken if the generation goes away while that read is
+    /// still active, because the source may never wake it. A replaced waker, and
+    /// the waker of a retired or finished generation, are dropped outside the
+    /// holder's borrow.
     reader: Option<Waker>,
 }
 
@@ -56,23 +56,23 @@ struct HolderState {
     forwarded: ForwardedPoll,
 }
 
-/// The read of a consumer polling the holder itself as a source
-/// (`HttpSource::poll_body_event`, `DIV-039`), which has no read future: a poll
-/// that follows a `Pending` poll continues that read.
+/// The read of a consumer that polls the holder itself as a source, through
+/// `HttpSource::poll_body_event`. Such a read has no read future, so a poll that
+/// follows a `Pending` poll continues the same read.
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 enum ForwardedPoll {
     #[default]
     Idle,
-    /// The last poll returned `Pending`; the current generation's `reader` is its waker.
+    /// The last poll returned `Pending`, and the current generation's `reader` is its waker.
     Pending,
-    /// The generation a pending poll was polling went away; the next poll fails `DROPPED`.
+    /// The generation of a pending poll went away, so the next poll fails with `DROPPED`.
     Orphaned,
 }
 
 impl HolderState {
-    /// Takes the current generation out for retirement, installing `replacement`;
-    /// a read waiting on it, through a read future or a forwarded poll, is woken
-    /// once the retirement has stopped and dropped it, and fails.
+    /// Takes the current generation out for retirement and installs `replacement`.
+    /// A read waiting on it, through a read future or a forwarded poll, is woken
+    /// after the retirement stops and drops the source, and then fails.
     fn retire_generation(
         &mut self,
         replacement: Option<SourceEntry>,
@@ -87,8 +87,8 @@ impl HolderState {
         SourceRetirement::of(previous, error, true, active_read || forwarded)
     }
 
-    /// Whether a forwarded poll is pending on the current generation, which is
-    /// going away; its next poll then fails.
+    /// Returns whether a forwarded poll is pending on the current generation,
+    /// which is going away, and marks it so that its next poll fails.
     fn orphan_forwarded_poll(&mut self) -> bool {
         let pending = self.forwarded == ForwardedPoll::Pending;
         if pending {
@@ -156,9 +156,9 @@ pub(crate) struct SourceRetirement {
 }
 
 impl SourceRetirement {
-    /// Retires a generation taken out of its holder, outside the holder's
-    /// borrow: its source is stopped (if `stop`) and dropped, then its cached
-    /// reader is woken (if `wake_reader`, a read still waiting on it) and dropped.
+    /// Prepares a generation taken out of its holder for retirement outside the
+    /// holder's borrow. Retirement stops the source if `stop` and drops it, then
+    /// wakes the cached reader if `wake_reader` and drops it.
     fn of(
         entry: Option<SourceEntry>,
         error: Option<HttpErrorCode>,
@@ -227,8 +227,8 @@ fn retire_some_reader(reader: Waker, wake: bool) -> Option<RetirementPanic> {
     first
 }
 
-/// Drops a generation a terminal event or error consumed, unstopped, outside
-/// the holder's borrow: its source, then its cached reader.
+/// Drops a generation consumed by a terminal event or error, without stopping
+/// it and outside the holder's borrow. The source is dropped before the reader.
 #[inline]
 fn retire_finished(entry: Option<SourceEntry>) {
     if entry.is_some() {
@@ -236,11 +236,10 @@ fn retire_finished(entry: Option<SourceEntry>) {
     }
 }
 
-/// Consumes, as an error would, the generation `take` removes from a holder
-/// whose source call is unwinding (`DIV-056`): its source is dropped without
-/// `stop_reading`, then its cached reader. Every panic here, including one
-/// taking the generation out, is discarded, since this runs in a destructor
-/// during that unwind.
+/// Consumes the generation that `take` removes, as an error would, while a
+/// source call is unwinding. The source is dropped without `stop_reading`, then
+/// the cached reader. Every panic here, including one from `take`, is
+/// discarded, because this runs in a destructor during that unwind.
 #[cold]
 #[inline(never)]
 fn retire_panicked(take: impl FnOnce() -> Option<SourceEntry>) {
@@ -252,9 +251,9 @@ fn retire_panicked(take: impl FnOnce() -> Option<SourceEntry>) {
     }
 }
 
-/// Retires the current generation if the source call it is armed around
-/// unwinds. It is declared before the holder's borrow, which the unwind
-/// therefore releases first.
+/// Retires the current generation if the source call that it guards unwinds.
+/// It is declared before the holder's borrow, so the unwind releases the borrow
+/// first.
 struct SourceCallGuard<'a> {
     state: &'a RefCell<HolderState>,
     armed: bool,
@@ -314,9 +313,9 @@ type InPlacePoll<T> = fn(&mut dyn HttpSource, &mut Context<'_>, u32) -> Poll<Res
 enum ReadInner<T> {
     /// The future the source returned when the read started.
     Future(LocalSourceFuture<Result<T, HttpError>>),
-    /// The source itself, polled while the holder's state is borrowed (`DIV-039`).
+    /// The source itself, polled while the holder's state is borrowed.
     InPlace { poll: InPlacePoll<T>, maximum: u32 },
-    /// A read whose poll panicked, with its future dropped (`DIV-056`).
+    /// A read that panicked while polled. Its future has been dropped.
     Retired,
 }
 
@@ -338,9 +337,10 @@ fn poll_source_body(
     source.poll_body_event(context, maximum)
 }
 
-/// Polls the read's own source generation, which a stop, clear, or replacement
-/// since the read started has made unavailable. A `Pending` poll registers the
-/// read's task with the generation, which wakes it if it goes away.
+/// Polls the source generation that the read started on, failing with `DROPPED`
+/// if a stop, clear, or replacement has made it unavailable since. A `Pending`
+/// poll registers the read's task with the generation, which wakes the task if
+/// the generation goes away.
 fn poll_in_place<T>(
     state: &RefCell<HolderState>,
     source_identity: &Rc<()>,
@@ -382,8 +382,8 @@ fn reader_registered(entry: &SourceEntry, context: &Context<'_>) -> bool {
         .is_some_and(|reader| reader.will_wake(context.waker()))
 }
 
-/// Whether a read of generation `source_identity` still waits on it: an
-/// admitted read (`admitted`) or a pending forwarded poll.
+/// Whether a read of generation `source_identity` still waits on it. The read is
+/// an admitted read if `admitted`, and otherwise a pending forwarded poll.
 fn reader_waits(state: &HolderState, source_identity: &Rc<()>, admitted: bool) -> bool {
     (if admitted {
         state.active_read
@@ -395,9 +395,9 @@ fn reader_waits(state: &HolderState, source_identity: &Rc<()>, admitted: bool) -
         .is_some_and(|entry| Rc::ptr_eq(&entry.identity, source_identity))
 }
 
-/// The slow path of a `Pending` poll whose task is not the cached reader: the
-/// task is cloned and installed, and the reader it replaces dropped, outside
-/// the holder's borrow, since a waker's clone or drop may reach the holder.
+/// The slow path of a `Pending` poll when its task is not the cached reader.
+/// The new waker is cloned, and the waker it replaces is dropped, outside the
+/// holder's borrow, because cloning or dropping a waker may reach the holder.
 /// Returns whether the read still waits on its generation afterwards.
 #[cold]
 #[inline(never)]
@@ -468,8 +468,8 @@ where
         }
     }
 
-    /// Completes a read whose poll is unwinding: its future is dropped before
-    /// its generation is retired, since that future may still reach the source.
+    /// Completes a read while its poll is unwinding. The future is dropped before
+    /// the generation is retired, because the future may still reach the source.
     #[cold]
     #[inline(never)]
     fn complete_panicked(&mut self) {
@@ -564,7 +564,7 @@ impl Future for HolderBodyRead {
     }
 }
 
-/// Owns one local source and guarantees cleanup of every unfinished path.
+/// Owns one local source and cleans it up on every unfinished path.
 ///
 /// A terminal event or error consumes only the source generation that
 /// produced it. Early drop, explicit replacement, and explicit stop call
@@ -572,11 +572,11 @@ impl Future for HolderBodyRead {
 /// `Rc` also makes the holder and every read future owner-local.
 ///
 /// A read that panics, while starting or while polled, consumes its source
-/// generation as an error does: the source is dropped without `stop_reading`,
-/// then the panic continues (`DIV-056`). So does a panicking in-place poll,
-/// through [`Self::poll_body_event_exclusive`] or of the holder polled as a
-/// source, and a panicking [`HttpSource::polls_body_events`] asked of the
-/// holder while no read is active.
+/// generation as an error does. The source is dropped without `stop_reading`,
+/// and then the panic resumes. The same applies when an in-place poll panics,
+/// whether through [`Self::poll_body_event_exclusive`] or through the holder
+/// polled as a source. It also applies when [`HttpSource::polls_body_events`]
+/// panics on the holder while no read is active.
 pub struct HttpSourceHolder {
     state: Rc<RefCell<HolderState>>,
 }
@@ -605,10 +605,12 @@ impl HttpSourceHolder {
         "SourceHolder"
     }
 
-    /// Takes the source out unstopped. A consumer polling the holder as a
-    /// source whose poll is pending is woken, and its next poll fails. If that
-    /// wake, or the drop of the generation's cached waker, panics, the source
-    /// cannot be handed out: it is stopped and dropped, then the panic resumes.
+    /// Takes the source out without stopping it. Fails with
+    /// [`SourceReleaseError::ReadInProgress`] while a read is active.
+    ///
+    /// A consumer with a pending poll of the holder as a source is woken, and its
+    /// next poll fails. If that wake, or dropping the generation's cached waker,
+    /// panics, the source is stopped and dropped instead, and the panic resumes.
     pub fn release(&mut self) -> Result<Option<Box<dyn HttpSource>>, SourceReleaseError> {
         let mut retirement = {
             let mut state = self.state.borrow_mut();
@@ -683,11 +685,12 @@ impl HttpSourceHolder {
     /// Starts a body read without boxing the holder's read future.
     ///
     /// Like [`Self::read_header_event_unboxed`], this admits the read immediately
-    /// and returns a future independent of this mutable borrow. A source whose
-    /// [`HttpSource::polls_body_events`] is `true` is not called here: each poll of the
-    /// returned future polls it in place (`DIV-039`), and fails with `DROPPED` once
-    /// the source was stopped, cleared, replaced, or destroyed with the holder; a
-    /// read pending then is woken, since its source may never wake it.
+    /// and returns a future independent of this mutable borrow. If the source's
+    /// [`HttpSource::polls_body_events`] is `true`, the source is not called here.
+    /// Instead each poll of the returned future polls it in place, and fails with
+    /// `DROPPED` once the source has been stopped, cleared, replaced, or destroyed
+    /// with the holder. A read pending at that point is woken, because its source
+    /// may never wake it.
     pub fn read_body_event_unboxed(&mut self, maximum: u32) -> HolderBodyRead {
         self.read_body_event_concrete(maximum)
     }
@@ -730,23 +733,25 @@ impl HttpSourceHolder {
         }))
     }
 
-    /// Roxygen-only (`DIV-039`): polls the held source in place for a consumer
-    /// that owns this holder outright, as [`HttpSource::poll_body_event`] does
-    /// for a consumer polling it as a source, with the caller's `context`
-    /// unchanged. Only such an owner can clear, stop, replace, release or
-    /// destroy the generation it polls, so it needs no wake when that
-    /// generation goes away, and no failure of its next poll after it installs
-    /// a replacement itself. While no read of this holder, no other handle to
-    /// its state, and no pending forwarded poll exists, this poll therefore
-    /// borrows nothing and registers no task; otherwise it is that forwarded
-    /// poll. Call it only while [`HttpSource::polls_body_events`] is `true`; a
-    /// terminal event or error consumes the source, as it does for a read.
+    /// Polls the held source in place for a consumer that owns this holder
+    /// outright.
+    ///
+    /// This works like [`HttpSource::poll_body_event`] on the holder, with the
+    /// caller's `context` passed through unchanged. Only the owner can clear, stop,
+    /// replace, release or destroy the generation it polls, so it does not need to be
+    /// woken when that generation goes away, or to fail its next poll after it
+    /// installs a replacement itself. When there is no read of this holder, no other
+    /// handle to its state, and no pending forwarded poll, this call does not borrow
+    /// the state or register a task. Otherwise it is the forwarded poll.
+    ///
+    /// Call it only while [`HttpSource::polls_body_events`] is `true`. A terminal
+    /// event or error consumes the source, as it does for a read.
     pub fn poll_body_event_exclusive(
         &mut self,
         context: &mut Context<'_>,
         maximum: u32,
     ) -> Poll<Result<HttpBodyEvent, HttpError>> {
-        // A unique state has no read future, so no read is active and nothing borrows it.
+        // A unique state has no read future, so no read is active and the state is unborrowed.
         let Some(state) = Rc::get_mut(&mut self.state)
             .map(RefCell::get_mut)
             .filter(|state| state.forwarded == ForwardedPoll::Idle)
@@ -839,8 +844,8 @@ impl HttpSource for HttpSourceHolder {
             .and_then(|entry| entry.source.ingress_completion())
     }
 
-    /// While no read is active, a panic in the source's answer consumes its
-    /// generation unstopped, as it does when a read starts (`DIV-056`).
+    /// While no read is active, a panic in the source's `polls_body_events`
+    /// consumes its generation without stopping it, as it does when a read starts.
     fn polls_body_events(&self) -> bool {
         let mut guard = SourceCallGuard {
             state: &self.state,
@@ -858,15 +863,16 @@ impl HttpSource for HttpSourceHolder {
         polls
     }
 
-    /// Polls the held source in place, outside any read of this holder; a
-    /// terminal event or error consumes the source, as it does for a read. A
-    /// poll that follows a `Pending` poll continues that read, with an in-place
-    /// read's guarantees: the `Pending` poll registers its waker with the
-    /// generation it polled, which wakes it when it is cleared, stopped,
-    /// replaced, released or destroyed, and the next poll then fails with
-    /// `DROPPED`, never reaching a replacement source. The holder cannot tell a
+    /// Polls the held source in place, outside any read of this holder. A
+    /// terminal event or error consumes the source, as it does for a read.
+    ///
+    /// A poll that follows a `Pending` poll continues that read, with the same
+    /// guarantees as an in-place read. The `Pending` poll registers its waker with
+    /// the generation it polled, which wakes it when the generation is cleared,
+    /// stopped, replaced, released or destroyed. The next poll then fails with
+    /// `DROPPED` and never reaches a replacement source. The holder cannot detect a
     /// consumer that abandoned its pending poll, so the first poll after such a
-    /// generation change fails that way too; a read of this holder resets it.
+    /// change fails the same way. A read of this holder resets that state.
     fn poll_body_event(
         &mut self,
         context: &mut Context<'_>,
@@ -926,8 +932,8 @@ impl Drop for HttpSourceHolder {
 }
 
 /// Releases a dropped read's admission, then drops its generation's cached
-/// reader; a panic in that drop resumes, unless the read is dropped while
-/// unwinding, when it is discarded instead of aborting.
+/// reader. A panic in that drop resumes, unless the read was dropped while
+/// unwinding, in which case the panic is discarded to avoid an abort.
 fn release_read(state: &Rc<RefCell<HolderState>>, source_identity: &Rc<()>) {
     let reader = {
         let mut state = state.borrow_mut();

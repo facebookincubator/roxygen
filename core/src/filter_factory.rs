@@ -40,8 +40,7 @@ impl HttpFilterFactoryHandler {
         Self::default()
     }
 
-    /// Appends one factory. A missing factory is ignored like a null shared
-    /// factory in the source API.
+    /// Appends a factory. `None` is ignored.
     pub fn add_filter_factory(&mut self, factory: Option<Rc<dyn FilterFactory>>) -> &mut Self {
         if let Some(factory) = factory {
             self.filter_factories.push(factory);

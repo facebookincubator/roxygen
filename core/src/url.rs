@@ -204,7 +204,8 @@ pub struct UrlParts<'a> {
     pub fragment: &'a [u8],
 }
 
-/// An owned URL value with Proxygen-compatible scheme validity and defaults.
+/// An owned URL value. Only the `http` and `https` schemes are valid, and a
+/// missing port defaults to 80 or 443.
 #[derive(Clone, Debug, Default)]
 pub struct Url {
     scheme: Box<[u8]>,
@@ -514,7 +515,7 @@ const URL_HIGH: u8 = 2;
 /// `URL_BYTES` flag: the byte is '/', '?' or '#'.
 const URL_DELIMITER: u8 = 4;
 
-/// Each byte's `validate_url` answers and whether it is a delimiter.
+/// The `URL_*` flags of each byte.
 const URL_BYTES: [u8; 256] = {
     let mut table = [0; 256];
     let mut index = 0;
@@ -549,8 +550,8 @@ struct Delimiters {
     fragment_start: Option<usize>,
 }
 
-/// `validate_url` and the first '/', '?' and '#' in one pass: `None` when
-/// `validate_url` rejects `url`.
+/// Runs `validate_url` and finds the first '/', '?' and '#' in one pass. Returns
+/// `None` when `validate_url` rejects `url`.
 fn scan_delimiters(url: &[u8], strict: bool) -> Option<Delimiters> {
     count_visited(url.len());
     let mut classes = 0;
@@ -844,9 +845,9 @@ fn take_bytes_visited() -> usize {
 mod tests {
     use super::*;
 
-    /// `parse_components`, `parse_fully_formed`, `parse_non_fully_formed`
-    /// and `validate_url` as they were before the single-pass origin-form
-    /// scan, kept as the differential oracle.
+    /// Simple reference versions of `parse_components`, `parse_fully_formed`,
+    /// `parse_non_fully_formed` and `validate_url`, which the tests compare
+    /// against the single-pass origin-form scan.
     mod oracle {
         use super::super::*;
 
@@ -1023,7 +1024,7 @@ mod tests {
         );
     }
 
-    /// Consumer-shaped origin-form request targets of 9, 34 and 120 bytes.
+    /// Typical origin-form request targets of 9, 34 and 120 bytes.
     const ORIGIN_FORM_PATHS: [&[u8]; 3] = [
         b"/svc/Ping",
         b"/consumer.v1.Routing/ResolveRoutes",

@@ -15,7 +15,7 @@ use crate::message::SocketAddress;
 /// An actual transport endpoint, independent of the logical HTTP origin.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum TransportEndpoint {
-    /// An Internet socket address in the existing Roxygen representation.
+    /// An Internet socket address.
     Socket(SocketAddress),
     /// A Unix-domain pathname, represented as raw filesystem bytes.
     UnixPath(Box<[u8]>),
@@ -29,7 +29,7 @@ pub enum TransportEndpoint {
 }
 
 impl TransportEndpoint {
-    /// Returns an Internet address only; Unix endpoints are never hostnames.
+    /// Returns the Internet socket address, or `None` for Unix and unknown endpoints.
     pub fn socket_address(&self) -> Option<&SocketAddress> {
         match self {
             Self::Socket(address) => Some(address),
@@ -39,7 +39,9 @@ impl TransportEndpoint {
 }
 
 /// Security of the immediate connection, not of a proxied origin.
-/// TLS describes encryption; it does not assert certificate authentication.
+///
+/// `Tls` means the connection is encrypted, not that the peer's certificate was
+/// authenticated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportSecurity {
     Unknown,
@@ -83,9 +85,10 @@ impl UpstreamOrigin {
 
 /// An immutable, transferable snapshot supplied by a trusted connector/acceptor.
 ///
-/// This is data, not a session-liveness capability. Identity bytes preserve the
-/// transport's encoding and verification policy; their presence does not prove
-/// TLS authentication. Never construct this snapshot from request headers.
+/// Holding a snapshot does not keep the session alive. The identity bytes use
+/// the transport's encoding and reflect its verification policy, and their
+/// presence does not prove TLS authentication. Never construct this snapshot from
+/// request headers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectionContext {
     local_endpoint: TransportEndpoint,

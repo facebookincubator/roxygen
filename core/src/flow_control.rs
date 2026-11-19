@@ -15,7 +15,7 @@ pub struct Window {
 }
 
 impl Window {
-    /// Constructs a window when `capacity` fits the source's signed range.
+    /// Constructs a window, or returns `None` if `capacity` exceeds `i32::MAX`.
     pub fn new(capacity: u32) -> Option<Self> {
         let mut window = Self::default();
         window.set_capacity(capacity).then_some(window)
@@ -111,7 +111,7 @@ impl WindowContainer {
     const UPDATE_THRESHOLD: u32 = 2;
     const MINIMUM_UPDATE: usize = 128 * 1024;
 
-    /// Constructs a container when `capacity` fits the signed window range.
+    /// Constructs a container, or returns `None` if `capacity` exceeds `i32::MAX`.
     pub fn new(capacity: u32) -> Option<Self> {
         Some(Self {
             receive_window: Window::new(capacity)?,

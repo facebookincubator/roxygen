@@ -5,10 +5,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-/// A stream identifier whose interpretation belongs to its codec.
+/// A stream identifier. Its meaning depends on the codec.
 ///
-/// Zero is the initialized representation of an unknown or unspecified stream.
-/// Absence of any stream is represented separately by [`NO_STREAM`].
+/// Zero means an unknown or unspecified stream. The absence of a stream is
+/// represented separately by [`NO_STREAM`].
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StreamId(u64);
@@ -42,8 +42,8 @@ impl From<StreamId> for u64 {
     }
 }
 
-/// The absence of a stream, corresponding to `HTTPCodec::NoStream`.
+/// The absence of a stream.
 pub const NO_STREAM: Option<StreamId> = None;
 
-/// The greatest value representable by `HTTPCodec::StreamID`.
+/// The largest stream identifier.
 pub const MAX_STREAM_ID: StreamId = StreamId::MAX;
