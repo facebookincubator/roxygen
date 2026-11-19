@@ -135,12 +135,17 @@ pub const fn is_no_error(code: HttpErrorCode) -> bool {
     code.as_u16() == HttpErrorCode::NO_ERROR.as_u16()
 }
 
-#[derive(Debug)]
 struct ErrorMessage<'a>(&'a [u8]);
 
 impl fmt::Display for ErrorMessage<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&String::from_utf8_lossy(self.0))
+    }
+}
+
+impl fmt::Debug for ErrorMessage<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&String::from_utf8_lossy(self.0), formatter)
     }
 }
 
@@ -300,7 +305,10 @@ impl fmt::Debug for HttpError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HttpError")
-            .field("code", &self.code)
+            .field(
+                "code",
+                &format_args!("{} ({})", get_error_string(self.code), self.code.as_u16()),
+            )
             .field("message", &ErrorMessage(self.message()))
             .field("http_message", &self.http_message())
             .field(

@@ -79,7 +79,7 @@ fn default_and_custom_assignment_preserve_message_and_partial_context() {
     assert!(target.http_message().is_none());
     assert_eq!(
         format!("{target:?}"),
-        "HttpError { code: HttpErrorCode(8), message: ErrorMessage([67, 65, 78, 67, 69, 76]), http_message: None, has_cause: false }",
+        r#"HttpError { code: CANCEL (8), message: "CANCEL", http_message: None, has_cause: false }"#,
     );
 }
 
