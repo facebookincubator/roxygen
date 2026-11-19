@@ -28,6 +28,8 @@ use roxygen_codec::ProxygenError;
 use roxygen_core::buf_queue::BufQueue;
 use roxygen_core::error::HttpError;
 use roxygen_core::error::HttpErrorCode;
+use roxygen_core::headers::HttpCommonHeaderTable;
+use roxygen_core::headers::HttpCommonHeaders;
 use roxygen_core::headers::HttpHeaderCode;
 use roxygen_core::headers::HttpHeaders;
 use roxygen_core::http::CodecProtocol;
@@ -35,6 +37,7 @@ use roxygen_core::http::HttpHeaderSize;
 use roxygen_core::http::HttpMethod;
 use roxygen_core::http::TransportDirection;
 use roxygen_core::ids::StreamId;
+use roxygen_core::message::HttpDate;
 use roxygen_core::message::HttpMessage;
 use roxygen_core::priority::HttpPriority;
 use roxygen_core::priority::http_priority_from_string;
@@ -147,7 +150,7 @@ struct PreparedMessageHeaders<'a> {
     pseudo: MessagePseudoHeaders<'a>,
     headers: &'a HttpHeaders,
     extra: Option<&'a HttpHeaders>,
-    date: Option<String>,
+    date: Option<HttpDate>,
     verbatim_values: bool,
 }
 
@@ -185,26 +188,23 @@ impl PreparedMessageHeaders<'_> {
                 authority,
                 protocol,
             } => {
-                visitor(Header::new(HttpHeaderCode::ColonMethod.into(), method));
+                visitor(common_field(HttpHeaderCode::ColonMethod, method));
                 if let Some((scheme, _)) = scheme_and_path {
-                    visitor(Header::new(HttpHeaderCode::ColonScheme.into(), scheme));
+                    visitor(common_field(HttpHeaderCode::ColonScheme, scheme));
                 }
                 if !authority.is_empty() {
-                    visitor(Header::new(
-                        HttpHeaderCode::ColonAuthority.into(),
-                        authority,
-                    ));
+                    visitor(common_field(HttpHeaderCode::ColonAuthority, authority));
                 }
                 if let Some((_, path)) = scheme_and_path {
-                    visitor(Header::new(HttpHeaderCode::ColonPath.into(), path));
+                    visitor(common_field(HttpHeaderCode::ColonPath, path));
                 }
                 if let Some(protocol) = protocol {
-                    visitor(Header::new(HttpHeaderCode::ColonProtocol.into(), protocol));
+                    visitor(common_field(HttpHeaderCode::ColonProtocol, protocol));
                 }
             }
             MessagePseudoHeaders::Response { bytes, start } => {
-                visitor(Header::new(
-                    HttpHeaderCode::ColonStatus.into(),
+                visitor(common_field(
+                    HttpHeaderCode::ColonStatus,
                     &bytes[usize::from(*start)..],
                 ));
             }
@@ -227,9 +227,25 @@ impl PreparedMessageHeaders<'_> {
             visit_headers(extra);
         }
         if let Some(date) = &self.date {
-            visitor(Header::new(HttpHeaderCode::Date.into(), date.as_bytes()));
+            visitor(common_field(HttpHeaderCode::Date, date.as_bytes()));
         }
     }
+}
+
+/// A field that `PreparedMessageHeaders` adds itself, named by the lowercase name of its code
+/// without a lookup in the shared name table.
+fn common_field(code: HttpHeaderCode, value: &[u8]) -> Header<'_> {
+    let name: &'static [u8] = match code {
+        HttpHeaderCode::ColonMethod => b":method",
+        HttpHeaderCode::ColonScheme => b":scheme",
+        HttpHeaderCode::ColonAuthority => b":authority",
+        HttpHeaderCode::ColonPath => b":path",
+        HttpHeaderCode::ColonProtocol => b":protocol",
+        HttpHeaderCode::ColonStatus => b":status",
+        HttpHeaderCode::Date => b"date",
+        code => HttpCommonHeaders::name(code, HttpCommonHeaderTable::Lowercase),
+    };
+    Header { code, name, value }
 }
 
 impl HeaderInputs for PreparedMessageHeaders<'_> {
@@ -1811,7 +1827,7 @@ impl Http2Codec {
             && self.add_date_to_response
             && !message.headers().exists(HttpHeaderCode::Date)
             && extra.is_none_or(|headers| !headers.exists(HttpHeaderCode::Date)))
-        .then(HttpMessage::format_date_header);
+        .then(HttpMessage::date_header);
         Ok(PreparedMessageHeaders {
             pseudo,
             headers: message.headers(),
@@ -2858,6 +2874,9 @@ mod tests {
     use roxygen_codec::HttpCodec;
     use roxygen_codec::HttpCodecCallback;
     use roxygen_core::buf_queue::BufQueue;
+    use roxygen_core::headers::HttpCommonHeaderTable;
+    use roxygen_core::headers::HttpCommonHeaders;
+    use roxygen_core::headers::HttpHeaderCode;
     use roxygen_core::headers::HttpHeaders;
     use roxygen_core::http::TransportDirection;
 
@@ -2934,6 +2953,25 @@ mod tests {
         LAST_HEADER_PRESIZE.set(usize::MAX);
         ingest(codec, wire, delivered);
         LAST_HEADER_PRESIZE.get()
+    }
+
+    #[test]
+    fn added_fields_use_the_lowercase_table_names() {
+        for code in HttpHeaderCode::ALL
+            .iter()
+            .copied()
+            .filter(|code| code.as_u8() >= HttpHeaderCode::COMMON_OFFSET)
+        {
+            let field = super::common_field(code, b"value");
+            assert_eq!(
+                (field.code, field.name, field.value),
+                (
+                    code,
+                    HttpCommonHeaders::name(code, HttpCommonHeaderTable::Lowercase),
+                    &b"value"[..],
+                ),
+            );
+        }
     }
 
     #[test]

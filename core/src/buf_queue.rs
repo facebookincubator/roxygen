@@ -16,10 +16,19 @@ use std::ops::DerefMut;
 
 use bytes::Buf;
 use bytes::Bytes;
+use bytes::BytesMut;
 use thiserror::Error;
 
 /// Maximum visible length and requested allocation for compact wire segments.
 pub const COMPACT_WRITE_LIMIT: usize = 2048;
+
+/// The largest compact tail that grows to an exactly sized copy, which `Bytes`
+/// holds in one allocation where a copy with room takes two.
+const COMPACT_EXACT_GROWTH: usize = 128;
+
+/// The smallest allocation that replaces a compact tail that grows past
+/// `COMPACT_EXACT_GROWTH`.
+const COMPACT_GROWTH_MINIMUM: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum BufQueueError {
@@ -713,12 +722,16 @@ impl BufQueue {
     }
 
     /// Copies a prefix and body into a unique small tail, using spare capacity
-    /// or replacing the tail with an exactly sized copy.
+    /// or replacing the tail with a larger copy.
     ///
-    /// Reuse requires a known backing bound within [`COMPACT_WRITE_LIMIT`].
-    /// Returns `false` without changing visible bytes when reuse is unavailable.
-    /// A recovered offset view may move within its allocation. The body is
-    /// borrowed and remains intact, including when output capacity is exceeded.
+    /// A tail that grows to at most 128 bytes is replaced with an exactly sized
+    /// copy. A larger replacement allocates twice the old allocation and at
+    /// least 512 bytes, less where that would take the queue's backing bound
+    /// past [`COMPACT_WRITE_LIMIT`], so that a run of small appends copies each
+    /// byte a bounded number of times. Reuse requires a known backing bound
+    /// within [`COMPACT_WRITE_LIMIT`]. Returns `false` without changing visible
+    /// bytes when reuse is unavailable. The body is borrowed and remains
+    /// intact, including when output capacity is exceeded.
     pub fn try_append_compact_to_tail(
         &mut self,
         prefix: &[u8],
@@ -751,29 +764,43 @@ impl BufQueue {
         if tail.is_empty() || incoming > COMPACT_WRITE_LIMIT.saturating_sub(tail.len()) {
             return Ok(false);
         }
-        let writable = match std::mem::take(tail).try_into_mut() {
+        let mut writable = match std::mem::take(tail).try_into_mut() {
             Ok(writable) => writable,
             Err(original) => {
                 *tail = original;
                 return Ok(false);
             }
         };
-        let mut bytes = Vec::<u8>::from(writable);
-        let old_capacity = bytes.capacity();
-        if old_capacity - bytes.len() < incoming {
-            // At these sizes a fresh allocation plus copy is cheaper than
-            // jemalloc's realloc path, which usually moves the block anyway.
-            let mut grown = Vec::with_capacity(bytes.len() + incoming);
-            grown.extend_from_slice(&bytes);
-            bytes = grown;
+        if writable.capacity() - writable.len() < incoming {
+            // The vector's capacity is the whole allocation, including any
+            // offset that trimming left before the view.
+            let bytes = Vec::<u8>::from(writable);
+            let others = bound.checked_sub(bytes.capacity());
+            let needed = bytes.len() + incoming;
+            let room = others.map_or(needed, |others| COMPACT_WRITE_LIMIT.saturating_sub(others));
+            let capacity = if needed <= COMPACT_EXACT_GROWTH {
+                needed
+            } else {
+                bytes
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(COMPACT_GROWTH_MINIMUM)
+                    .min(room)
+                    .max(needed)
+            };
+            writable = BytesMut::with_capacity(capacity);
+            writable.extend_from_slice(&bytes);
+            if capacity > needed {
+                // Sharing the buffer once lets `freeze` and later
+                // `try_into_mut` calls reuse it without allocating.
+                drop(writable.split_off(capacity));
+            }
+            self.backing_capacity = others.and_then(|others| others.checked_add(capacity));
         }
-        bytes.extend_from_slice(prefix);
+        writable.extend_from_slice(prefix);
         body.segments()
-            .for_each(|segment| bytes.extend_from_slice(segment));
-        self.backing_capacity = bound
-            .checked_sub(old_capacity)
-            .and_then(|rest| rest.checked_add(bytes.capacity()));
-        *tail = Bytes::from(bytes);
+            .for_each(|segment| writable.extend_from_slice(segment));
+        *tail = writable.freeze();
         self.length = new_length;
         Ok(true)
     }

@@ -9072,21 +9072,31 @@ fn headers_then_small_data_share_one_tail() {
         (headers, after_headers)
     };
 
-    // A block written at the start of a flush is an exactly sized tail that the DATA then extends.
+    // A block written at the start of a flush is an exactly sized tail. The DATA grows it with room
+    // that the next response fills without growing it again.
     let mut output = BufQueue::new(64 * 1024);
     let (headers, after_headers) = write(&mut output, 1);
+    let grown = output.backing_capacity_upper_bound();
+    assert_eq!(
+        (after_headers, output.segment_count()),
+        ((1, Some(headers)), 1),
+        "(after HEADERS (segments, backing), segments) from an empty output"
+    );
+    let room = 2 * output.chain_length()..=COMPACT_WRITE_LIMIT;
+    assert!(
+        grown.is_some_and(|grown| room.contains(&grown)),
+        "{grown:?}"
+    );
+    let pointer = output.front().unwrap().as_ptr();
+    write(&mut output, 3);
     assert_eq!(
         (
-            after_headers,
             output.segment_count(),
             output.backing_capacity_upper_bound(),
+            output.front().unwrap().as_ptr(),
         ),
-        (
-            (1, Some(headers)),
-            1,
-            Some(headers + FRAME_HEADER_SIZE + 128),
-        ),
-        "(after HEADERS (segments, backing), segments, backing) from an empty output"
+        (1, grown, pointer),
+        "(segments, backing, tail) after a second response"
     );
 
     // A tail with room takes the block and the DATA without growing.

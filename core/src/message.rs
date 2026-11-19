@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::net::IpAddr;
 use std::ops::Range;
+use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -703,6 +704,13 @@ impl HttpMessage {
 
     pub fn format_date_header() -> String {
         format_http_date(SystemTime::now())
+    }
+
+    /// The value [`format_date_header`](Self::format_date_header) returns, held inline so that
+    /// reading it does not allocate.
+    #[doc(hidden)]
+    pub fn date_header() -> HttpDate {
+        http_date(SystemTime::now())
     }
 
     pub fn ensure_host_header(&mut self) {
@@ -1529,9 +1537,40 @@ fn strip_control_chars(value: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// Room for the HTTP date of any `i64` second count, which takes at most 41 bytes.
+const HTTP_DATE_CAPACITY: usize = 48;
+
+/// An IMF-fixdate such as `Sun, 06 Nov 1994 08:49:37 GMT`, as [`HttpMessage::date_header`]
+/// returns it.
+#[doc(hidden)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct HttpDate {
+    bytes: [u8; HTTP_DATE_CAPACITY],
+    len: u8,
+}
+
+impl HttpDate {
+    /// The formatted date.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+impl fmt::Debug for HttpDate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("HttpDate")
+            .field(&String::from_utf8_lossy(self.as_bytes()))
+            .finish()
+    }
+}
+
+/// A formatted date and the times that format as it: from a whole second after the epoch up to the
+/// next one.
 struct CachedHttpDate {
-    seconds: i64,
-    formatted: String,
+    start: SystemTime,
+    end: SystemTime,
+    date: HttpDate,
 }
 
 thread_local! {
@@ -1544,31 +1583,37 @@ thread_local! {
 }
 
 fn format_http_date(time: SystemTime) -> String {
-    let seconds = time
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    String::from_utf8_lossy(http_date(time).as_bytes()).into_owned()
+}
+
+fn http_date(time: SystemTime) -> HttpDate {
     let cached = HTTP_DATE_CACHE.try_with(|cache| {
         cache
             .borrow()
             .as_ref()
-            .filter(|cached| cached.seconds == seconds)
-            .map(|cached| cached.formatted.clone())
+            .filter(|cached| cached.start <= time && time < cached.end)
+            .map(|cached| cached.date)
     });
-    if let Ok(Some(formatted)) = cached {
-        return formatted;
+    if let Ok(Some(date)) = cached {
+        return date;
     }
-    let formatted = format_http_date_seconds(seconds);
-    let _ = HTTP_DATE_CACHE.try_with(|cache| {
-        *cache.borrow_mut() = Some(CachedHttpDate {
-            seconds,
-            formatted: formatted.clone(),
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let date = format_http_date_seconds(seconds as i64);
+    if let Some(start) = UNIX_EPOCH.checked_add(Duration::from_secs(seconds)) {
+        let end = start.checked_add(Duration::from_secs(1)).unwrap_or(start);
+        let _ = HTTP_DATE_CACHE.try_with(|cache| {
+            *cache.borrow_mut() = Some(CachedHttpDate { start, end, date });
         });
-    });
-    formatted
+    }
+    date
 }
 
-fn format_http_date_seconds(seconds: i64) -> String {
+fn format_http_date_seconds(seconds: i64) -> HttpDate {
+    use std::io::Write as _;
+
     #[cfg(test)]
     DATE_FORMATS.with(|formats| formats.set(formats.get() + 1));
     let days = seconds / 86_400;
@@ -1582,7 +1627,10 @@ fn format_http_date_seconds(seconds: i64) -> String {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     let weekday = (days + 4).rem_euclid(7) as usize;
-    format!(
+    let mut bytes = [0; HTTP_DATE_CAPACITY];
+    let mut unwritten = &mut bytes[..];
+    let written = write!(
+        unwritten,
         "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
         weekdays[weekday],
         day,
@@ -1591,7 +1639,13 @@ fn format_http_date_seconds(seconds: i64) -> String {
         hour,
         minute,
         second,
-    )
+    );
+    debug_assert!(written.is_ok(), "an HTTP date fits its capacity");
+    let len = HTTP_DATE_CAPACITY - unwritten.len();
+    HttpDate {
+        bytes,
+        len: len as u8,
+    }
 }
 
 fn civil_from_days(days: i64) -> (i64, i64, i64) {
@@ -1619,6 +1673,8 @@ mod date_cache_tests {
     use super::DATE_FORMATS;
     use super::HTTP_DATE_CACHE;
     use super::format_http_date;
+    use super::format_http_date_seconds;
+    use super::http_date;
 
     #[test]
     fn equal_second_calls_format_the_date_once() {
@@ -1687,6 +1743,27 @@ mod date_cache_tests {
     }
 
     #[test]
+    fn inline_dates_match_formatted_strings_at_the_extremes() {
+        HTTP_DATE_CACHE.with(RefCell::take);
+        for (seconds, expected) in [
+            (784_111_777, "Sun, 06 Nov 1994 08:49:37 GMT"),
+            (253_402_300_800, "Sat, 01 Jan 10000 00:00:00 GMT"),
+        ] {
+            let time = UNIX_EPOCH + Duration::from_secs(seconds);
+            assert_eq!(http_date(time).as_bytes(), expected.as_bytes());
+            assert_eq!(
+                http_date(time).as_bytes(),
+                format_http_date(time).as_bytes()
+            );
+        }
+        for seconds in [i64::MIN, i64::MAX] {
+            let date = format_http_date_seconds(seconds);
+            assert!(date.as_bytes().ends_with(b" GMT"), "{date:?}");
+            assert!(date.as_bytes().len() <= 41, "{date:?}");
+        }
+    }
+
+    #[test]
     fn date_cache_returns_independent_owned_strings() {
         HTTP_DATE_CACHE.with(RefCell::take);
         let time = UNIX_EPOCH + Duration::from_secs(784_111_777);
@@ -1722,8 +1799,8 @@ mod date_cache_tests {
         .join()
         .expect("date formatting thread completes");
         assert_eq!(
-            HTTP_DATE_CACHE.with(|cache| cache.borrow().as_ref().map(|cached| cached.seconds)),
-            Some(1),
+            HTTP_DATE_CACHE.with(|cache| cache.borrow().as_ref().map(|cached| cached.start)),
+            Some(UNIX_EPOCH + Duration::from_secs(1)),
         );
         assert_eq!(
             format_http_date(UNIX_EPOCH + Duration::from_secs(1)),

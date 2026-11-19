@@ -1405,18 +1405,35 @@ impl StreamingCallback for CollectingCallback {
     fn on_decode_error(&mut self, _error: HpackError) {}
 }
 
+/// The name bytes that a memo key holds for `header`: empty for a common header, whose code alone
+/// selects the name that the encoder writes.
+fn key_name<'a>(header: &Header<'a>) -> &'a [u8] {
+    if header.code.as_u8() >= HttpHeaderCode::COMMON_OFFSET {
+        &[]
+    } else {
+        header.name
+    }
+}
+
 fn match_field_key(key: &mut &[u8], header: &Header<'_>) -> bool {
     let Some(prefix) = key.get(..5) else {
         return false;
     };
+    let name = key_name(header);
     let name_length = usize::from(u16::from_le_bytes([prefix[1], prefix[2]]));
     let value_length = usize::from(u16::from_le_bytes([prefix[3], prefix[4]]));
     let length = 5 + name_length + value_length;
     if prefix[0] != header.code.as_u8()
-        || name_length != header.name.len()
+        || name_length != name.len()
         || value_length != header.value.len()
-        || key.get(5..5 + name_length) != Some(header.name)
-        || key.get(5 + name_length..length) != Some(header.value)
+        || key.len() < length
+    {
+        return false;
+    }
+    // Empty slices are not compared: memcmp's masked loads can take a slow fault-suppression path
+    // on the dangling pointer of an empty slice.
+    if (name_length != 0 && key[5..5 + name_length] != *name)
+        || (value_length != 0 && key[5 + name_length..length] != *header.value)
     {
         return false;
     }
@@ -1440,9 +1457,10 @@ fn fill_field_key(
     key.clear();
     key.reserve(uncompressed as usize + 3 * fields);
     headers.for_each(|header| {
+        let name = key_name(&header);
         key.push(header.code.as_u8());
         key.extend_from_slice(
-            &u16::try_from(header.name.len())
+            &u16::try_from(name.len())
                 .expect("memo name is bounded")
                 .to_le_bytes(),
         );
@@ -1451,7 +1469,7 @@ fn fill_field_key(
                 .expect("memo value is bounded")
                 .to_le_bytes(),
         );
-        key.extend_from_slice(header.name);
+        key.extend_from_slice(name);
         key.extend_from_slice(header.value);
     });
 }
@@ -1486,6 +1504,60 @@ mod memo_tests {
             codec.encode_inputs_block(fields, 4096, 9).unwrap();
         }
         assert!(codec.encoder_memo.as_ref().unwrap().ready.is_some());
+    }
+
+    /// Fields whose names are spelled as given, whatever their codes.
+    struct Spelled(Vec<(HttpHeaderCode, &'static [u8], &'static [u8])>);
+
+    impl HeaderInputs for Spelled {
+        fn for_each<'a>(&'a self, mut visitor: impl FnMut(Header<'a>)) {
+            for &(code, name, value) in &self.0 {
+                visitor(Header { code, name, value });
+            }
+        }
+    }
+
+    #[test]
+    fn memo_key_holds_the_names_of_only_uncommon_fields() {
+        let lowercase = Spelled(vec![
+            (HttpHeaderCode::ColonStatus, b":status", b"200"),
+            (HttpHeaderCode::ContentLength, b"content-length", b""),
+            (HttpHeaderCode::Other, b"x-trace", b"abc"),
+        ]);
+        let camel = Spelled(vec![
+            (HttpHeaderCode::ColonStatus, b":Status", b"200"),
+            (HttpHeaderCode::ContentLength, b"Content-Length", b""),
+            (HttpHeaderCode::Other, b"x-trace", b"abc"),
+        ]);
+        let mut codec = HpackCodec::new();
+        // The first block inserts into the table, the second arms the key and the third records.
+        for _ in 0..3 {
+            codec.encode_inputs_block(&lowercase, 4096, 9).unwrap();
+        }
+        let expected = codec
+            .encoder
+            .clone()
+            .encode_inputs(&camel, 9, &mut InputStats::default());
+        let loops = codec.header_loop_counts();
+        let replayed = codec.encode_inputs_block(&camel, 4096, 9).unwrap();
+        assert_eq!(replayed.as_bytes(), expected.as_bytes());
+        assert_eq!(
+            codec.header_loop_counts(),
+            loops,
+            "common names do not miss the memo"
+        );
+
+        let renamed = Spelled(vec![
+            (HttpHeaderCode::ColonStatus, b":status", b"200"),
+            (HttpHeaderCode::ContentLength, b"content-length", b""),
+            (HttpHeaderCode::Other, b"x-trade", b"abc"),
+        ]);
+        codec.encode_inputs_block(&renamed, 4096, 9).unwrap();
+        assert_ne!(
+            codec.header_loop_counts(),
+            loops,
+            "an uncommon name misses the memo"
+        );
     }
 
     #[test]

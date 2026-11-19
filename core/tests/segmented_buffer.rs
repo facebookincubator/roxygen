@@ -126,6 +126,76 @@ fn compact_tail_spare_capacity_appends_in_place() {
 }
 
 #[test]
+fn compact_tail_growth_leaves_room_for_later_appends() {
+    let mut output = BufQueue::new(64 * 1024);
+    output.push_copy(b"headers").unwrap();
+    let body = queue_with_segments(16, &[b"0123456789", b"abcdef"]);
+    let mut expected = b"headers".to_vec();
+    let mut tails = vec![(
+        output.backing_capacity_upper_bound().unwrap(),
+        output.front().unwrap().as_ptr(),
+    )];
+    while output.chain_length() + 17 <= COMPACT_WRITE_LIMIT {
+        assert!(output.try_append_compact_to_tail(b"h", &body).unwrap());
+        expected.extend_from_slice(b"h0123456789abcdef");
+        assert_eq!(output.segment_count(), 1);
+        let tail = (
+            output.backing_capacity_upper_bound().unwrap(),
+            output.front().unwrap().as_ptr(),
+        );
+        if tails.last().map(|last| last.0) != Some(tail.0) {
+            tails.push(tail);
+        } else {
+            assert_eq!(
+                tails.last(),
+                Some(&tail),
+                "an append with room stays in place"
+            );
+        }
+    }
+    assert_eq!(contents(&output), expected);
+    // Exact copies while the tail holds at most 128 bytes, then tails of 512, 1024 and 2048.
+    let capacities = tails.iter().map(|tail| tail.0).collect::<Vec<_>>();
+    let exact = (0..8).map(|appends| 7 + 17 * appends);
+    assert_eq!(
+        capacities,
+        exact
+            .chain([512, 1024, COMPACT_WRITE_LIMIT])
+            .collect::<Vec<_>>()
+    );
+    assert!(!output.try_append_compact_to_tail(b"h", &body).unwrap());
+    assert_eq!(contents(&output), expected);
+}
+
+#[test]
+fn compact_tail_growth_counts_the_backing_of_earlier_segments() {
+    let mut output = BufQueue::new(64 * 1024);
+    output.push_vec(vec![b'x'; 1500]).unwrap();
+    output.push_vec(b"tail".to_vec()).unwrap();
+    let body = queue_with_segments(16, &[b"0123456789abcdef"]);
+    let mut bounds = Vec::new();
+    while output.try_append_compact_to_tail(b"", &body).unwrap() {
+        bounds.push(output.backing_capacity_upper_bound().unwrap());
+    }
+    // Past 128 bytes the tail grows to 512 bytes, then to the 548 bytes that the limit leaves
+    // beside the first segment. The append after that grows it to an exact size past the limit,
+    // which ends reuse.
+    assert_eq!(bounds.len(), 35);
+    assert_eq!(
+        (bounds[6], bounds[7], bounds[31]),
+        (1500 + 116, 1500 + 512, COMPACT_WRITE_LIMIT)
+    );
+    assert!(
+        bounds[..34]
+            .iter()
+            .all(|bound| *bound <= COMPACT_WRITE_LIMIT)
+    );
+    assert_eq!(bounds[34], 1500 + 4 + 35 * 16);
+    assert_eq!(output.chain_length(), 1500 + 4 + 35 * 16);
+    assert_eq!(output.segment_count(), 2);
+}
+
+#[test]
 fn compact_tail_rejects_aliases_hidden_capacity_and_excess_output() {
     let body = queue_with_segments(4, &[b"body"]);
     let mut shared = BufQueue::from_vec(b"prefix".to_vec(), 16).unwrap();
