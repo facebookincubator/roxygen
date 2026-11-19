@@ -153,7 +153,7 @@ fn cancelled() -> HttpError {
 fn wrong_worker() -> HttpError {
     HttpError::with_message(
         HttpErrorCode::INVALID_STATE_TRANSITION,
-        b"HTTPConnectTransport used from a different worker context",
+        b"connect transport used from a different worker context",
     )
 }
 
@@ -661,14 +661,14 @@ impl ReadOperation {
         if self.allocation_size == 0 {
             return Err(Err(HttpError::with_message(
                 HttpErrorCode::INVALID_STATE_TRANSITION,
-                b"HTTPConnectTransport read allocation size must be non-zero",
+                b"connect transport read allocation size must be non-zero",
             )));
         }
         let mut read = state.read.borrow_mut();
         if read.pending.is_some() {
             return Err(Err(HttpError::with_message(
                 HttpErrorCode::INVALID_STATE_TRANSITION,
-                b"HTTPConnectTransport already has a pending read",
+                b"connect transport already has a pending read",
             )));
         }
         let id = state.next_read.get();
@@ -1011,7 +1011,7 @@ impl WriteOperation {
             return Some(Poll::Ready(Err(TransportWriteError::new(
                 HttpError::with_message(
                     HttpErrorCode::INVALID_STATE_TRANSITION,
-                    b"HTTPConnectTransport already has a write in progress",
+                    b"connect transport already has a write in progress",
                 ),
                 0,
             ))));
@@ -1045,7 +1045,7 @@ impl WriteOperation {
             return self.fail(
                 state,
                 HttpErrorCode::TRANSPORT_WRITE_ERROR,
-                b"HTTPConnectTransport: egress closed",
+                b"connect transport egress is closed",
             );
         }
         let data = self.data.take().expect("should commit its data once");

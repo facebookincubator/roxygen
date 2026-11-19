@@ -3794,7 +3794,7 @@ fn kind_and_message<T: std::fmt::Debug>(result: Poll<io::Result<T>>) -> (io::Err
 fn not_connected() -> (io::ErrorKind, String) {
     (
         io::ErrorKind::NotConnected,
-        "writeChain on closed or bad transport".to_owned(),
+        "write on a closed or failed transport".to_owned(),
     )
 }
 

@@ -313,7 +313,7 @@ fn alpn_offered() -> ExplicitError {
     ExplicitError::new(
         Phase::Tls,
         ErrorKind::Protocol,
-        "the TLS configuration offers ALPN, which phase 1 does not support",
+        "the TLS configuration offers ALPN, which the explicit client does not support",
     )
 }
 

@@ -252,7 +252,7 @@ fn assert_write_error(
     assert_eq!(error.bytes_written(), 0);
 }
 
-const WRONG_WORKER: &[u8] = b"HTTPConnectTransport used from a different worker context";
+const WRONG_WORKER: &[u8] = b"connect transport used from a different worker context";
 
 fn assert_wrong_worker<T: std::fmt::Debug>(result: Result<T, HttpError>) {
     let error = result.expect_err("a call from another worker's context fails");
@@ -3834,7 +3834,7 @@ fn parked_write_at_egress_failure() {
             assert_write_error(
                 result,
                 HttpErrorCode::TRANSPORT_WRITE_ERROR,
-                b"HTTPConnectTransport: egress closed",
+                b"connect transport egress is closed",
             );
             let later = write(&transport, &context, b"later", Duration::ZERO)
                 .await
@@ -3894,7 +3894,7 @@ fn write_resumed_after_a_direct_eom_fails_the_egress_unless_it_completed() {
             assert_write_error(
                 parked.await,
                 HttpErrorCode::TRANSPORT_WRITE_ERROR,
-                b"HTTPConnectTransport: egress closed",
+                b"connect transport egress is closed",
             );
             drop(transport);
             drop(egress);

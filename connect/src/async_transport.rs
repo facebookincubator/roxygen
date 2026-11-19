@@ -170,7 +170,7 @@ impl HttpStreamSourceSharedCallback for WriteState {
 fn not_writable() -> io::Error {
     io::Error::new(
         io::ErrorKind::NotConnected,
-        "writeChain on closed or bad transport",
+        "write on a closed or failed transport",
     )
 }
 
