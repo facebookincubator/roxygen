@@ -28,7 +28,11 @@
 //! - [`http2`] holds HTTP/2 priority scheduling, flood limits and statistics hooks.
 //! - [`owned_h1`] and [`owned_h2`] are experimental poll-driven drivers. Each runs one future
 //!   per connection without a task per request. A downstream driver serves each request with an
-//!   [`OwnedExchange`] from the application's [`OwnedApplication`].
+//!   [`OwnedExchange`] from the application's [`OwnedApplication`], and
+//!   [`OwnedH1UpstreamSession`] and [`OwnedH2UpstreamSession`] send the requests that a caller
+//!   reserves and submits. `roxygen_server` serves on the downstream drivers when
+//!   `ServerSessionConfig::owned_http1` or `owned_http2` is set, and
+//!   `roxygen_client::experimental::owned` runs client connections on the upstream ones.
 //! - [`experimental`] holds unstable additions such as HTTP/2 PING probes and stream aborts.
 //!
 //! # Cargo features
@@ -40,6 +44,8 @@
 //! [`HttpHandler`]: roxygen_core::handler::HttpHandler
 //! [`OwnedApplication`]: owned::OwnedApplication
 //! [`OwnedExchange`]: owned::OwnedExchange
+//! [`OwnedH1UpstreamSession`]: owned_h1::OwnedH1UpstreamSession
+//! [`OwnedH2UpstreamSession`]: owned_h2::OwnedH2UpstreamSession
 //! [`SessionCore`]: session::SessionCore
 //! [`StreamState`]: stream_state::StreamState
 //! [`UniplexConfig`]: uniplex::UniplexConfig

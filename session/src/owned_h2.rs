@@ -5,9 +5,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Experimental HTTP/2 driver with concrete downstream and upstream exchange owners.
+//! Experimental poll-driven HTTP/2 driver, for downstream and upstream connections.
+//!
+//! One driver future per connection runs `Http2Codec`, every stream's exchange and every body
+//! source, and does not spawn a task for each stream. [`OwnedH2Session`] serves a downstream
+//! connection with an [`OwnedExchange`] for each request from the application's
+//! [`OwnedApplication`]. [`OwnedH2Session::new`] lists the configuration that the driver applies
+//! and rejects. The [`upstream`] module documents the client side, [`OwnedH2UpstreamSession`].
 
-mod upstream;
+pub mod upstream;
 
 use std::any::Any;
 use std::cell::Cell;
@@ -1955,10 +1961,16 @@ impl<A: OwnedApplication> OwnedH2Session<A> {
         Self(Some(driver.with_stream_seed(seed)))
     }
 
-    /// Runs the session inside the caller's registered worker cleanup scope.
+    /// Runs the session inside the caller's registered worker cleanup scope (see
+    /// `WorkerContext::register_scope`).
     ///
     /// The run never resumes a callback panic. A panic that aborts the connection is counted in
     /// the worker's `WorkerPollStats`, and the run returns `Err` once native I/O has joined.
+    ///
+    /// Dropping the run after its first poll and before it completes panics, outside a forced
+    /// worker teardown, because its native I/O has not joined. To stop early, call the handle's
+    /// `cancel` and poll the run to completion. Dropping the session or its run before the first
+    /// poll does not panic.
     pub fn run(mut self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
         self.0
             .take()

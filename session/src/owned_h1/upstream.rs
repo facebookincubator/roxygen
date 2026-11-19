@@ -1955,7 +1955,13 @@ impl OwnedH1UpstreamSession {
         Ok((Self(Some(driver)), handle))
     }
 
-    /// Runs inside the caller's registered worker cleanup scope, as `OwnedH2Session::run`.
+    /// Runs the session inside the caller's registered worker cleanup scope (see
+    /// `WorkerContext::register_scope`), as `OwnedH2Session::run` does.
+    ///
+    /// Dropping the run after its first poll and before it completes panics, outside a forced
+    /// worker teardown, because its native I/O has not joined. To stop early, call the handle's
+    /// `cancel` and poll the run to completion. Dropping the session or its run before the first
+    /// poll does not panic.
     pub fn run(mut self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
         UpstreamRun {
             driver: self.0.take(),

@@ -21,6 +21,12 @@
 //!   context. `ServerConfig` holds the listen addresses, the worker count, the protocol of
 //!   plaintext connections (HTTP/1.1 by default) and TLS. Its [`ServerSessionConfig`] holds
 //!   per-connection limits and timeouts.
+//! - [`ServerSessionConfig::owned_http1`] and [`ServerSessionConfig::owned_http2`] serve
+//!   HTTP/1.1 or HTTP/2 on the experimental owned drivers, which poll each handler from the
+//!   connection's future and do not spawn a task for it. `owned_http1` does not apply timeouts
+//!   and requires the stream read, connection idle and write timeouts to be zero.
+//!   `roxygen_tower_adapter` rejects both, because these drivers do not yet report when an
+//!   exchange's cleanup finishes.
 //! - [`HttpServer::drain`] stops accepting connections and drains the open ones.
 //!   [`HttpServer::wait_for_stop`] then blocks until they close and every worker exits. It
 //!   fails if a drain has not started. [`HttpServer::force_stop`] closes the connections
@@ -117,6 +123,8 @@
 //! [`HttpServerControl`]: server::HttpServerControl
 //! [`ServerConfig`]: server::ServerConfig
 //! [`ServerSessionConfig`]: acceptor::ServerSessionConfig
+//! [`ServerSessionConfig::owned_http1`]: acceptor::ServerSessionConfig::owned_http1
+//! [`ServerSessionConfig::owned_http2`]: acceptor::ServerSessionConfig::owned_http2
 //! [`StaticTlsCredentials`]: server::StaticTlsCredentials
 //! [`TlsCredentialProvider`]: server::TlsCredentialProvider
 //! [`serve_transport`]: connection::serve_transport

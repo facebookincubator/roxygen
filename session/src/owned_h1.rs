@@ -6,7 +6,7 @@
  */
 
 //! Experimental owned HTTP/1.1 downstream driver, and its upstream counterpart,
-//! [`OwnedH1UpstreamSession`].
+//! [`OwnedH1UpstreamSession`], which the [`upstream`] module documents.
 //!
 //! This is the poll-driven HTTP/1.1 counterpart of [`crate::owned_h2`]: one driver future per
 //! connection runs `Http1xCodec` and the application's [`OwnedExchange`]s, with no task per
@@ -118,7 +118,7 @@ use crate::uniplex::UniplexRunSummary;
 use crate::uniplex::UniplexTransport;
 use crate::uniplex::UniplexWriteQueue;
 
-mod upstream;
+pub mod upstream;
 
 pub use upstream::OwnedH1ExclusiveResponse;
 pub use upstream::OwnedH1ExclusiveSubmission;
@@ -757,7 +757,13 @@ impl<A: OwnedApplication> OwnedH1Session<A> {
         Ok((Self(driver), handle))
     }
 
-    /// Runs inside the caller's registered worker cleanup scope, as `OwnedH2Session::run`.
+    /// Runs the session inside the caller's registered worker cleanup scope (see
+    /// `WorkerContext::register_scope`), as `OwnedH2Session::run` does.
+    ///
+    /// Dropping the run after its first poll and before it completes panics, outside a forced
+    /// worker teardown, because its native I/O has not joined. To stop early, call the handle's
+    /// `cancel` and poll the run to completion. Dropping the session or its run before the first
+    /// poll does not panic.
     pub fn run(self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
         DriverRun(Some(self.0))
     }

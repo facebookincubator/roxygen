@@ -25,6 +25,10 @@ its APIs will change.
   TLS uses [rustls](https://github.com/rustls/rustls).
 - **Pull-based streaming.** A connection pulls more of a body only when it can
   send it, so a slow peer pauses the producer instead of growing a buffer.
+- **One future per connection.** The experimental owned drivers poll a
+  connection's codec, handlers and bodies from a single future, without a task
+  per request. On the server this is a configuration switch, and an
+  `HttpHandler` runs on it unchanged. See [Session drivers](#session-drivers).
 - **Few copies.** Bodies are queues of shared `bytes::Bytes` segments, so
   forwarding, splitting and trimming a body do not copy it. On Linux the TCP
   transport can send with `MSG_ZEROCOPY`.
@@ -109,6 +113,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Session drivers
+
+Roxygen has two drivers for a connection.
+
+- **`UniplexSession`** is the default, and `HttpServer` and `ClientSession` use
+  it. On the server, it runs each request's handler as a separate task on the
+  worker.
+- **The owned drivers** (`roxygen_session::owned_h1` and `owned_h2`) are
+  experimental. Each connection runs as one future, which polls the codec, the
+  handlers and the body sources in place and does not spawn a task for each
+  request.
+
+Both drivers keep a connection on one worker thread, so handlers and body
+sources do not need to be `Send` under either.
+
+On the server, each switch moves the connections of one protocol to its owned
+driver, and an `HttpHandler` runs there unchanged:
+
+```rust
+// The owned HTTP/2 driver applies the session timeouts.
+config.session.owned_http2 = true;
+// The owned HTTP/1.1 driver does not apply timeouts, so these must be zero.
+// HTTP/2 connections use the same fields, so this leaves them untimed too.
+config.session.owned_http1 = true;
+config.session.stream_read_timeout = Duration::ZERO;
+config.session.connection_idle_timeout = Duration::ZERO;
+config.session.write_timeout = Duration::ZERO;
+```
+
+The server adapts each `HttpHandler` to the drivers' `OwnedApplication` trait,
+so each request still has a boxed handler future and boxed request and
+response sources. An application that implements `OwnedApplication` itself
+exchanges header and body events with the driver directly, but it runs the
+drivers on connections it accepts, and that path does not have an example yet.
+
+On the client, `roxygen_client::experimental::owned` provides
+`OwnedClientSession` and a pool, `OwnedHttpSessionPool`. You reserve a slot,
+submit a request head and body, and read the response from the
+`HttpResponseSource` that the submission returns. See
+[`examples/owned_server.rs`](examples/owned_server.rs) and
+[`examples/owned_client.rs`](examples/owned_client.rs).
+
+Current limits of the owned drivers:
+
+- The HTTP/1.1 driver does not apply timeouts in either direction. On a
+  server, an idle HTTP/1.1 connection stays open until the client closes it or
+  the server drains, and a drain waits for a stalled request until the client
+  leaves or `force_stop` runs. The driver also cancels byte events instead of
+  firing them.
+- The owned server modes do not record statistics, so `stats_factory` must be
+  `None`, and `owned_http1` does not support lifecycle observers. The Tower
+  adapter rejects both modes, because the owned drivers do not yet report when
+  an exchange's cleanup finishes.
+- `OwnedClientSession::connect` and the pool dial plaintext TCP only. For TLS,
+  set up the connection yourself and pass it to `OwnedClientSession::attach`,
+  as the example does. Owned client sessions do not support lifecycle
+  observers, session statistics or PING probes, and HTTP/2 sessions refuse
+  server push. Dropping every handle does not close a session, so call
+  `close_when_idle`.
+- `HttpServer` and the owned client reject settings that the owned drivers do
+  not support when they start, and the error names the setting.
+
 ## More examples
 
 The [`examples`](examples) directory has complete programs. Run one with
@@ -117,9 +183,11 @@ The [`examples`](examples) directory has complete programs. Run one with
 | Example | What it shows |
 | --- | --- |
 | [`hello_server`](examples/hello_server.rs) | The handler API, over HTTP/1.1 or HTTP/2 with prior knowledge |
+| [`owned_server`](examples/owned_server.rs) | The `hello_server` handler on the experimental owned drivers, without a task per request |
 | [`streaming_server`](examples/streaming_server.rs) | A streamed response, and echoing a request body as it arrives |
 | [`tls_server`](examples/tls_server.rs) | HTTPS with ALPN choosing HTTP/2 or HTTP/1.1 |
 | [`client_get`](examples/client_get.rs) | Fetching a URL with the client |
+| [`owned_client`](examples/owned_client.rs) | Fetching a URL with the experimental owned client session |
 | [`axum_router`](examples/axum_router.rs) | An Axum router served by Roxygen through the Tower adapter |
 
 The [`curl`](curl) crate is a larger client: a command-line tool that accepts a
@@ -141,8 +209,8 @@ library: depend on `ferroxygen_server` and write `use roxygen_server::...`.
 | `ferroxygen_runtime` | Worker threads and their handles, timers, cancellation and task groups |
 | `ferroxygen_codec`, `ferroxygen_http1`, `ferroxygen_http2` | The codec interface and the HTTP/1.x and HTTP/2 codecs |
 | `ferroxygen_transport` | TCP and TLS byte streams, byte events, and adoption of connections you established |
-| `ferroxygen_session` | HTTP/1.1 and HTTP/2 connection state machines |
-| `ferroxygen_client` | Connector, connection pool and a simple request API |
+| `ferroxygen_session` | HTTP/1.1 and HTTP/2 connection state machines, including the experimental owned drivers |
+| `ferroxygen_client` | Connector, connection pool, a simple request API, and an experimental owned client |
 | `ferroxygen_server` | A multi-worker server with TLS, graceful drain and `100-continue` |
 | `ferroxygen_connect` | HTTP CONNECT tunnels over a client session |
 | `ferroxygen_http_adapter` | Conversions to and from the `http` crate's types |

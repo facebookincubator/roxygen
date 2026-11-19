@@ -30,8 +30,11 @@
 //! - [`HttpSessionPool`] reuses sessions to one address, and [`ClientConnectionCache`] keeps a
 //!   pool for each destination on a worker. Both return a session with a request
 //!   reservation, which [`HttpClient::request`] accepts.
-//! - [`experimental`] holds client sessions and a pool on the experimental owned session
-//!   drivers.
+//! - [`experimental::owned`] runs client connections on the experimental owned session drivers,
+//!   one future per connection. With an [`OwnedClientSession`], or a session from an
+//!   [`OwnedHttpSessionPool`], the caller reserves a slot, submits a request head and body, and
+//!   reads the response from an `HttpResponseSource`. Both dial plaintext TCP only, and
+//!   `OwnedClientSession::attach` takes a TLS connection that the caller established.
 //!
 //! TLS connections offer `h2` and `http/1.1` through ALPN by default. Plaintext connections use
 //! `ConnectionParams::plaintext_protocol`, which defaults to HTTP/1.1. The default
@@ -67,6 +70,8 @@
 //! ```
 //!
 //! [`ClientConnectionCache`]: pool::ClientConnectionCache
+//! [`OwnedClientSession`]: experimental::owned::OwnedClientSession
+//! [`OwnedHttpSessionPool`]: experimental::owned::OwnedHttpSessionPool
 //! [`HttpSessionPool`]: pool::HttpSessionPool
 //! [`IdentityValidation::Enforcing`]: connector::IdentityValidation::Enforcing
 //! [`IdentityValidation::Logging`]: connector::IdentityValidation::Logging

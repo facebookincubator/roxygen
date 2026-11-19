@@ -5,6 +5,86 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+//! Experimental owned HTTP/2 upstream session.
+//!
+//! This is the poll-driven HTTP/2 counterpart of
+//! [`crate::owned_h1::OwnedH1UpstreamSession`], with the same admission contract: reserve a slot,
+//! submit a head and its body source, and read the response from a source the caller owns. It
+//! shares the driver of [`crate::owned_h2::OwnedH2Session`]. One driver future runs the
+//! connection's `Http2Codec`, every request upload and every response source, and does not
+//! spawn a task for each request.
+//!
+//! # Concurrency and admission
+//!
+//! Each request is a stream. Capacity is the lower of
+//! `Http2SessionConfig::max_concurrent_outgoing_streams`, which must be nonzero, and the peer's
+//! `MAX_CONCURRENT_STREAMS`, less the reservations and streams that hold a slot
+//! (`OwnedH2UpstreamHandle::admitted_streams`). A reservation already taken survives a lower
+//! peer limit. The driver commits submissions in the order they were made: it opens the stream
+//! and queues its HEADERS. While the unwritten output is at `maximum_write_size` or more, it does
+//! not commit a queued request. A stream's slot is released once its request's end is serialized
+//! and its response's end has arrived, even if the reader has not consumed it yet. A stream that
+//! ends any other way, such as a reset, releases its slot once its response source completes and
+//! its writes are done.
+//!
+//! [`OwnedH2UpstreamReservation::submit`] and `submit_exclusive` resolve with the response's
+//! source once the request's HEADERS are serialized, which is before they are written.
+//! `submit_with_response_interest` resolves at the first response head instead, or when the
+//! response ends before one. On a connection that has carried requests and is not waiting for a
+//! response, the driver does not commit a queued request once the peer's FIN or RST is pending in
+//! the transport. That request fails unprocessed.
+//!
+//! # Requests and flow control
+//!
+//! Cancelling an unfinished request after commit, with a `cancel` call, a dropped submission or
+//! response, or its cancellation token, resets only its stream. A head that is not a request, or
+//! a TRACE request whose head declares a body, is rejected before commit. The upload is read in
+//! events of at most 65,535 bytes and sent as the stream and connection send windows allow. A
+//! failed upload resets its stream and fails its response. A peer `NO_ERROR` reset after the
+//! whole response only stops the upload. A request's transport-write and kernel-write byte events
+//! fire once the bytes that carry them are written.
+//!
+//! The response source's window is the last `INITIAL_WINDOW_SIZE` in
+//! `Http2SessionConfig::settings`, or `stream_receive_window` when the settings lack one, and the
+//! driver returns credit with WINDOW_UPDATE as the reader consumes body bytes.
+//! [`OwnedH2UpstreamSession::new`] rejects a `stream_receive_window` that conflicts with the
+//! advertised window, SETTINGS that do not carry `ENABLE_PUSH=0`, and a transport with byte-event
+//! capability.
+//!
+//! # Timeouts and shutdown
+//!
+//! If a read stays pending for `read_timeout`, the connection drains. `write_timeout` bounds a
+//! stalled write and an upload's wait for credit. A wait for stream credit that outlasts it resets
+//! each blocked stream with `FLOW_CONTROL_ERROR`, and a wait for connection credit fails the
+//! connection with that code. `stream_read_timeout` starts once the request's end is serialized
+//! and bounds each wait for response data. A response that stalls fails with `READ_TIMEOUT`, and
+//! its stream is reset with `CANCEL`.
+//!
+//! `OwnedH2UpstreamHandle::close_when_idle` closes admission and sends one GOAWAY, and the
+//! connection closes once its streams finish. `cancel` fails the connection with
+//! `CORO_CANCELLED` and resets the transport. To stop a session early, cancel it and poll its run
+//! to completion. Dropping a run after its first poll and before it completes panics, outside a
+//! forced worker teardown, because its native I/O has not joined. Dropping the session or its run
+//! before that first poll does not panic.
+//!
+//! A peer GOAWAY closes admission, and `peer_goaway` returns its code. Streams above its
+//! last-stream-id fail with `REFUSED_STREAM`, and a GOAWAY that carries an error code fails the
+//! connection. Peer EOF closes admission. A submission still queued when admission closes fails
+//! unprocessed (`OwnedRequestProgressExt::request_unprocessed`), as does a request that the peer
+//! refuses before any response head.
+//!
+//! # Panic containment
+//!
+//! The driver contains panics from the code it runs and counts each in its worker's
+//! `WorkerPollStats`. A panic in a request's upload or response observer fails only that request,
+//! resets its stream if the stream is still open, and leaves the connection serving. A panic in
+//! the connection's observer while the driver polls drains the connection. An observer callback
+//! that runs inside a caller's own call, such as dropping a reservation, raises its panic to that
+//! caller. A panic while the driver commits a request, or any other panic in the driver's poll,
+//! tears the connection down: its native read and writes are cancelled and joined, an operation
+//! whose teardown polls panic three times in total is dropped unfinished, and the run returns
+//! `Err(INTERNAL_ERROR)`. A run never resumes a panic.
+
 use roxygen_core::body_event_queue::HttpBodySource;
 use roxygen_core::body_event_queue::HttpBodyTransfer;
 use roxygen_core::source_holder::HttpSourceHolder;
@@ -1274,10 +1354,16 @@ impl OwnedH2UpstreamSession {
         ))
     }
 
-    /// Runs the session to completion.
+    /// Runs the session to completion inside the caller's registered worker cleanup scope (see
+    /// `WorkerContext::register_scope`).
     ///
     /// The run never resumes a callback panic. A panic that aborts the connection is counted in
     /// the worker's `WorkerPollStats`, and the run returns `Err` once native I/O has joined.
+    ///
+    /// Dropping the run after its first poll and before it completes panics, outside a forced
+    /// worker teardown, because its native I/O has not joined. To stop early, call the handle's
+    /// `cancel` and poll the run to completion. Dropping the session or its run before the first
+    /// poll does not panic.
     pub fn run(mut self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
         self.0
             .take()
