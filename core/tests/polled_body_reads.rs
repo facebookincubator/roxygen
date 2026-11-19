@@ -5,7 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Tests for `HttpSource::poll_body_event` through `HttpSourceHolder`.
+//! Tests for `HttpSource::poll_body_event` and `HttpSource::poll_header_event` through
+//! `HttpSourceHolder`.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -31,6 +32,7 @@ use crate::error::HttpError;
 use crate::error::HttpErrorCode;
 use crate::events::HttpBodyEvent;
 use crate::events::HttpHeaderEvent;
+use crate::message::HttpMessage;
 use crate::source::HttpSource;
 use crate::source::LocalSourceFuture;
 use crate::source_holder::HttpSourceHolder;
@@ -1484,5 +1486,217 @@ fn a_panicking_exclusive_or_forwarded_poll_retires_its_source() {
         assert!(log.stops.borrow().is_empty(), "{path:?}");
         assert_eq!(log.drops.get(), 1, "{path:?}");
         assert_eq!(*log.polls.borrow(), [7], "{path:?}");
+    }
+}
+
+#[derive(Default)]
+struct HeaderLog {
+    polls: Cell<usize>,
+    reads: Cell<usize>,
+    stops: Cell<usize>,
+    drops: Cell<usize>,
+}
+
+/// Serves scripted header results, one per `poll_header_event` call.
+struct ScriptedHeaderSource {
+    log: Rc<HeaderLog>,
+    script: VecDeque<Poll<Result<HttpHeaderEvent, HttpError>>>,
+}
+
+impl ScriptedHeaderSource {
+    fn new(
+        log: &Rc<HeaderLog>,
+        script: impl IntoIterator<Item = Poll<Result<HttpHeaderEvent, HttpError>>>,
+    ) -> Box<Self> {
+        Box::new(Self {
+            log: Rc::clone(log),
+            script: script.into_iter().collect(),
+        })
+    }
+}
+
+impl HttpSource for ScriptedHeaderSource {
+    fn read_header_event(&mut self) -> LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
+        self.log.reads.set(self.log.reads.get() + 1);
+        Box::pin(std::future::pending())
+    }
+
+    fn read_body_event(
+        &mut self,
+        _maximum: u32,
+    ) -> LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
+        unreachable!("the test reads only headers")
+    }
+
+    fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {
+        self.log.stops.set(self.log.stops.get() + 1);
+    }
+
+    fn polls_header_events(&self) -> bool {
+        true
+    }
+
+    fn poll_header_event(
+        &mut self,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        self.log.polls.set(self.log.polls.get() + 1);
+        self.script.pop_front().expect("a scripted header result")
+    }
+}
+
+impl Drop for ScriptedHeaderSource {
+    fn drop(&mut self) {
+        self.log.drops.set(self.log.drops.get() + 1);
+    }
+}
+
+fn header(eom: bool) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+    let mut message = HttpMessage::new();
+    message.set_status_code(200).expect("a valid status");
+    Poll::Ready(Ok(
+        HttpHeaderEvent::new(message, eom).expect("a final header")
+    ))
+}
+
+#[test]
+fn a_polling_source_serves_holder_header_reads_in_place() {
+    for eom in [false, true] {
+        let log = Rc::new(HeaderLog::default());
+        let mut holder = HttpSourceHolder::new(ScriptedHeaderSource::new(
+            &log,
+            [Poll::Pending, header(eom)],
+        ));
+        let mut read = holder.read_header_event_unboxed();
+        assert!(poll(&mut read).is_pending());
+        assert_eq!(
+            holder.release().err(),
+            Some(SourceReleaseError::ReadInProgress),
+            "a pending read keeps its admission"
+        );
+        let Poll::Ready(Ok(event)) = poll(&mut read) else {
+            panic!("eom {eom}: the second poll is ready");
+        };
+        assert_eq!(event.eom(), eom);
+        assert_eq!(
+            log.polls.get(),
+            2,
+            "eom {eom}: every poll reaches the source"
+        );
+        assert_eq!(log.reads.get(), 0, "eom {eom}: no boxed read was made");
+        assert_eq!(
+            holder.readable(),
+            !eom,
+            "only a terminal header consumes the source"
+        );
+        assert_eq!(log.drops.get(), usize::from(eom));
+        assert_eq!(log.stops.get(), 0);
+    }
+}
+
+#[test]
+fn a_pending_in_place_header_read_fails_once_its_generation_goes_away() {
+    for replace in [false, true] {
+        let log = Rc::new(HeaderLog::default());
+        let mut holder = HttpSourceHolder::new(ScriptedHeaderSource::new(&log, [Poll::Pending]));
+        let mut read = holder.read_header_event_unboxed();
+        assert!(poll(&mut read).is_pending());
+        let successor = Rc::new(HeaderLog::default());
+        if replace {
+            holder.set_source(ScriptedHeaderSource::new(&successor, [header(true)]));
+        } else {
+            holder.clear(Some(HttpErrorCode::CANCEL));
+        }
+        assert_eq!(log.stops.get(), 1, "replace {replace}");
+        assert_eq!(log.drops.get(), 1, "replace {replace}");
+        let Poll::Ready(Err(error)) = poll(&mut read) else {
+            panic!("replace {replace}: the read of a retired source fails");
+        };
+        assert_eq!(error.code(), HttpErrorCode::DROPPED);
+        assert_eq!(log.polls.get(), 1, "the retired source is not polled again");
+        assert_eq!(
+            successor.polls.get(),
+            0,
+            "the successor waits for its own read"
+        );
+        assert_eq!(holder.readable(), replace);
+    }
+}
+
+/// [`awaited_read_after`] for an in-place header read.
+fn awaited_header_read_after(invalidation: Invalidation) -> (Option<HttpErrorCode>, Rc<HeaderLog>) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async move {
+        let log = Rc::new(HeaderLog::default());
+        let mut holder = Some(HttpSourceHolder::new(ScriptedHeaderSource::new(
+            &log,
+            [Poll::Pending],
+        )));
+        let read = holder
+            .as_mut()
+            .expect("the holder is live")
+            .read_header_event_unboxed();
+        let reader = tokio::task::spawn_local(read);
+        while log.polls.get() == 0 {
+            tokio::task::yield_now().await;
+        }
+        let live = holder.as_mut().expect("the holder is live");
+        match invalidation {
+            Invalidation::Clear => live.clear(Some(HttpErrorCode::CANCEL)),
+            Invalidation::StopReading => {
+                HttpSource::stop_reading(live, Some(HttpErrorCode::CANCEL));
+            }
+            Invalidation::Replace => live.set_source(ScriptedHeaderSource::new(&log, [])),
+            Invalidation::Destroy => drop(holder.take()),
+        }
+        let code = tokio::time::timeout(Duration::from_secs(2), reader)
+            .await
+            .ok()
+            .map(|joined| {
+                joined
+                    .expect("the reader task finishes")
+                    .err()
+                    .expect("the read fails")
+                    .code()
+            });
+        drop(holder);
+        (code, log)
+    })
+}
+
+/// A pending in-place header read whose generation goes away is woken and fails
+/// `DROPPED`, as a body read does.
+#[test]
+fn a_pending_in_place_header_read_is_woken_when_its_source_generation_goes_away() {
+    for invalidation in [
+        Invalidation::Clear,
+        Invalidation::StopReading,
+        Invalidation::Replace,
+        Invalidation::Destroy,
+    ] {
+        let (code, log) = awaited_header_read_after(invalidation);
+        assert_eq!(
+            code,
+            Some(HttpErrorCode::DROPPED),
+            "{invalidation:?}: the reader is woken and fails"
+        );
+        assert_eq!(
+            log.polls.get(),
+            1,
+            "{invalidation:?}: the stopped source is not polled again"
+        );
+        let generations = match invalidation {
+            Invalidation::Replace => 2,
+            _ => 1,
+        };
+        assert_eq!(
+            (log.stops.get(), log.drops.get()),
+            (generations, generations),
+            "{invalidation:?}: every source generation is stopped and dropped"
+        );
     }
 }

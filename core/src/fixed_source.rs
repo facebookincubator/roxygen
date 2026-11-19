@@ -6,6 +6,8 @@
  */
 
 use std::collections::VecDeque;
+use std::task::Context;
+use std::task::Poll;
 
 use thiserror::Error;
 
@@ -37,19 +39,24 @@ pub enum FixedSourceError {
 
 /// An in-memory source with one header event and a fixed body-event sequence.
 pub struct HttpFixedSource {
-    message: Option<HttpMessage>,
+    message: Option<Box<HttpMessage>>,
     pushes: VecDeque<HttpBodyEvent>,
     trailers: Option<HttpHeaders>,
     body: BufQueue,
 }
 
 impl HttpFixedSource {
-    pub fn new(mut message: HttpMessage, body: Option<BufQueue>) -> Self {
+    pub fn new(message: HttpMessage, body: Option<BufQueue>) -> Self {
+        Self::with_boxed_message(Box::new(message), body)
+    }
+
+    fn with_boxed_message(mut message: Box<HttpMessage>, body: Option<BufQueue>) -> Self {
         let body = match body {
             Some(body) => {
+                let mut digits = [0; DECIMAL_DIGITS];
                 message.headers_mut().set(
                     HttpHeaderCode::ContentLength,
-                    body.chain_length().to_string().as_bytes(),
+                    format_decimal(body.chain_length(), &mut digits),
                 );
                 body
             }
@@ -151,22 +158,22 @@ impl HttpFixedSource {
         Self::from_message_and_body(self.message.take(), self.body.take())
     }
 
-    fn from_message_and_body(message: Option<HttpMessage>, body: BufQueue) -> Self {
+    fn from_message_and_body(message: Option<Box<HttpMessage>>, body: BufQueue) -> Self {
         match message {
             Some(message) => {
                 let body = (!body.is_empty()).then_some(body);
-                Self::new(message, body)
+                Self::with_boxed_message(message, body)
             }
             None => Self::make_fixed_body(body),
         }
     }
 
     pub fn message(&self) -> Option<&HttpMessage> {
-        self.message.as_ref()
+        self.message.as_deref()
     }
 
     pub fn message_mut(&mut self) -> Option<&mut HttpMessage> {
-        self.message.as_mut()
+        self.message.as_deref_mut()
     }
 
     pub fn body(&self) -> &BufQueue {
@@ -188,6 +195,31 @@ impl HttpFixedSource {
     pub fn has_trailers(&self) -> bool {
         self.trailers.is_some()
     }
+
+    fn take_header_event(&mut self) -> Result<HttpHeaderEvent, HttpError> {
+        let Some(message) = self.message.take() else {
+            return Err(HttpError::with_message(
+                HttpErrorCode::INVALID_STATE_TRANSITION,
+                b"fixed source header was already consumed or is body-only",
+            ));
+        };
+        HttpHeaderEvent::from_boxed_headers(message, self.body.is_empty())
+            .map_err(header_event_error)
+    }
+
+    fn next_body_event(&mut self, maximum: u32) -> HttpBodyEvent {
+        if let Some(push) = self.pushes.pop_front() {
+            return push;
+        }
+        if self.body.is_empty()
+            && let Some(trailers) = self.trailers.take()
+        {
+            return HttpBodyEvent::trailers(trailers);
+        }
+        let body = self.body.split_at_most(maximum as usize);
+        let eom = self.body.is_empty() && self.trailers.is_none();
+        HttpBodyEvent::body(body, eom)
+    }
 }
 
 impl Clone for HttpFixedSource {
@@ -198,41 +230,40 @@ impl Clone for HttpFixedSource {
 
 impl HttpSource for HttpFixedSource {
     fn read_header_event(&mut self) -> LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
-        let result = self.message.take().map_or_else(
-            || {
-                Err(HttpError::with_message(
-                    HttpErrorCode::INVALID_STATE_TRANSITION,
-                    b"fixed source header was already consumed or is body-only",
-                ))
-            },
-            |message| {
-                HttpHeaderEvent::new(message, self.body.is_empty()).map_err(header_event_error)
-            },
-        );
-        Box::pin(std::future::ready(result))
+        Box::pin(std::future::ready(self.take_header_event()))
     }
 
     fn read_body_event(
         &mut self,
         maximum: u32,
     ) -> LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
-        let event = if let Some(push) = self.pushes.pop_front() {
-            push
-        } else if self.body.is_empty() && self.trailers.is_some() {
-            HttpBodyEvent::trailers(
-                self.trailers
-                    .take()
-                    .expect("checked trailer presence before transfer"),
-            )
-        } else {
-            let body = self.body.split_at_most(maximum as usize);
-            let eom = self.body.is_empty() && self.trailers.is_none();
-            HttpBodyEvent::body(body, eom)
-        };
-        Box::pin(std::future::ready(Ok(event)))
+        Box::pin(std::future::ready(Ok(self.next_body_event(maximum))))
     }
 
     fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {}
+
+    fn polls_header_events(&self) -> bool {
+        true
+    }
+
+    fn poll_header_event(
+        &mut self,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        Poll::Ready(self.take_header_event())
+    }
+
+    fn polls_body_events(&self) -> bool {
+        true
+    }
+
+    fn poll_body_event(
+        &mut self,
+        _context: &mut Context<'_>,
+        maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        Poll::Ready(Ok(self.next_body_event(maximum)))
+    }
 }
 
 pub struct HttpErrorSource {
@@ -278,6 +309,22 @@ pub fn get_error_response(
         .expect("newly constructed fixed response retains its message")
         .set_wants_keepalive(false);
     Ok(response)
+}
+
+/// The most decimal digits a `usize` has.
+pub(crate) const DECIMAL_DIGITS: usize = usize::MAX.ilog10() as usize + 1;
+
+/// Writes `value` in decimal at the end of `digits` and returns the written part.
+pub(crate) fn format_decimal(mut value: usize, digits: &mut [u8; DECIMAL_DIGITS]) -> &[u8] {
+    let mut start = DECIMAL_DIGITS;
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            return &digits[start..];
+        }
+    }
 }
 
 fn header_event_error(error: HeaderEventError) -> HttpError {

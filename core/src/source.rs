@@ -51,6 +51,35 @@ pub trait HttpSource: 'static {
 
     fn set_read_timeout(&mut self, _timeout: Duration) {}
 
+    /// Whether this source serves header reads through [`Self::poll_header_event`], polled
+    /// in place, instead of the boxed future that [`Self::read_header_event`] returns.
+    /// Defaults to `false`.
+    ///
+    /// [`HttpSourceHolder`] calls it once per header read, when the read starts, as it
+    /// calls [`Self::polls_body_events`] for a body read.
+    ///
+    /// [`HttpSourceHolder`]: crate::source_holder::HttpSourceHolder
+    fn polls_header_events(&self) -> bool {
+        false
+    }
+
+    /// Polls for the next header event.
+    ///
+    /// A poll means the same as polling a [`Self::read_header_event`] future, and the
+    /// rules of [`Self::poll_body_event`] apply. This is called only while
+    /// [`Self::polls_header_events`] is `true`.
+    ///
+    /// The default returns an `INVALID_STATE_TRANSITION` error.
+    fn poll_header_event(
+        &mut self,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        Poll::Ready(Err(HttpError::with_message(
+            HttpErrorCode::INVALID_STATE_TRANSITION,
+            b"HTTP source does not poll header events",
+        )))
+    }
+
     /// Whether this source serves body reads through [`Self::poll_body_event`], polled in
     /// place, instead of the boxed future that [`Self::read_body_event`] returns. Defaults
     /// to `false`.

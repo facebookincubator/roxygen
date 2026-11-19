@@ -596,8 +596,12 @@ mod panicking_reads {
         Start,
         /// `polls_body_events`, which a body read calls first, panics.
         PollsBodyEvents,
+        /// `polls_header_events`, which a header read calls first, panics.
+        PollsHeaderEvents,
         /// The future the read returned panics when polled.
         Poll,
+        /// The source serves header reads in place, and `poll_header_event` panics.
+        HeaderPoll,
     }
 
     struct DropProbe(Lifecycle, &'static str);
@@ -660,6 +664,21 @@ mod panicking_reads {
                 panic_any("polls body events");
             }
             false
+        }
+
+        fn polls_header_events(&self) -> bool {
+            match self.panic {
+                ReadPanic::PollsHeaderEvents => panic_any("polls header events"),
+                ReadPanic::HeaderPoll => true,
+                _ => false,
+            }
+        }
+
+        fn poll_header_event(
+            &mut self,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+            panic_any("header poll")
         }
     }
 
@@ -742,6 +761,7 @@ mod panicking_reads {
             (ReadPanic::Start, true, "read start"),
             (ReadPanic::Start, false, "read start"),
             (ReadPanic::PollsBodyEvents, false, "polls body events"),
+            (ReadPanic::PollsHeaderEvents, true, "polls header events"),
         ] {
             let (mut holder, lifecycle) = panicking_holder(panic, false);
             let message = panic_message(|| start(&mut holder, header));
@@ -759,6 +779,20 @@ mod panicking_reads {
                 "{panic:?}, header {header}"
             );
         }
+    }
+
+    /// An in-place header read whose source poll panics consumes the source in
+    /// the same way. The read has no future of its own to drop.
+    #[test]
+    fn a_panicking_in_place_header_poll_retires_its_source_without_stop_reading() {
+        let (mut holder, lifecycle) = panicking_holder(ReadPanic::HeaderPoll, false);
+        let mut read = holder.read_header_event();
+        assert_eq!(panic_message(|| drop(poll_once(&mut read))), "header poll");
+        assert_eq!(*lifecycle.borrow(), ["source.drop"]);
+        drop(read);
+        assert_consumed(&mut holder);
+        drop(holder);
+        assert_eq!(*lifecycle.borrow(), ["source.drop"]);
     }
 
     /// Calling `polls_body_events` on the holder itself outside a read, as an

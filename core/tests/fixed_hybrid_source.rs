@@ -23,9 +23,11 @@ use crate::events::HttpBodyEvent;
 use crate::events::HttpBodyEventKind;
 use crate::events::HttpBodyEventType;
 use crate::events::HttpHeaderEvent;
+use crate::fixed_source::DECIMAL_DIGITS;
 use crate::fixed_source::FixedSourceError;
 use crate::fixed_source::HttpErrorSource;
 use crate::fixed_source::HttpFixedSource;
+use crate::fixed_source::format_decimal;
 use crate::fixed_source::get_error_response;
 use crate::headers::HttpHeaderCode;
 use crate::headers::HttpHeaders;
@@ -243,6 +245,97 @@ mod fixed_source {
             panic!("trailers changed event kind");
         };
         assert_eq!(headers.get_single_or_empty(b"x-trailer"), b"value");
+    }
+
+    /// Polling the source in place yields the events that its read futures yield.
+    #[test]
+    fn polled_events_match_read_events() {
+        let make = || {
+            let mut source =
+                HttpFixedSource::make_fixed_response(200, Some(queue(b"abcdef"))).unwrap();
+            source.push_event(HttpBodyEvent::padding(3, false));
+            let mut trailers = HttpHeaders::new();
+            trailers.add(b"x-trailer", b"value");
+            source.set_trailers(trailers);
+            source
+        };
+        let mut read = make();
+        let mut polled = make();
+        assert!(polled.polls_header_events());
+        assert!(polled.polls_body_events());
+        let mut context = Context::from_waker(Waker::noop());
+
+        let expected = ready(read.read_header_event()).unwrap();
+        let Poll::Ready(Ok(headers)) = polled.poll_header_event(&mut context) else {
+            panic!("the header poll is ready");
+        };
+        assert_eq!(headers.eom(), expected.eom());
+        assert_eq!(
+            headers
+                .headers()
+                .headers()
+                .get_single_or_empty(HttpHeaderCode::ContentLength),
+            b"6"
+        );
+
+        for maximum in [1, 0, 4, 4, u32::MAX] {
+            let expected = ready(read.read_body_event(maximum)).unwrap();
+            let Poll::Ready(Ok(event)) = polled.poll_body_event(&mut context, maximum) else {
+                panic!("the body poll is ready");
+            };
+            assert_eq!(
+                event.event_type(),
+                expected.event_type(),
+                "maximum {maximum}"
+            );
+            assert_eq!(event.eom(), expected.eom(), "maximum {maximum}");
+            if expected.as_body().is_some() {
+                assert_eq!(event_bytes(&event), event_bytes(&expected));
+            }
+        }
+        let Poll::Ready(Err(error)) = polled.poll_header_event(&mut context) else {
+            panic!("a second header poll fails");
+        };
+        assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+    }
+
+    /// A holder takes each event of a fixed source when its read is first polled. A
+    /// read dropped unpolled leaves the event, and a read started before a clear fails.
+    #[test]
+    fn holder_reads_take_fixed_events_when_first_polled() {
+        let fixed =
+            || Box::new(HttpFixedSource::make_fixed_response(200, Some(queue(b"abc"))).unwrap());
+        let mut holder = HttpSourceHolder::new(fixed());
+        drop(holder.read_header_event());
+        assert!(!ready(holder.read_header_event()).unwrap().eom());
+        drop(holder.read_body_event(16));
+        let body = ready(holder.read_body_event(16)).unwrap();
+        assert_eq!(event_bytes(&body), b"abc");
+        assert!(body.eom());
+
+        let mut holder = HttpSourceHolder::new(fixed());
+        let header = holder.read_header_event();
+        holder.clear(None);
+        let error = ready(header).err().expect("the header read fails");
+        assert_eq!(error.code(), HttpErrorCode::DROPPED);
+
+        let mut holder = HttpSourceHolder::new(fixed());
+        ready(holder.read_header_event()).unwrap();
+        let body = holder.read_body_event(16);
+        holder.clear(None);
+        let error = ready(body).err().expect("the body read fails");
+        assert_eq!(error.code(), HttpErrorCode::DROPPED);
+    }
+
+    #[test]
+    fn format_decimal_matches_to_string() {
+        let mut digits = [0; DECIMAL_DIGITS];
+        for value in [0, 9, 10, 99, 100, 12345, usize::MAX] {
+            assert_eq!(
+                format_decimal(value, &mut digits),
+                value.to_string().as_bytes()
+            );
+        }
     }
 
     #[test]
