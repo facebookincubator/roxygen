@@ -2525,6 +2525,35 @@ fn http2_first_initial_window_setting_takes_precedence() {
 }
 
 #[test]
+fn owned_http2_stream_window_is_stream_flow_control_unless_settings_set_it() {
+    let mut server = crate::acceptor::ServerSessionConfig {
+        owned_http2: true,
+        ..crate::acceptor::ServerSessionConfig::default()
+    };
+    assert_eq!(
+        owned_http2_session_config(&server).stream_receive_window,
+        server.stream_flow_control,
+        "without INITIAL_WINDOW_SIZE in settings, the window matches the default driver's"
+    );
+
+    server.settings.extend([
+        CodecSetting {
+            identifier: 4,
+            value: 111,
+        },
+        CodecSetting {
+            identifier: 4,
+            value: 222,
+        },
+    ]);
+    assert_eq!(
+        owned_http2_session_config(&server).stream_receive_window,
+        222,
+        "the owned driver's window must equal the last advertised value"
+    );
+}
+
+#[test]
 fn tls_alpn_h2_runs_real_uniplex_exchange() {
     let (options, certificate) = generated_tls_with_alpn([b"h2".as_slice()]);
     let stats = Arc::new(HandlerStats::default());

@@ -31,7 +31,6 @@ use roxygen_core::http::TransportDirection;
 use roxygen_core::message::SocketAddress;
 use roxygen_runtime::cancellation::CancellationSource;
 use roxygen_runtime::worker::WorkerContext;
-use roxygen_session::http2::DEFAULT_STREAM_WINDOW;
 use roxygen_session::http2::Http2SessionConfig;
 use roxygen_session::http2::StreamReceiveWindowMode;
 use roxygen_session::http2::rate_limit::Http2RateLimitConfig;
@@ -174,9 +173,10 @@ pub struct ServerSessionConfig {
     /// A `lifecycle_observer_factory` observer sees the connection's lifecycle as under
     /// `UniplexSession`, with some differences. Among them, events arrive at the end of each
     /// driver poll, a stream detaches when the driver retires it, and an observer panic aborts
-    /// the connection with `INTERNAL_ERROR`. The driver requires the stream receive window to
-    /// equal the advertised `INITIAL_WINDOW_SIZE`, so the stream window follows the advertised
-    /// setting, not `stream_flow_control`.
+    /// the connection with `INTERNAL_ERROR`. The stream receive window is `stream_flow_control`,
+    /// which the driver advertises as `INITIAL_WINDOW_SIZE`, unless `settings` sets
+    /// `INITIAL_WINDOW_SIZE`. The driver requires the window to equal the advertised value, so
+    /// if `settings` sets it more than once, the last value applies.
     pub owned_http2: bool,
     /// Fails a downstream HTTP/1.1 connection, as a reset does, when the peer's EOF arrives
     /// while a transaction other than an established tunnel is open. Experimental; off by
@@ -921,18 +921,20 @@ pub(crate) fn http2_session_config(config: &ServerSessionConfig) -> Http2Session
 /// The owned driver's HTTP/2 configuration. It differs from `http2_session_config` in two
 /// ways. Stats and ping probes are `None`, because the driver records no statistics. The
 /// driver also requires its stream receive window to equal the advertised
-/// `INITIAL_WINDOW_SIZE`, so the window is the last advertised value of that setting, or
-/// the protocol default when `settings` has none.
+/// `INITIAL_WINDOW_SIZE`, so when `settings` sets it more than once, the window is the last
+/// value rather than the first. When `settings` does not set it, the window stays
+/// `stream_flow_control`, which the driver advertises itself.
 pub(crate) fn owned_http2_session_config(config: &ServerSessionConfig) -> Http2SessionConfig {
     let mut http2 = http2_session_config(config);
-    let advertised = http2
+    if let Some(advertised) = http2
         .settings
         .iter()
         .rev()
         .find(|setting| setting.identifier == 4)
         .and_then(|setting| u32::try_from(setting.value).ok())
-        .unwrap_or(DEFAULT_STREAM_WINDOW);
-    http2.stream_receive_window = advertised;
+    {
+        http2.stream_receive_window = advertised;
+    }
     Http2SessionConfig {
         stats: None,
         ping_probes: None,
