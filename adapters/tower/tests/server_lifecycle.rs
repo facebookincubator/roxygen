@@ -94,6 +94,35 @@ fn options(protocol: CodecProtocol, capacity: usize) -> ServerOptions {
 }
 
 #[test]
+fn server_rejects_the_owned_session_drivers() {
+    for (owned_http1, owned_http2) in [(true, false), (false, true)] {
+        run_test(|worker, _| async move {
+            let probe = Probe::new();
+            let (established, _peer) = sockets(probe.clone(), None).await;
+            let mut options = options(CodecProtocol::Http11, 1);
+            options.session.owned_http1 = owned_http1;
+            options.session.owned_http2 = owned_http2;
+            let Err(error) = prepare_connection(
+                worker,
+                established,
+                service(probe.clone(), |_| async {
+                    panic!("a rejected connection must not reach the service")
+                }),
+                options,
+            ) else {
+                panic!("the owned drivers do not report the native cleanup the adapter waits for");
+            };
+            assert!(
+                matches!(error.cause(), ServerFailure::InvalidOptions),
+                "{error:?}"
+            );
+            assert!(error.cleanup_confirmed());
+            assert_eq!(probe.count("service call"), 0);
+        });
+    }
+}
+
+#[test]
 fn server_connection_switch_rejection_retires_ingress_before_flush() {
     for tls in [false, true] {
         run_test(|worker, _| async move {

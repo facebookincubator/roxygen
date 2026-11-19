@@ -150,6 +150,9 @@ pub struct ServerOptions {
     pub protocol: CodecProtocol,
     pub security: TransportSecurity,
     pub upstream_origin: Option<UpstreamOrigin>,
+    /// The connection's session settings. The adapter waits for each exchange's native
+    /// cleanup, which the owned drivers do not report yet, so `prepare_connection` rejects
+    /// `owned_http1` and `owned_http2` with `ServerFailure::InvalidOptions`.
     pub session: ServerSessionConfig,
     pub max_exchanges: NonZeroUsize,
     pub dispatch_capacity: NonZeroUsize,
@@ -185,7 +188,7 @@ impl ServerOptions {
 pub enum ServerFailure {
     #[error("prepare/run requires the same live application Tokio runtime")]
     ApplicationRuntime,
-    #[error("invalid server bounds or unsupported protocol")]
+    #[error("invalid server bounds, unsupported protocol, or an owned session driver")]
     InvalidOptions,
     #[error("connection or exchange cancelled")]
     Cancelled,
@@ -1018,6 +1021,8 @@ where
         .id();
     if options.dispatch_capacity > options.max_exchanges
         || options.request_body.command_capacity == 0
+        || options.session.owned_http1
+        || options.session.owned_http2
         || !matches!(
             options.protocol,
             CodecProtocol::Http11 | CodecProtocol::Http2
