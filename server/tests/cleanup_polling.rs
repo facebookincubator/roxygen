@@ -13,6 +13,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc;
+use std::task::Poll;
 use std::thread;
 use std::time::Duration;
 
@@ -29,10 +30,19 @@ use roxygen_core::http::CodecProtocol;
 use roxygen_core::message::SocketAddress;
 use roxygen_core::source::HttpSource;
 use roxygen_core::source_holder::HttpSourceHolder;
+use roxygen_runtime::cancellation::CancellationToken;
 use roxygen_runtime::tokio_host::ManagedWorker;
+use roxygen_runtime::worker::WorkerHandle;
 use roxygen_transport::byte_stream::ByteStreamLimits;
 use roxygen_transport::established::EstablishedIo;
 use roxygen_transport::established::adopt_local;
+use roxygen_transport::tls::TlsServerOptions;
+use roxygen_transport::tls::TlsTransport;
+use rustls::ClientConfig;
+use rustls::ClientConnection;
+use rustls::RootCertStore;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::ServerName;
 
 use crate::acceptor::ServerSessionConfig;
 use crate::connection::ServeTransportOptions;
@@ -629,4 +639,214 @@ fn woken_force_stop_and_drop_close_idle_and_inflight_connections() {
             "owned_http1={owned_http1}: {stats:?}"
         );
     }
+}
+
+/// A self-signed `localhost` server identity, and a TLS 1.3 client
+/// configuration that trusts only it.
+fn tls_identity() -> (TlsServerOptions, Arc<ClientConfig>) {
+    let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let certificate = generated.cert.der().to_vec();
+    let options = TlsServerOptions::new(
+        vec![certificate.clone().into_boxed_slice()],
+        generated
+            .signing_key
+            .serialized_der()
+            .to_vec()
+            .into_boxed_slice(),
+        Vec::new(),
+    )
+    .unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(CertificateDer::from(certificate)).unwrap();
+    let config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+    (options, Arc::new(config))
+}
+
+/// Completes a client TLS handshake on `socket` and returns the connection,
+/// which then stays idle.
+fn tls_handshake(
+    mut socket: TcpStream,
+    config: &Arc<ClientConfig>,
+) -> std::io::Result<(ClientConnection, TcpStream)> {
+    let mut connection = ClientConnection::new(
+        Arc::clone(config),
+        ServerName::try_from("localhost").unwrap(),
+    )
+    .map_err(std::io::Error::other)?;
+    while connection.is_handshaking() {
+        connection.complete_io(&mut socket)?;
+    }
+    while connection.wants_write() {
+        connection.write_tls(&mut socket)?;
+    }
+    Ok((connection, socket))
+}
+
+/// Starts a command on `handle` that accepts `connections` TCP connections on
+/// a loopback listener, then polls a `TlsTransport::accept` for each of them
+/// together, so that every accept starts in the same driver pass. It reports
+/// each accept's failure, if any, and holds the accepted connections until the
+/// worker shuts down.
+fn accept_tls_together(
+    handle: &WorkerHandle,
+    connections: usize,
+    options: TlsServerOptions,
+) -> (SocketAddr, mpsc::Receiver<Vec<Option<String>>>) {
+    let (bound_tx, bound_rx) = mpsc::sync_channel(1);
+    let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+    handle
+        .spawn_local(move |context| async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener binds");
+            bound_tx
+                .send(listener.local_addr().expect("listener address"))
+                .expect("test waits for the address");
+            let mut accepts = Vec::with_capacity(connections);
+            for _ in 0..connections {
+                let (stream, _) = listener.accept().await.expect("worker accepts");
+                accepts.push(Some(TlsTransport::accept(
+                    &context,
+                    stream.into_std().expect("accepted socket"),
+                    options.clone(),
+                    ByteStreamLimits::new(4096, 4096, 8).expect("bounded transport"),
+                    TIMEOUT,
+                    CancellationToken::never(),
+                )));
+            }
+            let mut results: Vec<Option<Result<TlsTransport, _>>> =
+                (0..connections).map(|_| None).collect();
+            std::future::poll_fn(|task_context| {
+                for (accept, result) in accepts.iter_mut().zip(&mut results) {
+                    if let Some(future) = accept
+                        && let Poll::Ready(outcome) = future.as_mut().poll(task_context)
+                    {
+                        *result = Some(outcome);
+                        *accept = None;
+                    }
+                }
+                if results.iter().all(Option::is_some) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            let mut held = Vec::with_capacity(connections);
+            let failures = results
+                .into_iter()
+                .map(|result| match result.expect("every accept finished") {
+                    Ok(transport) => {
+                        held.push(transport);
+                        None
+                    }
+                    Err(error) => Some(format!("{error:?}")),
+                })
+                .collect();
+            accepted_tx
+                .send(failures)
+                .expect("test waits for the accepts");
+            // The worker drops this command, and with it the connections,
+            // when it shuts down.
+            std::future::pending::<()>().await;
+        })
+        .expect("listener command admitted");
+    let address = bound_rx.recv_timeout(TIMEOUT).expect("listener bound");
+    (address, accepted_rx)
+}
+
+/// Connects `connections` clients to `address`, then completes each one's TLS
+/// handshake. The clients stay connected and idle while they are held.
+fn idle_tls_clients(
+    address: SocketAddr,
+    connections: usize,
+    config: &Arc<ClientConfig>,
+) -> Vec<std::io::Result<(ClientConnection, TcpStream)>> {
+    let sockets: Vec<_> = (0..connections).map(|_| connect(address)).collect();
+    sockets
+        .into_iter()
+        .map(|socket| tls_handshake(socket, config))
+        .collect()
+}
+
+/// Reads `handle`'s poll stats once two reads 10 ms apart agree, so that a
+/// driver pass still publishing its counters is not split across a window's
+/// edge.
+fn settled_poll_stats(handle: &WorkerHandle) -> WorkerPollStats {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut last = handle.poll_stats();
+    loop {
+        thread::sleep(Duration::from_millis(10));
+        let current = handle.poll_stats();
+        if current == last {
+            return current;
+        }
+        assert!(std::time::Instant::now() < deadline, "{current:?}");
+        last = current;
+    }
+}
+
+#[test]
+fn tls_idle_connections_add_no_driver_command_polls() {
+    const IDLE: usize = 64;
+    const SUBMITS: u64 = 1_000;
+    let (options, config) = tls_identity();
+    let worker = ManagedWorker::new(2 * IDLE).expect("worker starts");
+    let handle = worker.handle();
+    let (address, accepted) = accept_tls_together(&handle, IDLE, options);
+    let clients = idle_tls_clients(address, IDLE, &config);
+    let failures = accepted.recv_timeout(TIMEOUT).expect("accepts finish");
+    assert!(failures.iter().all(Option::is_none), "{failures:?}");
+    assert!(clients.iter().all(Result::is_ok), "{clients:?}");
+
+    let before = settled_poll_stats(&handle);
+    for _ in 0..SUBMITS {
+        let (ran_tx, ran_rx) = mpsc::sync_channel(1);
+        handle
+            .submit(move |_| {
+                let _ = ran_tx.send(());
+            })
+            .expect("no-op admitted");
+        ran_rx.recv_timeout(TIMEOUT).expect("no-op runs");
+    }
+    let delta = settled_poll_stats(&handle).since(&before);
+    assert!(
+        delta.driver_polls >= SUBMITS,
+        "each awaited submit runs in its own driver pass: {delta:?}"
+    );
+    // Each pass polls the submit and the listener command, about 2,000 polls
+    // in all. Polling every idle connection's writer would add 64 per pass.
+    assert!(
+        delta.command_polls <= 3_000,
+        "idle TLS connections add no command polls: {delta:?}"
+    );
+    assert!(
+        delta.cleanup_polls <= IDLE as u64 + SUBMITS,
+        "an idle connection's writer is polled only when woken: {delta:?}"
+    );
+    drop(clients);
+    worker.shutdown().expect("worker shuts down");
+}
+
+#[test]
+fn tls_accept_does_not_consume_command_capacity() {
+    const ACCEPTS: usize = 16;
+    let (options, config) = tls_identity();
+    let worker = ManagedWorker::new(2).expect("worker starts");
+    let handle = worker.handle();
+    let (address, accepted) = accept_tls_together(&handle, ACCEPTS, options);
+    let clients = idle_tls_clients(address, ACCEPTS, &config);
+    let failures = accepted.recv_timeout(TIMEOUT).expect("accepts finish");
+    assert!(
+        failures.iter().all(Option::is_none),
+        "16 TLS accepts started in one pass succeed beside a command capacity of 2: {failures:?}"
+    );
+    assert!(clients.iter().all(Result::is_ok), "{clients:?}");
+    drop(clients);
+    worker.shutdown().expect("worker shuts down");
 }

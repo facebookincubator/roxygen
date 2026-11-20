@@ -55,6 +55,12 @@ mod tcp_tls {
     use roxygen_runtime::cancellation::CancellationSource;
     use roxygen_runtime::cancellation::CancellationToken;
     use roxygen_runtime::driver::WorkerDriver;
+    #[cfg(target_os = "linux")]
+    use roxygen_runtime::managed::QuiesceFuture;
+    #[cfg(target_os = "linux")]
+    use roxygen_runtime::managed::RuntimeConfig;
+    #[cfg(target_os = "linux")]
+    use roxygen_runtime::managed::RuntimeOwner;
     #[cfg(unix)]
     use roxygen_runtime::worker::WorkerContext;
     use roxygen_runtime::worker::WorkerHandle;
@@ -11822,5 +11828,222 @@ mod tcp_tls {
                 worker.begin_shutdown();
                 driver_task.await.unwrap();
             }));
+    }
+
+    /// The plaintext that `BlockedTlsClose`'s server writes before its
+    /// close_notify: several times the socket buffers and the ciphertext
+    /// staging limit together.
+    #[cfg(target_os = "linux")]
+    const BLOCKED_CLOSE_PAYLOAD: usize = 512 * 1024;
+
+    /// What a `BlockedTlsClose` client read, how its TLS stream ended, and
+    /// what its next TCP read returned.
+    #[cfg(target_os = "linux")]
+    type BlockedCloseEnd = (Vec<u8>, io::Result<()>, io::Result<usize>);
+
+    /// One TLS connection, accepted on the only worker of a runtime, whose
+    /// server writes `BLOCKED_CLOSE_PAYLOAD` bytes and then shuts the TLS
+    /// stream down while the client reads nothing. Both socket buffers are 4
+    /// KiB, so the ciphertext writer holds staged ciphertext, with the
+    /// close_notify queued behind it, until the client reads.
+    ///
+    /// The stream's owner is a plain local task, not a worker command or
+    /// scope, so only the ciphertext writer can hold the worker open for the
+    /// flush. The owner drops the stream once its TLS shutdown completes.
+    #[cfg(target_os = "linux")]
+    struct BlockedTlsClose {
+        read: std::sync::mpsc::SyncSender<()>,
+        client: std::thread::JoinHandle<BlockedCloseEnd>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl BlockedTlsClose {
+        fn start() -> (RuntimeOwner, Self) {
+            let (certificate, server_config) = tls_fixture();
+            let runtime = RuntimeOwner::start(RuntimeConfig {
+                workers: 1,
+                command_capacity: 4,
+            })
+            .unwrap();
+            let worker = runtime.handle().worker(0).unwrap();
+            let (bound_tx, bound_rx) = std::sync::mpsc::sync_channel(1);
+            let (owned_tx, owned_rx) = std::sync::mpsc::sync_channel(1);
+            worker
+                .spawn_local(move |context| async move {
+                    let socket = TcpSocket::new_v4().unwrap();
+                    socket.set_send_buffer_size(4096).unwrap();
+                    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                    let listener = socket.listen(1).unwrap();
+                    bound_tx.send(listener.local_addr().unwrap()).unwrap();
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut wire = OwnedCiphertextStream::new(AcceptedTcpStream::new(stream));
+                    wire.start_background_for_test(&context).unwrap();
+                    let mut tls = TlsAcceptor::from(server_config).accept(wire).await.unwrap();
+                    tokio::task::spawn_local(async move {
+                        let payload = vec![b'p'; BLOCKED_CLOSE_PAYLOAD];
+                        if tls.write_all(&payload).await.is_ok() {
+                            let _ = tls.shutdown().await;
+                        }
+                    });
+                    owned_tx.send(()).unwrap();
+                })
+                .unwrap();
+            let destination = bound_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (handshaken_tx, handshaken_rx) = std::sync::mpsc::sync_channel(1);
+            let (read, read_rx) = std::sync::mpsc::sync_channel(1);
+            let client = std::thread::spawn(move || {
+                let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+                let mut tls = runtime.block_on(async {
+                    let socket = TcpSocket::new_v4().unwrap();
+                    socket.set_recv_buffer_size(4096).unwrap();
+                    let stream = socket.connect(destination).await.unwrap();
+                    let mut roots = RootCertStore::empty();
+                    roots.add(CertificateDer::from(certificate)).unwrap();
+                    let config = ClientConfig::builder_with_provider(Arc::new(
+                        rustls::crypto::ring::default_provider(),
+                    ))
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+                    TlsConnector::from(Arc::new(config))
+                        .connect(ServerName::try_from("localhost").unwrap(), stream)
+                        .await
+                        .unwrap()
+                });
+                handshaken_tx.send(()).unwrap();
+                read_rx.recv().unwrap();
+                runtime.block_on(async {
+                    let mut received = Vec::new();
+                    let tls_end =
+                        time::timeout(Duration::from_secs(10), tls.read_to_end(&mut received))
+                            .await
+                            .expect("the server ends the TLS stream")
+                            .map(drop);
+                    let (mut tcp, _) = tls.into_inner();
+                    let tcp_end = time::timeout(Duration::from_secs(10), tcp.read(&mut [0; 1]))
+                        .await
+                        .expect("the server ends the TCP stream");
+                    (received, tls_end, tcp_end)
+                })
+            });
+            handshaken_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            owned_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            (runtime, Self { read, client })
+        }
+
+        /// Lets the client read until the server ends the connection.
+        fn read_to_end(self) -> BlockedCloseEnd {
+            self.read.send(()).unwrap();
+            self.client.join().unwrap()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn await_quiesce(quiesced: QuiesceFuture) {
+        Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { time::timeout(Duration::from_secs(10), quiesced).await })
+            .expect("quiesce finishes")
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tls_close_notify_flushes_before_graceful_worker_quiesce() {
+        let (mut runtime, client) = BlockedTlsClose::start();
+        let worker = runtime.handle().worker(0).unwrap();
+        let quiesced = runtime.handle().quiesce(Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            worker.state(),
+            WorkerState::Open,
+            "the pending close_notify flush holds graceful quiesce open"
+        );
+
+        let (received, tls_end, tcp_end) = client.read_to_end();
+        tls_end.expect("the client reads the close_notify before TCP ends");
+        assert_eq!(received.len(), BLOCKED_CLOSE_PAYLOAD);
+        assert_eq!(
+            tcp_end.expect("TCP ends cleanly"),
+            0,
+            "then TCP reaches EOF"
+        );
+        await_quiesce(quiesced);
+        assert_eq!(runtime.join().unwrap().workers_forced, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tls_writer_cleanup_runs_at_force_deadline() {
+        let (mut runtime, client) = BlockedTlsClose::start();
+        let worker = runtime.handle().worker(0).unwrap();
+        await_quiesce(runtime.handle().quiesce(Duration::from_millis(100)));
+        assert_eq!(
+            runtime.join().unwrap().workers_forced,
+            1,
+            "the blocked ciphertext writer was still running at the deadline"
+        );
+        let stats = worker.poll_stats();
+        assert_eq!(
+            (stats.cleanups_registered, stats.cleanups_active),
+            (0, 0),
+            "{stats:?}"
+        );
+
+        let (received, tls_end, _) = client.read_to_end();
+        assert!(
+            tls_end.is_err(),
+            "the forced close discards the staged close_notify"
+        );
+        assert!(received.len() < BLOCKED_CLOSE_PAYLOAD);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tls_accept_after_worker_quiesce_starts_is_dropped() {
+        let (_, server_config) = tls_fixture();
+        let options = TlsServerOptions::from_rustls_config(Arc::unwrap_or_clone(server_config));
+        let mut runtime = RuntimeOwner::start(RuntimeConfig {
+            workers: 1,
+            command_capacity: 4,
+        })
+        .unwrap();
+        let worker = runtime.handle().worker(0).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let (quiescing_tx, quiescing_rx) = oneshot::channel::<()>();
+        let (refused_tx, refused_rx) = std::sync::mpsc::sync_channel(1);
+        worker
+            .spawn_local(move |context| async move {
+                let _ = quiescing_rx.await;
+                let accept = TlsTransport::accept(
+                    &context,
+                    accepted,
+                    options,
+                    limits(),
+                    Duration::from_secs(1),
+                    CancellationToken::never(),
+                )
+                .await;
+                refused_tx
+                    .send(accept.err().map(|error| error.code()))
+                    .unwrap();
+            })
+            .unwrap();
+
+        let quiesced = runtime.handle().quiesce(Duration::from_secs(10));
+        quiescing_tx.send(()).unwrap();
+        assert_eq!(
+            refused_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Some(HttpErrorCode::DROPPED),
+            "a TLS accept that starts after quiesce begins is refused before its handshake"
+        );
+        await_quiesce(quiesced);
+        assert_eq!(runtime.join().unwrap().workers_forced, 0);
+        drop(client);
     }
 }

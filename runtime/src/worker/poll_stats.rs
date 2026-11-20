@@ -45,9 +45,11 @@ pub struct WorkerPollStats {
     pub max_cleanup_polls_per_driver_poll: u64,
     /// The most entries that one open pass has drained.
     pub max_ready_batch: u64,
-    /// Registered cleanup tasks that have not finished.
+    /// Registered cleanup tasks that have not finished. The ciphertext writer
+    /// of each open Roxygen TLS connection counts here.
     pub cleanups_registered: u64,
-    /// Activated cleanup tasks that have not finished.
+    /// Activated cleanup tasks that have not finished. The ciphertext writer
+    /// of each open Roxygen TLS connection counts here.
     pub cleanups_active: u64,
     /// Panics that Roxygen's owned HTTP drivers on this worker contained in
     /// one exchange's callbacks. Panics that are combined into one, such as a

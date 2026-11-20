@@ -7,6 +7,7 @@
 
 //! Rustls adapter for the worker-local byte-stream contract.
 
+#[cfg(test)]
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::fmt;
@@ -32,8 +33,8 @@ use roxygen_core::error::HttpError;
 use roxygen_core::error::HttpErrorCode;
 use roxygen_core::message::SocketAddress;
 use roxygen_runtime::cancellation::CancellationToken;
-use roxygen_runtime::worker::SubmitError;
 use roxygen_runtime::worker::WorkerCleanupRegistration;
+use roxygen_runtime::worker::WorkerCleanupTaskRegistration;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_runtime::worker::WorkerState;
 use rustls::ClientConfig;
@@ -449,7 +450,6 @@ const TLS_CIPHERTEXT_STAGING_LIMIT: usize = 128 * 1024;
 /// Bounded caller-owned storage for ciphertext emitted by rustls.
 pub(crate) struct OwnedCiphertextStream<S: TokioByteStream> {
     state: Rc<RefCell<CiphertextState<S>>>,
-    background_id: Option<u64>,
     cleanup: Option<WorkerCleanupRegistration>,
     flush_waiting: bool,
     shutdown_waiting: bool,
@@ -840,23 +840,6 @@ pub(crate) fn deadline_timers_for_test() -> usize {
     DEADLINE_TIMERS.with(Cell::get)
 }
 
-std::thread_local! {
-    static NEXT_TLS_CIPHERTEXT_BACKGROUND_ID: Cell<u64> = const { Cell::new(1) };
-    static TLS_CIPHERTEXT_BACKGROUND_REGISTRY: RefCell<Vec<(
-        u64,
-        Weak<RefCell<CiphertextState<AcceptedTcpStream>>>,
-    )>> = const { RefCell::new(Vec::new()) };
-}
-
-fn remove_ciphertext_background(id: u64) {
-    TLS_CIPHERTEXT_BACKGROUND_REGISTRY.with(|registry| {
-        let mut registry = registry.borrow_mut();
-        if let Some(index) = registry.iter().position(|(candidate, _)| *candidate == id) {
-            registry.swap_remove(index);
-        }
-    });
-}
-
 impl<S> OwnedCiphertextStream<S>
 where
     S: TokioByteStream,
@@ -882,7 +865,6 @@ where
                 unstaged_deadline: None,
                 stopped: false,
             })),
-            background_id: None,
             cleanup: None,
             flush_waiting: false,
             shutdown_waiting: false,
@@ -1136,20 +1118,21 @@ where
 }
 
 impl OwnedCiphertextStream<AcceptedTcpStream> {
+    /// Starts the ciphertext writer, as a TLS connect or accept does.
+    #[cfg(test)]
+    pub(crate) fn start_background_for_test(
+        &mut self,
+        context: &WorkerContext,
+    ) -> Result<(), HttpError> {
+        self.start_background(context)
+    }
+
     fn start_background(&mut self, context: &WorkerContext) -> Result<(), HttpError> {
-        let id = NEXT_TLS_CIPHERTEXT_BACKGROUND_ID.with(|next| {
-            let id = next.get();
-            id.checked_add(1).map(|next_id| {
-                next.set(next_id);
-                id
-            })
-        });
-        let Some(id) = id else {
-            return Err(HttpError::with_message(
-                HttpErrorCode::INVALID_STATE_TRANSITION,
-                b"TLS ciphertext drain identifiers are exhausted",
-            ));
-        };
+        // `register_scope` admits work while the worker quiesces, but a new TLS
+        // connection is refused once admission closes.
+        if !context.handle().is_accepting() {
+            return Err(dropped_error());
+        }
         let weak = Rc::downgrade(&self.state);
         let cleanup_weak = weak.clone();
         let cleanup = context
@@ -1170,36 +1153,18 @@ impl OwnedCiphertextStream<AcceptedTcpStream> {
                     error.to_string().as_bytes(),
                 )
             })?;
-        TLS_CIPHERTEXT_BACKGROUND_REGISTRY.with(|registry| {
-            registry.borrow_mut().push((id, weak));
-        });
-        let spawned = context.handle().spawn_local(move |_context| async move {
-            let weak = TLS_CIPHERTEXT_BACKGROUND_REGISTRY.with(|registry| {
-                let mut registry = registry.borrow_mut();
-                registry
-                    .iter()
-                    .position(|(candidate, _)| *candidate == id)
-                    .map(|index| registry.swap_remove(index).1)
-            });
-            if let Some(weak) = weak {
-                std::future::poll_fn(|task_context| {
-                    poll_ciphertext_background(&weak, task_context)
-                })
-                .await;
+        let writer = context
+            .register_scope(std::future::poll_fn(move |task_context| {
+                poll_ciphertext_background(&weak, task_context)
+            }))
+            .and_then(WorkerCleanupTaskRegistration::activate);
+        match writer {
+            Ok(writer) => writer.detach(),
+            Err(_) => {
+                let _ = cleanup.disarm();
+                return Err(dropped_error());
             }
-        });
-        if let Err(error) = spawned {
-            remove_ciphertext_background(id);
-            let _ = cleanup.disarm();
-            return Err(match error {
-                SubmitError::Closed => dropped_error(),
-                SubmitError::Overloaded => HttpError::with_message(
-                    HttpErrorCode::ENHANCE_YOUR_CALM,
-                    b"worker command capacity exhausted while scheduling TLS ciphertext drain",
-                ),
-            });
         }
-        self.background_id = Some(id);
         self.cleanup = Some(cleanup);
         Ok(())
     }
@@ -1207,9 +1172,6 @@ impl OwnedCiphertextStream<AcceptedTcpStream> {
 
 impl<S: TokioByteStream> Drop for OwnedCiphertextStream<S> {
     fn drop(&mut self) {
-        if let Some(id) = self.background_id.take() {
-            remove_ciphertext_background(id);
-        }
         if let Some(cleanup) = self.cleanup.take() {
             let _ = cleanup.disarm();
         }
