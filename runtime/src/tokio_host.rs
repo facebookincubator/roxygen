@@ -884,6 +884,69 @@ async fn run_managed_driver(
     result
 }
 
+/// Limits on a worker runtime's blocking pool, the threads that run
+/// `spawn_blocking` work and blocking calls such as `tokio::net::lookup_host`.
+/// `None` keeps Tokio's default for that limit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct BlockingPoolLimits {
+    /// The most blocking threads the runtime runs at once (Tokio's
+    /// `Builder::max_blocking_threads`). Work spawned while that many are busy
+    /// waits in Tokio's queue. `None` keeps Tokio's default of 512.
+    pub max_threads: Option<NonZeroUsize>,
+    /// How long an idle blocking thread lives before it exits (Tokio's
+    /// `Builder::thread_keep_alive`). `None` keeps Tokio's default of 10 s.
+    pub keep_alive: Option<Duration>,
+}
+
+impl BlockingPoolLimits {
+    /// Limits with `max_threads` and `keep_alive`, each `None` for Tokio's
+    /// default.
+    pub fn new(max_threads: Option<NonZeroUsize>, keep_alive: Option<Duration>) -> Self {
+        Self {
+            max_threads,
+            keep_alive,
+        }
+    }
+
+    /// Applies the limits that are set to `builder`.
+    fn apply(self, builder: &mut Builder) {
+        if let Some(max_threads) = self.max_threads {
+            builder.max_blocking_threads(max_threads.get());
+        }
+        if let Some(keep_alive) = self.keep_alive {
+            builder.thread_keep_alive(keep_alive);
+        }
+    }
+}
+
+/// Configuration for a [`ManagedWorker`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ManagedWorkerOptions {
+    /// Bound on queued commands. Zero is rejected with
+    /// `WorkerCreateError::ZeroCapacity`.
+    pub command_capacity: usize,
+    /// Limits on the worker runtime's blocking pool.
+    pub blocking: BlockingPoolLimits,
+}
+
+impl ManagedWorkerOptions {
+    /// Options with `command_capacity` and Tokio's default blocking pool.
+    pub fn new(command_capacity: usize) -> Self {
+        Self {
+            command_capacity,
+            blocking: BlockingPoolLimits::default(),
+        }
+    }
+
+    /// Sets the limits on the worker runtime's blocking pool.
+    pub fn with_blocking(mut self, limits: BlockingPoolLimits) -> Self {
+        self.blocking = limits;
+        self
+    }
+}
+
 /// A worker hosted by a dedicated thread, current-thread runtime, and LocalSet.
 /// Like `HostedWorker`, it drives a wheel timer for its owner thread, which
 /// `Host::tokio().wheel_timer()` reports there.
@@ -908,6 +971,21 @@ impl ManagedWorker {
     where
         F: FnOnce() + Send + 'static,
     {
+        Self::new_with_options(ManagedWorkerOptions::new(command_capacity), exit_callback)
+    }
+
+    /// Like [`Self::new_with_exit_callback`], with the worker configured by
+    /// `options`. The worker's `WorkerPollStats` report its runtime's
+    /// blocking-pool threads in `blocking_threads_live`,
+    /// `max_blocking_threads_live` and `blocking_cap_hits`.
+    pub fn new_with_options(
+        options: ManagedWorkerOptions,
+        exit: impl FnOnce() + Send + 'static,
+    ) -> Result<Self, ManagedWorkerError> {
+        let ManagedWorkerOptions {
+            command_capacity,
+            blocking,
+        } = options;
         if command_capacity == 0 {
             return Err(WorkerCreateError::ZeroCapacity.into());
         }
@@ -918,7 +996,19 @@ impl ManagedWorker {
             .name("roxygen-worker".to_owned())
             .spawn(move || {
                 let result = catch_unwind(AssertUnwindSafe(|| {
-                    let runtime = match Builder::new_current_thread().enable_all().build() {
+                    let (handle, driver) = WorkerDriver::new(command_capacity)?;
+                    let mut builder = Builder::new_current_thread();
+                    builder.enable_all();
+                    blocking.apply(&mut builder);
+                    // A current-thread runtime starts no threads but blocking ones.
+                    let started = handle
+                        .shared
+                        .poll_counters()
+                        .count_blocking_threads(blocking.max_threads);
+                    let stopped = Arc::clone(&started);
+                    builder.on_thread_start(move || started.thread_started());
+                    builder.on_thread_stop(move || stopped.thread_stopped());
+                    let runtime = match builder.build() {
                         Ok(runtime) => runtime,
                         Err(error) => {
                             let message = error.to_string();
@@ -927,11 +1017,10 @@ impl ManagedWorker {
                         }
                     };
                     let local_set = LocalSet::new();
-                    let (handle, driver) = WorkerDriver::new(command_capacity)?;
                     if started_tx.send(Ok(handle.clone())).is_err() {
                         handle.begin_shutdown();
                     }
-                    let _exit_callback = ExitCallback::new(exit_callback);
+                    let _exit_callback = ExitCallback::new(exit);
                     local_set.block_on(&runtime, run_managed_driver(handle, driver, None))
                 }))
                 .unwrap_or(Err(ManagedWorkerError::OwnerThreadPanicked));
@@ -1035,6 +1124,9 @@ pub struct HostedWorkerBlockingPool {
     /// waits for it as part of the thread's exit. A thread that a teardown
     /// deadline abandoned runs it when its work returns.
     pub on_thread_stop: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    /// Limits on the blocking pool's size and on how long its idle threads
+    /// live.
+    pub limits: BlockingPoolLimits,
 }
 
 /// How [`HostedWorker::join_by`] ended.
@@ -1072,10 +1164,21 @@ fn configure_blocking_pool(
     blocking_pool: Option<HostedWorkerBlockingPool>,
     teardown: &Arc<TeardownDeadline>,
 ) {
-    let (thread_name, on_thread_start, on_thread_stop) = match blocking_pool {
-        Some(pool) => (pool.thread_name, pool.on_thread_start, pool.on_thread_stop),
-        None => (DEFAULT_BLOCKING_THREAD_NAME.to_owned(), None, None),
+    let (thread_name, on_thread_start, on_thread_stop, limits) = match blocking_pool {
+        Some(pool) => (
+            pool.thread_name,
+            pool.on_thread_start,
+            pool.on_thread_stop,
+            pool.limits,
+        ),
+        None => (
+            DEFAULT_BLOCKING_THREAD_NAME.to_owned(),
+            None,
+            None,
+            BlockingPoolLimits::default(),
+        ),
     };
+    limits.apply(builder);
     // Tokio names each blocking thread just before it spawns it.
     let spawning = Arc::downgrade(teardown);
     builder.thread_name_fn(move || {

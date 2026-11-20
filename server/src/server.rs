@@ -39,8 +39,10 @@ use roxygen_core::filter_factory::FilterFactory;
 use roxygen_core::filter_factory::HttpFilterFactoryHandler;
 use roxygen_core::handler::HttpHandlerRef;
 use roxygen_core::http::CodecProtocol;
+pub use roxygen_runtime::BlockingPoolLimits;
 use roxygen_runtime::tokio_host::ManagedWorker;
 use roxygen_runtime::tokio_host::ManagedWorkerError;
+use roxygen_runtime::tokio_host::ManagedWorkerOptions;
 use roxygen_runtime::worker::SubmitError;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_runtime::worker::WorkerHandle;
@@ -622,6 +624,9 @@ pub struct ServerConfig {
     pub tls_observer: Option<Arc<dyn TlsHandshakeObserver>>,
     pub connection_observer: Option<Arc<dyn AcceptedConnectionObserver>>,
     pub zero_copy_enable_threshold: usize,
+    /// Limits on each worker's blocking pool. The default keeps Tokio's,
+    /// 512 threads with a 10 s keep-alive per worker.
+    pub worker_blocking_pool: BlockingPoolLimits,
     #[cfg(test)]
     pub(crate) session_retirement_probe: Option<Arc<SessionRetirementProbe>>,
     #[cfg(test)]
@@ -646,6 +651,7 @@ impl Default for ServerConfig {
             tls_observer: None,
             connection_observer: None,
             zero_copy_enable_threshold: 0,
+            worker_blocking_pool: BlockingPoolLimits::default(),
             #[cfg(test)]
             session_retirement_probe: None,
             #[cfg(test)]
@@ -1177,8 +1183,9 @@ impl HttpServer {
             let callback_factories = config.filter_factories.clone();
             let callback_failure = Arc::clone(&callback_failure);
             let (exit_sender, exit_receiver) = std::sync::mpsc::sync_channel(1);
-            workers.push(ManagedWorker::new_with_exit_callback(
-                config.command_capacity,
+            workers.push(ManagedWorker::new_with_options(
+                ManagedWorkerOptions::new(config.command_capacity)
+                    .with_blocking(config.worker_blocking_pool),
                 move || {
                     if started.load(Ordering::Acquire) {
                         notify_worker_stop(

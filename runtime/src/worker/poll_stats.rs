@@ -7,8 +7,12 @@
 
 //! Per-worker driver poll counters, readable from any thread. The worker's
 //! owner thread writes all of them except the queued-command maximum, which
-//! enqueuers raise under the queue lock.
+//! enqueuers raise under the queue lock, and a `ManagedWorker`'s
+//! blocking-thread counts, which its blocking-pool threads update.
 
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -75,6 +79,31 @@ pub struct WorkerPollStats {
     /// The most commands that were queued at once. Every admitted command
     /// counts, whichever `WorkerHandle` method submitted it.
     pub max_queued_commands: u64,
+    /// Blocking-pool threads of a `ManagedWorker`'s runtime, counted from
+    /// their start hook to their stop hook. Tokio stops counting an exiting
+    /// thread before its stop hook runs, so this can briefly over-count by
+    /// the threads that are exiting: a replacement thread that starts in that
+    /// window can bring it to, or past, the pool's `max_threads` while Tokio
+    /// runs fewer threads. Always 0 for other workers.
+    ///
+    /// This, the next maximum and the cap-hit counter are reported-only
+    /// diagnostics, not a saturation detector: at its cap Tokio queues
+    /// blocking work without starting a thread, and its queue depth is not
+    /// observable here.
+    pub blocking_threads_live: u64,
+    /// The most blocking-pool threads that were live at once, by the gauge
+    /// above, so it includes any exiting threads that the gauge over-counted.
+    /// A worker whose maximum reached (or, through the exit race, briefly
+    /// reached) its `max_threads` may have been saturated, so its blocking
+    /// work may have queued.
+    pub max_blocking_threads_live: u64,
+    /// Blocking-thread starts that brought the live count to, or past, the
+    /// pool's `max_threads`, or 0 when `max_threads` is unset. Through the
+    /// exit race a start can briefly reach the cap while Tokio runs fewer
+    /// threads, so a hit does not prove that the pool was saturated. A pool
+    /// that stays saturated counts no further hits, and `max_threads` short
+    /// concurrent tasks count one without queueing.
+    pub blocking_cap_hits: u64,
 }
 
 impl WorkerPollStats {
@@ -109,6 +138,9 @@ impl WorkerPollStats {
             contained_driver_panics: self
                 .contained_driver_panics
                 .wrapping_sub(earlier.contained_driver_panics),
+            blocking_cap_hits: self
+                .blocking_cap_hits
+                .wrapping_sub(earlier.blocking_cap_hits),
             ..*self
         }
     }
@@ -156,6 +188,13 @@ impl WorkerPollStats {
             .max_command_polls_per_driver_poll
             .max(other.max_command_polls_per_driver_poll);
         self.max_queued_commands = self.max_queued_commands.max(other.max_queued_commands);
+        self.blocking_threads_live = self
+            .blocking_threads_live
+            .wrapping_add(other.blocking_threads_live);
+        self.max_blocking_threads_live = self
+            .max_blocking_threads_live
+            .max(other.max_blocking_threads_live);
+        self.blocking_cap_hits = self.blocking_cap_hits.wrapping_add(other.blocking_cap_hits);
     }
 }
 
@@ -246,6 +285,36 @@ pub(crate) struct PollCounters {
     command_polls_per_driver_poll: [AtomicU64; CLEANUP_POLL_BUCKETS],
     max_command_polls_per_driver_poll: AtomicU64,
     max_queued_commands: QueuedCommandsMaximum,
+    blocking_threads: OnceLock<Arc<BlockingThreadCounters>>,
+}
+
+/// The blocking-pool thread counts of a worker's runtime, which the pool's
+/// thread start and stop hooks update on the blocking threads.
+pub(crate) struct BlockingThreadCounters {
+    max_threads: Option<NonZeroUsize>,
+    live: AtomicU64,
+    max_live: AtomicU64,
+    cap_hits: AtomicU64,
+}
+
+impl BlockingThreadCounters {
+    /// Counts a blocking thread that started, and a cap hit if the live count
+    /// reaches `max_threads`.
+    pub(crate) fn thread_started(&self) {
+        let live = self.live.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        self.max_live.fetch_max(live, Ordering::Relaxed);
+        if self
+            .max_threads
+            .is_some_and(|max_threads| live >= max_threads.get() as u64)
+        {
+            self.cap_hits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Uncounts a blocking thread as it exits.
+    pub(crate) fn thread_stopped(&self) {
+        self.live.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl PollCounters {
@@ -330,7 +399,28 @@ impl PollCounters {
         add(counter, 1);
     }
 
+    /// The blocking-thread counters that this worker's snapshots report,
+    /// created on the first call with the runtime's `max_threads`.
+    pub(crate) fn count_blocking_threads(
+        &self,
+        max_threads: Option<NonZeroUsize>,
+    ) -> Arc<BlockingThreadCounters> {
+        Arc::clone(self.blocking_threads.get_or_init(|| {
+            Arc::new(BlockingThreadCounters {
+                max_threads,
+                live: AtomicU64::new(0),
+                max_live: AtomicU64::new(0),
+                cap_hits: AtomicU64::new(0),
+            })
+        }))
+    }
+
     pub(crate) fn snapshot(&self) -> WorkerPollStats {
+        let blocking = |counter: fn(&BlockingThreadCounters) -> &AtomicU64| {
+            self.blocking_threads
+                .get()
+                .map_or(0, |counters| counter(counters).load(Ordering::Relaxed))
+        };
         WorkerPollStats {
             driver_polls: self.driver_polls.load(Ordering::Relaxed),
             command_polls: self.command_polls.load(Ordering::Relaxed),
@@ -358,6 +448,9 @@ impl PollCounters {
                 .max_command_polls_per_driver_poll
                 .load(Ordering::Relaxed),
             max_queued_commands: self.max_queued_commands.0.load(Ordering::Relaxed),
+            blocking_threads_live: blocking(|counters| &counters.live),
+            max_blocking_threads_live: blocking(|counters| &counters.max_live),
+            blocking_cap_hits: blocking(|counters| &counters.cap_hits),
         }
     }
 }

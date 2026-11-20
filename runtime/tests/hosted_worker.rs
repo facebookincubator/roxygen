@@ -44,6 +44,7 @@ mod hosted_worker {
     use crate::host::timer::Timeout;
     use crate::task_group::TaskGroup;
     use crate::task_group::TaskGroupError;
+    use crate::tokio_host::BlockingPoolLimits;
     use crate::tokio_host::HostedWorker;
     use crate::tokio_host::HostedWorkerBlockingPool;
     use crate::tokio_host::HostedWorkerJoin;
@@ -1203,6 +1204,7 @@ mod hosted_worker {
                     .push(std::thread::current().name().map(str::to_owned));
             })),
             on_thread_stop: None,
+            limits: BlockingPoolLimits::default(),
         };
         (started, pool)
     }
@@ -1274,6 +1276,63 @@ mod hosted_worker {
             ),
             "a NUL byte is a spawn error, not a panic on the first blocking thread"
         );
+    }
+
+    #[test]
+    fn blocking_pool_limits_apply_to_the_hosted_worker_runtime() {
+        let (started, mut pool) = blocking_pool("rox-w8-blk");
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::clone(&stopped);
+        pool.on_thread_stop = Some(Arc::new(move || {
+            stops.fetch_add(1, Ordering::SeqCst);
+        }));
+        pool.limits =
+            BlockingPoolLimits::new(NonZeroUsize::new(1), Some(Duration::from_millis(50)));
+        let worker = HostedWorker::spawn_with_blocking_pool(options("rox-w8", 1), pool)
+            .expect("worker starts");
+        let peak = wait(
+            worker
+                .handle()
+                .call_local(|_context| async {
+                    let running = Arc::new(AtomicUsize::new(0));
+                    let peak = Arc::new(AtomicUsize::new(0));
+                    let joins = (0..3)
+                        .map(|_| {
+                            let running = Arc::clone(&running);
+                            let peak = Arc::clone(&peak);
+                            tokio::task::spawn_blocking(move || {
+                                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                                peak.fetch_max(now, Ordering::SeqCst);
+                                std::thread::sleep(Duration::from_millis(50));
+                                running.fetch_sub(1, Ordering::SeqCst);
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    for join in joins {
+                        join.await.expect("blocking task completes");
+                    }
+                    peak.load(Ordering::SeqCst)
+                })
+                .expect("probe admitted"),
+        )
+        .expect("probe completes");
+        assert_eq!(peak, 1, "max_threads 1 runs one blocking task at a time");
+        assert_eq!(
+            started.lock().unwrap().len(),
+            1,
+            "the queued tasks reuse the one blocking thread"
+        );
+
+        // Tokio's default keep-alive of 10 s would keep the idle thread past this.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while stopped.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the idle blocking thread exits after its keep-alive"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(worker);
     }
 
     /// Teardown deadline of the bounded-shutdown tests.
@@ -2778,6 +2837,7 @@ mod hosted_worker {
                     let _ = gate.lock().unwrap().recv();
                 })),
                 on_thread_stop: None,
+                limits: BlockingPoolLimits::default(),
             },
         )
         .expect("worker starts");
@@ -2872,6 +2932,7 @@ mod hosted_worker {
                         let _ = &held;
                     })),
                     on_thread_stop: None,
+                    limits: BlockingPoolLimits::default(),
                 },
             )
             .expect("worker starts");
@@ -2928,6 +2989,7 @@ mod hosted_worker {
                 on_thread_stop: Some(Arc::new(|| {
                     panic_any("injected blocking stop hook panic");
                 })),
+                limits: BlockingPoolLimits::default(),
             },
             started,
         );
@@ -2953,6 +3015,7 @@ mod hosted_worker {
                     }
                 })),
                 on_thread_stop: None,
+                limits: BlockingPoolLimits::default(),
             },
         )
         .expect("worker starts");

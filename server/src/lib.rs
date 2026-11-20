@@ -148,6 +148,10 @@ pub use server::StopAccepting;
 mod accept_distribution_tests;
 
 #[cfg(test)]
+#[path = "../tests/blocking_pool.rs"]
+mod blocking_pool_tests;
+
+#[cfg(test)]
 #[path = "../tests/cleanup_polling.rs"]
 mod cleanup_polling_tests;
 

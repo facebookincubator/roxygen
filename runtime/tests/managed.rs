@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::future::pending;
 use std::future::poll_fn;
+use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
 use std::panic::panic_any;
@@ -16,6 +17,8 @@ use std::panic::resume_unwind;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -42,8 +45,10 @@ use crate::managed::ShutdownReport;
 use crate::managed::WorkerFailure;
 use crate::task_group::TaskGroup;
 use crate::task_group::TaskGroupError;
+use crate::tokio_host::BlockingPoolLimits;
 use crate::tokio_host::ManagedWorker;
 use crate::tokio_host::ManagedWorkerError;
+use crate::tokio_host::ManagedWorkerOptions;
 use crate::wait::TimedBaton;
 use crate::wait::WaitStatus;
 use crate::worker::QuiesceDeadline;
@@ -51,6 +56,7 @@ use crate::worker::SubmitError;
 use crate::worker::WorkerCallError;
 use crate::worker::WorkerCleanupTaskRegistration;
 use crate::worker::WorkerHandle;
+use crate::worker::WorkerPollStats;
 use crate::worker::WorkerQuiescing;
 use crate::worker::WorkerState;
 
@@ -1495,5 +1501,205 @@ fn explicit_retirement_reports_final_forced_state() {
             },
             failures: Vec::new(),
         }
+    );
+}
+
+/// Blocking tasks that count how many of them run at once. Each one waits at
+/// a gate until the test opens it.
+#[derive(Default)]
+struct BlockingProbe {
+    state: Mutex<BlockingProbeState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct BlockingProbeState {
+    running: usize,
+    peak: usize,
+    open: bool,
+}
+
+impl BlockingProbe {
+    /// The body of one blocking task.
+    fn run(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.running += 1;
+        state.peak = state.peak.max(state.running);
+        self.changed.notify_all();
+        while !state.open {
+            state = self.changed.wait(state).unwrap();
+        }
+        state.running -= 1;
+    }
+
+    fn wait_for_running(&self, running: usize) {
+        let state = self.state.lock().unwrap();
+        let (_state, waited) = self
+            .changed
+            .wait_timeout_while(state, TEST_TIMEOUT, |state| state.running < running)
+            .unwrap();
+        assert!(!waited.timed_out(), "{running} blocking tasks run at once");
+    }
+
+    fn open(&self) {
+        self.state.lock().unwrap().open = true;
+        self.changed.notify_all();
+    }
+
+    fn peak(&self) -> usize {
+        self.state.lock().unwrap().peak
+    }
+}
+
+/// Opens the probe's gate when dropped, so a failed assertion does not leave
+/// blocking threads that the worker's join would wait for.
+struct OpenOnDrop(Arc<BlockingProbe>);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+#[test]
+fn managed_worker_caps_blocking_threads() {
+    let limits = BlockingPoolLimits::new(NonZeroUsize::new(2), None);
+    let worker =
+        ManagedWorker::new_with_options(ManagedWorkerOptions::new(4).with_blocking(limits), || {})
+            .expect("managed worker starts");
+    let handle = worker.handle();
+    let probe = Arc::new(BlockingProbe::default());
+    let _open = OpenOnDrop(Arc::clone(&probe));
+    let started = handle.poll_stats();
+
+    wait(
+        handle
+            .call_local(|_| async {
+                tokio::task::spawn_blocking(|| ())
+                    .await
+                    .expect("blocking task completes");
+            })
+            .expect("one blocking task admitted"),
+    )
+    .expect("one blocking task runs");
+    let one = handle.poll_stats();
+    assert_eq!(
+        one.since(&started).blocking_cap_hits,
+        0,
+        "one live thread stays below the cap of 2: {one:?}"
+    );
+
+    let tasks = Arc::clone(&probe);
+    let eight = handle
+        .call_local(move |_| async move {
+            let joins = (0..8)
+                .map(|_| {
+                    let probe = Arc::clone(&tasks);
+                    tokio::task::spawn_blocking(move || probe.run())
+                })
+                .collect::<Vec<_>>();
+            for join in joins {
+                join.await.expect("blocking task completes");
+            }
+        })
+        .expect("eight blocking tasks admitted");
+    probe.wait_for_running(2);
+    // Long enough for a third thread to start if the cap allowed one.
+    std::thread::sleep(Duration::from_millis(100));
+    probe.open();
+    wait(eight).expect("all eight blocking tasks run");
+    let saturated = handle.poll_stats();
+
+    assert_eq!(
+        probe.peak(),
+        2,
+        "at most max_threads blocking tasks run at once"
+    );
+    assert_eq!(saturated.max_blocking_threads_live, 2, "{saturated:?}");
+    assert!(
+        saturated.since(&one).blocking_cap_hits >= 1,
+        "the thread start that reached the cap counts: {saturated:?}"
+    );
+    worker.shutdown().expect("worker shuts down");
+}
+
+#[test]
+fn blocking_keep_alive_reaps_idle_threads() {
+    let limits = BlockingPoolLimits::new(None, Some(Duration::from_millis(50)));
+    let worker =
+        ManagedWorker::new_with_options(ManagedWorkerOptions::new(4).with_blocking(limits), || {})
+            .expect("managed worker starts");
+    let handle = worker.handle();
+    wait(
+        handle
+            .call_local(|_| async {
+                tokio::task::spawn_blocking(|| ())
+                    .await
+                    .expect("blocking task completes");
+            })
+            .expect("blocking task admitted"),
+    )
+    .expect("blocking task runs");
+    assert_eq!(
+        handle.poll_stats().max_blocking_threads_live,
+        1,
+        "the task ran on one blocking thread"
+    );
+
+    // Tokio's default keep-alive of 10 s would keep the idle thread past this.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while handle.poll_stats().blocking_threads_live != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the idle blocking thread exits after its keep-alive: {:?}",
+            handle.poll_stats()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    worker.shutdown().expect("worker shuts down");
+}
+
+#[test]
+fn blocking_thread_stats_since_and_merge() {
+    let earlier = WorkerPollStats {
+        blocking_threads_live: 3,
+        max_blocking_threads_live: 4,
+        blocking_cap_hits: 5,
+        ..WorkerPollStats::default()
+    };
+    let later = WorkerPollStats {
+        blocking_threads_live: 1,
+        max_blocking_threads_live: 4,
+        blocking_cap_hits: 7,
+        ..WorkerPollStats::default()
+    };
+    assert_eq!(
+        later.since(&earlier),
+        WorkerPollStats {
+            blocking_threads_live: 1,
+            max_blocking_threads_live: 4,
+            blocking_cap_hits: 2,
+            ..WorkerPollStats::default()
+        },
+        "since subtracts cap hits and keeps the later gauge and maximum"
+    );
+
+    let other = WorkerPollStats {
+        blocking_threads_live: 2,
+        max_blocking_threads_live: 6,
+        blocking_cap_hits: 1,
+        ..WorkerPollStats::default()
+    };
+    let mut merged = later;
+    merged.merge(&other);
+    assert_eq!(
+        merged,
+        WorkerPollStats {
+            blocking_threads_live: 3,
+            max_blocking_threads_live: 6,
+            blocking_cap_hits: 8,
+            ..WorkerPollStats::default()
+        },
+        "merge sums the gauge and cap hits and takes the larger maximum"
     );
 }

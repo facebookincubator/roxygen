@@ -102,6 +102,9 @@ pub mod tokio_host;
 pub mod wait;
 pub mod worker;
 
+pub use tokio_host::BlockingPoolLimits;
+pub use tokio_host::ManagedWorkerOptions;
+
 #[cfg(test)]
 #[path = "../tests/external_host.rs"]
 mod external_host_tests;
