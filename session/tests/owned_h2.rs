@@ -17599,8 +17599,8 @@ fn owned_unbounded_categories_read_no_clock() {
     );
     assert_eq!(
         control_bounded,
-        unlimited + 3,
-        "each counted control frame reads the clock once"
+        unlimited + 1,
+        "the three counted control frames of one parse share one clock read"
     );
 }
 

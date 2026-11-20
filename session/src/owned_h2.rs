@@ -2016,8 +2016,12 @@ fn push_connection_failure(failures: &mut VecDeque<Failure>, error: HttpError) {
 /// Counts one event of a category, reading the clock only when the category is bounded.
 #[cold]
 #[inline(never)]
-fn record_rate(limiter: &mut Http2RateLimiter, kind: RateLimitKind, host: &Host) -> bool {
-    !limiter.is_unbounded(kind) && limiter.record(kind, host.now()).0
+fn record_rate(
+    limiter: &mut Http2RateLimiter,
+    kind: RateLimitKind,
+    now: impl FnOnce() -> Instant,
+) -> bool {
+    !limiter.is_unbounded(kind) && limiter.record(kind, now()).0
 }
 
 #[cfg(test)]
@@ -3961,7 +3965,9 @@ where
     receive_window: u32,
     peer_goaway_pending: bool,
     peer_goaway_generated: bool,
-    header_only_eom_time: Option<Instant>,
+    /// The clock read that one parse shares, for its rate limits and the ingress completions
+    /// of its header-only requests.
+    parse_time: Option<Instant>,
 }
 
 impl<A, const UPSTREAM: bool> CodecInput<'_, A, UPSTREAM>
@@ -3999,7 +4005,12 @@ where
         !UPSTREAM
             && match self.state.rate_limits.as_deref_mut() {
                 None => false,
-                Some(limiter) => record_rate(limiter, kind, self.context.host()),
+                Some(limiter) => {
+                    let (parse_time, context) = (&mut self.parse_time, self.context);
+                    record_rate(limiter, kind, || {
+                        *parse_time.get_or_insert_with(|| context.host().now())
+                    })
+                }
             }
     }
 
@@ -4429,11 +4440,8 @@ where
                         let accepted = if UPSTREAM || owner.request_body_events {
                             owner.producer.eom()
                         } else {
-                            // Header-only requests that one parse completes share a clock read.
                             let context = self.context;
-                            let now = *self
-                                .header_only_eom_time
-                                .get_or_insert_with(|| context.host().now());
+                            let now = *self.parse_time.get_or_insert_with(|| context.host().now());
                             owner.producer.eom_at(now)
                         };
                         // A rejected EOM (e.g. before any head) leaves the response source
@@ -4799,7 +4807,7 @@ where
             receive_window: self.h2.stream_receive_window,
             peer_goaway_pending: false,
             peer_goaway_generated: false,
-            header_only_eom_time: None,
+            parse_time: None,
         };
         let (consumed, mut egress_results) = if input.is_empty() {
             (0, Vec::new())
@@ -4985,8 +4993,11 @@ where
             if stream.pending.as_ref().is_some_and(PendingEgress::eom) {
                 stream.signals.wake_on_completion.set(true);
             }
-            let retired =
-                if stream.consumed && stream.response_complete && stream.physically_complete {
+            // Until a byte event is registered the observer is empty, and an event cannot wait.
+            let retired = stream.consumed
+                && stream.response_complete
+                && stream.physically_complete
+                && (!connection.connection.state.byte_events_registered || {
                     let waker = waker_ref(&stream.wake);
                     let mut context = Context::from_waker(&waker);
                     match connection
@@ -5002,9 +5013,7 @@ where
                         }
                         Poll::Pending => false,
                     }
-                } else {
-                    false
-                };
+                });
             if retired {
                 connection.connection.state.settle_ingress(stream);
                 connection.connection.state.consumed_streams -= 1;
