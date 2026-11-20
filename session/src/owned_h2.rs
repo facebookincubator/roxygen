@@ -40,6 +40,7 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::Wake;
 use std::task::Waker;
+use std::thread::ThreadId;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -96,6 +97,7 @@ use roxygen_runtime::host::timer::Expiry;
 use roxygen_runtime::host::timer::Timeout;
 use roxygen_runtime::panic::discard_panic;
 use roxygen_runtime::task_group::in_forced_teardown;
+use roxygen_runtime::thread::current_id;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_transport::byte_event::AsyncSocketByteEventObserver;
 use roxygen_transport::byte_event::ByteEventOffsets;
@@ -169,18 +171,43 @@ pub struct OwnedH2Options {
 
 // Critical sections only push, pop or clone and drop replaced wakers after unlocking, so
 // the lock is never held during an unwind and a poisoning mutex would never be poisoned.
-#[derive(Default)]
 struct ReadyQueue {
+    /// The streams that wakers queued. The session's own thread queues owners in
+    /// `Control::owners` instead, without the lock.
     state: Mutex<ReadyQueueState>,
-    /// Set under the lock by every wake and every push, except a wake that
-    /// `IoWake::poll_inline` holds for a completed operation; cleared only by `settle`.
+    /// Set by every wake and every push, except a wake that `IoWake::poll_inline` holds for a
+    /// completed operation; cleared only by `settle`. Only the session's thread sets it
+    /// outside the lock.
     busy: AtomicBool,
+    /// Set under the lock when a waker queues a stream, and cleared when the session moves
+    /// `state.streams` to its own queue.
+    pushed: AtomicBool,
+    /// The session's thread.
+    owner: ThreadId,
+}
+
+impl Default for ReadyQueue {
+    fn default() -> Self {
+        Self {
+            state: Mutex::default(),
+            busy: AtomicBool::new(false),
+            pushed: AtomicBool::new(false),
+            owner: current_id(),
+        }
+    }
 }
 
 #[derive(Default)]
 struct ReadyQueueState {
     streams: VecDeque<StreamId>,
     waker: Option<Arc<Waker>>,
+}
+
+/// An owner queued for a poll. `shared` entries came through `ReadyQueue::state`.
+#[derive(Clone, Copy, Default)]
+struct QueuedOwner {
+    id: StreamId,
+    shared: bool,
 }
 
 impl ReadyQueue {
@@ -204,7 +231,8 @@ impl ReadyQueue {
     }
 
     /// Clears `busy` if the queue is empty and neither I/O wake is pending, and returns whether
-    /// it did. A wake or push that the lock orders after this sets `busy` again.
+    /// it did. A wake or push that the lock orders after this sets `busy` again. The caller
+    /// checks that the session's own queue is empty.
     fn settle(&self, read: &IoWake, write: &IoWake) -> bool {
         let state = self.state.lock();
         let settled = state.streams.is_empty()
@@ -218,7 +246,8 @@ impl ReadyQueue {
 
     // Only the session owner installs wakers, and `installed` is its copy of the current one,
     // so a stable waker does not need the lock. Pushes racing with a poll are still seen, or
-    // woken through the installed waker, because every poll pops under the lock.
+    // woken through the installed waker, because a push sets `pushed` under the lock before it
+    // clones the waker.
     fn register(&self, installed: &mut Option<Arc<Waker>>, context: &Context<'_>) {
         if installed
             .as_ref()
@@ -233,14 +262,18 @@ impl ReadyQueue {
         drop(previous);
     }
 
-    /// Moves the oldest queued streams into `batch`, up to its length, and returns how many.
-    fn pop_batch(&self, batch: &mut [StreamId]) -> usize {
+    /// Appends the streams that wakers queued to `owners`, in queue order.
+    #[cold]
+    #[inline(never)]
+    fn drain_into(&self, owners: &RefCell<VecDeque<QueuedOwner>>) {
         let mut state = self.state.lock();
-        let count = batch.len().min(state.streams.len());
-        for (slot, stream) in batch.iter_mut().zip(state.streams.drain(..count)) {
-            *slot = stream;
-        }
-        count
+        self.pushed.store(false, Ordering::Relaxed);
+        owners.borrow_mut().extend(
+            state
+                .streams
+                .drain(..)
+                .map(|id| QueuedOwner { id, shared: true }),
+        );
     }
 }
 
@@ -422,10 +455,15 @@ struct FlowMarks {
     streams: usize,
 }
 
+/// `queued` and `shared_queued` each mean that the owner has an entry that was queued and not yet
+/// polled: one that the session's thread queued, or one that a waker queued through
+/// `ReadyQueue::state`. An owner has at most one entry of each kind. Only the session's thread
+/// accesses `queued`.
 struct StreamWake {
     id: StreamId,
     queue: Arc<ReadyQueue>,
     queued: AtomicBool,
+    shared_queued: AtomicBool,
     headers_poll_ready: AtomicBool,
     live: AtomicBool,
 }
@@ -436,33 +474,35 @@ impl StreamWake {
             && self.headers_poll_ready.swap(false, Ordering::AcqRel)
     }
 
-    // Only the session owner may enqueue; cross-thread wakes must use schedule.
-    // A successful enqueue requires another queue check or a session wake.
-    fn enqueue(&self) -> bool {
-        if !self.live.load(Ordering::Acquire)
-            || self.queued.load(Ordering::Acquire)
-            || self.queued.swap(true, Ordering::AcqRel)
-        {
-            return false;
-        }
-        let mut state = self.queue.state.lock();
-        self.queue.busy.store(true, Ordering::Release);
-        state.streams.push_back(self.id);
-        true
-    }
-
+    /// Queues the owner from any thread and wakes the session. The session's thread uses
+    /// `Control::schedule` where it can reach the control.
     fn schedule(&self) {
-        if !self.live.load(Ordering::Acquire) || self.queued.swap(true, Ordering::AcqRel) {
+        if !self.live.load(Ordering::Acquire)
+            || (current_id() == self.queue.owner && self.queued.load(Ordering::Relaxed))
+            || self.shared_queued.swap(true, Ordering::AcqRel)
+        {
             return;
         }
         let wake = {
             let mut state = self.queue.state.lock();
             self.queue.busy.store(true, Ordering::Release);
+            self.queue.pushed.store(true, Ordering::Release);
             state.streams.push_back(self.id);
             state.waker.clone()
         };
         if let Some(wake) = wake {
             wake.wake_by_ref();
+        }
+    }
+
+    /// Clears the mark of `owner`, an entry of this owner, just before its poll.
+    #[inline(always)]
+    fn take_mark(&self, owner: QueuedOwner) {
+        if owner.shared {
+            // The swap pairs with the wakers', so this poll observes what they published.
+            self.shared_queued.swap(false, Ordering::AcqRel);
+        } else {
+            self.queued.store(false, Ordering::Relaxed);
         }
     }
 }
@@ -547,7 +587,7 @@ impl HttpStreamSourceSharedCallback for IngressSignals {
             .set(self.consumed.get().saturating_add(amount));
         self.acknowledge
             .set(self.acknowledge.get().saturating_add(acknowledge));
-        self.wake.schedule();
+        self.control.schedule(&self.wake);
     }
 
     fn source_complete(&self, _id: StreamId, error: Option<HttpError>) {
@@ -569,7 +609,7 @@ impl HttpStreamSourceSharedCallback for IngressSignals {
             self.control.early_completed.borrow_mut().push(self.wake.id);
             self.control.folds_pending.set(true);
         } else {
-            self.wake.schedule();
+            self.control.schedule(&self.wake);
         }
     }
 }
@@ -582,6 +622,13 @@ struct Control {
     handshake_complete: Cell<bool>,
     active_incoming: Cell<usize>,
     ready: Arc<ReadyQueue>,
+    /// Owners queued for a poll, in queue order. The session's thread queues them here
+    /// without the lock, and moves the streams that wakers queued here before its own.
+    owners: RefCell<VecDeque<QueuedOwner>>,
+    /// Set while the driver runs its turns.
+    polling: Cell<bool>,
+    /// Set once `schedule` has woken the session during the turns.
+    woken: Cell<bool>,
     upstream: Option<Rc<upstream::Admission>>,
     idle: Cell<bool>,
     host: Host,
@@ -628,6 +675,55 @@ impl Control {
         self.folds_pending.set(true);
         true
     }
+
+    /// Queues `wake`'s owner from the session's thread and returns whether it did. A queued
+    /// owner needs another queue check or a session wake.
+    fn enqueue(&self, wake: &StreamWake) -> bool {
+        if !wake.live.load(Ordering::Acquire)
+            || wake.queued.load(Ordering::Relaxed)
+            || wake.shared_queued.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        wake.queued.store(true, Ordering::Relaxed);
+        // Owners that wakers queued earlier stay ahead, as in a single queue.
+        if self.ready.pushed.load(Ordering::Acquire) {
+            self.ready.drain_into(&self.owners);
+        }
+        self.ready.busy.store(true, Ordering::Release);
+        self.owners.borrow_mut().push_back(QueuedOwner {
+            id: wake.id,
+            shared: false,
+        });
+        true
+    }
+
+    /// `enqueue`, then a session wake if it queued the owner. During the turns the first wake
+    /// is enough, because the host polls the session again after the turns return.
+    fn schedule(&self, wake: &StreamWake) {
+        if self.enqueue(wake) && !self.woken.get() {
+            self.ready.wake();
+            self.woken.set(self.polling.get());
+        }
+    }
+
+    /// Moves the oldest queued owners into `batch`, up to its length, and returns how many.
+    fn pop_batch(&self, batch: &mut [QueuedOwner]) -> usize {
+        if self.ready.pushed.load(Ordering::Acquire) {
+            self.ready.drain_into(&self.owners);
+        }
+        let mut owners = self.owners.borrow_mut();
+        let count = batch.len().min(owners.len());
+        for (slot, stream) in batch.iter_mut().zip(owners.drain(..count)) {
+            *slot = stream;
+        }
+        count
+    }
+
+    /// `ReadyQueue::settle`, unless an owner is queued.
+    fn settle(&self, read: &IoWake, write: &IoWake) -> bool {
+        self.owners.borrow().is_empty() && self.ready.settle(read, write)
+    }
 }
 
 /// Owner-local drain and cancel control for an owned HTTP/2 session. The session applies them
@@ -661,6 +757,12 @@ impl OwnedH2Handle {
     /// finished. A run that unwound out of a poll finishes when a later poll returns its error.
     pub fn is_finished(&self) -> bool {
         self.0.complete.get()
+    }
+
+    /// Whether the session is in its turns, and whether a schedule has woken it there.
+    #[cfg(test)]
+    pub(crate) fn turns_wake_state(&self) -> (bool, bool) {
+        (self.0.polling.get(), self.0.woken.get())
     }
 }
 
@@ -2193,6 +2295,9 @@ where
             handshake_complete: Cell::new(false),
             active_incoming: Cell::new(0),
             ready,
+            owners: RefCell::new(VecDeque::new()),
+            polling: Cell::new(false),
+            woken: Cell::new(false),
             upstream,
             idle: Cell::new(false),
             host: context.host().clone(),
@@ -2351,6 +2456,9 @@ where
     #[inline(never)]
     fn poll_panicked(&mut self, panic: PanicPayload, context: &Context<'_>) {
         discard_panic(panic);
+        // The panic skipped the end of `Driver::poll`, which resets these.
+        self.connection.state.control.polling.set(false);
+        self.connection.state.control.woken.set(false);
         self.teardown = Some(Box::default());
         if let Err(panic) = guarded(|| {
             self.abort(failure(
@@ -2727,6 +2835,9 @@ where
 
     fn poll(&mut self, context: &mut Context<'_>) -> Poll<Result<UniplexRunSummary, HttpError>> {
         let polled = self.poll_turns(context);
+        let control = &self.connection.state.control;
+        control.polling.set(false);
+        control.woken.set(false);
         if polled.is_pending() && self.deadline.is_some() {
             self.sync_deadline();
         }
@@ -2748,6 +2859,7 @@ where
             .control
             .ready
             .register(&mut self.ready_waker, context);
+        self.connection.state.control.polling.set(true);
         // This poll consumes an unarmed write's completion, since its waker was never
         // registered.
         if self.unarmed_write {
@@ -2837,11 +2949,11 @@ where
             }
             self.check_cancel_after(&mut ran);
             let mut serialized_owner = false;
-            let mut owners = [StreamId::default(); OWNER_POLLS_PER_TURN];
-            let polled = self.connection.state.control.ready.pop_batch(&mut owners);
+            let mut owners = [QueuedOwner::default(); OWNER_POLLS_PER_TURN];
+            let polled = self.connection.state.control.pop_batch(&mut owners);
             // Owners are polled after a connection failure too: only their polls retire streams.
-            for &stream in &owners[..polled] {
-                match self.poll_stream(stream) {
+            for &owner in &owners[..polled] {
+                match self.poll_stream(owner) {
                     Ok(OwnerPollResult::Polled) => {}
                     Ok(OwnerPollResult::Serialized(result)) => {
                         serialized_owner = true;
@@ -2849,7 +2961,7 @@ where
                             self.fail_connection(error);
                         }
                     }
-                    Err(error) => self.reset_polled_stream(stream, error),
+                    Err(error) => self.reset_polled_stream(owner.id, error),
                 }
                 ran = true;
                 // A cancel that this poll raised resets the later owners before their polls.
@@ -3006,10 +3118,7 @@ where
             && !self.cancelled()
             && self.failure.fatal.is_none()
             && self.failure.failures.is_empty()
-            && state
-                .control
-                .ready
-                .settle(&self.read_wake, &self.write_wake)
+            && state.control.settle(&self.read_wake, &self.write_wake)
         {
             state
                 .control
@@ -3833,7 +3942,7 @@ where
                         .is_some_and(|end| end <= self.connection.state.summary.bytes_written))
             {
                 stream.physically_complete = true;
-                stream.wake.enqueue();
+                self.connection.state.control.enqueue(&stream.wake);
             }
         }
     }
@@ -3938,6 +4047,7 @@ where
             id,
             queue: Arc::clone(&self.state.control.ready),
             queued: AtomicBool::new(false),
+            shared_queued: AtomicBool::new(false),
             headers_poll_ready: AtomicBool::new(true),
             live: AtomicBool::new(true),
         });
@@ -4216,7 +4326,7 @@ where
                     return actions.into();
                 }
                 owner.head = Some(message);
-                owner.wake.enqueue();
+                self.state.control.enqueue(&owner.wake);
             }
             CodecEvent::Body {
                 stream,
@@ -4282,7 +4392,7 @@ where
                 let accepted = owner.producer.trailers(*trailers) && owner.producer.eom();
                 self.state.settle_ingress(owner);
                 owner.wire_ingress_complete = true;
-                owner.wake.enqueue();
+                self.state.control.enqueue(&owner.wake);
                 if UPSTREAM {
                     owner.release_upstream_capacity();
                 }
@@ -4341,7 +4451,7 @@ where
                     let mismatch = owner
                         .expected_request_length
                         .is_some_and(|expected| expected != owner.request_body_length);
-                    owner.wake.enqueue();
+                    self.state.control.enqueue(&owner.wake);
                     if mismatch {
                         self.fail(Failure {
                             stream,
@@ -4435,7 +4545,7 @@ where
                         code == HttpErrorCode::REFUSED_STREAM && first_reset,
                         || failure(code, b"peer reset cancelled local byte events"),
                     );
-                    owner.wake.enqueue();
+                    self.state.control.enqueue(&owner.wake);
                     if first_reset
                         && code != HttpErrorCode::NO_ERROR
                         && let Some(admission) = &self.state.control.upstream
@@ -4559,7 +4669,7 @@ where
                         owner.record_peer_reset(first_reset, || {
                             failure(HttpErrorCode::REFUSED_STREAM, b"peer GOAWAY refused stream")
                         });
-                        owner.wake.enqueue();
+                        self.state.control.enqueue(&owner.wake);
                         if first_reset && let Some(admission) = &self.state.control.upstream {
                             admission.peer_reset(HttpErrorCode::REFUSED_STREAM);
                         }
@@ -4855,7 +4965,8 @@ where
         )
     }
 
-    fn poll_stream(&mut self, id: StreamId) -> Result<OwnerPollResult, HttpError> {
+    fn poll_stream(&mut self, owner: QueuedOwner) -> Result<OwnerPollResult, HttpError> {
+        let id = owner.id;
         let mut serialized = None;
         let retired = {
             let (streams, mut connection) = self.stream_connection();
@@ -4863,7 +4974,7 @@ where
                 return Ok(OwnerPollResult::Polled);
             };
             let stream = entry.get_mut();
-            stream.wake.queued.swap(false, Ordering::AcqRel);
+            stream.wake.take_mark(owner);
             if let Err(error) = connection.poll_stream_owner(id, stream) {
                 if self.failure.panicked && self.failure.fatal.is_none() {
                     self.abort_retirement_panic();
@@ -5182,7 +5293,7 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
                             unreachable!("event kind was checked");
                         };
                         stream.resume = Some(resume);
-                        stream.wake.schedule();
+                        self.connection.state.control.schedule(&stream.wake);
                     } else {
                         stream.pending = Some(PendingEgress::Body(event));
                         self.connection
@@ -5436,8 +5547,9 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
                     .cancel_stream_events(context, id, error)
             },
         );
+        let control = &self.connection.state.control;
         contain(context, self.failure, site, Some(id), || {
-            stream.wake.schedule()
+            control.schedule(&stream.wake)
         });
     }
 
@@ -5467,7 +5579,7 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
         stream.response_complete = false;
         stream.signals.error_response_pending();
         stream.reset_after_response = false;
-        stream.wake.schedule();
+        self.connection.state.control.schedule(&stream.wake);
         if stream.signals.source_complete.get() {
             self.connection
                 .state
@@ -5651,7 +5763,7 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
         if !stream.physically_complete {
             self.connection.state.write_fences.push_back((offset, id));
         }
-        stream.wake.schedule();
+        self.connection.state.control.schedule(&stream.wake);
     }
 }
 
@@ -5678,10 +5790,11 @@ where
                 self.transport.close_with_reset(&self.context)
             });
         }
+        let control = &self.connection.state.control;
         for id in self.streams.ids_in_order() {
             let stream = &self.streams[&id];
             contain(&self.context, &mut self.failure, site, None, || {
-                stream.wake.schedule()
+                control.schedule(&stream.wake)
             });
         }
     }
@@ -5703,10 +5816,11 @@ where
                 let _ = self.transport.close_with_reset(&self.context);
             }
         });
+        let control = &self.connection.state.control;
         for id in self.streams.ids_in_order() {
             let stream = &self.streams[&id];
             contain(&self.context, &mut self.failure, site, None, || {
-                stream.wake.schedule()
+                control.schedule(&stream.wake)
             });
         }
         true
@@ -5964,7 +6078,7 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
                 .dequeue(id, &mut stream.scheduling);
         }
         if stream.pending.is_none() && (!stream.response_complete || stream.physically_complete) {
-            stream.wake.enqueue();
+            self.connection.state.control.enqueue(&stream.wake);
         }
         Ok(())
     }
@@ -6359,42 +6473,283 @@ mod ready_queue_tests {
         assert!(read.ready.load(Ordering::Acquire) && queue.busy.load(Ordering::Acquire));
     }
 
+    fn control() -> Control {
+        Control {
+            drain: Cell::new(false),
+            cancel: Cell::new(false),
+            complete: Cell::new(false),
+            handshake_complete: Cell::new(false),
+            active_incoming: Cell::new(0),
+            ready: Arc::new(ReadyQueue::default()),
+            owners: RefCell::new(VecDeque::new()),
+            polling: Cell::new(false),
+            woken: Cell::new(false),
+            upstream: None,
+            idle: Cell::new(false),
+            host: Host::tokio(),
+            quiescent: Cell::new(false),
+            credit_headroom: Cell::new(0),
+            early_credit: Cell::new(0),
+            early_completed: RefCell::new(Vec::new()),
+            folds_pending: Cell::new(false),
+            window_transition: Cell::new(None),
+        }
+    }
+
+    fn stream_wake(control: &Control, id: u64) -> Arc<StreamWake> {
+        Arc::new(StreamWake {
+            id: StreamId::new(id),
+            queue: Arc::clone(&control.ready),
+            queued: AtomicBool::new(false),
+            shared_queued: AtomicBool::new(false),
+            headers_poll_ready: AtomicBool::new(false),
+            live: AtomicBool::new(true),
+        })
+    }
+
+    #[derive(Default)]
+    struct SessionWakes(std::sync::atomic::AtomicUsize);
+
+    impl Wake for SessionWakes {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Installs a counting session waker on `control`'s queue.
+    fn install_waker(control: &Control) -> (Arc<SessionWakes>, Option<Arc<Waker>>) {
+        let wakes = Arc::new(SessionWakes::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut installed = None;
+        control
+            .ready
+            .register(&mut installed, &Context::from_waker(&waker));
+        (wakes, installed)
+    }
+
+    fn ids(owners: &[QueuedOwner]) -> Vec<u64> {
+        owners.iter().map(|owner| owner.id.get()).collect()
+    }
+
     #[test]
     fn pop_batch_takes_the_oldest_streams_up_to_the_batch_length() {
-        let queue = ReadyQueue::default();
+        let control = control();
         let queued = OWNER_POLLS_PER_TURN as u64 + 4;
-        queue
+        control
+            .ready
             .state
             .lock()
             .streams
             .extend((1..=queued).map(StreamId::new));
-        let mut batch = [StreamId::default(); OWNER_POLLS_PER_TURN];
+        control.ready.pushed.store(true, Ordering::Release);
+        let mut batch = [QueuedOwner::default(); OWNER_POLLS_PER_TURN];
 
         assert_eq!(
-            queue.pop_batch(&mut batch),
+            control.pop_batch(&mut batch),
             OWNER_POLLS_PER_TURN,
             "a full batch takes as many streams as it holds"
         );
         assert!(
-            batch
-                .iter()
-                .copied()
-                .eq((1..=OWNER_POLLS_PER_TURN as u64).map(StreamId::new)),
+            ids(&batch).into_iter().eq(1..=OWNER_POLLS_PER_TURN as u64),
             "the batch holds the oldest streams in queue order"
         );
         assert_eq!(
-            queue.pop_batch(&mut batch),
+            control.pop_batch(&mut batch),
             4,
             "the next batch takes the four streams left over"
         );
         assert!(
-            batch[..4]
-                .iter()
-                .copied()
-                .eq((queued - 3..=queued).map(StreamId::new)),
+            ids(&batch[..4]).into_iter().eq(queued - 3..=queued),
             "the batch holds the remaining streams in queue order"
         );
-        assert_eq!(queue.pop_batch(&mut batch), 0, "the queue is empty");
+        assert_eq!(control.pop_batch(&mut batch), 0, "the queue is empty");
+    }
+
+    #[test]
+    fn owner_thread_queues_skip_the_lock_and_keep_one_queue_order() {
+        let control = control();
+        let (wakes, _installed) = install_waker(&control);
+        let [a, b, c] = [1, 3, 5].map(|id| stream_wake(&control, id));
+        let b_waker = futures::task::waker(Arc::clone(&b));
+
+        assert!(control.enqueue(&a));
+        assert!(
+            control.ready.state.lock().streams.is_empty()
+                && !control.ready.pushed.load(Ordering::Acquire)
+                && control.ready.busy.load(Ordering::Acquire),
+            "the session's thread queues its owner locally and marks the queue busy"
+        );
+        b_waker.wake_by_ref();
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            1,
+            "a waker queues through the shared queue and wakes the session"
+        );
+        assert!(control.enqueue(&c));
+        futures::task::waker_ref(&a).wake_by_ref();
+        assert!(!control.enqueue(&a), "a queued owner is queued once");
+        assert!(
+            !control.enqueue(&b),
+            "an owner that a waker queued is queued once"
+        );
+        assert!(
+            control.ready.state.lock().streams.is_empty(),
+            "a waker on the session's thread does not queue a locally queued owner again"
+        );
+        let mut batch = [QueuedOwner::default(); OWNER_POLLS_PER_TURN];
+        let polled = control.pop_batch(&mut batch);
+        assert_eq!(
+            ids(&batch[..polled]),
+            [1, 3, 5],
+            "owners keep the order in which they were queued, whichever queue took them"
+        );
+        assert_eq!(
+            batch[..polled]
+                .iter()
+                .map(|owner| owner.shared)
+                .collect::<Vec<_>>(),
+            [false, true, false],
+            "each entry records the queue that took it"
+        );
+
+        for (wake, owner) in [&a, &b, &c].into_iter().zip(&batch[..polled]) {
+            wake.take_mark(*owner);
+        }
+        assert!(
+            !b.shared_queued.load(Ordering::Acquire) && !a.queued.load(Ordering::Relaxed),
+            "polling an entry clears its mark"
+        );
+        assert!(control.enqueue(&b), "a polled owner can be queued again");
+        let polled = control.pop_batch(&mut batch);
+        assert_eq!(ids(&batch[..polled]), [3]);
+    }
+
+    #[test]
+    fn a_wake_from_another_thread_queues_through_the_lock() {
+        let control = control();
+        let (wakes, _installed) = install_waker(&control);
+        let a = stream_wake(&control, 1);
+        assert!(control.enqueue(&a));
+        let waker = futures::task::waker(Arc::clone(&a));
+        thread::spawn(move || waker.wake_by_ref())
+            .join()
+            .expect("the wake completes");
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            1,
+            "another thread does not check the local mark, so it queues and wakes the session"
+        );
+        assert!(control.ready.pushed.load(Ordering::Acquire));
+        let idle = IoWake::new(&control.ready, false);
+        assert!(!control.settle(&idle, &idle));
+    }
+
+    /// One owner queues itself again on each of its polls, as an owner that serializes one
+    /// chunk per poll does, and another thread wakes it every other turn while it is queued.
+    #[test]
+    fn a_cross_thread_wake_adds_one_entry_that_its_poll_retires() {
+        let control = control();
+        let (_wakes, _installed) = install_waker(&control);
+        let a = stream_wake(&control, 1);
+        let waker = futures::task::waker(Arc::clone(&a));
+        assert!(control.enqueue(&a));
+        let mut batch = [QueuedOwner::default(); OWNER_POLLS_PER_TURN];
+        let mut entries = Vec::new();
+        for turn in 0..8 {
+            if turn % 2 == 0 {
+                let waker = waker.clone();
+                thread::spawn(move || waker.wake_by_ref())
+                    .join()
+                    .expect("the wake completes");
+            }
+            let polled = control.pop_batch(&mut batch);
+            entries.push(polled);
+            for owner in &batch[..polled] {
+                a.take_mark(*owner);
+                control.enqueue(&a);
+            }
+        }
+        assert_eq!(
+            entries,
+            [2, 1, 2, 1, 2, 1, 2, 1],
+            "each cross-thread wake adds one poll, and the owner keeps at most one entry of \
+             each kind"
+        );
+    }
+
+    #[test]
+    fn schedule_wakes_the_session_once_during_the_turns() {
+        let control = control();
+        let (wakes, _installed) = install_waker(&control);
+        let [a, b, c] = [1, 3, 5].map(|id| stream_wake(&control, id));
+
+        control.polling.set(true);
+        control.schedule(&a);
+        control.schedule(&b);
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            1,
+            "the first schedule of the turns wakes the session, and the host polls it again \
+             after the turns"
+        );
+        control.polling.set(false);
+        control.woken.set(false);
+        control.schedule(&c);
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            2,
+            "outside the turns each schedule wakes the session"
+        );
+        control.schedule(&c);
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            2,
+            "an owner that is already queued does not send a wake"
+        );
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn a_schedule_whose_wake_panicked_lets_the_next_one_wake() {
+        struct PanicOnce(std::sync::atomic::AtomicUsize);
+
+        impl Wake for PanicOnce {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("session waker");
+                }
+            }
+        }
+
+        let control = control();
+        let wakes = Arc::new(PanicOnce(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut installed = None;
+        control
+            .ready
+            .register(&mut installed, &Context::from_waker(&waker));
+        let [a, b] = [1, 3].map(|id| stream_wake(&control, id));
+
+        control.polling.set(true);
+        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| control.schedule(&a)));
+        assert!(
+            panicked.is_err(),
+            "the waker's panic reaches the schedule's caller"
+        );
+        control.schedule(&b);
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            2,
+            "a wake that panicked does not count as the turns' wake"
+        );
     }
 }
 

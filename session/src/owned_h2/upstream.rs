@@ -1543,6 +1543,7 @@ where
             id,
             queue: Arc::clone(&self.connection.state.control.ready),
             queued: AtomicBool::new(false),
+            shared_queued: AtomicBool::new(false),
             headers_poll_ready: AtomicBool::new(true),
             live: AtomicBool::new(true),
         });
@@ -1683,7 +1684,7 @@ where
             .state
             .scheduler
             .enqueue(id, &mut stream.scheduling);
-        wake.enqueue();
+        self.connection.state.control.enqueue(&wake);
         Ok(())
     }
 }
@@ -1759,7 +1760,7 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
                     .upstream_mut()
                     .expect("upstream stream owns its exchange")
                     .resume = Some(resume);
-                stream.wake.enqueue();
+                self.connection.state.control.enqueue(&stream.wake);
             } else {
                 stream.pending = Some(PendingEgress::Body(event));
             }

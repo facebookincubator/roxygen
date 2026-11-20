@@ -7201,6 +7201,225 @@ fn continuously_ready_owners_are_polled_once_per_turn() {
     });
 }
 
+/// An owner that serializes one chunk per poll is still queued when a poll spends its turn
+/// budget. A wake from another thread then queues it a second time: the next poll polls it once
+/// more, and the poll after that polls it once per turn again.
+#[test]
+fn a_cross_thread_wake_polls_a_queued_owner_once_more() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (_, input) = ready_owner_requests(1);
+            let (transport, _state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::DataEof(Vec::new()),
+            ]);
+            let gate = Rc::new(OwnerPollGate {
+                ready: Cell::new(true),
+                ..OwnerPollGate::default()
+            });
+            let (mut application, probes) = Application::new(vec![Reply::Body(1024)]);
+            application.body_chunk = 1;
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            let mut config = options(context, transport);
+            config.io.buffer_limit = 64 << 10;
+            config.io.ingress_buffer_limit = 64 << 10;
+            config.io.maximum_write_size = 64 << 10;
+            config.io.maximum_read_size = 4096;
+            config.io.read_allocation_size = 4096;
+            let (session, _) = OwnedH2Session::new(application, config).unwrap();
+            let mut run = Box::pin(session.run());
+            let mut poll = || {
+                let polled = run.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+                assert!(polled.is_pending(), "a 1024-chunk body outlasts the poll");
+            };
+            poll();
+            let probe = Rc::clone(&probes.borrow()[0]);
+            let owner = gate.wakers.borrow()[0]
+                .clone()
+                .expect("the owner registered its waker");
+            let mut polls = Vec::new();
+            for _ in 0..2 {
+                let waker = owner.clone();
+                std::thread::spawn(move || waker.wake_by_ref())
+                    .join()
+                    .expect("the wake completes");
+                for _ in 0..2 {
+                    let before = probe.body_polls.get();
+                    poll();
+                    polls.push(probe.body_polls.get() - before);
+                }
+            }
+            assert_eq!(
+                polls,
+                [TURN_BUDGET + 1, TURN_BUDGET, TURN_BUDGET + 1, TURN_BUDGET],
+                "each cross-thread wake adds one poll of the owner, in one poll of the session"
+            );
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(probe.produced_bytes.get(), 1024);
+            assert_eq!(probe.completed.get(), 1);
+        })
+    });
+}
+
+/// Owners that the turns queue through a schedule wake the session once per poll, since the host
+/// polls the session again after the turns.
+#[test]
+fn schedules_during_the_turns_wake_the_session_once() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_posts(&[(64, 16_384, None), (64, 16_384, None)]);
+            let (transport, _state) =
+                FixtureTransport::new([FixtureRead::SegmentedData(queue(&input))]);
+            let (application, probes) = Application::new(vec![Reply::Body(0); 2]);
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let wake = Arc::new(HandWake::default());
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut run = Box::pin(session.run());
+            assert!(
+                run.as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            assert!(
+                probes
+                    .borrow()
+                    .iter()
+                    .all(|probe| probe.request_bytes.get() == 64),
+                "each owner read its request body during the poll, which schedules it"
+            );
+            assert_eq!(
+                wake.wakes.load(Ordering::SeqCst),
+                1,
+                "the first schedule of the turns wakes the session, and the others do not"
+            );
+            handle.cancel();
+            let error = tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .unwrap()
+                .expect_err("the cancelled session fails its run");
+            assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+        })
+    });
+}
+
+/// A session waker that panics when a schedule during the turns wakes it is contained where the
+/// schedule runs, like any other panic at that site.
+#[cfg(panic = "unwind")]
+#[test]
+fn a_session_waker_panic_in_a_schedule_is_contained_at_its_site() {
+    struct ArmedPanic(AtomicBool);
+
+    impl std::task::Wake for ArmedPanic {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            if self.0.load(Ordering::SeqCst) {
+                panic_any("session waker");
+            }
+        }
+    }
+
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let (transport, state) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(1)]);
+            application.hold_headers = true;
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let armed = Arc::new(ArmedPanic(AtomicBool::new(false)));
+            let waker = Waker::from(Arc::clone(&armed));
+            let mut run = Box::pin(session.run());
+            // Reads the request and EOF; the held head leaves the owner idle and unqueued.
+            for _ in 0..DRIVE_LIMIT {
+                assert!(
+                    run.as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                tokio::task::yield_now().await;
+            }
+            assert!(state.borrow().reads.is_empty() && probes.borrow().len() == 1);
+            handle.cancel();
+            // The cancel resets the transport, whose per-stream schedule wakes the session.
+            armed.0.store(true, Ordering::SeqCst);
+            let polled = run.as_mut().poll(&mut Context::from_waker(&waker));
+            armed.0.store(false, Ordering::SeqCst);
+            assert_eq!(
+                take_contained_panics(),
+                [(PanicSite::Transport, None, Some("session waker".to_owned()))]
+            );
+            let result = match polled {
+                Poll::Ready(result) => result,
+                Poll::Pending => tokio::time::timeout(Duration::from_secs(5), run)
+                    .await
+                    .unwrap(),
+            };
+            let error = result.expect_err("the cancelled session fails its run");
+            assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+            assert_eq!(probes.borrow()[0].dropped.get(), 1);
+        })
+    });
+}
+
+/// A Driver-scope panic in the turns skips the end of the poll. Its teardown still leaves the
+/// turns' wake state, so schedules during the teardown wake the session at once.
+#[cfg(panic = "unwind")]
+#[test]
+fn a_turn_panic_leaves_the_turns_wake_state() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let input = peer_posts(&[(64, 16_384, None)]);
+            let (transport, _state) =
+                FixtureTransport::new([FixtureRead::SegmentedData(queue(&input))]);
+            let (application, probes) = Application::new(vec![Reply::Body(1)]);
+            let mut config = options(context, transport);
+            config.http2.header_indexing_strategy = Some(Rc::new(PanickingIndexing));
+            let (session, handle) = OwnedH2Session::new(application, config).unwrap();
+            let wake = Arc::new(HandWake::default());
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut run = Box::pin(session.run());
+            assert!(
+                run.as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending(),
+                "the panic starts a teardown"
+            );
+            assert_eq!(
+                probes.borrow()[0].request_bytes.get(),
+                64,
+                "the owner read its body, whose schedule woke the session, before the panic"
+            );
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::DriverTurn,
+                    None,
+                    Some("indexing strategy".to_owned())
+                )]
+            );
+            assert_eq!(
+                handle.turns_wake_state(),
+                (false, false),
+                "the teardown runs outside the turns"
+            );
+            let error = tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .unwrap()
+                .expect_err("a Driver-scope panic fails the run");
+            assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+        })
+    });
+}
+
 /// A cancel raised inside one owner's poll resets the owners polled after it, in the same turn
 /// and later ones, before their polls run application code, and every stream still retires.
 #[test]
