@@ -28,6 +28,7 @@ use roxygen_core::buf_queue::BufQueue;
 use roxygen_core::error::HttpError;
 use roxygen_core::error::HttpErrorCode;
 use roxygen_core::fixed_source::HttpFixedSource;
+use roxygen_core::handler::FixedResponse;
 use roxygen_core::headers::HttpHeaderCode;
 use roxygen_core::message::HttpMessage;
 use roxygen_core::source_holder::HttpSourceHolder;
@@ -142,10 +143,26 @@ impl StaticFiles {
         path: &[u8],
         accept_encoding: &[u8],
     ) -> Result<HttpSourceHolder, HttpError> {
+        let (head, body) = self.respond_now(path, accept_encoding)?.into_parts();
+        Ok(HttpSourceHolder::new(Box::new(HttpFixedSource::new(
+            head,
+            Some(body),
+        ))))
+    }
+
+    /// The response [`Self::respond`] answers with, as a whole response that a handler can
+    /// return from `HttpHandler::respond_now`.
+    pub fn respond_now(
+        &self,
+        path: &[u8],
+        accept_encoding: &[u8],
+    ) -> Result<FixedResponse, HttpError> {
         if self.revalidate.is_zero() {
             let found = self.lookup(path, accept_encoding)?;
-            let head = response_head(&found)?;
-            return fixed_response(head, found.body);
+            return Ok(FixedResponse::new(
+                response_head(&found)?,
+                body_queue(found.body)?,
+            ));
         }
         let codings = self.codings(accept_encoding);
         let now = Instant::now();
@@ -154,23 +171,25 @@ impl StaticFiles {
             .borrow()
             .get(path, codings, now, self.revalidate);
         if let Some((head, body)) = cached {
-            return fixed_response(head, body);
+            return Ok(FixedResponse::from_parts(head, body_queue(body)?));
         }
         let found = self.lookup(path, accept_encoding)?;
-        let mut head = response_head(&found)?;
-        if found.cached {
-            head.headers_mut().share_entries();
-            self.responses.borrow_mut().insert(
-                path,
-                codings,
-                CachedResponse {
-                    head: head.clone(),
-                    body: found.body.clone(),
-                    checked: now,
-                },
-            );
+        let response = FixedResponse::new(response_head(&found)?, body_queue(found.body.clone())?);
+        if !found.cached {
+            return Ok(response);
         }
-        fixed_response(head, found.body)
+        let (mut head, body) = response.into_parts();
+        head.headers_mut().share_entries();
+        self.responses.borrow_mut().insert(
+            path,
+            codings,
+            CachedResponse {
+                head: head.clone(),
+                body: found.body,
+                checked: now,
+            },
+        );
+        Ok(FixedResponse::from_parts(head, body))
     }
 
     /// The precompressed codings that `accept_encoding` allows, as an index into a path's
@@ -388,7 +407,7 @@ impl FileCache {
 
 /// A response that a request for the same path and codings can reuse.
 struct CachedResponse {
-    /// Shares its header entries with its clones.
+    /// Carries `Content-Length` and shares its header entries with its clones.
     head: HttpMessage,
     body: Bytes,
     /// When the response's files were last checked on disk.
@@ -450,13 +469,9 @@ fn response_head(found: &Found) -> Result<HttpMessage, HttpError> {
     Ok(head)
 }
 
-fn fixed_response(head: HttpMessage, body: Bytes) -> Result<HttpSourceHolder, HttpError> {
+fn body_queue(body: Bytes) -> Result<BufQueue, HttpError> {
     let length = body.len();
-    let body = BufQueue::from_bytes(body, length).map_err(internal)?;
-    Ok(HttpSourceHolder::new(Box::new(HttpFixedSource::new(
-        head,
-        Some(body),
-    ))))
+    BufQueue::from_bytes(body, length).map_err(internal)
 }
 
 /// Opens `path` and returns it with its `fstat`, or `None` when it no longer names a regular
@@ -952,6 +967,142 @@ mod tests {
             source.read_header_event().await.unwrap()
         });
         assert_eq!(missing.headers().response_status(), Some(404));
+    }
+
+    type Response = (Option<u16>, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>);
+
+    fn headers_of(message: &HttpMessage) -> Vec<(Vec<u8>, Vec<u8>)> {
+        message
+            .headers()
+            .iter()
+            .map(|(_, name, value)| (name.to_vec(), value.to_vec()))
+            .collect()
+    }
+
+    /// The status, headers and body of the response that `respond_now` returns.
+    fn fixed(files: &StaticFiles, path: &str, accept_encoding: &str) -> Response {
+        let (head, body) = files
+            .respond_now(path.as_bytes(), accept_encoding.as_bytes())
+            .unwrap()
+            .into_parts();
+        let body = body.coalesce(usize::MAX).unwrap().to_vec();
+        (head.response_status(), headers_of(&head), body)
+    }
+
+    /// The status, headers and body that the source from `respond` produces.
+    fn streamed(
+        runtime: &tokio::runtime::Runtime,
+        files: &StaticFiles,
+        path: &str,
+        accept_encoding: &str,
+    ) -> Response {
+        runtime.block_on(async {
+            let mut source = files
+                .respond(path.as_bytes(), accept_encoding.as_bytes())
+                .unwrap();
+            let head = source.read_header_event().await.unwrap();
+            let mut body = Vec::new();
+            let mut eom = head.eom();
+            while !eom {
+                let event = source.read_body_event(u32::MAX).await.unwrap();
+                if let Some(data) = event.as_body() {
+                    body.extend_from_slice(&data.coalesce(usize::MAX).unwrap());
+                }
+                eom = event.eom();
+            }
+            (
+                head.headers().response_status(),
+                headers_of(head.headers()),
+                body,
+            )
+        })
+    }
+
+    #[test]
+    fn respond_now_answers_as_respond() {
+        let root = Root::new();
+        root.write("app.js", b"plain");
+        root.write("app.js.br", b"brotli");
+        root.write("app.js.gz", b"gzipped");
+        root.write("logo.png", b"png");
+        let runtime = current_thread();
+        for interval in [Duration::ZERO, Duration::from_secs(3600)] {
+            let files = StaticFiles::new(&root.0)
+                .with_precompressed(true)
+                .with_settle(Duration::ZERO)
+                .with_revalidate_interval(interval);
+            // With an interval, the second round reuses the responses of the first.
+            for _ in 0..2 {
+                for (path, accept_encoding) in [
+                    ("app.js", "br, gzip"),
+                    ("app.js", "gzip"),
+                    ("app.js", ""),
+                    ("logo.png", "br"),
+                    ("missing.js", "br"),
+                ] {
+                    let response = fixed(&files, path, accept_encoding);
+                    assert_eq!(
+                        response,
+                        streamed(&runtime, &files, path, accept_encoding),
+                        "{path} {accept_encoding:?} {interval:?}"
+                    );
+                    let (_, headers, body) = response;
+                    assert_eq!(
+                        headers.last(),
+                        Some(&(
+                            b"Content-Length".to_vec(),
+                            body.len().to_string().into_bytes()
+                        )),
+                        "{path} {accept_encoding:?}: the head carries the body's length last"
+                    );
+                }
+            }
+        }
+        let (_, headers, body) = fixed(
+            &StaticFiles::new(&root.0).with_precompressed(true),
+            "app.js",
+            "gzip",
+        );
+        assert_eq!(body, b"gzipped");
+        assert_eq!(
+            headers,
+            [
+                (b"Content-Type".to_vec(), b"application/javascript".to_vec()),
+                (b"Content-Encoding".to_vec(), b"gzip".to_vec()),
+                (b"Vary".to_vec(), b"Accept-Encoding".to_vec()),
+                (b"Content-Length".to_vec(), b"7".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn respond_now_reuses_a_response_within_the_revalidate_interval() {
+        let root = Root::new();
+        root.write("note.txt", b"first");
+        let reused = StaticFiles::new(&root.0)
+            .with_settle(Duration::ZERO)
+            .with_revalidate_interval(Duration::from_secs(3600));
+        let checked = StaticFiles::new(&root.0).with_settle(Duration::ZERO);
+        for files in [&reused, &checked] {
+            assert_eq!(fixed(files, "note.txt", "").2, b"first");
+        }
+
+        root.write("note.txt", b"second version");
+        let (_, headers, body) = fixed(&reused, "note.txt", "");
+        assert_eq!(body, b"first", "the earlier response is reused");
+        assert_eq!(
+            headers.last(),
+            Some(&(b"Content-Length".to_vec(), b"5".to_vec()))
+        );
+        let (_, headers, body) = fixed(&checked, "note.txt", "");
+        assert_eq!(
+            body, b"second version",
+            "without an interval the file is checked"
+        );
+        assert_eq!(
+            headers.last(),
+            Some(&(b"Content-Length".to_vec(), b"14".to_vec()))
+        );
     }
 
     #[test]
