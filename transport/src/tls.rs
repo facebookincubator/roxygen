@@ -7,7 +7,6 @@
 
 //! Rustls adapter for the worker-local byte-stream contract.
 
-#[cfg(test)]
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::fmt;
@@ -448,6 +447,52 @@ pub const fn get_fallback_ca_path() -> Option<&'static str> {
 
 const TLS_CIPHERTEXT_STAGING_LIMIT: usize = 128 * 1024;
 
+/// How a TLS connection closes, shared by its transport, its TLS stream and its ciphertext
+/// writer.
+#[derive(Default)]
+struct TlsCloseMode {
+    /// Every reset closes the socket without `SO_LINGER` zero.
+    non_abortive: Cell<bool>,
+    /// The graceful close sends no close_notify.
+    skip_close_notify: Cell<bool>,
+    /// Asked once, when the graceful close starts; false skips close_notify.
+    close_notify_condition: RefCell<Option<Box<dyn Fn() -> bool>>>,
+}
+
+impl TlsCloseMode {
+    /// Whether the graceful close that is starting sends close_notify.
+    fn close_notify(&self) -> bool {
+        let condition = self.close_notify_condition.borrow_mut().take();
+        if let Some(established) = condition
+            && !established()
+        {
+            self.skip_close_notify.set(true);
+        }
+        !self.skip_close_notify.get()
+    }
+}
+
+/// Controls how one TLS connection's graceful close ends. Clones control the same connection.
+#[derive(Clone)]
+pub struct TlsCloseControl(Rc<TlsCloseMode>);
+
+impl TlsCloseControl {
+    /// Makes the connection's graceful close (`close` or `shutdown_write`) send no
+    /// close_notify: once the ciphertext already written is on the socket, the TCP stream is
+    /// shut down with FIN. It has no effect on a close that has already started.
+    pub fn skip_close_notify(&self) {
+        self.0.skip_close_notify.set(true);
+    }
+
+    /// Makes the connection's graceful close send close_notify only if `established` returns
+    /// true when the close starts; otherwise the close ends as `skip_close_notify` describes.
+    /// `established` is called at most once, on the connection's worker, and replaces any
+    /// condition set before.
+    pub fn skip_close_notify_unless(&self, established: impl Fn() -> bool + 'static) {
+        *self.0.close_notify_condition.borrow_mut() = Some(Box::new(established));
+    }
+}
+
 /// Bounded caller-owned storage for ciphertext emitted by rustls.
 pub(crate) struct OwnedCiphertextStream<S: TokioByteStream> {
     state: Rc<RefCell<CiphertextState<S>>>,
@@ -525,6 +570,7 @@ struct CiphertextState<S> {
     /// is first staged (`stage_deadline`). A write that TCP accepts immediately never builds one.
     unstaged_deadline: Option<Instant>,
     stopped: bool,
+    close: Rc<TlsCloseMode>,
 }
 
 impl<S> CiphertextState<S>
@@ -655,7 +701,7 @@ where
             self.error = Some(StoredIoError::new(error));
         }
         if let Some(stream) = self.stream.as_mut() {
-            if reset {
+            if reset && !self.close.non_abortive.get() {
                 stream.prepare_reset();
             }
             stream.abandon_zero_copy();
@@ -877,6 +923,7 @@ where
                 deadline: None,
                 unstaged_deadline: None,
                 stopped: false,
+                close: Rc::default(),
             })),
             cleanup: None,
             flush_waiting: false,
@@ -890,6 +937,10 @@ where
         if let Some(stream) = self.state.borrow().stream.as_ref() {
             stream.prepare_reset();
         }
+    }
+
+    fn close_mode(&self) -> Rc<TlsCloseMode> {
+        Rc::clone(&self.state.borrow().close)
     }
 
     fn set_foreground_role(&self, role: ForegroundRole) -> ForegroundRole {
@@ -1309,6 +1360,10 @@ pub(crate) struct OwnedTlsStream<T> {
     write_remaining: usize,
     pending_plaintext: Option<usize>,
     write_active: bool,
+    /// Whether the shutdown sends close_notify, decided when it starts.
+    shutdown_close_notify: Option<bool>,
+    /// Whether a shutdown without close_notify has written the records rustls held.
+    shutdown_flushed: bool,
 }
 
 impl<T> OwnedTlsStream<T>
@@ -1321,6 +1376,8 @@ where
             write_remaining: 0,
             pending_plaintext: None,
             write_active: false,
+            shutdown_close_notify: None,
+            shutdown_flushed: false,
         }
     }
 
@@ -1462,14 +1519,42 @@ where
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let Some(tls) = self.tls.as_mut() else {
+        let this = &mut *self;
+        let Some(tls) = this.tls.as_mut() else {
             return Poll::Ready(Err(Self::closed_error()));
         };
+        let close_notify = *this
+            .shutdown_close_notify
+            .get_or_insert_with(|| tls.transport().close_mode().close_notify());
         let previous = tls.transport().set_foreground_role(ForegroundRole::Barrier);
-        let result = Pin::new(&mut *tls).poll_shutdown(context);
+        let result = if close_notify {
+            Pin::new(&mut *tls).poll_shutdown(context)
+        } else {
+            poll_shutdown_without_close_notify(tls, &mut this.shutdown_flushed, context)
+        };
         tls.transport().set_foreground_role(previous);
         result
     }
+}
+
+/// Writes the records rustls holds and the staged ciphertext, then shuts the TCP stream down,
+/// with no close_notify. As tokio-rustls's shutdown does, it treats an unconnected socket as shut
+/// down.
+fn poll_shutdown_without_close_notify<T: TlsStreamAccess>(
+    tls: &mut T,
+    flushed: &mut bool,
+    context: &mut Context<'_>,
+) -> Poll<io::Result<()>> {
+    if !*flushed {
+        std::task::ready!(Pin::new(&mut *tls).poll_flush(context))?;
+        *flushed = true;
+    }
+    Poll::Ready(
+        match std::task::ready!(Pin::new(tls.transport_mut()).poll_shutdown(context)) {
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
+            result => result,
+        },
+    )
 }
 
 impl<T> TokioByteStream for OwnedTlsStream<T>
@@ -1880,6 +1965,7 @@ impl TlsConnectionInfo {
 pub struct TlsTransport {
     stream: OwnedByteStream,
     connection_info: TlsConnectionInfo,
+    close: Rc<TlsCloseMode>,
 }
 
 impl TlsTransport {
@@ -1933,6 +2019,7 @@ impl TlsTransport {
                     .await?;
             set_congestion_flavor_best_effort(&connected.stream, congestion_flavor.as_deref());
             let mut wire = OwnedCiphertextStream::new(AcceptedTcpStream::new(connected.stream));
+            let close = wire.close_mode();
             wire.start_background(&setup_context)?;
             let tls = match await_handshake_with_deadline(
                 TlsConnector::from(config).connect(server_name, wire),
@@ -1980,6 +2067,7 @@ impl TlsTransport {
             Ok(Self {
                 stream,
                 connection_info,
+                close,
             })
         };
         setup_future(context, setup)
@@ -2009,6 +2097,7 @@ impl TlsTransport {
             let (stream, local_address, peer_address) = prepare_accepted_stream(stream)?;
             let deadline = ConnectDeadline::new(timeout);
             let mut wire = OwnedCiphertextStream::new(stream);
+            let close = wire.close_mode();
             wire.start_background(&setup_context)?;
             let tls = match await_handshake_with_deadline(
                 TlsAcceptor::from(options.config).accept(wire),
@@ -2070,6 +2159,7 @@ impl TlsTransport {
             Ok(Self {
                 stream,
                 connection_info,
+                close,
             })
         };
         setup_future(context, setup)
@@ -2098,6 +2188,21 @@ impl TlsTransport {
 
     pub fn into_byte_stream(self) -> OwnedByteStream {
         self.stream
+    }
+
+    /// The control of how this connection's graceful close ends.
+    pub fn close_control(&self) -> TlsCloseControl {
+        TlsCloseControl(Rc::clone(&self.close))
+    }
+
+    /// Makes every later reset of this connection close its socket without `SO_LINGER` zero,
+    /// as `OwnedByteStream::enable_non_abortive_close` does, and without close_notify. This
+    /// includes the resets that the ciphertext writer's own failures cause (a socket write error
+    /// or a missed write deadline), an abandoned plaintext write, and the worker's teardown.
+    pub fn enable_non_abortive_close(&self, context: &WorkerContext) -> Result<(), HttpError> {
+        self.stream.enable_non_abortive_close(context)?;
+        self.close.non_abortive.set(true);
+        Ok(())
     }
 
     /// Returns an observer that reports when the I/O value and close future have

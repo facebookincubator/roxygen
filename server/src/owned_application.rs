@@ -36,6 +36,7 @@ use roxygen_session::owned_h1::OwnedH1Handle;
 use roxygen_session::owned_h2::OwnedH2Handle;
 use roxygen_session::uniplex::UniplexConfig;
 use roxygen_session::uniplex::UniplexTransport;
+use roxygen_transport::tls::TlsCloseControl;
 use tokio::sync::watch;
 
 use crate::acceptor::ConnectionId;
@@ -125,6 +126,7 @@ pub struct OwnedConnectionAttach<'a> {
     session: &'a ServerSessionConfig,
     transport: Rc<dyn UniplexTransport>,
     io: UniplexConfig,
+    tls_close: Option<TlsCloseControl>,
 }
 
 impl<'a> OwnedConnectionAttach<'a> {
@@ -145,7 +147,13 @@ impl<'a> OwnedConnectionAttach<'a> {
             session,
             transport,
             io,
+            tls_close: None,
         }
+    }
+
+    /// Sets the control of how the connection's TLS close ends, for a TLS connection.
+    pub(crate) fn with_tls_close(self, tls_close: Option<TlsCloseControl>) -> Self {
+        Self { tls_close, ..self }
     }
 
     /// The worker that serves the connection.
@@ -194,10 +202,10 @@ impl<'a> OwnedConnectionAttach<'a> {
             self.io,
             self.session,
             |handle: &OwnedH2Handle, finished: &Rc<Cell<bool>>| {
-                make(OwnedConnectionControl::http2(
-                    handle.clone(),
-                    Rc::clone(finished),
-                ))
+                make(OwnedConnectionControl {
+                    handle: ControlHandle::Http2(handle.clone(), Rc::clone(finished)),
+                    tls_close: self.tls_close,
+                })
             },
         )?;
         Ok(OwnedAttached { session, control })
@@ -224,7 +232,12 @@ impl<'a> OwnedConnectionAttach<'a> {
             self.io,
             self.session,
             http1,
-            |handle: &OwnedH1Handle| make(OwnedConnectionControl::http1(handle.clone())),
+            |handle: &OwnedH1Handle| {
+                make(OwnedConnectionControl {
+                    handle: ControlHandle::Http1(handle.clone()),
+                    tls_close: self.tls_close,
+                })
+            },
         )?;
         Ok(OwnedAttached { session, control })
     }
@@ -252,7 +265,11 @@ impl OwnedAttached {
 
 /// Owner-local control of one hosted connection.
 #[derive(Clone)]
-pub struct OwnedConnectionControl(ControlHandle);
+pub struct OwnedConnectionControl {
+    handle: ControlHandle,
+    /// How a TLS connection's graceful close ends; `None` for plaintext.
+    tls_close: Option<TlsCloseControl>,
+}
 
 #[derive(Clone)]
 enum ControlHandle {
@@ -263,19 +280,11 @@ enum ControlHandle {
 }
 
 impl OwnedConnectionControl {
-    fn http1(handle: OwnedH1Handle) -> Self {
-        Self(ControlHandle::Http1(handle))
-    }
-
-    fn http2(handle: OwnedH2Handle, finished: Rc<Cell<bool>>) -> Self {
-        Self(ControlHandle::Http2(handle, finished))
-    }
-
     /// Drains the connection: an HTTP/2 session sends GOAWAY and admits no new stream, and an
     /// HTTP/1.1 session closes once its current exchange ends. Returns whether this call changed
     /// the session's state, which it never does once the session has finished.
     pub fn drain(&self) -> Result<bool, HttpError> {
-        match &self.0 {
+        match &self.handle {
             ControlHandle::Http1(handle) => handle.initiate_drain(),
             ControlHandle::Http2(_, finished) if finished.get() => Ok(false),
             ControlHandle::Http2(handle, _) => handle.initiate_drain(),
@@ -287,9 +296,10 @@ impl OwnedConnectionControl {
     /// transport, which closes as `ServerSessionConfig::non_abortive_close` describes: with
     /// `SO_LINGER` zero by default, so the peer sees a reset, or without it when that option is
     /// set, so the peer reads the bytes already written and then EOF, or sees a reset if
-    /// received bytes are unread.
+    /// received bytes are unread. On TLS, that EOF comes with no close_notify, and ciphertext
+    /// that the socket has not taken yet is discarded.
     pub fn hard_close(&self) {
-        match &self.0 {
+        match &self.handle {
             ControlHandle::Http1(handle) => handle.cancel(),
             ControlHandle::Http2(handle, _) => handle.cancel(),
         }
@@ -299,16 +309,25 @@ impl OwnedConnectionControl {
     /// error, including a run that panicked and a run that the server abandoned and finished in
     /// its cleanup.
     pub fn is_finished(&self) -> bool {
-        match &self.0 {
+        match &self.handle {
             ControlHandle::Http1(handle) => handle.is_finished(),
             ControlHandle::Http2(handle, finished) => finished.get() || handle.is_finished(),
+        }
+    }
+
+    /// Makes the connection's graceful close, once its last response is written, end with FIN
+    /// and no TLS close_notify. It has no effect on a plaintext connection or on a close that has
+    /// already started.
+    pub fn skip_tls_close_notify(&self) {
+        if let Some(tls_close) = &self.tls_close {
+            tls_close.skip_close_notify();
         }
     }
 
     /// Whether the connection handshake has completed: an HTTP/2 session has processed the
     /// peer's first SETTINGS frame, or an HTTP/1.1 session has delivered its first request head.
     pub fn handshake_complete(&self) -> bool {
-        match &self.0 {
+        match &self.handle {
             ControlHandle::Http1(handle) => handle.handshake_complete(),
             ControlHandle::Http2(handle, _) => handle.handshake_complete(),
         }

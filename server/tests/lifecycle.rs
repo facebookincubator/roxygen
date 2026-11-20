@@ -3860,19 +3860,6 @@ fn owned_http1_rejects_unsupported_factories() {
 }
 
 #[test]
-fn non_abortive_close_rejects_tls() {
-    let mut config = tls_config(generated_tls().0);
-    config.session.non_abortive_close = true;
-    match ScopedHttpServer::start(config, echo_factory(Arc::default()), None) {
-        Err(HttpServerError::InvalidConfig(message)) => {
-            assert_eq!(message, "non_abortive_close does not support TLS");
-        }
-        Err(error) => panic!("unexpected server error: {error}"),
-        Ok(_) => panic!("the server started with non_abortive_close and TLS"),
-    }
-}
-
-#[test]
 fn owned_http1_rejects_nonzero_timeouts() {
     let defaults = crate::acceptor::ServerSessionConfig {
         owned_http1: true,

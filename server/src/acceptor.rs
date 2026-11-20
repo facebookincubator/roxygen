@@ -53,6 +53,7 @@ use roxygen_transport::byte_stream::ByteStreamTransport;
 #[cfg(test)]
 use roxygen_transport::byte_stream::TransportRetirement;
 use roxygen_transport::tcp::TcpTransport;
+use roxygen_transport::tls::TlsCloseControl;
 use roxygen_transport::tls::TlsServerOptions;
 use roxygen_transport::tls::TlsTransport;
 
@@ -411,9 +412,16 @@ pub struct ServerSessionConfig {
     /// connection). The kernel still sends the bytes already written, then FIN, or RST only if
     /// received bytes are unread. An HTTP/1.1 response body error also discards output that is
     /// serialized but not yet written, as hyper drops its unflushed buffer, so the close never
-    /// waits on a peer that stopped reading. The reset is otherwise unchanged. Plaintext only:
-    /// `HttpServer` rejects it with TLS credentials, and `serve_transport` rejects it for a
-    /// transport declared TLS.
+    /// waits on a peer that stopped reading. The reset is otherwise unchanged.
+    ///
+    /// On a TLS connection of `HttpServer`, the close kind follows the cause. A graceful end, a
+    /// connection error that the session reports with GOAWAY (which is written first) and a peer
+    /// EOF send close_notify and then FIN. A reset, including a hard close, a deadline's hard
+    /// close, a forced stop, a transport error and the reset after an HTTP/1.1 error response,
+    /// sends FIN with no close_notify; so does an owned HTTP/2 session that closes before its
+    /// handshake completes, and a failed TLS handshake. Ciphertext that the socket has not taken
+    /// yet is discarded by a reset. `serve_transport` rejects the option for a transport declared
+    /// TLS, whose TLS layer Roxygen does not own.
     pub non_abortive_close: bool,
     /// Keeps downstream HTTP/2 request methods as exact, case-sensitive RFC tokens. Off by
     /// default. HTTP/1 always uses llhttp's table of recognized methods, whatever this is set
@@ -489,8 +497,6 @@ impl Default for ServerSessionConfig {
         }
     }
 }
-
-pub(crate) const NON_ABORTIVE_CLOSE_WITH_TLS: &str = "non_abortive_close does not support TLS";
 
 impl ServerSessionConfig {
     /// Rejects settings that the owned HTTP/1.1 mode does not support.
@@ -662,6 +668,18 @@ impl SessionControl {
 
     pub(crate) fn force_stop(&self) {
         let _ = self.transport.close_with_reset(&self.context);
+    }
+
+    /// Makes an owned HTTP/2 session whose graceful close starts before its handshake completes
+    /// end with FIN and no close_notify on its TLS connection `tls_close`, as a failed handshake
+    /// does.
+    fn skip_close_notify_before_http2_handshake(&self, tls_close: Option<&TlsCloseControl>) {
+        if let (Some(tls_close), SessionHandle::OwnedHttp2 { handle, .. }) =
+            (tls_close, &self.handle)
+        {
+            let handle = handle.clone();
+            tls_close.skip_close_notify_unless(move || handle.handshake_complete());
+        }
     }
 
     fn handshake(&self) -> SessionHandshake {
@@ -980,6 +998,7 @@ pub(crate) fn attach_session(
     })?;
     let PreparedSession {
         transport,
+        tls_close,
         connection,
         uniplex,
         #[cfg(test)]
@@ -1045,16 +1064,20 @@ pub(crate) fn attach_session(
             )?;
             session.add_lifecycle_observer(observer)?;
         }
+        let control = SessionControl {
+            handle: SessionHandle::OwnedHttp2 { handle, finished },
+            transport,
+            context: context.clone(),
+        };
+        if config.session.non_abortive_close {
+            control.skip_close_notify_before_http2_handshake(tls_close.as_ref());
+        }
         return admit_session(
             context,
             draining,
             connection.protocol,
             ServerSession::OwnedHttp2(session),
-            SessionControl {
-                handle: SessionHandle::OwnedHttp2 { handle, finished },
-                transport,
-                context: context.clone(),
-            },
+            control,
             #[cfg(test)]
             retirement,
         );
@@ -1139,6 +1162,8 @@ struct SessionPreparation<'a> {
 /// An admitted connection's transport and session I/O configuration.
 struct PreparedSession {
     transport: Rc<dyn UniplexTransport>,
+    /// How a TLS connection's graceful close ends; `None` for plaintext.
+    tls_close: Option<TlsCloseControl>,
     connection: ConnectionInfo,
     uniplex: UniplexConfig,
     #[cfg(test)]
@@ -1170,10 +1195,11 @@ fn prepare_session(
             AcceptedTransport::ByteStream(transport) if !connection.secure => {
                 transport.enable_non_abortive_close(context)?;
             }
-            AcceptedTransport::ByteStream(_) | AcceptedTransport::Tls(_) => {
+            AcceptedTransport::Tls(transport) => transport.enable_non_abortive_close(context)?,
+            AcceptedTransport::ByteStream(_) => {
                 return Err(HttpError::with_message(
                     HttpErrorCode::INVALID_STATE_TRANSITION,
-                    NON_ABORTIVE_CLOSE_WITH_TLS.as_bytes(),
+                    b"non_abortive_close does not support a TLS layer that Roxygen does not own",
                 ));
             }
         }
@@ -1204,6 +1230,10 @@ fn prepare_session(
         AcceptedTransport::ByteStream(transport) => transport.retirement(),
         AcceptedTransport::Tls(transport) => transport.retirement(),
     };
+    let tls_close = match &transport {
+        AcceptedTransport::ByteStream(_) => None,
+        AcceptedTransport::Tls(transport) => Some(transport.close_control()),
+    };
     let transport = transport.into_uniplex();
 
     let mut uniplex = UniplexConfig {
@@ -1232,6 +1262,7 @@ fn prepare_session(
     }
     Ok(PreparedSession {
         transport,
+        tls_close,
         connection,
         uniplex,
         #[cfg(test)]
@@ -1269,6 +1300,7 @@ pub(crate) fn attach_owned_session(
     } = attachment;
     let PreparedSession {
         transport,
+        tls_close,
         connection,
         uniplex,
         #[cfg(test)]
@@ -1296,7 +1328,8 @@ pub(crate) fn attach_owned_session(
         &config.session,
         transport,
         io,
-    );
+    )
+    .with_tls_close(tls_close.clone());
     let (session, control) = invoke_accept_callback(
         callback_failure,
         worker_index,
@@ -1304,6 +1337,9 @@ pub(crate) fn attach_owned_session(
         || factory.attach(attach),
     )??
     .into_parts();
+    if config.session.non_abortive_close {
+        control.skip_close_notify_before_http2_handshake(tls_close.as_ref());
+    }
     admit_session(
         context,
         Some(draining),

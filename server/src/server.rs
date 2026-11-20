@@ -67,7 +67,6 @@ use crate::acceptor::AcceptorConfig;
 use crate::acceptor::ConnectionId;
 use crate::acceptor::ConnectionLifecycle;
 use crate::acceptor::ConnectionLifecycleObserver;
-use crate::acceptor::NON_ABORTIVE_CLOSE_WITH_TLS;
 use crate::acceptor::NewConnectionFilter;
 use crate::acceptor::ServerSessionConfig;
 use crate::acceptor::SessionControl;
@@ -1163,9 +1162,6 @@ impl HttpServer {
             .session
             .check_owned()
             .map_err(HttpServerError::InvalidConfig)?;
-        if config.session.non_abortive_close && config.tls_credentials.is_some() {
-            return Err(HttpServerError::InvalidConfig(NON_ABORTIVE_CLOSE_WITH_TLS));
-        }
         if config.socket.accept_distribution == AcceptDistribution::PerWorkerReusePort
             && (!config.socket.reuse_port || !config.socket.prebound_listeners.is_empty())
         {
