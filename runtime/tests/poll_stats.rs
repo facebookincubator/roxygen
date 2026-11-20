@@ -13,6 +13,7 @@ mod poll_stats {
     use std::fmt::Write as _;
     use std::future::Future;
     use std::future::pending;
+    use std::future::poll_fn;
     use std::panic::catch_unwind;
     use std::panic::panic_any;
     use std::pin::Pin;
@@ -281,6 +282,177 @@ mod poll_stats {
     }
 
     #[test]
+    fn command_poll_histogram_counts_long_lived_commands() {
+        let (handle, mut driver) = WorkerDriver::new(8).expect("worker starts");
+        assert!(turn(&mut driver).is_pending());
+        for _ in 0..3 {
+            handle
+                .spawn_local(|_| pending::<()>())
+                .expect("command admitted");
+        }
+        assert_eq!(handle.poll_stats().commands_live, 0, "queued is not live");
+
+        let start = handle.poll_stats();
+        assert!(turn(&mut driver).is_pending());
+        let delta = handle.poll_stats().since(&start);
+        assert_eq!(delta.command_polls, 3);
+        assert_eq!(delta.command_polls_per_driver_poll, histogram(&[(2, 1)]));
+        assert_eq!(delta.max_command_polls_per_driver_poll, 3);
+        assert_eq!(delta.commands_live, 3);
+
+        // The short command makes this pass's fourth poll and finishes in it.
+        let start = handle.poll_stats();
+        handle.submit(|_| {}).expect("command admitted");
+        assert!(turn(&mut driver).is_pending());
+        let delta = handle.poll_stats().since(&start);
+        assert_eq!(delta.command_polls_per_driver_poll, histogram(&[(3, 1)]));
+        assert_eq!(delta.max_command_polls_per_driver_poll, 4);
+        assert_eq!(delta.commands_live, 3);
+
+        assert!(handle.begin_shutdown());
+        assert!(turn(&mut driver).is_ready());
+        assert_eq!(handle.poll_stats().commands_live, 0, "shutdown drops them");
+
+        let host = ManualHost::default();
+        let (handle, mut driver) =
+            WorkerDriver::with_host(8, Host::new(Rc::new(host.clone()))).expect("worker starts");
+        let release = Arc::new(AtomicBool::new(false));
+        for _ in 0..3 {
+            let release = Arc::clone(&release);
+            handle
+                .spawn_local(move |_| {
+                    poll_fn(move |_| {
+                        if release.load(Ordering::Relaxed) {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                })
+                .expect("command admitted");
+        }
+        assert!(turn(&mut driver).is_pending());
+        host.run();
+        let stats = handle.poll_stats();
+        assert_eq!(stats.commands_live, 3, "host tasks are live commands");
+        assert_eq!(
+            (
+                stats.command_polls_per_driver_poll,
+                stats.max_command_polls_per_driver_poll
+            ),
+            ([0; 8], 0),
+            "a hosted driver polls no commands itself"
+        );
+        release.store(true, Ordering::Relaxed);
+        host.run();
+        assert_eq!(handle.poll_stats().commands_live, 0, "finished tasks");
+        assert!(handle.begin_shutdown());
+        assert!(turn(&mut driver).is_ready());
+    }
+
+    #[test]
+    fn max_queued_commands_tracks_enqueue_high_water() {
+        let (handle, mut driver) = WorkerDriver::new(8).expect("worker starts");
+        let start = handle.poll_stats();
+        for _ in 0..5 {
+            handle.submit(|_| {}).expect("command admitted");
+        }
+        let blocked = handle.poll_stats();
+        assert_eq!(blocked.max_queued_commands, 5);
+
+        assert!(turn(&mut driver).is_pending());
+        for _ in 0..2 {
+            handle.submit(|_| {}).expect("command admitted");
+        }
+        assert!(turn(&mut driver).is_pending());
+        let later = handle.poll_stats();
+        assert_eq!(later.max_queued_commands, 5, "a lifetime maximum");
+        assert_eq!(later.since(&start).max_queued_commands, 5);
+        assert_eq!(
+            later.since(&blocked).max_queued_commands,
+            5,
+            "since keeps the later maximum"
+        );
+        assert!(handle.begin_shutdown());
+        assert!(turn(&mut driver).is_ready());
+    }
+
+    #[test]
+    fn max_queued_commands_counts_spawn_local_and_call_local() {
+        let (handle, mut driver) = WorkerDriver::new(8).expect("worker starts");
+        handle
+            .spawn_local(|_| async {})
+            .expect("spawn_local admitted");
+        assert_eq!(handle.poll_stats().max_queued_commands, 1);
+        let call = handle
+            .call_local(|_| async { 7 })
+            .expect("call_local admitted");
+        assert_eq!(handle.poll_stats().max_queued_commands, 2);
+        let sync_call = handle.call(|_| 8).expect("call admitted");
+        assert_eq!(handle.poll_stats().max_queued_commands, 3);
+
+        assert!(turn(&mut driver).is_pending());
+        let runtime = Builder::new_current_thread().build().expect("test runtime");
+        assert_eq!(runtime.block_on(call), Ok(7));
+        assert_eq!(runtime.block_on(sync_call), Ok(8));
+        assert!(handle.begin_shutdown());
+        assert!(turn(&mut driver).is_ready());
+    }
+
+    #[test]
+    fn poll_stats_since_and_merge_laws() {
+        let earlier = WorkerPollStats {
+            command_polls: 30,
+            commands_live: 6,
+            command_polls_per_driver_poll: [4, 3, 2, 1, 0, 0, 0, 1],
+            max_command_polls_per_driver_poll: 70,
+            max_queued_commands: 9,
+            ..WorkerPollStats::default()
+        };
+        let later = WorkerPollStats {
+            command_polls: 45,
+            commands_live: 2,
+            command_polls_per_driver_poll: [5, 5, 2, 4, 1, 0, 0, 1],
+            max_command_polls_per_driver_poll: 71,
+            max_queued_commands: 12,
+            ..WorkerPollStats::default()
+        };
+        assert_eq!(
+            later.since(&earlier),
+            WorkerPollStats {
+                command_polls: 15,
+                commands_live: 2,
+                command_polls_per_driver_poll: [1, 2, 0, 3, 1, 0, 0, 0],
+                max_command_polls_per_driver_poll: 71,
+                max_queued_commands: 12,
+                ..WorkerPollStats::default()
+            },
+            "since subtracts counters and histograms and keeps the later gauge and maxima"
+        );
+
+        let mut merged = later;
+        merged.merge(&earlier);
+        assert_eq!(
+            merged,
+            WorkerPollStats {
+                command_polls: 75,
+                commands_live: 8,
+                command_polls_per_driver_poll: [9, 8, 4, 5, 1, 0, 0, 2],
+                max_command_polls_per_driver_poll: 71,
+                max_queued_commands: 12,
+                ..WorkerPollStats::default()
+            },
+            "merge sums counters, histograms and the gauge and takes the larger maxima"
+        );
+        let mut reversed = earlier;
+        reversed.merge(&later);
+        assert_eq!(reversed, merged, "merge is order independent");
+        let mut unchanged = later;
+        unchanged.merge(&WorkerPollStats::default());
+        assert_eq!(unchanged, later, "an empty snapshot is merge's identity");
+    }
+
+    #[test]
     fn since_keeps_later_gauges_and_maxima_and_merge_sums() {
         let earlier = WorkerPollStats {
             driver_polls: 10,
@@ -297,6 +469,7 @@ mod poll_stats {
             contained_exchange_panics: 3,
             contained_connection_panics: 2,
             contained_driver_panics: 1,
+            ..WorkerPollStats::default()
         };
         let later = WorkerPollStats {
             driver_polls: 15,
@@ -313,6 +486,7 @@ mod poll_stats {
             contained_exchange_panics: 8,
             contained_connection_panics: 6,
             contained_driver_panics: 2,
+            ..WorkerPollStats::default()
         };
         assert_eq!(
             later.since(&earlier),
@@ -331,6 +505,7 @@ mod poll_stats {
                 contained_exchange_panics: 5,
                 contained_connection_panics: 4,
                 contained_driver_panics: 1,
+                ..WorkerPollStats::default()
             }
         );
 
@@ -353,6 +528,7 @@ mod poll_stats {
                 contained_exchange_panics: 11,
                 contained_connection_panics: 8,
                 contained_driver_panics: 3,
+                ..WorkerPollStats::default()
             }
         );
         let hosted = WorkerPollStats {

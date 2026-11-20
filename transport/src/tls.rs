@@ -590,6 +590,18 @@ where
         self.unstaged_deadline = None;
     }
 
+    /// Stores the writer task's waker, keeping a stored one that will wake the
+    /// same task.
+    fn register_task_waker(&mut self, waker: &std::task::Waker) {
+        if self
+            .task_waker
+            .as_ref()
+            .is_none_or(|stored| !stored.will_wake(waker))
+        {
+            self.task_waker = Some(waker.clone());
+        }
+    }
+
     fn foreground_waker_for(&mut self, role: ForegroundRole) -> &mut Option<std::task::Waker> {
         match role {
             ForegroundRole::Read => &mut self.read_waker,
@@ -719,7 +731,7 @@ where
                         return Poll::Ready(());
                     }
                     Poll::Pending => {
-                        self.task_waker = Some(context.waker().clone());
+                        self.register_task_waker(context.waker());
                         return Poll::Pending;
                     }
                 }
@@ -746,7 +758,7 @@ where
                         Poll::Ready(())
                     }
                     Poll::Pending => {
-                        self.task_waker = Some(context.waker().clone());
+                        self.register_task_waker(context.waker());
                         Poll::Pending
                     }
                 };
@@ -763,13 +775,13 @@ where
                         return Poll::Ready(());
                     }
                     Poll::Pending => {
-                        self.task_waker = Some(context.waker().clone());
+                        self.register_task_waker(context.waker());
                         return Poll::Pending;
                     }
                 }
             }
 
-            self.task_waker = Some(context.waker().clone());
+            self.register_task_waker(context.waker());
             return Poll::Pending;
         }
     }

@@ -2406,6 +2406,41 @@ mod tcp_tls {
     }
 
     #[test]
+    fn idle_tls_writer_poll_does_not_clone_same_waker() {
+        use std::task::RawWaker;
+        use std::task::RawWakerVTable;
+
+        thread_local! {
+            static CLONES: Cell<usize> = const { Cell::new(0) };
+        }
+        // A static, not a const, so every clone shares the vtable address that `will_wake`
+        // compares.
+        static COUNTING_WAKER: RawWakerVTable =
+            RawWakerVTable::new(clone_counting, ignore, ignore, ignore);
+
+        fn clone_counting(_data: *const ()) -> RawWaker {
+            CLONES.with(|clones| clones.set(clones.get() + 1));
+            RawWaker::new(std::ptr::null(), &COUNTING_WAKER)
+        }
+
+        fn ignore(_data: *const ()) {}
+
+        // SAFETY: the vtable ignores its null data pointer and owns no data, and its clone
+        // touches only the calling thread's counter, so the waker is valid on any thread.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &COUNTING_WAKER)) };
+        let control = CiphertextProbeControl::default();
+        let stream = OwnedCiphertextStream::new(control.stream([]));
+        let mut context = Context::from_waker(&waker);
+        assert!(stream.poll_background_for_test(&mut context).is_pending());
+        assert!(stream.poll_background_for_test(&mut context).is_pending());
+        assert_eq!(
+            CLONES.with(Cell::get),
+            1,
+            "the idle writer keeps the waker that will wake the same task"
+        );
+    }
+
+    #[test]
     fn tls_ciphertext_staging_preserves_owned_backing_fifo_and_close_order() {
         let control = CiphertextProbeControl::default();
         let mut stream = OwnedCiphertextStream::new(control.stream([

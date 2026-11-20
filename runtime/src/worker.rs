@@ -273,8 +273,20 @@ impl CommandTask {
     }
 
     fn release(&mut self) {
-        drop(self.task.take());
+        self.drop_job();
         drop(self.completion.take());
+    }
+
+    /// Drops the job, if it has not been dropped already, after removing it
+    /// from its worker's live commands.
+    fn drop_job(&mut self) {
+        let Some(job) = self.task.take() else {
+            return;
+        };
+        if let Some(completion) = &self.completion {
+            completion.shared.poll_counters.command_finished();
+        }
+        drop(job);
     }
 }
 
@@ -295,7 +307,7 @@ impl Future for CommandTask {
 
 impl Drop for CommandTask {
     fn drop(&mut self) {
-        let mut first_panic = catch_unwind(AssertUnwindSafe(|| drop(self.task.take()))).err();
+        let mut first_panic = catch_unwind(AssertUnwindSafe(|| self.drop_job())).err();
         let completion_panic =
             catch_unwind(AssertUnwindSafe(|| drop(self.completion.take()))).err();
         retain_first_panic(&mut first_panic, completion_panic);
@@ -347,9 +359,13 @@ impl WorkerCommand {
                 resume_unwind(payload)
             }
         };
+        let completion = self.completion.take();
+        if let Some(completion) = &completion {
+            completion.shared.poll_counters.command_started();
+        }
         CommandTask {
             task: Some(ObservedTask::new(command_span, future)),
-            completion: self.completion.take(),
+            completion,
         }
     }
 
@@ -776,6 +792,9 @@ impl WorkerHandle {
                 });
                 queue.outstanding_work += 1;
                 queue.commands.push_back(admitted);
+                self.shared
+                    .poll_counters
+                    .record_queued_commands(queue.commands.len());
                 (queue.driver_waker.take(), None)
             }
         };

@@ -5,15 +5,16 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Per-worker driver poll counters, written only by the worker's owner thread
-//! and readable from any thread.
+//! Per-worker driver poll counters, readable from any thread. The worker's
+//! owner thread writes all of them except the queued-command maximum, which
+//! enqueuers raise under the queue lock.
 
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use super::ContainedPanicScope;
 
-/// How many buckets `WorkerPollStats::cleanup_polls_per_driver_poll` has.
+/// How many buckets each per-driver-poll histogram in `WorkerPollStats` has.
 pub(crate) const CLEANUP_POLL_BUCKETS: usize = 8;
 
 /// A snapshot of one worker's driver poll counters.
@@ -62,19 +63,24 @@ pub struct WorkerPollStats {
     /// Panics those drivers contained at driver scope, outside any narrower
     /// boundary.
     pub contained_driver_panics: u64,
+    /// Commands whose job the driver has created and not yet dropped, whether
+    /// the driver polls it itself or a host task runs it. Queued commands do
+    /// not count until a driver poll takes them.
+    pub commands_live: u64,
+    /// Non-hosted driver polls by how many command polls each made, in the
+    /// buckets of `cleanup_polls_per_driver_poll`.
+    pub command_polls_per_driver_poll: [u64; CLEANUP_POLL_BUCKETS],
+    /// The most command polls that one non-hosted driver poll has made.
+    pub max_command_polls_per_driver_poll: u64,
+    /// The most commands that were queued at once. Every admitted command
+    /// counts, whichever `WorkerHandle` method submitted it.
+    pub max_queued_commands: u64,
 }
 
 impl WorkerPollStats {
-    /// The counters and histogram that accrued since `earlier`, an earlier
+    /// The counters and histograms that accrued since `earlier`, an earlier
     /// snapshot of the same worker. Gauges and maxima are this snapshot's.
     pub fn since(&self, earlier: &Self) -> Self {
-        let mut histogram = self.cleanup_polls_per_driver_poll;
-        for (bucket, before) in histogram
-            .iter_mut()
-            .zip(earlier.cleanup_polls_per_driver_poll)
-        {
-            *bucket = bucket.wrapping_sub(before);
-        }
         Self {
             driver_polls: self.driver_polls.wrapping_sub(earlier.driver_polls),
             command_polls: self.command_polls.wrapping_sub(earlier.command_polls),
@@ -86,7 +92,14 @@ impl WorkerPollStats {
             budget_exhausted_passes: self
                 .budget_exhausted_passes
                 .wrapping_sub(earlier.budget_exhausted_passes),
-            cleanup_polls_per_driver_poll: histogram,
+            cleanup_polls_per_driver_poll: histogram_since(
+                self.cleanup_polls_per_driver_poll,
+                earlier.cleanup_polls_per_driver_poll,
+            ),
+            command_polls_per_driver_poll: histogram_since(
+                self.command_polls_per_driver_poll,
+                earlier.command_polls_per_driver_poll,
+            ),
             contained_exchange_panics: self
                 .contained_exchange_panics
                 .wrapping_sub(earlier.contained_exchange_panics),
@@ -100,7 +113,7 @@ impl WorkerPollStats {
         }
     }
 
-    /// Adds `other`, another worker's snapshot: counters, histogram and gauges
+    /// Adds `other`, another worker's snapshot: counters, histograms and gauges
     /// sum, and maxima take the larger value.
     pub fn merge(&mut self, other: &Self) {
         self.driver_polls = self.driver_polls.wrapping_add(other.driver_polls);
@@ -113,13 +126,10 @@ impl WorkerPollStats {
         self.budget_exhausted_passes = self
             .budget_exhausted_passes
             .wrapping_add(other.budget_exhausted_passes);
-        for (bucket, added) in self
-            .cleanup_polls_per_driver_poll
-            .iter_mut()
-            .zip(other.cleanup_polls_per_driver_poll)
-        {
-            *bucket = bucket.wrapping_add(added);
-        }
+        add_histogram(
+            &mut self.cleanup_polls_per_driver_poll,
+            other.cleanup_polls_per_driver_poll,
+        );
         self.max_cleanup_polls_per_driver_poll = self
             .max_cleanup_polls_per_driver_poll
             .max(other.max_cleanup_polls_per_driver_poll);
@@ -137,12 +147,37 @@ impl WorkerPollStats {
         self.contained_driver_panics = self
             .contained_driver_panics
             .wrapping_add(other.contained_driver_panics);
+        self.commands_live = self.commands_live.wrapping_add(other.commands_live);
+        add_histogram(
+            &mut self.command_polls_per_driver_poll,
+            other.command_polls_per_driver_poll,
+        );
+        self.max_command_polls_per_driver_poll = self
+            .max_command_polls_per_driver_poll
+            .max(other.max_command_polls_per_driver_poll);
+        self.max_queued_commands = self.max_queued_commands.max(other.max_queued_commands);
     }
 }
 
-/// The `cleanup_polls_per_driver_poll` bucket of a driver poll that made
-/// `polls` cleanup polls.
-pub(crate) fn cleanup_poll_bucket(polls: u64) -> usize {
+fn histogram_since(
+    mut later: [u64; CLEANUP_POLL_BUCKETS],
+    earlier: [u64; CLEANUP_POLL_BUCKETS],
+) -> [u64; CLEANUP_POLL_BUCKETS] {
+    for (bucket, before) in later.iter_mut().zip(earlier) {
+        *bucket = bucket.wrapping_sub(before);
+    }
+    later
+}
+
+fn add_histogram(sum: &mut [u64; CLEANUP_POLL_BUCKETS], added: [u64; CLEANUP_POLL_BUCKETS]) {
+    for (bucket, count) in sum.iter_mut().zip(added) {
+        *bucket = bucket.wrapping_add(count);
+    }
+}
+
+/// The histogram bucket of a driver poll that made `polls` cleanup polls, or
+/// `polls` command polls.
+pub(crate) fn poll_bucket(polls: u64) -> usize {
     if polls == 0 {
         0
     } else {
@@ -182,6 +217,12 @@ fn sub(counter: &AtomicU64, n: u64) {
     );
 }
 
+/// The queued-command maximum, on its own cache line because enqueuers on any
+/// thread raise it.
+#[repr(align(64))]
+#[derive(Default)]
+struct QueuedCommandsMaximum(AtomicU64);
+
 /// The counters behind `WorkerPollStats`. A driver poll that unwinds before
 /// it returns publishes only its `driver_polls`.
 #[repr(align(64))]
@@ -201,6 +242,10 @@ pub(crate) struct PollCounters {
     contained_exchange_panics: AtomicU64,
     contained_connection_panics: AtomicU64,
     contained_driver_panics: AtomicU64,
+    commands_live: AtomicU64,
+    command_polls_per_driver_poll: [AtomicU64; CLEANUP_POLL_BUCKETS],
+    max_command_polls_per_driver_poll: AtomicU64,
+    max_queued_commands: QueuedCommandsMaximum,
 }
 
 impl PollCounters {
@@ -209,7 +254,7 @@ impl PollCounters {
     }
 
     /// Publishes a driver poll; `inline` drivers also record its histogram
-    /// bucket and maximum.
+    /// buckets and maxima.
     pub(crate) fn record_pass(&self, pass: &PassStats, inline: bool) {
         add(&self.command_polls, pass.command_polls);
         add(&self.cleanup_polls, pass.cleanup_polls);
@@ -218,10 +263,15 @@ impl PollCounters {
         }
         if inline {
             add(
-                &self.cleanup_polls_per_driver_poll[cleanup_poll_bucket(pass.cleanup_polls)],
+                &self.cleanup_polls_per_driver_poll[poll_bucket(pass.cleanup_polls)],
                 1,
             );
             raise(&self.max_cleanup_polls_per_driver_poll, pass.cleanup_polls);
+            add(
+                &self.command_polls_per_driver_poll[poll_bucket(pass.command_polls)],
+                1,
+            );
+            raise(&self.max_command_polls_per_driver_poll, pass.command_polls);
         }
         if pass.ready_entries != 0 {
             add(&self.ready_entries, pass.ready_entries);
@@ -250,6 +300,24 @@ impl PollCounters {
         }
         if activated {
             sub(&self.cleanups_active, 1);
+        }
+    }
+
+    pub(crate) fn command_started(&self) {
+        add(&self.commands_live, 1);
+    }
+
+    pub(crate) fn command_finished(&self) {
+        sub(&self.commands_live, 1);
+    }
+
+    /// Raises the queued-command maximum to `queued`. Callers hold the queue
+    /// lock, and the load skips the read-modify-write while the maximum holds.
+    pub(crate) fn record_queued_commands(&self, queued: usize) {
+        let queued = queued as u64;
+        let maximum = &self.max_queued_commands.0;
+        if queued > maximum.load(Ordering::Relaxed) {
+            maximum.fetch_max(queued, Ordering::Relaxed);
         }
     }
 
@@ -282,6 +350,14 @@ impl PollCounters {
             contained_exchange_panics: self.contained_exchange_panics.load(Ordering::Relaxed),
             contained_connection_panics: self.contained_connection_panics.load(Ordering::Relaxed),
             contained_driver_panics: self.contained_driver_panics.load(Ordering::Relaxed),
+            commands_live: self.commands_live.load(Ordering::Relaxed),
+            command_polls_per_driver_poll: std::array::from_fn(|bucket| {
+                self.command_polls_per_driver_poll[bucket].load(Ordering::Relaxed)
+            }),
+            max_command_polls_per_driver_poll: self
+                .max_command_polls_per_driver_poll
+                .load(Ordering::Relaxed),
+            max_queued_commands: self.max_queued_commands.0.load(Ordering::Relaxed),
         }
     }
 }
