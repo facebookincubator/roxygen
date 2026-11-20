@@ -16,17 +16,22 @@ use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::num::NonZeroUsize;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::SyncSender;
+use std::task::Context;
+use std::task::Poll;
 use std::time::Duration;
 
 use roxygen_core::error::HttpError;
@@ -51,6 +56,8 @@ use socket2::Socket;
 use socket2::Type;
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::acceptor::AcceptedConnectionObserver;
@@ -472,6 +479,54 @@ impl SessionRetirementProbe {
     }
 }
 
+/// Holds every worker's dequeue of accepted sockets until released, so a test can fill the
+/// accepted-socket queues.
+#[cfg(test)]
+pub(crate) struct DequeueHoldForTest {
+    state: watch::Sender<DequeueHoldState>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct DequeueHoldState {
+    released: bool,
+    held: std::collections::BTreeSet<usize>,
+}
+
+#[cfg(test)]
+impl DequeueHoldForTest {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: watch::Sender::new(DequeueHoldState::default()),
+        })
+    }
+
+    /// Returns once worker `worker_index` is parked before a dequeue.
+    pub(crate) async fn wait_held(&self, worker_index: usize) {
+        let _ = self
+            .state
+            .subscribe()
+            .wait_for(|state| state.held.contains(&worker_index))
+            .await;
+    }
+
+    /// Lets every worker dequeue from now on. Idempotent.
+    pub(crate) fn release(&self) {
+        self.state.send_modify(|state| state.released = true);
+    }
+
+    /// Parks worker `worker_index` until `release`, recording that it is held.
+    async fn hold(&self, worker_index: usize) {
+        let mut state = self.state.subscribe();
+        if state.borrow().released {
+            return;
+        }
+        self.state
+            .send_if_modified(|state| state.held.insert(worker_index));
+        let _ = state.wait_for(|state| state.released).await;
+    }
+}
+
 pub type HandlerFactory = Arc<dyn Fn(usize) -> HttpHandlerRef + Send + Sync>;
 
 /// Constructs worker-local application state on the worker serving its requests.
@@ -512,6 +567,21 @@ impl TlsCredentialProvider for StaticTlsCredentials {
     }
 }
 
+/// Which workers accept connections.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AcceptDistribution {
+    /// Worker 0 accepts every connection and hands the sockets to the workers in turn. A socket
+    /// whose worker's accepted-socket queue is full is closed and counted in
+    /// [`AcceptStats::handoff_dropped`].
+    #[default]
+    Worker0,
+    /// Each worker binds its own `SO_REUSEPORT` listener for every address and serves the
+    /// connections it accepts. A full accepted-socket queue pauses that worker's accepts and
+    /// leaves new connections in the kernel backlog, so no socket is dropped. Requires
+    /// `reuse_port` and no prebound listeners.
+    PerWorkerReusePort,
+}
+
 pub struct ServerSocketConfig {
     pub bind_addresses: Vec<SocketAddr>,
     pub prebound_listeners: Vec<TcpListener>,
@@ -519,6 +589,8 @@ pub struct ServerSocketConfig {
     pub reuse_port: bool,
     pub tcp_max_segment: Option<u32>,
     pub use_zero_copy: bool,
+    /// Which workers accept connections. Defaults to [`AcceptDistribution::Worker0`].
+    pub accept_distribution: AcceptDistribution,
 }
 
 impl Default for ServerSocketConfig {
@@ -530,6 +602,7 @@ impl Default for ServerSocketConfig {
             reuse_port: false,
             tcp_max_segment: None,
             use_zero_copy: false,
+            accept_distribution: AcceptDistribution::Worker0,
         }
     }
 }
@@ -540,6 +613,8 @@ pub struct ServerConfig {
     pub session: ServerSessionConfig,
     pub num_io_threads: usize,
     pub command_capacity: usize,
+    /// The capacity of each worker's queue of accepted sockets. `None` uses `command_capacity`.
+    pub accepted_socket_capacity: Option<NonZeroUsize>,
     pub shutdown_on_signals: Vec<i32>,
     pub new_connection_filter: Option<Arc<dyn NewConnectionFilter>>,
     pub filter_factories: Vec<Arc<dyn ServerFilterFactory>>,
@@ -551,6 +626,8 @@ pub struct ServerConfig {
     pub(crate) session_retirement_probe: Option<Arc<SessionRetirementProbe>>,
     #[cfg(test)]
     pub(crate) admission_probe: Option<Arc<AdmissionProbe>>,
+    #[cfg(test)]
+    pub(crate) dequeue_hold_for_test: Option<Arc<DequeueHoldForTest>>,
 }
 
 impl Default for ServerConfig {
@@ -561,6 +638,7 @@ impl Default for ServerConfig {
             session: ServerSessionConfig::default(),
             num_io_threads: 1,
             command_capacity: DEFAULT_COMMAND_CAPACITY,
+            accepted_socket_capacity: None,
             shutdown_on_signals: vec![libc::SIGINT],
             new_connection_filter: None,
             filter_factories: Vec::new(),
@@ -572,6 +650,8 @@ impl Default for ServerConfig {
             session_retirement_probe: None,
             #[cfg(test)]
             admission_probe: None,
+            #[cfg(test)]
+            dequeue_hold_for_test: None,
         }
     }
 }
@@ -643,6 +723,66 @@ pub(crate) struct CallbackFailure {
 enum WorkerCommand {
     Drain,
     ForceStop,
+    StopAccepting(AcceptStopAck),
+}
+
+/// Acknowledges a [`StopAccepting`] when dropped. A worker that exits without handling the
+/// command still acknowledges it, because its listeners closed with it.
+struct AcceptStopAck(Option<oneshot::Sender<()>>);
+
+impl Drop for AcceptStopAck {
+    fn drop(&mut self) {
+        if let Some(acknowledgement) = self.0.take() {
+            let _ = acknowledgement.send(());
+        }
+    }
+}
+
+/// Resolves once every worker has closed its listeners after
+/// [`HttpServerControl::stop_accepting`].
+///
+/// A worker acknowledges once every listener task it runs has exited, so its listeners are closed
+/// and none of its accepted sockets waits outside its queue. A worker that has exited counts as
+/// acknowledged. Dropping this future does not cancel the stop.
+pub struct StopAccepting {
+    acknowledgements: Vec<Option<oneshot::Receiver<()>>>,
+}
+
+impl StopAccepting {
+    /// Indices of the workers whose acknowledgement has not arrived, so a caller that bounds the
+    /// wait can name them.
+    pub fn unacknowledged(&self) -> Vec<usize> {
+        self.acknowledgements
+            .iter()
+            .enumerate()
+            .filter(|(_, acknowledgement)| {
+                acknowledgement
+                    .as_ref()
+                    .is_some_and(oneshot::Receiver::is_empty)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+}
+
+impl Future for StopAccepting {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+        let acknowledgements = &mut self.get_mut().acknowledgements;
+        for acknowledgement in acknowledgements.iter_mut() {
+            if let Some(receiver) = acknowledgement
+                && Pin::new(receiver).poll(context).is_ready()
+            {
+                *acknowledgement = None;
+            }
+        }
+        if acknowledgements.iter().all(Option::is_none) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
 }
 
 struct WorkerConfig {
@@ -656,10 +796,148 @@ struct WorkerConfig {
     shutdown_on_signals: Vec<i32>,
     callback_failure: Arc<Mutex<Option<CallbackFailure>>>,
     lifecycle_started: Arc<AtomicBool>,
+    accept_distribution: AcceptDistribution,
+    accept_counters: Arc<[Arc<AcceptCounters>]>,
     #[cfg(test)]
     session_retirement_probe: Option<Arc<SessionRetirementProbe>>,
     #[cfg(test)]
     admission_probe: Option<Arc<AdmissionProbe>>,
+    #[cfg(test)]
+    dequeue_hold_for_test: Option<Arc<DequeueHoldForTest>>,
+}
+
+/// A snapshot of one worker's accept counters.
+///
+/// In [`AcceptDistribution::Worker0`] mode a socket counts toward the worker it is handed to,
+/// not toward worker 0. A snapshot reads each value independently.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct AcceptStats {
+    /// Sockets accepted for this worker.
+    pub accepted: u64,
+    /// Sockets that worker 0 handed to this worker and that were closed without a session: this
+    /// worker's queue was full or closed, or the worker stopped dequeuing for a drain. Only
+    /// [`AcceptDistribution::Worker0`] mode drops sockets.
+    pub handoff_dropped: u64,
+    /// Gauge: sockets accepted but not yet turned into sessions (held by a listener task awaiting
+    /// queue capacity, or queued in the accepted-socket queue).
+    pub pending_handoff: u64,
+    /// Sockets closed unsessionized by a forced stop.
+    pub closed_at_force_stop: u64,
+}
+
+impl AcceptStats {
+    /// All counters zero.
+    pub const fn new() -> Self {
+        Self {
+            accepted: 0,
+            handoff_dropped: 0,
+            pending_handoff: 0,
+            closed_at_force_stop: 0,
+        }
+    }
+
+    /// Sets `accepted`.
+    pub const fn with_accepted(mut self, accepted: u64) -> Self {
+        self.accepted = accepted;
+        self
+    }
+
+    /// Sets `handoff_dropped`.
+    pub const fn with_handoff_dropped(mut self, handoff_dropped: u64) -> Self {
+        self.handoff_dropped = handoff_dropped;
+        self
+    }
+
+    /// Sets `pending_handoff`.
+    pub const fn with_pending_handoff(mut self, pending_handoff: u64) -> Self {
+        self.pending_handoff = pending_handoff;
+        self
+    }
+
+    /// Sets `closed_at_force_stop`.
+    pub const fn with_closed_at_force_stop(mut self, closed_at_force_stop: u64) -> Self {
+        self.closed_at_force_stop = closed_at_force_stop;
+        self
+    }
+}
+
+/// One worker's live accept counters.
+#[derive(Default)]
+struct AcceptCounters {
+    accepted: AtomicU64,
+    handoff_dropped: AtomicU64,
+    pending_handoff: AtomicU64,
+    closed_at_force_stop: AtomicU64,
+}
+
+impl AcceptCounters {
+    fn snapshot(&self) -> AcceptStats {
+        AcceptStats::new()
+            .with_accepted(self.accepted.load(Ordering::Relaxed))
+            .with_handoff_dropped(self.handoff_dropped.load(Ordering::Relaxed))
+            .with_pending_handoff(self.pending_handoff.load(Ordering::Relaxed))
+            .with_closed_at_force_stop(self.closed_at_force_stop.load(Ordering::Relaxed))
+    }
+}
+
+/// An accepted socket that is not a session yet. It counts in its worker's `pending_handoff`
+/// until it becomes a session or is closed. Dropping it any other way, such as with an aborted
+/// listener task or a closed queue, counts it in `closed_at_force_stop`.
+struct PendingSocket {
+    stream: Option<TcpStream>,
+    counters: Arc<AcceptCounters>,
+}
+
+impl PendingSocket {
+    fn accepted(stream: TcpStream, counters: &Arc<AcceptCounters>) -> Self {
+        counters.accepted.fetch_add(1, Ordering::Relaxed);
+        counters.pending_handoff.fetch_add(1, Ordering::Relaxed);
+        Self {
+            stream: Some(stream),
+            counters: Arc::clone(counters),
+        }
+    }
+
+    #[cfg(test)]
+    fn stream(&self) -> &TcpStream {
+        self.stream
+            .as_ref()
+            .expect("a pending socket holds its stream until it leaves the count")
+    }
+
+    fn leave(&mut self) -> TcpStream {
+        self.counters
+            .pending_handoff
+            .fetch_sub(1, Ordering::Relaxed);
+        self.stream
+            .take()
+            .expect("a pending socket leaves the count once")
+    }
+
+    /// Hands the socket to a new session.
+    fn into_session(mut self) -> TcpStream {
+        self.leave()
+    }
+
+    /// Closes the socket because its worker could not take it.
+    fn drop_handoff(mut self) {
+        self.counters
+            .handoff_dropped
+            .fetch_add(1, Ordering::Relaxed);
+        drop(self.leave());
+    }
+}
+
+impl Drop for PendingSocket {
+    fn drop(&mut self) {
+        if self.stream.is_some() {
+            self.counters
+                .closed_at_force_stop
+                .fetch_add(1, Ordering::Relaxed);
+            drop(self.leave());
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -668,6 +946,7 @@ pub struct HttpServerControl {
     draining: Arc<AtomicBool>,
     commands: Vec<mpsc::UnboundedSender<WorkerCommand>>,
     worker_handles: Arc<[WorkerHandle]>,
+    accept_counters: Arc<[Arc<AcceptCounters>]>,
 }
 
 impl HttpServerControl {
@@ -682,6 +961,35 @@ impl HttpServerControl {
             .iter()
             .map(WorkerHandle::poll_stats)
             .collect()
+    }
+
+    /// Each worker's accept counters, in worker index order, including after the workers have
+    /// stopped.
+    pub fn accept_stats(&self) -> Vec<AcceptStats> {
+        self.accept_counters
+            .iter()
+            .map(|counters| counters.snapshot())
+            .collect()
+    }
+
+    /// Closes every listener without draining sessions. The returned future resolves once every
+    /// worker has dropped its listeners; sockets already accepted still become sessions.
+    /// Idempotent; `drain()` still closes listeners if this was not called. Dropping the future
+    /// does not cancel the stop.
+    pub fn stop_accepting(&self) -> StopAccepting {
+        StopAccepting {
+            acknowledgements: self
+                .commands
+                .iter()
+                .map(|commands| {
+                    let (acknowledgement, acknowledged) = oneshot::channel();
+                    let _ = commands.send(WorkerCommand::StopAccepting(AcceptStopAck(Some(
+                        acknowledgement,
+                    ))));
+                    Some(acknowledged)
+                })
+                .collect(),
+        }
     }
 
     pub fn drain(&self) -> bool {
@@ -730,6 +1038,7 @@ pub struct HttpServer {
     num_io_threads: usize,
     workers: RefCell<Vec<ManagedWorker>>,
     worker_handles: Arc<[WorkerHandle]>,
+    accept_counters: Arc<[Arc<AcceptCounters>]>,
     commands: Vec<mpsc::UnboundedSender<WorkerCommand>>,
     tls_credentials: Option<Arc<dyn TlsCredentialProvider>>,
     tls: Option<Arc<ArcSwap<TlsServerOptions>>>,
@@ -769,6 +1078,13 @@ impl HttpServer {
         if config.session.non_abortive_close && config.tls_credentials.is_some() {
             return Err(HttpServerError::InvalidConfig(NON_ABORTIVE_CLOSE_WITH_TLS));
         }
+        if config.socket.accept_distribution == AcceptDistribution::PerWorkerReusePort
+            && (!config.socket.reuse_port || !config.socket.prebound_listeners.is_empty())
+        {
+            return Err(HttpServerError::InvalidConfig(
+                "per-worker accept requires reuse_port and no prebound listeners",
+            ));
+        }
         let num_io_threads = if config.num_io_threads == 0 {
             std::thread::available_parallelism()
                 .map(usize::from)
@@ -776,7 +1092,16 @@ impl HttpServer {
         } else {
             config.num_io_threads
         };
-        let listeners = if config.socket.prebound_listeners.is_empty() {
+        let per_worker_accept =
+            config.socket.accept_distribution == AcceptDistribution::PerWorkerReusePort;
+        let mut worker_listeners = if per_worker_accept {
+            bind_per_worker_listeners(&config.socket, num_io_threads)?
+        } else {
+            Vec::new()
+        };
+        let listeners = if per_worker_accept {
+            worker_listeners.remove(0)
+        } else if config.socket.prebound_listeners.is_empty() {
             bind_listeners(&config.socket)?
         } else {
             let listeners = std::mem::take(&mut config.socket.prebound_listeners);
@@ -802,7 +1127,7 @@ impl HttpServer {
                 "admission probe requires one worker/listener, capacity one, no signals or TLS",
             ));
         }
-        for listener in &listeners {
+        for listener in listeners.iter().chain(worker_listeners.iter().flatten()) {
             listener.set_nonblocking(true)?;
         }
         let addresses = listeners
@@ -839,7 +1164,11 @@ impl HttpServer {
             let (sender, receiver) = mpsc::unbounded_channel();
             commands.push(sender);
             receivers.push(Some(receiver));
-            let (accepted_sender, accepted_receiver) = mpsc::channel(config.command_capacity);
+            let (accepted_sender, accepted_receiver) = mpsc::channel(
+                config
+                    .accepted_socket_capacity
+                    .map_or(config.command_capacity, NonZeroUsize::get),
+            );
             accepted_senders.push(accepted_sender);
             accepted_receivers.push(Some(accepted_receiver));
             let started = Arc::new(AtomicBool::new(false));
@@ -868,14 +1197,19 @@ impl HttpServer {
         let accept_round_robin = Arc::new(AtomicUsize::new(0));
         let worker_handles: Arc<[WorkerHandle]> =
             workers.iter().map(ManagedWorker::handle).collect();
+        let accept_counters: Arc<[Arc<AcceptCounters>]> = (0..num_io_threads)
+            .map(|_| Arc::new(AcceptCounters::default()))
+            .collect();
         let control = HttpServerControl {
             state: Arc::clone(&state),
             draining: Arc::clone(&draining),
             commands: commands.clone(),
             worker_handles: Arc::clone(&worker_handles),
+            accept_counters: Arc::clone(&accept_counters),
         };
         let mut startup_receivers = Vec::with_capacity(num_io_threads);
         let mut owned_listeners = Some(listeners);
+        let mut worker_listeners = worker_listeners.into_iter();
         for index in 0..num_io_threads {
             let receiver = receivers[index]
                 .take()
@@ -898,15 +1232,25 @@ impl HttpServer {
                 },
                 callback_failure: Arc::clone(&callback_failure),
                 lifecycle_started: Arc::clone(&lifecycle_started[index]),
+                accept_distribution: config.socket.accept_distribution,
+                accept_counters: Arc::clone(&accept_counters),
                 #[cfg(test)]
                 session_retirement_probe: config.session_retirement_probe.clone(),
                 #[cfg(test)]
                 admission_probe: config.admission_probe.clone(),
+                #[cfg(test)]
+                dequeue_hold_for_test: config.dequeue_hold_for_test.clone(),
             };
-            let worker_accepted = accepted_senders.clone();
+            let worker_accepted = if per_worker_accept {
+                vec![accepted_senders[index].clone()]
+            } else {
+                accepted_senders.clone()
+            };
             let round_robin = Arc::clone(&accept_round_robin);
             let listeners = if index == 0 {
                 owned_listeners.take().unwrap_or_default()
+            } else if per_worker_accept {
+                worker_listeners.next().unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -941,6 +1285,7 @@ impl HttpServer {
             num_io_threads,
             workers: RefCell::new(workers),
             worker_handles,
+            accept_counters,
             commands,
             tls_credentials: config.tls_credentials,
             tls,
@@ -959,6 +1304,7 @@ impl HttpServer {
             draining: Arc::clone(&self.draining),
             commands: self.commands.clone(),
             worker_handles: Arc::clone(&self.worker_handles),
+            accept_counters: Arc::clone(&self.accept_counters),
         }
     }
 
@@ -1083,8 +1429,8 @@ impl Drop for HttpServer {
 async fn worker_loop(
     context: WorkerContext,
     mut receiver: mpsc::UnboundedReceiver<WorkerCommand>,
-    mut accepted_receiver: mpsc::Receiver<TcpStream>,
-    accepted_senders: Vec<mpsc::Sender<TcpStream>>,
+    mut accepted_receiver: mpsc::Receiver<PendingSocket>,
+    accepted_senders: Vec<mpsc::Sender<PendingSocket>>,
     round_robin: Arc<AtomicUsize>,
     listeners: Vec<TcpListener>,
     config: WorkerConfig,
@@ -1140,7 +1486,8 @@ async fn worker_loop(
     #[cfg(test)]
     let mut dequeue_held = false;
 
-    let mut accept_tasks = JoinSet::new();
+    let (stop_accepting, accept_stop) = watch::channel(false);
+    let mut listener_tasks = JoinSet::new();
     for listener in listeners {
         let listener = match tokio::net::TcpListener::from_std(listener) {
             Ok(listener) => listener,
@@ -1150,72 +1497,33 @@ async fn worker_loop(
                 return;
             }
         };
-        let worker_accepted = accepted_senders.clone();
-        let round_robin = Arc::clone(&round_robin);
-        let draining = Arc::clone(&config.draining);
-        #[cfg(test)]
-        let admission_probe = config.admission_probe.clone();
-        #[cfg(test)]
-        let worker_index = config.index;
-        let task = accept_tasks.spawn_local(async move {
-            while !draining.load(Ordering::Acquire) {
-                match listener.accept().await {
-                    Ok((stream, peer)) => {
-                        #[cfg(not(test))]
-                        let _ = peer;
-                        let Ok(stream) = stream.into_std() else {
-                            #[cfg(test)]
-                            if let Some(probe) = &admission_probe {
-                                probe.confirm(false);
-                            }
-                            continue;
-                        };
-                        let index =
-                            round_robin.fetch_add(1, Ordering::Relaxed) % worker_accepted.len();
-                        #[cfg(test)]
-                        if let Some(probe) = &admission_probe {
-                            let local = stream.local_addr().ok();
-                            let attempt = match worker_accepted[index].try_send(stream) {
-                                Ok(()) => AdmissionAttempt::Enqueued,
-                                Err(mpsc::error::TrySendError::Full(stream)) => {
-                                    drop(stream);
-                                    AdmissionAttempt::Full
-                                }
-                                Err(mpsc::error::TrySendError::Closed(stream)) => {
-                                    drop(stream);
-                                    AdmissionAttempt::Closed
-                                }
-                            };
-                            probe.publish(AdmissionEvent::Socket {
-                                key: AdmissionListenerKey {
-                                    worker_index,
-                                    task_id: tokio::task::id(),
-                                },
-                                socket: AdmissionSocket {
-                                    worker_index: index,
-                                    local,
-                                    peer,
-                                    capacity: worker_accepted[index].capacity(),
-                                    max_capacity: worker_accepted[index].max_capacity(),
-                                },
-                                attempt,
-                            });
-                        } else {
-                            let _ = worker_accepted[index].try_send(stream);
-                        }
-                        #[cfg(not(test))]
-                        let _ = worker_accepted[index].try_send(stream);
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        tokio::task::yield_now().await;
-                    }
-                    Err(error) => match accept_retry_delay(&error) {
-                        Some(delay) => tokio::time::sleep(delay).await,
-                        None => tokio::task::yield_now().await,
-                    },
-                }
+        let stop = AcceptStop {
+            draining: Arc::clone(&config.draining),
+            requested: accept_stop.clone(),
+        };
+        let task = match config.accept_distribution {
+            AcceptDistribution::Worker0 => listener_tasks.spawn_local(round_robin_accept_loop(
+                listener,
+                RoundRobinHandoff {
+                    senders: accepted_senders.clone(),
+                    next: Arc::clone(&round_robin),
+                    counters: Arc::clone(&config.accept_counters),
+                },
+                stop,
+                #[cfg(test)]
+                config.admission_probe.clone(),
+                #[cfg(test)]
+                config.index,
+            )),
+            AcceptDistribution::PerWorkerReusePort => {
+                listener_tasks.spawn_local(per_worker_accept_loop(
+                    listener,
+                    accepted_senders[0].clone(),
+                    Arc::clone(&config.accept_counters[config.index]),
+                    stop,
+                ))
             }
-        });
+        };
         #[cfg(test)]
         if let Some(probe) = &config.admission_probe {
             probe.publish(AdmissionEvent::ListenerRegistered(AdmissionListenerKey {
@@ -1225,6 +1533,7 @@ async fn worker_loop(
         }
         drop(task);
     }
+    let mut signal_tasks: JoinSet<()> = JoinSet::new();
     #[cfg(unix)]
     for signal in &config.shutdown_on_signals {
         let Ok(mut signal) =
@@ -1233,7 +1542,7 @@ async fn worker_loop(
             continue;
         };
         let control = config.control.clone();
-        accept_tasks.spawn_local(async move {
+        signal_tasks.spawn_local(async move {
             signal.recv().await;
             control.drain();
         });
@@ -1245,6 +1554,10 @@ async fn worker_loop(
     let mut task_sessions = HashMap::new();
     let mut sessions: JoinSet<(u64, Result<UniplexRunSummary, HttpError>)> = JoinSet::new();
     let mut drain_requested = false;
+    let mut stop_acknowledgements = Vec::new();
+    let per_worker_accept = config.accept_distribution == AcceptDistribution::PerWorkerReusePort;
+    // Until the accepted-socket queue is closed and empty.
+    let mut receiving = true;
     loop {
         tokio::select! {
             biased;
@@ -1252,7 +1565,18 @@ async fn worker_loop(
                 match command {
                     Some(WorkerCommand::Drain) => {
                         drain_requested = true;
-                        accept_tasks.abort_all();
+                        if per_worker_accept {
+                            // Each listener task drops its listener, queues the socket it holds and
+                            // exits; the queue is closed once they all have, and every socket in
+                            // it becomes a draining session.
+                            stop_accepting.send_replace(true);
+                            if listener_tasks.is_empty() {
+                                accepted_receiver.close();
+                            }
+                        } else {
+                            listener_tasks.abort_all();
+                        }
+                        signal_tasks.abort_all();
                         for control in controls.values() {
                             if let Some(control) = control.borrow().as_ref() {
                                 invoke_callback(&config, ServerCallbackStage::SessionDrain, || {
@@ -1279,7 +1603,8 @@ async fn worker_loop(
                         if let Some(probe) = &config.session_retirement_probe {
                             probe.confirm(sessions.is_empty() && controls.is_empty() && task_sessions.is_empty());
                         }
-                        accept_tasks.abort_all();
+                        listener_tasks.abort_all();
+                        signal_tasks.abort_all();
                         for control in controls.values() {
                             if let Some(control) = control.borrow().as_ref() {
                                 invoke_callback(
@@ -1297,15 +1622,40 @@ async fn worker_loop(
                         task_sessions.clear();
                         #[cfg(test)]
                         if let Some(probe) = &config.admission_probe {
-                            observe_accept_reaps(&mut accept_tasks, probe, config.index).await;
+                            observe_accept_reaps(&mut listener_tasks, probe, config.index).await;
                         }
-                        while accept_tasks.join_next().await.is_some() {}
+                        while listener_tasks.join_next().await.is_some() {}
+                        while signal_tasks.join_next().await.is_some() {}
+                        // Closes the queued sockets, each counted in `closed_at_force_stop`.
+                        accepted_receiver.close();
+                        while let Ok(socket) = accepted_receiver.try_recv() {
+                            drop(socket);
+                        }
                         break;
+                    }
+                    Some(WorkerCommand::StopAccepting(acknowledgement)) => {
+                        stop_accepting.send_replace(true);
+                        stop_acknowledgements.push(acknowledgement);
+                        if listener_tasks.is_empty() {
+                            stop_acknowledgements.clear();
+                        }
                     }
                     None => break,
                 }
             }
+            Some(_) = listener_tasks.join_next(), if !listener_tasks.is_empty() => {
+                if listener_tasks.is_empty() {
+                    stop_acknowledgements.clear();
+                    if per_worker_accept && drain_requested {
+                        accepted_receiver.close();
+                    }
+                }
+            }
             accepted = async {
+                #[cfg(test)]
+                if let Some(hold) = &config.dequeue_hold_for_test {
+                    hold.hold(config.index).await;
+                }
                 #[cfg(test)]
                 if let Some(gate) = admission_gate.as_mut() {
                     if !dequeue_held {
@@ -1321,8 +1671,9 @@ async fn worker_loop(
                     std::future::pending::<()>().await;
                 }
                 accepted_receiver.recv().await
-            }, if !drain_requested => {
+            }, if receiving && (per_worker_accept || !drain_requested) => {
                 if let Some(socket) = accepted {
+                    let socket = socket.into_session();
                     let id = next_session;
                     next_session = next_session.wrapping_add(1);
                     let slot = Rc::new(RefCell::new(None));
@@ -1443,6 +1794,8 @@ async fn worker_loop(
                             SessionRetirementRecord::Registered,
                         );
                     }
+                } else {
+                    receiving = false;
                 }
             }
             completed = sessions.join_next_with_id(), if !sessions.is_empty() => {
@@ -1512,16 +1865,28 @@ async fn worker_loop(
                 }
             }
         }
-        if drain_requested && sessions.is_empty() {
+        if drain_requested
+            && sessions.is_empty()
+            && (!per_worker_accept || (listener_tasks.is_empty() && !receiving))
+        {
             break;
         }
     }
-    accept_tasks.abort_all();
+    // A drained `Worker0`-mode worker stops dequeuing, so the sockets still queued are dropped. A
+    // drained per-worker queue is already closed and empty here.
+    accepted_receiver.close();
+    while let Ok(socket) = accepted_receiver.try_recv() {
+        socket.drop_handoff();
+    }
+    listener_tasks.abort_all();
     #[cfg(test)]
     if let Some(probe) = &config.admission_probe {
-        observe_accept_reaps(&mut accept_tasks, probe, config.index).await;
+        observe_accept_reaps(&mut listener_tasks, probe, config.index).await;
     }
-    while accept_tasks.join_next().await.is_some() {}
+    while listener_tasks.join_next().await.is_some() {}
+    stop_acknowledgements.clear();
+    signal_tasks.abort_all();
+    while signal_tasks.join_next().await.is_some() {}
     #[cfg(test)]
     if let Some(probe) = &config.session_retirement_probe {
         probe.confirm(sessions.is_empty() && controls.is_empty() && task_sessions.is_empty());
@@ -1529,6 +1894,162 @@ async fn worker_loop(
     sessions.abort_all();
     while sessions.join_next().await.is_some() {}
     context.handle().begin_shutdown();
+}
+
+/// Every worker's accepted-socket queue and counters, which worker 0 hands sockets to in turn.
+struct RoundRobinHandoff {
+    senders: Vec<mpsc::Sender<PendingSocket>>,
+    next: Arc<AtomicUsize>,
+    counters: Arc<[Arc<AcceptCounters>]>,
+}
+
+/// Tells an accept loop to stop accepting: a drain started, or a stop was requested.
+struct AcceptStop {
+    draining: Arc<AtomicBool>,
+    requested: watch::Receiver<bool>,
+}
+
+impl AcceptStop {
+    fn draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+
+    /// Resolves once a stop is requested, or once the worker loop that requests it is gone.
+    async fn requested(&mut self) {
+        let _ = self.requested.wait_for(|stop| *stop).await;
+    }
+}
+
+/// Accepts on worker 0's `listener` and hands each socket to the next worker in turn. A socket
+/// whose worker's queue is full or closed is dropped, which closes it.
+async fn round_robin_accept_loop(
+    listener: tokio::net::TcpListener,
+    handoff: RoundRobinHandoff,
+    mut stop: AcceptStop,
+    #[cfg(test)] admission_probe: Option<Arc<AdmissionProbe>>,
+    #[cfg(test)] worker_index: usize,
+) {
+    while !stop.draining() {
+        let accepted = tokio::select! {
+            biased;
+            () = stop.requested() => break,
+            accepted = listener.accept() => accepted,
+        };
+        match accepted {
+            Ok((stream, peer)) => {
+                #[cfg(not(test))]
+                let _ = peer;
+                let Ok(stream) = stream.into_std() else {
+                    #[cfg(test)]
+                    if let Some(probe) = &admission_probe {
+                        probe.confirm(false);
+                    }
+                    continue;
+                };
+                let worker_accepted = &handoff.senders;
+                let index = handoff.next.fetch_add(1, Ordering::Relaxed) % worker_accepted.len();
+                let socket = PendingSocket::accepted(stream, &handoff.counters[index]);
+                #[cfg(test)]
+                if let Some(probe) = &admission_probe {
+                    let local = socket.stream().local_addr().ok();
+                    let attempt = match worker_accepted[index].try_send(socket) {
+                        Ok(()) => AdmissionAttempt::Enqueued,
+                        Err(mpsc::error::TrySendError::Full(socket)) => {
+                            socket.drop_handoff();
+                            AdmissionAttempt::Full
+                        }
+                        Err(mpsc::error::TrySendError::Closed(socket)) => {
+                            socket.drop_handoff();
+                            AdmissionAttempt::Closed
+                        }
+                    };
+                    probe.publish(AdmissionEvent::Socket {
+                        key: AdmissionListenerKey {
+                            worker_index,
+                            task_id: tokio::task::id(),
+                        },
+                        socket: AdmissionSocket {
+                            worker_index: index,
+                            local,
+                            peer,
+                            capacity: worker_accepted[index].capacity(),
+                            max_capacity: worker_accepted[index].max_capacity(),
+                        },
+                        attempt,
+                    });
+                } else if let Err(error) = worker_accepted[index].try_send(socket) {
+                    error.into_inner().drop_handoff();
+                }
+                #[cfg(not(test))]
+                if let Err(error) = worker_accepted[index].try_send(socket) {
+                    error.into_inner().drop_handoff();
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => match accept_retry_delay(&error) {
+                Some(delay) => tokio::select! {
+                    biased;
+                    () = stop.requested() => break,
+                    () = tokio::time::sleep(delay) => {}
+                },
+                None => tokio::task::yield_now().await,
+            },
+        }
+    }
+}
+
+/// Accepts on one of this worker's own `listener`s and queues each socket for this worker's
+/// session loop. A full queue pauses the accepts, which leaves new connections in the kernel
+/// backlog.
+async fn per_worker_accept_loop(
+    listener: tokio::net::TcpListener,
+    queue: mpsc::Sender<PendingSocket>,
+    counters: Arc<AcceptCounters>,
+    mut stop: AcceptStop,
+) {
+    while !stop.draining() {
+        let accepted = tokio::select! {
+            biased;
+            () = stop.requested() => break,
+            accepted = listener.accept() => accepted,
+        };
+        match accepted {
+            Ok((stream, _)) => {
+                let Ok(stream) = stream.into_std() else {
+                    continue;
+                };
+                let send = queue.send(PendingSocket::accepted(stream, &counters));
+                tokio::pin!(send);
+                let sent = tokio::select! {
+                    biased;
+                    sent = &mut send => sent,
+                    () = stop.requested() => {
+                        // Closes the listener at once. The session loop keeps dequeuing until
+                        // this task exits, so the send still completes.
+                        drop(listener);
+                        let _ = send.await;
+                        return;
+                    }
+                };
+                if sent.is_err() {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => match accept_retry_delay(&error) {
+                Some(delay) => tokio::select! {
+                    biased;
+                    () = stop.requested() => break,
+                    () = tokio::time::sleep(delay) => {}
+                },
+                None => tokio::task::yield_now().await,
+            },
+        }
+    }
 }
 
 /// Returns how long the acceptor waits before accepting again after `error`,
@@ -1652,6 +2173,27 @@ fn bind_listeners(config: &ServerSocketConfig) -> Result<Vec<TcpListener>, io::E
         .iter()
         .copied()
         .map(|address| bind_listener(address, config))
+        .collect()
+}
+
+/// Binds every worker's listeners for per-worker accept. Worker 0 binds first, and the other
+/// workers bind the addresses it was assigned, so a port 0 resolves to one shared port.
+fn bind_per_worker_listeners(
+    config: &ServerSocketConfig,
+    workers: usize,
+) -> Result<Vec<Vec<TcpListener>>, io::Error> {
+    let first = bind_listeners(config)?;
+    let assigned = first
+        .iter()
+        .map(TcpListener::local_addr)
+        .collect::<Result<Vec<_>, _>>()?;
+    std::iter::once(Ok(first))
+        .chain((1..workers).map(|_| {
+            assigned
+                .iter()
+                .map(|&address| bind_listener(address, config))
+                .collect()
+        }))
         .collect()
 }
 

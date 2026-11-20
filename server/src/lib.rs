@@ -139,6 +139,14 @@ pub mod scoped_server;
 pub mod server;
 pub mod shutdown;
 
+pub use server::AcceptDistribution;
+pub use server::AcceptStats;
+pub use server::StopAccepting;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/accept_distribution.rs"]
+mod accept_distribution_tests;
+
 #[cfg(test)]
 #[path = "../tests/cleanup_polling.rs"]
 mod cleanup_polling_tests;
