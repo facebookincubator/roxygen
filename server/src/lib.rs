@@ -23,8 +23,9 @@
 //!   per-connection limits and timeouts.
 //! - [`ServerSessionConfig::owned_http1`] and [`ServerSessionConfig::owned_http2`] serve
 //!   HTTP/1.1 or HTTP/2 on the experimental owned drivers, which poll each handler from the
-//!   connection's future and do not spawn a task for it. `owned_http1` does not apply timeouts
-//!   and requires the stream read, connection idle and write timeouts to be zero.
+//!   connection's future and do not spawn a task for it. Both apply
+//!   `ServerSessionConfig::owned_deadlines`. `owned_http1` applies no other session timeout and
+//!   requires the stream read, connection idle and write timeouts to be zero.
 //!   `roxygen_tower_adapter` rejects both, because these drivers do not yet report when an
 //!   exchange's cleanup finishes.
 //! - [`HttpServer::drain`] stops accepting connections and drains the open ones.
@@ -209,3 +210,7 @@ mod native_lifecycle_readiness_tests;
 #[cfg(test)]
 #[path = "../tests/tls_session_facts.rs"]
 mod tls_session_facts_tests;
+
+#[cfg(test)]
+#[path = "../tests/owned_deadlines.rs"]
+mod owned_deadlines_tests;

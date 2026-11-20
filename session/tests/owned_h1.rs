@@ -21,6 +21,9 @@ use roxygen_core::stream_source::HttpStreamSourceOwner;
 use roxygen_runtime::tokio_host::ManagedWorkerError;
 
 use super::*;
+use crate::DeadlineExpiry;
+use crate::OwnedConnectionDeadlines;
+use crate::external_host_tests::ManualHost;
 use crate::external_host_tests::YieldMode;
 use crate::external_host_tests::after_forced_teardown;
 use crate::external_host_tests::forced_teardown_of_scope;
@@ -28,9 +31,11 @@ use crate::external_host_tests::panic_text;
 use crate::external_host_tests::poll_once;
 use crate::external_host_tests::run_on_host;
 use crate::external_host_tests::run_on_host_with;
+use crate::external_host_tests::run_on_wheel_host_with;
 use crate::owned::OwnedApplication;
 use crate::owned::OwnedExchange;
 use crate::owned::PanicSite;
+use crate::owned::deadline_timers;
 use crate::owned::take_contained_panics;
 use crate::owned_h1::Http1DriverConfig;
 use crate::owned_h1::Http1UpgradePolicy;
@@ -8090,4 +8095,710 @@ fn a_write_failure_after_an_early_retirement_over_tcp_fails_only_the_connection(
     );
     assert!(outcome.run.is_err(), "the reset fails the connection");
     assert_eq!(outcome.exchange, (1, 1, Vec::new()));
+}
+
+type DeadlineCase = fn(Rc<ManualHost>, WorkerContext) -> Pin<Box<dyn Future<Output = ()>>>;
+
+/// Runs `case` on a host that drives a wheel timer and on one where the driver's deadline falls
+/// back to host sleeps.
+fn on_both_hosts(case: DeadlineCase) {
+    run_on_wheel_host_with(case);
+    run_on_host_with(case);
+}
+
+/// Lets the driver run until it waits.
+async fn settle() {
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The handshake deadline of the connection-deadline tests.
+const DEADLINE_HANDSHAKE: Duration = Duration::from_secs(8);
+
+/// The owned session's options on `transport`, applying `deadlines`.
+fn deadline_options(
+    context: WorkerContext,
+    transport: Rc<dyn UniplexTransport>,
+    deadlines: OwnedConnectionDeadlines,
+) -> OwnedH1Options {
+    let mut options = owned_options(context, transport);
+    options.http1.deadlines = deadlines;
+    options
+}
+
+/// A request head that has not ended by the handshake deadline resets the connection then,
+/// with no response, and its exchange is cancelled with `READ_TIMEOUT`.
+#[test]
+fn h1_head_deadline_closes_without_response() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (transport, state) = ScriptedTransport::new([ReadAction::Data(
+                b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec(),
+            )]);
+            let (application, probes) = H1App::new(vec![Response::fixed(200, b"hello")]);
+            let (session, _handle) = OwnedH1Session::new(
+                application,
+                deadline_options(
+                    context,
+                    transport,
+                    OwnedConnectionDeadlines::new(
+                        DEADLINE_HANDSHAKE,
+                        Duration::ZERO,
+                        DeadlineExpiry::HardClose,
+                    ),
+                ),
+            )
+            .unwrap();
+            let (result, ()) = futures::join!(session.run(), async {
+                settle().await;
+                assert_eq!(
+                    probes.borrow().len(),
+                    1,
+                    "the request line opened an exchange"
+                );
+                host.advance(DEADLINE_HANDSHAKE - Duration::from_millis(1));
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Open,
+                    "the deadline fired early"
+                );
+                host.advance(Duration::from_millis(1));
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Reset,
+                    "the deadline fired on time"
+                );
+            });
+            assert_eq!(
+                result
+                    .expect_err("a head expiry fails the connection")
+                    .code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+            assert!(state.borrow().writes.is_empty(), "no response is written");
+            assert_eq!(
+                *probes.borrow()[0].cancelled.borrow(),
+                [(HttpErrorCode::READ_TIMEOUT, false)]
+            );
+        })
+    });
+}
+
+/// The idle deadline of the connection-deadline tests.
+const DEADLINE_IDLE: Duration = Duration::from_secs(10);
+
+/// An accepted CONNECT tunnel stays in the idle phase, not a head wait: tunnel bytes read at
+/// half the idle timeout move its expiry from `T` to `1.5 T`, past the handshake deadline, and
+/// the idle tunnel then resets with nothing written after the response head.
+#[test]
+fn h1_upgraded_tunnel_idle_closes_without_bytes() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let tunnel = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = ScriptedTransport::new([
+                ReadAction::Data(CONNECT_HEAD.to_vec()),
+                ReadAction::WaitData(Arc::clone(&tunnel), vec![b'x'; 10]),
+            ]);
+            let (application, probes) = H1App::new(vec![Response::tunnel(200, b"y", false)]);
+            let (session, _handle) = OwnedH1Session::new(
+                application,
+                deadline_options(
+                    context,
+                    transport,
+                    OwnedConnectionDeadlines::new(
+                        DEADLINE_HANDSHAKE,
+                        DEADLINE_IDLE,
+                        DeadlineExpiry::HardClose,
+                    ),
+                ),
+            )
+            .unwrap();
+            let (result, written) = futures::join!(session.run(), async {
+                settle().await;
+                let written = state.borrow().writes.concat();
+                assert!(
+                    written.starts_with(b"HTTP/1.1 200") && written.ends_with(b"\r\n\r\n"),
+                    "the tunnel's response head is written: {:?}",
+                    String::from_utf8_lossy(&written)
+                );
+                host.advance(DEADLINE_IDLE / 2);
+                tunnel.notify_one();
+                settle().await;
+                assert_eq!(*probes.borrow()[0].request_body.borrow(), [b'x'; 10]);
+                host.advance(DEADLINE_HANDSHAKE - DEADLINE_IDLE / 2);
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Open,
+                    "a tunnel is not a head wait"
+                );
+                host.advance(DEADLINE_IDLE - DEADLINE_HANDSHAKE);
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Open,
+                    "the tunnel read restarted the idle deadline"
+                );
+                host.advance(DEADLINE_IDLE / 2 - Duration::from_millis(1));
+                settle().await;
+                assert_eq!(state.borrow().close, CloseKind::Open);
+                host.advance(Duration::from_millis(1));
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Reset,
+                    "the deadline fired on time"
+                );
+                written
+            });
+            assert_eq!(
+                result
+                    .expect_err("an idle expiry fails the connection")
+                    .code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+            assert_eq!(
+                state.borrow().writes.concat(),
+                written,
+                "nothing is written after the response head"
+            );
+            assert_eq!(
+                *probes.borrow()[0].cancelled.borrow(),
+                [(HttpErrorCode::READ_TIMEOUT, false)]
+            );
+        })
+    });
+}
+
+/// Zero deadlines cost nothing: a full exchange on a host without a wheel allocates no
+/// `DeadlineTimer` and creates no host timer. With an idle deadline set, the same exchange on a
+/// connection that then stays open allocates one timer, which sleeps on the host and expires.
+#[test]
+fn zero_deadlines_allocate_nothing() {
+    fn exchange(
+        deadlines: OwnedConnectionDeadlines,
+        reads: Vec<ReadAction>,
+    ) -> (usize, usize, Option<HttpErrorCode>) {
+        run_on_host_with(move |host, context| {
+            Box::pin(async move {
+                let timers = deadline_timers();
+                let (transport, state) = ScriptedTransport::new(reads);
+                let (application, _probes) = H1App::new(vec![Response::fixed(200, b"hello")]);
+                let (session, _handle) = OwnedH1Session::new(
+                    application,
+                    deadline_options(context, transport, deadlines),
+                )
+                .unwrap();
+                let result = session.run().await;
+                assert!(
+                    state.borrow().writes.concat().ends_with(b"hello"),
+                    "the exchange completed"
+                );
+                (
+                    deadline_timers() - timers,
+                    host.timers_created(),
+                    result.err().map(|error| error.code()),
+                )
+            })
+        })
+    }
+    assert_eq!(
+        exchange(
+            OwnedConnectionDeadlines::default(),
+            vec![ReadAction::Data(KEEP_ALIVE_GET.to_vec()), ReadAction::Eof],
+        ),
+        (0, 0, None),
+        "zero deadlines allocate no timer and create no host timer"
+    );
+    let (timers, host_timers, error) = exchange(
+        OwnedConnectionDeadlines::new(Duration::ZERO, DEADLINE_IDLE, DeadlineExpiry::HardClose),
+        vec![ReadAction::Data(KEEP_ALIVE_GET.to_vec())],
+    );
+    assert_eq!((timers, error), (1, Some(HttpErrorCode::READ_TIMEOUT)));
+    assert!(host_timers > 0, "an armed deadline sleeps on the host");
+}
+
+/// Each wait for a request head gets its own head deadline, measured from the start of that
+/// wait. The first request arrives at `H/2`; the next head trickles in every `H/4`, each part
+/// within the idle timeout `H/2`, and never ends. The connection is open at `H`, when the first
+/// wait's deadline would have passed, and resets with no second response at `1.5 H`.
+#[test]
+fn h1_head_deadline_rearms_for_each_keep_alive_request() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let gates: Vec<_> = (0..4)
+                .map(|_| Arc::new(tokio::sync::Notify::new()))
+                .collect();
+            let parts: [&[u8]; 4] = [KEEP_ALIVE_GET, b"GET / HT", b"TP/1.1\r\n", b"Host: a\r\n"];
+            let (transport, state) = ScriptedTransport::new(
+                gates
+                    .iter()
+                    .zip(parts)
+                    .map(|(gate, part)| ReadAction::WaitData(Arc::clone(gate), part.to_vec())),
+            );
+            let (application, probes) = H1App::new(vec![Response::fixed(200, b"hello")]);
+            let (session, _handle) = OwnedH1Session::new(
+                application,
+                deadline_options(
+                    context,
+                    transport,
+                    OwnedConnectionDeadlines::new(
+                        DEADLINE_HANDSHAKE,
+                        DEADLINE_HANDSHAKE / 2,
+                        DeadlineExpiry::HardClose,
+                    ),
+                ),
+            )
+            .unwrap();
+            let (result, first) = futures::join!(session.run(), async {
+                settle().await;
+                host.advance(DEADLINE_HANDSHAKE / 2);
+                gates[0].notify_one();
+                settle().await;
+                let first = state.borrow().writes.concat();
+                assert!(first.ends_with(b"hello"), "the first request is served");
+                for gate in &gates[1..] {
+                    host.advance(DEADLINE_HANDSHAKE / 4);
+                    gate.notify_one();
+                    settle().await;
+                    assert_eq!(
+                        state.borrow().close,
+                        CloseKind::Open,
+                        "each head wait has its own deadline, and each part restarts idle"
+                    );
+                }
+                host.advance(DEADLINE_HANDSHAKE / 4 - Duration::from_millis(1));
+                settle().await;
+                assert_eq!(state.borrow().close, CloseKind::Open);
+                host.advance(Duration::from_millis(1));
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Reset,
+                    "the second head wait's deadline passed"
+                );
+                first
+            });
+            assert_eq!(
+                result
+                    .expect_err("a head expiry fails the connection")
+                    .code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+            assert_eq!(state.borrow().writes.concat(), first, "no second response");
+            let probes = probes.borrow();
+            assert_eq!(probes.len(), 2);
+            assert!(probes[0].cancelled.borrow().is_empty());
+            assert_eq!(
+                *probes[1].cancelled.borrow(),
+                [(HttpErrorCode::READ_TIMEOUT, false)]
+            );
+        })
+    });
+}
+
+/// With `Drain`, an expiry on a connection that waits for its next request closes it
+/// gracefully at once, with nothing more written. On a second connection, an exchange whose
+/// response made no progress for the whole idle timeout is aborted at the expiry, as with
+/// `HardClose`, with no hold.
+#[test]
+fn h1_drain_expiry_closes_idle_and_aborts_live_exchange() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (transport, state) =
+                ScriptedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())]);
+            let (application, probes) = H1App::new(vec![Response::fixed(200, b"hello")]);
+            let (session, _handle) = OwnedH1Session::new(
+                application,
+                deadline_options(
+                    context,
+                    transport,
+                    OwnedConnectionDeadlines::new(
+                        Duration::ZERO,
+                        DEADLINE_IDLE,
+                        DeadlineExpiry::Drain,
+                    ),
+                ),
+            )
+            .unwrap();
+            let (result, first) = futures::join!(session.run(), async {
+                settle().await;
+                let first = state.borrow().writes.concat();
+                assert!(first.ends_with(b"hello"), "the request is served");
+                host.advance(DEADLINE_IDLE - Duration::from_millis(1));
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Open,
+                    "the deadline fired early"
+                );
+                host.advance(Duration::from_millis(1));
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::ShutdownWrite,
+                    "the idle connection closes gracefully at the expiry"
+                );
+                first
+            });
+            result.expect("an idle drain closes cleanly");
+            assert_eq!(
+                state.borrow().writes.concat(),
+                first,
+                "nothing more is written"
+            );
+            assert_eq!(probes.borrow()[0].completed.get(), 1);
+            assert!(probes.borrow()[0].cancelled.borrow().is_empty());
+        })
+    });
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (transport, state) =
+                ScriptedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())]);
+            let (mut application, probes) = H1App::new(vec![Response::fixed(200, b"hello")]);
+            application.response_resume = Some(Rc::new(ResumeProbe::default()));
+            let (session, _handle) = OwnedH1Session::new(
+                application,
+                deadline_options(
+                    context,
+                    transport,
+                    OwnedConnectionDeadlines::new(
+                        Duration::ZERO,
+                        DEADLINE_IDLE,
+                        DeadlineExpiry::Drain,
+                    ),
+                ),
+            )
+            .unwrap();
+            let (result, head) = futures::join!(session.run(), async {
+                settle().await;
+                let head = state.borrow().writes.concat();
+                assert!(
+                    head.starts_with(b"HTTP/1.1 200") && head.ends_with(b"\r\n\r\n"),
+                    "the response head is written and its body waits: {:?}",
+                    String::from_utf8_lossy(&head)
+                );
+                host.advance(DEADLINE_IDLE - Duration::from_millis(1));
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Open,
+                    "the deadline fired early"
+                );
+                host.advance(Duration::from_millis(1));
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Reset,
+                    "the live exchange is aborted at the expiry"
+                );
+                head
+            });
+            assert_eq!(
+                result
+                    .expect_err("a live exchange's expiry fails the connection")
+                    .code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+            assert_eq!(
+                state.borrow().writes.concat(),
+                head,
+                "nothing more is written"
+            );
+            assert_eq!(
+                *probes.borrow()[0].cancelled.borrow(),
+                [(HttpErrorCode::READ_TIMEOUT, false)]
+            );
+        })
+    });
+}
+
+/// With `Drain`, a connection waiting for its next request whose last response is still
+/// unwritten has made no write progress for the whole idle timeout, so the expiry hard-closes
+/// it rather than wait for that output. The exchange retired when its response was serialized,
+/// through an unsaturated write queue whose writes stay incomplete.
+#[test]
+fn h1_drain_expiry_with_stuck_output_hard_closes() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (transport, state, fence) =
+                FencedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())], true);
+            fence.unsaturated.set(true);
+            let (application, probes) = H1App::new(vec![Response::fixed(200, b"hello")]);
+            let (session, _handle) = OwnedH1Session::new(
+                application,
+                deadline_options(
+                    context,
+                    transport,
+                    OwnedConnectionDeadlines::new(
+                        Duration::ZERO,
+                        DEADLINE_IDLE,
+                        DeadlineExpiry::Drain,
+                    ),
+                ),
+            )
+            .unwrap();
+            let (result, ()) = futures::join!(session.run(), async {
+                settle().await;
+                assert!(
+                    state.borrow().writes.concat().ends_with(b"hello"),
+                    "the response is handed to the queue"
+                );
+                assert_eq!(
+                    probes.borrow()[0].completed.get(),
+                    1,
+                    "the exchange retired at serialization"
+                );
+                host.advance(DEADLINE_IDLE - Duration::from_millis(1));
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Open,
+                    "the deadline fired early"
+                );
+                host.advance(Duration::from_millis(1));
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Reset,
+                    "stuck output is not waited for"
+                );
+                fence.open();
+            });
+            assert_eq!(
+                result.expect_err("the expiry fails the connection").code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+        })
+    });
+}
+
+/// A head wait starts once the previous response is written. The exchange retires when its
+/// response is serialized, through an unsaturated write queue, and the write completes at
+/// `H + 1 s`, within the idle timeout. The connection is open then, and resets `H` after the
+/// write completed.
+#[test]
+fn h1_head_deadline_starts_after_response_is_written() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (transport, state, fence) =
+                FencedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())], true);
+            fence.unsaturated.set(true);
+            let (application, probes) = H1App::new(vec![Response::fixed(200, b"hello")]);
+            let (session, _handle) = OwnedH1Session::new(
+                application,
+                deadline_options(
+                    context,
+                    transport,
+                    OwnedConnectionDeadlines::new(
+                        DEADLINE_HANDSHAKE,
+                        DEADLINE_IDLE,
+                        DeadlineExpiry::HardClose,
+                    ),
+                ),
+            )
+            .unwrap();
+            let (result, ()) = futures::join!(session.run(), async {
+                settle().await;
+                assert_eq!(
+                    probes.borrow()[0].completed.get(),
+                    1,
+                    "the exchange retired at serialization"
+                );
+                host.advance(DEADLINE_HANDSHAKE + Duration::from_secs(1));
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Open,
+                    "the head wait starts once the response is written"
+                );
+                fence.open();
+                settle().await;
+                host.advance(DEADLINE_HANDSHAKE - Duration::from_millis(1));
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Open,
+                    "the deadline fired early"
+                );
+                host.advance(Duration::from_millis(1));
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Reset,
+                    "the head wait's deadline passed"
+                );
+            });
+            assert_eq!(
+                result
+                    .expect_err("a head expiry fails the connection")
+                    .code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+            assert!(state.borrow().writes.concat().ends_with(b"hello"));
+        })
+    });
+}
+
+/// A head wait that begins inside the driver poll that served the previous request still gets
+/// its own head deadline. The first request is served at `0` and the second at `3H/4`, each
+/// read, delivered, answered, written and retired within one poll. The connection is open at
+/// `H`, where the first wait's deadline was, and resets at `7H/4`, `H` after the second wait
+/// began.
+#[test]
+fn h1_head_deadline_rearms_after_a_request_served_in_one_poll() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let second = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = ScriptedTransport::new([
+                ReadAction::Data(KEEP_ALIVE_GET.to_vec()),
+                ReadAction::WaitData(Arc::clone(&second), KEEP_ALIVE_GET.to_vec()),
+            ]);
+            let (application, probes) = H1App::new(vec![
+                Response::fixed(200, b"hello"),
+                Response::fixed(200, b"hello"),
+            ]);
+            let (session, _handle) = OwnedH1Session::new(
+                application,
+                deadline_options(
+                    context,
+                    transport,
+                    OwnedConnectionDeadlines::new(
+                        DEADLINE_HANDSHAKE,
+                        DEADLINE_IDLE * 10,
+                        DeadlineExpiry::HardClose,
+                    ),
+                ),
+            )
+            .unwrap();
+            let (result, served) = futures::join!(session.run(), async {
+                settle().await;
+                host.advance(DEADLINE_HANDSHAKE * 3 / 4);
+                second.notify_one();
+                settle().await;
+                let served = state.borrow().writes.concat();
+                assert_eq!(
+                    String::from_utf8_lossy(&served).matches("hello").count(),
+                    2,
+                    "both requests are served"
+                );
+                host.advance(DEADLINE_HANDSHAKE / 4);
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Open,
+                    "the second head wait has its own deadline"
+                );
+                host.advance(DEADLINE_HANDSHAKE * 3 / 4 - Duration::from_millis(1));
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Open,
+                    "the deadline fired early"
+                );
+                host.advance(Duration::from_millis(1));
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Reset,
+                    "the second head wait's deadline passed"
+                );
+                served
+            });
+            assert_eq!(
+                result
+                    .expect_err("a head expiry fails the connection")
+                    .code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+            assert_eq!(
+                state.borrow().writes.concat(),
+                served,
+                "nothing more is written"
+            );
+            let probes = probes.borrow();
+            assert_eq!(probes.len(), 2);
+            assert!(
+                probes
+                    .iter()
+                    .all(|probe| probe.cancelled.borrow().is_empty())
+            );
+            assert!(probes.iter().all(|probe| probe.completed.get() == 1));
+        })
+    });
+}
+
+/// With `Drain`, an expiry during RFC 9112's staged close of a stopped upload fails the
+/// connection, as `HardClose` does, instead of leaving the close to read until a peer EOF that
+/// may never come. The response is written and the write side shut down, and the peer then sends
+/// nothing for the whole idle timeout.
+#[test]
+fn h1_drain_expiry_aborts_a_staged_close() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let rest = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = ScriptedTransport::new([
+                ReadAction::Data(OPEN_UPLOAD.to_vec()),
+                ReadAction::WaitData(Arc::clone(&rest), UPLOAD_END.to_vec()),
+            ]);
+            let (mut application, probes) = H1App::new(vec![trailered_response()]);
+            application.stop_request = Some((HttpErrorCode::NO_ERROR, StopAt::Head));
+            let (session, _handle) = OwnedH1Session::new(
+                application,
+                deadline_options(
+                    context,
+                    transport,
+                    OwnedConnectionDeadlines::new(
+                        Duration::ZERO,
+                        DEADLINE_IDLE,
+                        DeadlineExpiry::Drain,
+                    ),
+                ),
+            )
+            .unwrap();
+            let (result, served) = futures::join!(session.run(), async {
+                settle().await;
+                let served = state.borrow().writes.concat();
+                assert!(
+                    String::from_utf8_lossy(&served).ends_with(TRAILERED_END),
+                    "the response is written: {:?}",
+                    String::from_utf8_lossy(&served)
+                );
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::ShutdownWrite,
+                    "the staged close shut the write side down and still reads"
+                );
+                host.advance(DEADLINE_IDLE - Duration::from_millis(1));
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::ShutdownWrite,
+                    "the deadline fired early"
+                );
+                host.advance(Duration::from_millis(1));
+                settle().await;
+                assert_eq!(
+                    state.borrow().close,
+                    CloseKind::Reset,
+                    "the expiry ends the staged close"
+                );
+                rest.notify_one();
+                served
+            });
+            assert_eq!(
+                result.expect_err("the expiry fails the connection").code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+            assert_eq!(
+                state.borrow().writes.concat(),
+                served,
+                "nothing more is written"
+            );
+            assert_eq!(probes.borrow()[0].completed.get(), 1);
+        })
+    });
 }

@@ -36,6 +36,7 @@ use self::rate_limit::RateLimitSample;
 use self::scheduler::Http2PriorityScheduler;
 use self::stats::Http2SessionStats;
 use crate::experimental::PingProbeConfig;
+use crate::owned::OwnedConnectionDeadlines;
 use crate::uniplex::BodySourcePublications;
 use crate::uniplex::EgressTransferKey;
 use crate::uniplex::PingProber;
@@ -93,6 +94,11 @@ pub struct Http2SessionConfig {
     /// still arriving. When this is off, only the streams with an incomplete request fail.
     /// Upstream `UniplexSession` ignores it, and `OwnedH2UpstreamSession::new` rejects it.
     pub abort_streams_on_eof: bool,
+    /// The connection deadlines of a downstream `OwnedH2Session`; none by default.
+    /// `OwnedH2UpstreamSession` and `UniplexSession` ignore them. For a session that
+    /// `roxygen_server` hosts, `ServerSessionConfig::owned_deadlines` is their only source and
+    /// replaces this value.
+    pub deadlines: OwnedConnectionDeadlines,
 }
 
 impl Default for Http2SessionConfig {
@@ -111,6 +117,7 @@ impl Default for Http2SessionConfig {
             goaway_timeout: Duration::from_secs(1),
             ping_probes: None,
             abort_streams_on_eof: false,
+            deadlines: OwnedConnectionDeadlines::default(),
         }
     }
 }

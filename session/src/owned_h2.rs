@@ -129,6 +129,9 @@ use crate::http2::rate_limit::RateLimitKind;
 use crate::http2::rate_limit::rate_limit_exceeded;
 use crate::http2::scheduler::PriorityEntry;
 use crate::http2::scheduler::PriorityQueue;
+use crate::owned::DeadlineExpiry;
+use crate::owned::DeadlinePhase;
+use crate::owned::DeadlineTimer;
 pub use crate::owned::OwnedApplication as OwnedH2Application;
 use crate::owned::OwnedApplication;
 pub use crate::owned::OwnedExchange as OwnedH2Exchange;
@@ -1746,6 +1749,8 @@ where
     goaway_deadline: Option<Instant>,
     budget_yield: Option<roxygen_runtime::host::LocalFuture>,
     timers: Option<Box<ConnectionTimers>>,
+    /// `Http2SessionConfig::deadlines` of a downstream session that sets one.
+    deadline: Option<Box<DeadlineTimer<IoWake>>>,
     /// The last `poll_read` left a drained reader's next read waiting for its waker. For
     /// `read_idle`, that read counts as issued and outstanding.
     read_parked: bool,
@@ -2256,6 +2261,13 @@ where
         )?;
         let read_wake = IoWake::new(&control.ready, !read.uses_reader());
         let write_wake = IoWake::new(&control.ready, write_queue.is_none());
+        let deadline = (!UPSTREAM && http2.deadlines.is_enabled()).then(|| {
+            DeadlineTimer::new(
+                context.host(),
+                IoWake::new(&control.ready, false),
+                http2.deadlines,
+            )
+        });
         let handle = OwnedH2Handle(control);
         let application = make(&handle);
         Ok((
@@ -2316,6 +2328,7 @@ where
                 goaway_deadline: None,
                 budget_yield: None,
                 timers: None,
+                deadline,
                 read_parked: false,
                 ready_waker: None,
                 unarmed_write: false,
@@ -2570,6 +2583,7 @@ where
             goaway_deadline: _,
             budget_yield,
             timers,
+            deadline,
             read_parked: _,
             ready_waker,
             unarmed_write: _,
@@ -2594,6 +2608,7 @@ where
         release_field(&context, failure);
         release_field(&context, budget_yield);
         release_field(&context, timers);
+        release_field(&context, deadline);
         release_field(&context, ready_waker);
         drop(context);
     }
@@ -2711,6 +2726,17 @@ where
     }
 
     fn poll(&mut self, context: &mut Context<'_>) -> Poll<Result<UniplexRunSummary, HttpError>> {
+        let polled = self.poll_turns(context);
+        if polled.is_pending() && self.deadline.is_some() {
+            self.sync_deadline();
+        }
+        polled
+    }
+
+    fn poll_turns(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<UniplexRunSummary, HttpError>> {
         if !UPSTREAM {
             if self.connection.state.control.folds_pending.get() {
                 self.apply_folds();
@@ -2744,6 +2770,13 @@ where
                 .timers
                 .as_ref()
                 .is_some_and(|timers| timers.wake.take_ready());
+            let deadline_fired = self
+                .deadline
+                .as_ref()
+                .is_some_and(|deadline| deadline.wake.take_ready());
+            // Taken before this turn queues a GOAWAY or starts a write.
+            let output_pending =
+                deadline_fired && (!self.egress.is_empty() || self.writes_pending());
             let mut ran = self.goaway_deadline.is_some();
             if self.connection.state.control.drain.get()
                 && !self.connection.state.draining
@@ -2776,6 +2809,10 @@ where
                 && self.read_idle_expired()
             {
                 self.read_idle_timeout();
+                ran = true;
+            }
+            if deadline_fired {
+                self.poll_deadline(output_pending);
                 ran = true;
             }
             self.check_cancel_after(&mut ran);
@@ -3212,6 +3249,11 @@ where
                     .summary
                     .bytes_read
                     .saturating_add(read.bytes_read() as u64);
+                if read.bytes_read() != 0
+                    && let Some(deadline) = self.deadline.as_deref_mut()
+                {
+                    deadline.note_progress();
+                }
                 self.eof |= read.is_eof();
                 let mut data = read.into_data();
                 if self.ingress.append(&mut data).is_err() {
@@ -3245,6 +3287,72 @@ where
         self.timers
             .as_mut()
             .is_some_and(|timers| timers.read_idle.take_expired().is_some())
+    }
+
+    /// The deadline phase the connection is in.
+    fn deadline_phase(&self) -> DeadlinePhase {
+        if self.connection.state.control.handshake_complete.get() {
+            DeadlinePhase::Idle
+        } else {
+            DeadlinePhase::Handshake
+        }
+    }
+
+    /// Applies the poll's phase change to the connection deadlines as the poll ends.
+    fn sync_deadline(&mut self) {
+        let phase = self.deadline_phase();
+        let Some(deadline) = self.deadline.as_deref_mut() else {
+            return;
+        };
+        if deadline.needs_sync(phase) {
+            deadline.sync(phase, self.context.host().now());
+        }
+    }
+
+    /// Handles the connection deadline's slot firing. `output_pending` says whether output the
+    /// connection had before this turn was still unwritten when the slot fired. A deadline that
+    /// passed with `HardClose`, or with `Drain` and a zero `goaway_timeout`, fails the connection.
+    /// Otherwise `Drain` starts the GOAWAY drain. `goaway_timeout` later, a stream still live or
+    /// output still pending fails the connection; otherwise the drain's final GOAWAY has one more
+    /// `goaway_timeout` to go out.
+    #[cold]
+    #[inline(never)]
+    fn poll_deadline(&mut self, output_pending: bool) {
+        if self.failure.fatal.is_some() {
+            return;
+        }
+        let phase = self.deadline_phase();
+        let now = self.context.host().now();
+        let Some(deadline) = self.deadline.as_deref_mut() else {
+            return;
+        };
+        let Some(expired) = deadline.expire(phase, now) else {
+            return;
+        };
+        let hard_close = match expired {
+            DeadlinePhase::DrainGrace => !self.streams.is_empty() || output_pending,
+            DeadlinePhase::DrainFlush => true,
+            _ if deadline.on_expiry() == DeadlineExpiry::Drain
+                && !self.h2.goaway_timeout.is_zero() =>
+            {
+                let grace = self.context.host().deadline_after(self.h2.goaway_timeout);
+                deadline.start_grace(grace);
+                if !self.connection.state.draining {
+                    self.start_drain(DrainTrigger::IdleTimeout);
+                }
+                return;
+            }
+            _ => true,
+        };
+        if !hard_close {
+            deadline.start_flush(self.context.host().deadline_after(self.h2.goaway_timeout));
+            return;
+        }
+        deadline.finish();
+        self.abort(failure(
+            HttpErrorCode::READ_TIMEOUT,
+            b"owned H2 connection deadline expired",
+        ));
     }
 
     /// Handles a timed-out outstanding read. The connection drains and keeps reading with a fresh
@@ -3552,6 +3660,11 @@ where
                 Ok(info) => info.bytes_written,
                 Err(error) => error.bytes_written(),
             };
+            if bytes != 0
+                && let Some(deadline) = self.deadline.as_deref_mut()
+            {
+                deadline.note_progress();
+            }
             self.connection.state.summary.bytes_written = self
                 .connection
                 .state
@@ -3623,6 +3736,11 @@ where
                 Ok(info) => info.bytes_written,
                 Err(error) => error.bytes_written(),
             };
+            if bytes != 0
+                && let Some(deadline) = self.deadline.as_deref_mut()
+            {
+                deadline.note_progress();
+            }
             self.connection.state.summary.bytes_written = self
                 .connection
                 .state

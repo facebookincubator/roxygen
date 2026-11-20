@@ -26,6 +26,8 @@ use roxygen_runtime::worker::WorkerHandle;
 use roxygen_runtime::worker::WorkerPollStats;
 
 use super::*;
+use crate::DeadlineExpiry;
+use crate::OwnedConnectionDeadlines;
 use crate::external_host_tests::ManualHost;
 use crate::external_host_tests::YieldMode;
 use crate::external_host_tests::after_forced_teardown;
@@ -22379,4 +22381,887 @@ fn client_data_after_its_cancel_is_ignored_and_credited() {
         assert!(ends_without_error(&run), "owned: {owned}: {run:?}");
         assert_eq!(run.connection_credit, 33_000, "owned: {owned}: {run:?}");
     }
+}
+
+/// The idle deadline of the connection-deadline tests.
+const DEADLINE_IDLE: Duration = Duration::from_secs(10);
+
+/// A downstream session on `fixture`'s untimed reads that applies `deadlines` and the GOAWAY
+/// timeout `goaway_timeout`, and no other timeout.
+fn deadline_session(
+    context: WorkerContext,
+    fixture: Rc<FixtureTransport>,
+    application: Application,
+    deadlines: OwnedConnectionDeadlines,
+    goaway_timeout: Duration,
+) -> (OwnedH2Session<Application>, OwnedH2Handle) {
+    let mut config = options(context, Rc::new(UntimedReads(fixture)));
+    config.http2.deadlines = deadlines;
+    config.http2.goaway_timeout = goaway_timeout;
+    OwnedH2Session::new(application, config).expect("owned H2 with deadlines")
+}
+
+/// Idle deadlines of `idle` with no handshake deadline, expiring with `on_expiry`.
+fn idle_deadlines(idle: Duration, on_expiry: DeadlineExpiry) -> OwnedConnectionDeadlines {
+    OwnedConnectionDeadlines::new(Duration::ZERO, idle, on_expiry)
+}
+
+/// A connection with no activity after its handshake hard-closes at its idle deadline, not a
+/// millisecond earlier. It writes no GOAWAY, the live exchange is cancelled with `READ_TIMEOUT`,
+/// and the transport resets.
+#[test]
+fn h2_idle_expiry_hard_closes_without_goaway() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(1);
+            let (fixture, state) = FixtureTransport::new([FixtureRead::Data(preface)]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+            application.hold_headers = true;
+            let (session, _handle) = deadline_session(
+                context,
+                fixture,
+                application,
+                idle_deadlines(DEADLINE_IDLE, DeadlineExpiry::HardClose),
+                Duration::ZERO,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                assert_eq!(probes.borrow().len(), 1, "the request reached its exchange");
+                host.advance(DEADLINE_IDLE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Open,
+                    "the idle deadline fired early"
+                );
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Reset,
+                    "the deadline fired on time"
+                );
+            });
+            assert_eq!(
+                run.expect_err("an idle expiry fails the connection").code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+            assert!(
+                written_goaways(&state).is_empty(),
+                "a hard close sends no GOAWAY"
+            );
+            assert_eq!(state.borrow().close, FixtureClose::Reset);
+            assert_eq!(
+                *probes.borrow()[0].cancelled.borrow(),
+                [(HttpErrorCode::READ_TIMEOUT, false)]
+            );
+        })
+    });
+}
+
+/// Bytes read with nothing written restart the idle deadline: a connection WINDOW_UPDATE at
+/// half the idle timeout moves the expiry from `T` to `1.5 T`.
+#[test]
+fn h2_read_activity_refreshes_idle() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(1);
+            let update = Arc::new(tokio::sync::Notify::new());
+            let (fixture, state) = FixtureTransport::new([
+                FixtureRead::Data(preface),
+                FixtureRead::WaitData(
+                    Arc::clone(&update),
+                    raw_frame(FrameType::WINDOW_UPDATE, 0, 0, &1000u32.to_be_bytes()),
+                ),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+            application.hold_headers = true;
+            let (session, _handle) = deadline_session(
+                context,
+                fixture,
+                application,
+                idle_deadlines(DEADLINE_IDLE, DeadlineExpiry::HardClose),
+                Duration::ZERO,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                assert_eq!(probes.borrow().len(), 1, "the request reached its exchange");
+                host.advance(DEADLINE_IDLE / 2);
+                let written = state.borrow().writes.concat().len();
+                update.notify_one();
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().writes.concat().len(),
+                    written,
+                    "the WINDOW_UPDATE is read with nothing written"
+                );
+                host.advance(DEADLINE_IDLE / 2);
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Open,
+                    "the read restarted the idle deadline"
+                );
+                host.advance(DEADLINE_IDLE / 2 - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(state.borrow().close, FixtureClose::Open);
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Reset,
+                    "the deadline fired on time"
+                );
+            });
+            assert_eq!(
+                run.expect_err("an idle expiry fails the connection").code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+            assert_eq!(state.borrow().close, FixtureClose::Reset);
+        })
+    });
+}
+
+/// A write the transport completes restarts the idle deadline with nothing read: the
+/// connection's first write, held by the transport until `0.75 T`, moves the expiry from `T`
+/// to `1.75 T`.
+#[test]
+fn h2_write_only_activity_refreshes_idle() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(1);
+            let (fixture, state) = FixtureTransport::new([FixtureRead::Data(preface)]);
+            let release_write = Arc::new(tokio::sync::Notify::new());
+            state.borrow_mut().write_gate = Some(Arc::clone(&release_write));
+            let (application, probes) = Application::new(vec![Reply::Body(0)]);
+            let (session, _handle) = deadline_session(
+                context,
+                fixture,
+                application,
+                idle_deadlines(DEADLINE_IDLE, DeadlineExpiry::HardClose),
+                Duration::ZERO,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                assert_eq!(probes.borrow().len(), 1, "the request reached its exchange");
+                assert!(state.borrow().writes.is_empty(), "the first write is held");
+                host.advance(DEADLINE_IDLE * 3 / 4);
+                release_write.notify_one();
+                settle_turns(32).await;
+                assert!(
+                    !state.borrow().writes.is_empty(),
+                    "the held write completed"
+                );
+                host.advance(DEADLINE_IDLE / 4);
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Open,
+                    "the completed write restarted the idle deadline"
+                );
+                host.advance(DEADLINE_IDLE * 3 / 4 - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(state.borrow().close, FixtureClose::Open);
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Reset,
+                    "the deadline fired on time"
+                );
+            });
+            assert_eq!(
+                run.expect_err("an idle expiry fails the connection").code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+            assert_eq!(state.borrow().close, FixtureClose::Reset);
+        })
+    });
+}
+
+/// A completion taken from the transport's write queue restarts the idle deadline with nothing
+/// read: the connection's writes, held in the queue until `0.75 T`, move the expiry from `T` to
+/// `1.75 T`.
+#[test]
+fn h2_queued_write_only_activity_refreshes_idle() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(1);
+            let never = Arc::new(tokio::sync::Notify::new());
+            let transport = QueuedFixtureTransport::new([
+                FixtureRead::Data(preface),
+                FixtureRead::WaitData(
+                    Arc::clone(&never),
+                    raw_frame(FrameType::PING, 0, 0, &[7; 8]),
+                ),
+            ]);
+            let queue = Rc::clone(&transport.probe);
+            let wire = Rc::clone(&transport.inner.state);
+            let (application, probes) = Application::new(vec![Reply::Body(0)]);
+            let mut config = options(context, transport);
+            config.http2.deadlines = idle_deadlines(DEADLINE_IDLE, DeadlineExpiry::HardClose);
+            config.http2.goaway_timeout = Duration::ZERO;
+            let (session, _handle) =
+                OwnedH2Session::new(application, config).expect("owned H2 with deadlines");
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                assert_eq!(probes.borrow().len(), 1, "the request reached its exchange");
+                assert!(
+                    !queue.borrow().accepted.is_empty(),
+                    "the writes went to the queue"
+                );
+                assert_eq!(queue.borrow().released, 0, "the writes are held");
+                host.advance(DEADLINE_IDLE * 3 / 4);
+                finish_queued_writes(&queue);
+                settle_turns(32).await;
+                assert_eq!(
+                    queue.borrow().released,
+                    queue.borrow().accepted.len(),
+                    "the held writes completed"
+                );
+                host.advance(DEADLINE_IDLE / 4);
+                settle_turns(32).await;
+                assert_eq!(
+                    wire.borrow().close,
+                    FixtureClose::Open,
+                    "the queued write completion restarted the idle deadline"
+                );
+                host.advance(DEADLINE_IDLE * 3 / 4 - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(wire.borrow().close, FixtureClose::Open);
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    wire.borrow().close,
+                    FixtureClose::Reset,
+                    "the deadline fired on time"
+                );
+                never.notify_one();
+            });
+            assert_eq!(
+                run.expect_err("an idle expiry fails the connection").code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+        })
+    });
+}
+
+/// A client PING at half the idle timeout, read and answered, moves the expiry from `T` to
+/// `1.5 T`.
+#[test]
+fn h2_client_ping_refreshes_idle() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(1);
+            let ping = Arc::new(tokio::sync::Notify::new());
+            let (fixture, state) = FixtureTransport::new([
+                FixtureRead::Data(preface),
+                FixtureRead::WaitData(Arc::clone(&ping), raw_frame(FrameType::PING, 0, 0, &[7; 8])),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+            application.hold_headers = true;
+            let (session, _handle) = deadline_session(
+                context,
+                fixture,
+                application,
+                idle_deadlines(DEADLINE_IDLE, DeadlineExpiry::HardClose),
+                Duration::ZERO,
+            );
+            let ping_acks = || {
+                raw_frames(&state.borrow().writes.concat())
+                    .iter()
+                    .filter(|frame| {
+                        frame.frame_type == FrameType::PING.as_u8() && frame.flags == ACK
+                    })
+                    .count()
+            };
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                assert_eq!(probes.borrow().len(), 1, "the request reached its exchange");
+                host.advance(DEADLINE_IDLE / 2);
+                ping.notify_one();
+                settle_turns(32).await;
+                assert_eq!(ping_acks(), 1, "the PING was answered");
+                host.advance(DEADLINE_IDLE / 2);
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Open,
+                    "the PING restarted the idle deadline"
+                );
+                host.advance(DEADLINE_IDLE / 2 - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(state.borrow().close, FixtureClose::Open);
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Reset,
+                    "the deadline fired on time"
+                );
+            });
+            assert_eq!(
+                run.expect_err("an idle expiry fails the connection").code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+            assert_eq!(state.borrow().close, FixtureClose::Reset);
+        })
+    });
+}
+
+/// The handshake deadline of the connection-deadline tests.
+const DEADLINE_HANDSHAKE: Duration = Duration::from_secs(8);
+
+/// Bytes do not extend the handshake deadline: a client that trickles its connection preface
+/// every quarter of the deadline, the last bytes a millisecond before it, is still cut off at
+/// the deadline, with no GOAWAY.
+#[test]
+fn h2_handshake_deadline_is_absolute_under_trickle() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(0);
+            let gates: Vec<_> = (0..4)
+                .map(|_| Arc::new(tokio::sync::Notify::new()))
+                .collect();
+            let mut reads = vec![FixtureRead::Data(preface[..4].to_vec())];
+            reads.extend(gates.iter().enumerate().map(|(index, gate)| {
+                let start = 4 * (index + 1);
+                FixtureRead::WaitData(Arc::clone(gate), preface[start..start + 4].to_vec())
+            }));
+            let (fixture, state) = FixtureTransport::new(reads);
+            let (application, probes) = Application::new(Vec::new());
+            let (session, _handle) = deadline_session(
+                context,
+                fixture,
+                application,
+                OwnedConnectionDeadlines::new(
+                    DEADLINE_HANDSHAKE,
+                    Duration::ZERO,
+                    DeadlineExpiry::HardClose,
+                ),
+                Duration::ZERO,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                for (index, gate) in gates.iter().enumerate() {
+                    let step = if index + 1 == gates.len() {
+                        DEADLINE_HANDSHAKE / 4 - Duration::from_millis(1)
+                    } else {
+                        DEADLINE_HANDSHAKE / 4
+                    };
+                    host.advance(step);
+                    gate.notify_one();
+                    settle_turns(32).await;
+                    assert_eq!(state.borrow().close, FixtureClose::Open);
+                }
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Reset,
+                    "the handshake deadline is absolute"
+                );
+            });
+            assert_eq!(
+                run.expect_err("a handshake expiry fails the connection")
+                    .code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+            assert!(
+                written_goaways(&state).is_empty(),
+                "a hard close sends no GOAWAY"
+            );
+            assert!(probes.borrow().is_empty());
+        })
+    });
+}
+
+/// With `Drain`, an idle expiry starts the GOAWAY drain at `T`. A stream still live once the
+/// GOAWAY timeout `G` has passed is then hard-closed at `T + G`.
+#[test]
+fn drain_expiry_sends_goaway_then_closes() {
+    const GRACE: Duration = Duration::from_secs(2);
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(1);
+            let (fixture, state) = FixtureTransport::new([FixtureRead::Data(preface)]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+            application.hold_headers = true;
+            let (session, _handle) = deadline_session(
+                context,
+                fixture,
+                application,
+                idle_deadlines(DEADLINE_IDLE, DeadlineExpiry::Drain),
+                GRACE,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                assert_eq!(probes.borrow().len(), 1, "the request reached its exchange");
+                host.advance(DEADLINE_IDLE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert!(written_goaways(&state).is_empty(), "the drain came early");
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    written_goaways(&state),
+                    [(GOAWAY_MAX, H2ErrorCode::NO_ERROR)],
+                    "the expiry starts the drain"
+                );
+                assert_eq!(state.borrow().close, FixtureClose::Open);
+                host.advance(GRACE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Open,
+                    "the hard close came early"
+                );
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Reset,
+                    "the live stream is hard-closed after the GOAWAY timeout"
+                );
+            });
+            assert_eq!(
+                run.expect_err("a drain expiry with a live stream fails the connection")
+                    .code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+            assert_eq!(
+                written_goaways(&state)[0],
+                (GOAWAY_MAX, H2ErrorCode::NO_ERROR)
+            );
+            assert_eq!(
+                *probes.borrow()[0].cancelled.borrow(),
+                [(HttpErrorCode::READ_TIMEOUT, false)]
+            );
+        })
+    });
+}
+
+/// On a wheel with a 1 ms tick, a deadline between ticks fires neither a tick early nor a
+/// microsecond early: progress at `0.7 ms` with `T = 10.00045 s` expires at `10.00115 s`.
+#[test]
+fn deadline_never_fires_early() {
+    const IDLE: Duration = Duration::from_micros(10_000_450);
+    const PROGRESS: Duration = Duration::from_micros(700);
+    crate::external_host_tests::run_on_wheel_host_with(|host, context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(1);
+            let update = Arc::new(tokio::sync::Notify::new());
+            let (fixture, state) = FixtureTransport::new([
+                FixtureRead::Data(preface),
+                FixtureRead::WaitData(
+                    Arc::clone(&update),
+                    raw_frame(FrameType::WINDOW_UPDATE, 0, 0, &1000u32.to_be_bytes()),
+                ),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+            application.hold_headers = true;
+            let (session, _handle) = deadline_session(
+                context,
+                fixture,
+                application,
+                idle_deadlines(IDLE, DeadlineExpiry::HardClose),
+                Duration::ZERO,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                assert_eq!(probes.borrow().len(), 1, "the request reached its exchange");
+                host.advance(PROGRESS);
+                update.notify_one();
+                settle_turns(32).await;
+                host.advance(IDLE - Duration::from_micros(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Open,
+                    "the deadline fired early"
+                );
+                host.advance(Duration::from_micros(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Reset,
+                    "the deadline fired on time"
+                );
+            });
+            assert_eq!(
+                run.expect_err("an idle expiry fails the connection").code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+        })
+    });
+}
+
+/// With `Drain`, a GOAWAY timeout too long to add to the clock (`Duration::MAX`) starts the drain
+/// at the expiry and leaves the connection open: the drain's hard-close deadline saturates, as
+/// its GOAWAY deadline does, instead of overflowing.
+#[test]
+fn drain_expiry_saturates_an_unbounded_goaway_timeout() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(1);
+            let (fixture, state) = FixtureTransport::new([FixtureRead::Data(preface)]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+            application.hold_headers = true;
+            let (session, handle) = deadline_session(
+                context,
+                fixture,
+                application,
+                idle_deadlines(DEADLINE_IDLE, DeadlineExpiry::Drain),
+                Duration::MAX,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                assert_eq!(probes.borrow().len(), 1, "the request reached its exchange");
+                host.advance(DEADLINE_IDLE);
+                settle_turns(32).await;
+                assert_eq!(
+                    written_goaways(&state),
+                    [(GOAWAY_MAX, H2ErrorCode::NO_ERROR)],
+                    "the expiry starts the drain"
+                );
+                assert_eq!(state.borrow().close, FixtureClose::Open);
+                handle.cancel();
+            });
+            assert_eq!(
+                run.expect_err("the cancelled session fails").code(),
+                HttpErrorCode::CORO_CANCELLED
+            );
+        })
+    });
+}
+
+/// With `Drain`, an idle expiry on a connection with no live stream and its output written drains
+/// gracefully: the first GOAWAY at `T`, the final GOAWAY at `T + G`, then a clean close with no
+/// reset.
+#[test]
+fn h2_idle_drain_expiry_closes_gracefully() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(1);
+            let (fixture, state) = FixtureTransport::new([FixtureRead::Data(preface)]);
+            let (application, probes) = Application::new(vec![Reply::Body(0)]);
+            let (session, _handle) = deadline_session(
+                context,
+                fixture,
+                application,
+                idle_deadlines(DEADLINE_IDLE, DeadlineExpiry::Drain),
+                GRACE,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                assert_eq!(
+                    probes.borrow()[0].completed.get(),
+                    1,
+                    "the request was served"
+                );
+                host.advance(DEADLINE_IDLE);
+                settle_turns(32).await;
+                assert_eq!(
+                    written_goaways(&state),
+                    [(GOAWAY_MAX, H2ErrorCode::NO_ERROR)],
+                    "the expiry starts the drain"
+                );
+                host.advance(GRACE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    written_goaways(&state).len(),
+                    1,
+                    "the final GOAWAY came early"
+                );
+                assert_eq!(state.borrow().close, FixtureClose::Open);
+                host.advance(Duration::from_millis(1));
+            });
+            run.expect("the idle drain closes cleanly");
+            assert_eq!(
+                written_goaways(&state),
+                [
+                    (GOAWAY_MAX, H2ErrorCode::NO_ERROR),
+                    (StreamId::new(1), H2ErrorCode::NO_ERROR)
+                ]
+            );
+            assert_eq!(state.borrow().close, FixtureClose::Closed);
+            assert!(probes.borrow()[0].cancelled.borrow().is_empty());
+        })
+    });
+}
+
+/// A `Drain` expiry with GOAWAY timeout `grace` on a connection whose only stream retired at its
+/// response's serialization while every write stayed incomplete: the drain cannot write its
+/// GOAWAY, so the connection hard-closes `grace` after the expiry.
+async fn drain_with_stuck_output_hard_closes(
+    host: Rc<ManualHost>,
+    context: WorkerContext,
+    grace: Duration,
+) {
+    let (_, preface) = ready_owner_requests(1);
+    let never = Arc::new(tokio::sync::Notify::new());
+    let transport = QueuedFixtureTransport::reporting(
+        [
+            FixtureRead::Data(preface),
+            FixtureRead::WaitData(
+                Arc::clone(&never),
+                raw_frame(FrameType::PING, 0, 0, &[7; 8]),
+            ),
+        ],
+        Some(Rc::new(Cell::new(false))),
+        false,
+    );
+    let queue = Rc::clone(&transport.probe);
+    let wire = Rc::clone(&transport.inner.state);
+    let (application, probes) = Application::new(vec![Reply::Body(0)]);
+    let mut config = options(context, transport);
+    config.http2.deadlines = idle_deadlines(DEADLINE_IDLE, DeadlineExpiry::Drain);
+    config.http2.goaway_timeout = grace;
+    let (session, _handle) =
+        OwnedH2Session::new(application, config).expect("owned H2 with deadlines");
+    let (run, ()) = futures::join!(session.run(), async {
+        settle_turns(32).await;
+        assert_eq!(
+            probes.borrow()[0].completed.get(),
+            1,
+            "the stream retired at its response's serialization"
+        );
+        assert_eq!(queue.borrow().released, 0, "every write is still held");
+        host.advance(DEADLINE_IDLE - Duration::from_millis(1));
+        settle_turns(32).await;
+        assert_eq!(wire.borrow().close, FixtureClose::Open);
+        host.advance(Duration::from_millis(1));
+        settle_turns(32).await;
+        if !grace.is_zero() {
+            assert_eq!(
+                wire.borrow().close,
+                FixtureClose::Open,
+                "the expiry starts a drain"
+            );
+            host.advance(grace - Duration::from_millis(1));
+            settle_turns(32).await;
+            assert_eq!(
+                wire.borrow().close,
+                FixtureClose::Open,
+                "the hard close came early"
+            );
+            host.advance(Duration::from_millis(1));
+            settle_turns(32).await;
+        }
+        assert_eq!(
+            wire.borrow().close,
+            FixtureClose::Reset,
+            "stuck output is not waited for"
+        );
+        release_all_queued_writes(&queue);
+        never.notify_one();
+    });
+    assert_eq!(
+        run.expect_err("the stuck drain fails the connection")
+            .code(),
+        HttpErrorCode::READ_TIMEOUT
+    );
+    assert_eq!(queue.borrow().released, queue.borrow().accepted.len());
+}
+
+/// With `Drain`, a connection with no live stream but output the peer never took is hard-closed
+/// when the GOAWAY timeout has passed, and at once with a zero GOAWAY timeout, as `HardClose`
+/// would have closed it at the expiry.
+#[test]
+fn h2_drain_expiry_with_stuck_output_hard_closes() {
+    on_both_hosts(|host, context| {
+        Box::pin(drain_with_stuck_output_hard_closes(host, context, GRACE))
+    });
+    on_both_hosts(|host, context| {
+        Box::pin(drain_with_stuck_output_hard_closes(
+            host,
+            context,
+            Duration::ZERO,
+        ))
+    });
+}
+
+/// A `Drain` expiry with GOAWAY timeout `grace` on a connection with no live stream and its
+/// output written, whose transport then stops taking writes: the drain's final GOAWAY write
+/// stalls, and the connection hard-closes one more GOAWAY timeout after the grace.
+async fn drain_with_stalled_final_goaway_hard_closes(
+    host: Rc<ManualHost>,
+    context: WorkerContext,
+    grace: Duration,
+) {
+    let (_, preface) = ready_owner_requests(1);
+    let (fixture, state) = FixtureTransport::new([FixtureRead::Data(preface)]);
+    let (application, probes) = Application::new(vec![Reply::Body(0)]);
+    let (session, _handle) = deadline_session(
+        context,
+        fixture,
+        application,
+        idle_deadlines(DEADLINE_IDLE, DeadlineExpiry::Drain),
+        grace,
+    );
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (run, ()) = futures::join!(session.run(), async {
+        settle_turns(32).await;
+        assert_eq!(
+            probes.borrow()[0].completed.get(),
+            1,
+            "the request was served"
+        );
+        host.advance(DEADLINE_IDLE);
+        settle_turns(32).await;
+        assert_eq!(
+            written_goaways(&state),
+            [(GOAWAY_MAX, H2ErrorCode::NO_ERROR)],
+            "the expiry starts the drain"
+        );
+        state.borrow_mut().write_gate = Some(Arc::clone(&release));
+        host.advance(grace);
+        settle_turns(32).await;
+        assert!(
+            state.borrow().write_gate_pending.is_some(),
+            "the drain's final GOAWAY write is stalled"
+        );
+        assert_eq!(
+            state.borrow().close,
+            FixtureClose::Open,
+            "the drain waits for its final GOAWAY"
+        );
+        host.advance(grace - Duration::from_millis(1));
+        settle_turns(32).await;
+        assert_eq!(
+            state.borrow().close,
+            FixtureClose::Open,
+            "the hard close came early"
+        );
+        host.advance(Duration::from_millis(1));
+        settle_turns(32).await;
+        assert_eq!(
+            state.borrow().close,
+            FixtureClose::Reset,
+            "a stalled final GOAWAY is not waited for"
+        );
+        release.notify_one();
+    });
+    assert_eq!(
+        run.expect_err("the stalled drain fails the connection")
+            .code(),
+        HttpErrorCode::READ_TIMEOUT
+    );
+}
+
+/// With `Drain`, a connection that has nothing left but its drain's final GOAWAY when the GOAWAY
+/// timeout passes, and then cannot write it, is hard-closed one more GOAWAY timeout later.
+#[test]
+fn h2_drain_expiry_bounds_a_stalled_final_goaway() {
+    on_both_hosts(|host, context| {
+        Box::pin(drain_with_stalled_final_goaway_hard_closes(
+            host, context, GRACE,
+        ))
+    });
+}
+
+/// With both deadlines set, the handshake deadline ends when the peer's first SETTINGS is
+/// processed: a connection whose preface arrived at once is still open at the handshake deadline
+/// `H` and hard-closes at the later idle deadline `T`.
+#[test]
+fn h2_handshake_deadline_ends_at_the_first_settings() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(1);
+            let (fixture, state) = FixtureTransport::new([FixtureRead::Data(preface)]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+            application.hold_headers = true;
+            let (session, _handle) = deadline_session(
+                context,
+                fixture,
+                application,
+                OwnedConnectionDeadlines::new(
+                    DEADLINE_HANDSHAKE,
+                    DEADLINE_IDLE,
+                    DeadlineExpiry::HardClose,
+                ),
+                Duration::ZERO,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                assert_eq!(probes.borrow().len(), 1, "the request reached its exchange");
+                host.advance(DEADLINE_HANDSHAKE);
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Open,
+                    "the completed handshake dropped its deadline"
+                );
+                host.advance(DEADLINE_IDLE - DEADLINE_HANDSHAKE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(state.borrow().close, FixtureClose::Open);
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Reset,
+                    "the idle deadline fired on time"
+                );
+            });
+            assert_eq!(
+                run.expect_err("an idle expiry fails the connection").code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+            assert!(
+                written_goaways(&state).is_empty(),
+                "a hard close sends no GOAWAY"
+            );
+        })
+    });
+}
+
+/// With `Drain` and a zero GOAWAY timeout, the drain has no time at all, so an idle expiry fails
+/// the connection at once, as `HardClose` does, even with no live stream and every write done:
+/// a reset at `T` with no GOAWAY written.
+#[test]
+fn h2_drain_expiry_with_zero_goaway_timeout_hard_closes() {
+    on_both_hosts(|host, context| {
+        Box::pin(async move {
+            let (_, preface) = ready_owner_requests(1);
+            let (fixture, state) = FixtureTransport::new([FixtureRead::Data(preface)]);
+            let (application, probes) = Application::new(vec![Reply::Body(0)]);
+            let (session, _handle) = deadline_session(
+                context,
+                fixture,
+                application,
+                idle_deadlines(DEADLINE_IDLE, DeadlineExpiry::Drain),
+                Duration::ZERO,
+            );
+            let (run, ()) = futures::join!(session.run(), async {
+                settle_turns(32).await;
+                assert_eq!(
+                    probes.borrow()[0].completed.get(),
+                    1,
+                    "the request was served"
+                );
+                host.advance(DEADLINE_IDLE - Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Open,
+                    "the deadline fired early"
+                );
+                host.advance(Duration::from_millis(1));
+                settle_turns(32).await;
+                assert_eq!(
+                    state.borrow().close,
+                    FixtureClose::Reset,
+                    "a drain with no time hard-closes at the expiry"
+                );
+            });
+            assert_eq!(
+                run.expect_err("the expiry fails the connection").code(),
+                HttpErrorCode::READ_TIMEOUT
+            );
+            assert!(
+                written_goaways(&state).is_empty(),
+                "a hard close sends no GOAWAY"
+            );
+            assert!(probes.borrow()[0].cancelled.borrow().is_empty());
+        })
+    });
 }

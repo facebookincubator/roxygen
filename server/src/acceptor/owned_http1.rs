@@ -26,6 +26,7 @@ use roxygen_runtime::panic::discard_panic;
 use roxygen_runtime::worker::WorkerCleanupTask;
 use roxygen_runtime::worker::WorkerCleanupTaskRegistration;
 use roxygen_runtime::worker::WorkerContext;
+use roxygen_session::OwnedConnectionDeadlines;
 use roxygen_session::owned_h1::Http1DriverConfig;
 use roxygen_session::owned_h1::OwnedH1Handle;
 use roxygen_session::owned_h1::OwnedH1Options;
@@ -64,6 +65,7 @@ impl OwnedHttp1Session {
         handler: HttpHandlerRef,
         connection: &ConnectionContext,
         io: UniplexConfig,
+        deadlines: OwnedConnectionDeadlines,
     ) -> Result<(Self, OwnedH1Handle, Rc<Cell<bool>>), HttpError> {
         let mut owner = KeepAliveOwner::new_for_worker((), context.handle())
             .map_err(|error| failure(error.to_string().as_bytes()))?;
@@ -105,7 +107,10 @@ impl OwnedHttp1Session {
                 context: context.clone(),
                 transport,
                 io,
-                http1: Http1DriverConfig::default(),
+                http1: Http1DriverConfig {
+                    deadlines,
+                    ..Http1DriverConfig::default()
+                },
             },
         )?;
         Ok((

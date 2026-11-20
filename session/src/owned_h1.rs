@@ -32,8 +32,9 @@
 //! HTTP/1 parsing uses llhttp's method table, so `exact_method_tokens` affects only HTTP/2.
 //! `new` fails with `INVALID_STATE_TRANSITION` for anything else:
 //!
-//! - a nonzero `read_timeout`, `stream_read_timeout` or `write_timeout`. The driver has no
-//!   timers, so timeouts are up to the caller.
+//! - a nonzero `read_timeout`, `stream_read_timeout` or `write_timeout`. The driver's only
+//!   timers are its connection deadlines (`Http1DriverConfig::deadlines`), so other timeouts are
+//!   up to the caller.
 //! - `drain_request_body_on_drop` false, or `wait_for_http1_response_on_drain` or
 //!   `deliver_ingress_before_abort` true.
 //! - a `maximum_write_size` above `buffer_limit`, or too small to carry a chunk's framing
@@ -109,7 +110,11 @@ use roxygen_transport::byte_stream::LocalTransportFuture;
 use roxygen_transport::byte_stream::TransportWriteError;
 use roxygen_transport::byte_stream::WriteInfo;
 
+use crate::owned::DeadlineExpiry;
+use crate::owned::DeadlinePhase;
+use crate::owned::DeadlineTimer;
 use crate::owned::OwnedApplication;
+use crate::owned::OwnedConnectionDeadlines;
 use crate::owned::OwnedExchange;
 use crate::owned::PanicSite;
 use crate::owned::ReadSlot;
@@ -304,6 +309,10 @@ pub struct Http1DriverConfig {
     pub strict_validation: bool,
     /// How an upgrade or CONNECT request is handled.
     pub upgrade_policy: Http1UpgradePolicy,
+    /// The connection deadlines of a downstream `OwnedH1Session`; none by default.
+    /// `OwnedH1UpstreamSession` ignores them. For a session that `roxygen_server` hosts,
+    /// `ServerSessionConfig::owned_deadlines` is their only source and replaces this value.
+    pub deadlines: OwnedConnectionDeadlines,
 }
 
 /// How an upgrade or CONNECT request is handled.
@@ -901,6 +910,8 @@ struct Driver<A: OwnedApplication> {
     summary: UniplexRunSummary,
     budget_yield: Option<LocalFuture>,
     started: bool,
+    /// `Http1DriverConfig::deadlines`, when one is set.
+    deadline: Option<Box<DeadlineTimer<Signal>>>,
 }
 
 /// The codec callback: borrows what one `on_ingress` call may change.
@@ -1177,6 +1188,10 @@ impl<A: OwnedApplication> Driver<A> {
             http1.upgrade_policy == Http1UpgradePolicy::AsOrdinaryRequest,
         );
         codec.set_add_date_header_to_response(io.add_date_header_to_response);
+        let deadline = http1
+            .deadlines
+            .is_enabled()
+            .then(|| DeadlineTimer::new(context.host(), Signal::new(&task), http1.deadlines));
         let handle = OwnedH1Handle(control);
         let application = make(&handle);
         Ok((
@@ -1223,6 +1238,7 @@ impl<A: OwnedApplication> Driver<A> {
                 summary: UniplexRunSummary::default(),
                 budget_yield: None,
                 started: false,
+                deadline,
             },
             handle,
         ))
@@ -1237,6 +1253,17 @@ impl<A: OwnedApplication> Driver<A> {
     }
 
     fn poll(&mut self, context: &mut Context<'_>) -> Poll<Result<UniplexRunSummary, HttpError>> {
+        let polled = self.poll_turns(context);
+        if polled.is_pending() && self.deadline.is_some() {
+            self.sync_deadline();
+        }
+        polled
+    }
+
+    fn poll_turns(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<UniplexRunSummary, HttpError>> {
         self.task.register(context.waker());
         if self.budget_yield.is_some() && self.poll_budget_yield(context).is_pending() {
             return Poll::Pending;
@@ -1257,6 +1284,14 @@ impl<A: OwnedApplication> Driver<A> {
                 // A drain requested during the read takes effect before its input is parsed, so
                 // a request that the read carried is not admitted.
                 self.observe_drain();
+            }
+            if self
+                .deadline
+                .as_ref()
+                .is_some_and(|deadline| deadline.wake.take_ready())
+                && self.poll_deadline()
+            {
+                progress = true;
             }
             self.observe_stop();
             if self.parse_due() {
@@ -1433,6 +1468,10 @@ impl<A: OwnedApplication> Driver<A> {
             || (self.read_error.is_some() && !self.holds_read_error())
             || (self.fatal.is_none() && self.retire_due())
             || self.eof_abort_due()
+            || self
+                .deadline
+                .as_ref()
+                .is_some_and(|deadline| deadline.wake.is_ready())
     }
 
     /// Whether this turn, right after the exchange serialized a body event that does not end the
@@ -1507,6 +1546,83 @@ impl<A: OwnedApplication> Driver<A> {
         };
         self.observe_cancel();
         wrote
+    }
+
+    /// The deadline phase the connection is in. Until a request head reaches its exchange, the
+    /// connection waits for that head, once its output is written. A tunnel stays in the idle
+    /// phase.
+    fn deadline_phase(&self) -> DeadlinePhase {
+        if !self.control.handshake_complete.get() {
+            DeadlinePhase::Handshake
+        } else if self
+            .exchange
+            .as_ref()
+            .is_some_and(|exchange| exchange.started)
+            || !self.egress.is_empty()
+            || self.writes_pending()
+        {
+            DeadlinePhase::Idle
+        } else {
+            DeadlinePhase::HeadWait
+        }
+    }
+
+    /// Applies the poll's phase change to the connection deadlines as the poll ends.
+    fn sync_deadline(&mut self) {
+        let phase = self.deadline_phase();
+        let Some(deadline) = self.deadline.as_deref_mut() else {
+            return;
+        };
+        if deadline.needs_sync(phase) {
+            deadline.sync(phase, self.context.host().now());
+        }
+    }
+
+    /// Handles the connection deadline's slot firing, and returns whether a deadline had
+    /// passed. That fails the connection, except under `Drain` while it waits for a request head
+    /// with no output pending and no staged close, when it closes gracefully at once. Output
+    /// still pending made no write progress for the whole idle timeout, and a staged close reads
+    /// until a peer EOF, so neither is waited for.
+    #[cold]
+    #[inline(never)]
+    fn poll_deadline(&mut self) -> bool {
+        if self.fatal.is_some() {
+            return false;
+        }
+        let phase = self.deadline_phase();
+        let now = self.context.host().now();
+        let Some(deadline) = self.deadline.as_deref_mut() else {
+            return false;
+        };
+        if deadline.expire(phase, now).is_none() {
+            return false;
+        }
+        deadline.finish();
+        let error = failure(
+            HttpErrorCode::READ_TIMEOUT,
+            b"owned H1 connection deadline expired",
+        );
+        if deadline.on_expiry() == DeadlineExpiry::Drain
+            && phase != DeadlinePhase::Idle
+            && self.egress.is_empty()
+            && !self.writes_pending()
+            && !self.ingress_stopped
+        {
+            self.close_on_expiry(&error);
+        } else {
+            self.abort(error);
+        }
+        true
+    }
+
+    /// Closes a connection that waits for a request head gracefully: the exchange of a head
+    /// still arriving is cancelled with `error`, nothing more is parsed, and the connection
+    /// closes once its output is written.
+    #[cold]
+    fn close_on_expiry(&mut self, error: &HttpError) {
+        self.cancel_exchange(error, false);
+        self.draining = true;
+        self.codec.get_mut().generate_immediate_goaway();
     }
 
     /// Run at each phase boundary: the transport's callbacks, like the application's, may
@@ -1721,6 +1837,9 @@ impl<A: OwnedApplication> Driver<A> {
             }
             exchange.started = true;
             self.control.complete_handshake();
+            if let Some(deadline) = self.deadline.as_deref_mut() {
+                deadline.note_head_delivered();
+            }
             exchange
                 .application
                 .as_mut()
@@ -2027,6 +2146,11 @@ impl<A: OwnedApplication> Driver<A> {
                     .summary
                     .bytes_read
                     .saturating_add(read.bytes_read() as u64);
+                if read.bytes_read() != 0
+                    && let Some(deadline) = self.deadline.as_deref_mut()
+                {
+                    deadline.note_progress();
+                }
                 if read.is_eof() {
                     // As `UniplexSession`: a response generated after peer EOF closes.
                     self.eof = true;
@@ -2139,6 +2263,11 @@ impl<A: OwnedApplication> Driver<A> {
                     Ok(info) => info.bytes_written,
                     Err(error) => error.bytes_written(),
                 };
+                if bytes != 0
+                    && let Some(deadline) = self.deadline.as_deref_mut()
+                {
+                    deadline.note_progress();
+                }
                 self.summary.bytes_written =
                     self.summary.bytes_written.saturating_add(bytes as u64);
                 match completion.result {
@@ -2164,6 +2293,11 @@ impl<A: OwnedApplication> Driver<A> {
                 Ok(info) => info.bytes_written,
                 Err(error) => error.bytes_written(),
             };
+            if bytes != 0
+                && let Some(deadline) = self.deadline.as_deref_mut()
+            {
+                deadline.note_progress();
+            }
             self.summary.bytes_written = self.summary.bytes_written.saturating_add(bytes as u64);
             match result {
                 Err(error) => failed = Some(error.error().clone()),

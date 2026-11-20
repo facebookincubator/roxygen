@@ -31,6 +31,7 @@ use roxygen_core::http::TransportDirection;
 use roxygen_core::message::SocketAddress;
 use roxygen_runtime::cancellation::CancellationSource;
 use roxygen_runtime::worker::WorkerContext;
+use roxygen_session::OwnedConnectionDeadlines;
 use roxygen_session::http2::Http2SessionConfig;
 use roxygen_session::http2::StreamReceiveWindowMode;
 use roxygen_session::http2::rate_limit::Http2RateLimitConfig;
@@ -326,10 +327,10 @@ pub struct ServerSessionConfig {
     /// of `UniplexSession`, with no task per request. Experimental; off by default. HTTP/2
     /// connections are unchanged.
     ///
-    /// The owned mode is untimed, so the caller is responsible for timeouts.
+    /// The owned mode applies `owned_deadlines` and no other session timeout.
     /// `stream_read_timeout`, `connection_idle_timeout` and `write_timeout` must be zero,
-    /// which also leaves HTTP/2 sessions untimed apart from `goaway_timeout`. TLS handshakes
-    /// still use `tls_handshake_timeout`. The mode records no statistics and observes no
+    /// which also leaves HTTP/2 sessions without them. TLS handshakes still use
+    /// `tls_handshake_timeout`. The mode records no statistics and observes no
     /// lifecycle, so `stats_factory` and `lifecycle_observer_factory` must be `None`. Server
     /// construction rejects any other configuration with `HttpServerError::InvalidConfig`
     /// (`INVALID_STATE_TRANSITION` from `serve_transport`), naming the reason.
@@ -344,7 +345,8 @@ pub struct ServerSessionConfig {
     /// request body, and sends 408 if the response head is not yet sent. It also applies
     /// `goaway_timeout`, `http2_rate_limits`, `abort_http2_streams_on_eof`,
     /// `exact_method_tokens`, `verbatim_http2_header_values` and `add_date_header_to_response`
-    /// as `UniplexSession` does. It records no statistics, so `stats_factory` must be `None`.
+    /// as `UniplexSession` does, and `owned_deadlines`. It records no statistics, so
+    /// `stats_factory` must be `None`.
     /// Server construction rejects any other configuration with `HttpServerError::InvalidConfig`
     /// (`INVALID_STATE_TRANSITION` from `serve_transport`), naming the reason.
     ///
@@ -356,6 +358,16 @@ pub struct ServerSessionConfig {
     /// `INITIAL_WINDOW_SIZE`. The driver requires the window to equal the advertised value, so
     /// if `settings` sets it more than once, the last value applies.
     pub owned_http2: bool,
+    /// The connection deadlines of the owned downstream drivers (`owned_http1` and
+    /// `owned_http2`): a handshake deadline, an idle deadline, and what happens when one
+    /// expires. None by default. `UniplexSession` connections ignore them. This is the only
+    /// source of the drivers' deadlines: it replaces `Http1DriverConfig::deadlines` and
+    /// `Http2SessionConfig::deadlines`.
+    ///
+    /// On `owned_http2`, `connection_idle_timeout` still drains an idle connection with GOAWAY
+    /// on its own schedule, and whichever expires first acts. To apply only these deadlines,
+    /// set `connection_idle_timeout` to zero.
+    pub owned_deadlines: OwnedConnectionDeadlines,
     /// Fails a downstream HTTP/1.1 connection, as a reset does, when the peer's EOF arrives
     /// while a transaction other than an established tunnel is open. Experimental; off by
     /// default.
@@ -456,6 +468,7 @@ impl Default for ServerSessionConfig {
             http2_rate_limits: Http2RateLimitConfig::default(),
             owned_http1: false,
             owned_http2: false,
+            owned_deadlines: OwnedConnectionDeadlines::default(),
             abort_exchanges_on_eof: false,
             abort_http2_streams_on_eof: false,
             non_abortive_close: false,
@@ -989,6 +1002,7 @@ pub(crate) fn attach_session(
             handler,
             &connection.context,
             io,
+            config.session.owned_deadlines,
         )?;
         return admit_session(
             context,
@@ -1192,6 +1206,7 @@ pub(crate) fn owned_http2_session_config(config: &ServerSessionConfig) -> Http2S
     Http2SessionConfig {
         stats: None,
         ping_probes: None,
+        deadlines: config.owned_deadlines,
         ..http2
     }
 }

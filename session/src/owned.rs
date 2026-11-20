@@ -9,9 +9,14 @@
 
 use std::any::Any;
 #[cfg(test)]
+use std::cell::Cell;
+#[cfg(test)]
 use std::cell::RefCell;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
+use std::task::Wake;
+use std::task::Waker;
 use std::task::ready;
 use std::time::Duration;
 use std::time::Instant;
@@ -26,6 +31,9 @@ use roxygen_core::message::HttpMessage;
 use roxygen_core::stream_source::HttpIngressBody;
 use roxygen_core::stream_source::HttpStreamSourceOwner;
 use roxygen_runtime::cancellation::CancellationToken;
+use roxygen_runtime::host::Host;
+use roxygen_runtime::host::timer::Expiry;
+use roxygen_runtime::host::timer::Timeout;
 use roxygen_runtime::worker::ContainedPanicScope;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_transport::byte_stream::LocalTransportFuture;
@@ -139,6 +147,310 @@ pub trait OwnedResponseObserver: 'static {
 
     /// Consumes the observer before applying producer completion or deadline policy.
     fn response_complete(self: Box<Self>, completed: Result<Instant, HttpError>);
+}
+
+/// The connection deadlines an owned downstream driver applies: an absolute handshake deadline
+/// and a restartable idle deadline. The default disables both, and a session with both disabled
+/// allocates no timer for them.
+///
+/// Only the downstream drivers, `OwnedH1Session` and `OwnedH2Session`, apply them. The upstream
+/// owned sessions and `UniplexSession` ignore them. A deadline never fires before its instant.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct OwnedConnectionDeadlines {
+    /// The most time from the session's first poll until its connection handshake completes:
+    /// on HTTP/2 when the driver processes the peer's first SETTINGS frame, on HTTP/1.1 when it
+    /// delivers the first request head to its exchange. Bytes the peer sends do not extend it.
+    /// On HTTP/1.1 it also bounds each later wait for a request head, alongside the idle
+    /// deadline, from the start of that wait: once no exchange is live and the previous response
+    /// is written. An accepted upgrade or CONNECT tunnel is not such a wait. Zero disables it.
+    pub handshake_timeout: Duration,
+    /// The most time without progress once the handshake has completed. Each driver poll that
+    /// reads bytes or takes a completed write restarts it. Zero disables it.
+    pub idle_timeout: Duration,
+    /// What the driver does when a deadline expires.
+    pub on_expiry: DeadlineExpiry,
+}
+
+impl OwnedConnectionDeadlines {
+    /// Deadlines of `handshake_timeout` and `idle_timeout`, each zero to disable it, that expire
+    /// with `on_expiry`.
+    pub fn new(
+        handshake_timeout: Duration,
+        idle_timeout: Duration,
+        on_expiry: DeadlineExpiry,
+    ) -> Self {
+        Self {
+            handshake_timeout,
+            idle_timeout,
+            on_expiry,
+        }
+    }
+
+    /// Sets `handshake_timeout`.
+    pub const fn with_handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
+        self.handshake_timeout = handshake_timeout;
+        self
+    }
+
+    /// Sets `idle_timeout`.
+    pub const fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
+
+    /// Sets `on_expiry`.
+    pub const fn with_on_expiry(mut self, on_expiry: DeadlineExpiry) -> Self {
+        self.on_expiry = on_expiry;
+        self
+    }
+
+    /// Whether either deadline is set.
+    pub(crate) fn is_enabled(&self) -> bool {
+        !self.handshake_timeout.is_zero() || !self.idle_timeout.is_zero()
+    }
+}
+
+/// What an owned driver does when a connection deadline expires.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DeadlineExpiry {
+    /// Fails the connection with `READ_TIMEOUT`. The driver sends no GOAWAY, response or other
+    /// closing bytes, cancels every live exchange with `READ_TIMEOUT` and resets the transport.
+    #[default]
+    HardClose,
+    /// Closes the connection gracefully where it can. On HTTP/2 the driver starts the GOAWAY
+    /// drain, as `OwnedH2Handle::initiate_drain` does. `Http2SessionConfig::goaway_timeout`
+    /// later, a stream still live or output the transport has not completed fails the
+    /// connection as `HardClose` does. Otherwise the drain sends its final GOAWAY, and if the
+    /// connection is still open one more `goaway_timeout` later, it fails then. With a zero
+    /// `goaway_timeout` the expiry fails the connection at once, as `HardClose` does.
+    ///
+    /// On HTTP/1.1, a connection that waits for a request head with no output pending closes at
+    /// once, with no response, and the exchange of a head still arriving is cancelled with
+    /// `READ_TIMEOUT`. A live exchange or tunnel, output still pending, or the staged close that
+    /// follows a stopped upload fails the connection as `HardClose` does.
+    Drain,
+}
+
+#[cfg(test)]
+thread_local! {
+    static DEADLINE_TIMERS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// How many `DeadlineTimer`s the owned drivers on this thread have allocated.
+#[cfg(test)]
+pub(crate) fn deadline_timers() -> usize {
+    DEADLINE_TIMERS.with(Cell::get)
+}
+
+/// Which deadline a [`DeadlineTimer`] enforces.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeadlinePhase {
+    /// Before the end of the session's first poll.
+    Unstarted,
+    /// Until the handshake completes: the absolute handshake deadline.
+    Handshake,
+    /// After the handshake: the idle deadline.
+    Idle,
+    /// After the handshake, while an HTTP/1.1 connection with its output written waits for its
+    /// next request head: a head deadline of `handshake_timeout` from the start of the wait, and
+    /// the idle deadline.
+    HeadWait,
+    /// A deadline expired with `DeadlineExpiry::Drain`: the drain's grace deadline.
+    DrainGrace,
+    /// The drain's grace passed with nothing left but its final GOAWAY: a last hard-close
+    /// deadline for that GOAWAY's write.
+    DrainFlush,
+    /// The deadlines no longer apply.
+    Finished,
+}
+
+/// An owned driver's connection deadlines on one timeout slot, allocated only when a deadline is
+/// set. The driver records progress and phase changes as they happen, and the timer applies
+/// them with one clock read when the driver's poll ends (`sync`) or when the slot fires
+/// (`expire`).
+pub(crate) struct DeadlineTimer<W> {
+    /// Marked when the slot fires.
+    pub(crate) wake: Arc<W>,
+    waker: Waker,
+    slot: Timeout,
+    deadlines: OwnedConnectionDeadlines,
+    phase: DeadlinePhase,
+    /// The handshake deadline, the current head wait's deadline, or the drain's grace or last
+    /// deadline.
+    fixed: Option<Instant>,
+    /// The idle deadline: the last applied progress plus `idle_timeout`.
+    idle: Option<Instant>,
+    /// The driver moved bytes since the last `sync` or `expire`.
+    progressed: bool,
+    /// A request head reached its exchange since the last `sync` or `expire`, so a head wait
+    /// observed now is a new one.
+    head_delivered: bool,
+}
+
+impl<W: Wake + Send + Sync + 'static> DeadlineTimer<W> {
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn new(host: &Host, wake: Arc<W>, deadlines: OwnedConnectionDeadlines) -> Box<Self> {
+        #[cfg(test)]
+        DEADLINE_TIMERS.with(|count| count.set(count.get() + 1));
+        Box::new(Self {
+            waker: Waker::from(Arc::clone(&wake)),
+            wake,
+            slot: Timeout::new(host),
+            deadlines,
+            phase: DeadlinePhase::Unstarted,
+            fixed: None,
+            idle: None,
+            progressed: false,
+            head_delivered: false,
+        })
+    }
+
+    /// Records that the driver read bytes, or that the transport completed a write.
+    #[inline]
+    pub(crate) fn note_progress(&mut self) {
+        self.progressed = true;
+    }
+
+    /// Records that a request head reached its exchange, which ends an HTTP/1.1 head wait.
+    #[inline]
+    pub(crate) fn note_head_delivered(&mut self) {
+        self.head_delivered = true;
+    }
+
+    /// Whether `sync` would change anything for the driver's current phase, `observed`.
+    #[inline]
+    pub(crate) fn needs_sync(&self, observed: DeadlinePhase) -> bool {
+        self.progressed || self.head_delivered || self.next_phase(observed) != self.phase
+    }
+
+    /// Applies the phase change since the last call at `now`, and arms the slot for the
+    /// resulting deadline.
+    pub(crate) fn sync(&mut self, observed: DeadlinePhase, now: Instant) {
+        self.apply(observed, now);
+        self.rearm();
+    }
+
+    /// Takes the slot's expiry and applies what `sync` would at `now`. Returns the phase whose
+    /// deadline passed, or `None` if the slot had not fired or the deadline moved past `now`, in
+    /// which case the slot is armed again.
+    pub(crate) fn expire(
+        &mut self,
+        observed: DeadlinePhase,
+        now: Instant,
+    ) -> Option<DeadlinePhase> {
+        match self.slot.take_expired()? {
+            Expiry::Elapsed => {}
+            // The worker stopped the wheel: a later schedule would complete at once.
+            Expiry::Stopped => {
+                self.finish();
+                return None;
+            }
+        }
+        self.apply(observed, now);
+        if self.deadline().is_some_and(|deadline| deadline <= now) {
+            return Some(self.phase);
+        }
+        self.rearm();
+        None
+    }
+
+    /// What the driver does when a deadline expires.
+    #[inline]
+    pub(crate) fn on_expiry(&self) -> DeadlineExpiry {
+        self.deadlines.on_expiry
+    }
+
+    /// Replaces the deadlines with the drain's grace deadline, `deadline`.
+    pub(crate) fn start_grace(&mut self, deadline: Instant) {
+        self.phase = DeadlinePhase::DrainGrace;
+        self.fixed = Some(deadline);
+        self.progressed = false;
+        self.rearm();
+    }
+
+    /// Replaces the grace deadline with the drain's last deadline, `deadline`.
+    pub(crate) fn start_flush(&mut self, deadline: Instant) {
+        self.phase = DeadlinePhase::DrainFlush;
+        self.fixed = Some(deadline);
+        self.rearm();
+    }
+
+    /// Stops applying deadlines.
+    pub(crate) fn finish(&mut self) {
+        self.phase = DeadlinePhase::Finished;
+        self.slot.cancel();
+    }
+
+    fn next_phase(&self, observed: DeadlinePhase) -> DeadlinePhase {
+        match self.phase {
+            DeadlinePhase::DrainGrace | DeadlinePhase::DrainFlush | DeadlinePhase::Finished => {
+                self.phase
+            }
+            _ => observed,
+        }
+    }
+
+    fn apply(&mut self, observed: DeadlinePhase, now: Instant) {
+        let progressed = std::mem::take(&mut self.progressed);
+        let head_delivered = std::mem::take(&mut self.head_delivered);
+        let phase = self.next_phase(observed);
+        let previous = std::mem::replace(&mut self.phase, phase);
+        // A head wait that began in the same poll as the one before it is still a new wait.
+        if phase != previous || (phase == DeadlinePhase::HeadWait && head_delivered) {
+            match phase {
+                DeadlinePhase::Handshake | DeadlinePhase::HeadWait => {
+                    self.fixed = after(now, self.deadlines.handshake_timeout);
+                }
+                DeadlinePhase::Idle => self.fixed = None,
+                DeadlinePhase::Unstarted
+                | DeadlinePhase::DrainGrace
+                | DeadlinePhase::DrainFlush
+                | DeadlinePhase::Finished => {}
+            }
+        }
+        // The idle deadline starts when the handshake completes, and progress restarts it.
+        if matches!(phase, DeadlinePhase::Idle | DeadlinePhase::HeadWait)
+            && (progressed
+                || matches!(
+                    previous,
+                    DeadlinePhase::Unstarted | DeadlinePhase::Handshake
+                ))
+        {
+            self.idle = after(now, self.deadlines.idle_timeout);
+        }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        match self.phase {
+            DeadlinePhase::Unstarted | DeadlinePhase::Finished => None,
+            DeadlinePhase::Handshake | DeadlinePhase::DrainGrace | DeadlinePhase::DrainFlush => {
+                self.fixed
+            }
+            DeadlinePhase::Idle => self.idle,
+            DeadlinePhase::HeadWait => match (self.fixed, self.idle) {
+                (Some(fixed), Some(idle)) => Some(fixed.min(idle)),
+                (fixed, idle) => fixed.or(idle),
+            },
+        }
+    }
+
+    fn rearm(&mut self) {
+        match self.deadline() {
+            Some(deadline) => self.slot.schedule_at(deadline, &self.waker),
+            None => self.slot.cancel(),
+        }
+    }
+}
+
+/// `now` plus `timeout`, or `None` for a zero `timeout`. An unrepresentable instant becomes
+/// thirty years from `now`, as in `Host::deadline_after`.
+fn after(now: Instant, timeout: Duration) -> Option<Instant> {
+    (!timeout.is_zero()).then(|| {
+        now.checked_add(timeout)
+            .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30))
+    })
 }
 
 /// Where an owned driver contained a panic.

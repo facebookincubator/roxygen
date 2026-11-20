@@ -65,6 +65,9 @@ pub mod shutdown;
 pub mod stream_state;
 pub mod uniplex;
 
+pub use owned::DeadlineExpiry;
+pub use owned::OwnedConnectionDeadlines;
+
 #[cfg(test)]
 #[path = "../tests/core.rs"]
 mod core_tests;
