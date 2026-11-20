@@ -13480,8 +13480,8 @@ fn post_then_late_data() -> (StreamId, Vec<u8>, Vec<u8>) {
             end_stream: true,
         },
     ));
-    // DATA after the client's END_STREAM is a stream error for a live stream, and is ignored
-    // once both directions are complete.
+    // DATA after the client's END_STREAM gets RST_STREAM(STREAM_CLOSED), whether or not the
+    // response is complete.
     let late = eligibility_frame(
         &mut peer,
         EgressFrame::Body {
@@ -13495,7 +13495,7 @@ fn post_then_late_data() -> (StreamId, Vec<u8>, Vec<u8>) {
 }
 
 #[test]
-fn late_request_data_after_a_folded_end_is_ignored() {
+fn late_request_data_after_a_folded_end_is_reset() {
     let written = run_on_fold_worker(|context| {
         Box::pin(async move {
             let (stream, input, late) = post_then_late_data();
@@ -13548,11 +13548,19 @@ fn late_request_data_after_a_folded_end_is_ignored() {
                 settle_turns(16).await;
                 let decoded = decode_server_frames(&state.borrow().writes.concat());
                 assert_eq!(
-                    (decoded.resets, probe.cancelled.borrow().clone()),
-                    (vec![], vec![]),
-                    "late DATA for a completed exchange is ignored, not reset"
+                    (
+                        decoded.resets,
+                        decoded.goaways,
+                        probe.cancelled.borrow().clone()
+                    ),
+                    (vec![(stream, H2ErrorCode::STREAM_CLOSED)], vec![], vec![]),
+                    "late DATA on a stream that closed after both ends ended is reset"
                 );
-                assert_eq!(probe.completed.get(), 1);
+                assert_eq!(
+                    probe.completed.get(),
+                    1,
+                    "the reset leaves the exchange complete"
+                );
                 assert_eq!(decoded.header_statuses, [(stream, 200)]);
                 written.set(written_transcript(&state).digest());
             })
@@ -13562,7 +13570,7 @@ fn late_request_data_after_a_folded_end_is_ignored() {
     });
     assert_eq!(
         written,
-        (3, 10_517_397_198_046_951_649),
+        (4, 2_387_522_901_023_429_832),
         "the transcript is unchanged"
     );
 }
@@ -13690,11 +13698,19 @@ fn completion_inside_the_owner_poll_is_not_folded() {
                 settle_turns(16).await;
                 let decoded = decode_server_frames(&state.borrow().writes.concat());
                 assert_eq!(
-                    (decoded.resets, probe.cancelled.borrow().clone()),
-                    (vec![], vec![]),
-                    "late DATA for a completed exchange is ignored, not reset"
+                    (
+                        decoded.resets,
+                        decoded.goaways,
+                        probe.cancelled.borrow().clone()
+                    ),
+                    (vec![(stream, H2ErrorCode::STREAM_CLOSED)], vec![], vec![]),
+                    "late DATA on a stream that closed after both ends ended is reset"
                 );
-                assert_eq!(probe.completed.get(), 1);
+                assert_eq!(
+                    probe.completed.get(),
+                    1,
+                    "the reset leaves the exchange complete"
+                );
                 assert_eq!(decoded.header_statuses, [(stream, 200)]);
                 written.set(written_transcript(&state).digest());
             })
@@ -13704,7 +13720,7 @@ fn completion_inside_the_owner_poll_is_not_folded() {
     });
     assert_eq!(
         written,
-        (3, 10_517_397_198_046_951_649),
+        (4, 2_387_522_901_023_429_832),
         "the transcript is unchanged"
     );
 }
@@ -14538,7 +14554,7 @@ fn downstream_transcripts_are_unchanged_by_early_retirement() {
             [
                 ((8, 234_198_259_703_760_995), Ok(())),
                 ((5, 12_245_000_780_145_702_999), Ok(())),
-                ((5, 5_501_662_039_820_430_337), Ok(())),
+                ((5, 9_586_466_474_454_564_876), Ok(())),
                 ((8, 15_476_332_832_309_872_086), Ok(())),
                 ((6, 11_756_098_851_954_770_615), Ok(())),
             ],
@@ -21552,4 +21568,631 @@ fn reads_and_queued_writes_that_complete_without_waking_poll_nothing_inline() {
             inline_polls: 0,
         }
     );
+}
+
+/// What the server wrote back for frames on streams that are not open: the RST_STREAM and
+/// GOAWAY frames, the connection credit that its WINDOW_UPDATE frames returned, and the session's
+/// error.
+#[derive(Debug, PartialEq)]
+struct ClosedStreamRun {
+    resets: Vec<(StreamId, H2ErrorCode)>,
+    goaways: Vec<(StreamId, H2ErrorCode)>,
+    connection_credit: u32,
+    error: Option<HttpErrorCode>,
+}
+
+/// Whether `wire` holds a complete frame that ends or resets `stream`.
+fn closes_stream(wire: &[u8], stream: u32) -> bool {
+    let mut rest = wire;
+    while rest.len() >= 9 {
+        let length = usize::from(rest[0]) << 16 | usize::from(rest[1]) << 8 | usize::from(rest[2]);
+        let Some(frame) = rest.get(..9 + length) else {
+            return false;
+        };
+        let frame_stream = u32::from_be_bytes(frame[5..9].try_into().unwrap()) & 0x7fff_ffff;
+        if frame_stream == stream
+            && (frame[3] == FrameType::RST_STREAM.as_u8() || frame[4] & END_STREAM != 0)
+        {
+            return true;
+        }
+        rest = &rest[9 + length..];
+    }
+    false
+}
+
+/// How the server applications in `closed_stream_run` answer each request.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ClosedStreamAnswer {
+    /// They hold every response, and the frames arrive with the requests.
+    Hold,
+    /// They answer with a bodiless 200, and the frames follow the end of stream 1's response.
+    Respond,
+    /// They fail the response, which resets the stream, and the frames follow stream 1's reset.
+    Fail,
+}
+
+/// Answers each request with a response that fails at once.
+struct FailedResponseHandler;
+
+impl HttpHandler for FailedResponseHandler {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        _request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        Box::pin(async {
+            Ok(HttpSourceHolder::new(Box::new(HttpErrorSource::new(
+                HttpError::with_message(HttpErrorCode::INTERNAL_ERROR, b"scripted response error"),
+            ))))
+        })
+    }
+}
+
+/// Serves `requests` and then `frames`, read with EOF, on the owned driver (`owned`) or
+/// `UniplexSession`, both configured as `options` with `abort_streams_on_eof`, then
+/// `configure`, with applications that answer as `answer`.
+fn closed_stream_run(
+    owned: bool,
+    requests: &[Vec<u8>],
+    frames: &[Vec<u8>],
+    answer: ClosedStreamAnswer,
+    configure: fn(&mut OwnedH2Options),
+) -> ClosedStreamRun {
+    let requests = eof_script(requests);
+    let frames = frames.concat();
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let send_frames = Arc::new(tokio::sync::Notify::new());
+            let reads = if answer != ClosedStreamAnswer::Hold {
+                vec![
+                    FixtureRead::Data(requests),
+                    FixtureRead::WaitDataEof(Arc::clone(&send_frames), frames),
+                ]
+            } else {
+                vec![FixtureRead::DataEof([requests, frames].concat())]
+            };
+            let (transport, state) = FixtureTransport::new(reads);
+            let mut config = options(context, transport);
+            config.http2.abort_streams_on_eof = true;
+            configure(&mut config);
+            let run = async {
+                if owned && answer == ClosedStreamAnswer::Respond {
+                    let (session, _) =
+                        OwnedH2Session::new(MethodApplication(Rc::default()), config).unwrap();
+                    return session.run().await;
+                }
+                if owned && answer == ClosedStreamAnswer::Fail {
+                    let (mut application, _) = Application::new(vec![Reply::Body(0)]);
+                    application.response_head_error = Some(HttpErrorCode::INTERNAL_ERROR);
+                    let (session, _) = OwnedH2Session::new(application, config).unwrap();
+                    return session.run().await;
+                }
+                if owned {
+                    let (session, _) =
+                        OwnedH2Session::new(HeldApplication(Rc::default()), config).unwrap();
+                    return session.run().await;
+                }
+                let OwnedH2Options {
+                    context,
+                    transport,
+                    io,
+                    http2,
+                } = config;
+                let handler: Rc<dyn HttpHandler> = match answer {
+                    ClosedStreamAnswer::Hold => Rc::new(HeldStreamHandler(Rc::default())),
+                    ClosedStreamAnswer::Respond => Rc::new(MethodHandler(Rc::default())),
+                    ClosedStreamAnswer::Fail => Rc::new(FailedResponseHandler),
+                };
+                let (session, _) = UniplexSession::new_http2(
+                    context,
+                    TransportDirection::Downstream,
+                    transport,
+                    Some(handler),
+                    io,
+                    http2,
+                )
+                .unwrap();
+                session.run().await
+            };
+            let script = async {
+                if answer != ClosedStreamAnswer::Hold {
+                    wait_until(|| closes_stream(&state.borrow().writes.concat(), 1)).await;
+                    for _ in 0..64 {
+                        tokio::task::yield_now().await;
+                    }
+                    send_frames.notify_one();
+                }
+            };
+            let (result, ()) =
+                tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(run, script) })
+                    .await
+                    .expect("the run ends");
+            let decoded = decode_server_frames_with_requests(&state.borrow().writes.concat(), 3);
+            ClosedStreamRun {
+                connection_credit: connection_credit(&decoded),
+                resets: decoded.resets,
+                goaways: decoded.goaways,
+                error: result.err().map(|error| error.code()),
+            }
+        })
+    })
+}
+
+/// The connection credit that the WINDOW_UPDATE frames in `decoded` returned.
+fn connection_credit(decoded: &DecodedServerFrames) -> u32 {
+    decoded
+        .window_updates
+        .iter()
+        .filter(|(stream, _)| *stream == StreamId::UNSPECIFIED)
+        .map(|(_, amount)| amount)
+        .sum()
+}
+
+/// Three 11,000-byte DATA frames on `stream`. A connection WINDOW_UPDATE goes out once more than
+/// half of the 65,535-byte window is credited, so their 33,000 bytes draw one only if every frame
+/// is credited.
+fn three_data_frames(stream: u32) -> Vec<Vec<u8>> {
+    vec![eof_frame(FrameType::DATA, 0, stream, &[b'x'; 11_000]); 3]
+}
+
+fn unconfigured(_config: &mut OwnedH2Options) {}
+
+/// A second request head on stream 1, which the codec reads as a trailer block.
+fn repeated_request() -> Vec<u8> {
+    eof_request(1, true, true)
+}
+
+fn stream_closed_reset(stream: u64) -> ClosedStreamRun {
+    ClosedStreamRun {
+        resets: vec![(StreamId::new(stream), H2ErrorCode::STREAM_CLOSED)],
+        goaways: Vec::new(),
+        connection_credit: 0,
+        error: None,
+    }
+}
+
+/// RFC 9113: DATA or HEADERS on a stream that the peer ended while the server still holds the
+/// response (half-closed (remote)) is a stream error of type STREAM_CLOSED, on both drivers.
+/// WINDOW_UPDATE and PRIORITY on such a stream are not.
+#[test]
+fn frames_on_a_half_closed_stream_get_stream_closed() {
+    for owned in [true, false] {
+        for frame in [
+            eof_frame(FrameType::DATA, 0, 1, b"late"),
+            repeated_request(),
+        ] {
+            assert_eq!(
+                closed_stream_run(
+                    owned,
+                    &[eof_request(1, true, true)],
+                    &[frame],
+                    ClosedStreamAnswer::Hold,
+                    unconfigured
+                ),
+                stream_closed_reset(1),
+                "owned: {owned}"
+            );
+        }
+        let held = ClosedStreamRun {
+            resets: Vec::new(),
+            goaways: vec![(StreamId::new(1), H2ErrorCode::INTERNAL_ERROR)],
+            connection_credit: 0,
+            error: Some(HttpErrorCode::TRANSPORT_EOF),
+        };
+        assert_eq!(
+            closed_stream_run(
+                owned,
+                &[eof_request(1, true, true)],
+                &[
+                    eof_frame(FrameType::WINDOW_UPDATE, 0, 1, &1_u32.to_be_bytes()),
+                    eof_frame(FrameType::PRIORITY, 0, 1, &[0, 0, 0, 0, 15]),
+                ],
+                ClosedStreamAnswer::Hold,
+                unconfigured
+            ),
+            held,
+            "owned: {owned}"
+        );
+    }
+}
+
+/// DATA or HEADERS after the peer's RST_STREAM is a stream error of type STREAM_CLOSED, on both
+/// drivers.
+#[test]
+fn frames_after_a_peer_reset_get_stream_closed() {
+    for owned in [true, false] {
+        for frame in [
+            eof_frame(FrameType::DATA, 0, 1, b"late"),
+            repeated_request(),
+        ] {
+            assert_eq!(
+                closed_stream_run(
+                    owned,
+                    &[eof_request(1, false, true), eof_reset(1)],
+                    &[frame],
+                    ClosedStreamAnswer::Hold,
+                    unconfigured
+                ),
+                stream_closed_reset(1),
+                "owned: {owned}"
+            );
+        }
+    }
+}
+
+/// A request head on a stream that closed after the peer ended it and the server answered it is
+/// a connection error of type STREAM_CLOSED, on both drivers.
+#[test]
+fn headers_on_a_closed_stream_fail_the_connection() {
+    for owned in [true, false] {
+        assert_eq!(
+            closed_stream_run(
+                owned,
+                &[eof_request(1, true, true)],
+                &[repeated_request()],
+                ClosedStreamAnswer::Respond,
+                unconfigured
+            ),
+            ClosedStreamRun {
+                resets: Vec::new(),
+                goaways: vec![(StreamId::new(1), H2ErrorCode::STREAM_CLOSED)],
+                connection_credit: 0,
+                error: Some(HttpErrorCode::STREAM_CLOSED),
+            },
+            "owned: {owned}"
+        );
+    }
+}
+
+/// RFC 9113: DATA on a stream that closed after the peer ended it and the server answered it is
+/// a stream error of type STREAM_CLOSED, on both drivers. The server resets the stream once,
+/// ignores the DATA that follows its reset, returns the connection credit of all of it, and
+/// does not fail the connection.
+#[test]
+fn data_on_a_closed_stream_is_reset_once_and_credited() {
+    for owned in [true, false] {
+        let run = closed_stream_run(
+            owned,
+            &[eof_request(1, true, true)],
+            &three_data_frames(1),
+            ClosedStreamAnswer::Respond,
+            unconfigured,
+        );
+        assert_eq!(
+            run.resets,
+            [(StreamId::new(1), H2ErrorCode::STREAM_CLOSED)],
+            "owned: {owned}: {run:?}"
+        );
+        assert!(
+            run.goaways.is_empty() && run.error.is_none(),
+            "owned: {owned}: {run:?}"
+        );
+        assert_eq!(run.connection_credit, 33_000, "owned: {owned}: {run:?}");
+    }
+}
+
+/// DATA on a stream that the server refused is ignored, on both drivers, and still returns all
+/// of its connection credit: the server neither resets the stream again nor fails the connection.
+#[test]
+fn data_after_a_refusal_is_ignored_and_credited() {
+    fn one_stream(config: &mut OwnedH2Options) {
+        config.http2.settings.push(CodecSetting {
+            identifier: SettingsId::MaxConcurrentStreams.as_u16(),
+            value: 1,
+        });
+    }
+    for owned in [true, false] {
+        let run = closed_stream_run(
+            owned,
+            &[eof_request(1, true, true), eof_request(3, false, true)],
+            &three_data_frames(3),
+            ClosedStreamAnswer::Hold,
+            one_stream,
+        );
+        assert_eq!(
+            run.resets,
+            [(StreamId::new(3), H2ErrorCode::REFUSED_STREAM)],
+            "owned: {owned}: {run:?}"
+        );
+        assert_eq!(
+            run.goaways,
+            [(StreamId::new(3), H2ErrorCode::INTERNAL_ERROR)],
+            "owned: {owned}: only the EOF fails the connection"
+        );
+        assert_eq!(run.connection_credit, 33_000, "owned: {owned}: {run:?}");
+    }
+}
+
+/// DATA on an upload that the server reset when its response failed is ignored, on both
+/// drivers, and still returns all of its connection credit.
+#[test]
+fn data_after_a_server_reset_is_ignored_and_credited() {
+    for owned in [true, false] {
+        let run = closed_stream_run(
+            owned,
+            &[eof_request(1, false, true)],
+            &three_data_frames(1),
+            ClosedStreamAnswer::Fail,
+            unconfigured,
+        );
+        assert_eq!(
+            run.resets,
+            [(StreamId::new(1), H2ErrorCode::INTERNAL_ERROR)],
+            "owned: {owned}: {run:?}"
+        );
+        assert!(run.goaways.is_empty(), "owned: {owned}: {run:?}");
+        assert_eq!(run.connection_credit, 33_000, "owned: {owned}: {run:?}");
+    }
+}
+
+/// DATA on an idle stream is a connection error of type PROTOCOL_ERROR, on both drivers.
+#[test]
+fn data_on_an_idle_stream_fails_the_connection() {
+    for owned in [true, false] {
+        assert_eq!(
+            closed_stream_run(
+                owned,
+                &[eof_request(1, true, true)],
+                &[eof_frame(FrameType::DATA, 0, 5, b"early")],
+                ClosedStreamAnswer::Hold,
+                unconfigured
+            ),
+            ClosedStreamRun {
+                resets: Vec::new(),
+                goaways: vec![(StreamId::new(1), H2ErrorCode::PROTOCOL_ERROR)],
+                connection_credit: 0,
+                error: Some(HttpErrorCode::PROTOCOL_ERROR),
+            },
+            "owned: {owned}"
+        );
+    }
+}
+
+/// The client's request on stream 1 in `client_closed_stream_run`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ClientRequest {
+    /// A GET, whose response ends the stream.
+    Get,
+    /// A POST whose upload never ends, while its response ends.
+    OpenUpload,
+    /// A GET that the client cancels once the head of its response, which does not end, arrives.
+    CancelledGet,
+}
+
+/// A request source that produces its head, if it has one, and then no body event.
+struct PendingBody(Option<HttpHeaderEvent>);
+
+impl HttpSource for PendingBody {
+    fn read_header_event(&mut self) -> LocalSourceFuture<Result<HttpHeaderEvent, HttpError>> {
+        let head = self.0.take().expect("the head is read once");
+        Box::pin(std::future::ready(Ok(head)))
+    }
+
+    fn read_body_event(
+        &mut self,
+        _maximum: u32,
+    ) -> LocalSourceFuture<Result<HttpBodyEvent, HttpError>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn stop_reading(&mut self, _error: Option<HttpErrorCode>) {}
+}
+
+/// Sends `request` from an owned upstream session (`owned`) or a `UniplexSession` client. The
+/// server answers with a 200 head, and once the client has read it, and has sent its reset and
+/// dropped the response for `ClientRequest::CancelledGet`, sends `frames` and EOF. The other
+/// responses stay held until the run ends. Returns what the client wrote.
+fn client_closed_stream_run(
+    owned: bool,
+    request: ClientRequest,
+    frames: &[Vec<u8>],
+) -> ClosedStreamRun {
+    let frames = frames.concat();
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Downstream);
+            let mut message = HttpMessage::new();
+            message.set_status_code(200).unwrap();
+            message.set_http_version(1, 1);
+            let response = eligibility_frame(
+                &mut peer,
+                EgressFrame::Headers {
+                    stream: StreamId::new(1),
+                    message: &message,
+                    end_stream: request != ClientRequest::CancelledGet,
+                    extra_headers: None,
+                },
+            );
+            let respond = Arc::new(tokio::sync::Notify::new());
+            let send_frames = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(server_settings_bytes(100)),
+                FixtureRead::WaitData(Arc::clone(&respond), response),
+                FixtureRead::WaitDataEof(Arc::clone(&send_frames), frames),
+            ]);
+            let mut config = options(context, transport);
+            config.io.drain_request_body_on_drop = false;
+            config.http2.settings.push(CodecSetting {
+                identifier: SettingsId::EnablePush.as_u16(),
+                value: 0,
+            });
+            let head = if request == ClientRequest::OpenUpload {
+                committed_test_headers(b"/", false)
+            } else {
+                let mut head = committed_test_headers(b"/", true);
+                head.headers_mut().set_method(HttpMethod::Get).unwrap();
+                head
+            };
+            let written = |condition: fn(&DecodedServerFrames) -> bool| {
+                let state = Rc::clone(&state);
+                async move {
+                    wait_until(|| {
+                        condition(&decode_client_frames(&state.borrow().writes.concat()))
+                    })
+                    .await;
+                }
+            };
+            let sent = written(|decoded| decoded.header_streams.contains(&StreamId::new(1)));
+            let reset = written(|decoded| decoded.resets.iter().any(|(id, _)| id.get() == 1));
+            let finish = async {
+                if request == ClientRequest::CancelledGet {
+                    reset.await;
+                }
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                }
+                send_frames.notify_one();
+            };
+            let ends = Duration::from_secs(5);
+            let result = if owned {
+                let (session, handle) = OwnedH2UpstreamSession::new(config).unwrap();
+                let body = if request == ClientRequest::OpenUpload {
+                    HttpSourceHolder::new(Box::new(PendingBody(None)))
+                } else {
+                    HttpSourceHolder::empty()
+                };
+                let submission = handle.reserve_request().unwrap().submit(
+                    head,
+                    body,
+                    CancellationToken::never(),
+                );
+                let exchange = async {
+                    let (_, mut source, control) = submission.await.unwrap().into_source_parts();
+                    sent.await;
+                    respond.notify_one();
+                    source.read_header_event().await.unwrap();
+                    let held = if request == ClientRequest::CancelledGet {
+                        control.cancel(HttpError::with_message(
+                            HttpErrorCode::CANCEL,
+                            b"stream aborted",
+                        ));
+                        None
+                    } else {
+                        Some((source, control))
+                    };
+                    finish.await;
+                    held
+                };
+                let (result, _held) =
+                    tokio::time::timeout(ends, async { tokio::join!(session.run(), exchange) })
+                        .await
+                        .expect("the run ends");
+                result
+            } else {
+                use crate::experimental::UniplexResponseAbortExt;
+
+                let OwnedH2Options {
+                    context,
+                    transport,
+                    io,
+                    http2,
+                } = config;
+                let (session, handle) = UniplexSession::new_http2(
+                    context,
+                    TransportDirection::Upstream,
+                    transport,
+                    None,
+                    io,
+                    http2,
+                )
+                .unwrap();
+                let exchange = async {
+                    let source = HttpSourceHolder::new(Box::new(PendingBody(Some(head))));
+                    let mut response = handle
+                        .send_request(source, CancellationToken::never())
+                        .await
+                        .unwrap();
+                    sent.await;
+                    respond.notify_one();
+                    response.source.read_header_event().await.unwrap();
+                    let held = if request == ClientRequest::CancelledGet {
+                        response.take_stream_abort().unwrap().abort();
+                        None
+                    } else {
+                        Some(response)
+                    };
+                    finish.await;
+                    held
+                };
+                let (result, _held) =
+                    tokio::time::timeout(ends, async { tokio::join!(session.run(), exchange) })
+                        .await
+                        .expect("the run ends");
+                result
+            };
+            let decoded = decode_client_frames(&state.borrow().writes.concat());
+            ClosedStreamRun {
+                connection_credit: connection_credit(&decoded),
+                resets: decoded.resets,
+                goaways: decoded.goaways,
+                error: result.err().map(|error| error.code()),
+            }
+        })
+    })
+}
+
+/// Whether the client's run ended without a connection error.
+fn ends_without_error(run: &ClosedStreamRun) -> bool {
+    run.error.is_none()
+        && run
+            .goaways
+            .iter()
+            .all(|(_, code)| *code == H2ErrorCode::NO_ERROR)
+}
+
+/// A client answers DATA on a stream whose response ended, while its upload is open or after its
+/// request ended too, with RST_STREAM(STREAM_CLOSED), and the EOF that follows ends the run
+/// without an error. It answers trailers on a stream whose request and response both ended with
+/// GOAWAY(STREAM_CLOSED). Both drivers behave the same.
+#[test]
+fn client_frames_on_ended_responses_get_stream_closed() {
+    let late = || [eof_frame(FrameType::DATA, 0, 1, b"late")];
+    let trailers = HpackEncoder::new(false).encode(&[HpackHeader::new("x-trailer", "mole")]);
+    let late_trailers = [eof_frame(
+        FrameType::HEADERS,
+        0x4 | END_STREAM,
+        1,
+        &trailers,
+    )];
+    for owned in [true, false] {
+        for request in [ClientRequest::OpenUpload, ClientRequest::Get] {
+            let run = client_closed_stream_run(owned, request, &late());
+            assert_eq!(
+                run.resets,
+                [(StreamId::new(1), H2ErrorCode::STREAM_CLOSED)],
+                "owned: {owned}: {request:?}: {run:?}"
+            );
+            assert!(
+                ends_without_error(&run),
+                "owned: {owned}: {request:?}: {run:?}"
+            );
+        }
+        assert_eq!(
+            client_closed_stream_run(owned, ClientRequest::Get, &late_trailers),
+            ClosedStreamRun {
+                resets: Vec::new(),
+                goaways: vec![(StreamId::new(0), H2ErrorCode::STREAM_CLOSED)],
+                connection_credit: 0,
+                error: Some(HttpErrorCode::STREAM_CLOSED),
+            },
+            "owned: {owned}"
+        );
+    }
+}
+
+/// A client ignores DATA after its own CANCEL reset, on both drivers, and still returns all of
+/// the DATA's connection credit. The connection then closes without an error at the EOF.
+#[test]
+fn client_data_after_its_cancel_is_ignored_and_credited() {
+    for owned in [true, false] {
+        let run =
+            client_closed_stream_run(owned, ClientRequest::CancelledGet, &three_data_frames(1));
+        assert_eq!(
+            run.resets,
+            [(StreamId::new(1), H2ErrorCode::CANCEL)],
+            "owned: {owned}: {run:?}"
+        );
+        assert!(ends_without_error(&run), "owned: {owned}: {run:?}");
+        assert_eq!(run.connection_credit, 33_000, "owned: {owned}: {run:?}");
+    }
 }

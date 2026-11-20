@@ -54,6 +54,7 @@ use roxygen_codec::H2ErrorCode;
 use roxygen_codec::HttpCodec;
 use roxygen_codec::HttpCodecCallback;
 use roxygen_codec::HttpExceptionDirection;
+use roxygen_codec::IngressStreamState;
 use roxygen_codec::OwnedEgressFrame;
 use roxygen_codec::error_adapter::h2_error_code_to_http_error_code;
 use roxygen_codec::error_adapter::http_error_code_to_h2_error_code;
@@ -135,6 +136,7 @@ use crate::http2::protocol::GoawayPhase;
 use crate::http2::protocol::PeerSetting;
 use crate::http2::protocol::SentGoaway;
 use crate::http2::protocol::connection_error_goaway_code;
+use crate::http2::protocol::ingress_reset_code;
 use crate::http2::protocol::peer_goaway_refuses;
 use crate::http2::protocol::plan_goaway;
 use crate::http2::rate_limit::RateLimitKind;
@@ -1349,6 +1351,12 @@ impl HttpCodec for DriverCodec {
         match self {
             Self::Http1(codec) => codec.has_partial_request_head(),
             Self::Http2(codec) => codec.has_partial_request_head(),
+        }
+    }
+
+    fn abandon_stream(&mut self, stream: StreamId) {
+        if let Self::Http2(codec) = self {
+            codec.abandon_stream(stream);
         }
     }
 
@@ -6038,6 +6046,74 @@ impl SessionCodecCallback<'_> {
         meta.discard
     }
 
+    /// How the session holds `stream`, read without changing it.
+    fn stream_state(&self, stream: StreamId) -> IngressStreamState {
+        if self.stream_erased(stream) {
+            return IngressStreamState::Closed;
+        }
+        let discarded = self.upgraded_source_complete(stream)
+            || match self.ingress_meta.get(&stream) {
+                Some(meta) => {
+                    meta.discard
+                        || (self.core.direction().is_downstream()
+                            && self.core.stream_if_present(stream).is_none())
+                }
+                None => true,
+            };
+        if discarded {
+            return IngressStreamState::Discarded;
+        }
+        let Some(state) = self.core.stream_if_present(stream) else {
+            return IngressStreamState::Discarded;
+        };
+        if state.ingress_cancel_requested() {
+            return IngressStreamState::Discarded;
+        }
+        match (state.ingress_eom_seen(), state.egress_complete()) {
+            (true, true) => IngressStreamState::Closed,
+            (true, false) => IngressStreamState::PeerEnded,
+            (false, _) => IngressStreamState::Open,
+        }
+    }
+
+    /// Hands a DATA frame or trailer block (`trailers`) on a discarded stream, or on one whose
+    /// request and response both ended, to the codec, which answers it as RFC 9113 requires for
+    /// a stream that is not open.
+    #[cold]
+    #[inline(never)]
+    fn closed_stream_frame(&self, stream: StreamId, trailers: bool) -> CodecCallbackAction {
+        let state = self.stream_state(stream);
+        CodecCallbackAction::ClosedStreamFrame {
+            stream,
+            state,
+            trailers,
+        }
+    }
+
+    /// Fails a stream whose source rejected its trailers, with STREAM_CLOSED once the peer had
+    /// already ended it, or hands the trailers to the codec once the response ended too.
+    #[cold]
+    #[inline(never)]
+    fn reject_trailers(&mut self, stream: StreamId) -> Option<CodecCallbackAction> {
+        let error = invalid_transition(b"ingress source rejected trailers");
+        let peer_ended = self
+            .ingress_meta
+            .get(&stream)
+            .is_some_and(|meta| meta.complete);
+        if !peer_ended {
+            self.fail(stream, error);
+        } else if self.stream_state(stream) == IngressStreamState::Closed {
+            return Some(self.closed_stream_frame(stream, true));
+        } else if self.failures.is_empty() {
+            self.failures.push(CodecFailure {
+                wire_code: Some(H2ErrorCode::STREAM_CLOSED),
+                direction: HttpExceptionDirection::Ingress,
+                ..CodecFailure::plain(stream, error)
+            });
+        }
+        None
+    }
+
     fn rate_limit_breached(&mut self, kind: RateLimitKind) -> bool {
         self.core.direction().is_downstream()
             && self
@@ -6409,6 +6485,7 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
                                 ),
                             );
                         }
+                        actions.push(self.closed_stream_frame(stream, false));
                     } else if body_length != 0
                         && let Some(pending) = self.pending_stats()
                     {
@@ -6482,6 +6559,10 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
                                 } else {
                                     self.fail(stream, error);
                                 }
+                            } else if !self.stream_is_upgraded(stream)
+                                && self.stream_state(stream) == IngressStreamState::Closed
+                            {
+                                actions.push(self.closed_stream_frame(stream, false));
                             } else if self.failures.is_empty() && !self.stream_is_upgraded(stream) {
                                 let mut error = HttpError::with_message(
                                     HttpErrorCode::INVALID_STATE_TRANSITION,
@@ -6496,7 +6577,7 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
                                     stream,
                                     error,
                                     http_status: None,
-                                    wire_code: Some(H2ErrorCode::PROTOCOL_ERROR),
+                                    wire_code: Some(H2ErrorCode::STREAM_CLOSED),
                                     direction: HttpExceptionDirection::Ingress,
                                     new_stream: false,
                                 });
@@ -6524,23 +6605,24 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
                 }
             }
             CodecEvent::TrailersComplete { stream, trailers } => {
-                if !self.stream_is_discarded(stream) {
-                    match self.core.stream(stream) {
-                        Ok(stream_state) => {
-                            if !stream_state.ingress_producer().trailers(*trailers)
-                                && !self.stream_is_upgraded(stream)
-                            {
-                                self.fail(
-                                    stream,
-                                    invalid_transition(b"ingress source rejected trailers"),
-                                );
-                            }
-                            if let Some(meta) = self.ingress_meta.get_mut(&stream) {
-                                meta.complete = true;
-                            }
-                        }
-                        Err(error) => self.fail(stream, error),
+                if self.stream_is_discarded(stream) {
+                    if self.http2.is_some() {
+                        actions.push(self.closed_stream_frame(stream, true));
                     }
+                    return actions.into();
+                }
+                match self.core.stream(stream) {
+                    Ok(stream_state) => {
+                        if !stream_state.ingress_producer().trailers(*trailers)
+                            && !self.stream_is_upgraded(stream)
+                        {
+                            actions.extend(self.reject_trailers(stream));
+                        }
+                        if let Some(meta) = self.ingress_meta.get_mut(&stream) {
+                            meta.complete = true;
+                        }
+                    }
+                    Err(error) => self.fail(stream, error),
                 }
             }
             CodecEvent::MessageComplete { stream, upgraded } => {
@@ -6881,6 +6963,10 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
 
     fn num_incoming_streams(&self) -> u32 {
         self.core.num_incoming_streams()
+    }
+
+    fn ingress_stream_state(&self, stream: StreamId) -> IngressStreamState {
+        self.stream_state(stream)
     }
 
     fn ingress_body_limit(&self, stream: StreamId) -> Option<usize> {
@@ -9724,7 +9810,11 @@ fn apply_stream_update_locked(
                     meta.discard = true;
                 }
                 let mut callback = NoopCodecCallback;
-                let wire_code = http_error_code_to_h2_error_code(code, origin.from_source());
+                let wire_code = if origin.from_source() {
+                    http_error_code_to_h2_error_code(code, true)
+                } else {
+                    ingress_reset_code(code)
+                };
                 let children = state
                     .http2
                     .as_ref()
@@ -9805,12 +9895,21 @@ fn apply_stream_update_locked(
             state.upgrade_stream_awaiting_detach = None;
         }
         let erased = state.http2.is_some();
-        if let Entry::Occupied(mut entry) = state.ingress_meta.entry(update.stream) {
-            if entry.get().complete || erased {
-                entry.remove();
-            } else {
-                entry.get_mut().discard = true;
+        let peer_ended = match state.ingress_meta.entry(update.stream) {
+            Entry::Occupied(mut entry) => {
+                let meta = entry.get();
+                let peer_ended = meta.complete && !meta.discard;
+                if meta.complete || erased {
+                    entry.remove();
+                } else {
+                    entry.get_mut().discard = true;
+                }
+                peer_ended
             }
+            Entry::Vacant(_) => false,
+        };
+        if erased && !peer_ended {
+            state.codec.abandon_stream(update.stream);
         }
         state.egress_meta.remove(&update.stream);
     }

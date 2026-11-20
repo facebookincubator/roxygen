@@ -57,6 +57,7 @@ use roxygen_codec::H2ErrorCode;
 use roxygen_codec::HttpCodec;
 use roxygen_codec::HttpCodecCallback;
 use roxygen_codec::HttpExceptionDirection;
+use roxygen_codec::IngressStreamState;
 use roxygen_codec::OwnedEgressFrame;
 use roxygen_codec::error_adapter::h2_error_code_to_http_error_code;
 use roxygen_codec::error_adapter::http_error_code_to_h2_error_code;
@@ -3880,6 +3881,21 @@ where
             )),
         }
     }
+
+    /// Hands a DATA frame or trailer block (`trailers`) that no live owner takes, or that
+    /// arrives after both the request and the response ended, to the codec, which answers it as
+    /// RFC 9113 requires for a stream that is not open.
+    #[cold]
+    #[inline(never)]
+    fn closed_stream_frame(&self, stream: StreamId, trailers: bool) -> CodecCallbackActions {
+        let state = self.ingress_stream_state(stream);
+        vec![CodecCallbackAction::ClosedStreamFrame {
+            stream,
+            state,
+            trailers,
+        }]
+        .into()
+    }
 }
 
 impl<A, const UPSTREAM: bool> HttpCodecCallback for CodecInput<'_, A, UPSTREAM>
@@ -4055,13 +4071,17 @@ where
                     .filter(|owner| !owner.reset && !owner.ingress_rejected)
                 else {
                     self.return_rejected_credit(length);
-                    return actions.into();
+                    return self.closed_stream_frame(stream, false);
                 };
                 owner.request_body_events = true;
                 owner.request_body_length = owner.request_body_length.saturating_add(length as u64);
                 if owner.producer.body(body, padding, false) == FlowControlState::Error {
                     let complete = owner.wire_ingress_complete;
+                    let closed = complete && owner.response_complete;
                     self.return_rejected_credit(length);
+                    if closed {
+                        return self.closed_stream_frame(stream, false);
+                    }
                     let mut rejected = Failure::new(
                         stream,
                         failure(
@@ -4075,7 +4095,7 @@ where
                     );
                     if complete {
                         rejected.direction = HttpExceptionDirection::Ingress;
-                        rejected.wire_code = Some(H2ErrorCode::PROTOCOL_ERROR);
+                        rejected.wire_code = Some(H2ErrorCode::STREAM_CLOSED);
                     }
                     self.fail(rejected);
                 }
@@ -4084,30 +4104,41 @@ where
                 if self.state.discarded.contains_key(&stream) {
                     return actions.into();
                 }
-                if let Some(owner) = self
+                let Some(owner) = self
                     .streams
                     .get_mut(&stream)
                     .filter(|owner| !owner.ingress_rejected)
-                {
-                    owner.request_body_events = true;
-                    // As `UniplexSession`: the source's `trailers` leaves the body open for a
-                    // later EOM, and the trailers end this message, so EOM follows them here.
-                    let accepted = owner.producer.trailers(*trailers) && owner.producer.eom();
-                    self.state.settle_ingress(owner);
-                    owner.wire_ingress_complete = true;
-                    owner.wake.enqueue();
-                    if UPSTREAM {
-                        owner.release_upstream_capacity();
+                else {
+                    return self.closed_stream_frame(stream, true);
+                };
+                let peer_ended = owner.wire_ingress_complete;
+                let closed = peer_ended && owner.response_complete;
+                owner.request_body_events = true;
+                // As `UniplexSession`: the source's `trailers` leaves the body open for a
+                // later EOM, and the trailers end this message, so EOM follows them here.
+                let accepted = owner.producer.trailers(*trailers) && owner.producer.eom();
+                self.state.settle_ingress(owner);
+                owner.wire_ingress_complete = true;
+                owner.wake.enqueue();
+                if UPSTREAM {
+                    owner.release_upstream_capacity();
+                }
+                if !accepted && closed {
+                    return self.closed_stream_frame(stream, true);
+                }
+                if !accepted {
+                    let mut rejected = Failure::new(
+                        stream,
+                        failure(
+                            HttpErrorCode::INVALID_STATE_TRANSITION,
+                            b"ingress source rejected trailers",
+                        ),
+                    );
+                    if peer_ended {
+                        rejected.direction = HttpExceptionDirection::Ingress;
+                        rejected.wire_code = Some(H2ErrorCode::STREAM_CLOSED);
                     }
-                    if !accepted {
-                        self.fail(Failure::new(
-                            stream,
-                            failure(
-                                HttpErrorCode::INVALID_STATE_TRANSITION,
-                                b"ingress source rejected trailers",
-                            ),
-                        ));
-                    }
+                    self.fail(rejected);
                 }
             }
             CodecEvent::MessageComplete { stream, .. } => {
@@ -4458,6 +4489,21 @@ where
         }
     }
 
+    fn ingress_stream_state(&self, stream: StreamId) -> IngressStreamState {
+        if self.state.discarded.contains_key(&stream) {
+            return IngressStreamState::Discarded;
+        }
+        match self.streams.get(&stream) {
+            None => IngressStreamState::Closed,
+            Some(owner) if owner.ingress_rejected => IngressStreamState::Discarded,
+            Some(owner) if owner.wire_ingress_complete && owner.response_complete => {
+                IngressStreamState::Closed
+            }
+            Some(owner) if owner.wire_ingress_complete => IngressStreamState::PeerEnded,
+            Some(_) => IngressStreamState::Open,
+        }
+    }
+
     fn observes_frame_headers(&self) -> bool {
         Self::OBSERVES_FRAME_HEADERS
     }
@@ -4687,6 +4733,9 @@ where
             if retired {
                 connection.connection.state.settle_ingress(stream);
                 connection.connection.state.consumed_streams -= 1;
+                if stream.reset || !stream.wire_ingress_complete {
+                    connection.connection.codec.abandon_stream(id);
+                }
                 Some(entry.remove())
             } else {
                 serialized = connection.serialize_polled(id, stream);

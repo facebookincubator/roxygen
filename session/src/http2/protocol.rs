@@ -93,6 +93,12 @@ pub const fn connection_error_goaway_code(code: HttpErrorCode) -> H2ErrorCode {
     }
 }
 
+/// The code of a stream reset that answers the peer's frame. As in a failed connection's
+/// GOAWAY, an HTTP/2 error code is sent unchanged.
+pub const fn ingress_reset_code(code: HttpErrorCode) -> H2ErrorCode {
+    connection_error_goaway_code(code)
+}
+
 /// The state transition following successful GOAWAY generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GoawayPhase {

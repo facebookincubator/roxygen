@@ -21,6 +21,7 @@ use roxygen_codec::H2ErrorCode;
 use roxygen_codec::HttpCodec;
 use roxygen_codec::HttpCodecCallback;
 use roxygen_codec::HttpExceptionDirection;
+use roxygen_codec::IngressStreamState;
 use roxygen_codec::OwnedEgressFrame;
 use roxygen_codec::ProxygenError;
 use roxygen_core::buf_queue::BufQueue;
@@ -9425,4 +9426,508 @@ fn consumer_shaped_heads_decode_and_reencode_identically() {
     );
     assert!(requests.iter().all(|message| message.headers().len() > 16));
     assert!(responses.iter().all(|message| message.headers().len() > 16));
+}
+
+/// A session stand-in that holds each stream in a set state and, as the drivers do, hands a
+/// DATA frame or trailer block on a stream that is not open back to the codec.
+#[derive(Default)]
+struct StreamStates {
+    trace: Trace,
+    states: Vec<(u64, IngressStreamState)>,
+}
+
+impl StreamStates {
+    fn set(&mut self, stream: u64, state: IngressStreamState) {
+        self.states.retain(|(id, _)| *id != stream);
+        self.states.push((stream, state));
+    }
+
+    fn state(&self, stream: u64) -> IngressStreamState {
+        self.states
+            .iter()
+            .find(|(id, _)| *id == stream)
+            .map_or(IngressStreamState::Open, |(_, state)| *state)
+    }
+}
+
+impl HttpCodecCallback for StreamStates {
+    fn on_event(&mut self, event: CodecEvent<'_>) {
+        self.trace.on_event(event);
+    }
+
+    fn on_ingress_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
+        let frame = match &event {
+            CodecEvent::Body { stream, .. } => Some((*stream, false)),
+            CodecEvent::TrailersComplete { stream, .. } => Some((*stream, true)),
+            _ => None,
+        };
+        self.trace.on_event(event);
+        match frame.map(|(stream, trailers)| (stream, self.state(stream.get()), trailers)) {
+            Some((stream, state, trailers)) if state != IngressStreamState::Open => {
+                vec![CodecCallbackAction::ClosedStreamFrame {
+                    stream,
+                    state,
+                    trailers,
+                }]
+                .into()
+            }
+            _ => CodecCallbackActions::new(),
+        }
+    }
+
+    fn ingress_stream_state(&self, stream: StreamId) -> IngressStreamState {
+        self.state(stream.get())
+    }
+}
+
+fn data_frame(stream: u32, length: usize) -> Vec<u8> {
+    let mut wire = BufQueue::new(64 * 1024);
+    frame::write_data(
+        &mut wire,
+        queue(&vec![b'x'; length]),
+        stream,
+        None,
+        false,
+        false,
+    )
+    .unwrap();
+    bytes(&wire)
+}
+
+fn reset_frame(stream: u32) -> Vec<u8> {
+    let mut wire = BufQueue::new(64);
+    frame::write_rst_stream(&mut wire, stream, H2ErrorCode::CANCEL).unwrap();
+    bytes(&wire)
+}
+
+/// The RST_STREAM frames in `egress`, as stream and code.
+fn written_resets(egress: &BufQueue) -> Vec<(u32, H2ErrorCode)> {
+    let mut egress = queue(&bytes(egress));
+    std::iter::from_fn(|| parse_frame(&mut egress).unwrap())
+        .filter_map(|parsed| match parsed.frame {
+            Frame::RstStream(code) => Some((parsed.header.stream, code)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A server codec that has read GETs on streams 1 through 11 and then reset stream 3 itself,
+/// read the peer's reset of stream 5, and been told that the session abandoned stream 7. The
+/// session holds 1, 3, 5 and 7 as closed, 9 as ended by the peer, and 11 as discarded.
+fn closed_stream_server() -> (Http2Codec, StreamStates) {
+    let mut codec = Http2Codec::new(TransportDirection::Downstream);
+    let mut states = StreamStates::default();
+    open(&mut codec, &mut states.trace);
+    let mut wire: Vec<u8> = [1, 3, 5, 7, 9, 11]
+        .into_iter()
+        .flat_map(|stream| encoded_headers(stream, &request_fields(b"/"), true))
+        .collect();
+    wire.extend(reset_frame(5));
+    let mut egress = BufQueue::new(64 * 1024);
+    assert_eq!(
+        codec
+            .on_ingress(&queue(&wire), &mut states, &mut egress)
+            .consumed,
+        wire.len()
+    );
+    codec
+        .generate(
+            &mut egress,
+            EgressFrame::Reset {
+                stream: StreamId::new(3),
+                code: H2ErrorCode::INTERNAL_ERROR,
+            },
+            &mut Trace::default(),
+        )
+        .unwrap();
+    codec.abandon_stream(StreamId::new(7));
+    states.states = vec![
+        (1, IngressStreamState::Closed),
+        (3, IngressStreamState::Closed),
+        (5, IngressStreamState::Closed),
+        (7, IngressStreamState::Closed),
+        (9, IngressStreamState::PeerEnded),
+        (11, IngressStreamState::Discarded),
+    ];
+    states.trace.events.clear();
+    (codec, states)
+}
+
+/// Feeds `wire` to `codec` and returns the errors it reported and the resets it wrote.
+fn closed_stream_answers(
+    codec: &mut Http2Codec,
+    states: &mut StreamStates,
+    wire: &[u8],
+) -> (Vec<Seen>, Vec<(u32, H2ErrorCode)>) {
+    let mut egress = BufQueue::new(64 * 1024);
+    let result = codec.on_ingress(&queue(wire), states, &mut egress);
+    assert!(result.egress_results.iter().all(Result::is_ok));
+    let errors = std::mem::take(&mut states.trace.events)
+        .into_iter()
+        .filter(|event| matches!(event, Seen::Error(..)))
+        .collect();
+    (errors, written_resets(&egress))
+}
+
+/// RFC 9113: DATA on a stream that the peer ended (half-closed (remote)) or reset, or that closed
+/// after the peer ended it, is a stream error of type STREAM_CLOSED, and on an idle stream a
+/// connection error of type PROTOCOL_ERROR. DATA that arrives after this endpoint reset the
+/// stream, or on a stream that the session abandoned or discards without a reset, is ignored.
+#[test]
+fn data_on_closed_streams_gets_stream_closed() {
+    let connection_error = |code| vec![Seen::Error(0, Some(code), None, false)];
+    let reset = |stream| vec![(stream, H2ErrorCode::STREAM_CLOSED)];
+    let cases: [(u32, Vec<Seen>, Vec<(u32, H2ErrorCode)>); 8] = [
+        (1, vec![], reset(1)),
+        (3, vec![], vec![]),
+        (5, vec![], reset(5)),
+        (7, vec![], vec![]),
+        (
+            9,
+            vec![Seen::Error(
+                9,
+                Some(H2ErrorCode::STREAM_CLOSED),
+                None,
+                false,
+            )],
+            vec![],
+        ),
+        (11, vec![], vec![]),
+        // Streams 13 and 15 are idle.
+        (13, connection_error(H2ErrorCode::PROTOCOL_ERROR), vec![]),
+        (15, connection_error(H2ErrorCode::PROTOCOL_ERROR), vec![]),
+    ];
+    for (stream, errors, resets) in cases {
+        let (mut codec, mut states) = closed_stream_server();
+        states.set(13, IngressStreamState::Closed);
+        states.set(15, IngressStreamState::Discarded);
+        assert_eq!(
+            closed_stream_answers(&mut codec, &mut states, &data_frame(stream, 4)),
+            (errors, resets),
+            "stream {stream}"
+        );
+    }
+}
+
+/// The STREAM_CLOSED reset that answers DATA after the peer's reset, or after both ends ended
+/// the stream, counts as this endpoint's reset, so later DATA and header blocks on the stream
+/// are ignored, and a discarded stream that the peer reset gets the same reset.
+#[test]
+fn a_stream_closed_reset_is_sent_once() {
+    for stream in [1, 5] {
+        let (mut codec, mut states) = closed_stream_server();
+        let wire = [
+            data_frame(stream, 4),
+            data_frame(stream, 4),
+            encoded_headers(stream, &request_fields(b"/again"), true),
+            data_frame(stream, 4),
+        ]
+        .concat();
+        assert_eq!(
+            closed_stream_answers(&mut codec, &mut states, &wire),
+            (vec![], vec![(stream, H2ErrorCode::STREAM_CLOSED)]),
+            "stream {stream}"
+        );
+    }
+
+    let (mut codec, mut states) = closed_stream_server();
+    states.set(5, IngressStreamState::Discarded);
+    assert_eq!(
+        closed_stream_answers(&mut codec, &mut states, &data_frame(5, 4)),
+        (vec![], vec![(5, H2ErrorCode::STREAM_CLOSED)])
+    );
+}
+
+/// A request head sent again on a stream that is not open fails as a frame on that stream
+/// would, rather than as malformed trailers: STREAM_CLOSED for a stream the peer ended or
+/// reset, or that closed after the peer ended it, and nothing after this endpoint's reset. On
+/// an open stream the block is still malformed trailers, a PROTOCOL_ERROR stream error.
+#[test]
+fn headers_on_closed_streams_get_stream_closed() {
+    let headers = |stream| encoded_headers(stream, &request_fields(b"/again"), true);
+    let cases = [
+        (
+            1,
+            vec![Seen::Error(
+                0,
+                Some(H2ErrorCode::STREAM_CLOSED),
+                None,
+                false,
+            )],
+            vec![],
+        ),
+        (3, vec![], vec![]),
+        (5, vec![], vec![(5, H2ErrorCode::STREAM_CLOSED)]),
+        (
+            9,
+            vec![Seen::Error(
+                9,
+                Some(H2ErrorCode::STREAM_CLOSED),
+                None,
+                false,
+            )],
+            vec![],
+        ),
+        (11, vec![], vec![]),
+    ];
+    for (stream, errors, resets) in cases {
+        let (mut codec, mut states) = closed_stream_server();
+        assert_eq!(
+            closed_stream_answers(&mut codec, &mut states, &headers(stream)),
+            (errors, resets),
+            "stream {stream}"
+        );
+    }
+
+    let (mut codec, mut states) = closed_stream_server();
+    states.states.clear();
+    let (errors, resets) = closed_stream_answers(&mut codec, &mut states, &headers(1));
+    assert!(
+        matches!(
+            errors.as_slice(),
+            [Seen::Error(
+                1,
+                Some(H2ErrorCode::PROTOCOL_ERROR),
+                None,
+                true
+            )]
+        ),
+        "{errors:?}"
+    );
+    assert_eq!(resets, []);
+}
+
+/// A stream id below the peer's highest that the peer never opened is answered as a stream that
+/// closed after both ends, because the session holds neither: DATA gets RST_STREAM(STREAM_CLOSED),
+/// and a request head fails the connection with STREAM_CLOSED. RFC 9113 asks for PROTOCOL_ERROR
+/// on such an unexpected request head.
+#[test]
+fn frames_on_a_skipped_stream_get_stream_closed() {
+    let cases = [
+        (
+            encoded_headers(3, &request_fields(b"/"), true),
+            vec![Seen::Error(
+                0,
+                Some(H2ErrorCode::STREAM_CLOSED),
+                None,
+                false,
+            )],
+            vec![],
+        ),
+        (
+            data_frame(3, 4),
+            vec![],
+            vec![(3, H2ErrorCode::STREAM_CLOSED)],
+        ),
+    ];
+    for (frame, errors, resets) in cases {
+        let mut codec = Http2Codec::new(TransportDirection::Downstream);
+        let mut states = StreamStates::default();
+        open(&mut codec, &mut states.trace);
+        let opened = encoded_headers(5, &request_fields(b"/"), true);
+        let mut egress = BufQueue::new(64 * 1024);
+        assert_eq!(
+            codec
+                .on_ingress(&queue(&opened), &mut states, &mut egress)
+                .consumed,
+            opened.len()
+        );
+        states.set(3, IngressStreamState::Closed);
+        states.trace.events.clear();
+        assert_eq!(
+            closed_stream_answers(&mut codec, &mut states, &frame),
+            (errors, resets)
+        );
+    }
+}
+
+/// Valid trailers on a stream that is not open are answered as a repeated request head is: a
+/// reset after the peer's reset, and a connection error once both ends ended the stream, where
+/// DATA gets a reset.
+#[test]
+fn trailers_on_closed_streams_get_stream_closed() {
+    let trailers = |stream| {
+        encoded_headers(
+            stream,
+            &[HpackHeader::new(b"x-trailer", b"guacamole")],
+            true,
+        )
+    };
+    let (mut codec, mut states) = closed_stream_server();
+    assert_eq!(
+        closed_stream_answers(&mut codec, &mut states, &trailers(5)),
+        (vec![], vec![(5, H2ErrorCode::STREAM_CLOSED)])
+    );
+    let (mut codec, mut states) = closed_stream_server();
+    assert_eq!(
+        closed_stream_answers(&mut codec, &mut states, &trailers(1)),
+        (
+            vec![Seen::Error(
+                0,
+                Some(H2ErrorCode::STREAM_CLOSED),
+                None,
+                false
+            )],
+            vec![]
+        )
+    );
+}
+
+/// A header block that the codec discards still updates the HPACK decoder, so a later block
+/// that refers to the entries it added decodes.
+#[test]
+fn an_ignored_header_block_keeps_the_hpack_decoder_in_step() {
+    let (mut codec, mut states) = closed_stream_server();
+    let mut encoder = HpackCodec::new();
+    let custom = [HpackHeader::new(b"x-custom", b"salsa-verde")];
+    let mut wire = BufQueue::new(4096);
+    let ignored = [request_fields(b"/again"), custom.to_vec()].concat();
+    frame::write_headers(
+        &mut wire,
+        queue(&encoder.encode(&ignored)),
+        3,
+        None,
+        true,
+        true,
+    )
+    .unwrap();
+    let next = [request_fields(b"/next"), custom.to_vec()].concat();
+    let block = encoder.encode(&next);
+    frame::write_headers(&mut wire, queue(&block), 13, None, true, true).unwrap();
+    let mut egress = BufQueue::new(64 * 1024);
+    let wire = bytes(&wire);
+    let result = codec.on_ingress(&queue(&wire), &mut states, &mut egress);
+    assert_eq!(result.consumed, wire.len());
+    states
+        .trace
+        .events
+        .retain(|event| !matches!(event, Seen::Frame(..)));
+    assert_eq!(
+        states.trace.events,
+        [
+            Seen::Begin(13),
+            Seen::Headers(13, true, 0, b"/next".to_vec()),
+            Seen::Complete(13),
+        ]
+    );
+    assert!(
+        block.len() < HpackCodec::new().encode(&next).len(),
+        "the second block refers to the dynamic table"
+    );
+}
+
+/// The record of closed streams is bounded. After it evicts a stream, DATA on that stream or
+/// on any lower stream is ignored, while a higher stream that closed after the peer ended it
+/// still gets a reset.
+#[test]
+fn forgotten_closed_streams_are_ignored() {
+    let mut codec = Http2Codec::new(TransportDirection::Downstream);
+    let mut states = StreamStates::default();
+    open(&mut codec, &mut states.trace);
+    let streams: Vec<u32> = (0..140).map(|index| 2 * index + 1).collect();
+    let wire: Vec<u8> = streams
+        .iter()
+        .flat_map(|stream| encoded_headers(*stream, &request_fields(b"/"), true))
+        .collect();
+    let mut egress = BufQueue::new(1 << 20);
+    assert_eq!(
+        codec
+            .on_ingress(&queue(&wire), &mut states, &mut egress)
+            .consumed,
+        wire.len()
+    );
+    // The first two and the last stream close after the peer ended them; this endpoint resets
+    // the rest, more than the record keeps.
+    let (&highest, reset) = streams[2..].split_last().unwrap();
+    for stream in reset {
+        codec
+            .generate(
+                &mut egress,
+                EgressFrame::Reset {
+                    stream: StreamId::new(u64::from(*stream)),
+                    code: H2ErrorCode::CANCEL,
+                },
+                &mut Trace::default(),
+            )
+            .unwrap();
+    }
+    for stream in &streams {
+        states.set(u64::from(*stream), IngressStreamState::Closed);
+    }
+    states.trace.events.clear();
+    for stream in [1, 3, 5, highest - 2] {
+        assert_eq!(
+            closed_stream_answers(&mut codec, &mut states, &data_frame(stream, 4)),
+            (vec![], vec![]),
+            "stream {stream}"
+        );
+    }
+    assert_eq!(
+        closed_stream_answers(&mut codec, &mut states, &data_frame(highest, 4)),
+        (vec![], vec![(highest, H2ErrorCode::STREAM_CLOSED)])
+    );
+}
+
+/// After its final GOAWAY a server ignores the peer's new streams, so DATA on a stream above the
+/// last one it accepted is ignored rather than treated as DATA on an idle stream.
+#[test]
+fn data_on_a_stream_after_the_final_goaway_is_ignored() {
+    let (mut codec, mut states) = closed_stream_server();
+    codec
+        .generate(
+            &mut BufQueue::new(1024),
+            EgressFrame::Goaway {
+                last_stream: StreamId::new(11),
+                code: H2ErrorCode::NO_ERROR,
+                debug_data: None,
+            },
+            &mut Trace::default(),
+        )
+        .unwrap();
+    states.set(13, IngressStreamState::Closed);
+    assert_eq!(
+        closed_stream_answers(&mut codec, &mut states, &data_frame(13, 4)),
+        (vec![], vec![])
+    );
+}
+
+/// A client answers frames on its own streams as a server does: on a stream that closed after
+/// the server ended it, DATA gets RST_STREAM(STREAM_CLOSED) and trailers fail the connection,
+/// and DATA on a stream that the client has not opened is DATA on an idle stream.
+#[test]
+fn client_data_on_closed_and_idle_streams() {
+    let connection_error = |code| vec![Seen::Error(0, Some(code), None, false)];
+    let trailers = encoded_headers(1, &[HpackHeader::new(b"x-trailer", b"mole")], true);
+    let cases = [
+        (
+            data_frame(1, 4),
+            vec![],
+            vec![(1, H2ErrorCode::STREAM_CLOSED)],
+        ),
+        (
+            trailers,
+            connection_error(H2ErrorCode::STREAM_CLOSED),
+            vec![],
+        ),
+        (
+            data_frame(3, 4),
+            connection_error(H2ErrorCode::PROTOCOL_ERROR),
+            vec![],
+        ),
+    ];
+    for (frame, errors, resets) in cases {
+        let mut codec = Http2Codec::new(TransportDirection::Upstream);
+        let mut states = StreamStates::default();
+        assert_eq!(codec.create_stream(), StreamId::new(1));
+        open(&mut codec, &mut states.trace);
+        states.states = vec![
+            (1, IngressStreamState::Closed),
+            (3, IngressStreamState::Closed),
+        ];
+        states.trace.events.clear();
+        assert_eq!(
+            closed_stream_answers(&mut codec, &mut states, &frame),
+            (errors, resets)
+        );
+    }
 }

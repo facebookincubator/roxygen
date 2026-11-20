@@ -23,6 +23,7 @@
 //! The codec also handles server push, extended `CONNECT` (RFC 8441), RFC 9218 priority
 //! updates, and graceful shutdown with GOAWAY.
 
+mod closed_streams;
 pub mod codec_impl;
 pub mod constants;
 pub mod flow_control;

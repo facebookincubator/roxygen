@@ -363,6 +363,29 @@ pub enum CodecCallbackAction {
         frame: OwnedEgressFrame,
         interceptors: Vec<Rc<dyn CodecCallbackGenerateInterceptor>>,
     },
+    /// The callback discarded the DATA frame, or with `trailers` the trailer block, just
+    /// delivered on `stream`, a stream in `state` other than [`IngressStreamState::Open`]. The
+    /// HTTP/2 codec answers the frame as RFC 9113 requires for a stream that is not open; other
+    /// codecs ignore it.
+    ClosedStreamFrame {
+        stream: StreamId,
+        state: IngressStreamState,
+        trailers: bool,
+    },
+}
+
+/// How a callback holds a stream that the peer sends on, for the frames that RFC 9113 limits
+/// on a stream that is not open.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngressStreamState {
+    /// The peer may still send on the stream.
+    Open,
+    /// The peer ended the stream, which is still open locally: half-closed (remote).
+    PeerEnded,
+    /// The callback keeps the stream but discards the peer's frames on it.
+    Discarded,
+    /// Both ends ended the stream, or the callback no longer keeps it.
+    Closed,
 }
 
 /// Ordered controls requested by one synchronous ingress callback.
@@ -418,7 +441,8 @@ impl CodecCallbackActions {
             CodecCallbackAction::InterceptedGenerate { interceptors, .. } => {
                 interceptors.push(Rc::clone(&interceptor));
             }
-            CodecCallbackAction::SetParserPaused(_) => {}
+            CodecCallbackAction::SetParserPaused(_)
+            | CodecCallbackAction::ClosedStreamFrame { .. } => {}
         });
     }
 }
@@ -594,6 +618,13 @@ pub trait HttpCodecCallback {
         0
     }
 
+    /// How the callback holds `stream`. The HTTP/2 codec asks only before it fails a trailer
+    /// block as malformed, so that a header block on a stream that is not open gets the error
+    /// RFC 9113 gives a closed stream.
+    fn ingress_stream_state(&self, _stream: StreamId) -> IngressStreamState {
+        IngressStreamState::Open
+    }
+
     /// Returns the most body bytes the codec may deliver for `stream` before it calls this
     /// again, or `None` for no limit.
     ///
@@ -694,6 +725,11 @@ pub trait HttpCodec {
         false
     }
 
+    /// Notes that the session dropped `stream` before the peer ended it, and that neither side
+    /// reset it. The HTTP/2 codec then discards the peer's later frames on the stream, as it
+    /// does after a reset that it sent. Other codecs ignore it.
+    fn abandon_stream(&mut self, _stream: StreamId) {}
+
     /// Serialize one operation and return exact wire-size and offset metadata.
     fn generate(
         &mut self,
@@ -744,6 +780,7 @@ pub trait HttpCodec {
                         .for_each(|interceptor| interceptor.after_generate(&result));
                     Some(result)
                 }
+                CodecCallbackAction::ClosedStreamFrame { .. } => None,
             })
             .collect();
         CodecCallbackResult { egress_results }
@@ -1218,6 +1255,10 @@ impl HttpCodecCallback for FilteredCallback<'_> {
     fn ingress_body_limit(&self, stream: StreamId) -> Option<usize> {
         self.callback.ingress_body_limit(stream)
     }
+
+    fn ingress_stream_state(&self, stream: StreamId) -> IngressStreamState {
+        self.callback.ingress_stream_state(stream)
+    }
 }
 
 struct QueryTail<'a> {
@@ -1619,6 +1660,10 @@ impl HttpCodec for HttpCodecFilterChain {
 
     fn has_partial_request_head(&self) -> bool {
         self.destination.has_partial_request_head()
+    }
+
+    fn abandon_stream(&mut self, stream: StreamId) {
+        self.destination.abandon_stream(stream);
     }
 
     fn set_parser_paused(&mut self, paused: bool) {

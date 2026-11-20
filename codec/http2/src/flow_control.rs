@@ -21,6 +21,7 @@ use roxygen_codec::HttpCodec;
 use roxygen_codec::HttpCodecCallback;
 use roxygen_codec::HttpException;
 use roxygen_codec::HttpExceptionDirection;
+use roxygen_codec::IngressStreamState;
 use roxygen_codec::OwnedEgressFrame;
 use roxygen_core::buf_queue::BufQueue;
 use roxygen_core::error::HttpError;
@@ -485,6 +486,10 @@ impl HttpCodecCallback for FlowControlledCallback<'_> {
         self.callback.num_incoming_streams()
     }
 
+    fn ingress_stream_state(&self, stream: StreamId) -> IngressStreamState {
+        self.callback.ingress_stream_state(stream)
+    }
+
     fn observes_frame_headers(&self) -> bool {
         self.callback.observes_frame_headers()
     }
@@ -513,6 +518,10 @@ impl HttpCodec for FlowControlledCodec {
 
     fn has_partial_request_head(&self) -> bool {
         HttpCodec::has_partial_request_head(self.codec.as_ref())
+    }
+
+    fn abandon_stream(&mut self, stream: StreamId) {
+        HttpCodec::abandon_stream(self.codec.as_mut(), stream);
     }
 
     fn set_parser_paused(&mut self, paused: bool) {

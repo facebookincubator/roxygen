@@ -13,6 +13,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use roxygen_codec::CodecCallbackAction;
+use roxygen_codec::CodecCallbackActions;
 use roxygen_codec::CodecCapabilities;
 use roxygen_codec::CodecEvent;
 use roxygen_codec::CodecIngressResult;
@@ -24,6 +26,8 @@ use roxygen_codec::HttpCodec;
 use roxygen_codec::HttpCodecCallback;
 use roxygen_codec::HttpException;
 use roxygen_codec::HttpExceptionDirection;
+use roxygen_codec::IngressStreamState;
+use roxygen_codec::OwnedEgressFrame;
 use roxygen_codec::ProxygenError;
 use roxygen_core::buf_queue::BufQueue;
 use roxygen_core::error::HttpError;
@@ -43,6 +47,9 @@ use roxygen_core::priority::HttpPriority;
 use roxygen_core::priority::http_priority_from_string;
 use roxygen_core::priority::http_priority_to_string;
 
+use crate::closed_streams::ClosedBy;
+use crate::closed_streams::ClosedStreams;
+use crate::closed_streams::Recorded;
 use crate::constants::CONNECTION_PREFACE;
 use crate::constants::FRAME_HEADER_SIZE;
 use crate::constants::INITIAL_WINDOW;
@@ -305,6 +312,7 @@ pub struct Http2Codec {
     header_block: Option<HeaderBlockState>,
     pending_end_stream: Option<u32>,
     upgraded_streams: HashSet<u32>,
+    closed_streams: ClosedStreams,
     pending_table_max_size: Option<u32>,
     fatal_error: Option<H2ErrorCode>,
     add_date_to_response: bool,
@@ -351,6 +359,7 @@ impl Http2Codec {
             header_block: None,
             pending_end_stream: None,
             upgraded_streams: HashSet::new(),
+            closed_streams: ClosedStreams::default(),
             pending_table_max_size: None,
             fatal_error: None,
             add_date_to_response: true,
@@ -561,9 +570,144 @@ impl Http2Codec {
         if actions.is_empty() {
             return;
         }
+        self.apply_actions(actions, callback, callback_egress, result);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn apply_actions(
+        &mut self,
+        mut actions: CodecCallbackActions,
+        callback: &mut dyn HttpCodecCallback,
+        callback_egress: &mut BufQueue,
+        result: &mut CodecIngressResult,
+    ) {
+        let mut closed_stream_frame = None;
+        actions.retain(|action| match action {
+            CodecCallbackAction::ClosedStreamFrame {
+                stream,
+                state,
+                trailers,
+            } => {
+                closed_stream_frame = Some((*stream, *state, *trailers));
+                false
+            }
+            _ => true,
+        });
         let callback_result =
             HttpCodec::apply_callback_actions(self, actions, callback, callback_egress);
         result.append_callback_result(callback_result);
+        if let Some((stream, state, trailers)) = closed_stream_frame
+            && let Ok(stream) = u32::try_from(stream.get())
+        {
+            self.answer_closed_stream_frame(
+                stream,
+                state,
+                trailers,
+                callback,
+                callback_egress,
+                result,
+            );
+        }
+    }
+
+    /// Answers a DATA frame or header block (`trailers`) on a stream that is not open. A stream
+    /// that the peer ended but that is still open locally, or that the peer reset, gets
+    /// RST_STREAM(STREAM_CLOSED). On a request stream that closed after the peer ended it, or on
+    /// a lower stream id that the peer never opened, which the codec cannot tell apart from it,
+    /// DATA gets the same reset, and a header block fails the connection with STREAM_CLOSED,
+    /// though RFC 9113 asks for PROTOCOL_ERROR on a stream id that the peer skipped. A frame on
+    /// an idle stream fails the connection with PROTOCOL_ERROR. The frame is ignored after this
+    /// endpoint's reset or stream error, on a stream that the session abandoned, and on one whose
+    /// close the record forgot.
+    #[cold]
+    #[inline(never)]
+    fn answer_closed_stream_frame(
+        &mut self,
+        stream: u32,
+        state: IngressStreamState,
+        trailers: bool,
+        callback: &mut dyn HttpCodecCallback,
+        callback_egress: &mut BufQueue,
+        result: &mut CodecIngressResult,
+    ) {
+        let reset = match state {
+            IngressStreamState::Open => return,
+            IngressStreamState::PeerEnded => {
+                self.stream_error(
+                    stream,
+                    H2ErrorCode::STREAM_CLOSED,
+                    b"frame on a stream that the peer ended",
+                    false,
+                    None,
+                    callback,
+                    callback_egress,
+                    result,
+                );
+                return;
+            }
+            IngressStreamState::Discarded | IngressStreamState::Closed
+                if self.is_idle_stream(stream) =>
+            {
+                // After the final GOAWAY the peer's new streams never open, and frames on them
+                // are ignored.
+                if self.parallel.is_initiated_stream(stream)
+                    || self.parallel.closing_state() != ClosingState::Closed
+                {
+                    self.connection_error(
+                        H2ErrorCode::PROTOCOL_ERROR,
+                        b"frame on an idle stream",
+                        callback,
+                        callback_egress,
+                        result,
+                    );
+                }
+                return;
+            }
+            IngressStreamState::Discarded => matches!(
+                self.closed_streams.lookup(stream),
+                Recorded::Closed(ClosedBy::PeerReset)
+            ),
+            IngressStreamState::Closed => match self.closed_streams.lookup(stream) {
+                Recorded::Closed(ClosedBy::PeerReset) => true,
+                Recorded::Closed(_) | Recorded::Forgotten => false,
+                // A client can ignore a pushed stream without resetting it.
+                Recorded::Unrecorded if stream.is_multiple_of(2) => false,
+                // RFC 9113 makes DATA here a stream error, and lets other frames on a closed
+                // stream fail the connection.
+                Recorded::Unrecorded if !trailers => true,
+                Recorded::Unrecorded => {
+                    self.connection_error(
+                        H2ErrorCode::STREAM_CLOSED,
+                        b"frame on a stream that closed after the peer ended it",
+                        callback,
+                        callback_egress,
+                        result,
+                    );
+                    return;
+                }
+            },
+        };
+        if reset {
+            let reset = CodecCallbackActions::from(vec![CodecCallbackAction::Generate(
+                OwnedEgressFrame::Reset {
+                    stream: StreamId::new(u64::from(stream)),
+                    code: H2ErrorCode::STREAM_CLOSED,
+                },
+            )]);
+            let callback_result =
+                HttpCodec::apply_callback_actions(self, reset, callback, callback_egress);
+            result.append_callback_result(callback_result);
+        }
+    }
+
+    /// Whether neither side has opened `stream` yet.
+    fn is_idle_stream(&self, stream: u32) -> bool {
+        if self.parallel.is_initiated_stream(stream) {
+            stream >= self.parallel.next_egress_stream_id()
+        } else {
+            stream > self.parallel.last_incoming_stream_id()
+        }
     }
 
     #[cold]
@@ -608,6 +752,8 @@ impl Http2Codec {
         callback_egress: &mut BufQueue,
         result: &mut CodecIngressResult,
     ) {
+        // The session answers a stream error with a reset, perhaps only after this call returns.
+        self.closed_streams.record(stream, ClosedBy::LocalReset);
         let mut error = HttpException::new(HttpExceptionDirection::IngressAndEgress, message);
         error.set_codec_status_code(code);
         error.set_partial_message(partial_message);
@@ -909,6 +1055,8 @@ impl Http2Codec {
             FrameType::RST_STREAM => {
                 let code = frame::parse_rst_stream_cursor(payload, &header).map_err(frame_error)?;
                 self.remove_upgraded_stream(header.stream);
+                self.closed_streams
+                    .record(header.stream, ClosedBy::PeerReset);
                 self.dispatch(
                     callback,
                     callback_egress,
@@ -1409,6 +1557,21 @@ impl Http2Codec {
         callback_egress: &mut BufQueue,
         result: &mut CodecIngressResult,
     ) {
+        if trailers && let HeaderBlockKind::Headers { stream, .. } = kind {
+            let state = callback.ingress_stream_state(StreamId::new(u64::from(stream)));
+            if state != IngressStreamState::Open {
+                self.answer_closed_stream_frame(
+                    stream,
+                    state,
+                    true,
+                    callback,
+                    callback_egress,
+                    result,
+                );
+                self.pending_end_stream = None;
+                return;
+            }
+        }
         let (stream, downstream_headers) = match kind {
             HeaderBlockKind::Headers { stream, .. } => (
                 stream,
@@ -2145,6 +2308,7 @@ impl Http2Codec {
             self.pending_end_stream = None;
         }
         self.remove_upgraded_stream(stream);
+        self.closed_streams.record(stream, ClosedBy::LocalReset);
         Self::generated_frame(callback, stream, FrameType::RST_STREAM, written);
         Ok(simple_generated(written))
     }
@@ -2511,6 +2675,12 @@ impl HttpCodec for Http2Codec {
                     } if self.parallel.stream_allowed(stream)
                 )
         })
+    }
+
+    fn abandon_stream(&mut self, stream: StreamId) {
+        if let Ok(stream) = u32::try_from(stream.get()) {
+            self.closed_streams.record(stream, ClosedBy::Abandoned);
+        }
     }
 
     fn generate(
