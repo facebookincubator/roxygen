@@ -31,6 +31,7 @@ use crate::external_host_tests::YieldMode;
 use crate::external_host_tests::after_forced_teardown;
 use crate::external_host_tests::forced_teardown_of_scope;
 use crate::http2::StreamReceiveWindowMode;
+use crate::http2::protocol::connection_error_goaway_code;
 use crate::owned::PanicSite;
 use crate::owned::take_contained_panics;
 use crate::owned_h2::OWNER_POLLS_PER_TURN;
@@ -3049,6 +3050,192 @@ fn uniplex_eof_aborts_a_held_stream_after_a_refusal_found_no_room() {
             );
         })
     });
+}
+
+/// Serves `input`, read with EOF, on the owned driver (`owned`) or `UniplexSession`, as a
+/// client when `upstream` is set, and returns the GOAWAYs written and the session's error.
+fn failed_connection_goaways(
+    owned: bool,
+    upstream: bool,
+    input: Vec<u8>,
+) -> (Vec<(StreamId, H2ErrorCode)>, Option<HttpErrorCode>) {
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let (transport, state) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+            let mut config = options(context, transport);
+            if upstream {
+                config.io.drain_request_body_on_drop = false;
+                config.http2.settings.push(CodecSetting {
+                    identifier: SettingsId::EnablePush.as_u16(),
+                    value: 0,
+                });
+            }
+            let run = async {
+                if owned && upstream {
+                    let (session, _handle) = OwnedH2UpstreamSession::new(config).unwrap();
+                    return session.run().await;
+                }
+                if owned {
+                    let (session, _) =
+                        OwnedH2Session::new(HeldApplication(Rc::default()), config).unwrap();
+                    return session.run().await;
+                }
+                let OwnedH2Options {
+                    context,
+                    transport,
+                    io,
+                    http2,
+                } = config;
+                let (direction, handler) = if upstream {
+                    (TransportDirection::Upstream, None)
+                } else {
+                    let handler: Rc<dyn HttpHandler> = Rc::new(HeldStreamHandler(Rc::default()));
+                    (TransportDirection::Downstream, Some(handler))
+                };
+                let (session, _handle) =
+                    UniplexSession::new_http2(context, direction, transport, handler, io, http2)
+                        .unwrap();
+                session.run().await
+            };
+            let result = tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection error ends the run");
+            let wire = state.borrow().writes.concat();
+            let decoded = if upstream {
+                decode_client_frames(&wire)
+            } else {
+                decode_server_frames(&wire)
+            };
+            (decoded.goaways, result.err().map(|error| error.code()))
+        })
+    })
+}
+
+/// A failed connection's GOAWAY carries the HTTP/2 code of the codec's connection error, on
+/// both drivers, as a server and as a client. The session's error has the same code. The
+/// HEADERS frame opens stream 1, so a server's GOAWAY names it as the last stream.
+#[test]
+fn connection_error_goaways_carry_the_error_code() {
+    let cases = [
+        // A SETTINGS payload is a multiple of 6 octets.
+        (
+            eof_frame(FrameType::SETTINGS, 0, 0, &[0; 3]),
+            0,
+            H2ErrorCode::FRAME_SIZE_ERROR,
+            HttpErrorCode::FRAME_SIZE_ERROR,
+        ),
+        // HPACK does not use index 0.
+        (
+            eof_frame(FrameType::HEADERS, END_STREAM | END_HEADERS, 1, &[0x80]),
+            1,
+            H2ErrorCode::COMPRESSION_ERROR,
+            HttpErrorCode::COMPRESSION_ERROR,
+        ),
+        // INITIAL_WINDOW_SIZE is at most 2^31-1.
+        (
+            eof_frame(FrameType::SETTINGS, 0, 0, &[0, 4, 0x80, 0, 0, 0]),
+            0,
+            H2ErrorCode::FLOW_CONTROL_ERROR,
+            HttpErrorCode::FLOW_CONTROL_ERROR,
+        ),
+    ];
+    for upstream in [false, true] {
+        for (frame, stream, wire_code, code) in &cases {
+            let mut input = if upstream {
+                Vec::new()
+            } else {
+                CONNECTION_PREFACE.to_vec()
+            };
+            input.extend(eof_frame(FrameType::SETTINGS, 0, 0, &[]));
+            input.extend(frame);
+            let last = StreamId::new(if upstream { 0 } else { *stream });
+            for owned in [true, false] {
+                assert_eq!(
+                    failed_connection_goaways(owned, upstream, input.clone()),
+                    (vec![(last, *wire_code)], Some(*code)),
+                    "{code:?}, owned {owned}, upstream {upstream}"
+                );
+            }
+        }
+    }
+}
+
+/// A peer's GOAWAY with an error code fails the connection with that code, but the GOAWAY sent
+/// in reply carries NO_ERROR, on both drivers, as a server and as a client. The error is the
+/// peer's, so the reply does not repeat it. A server's reply names its open request's stream.
+#[test]
+fn a_peer_error_goaway_is_answered_with_no_error() {
+    let codes = [
+        (H2ErrorCode::PROTOCOL_ERROR, HttpErrorCode::PROTOCOL_ERROR),
+        (H2ErrorCode::INTERNAL_ERROR, HttpErrorCode::INTERNAL_ERROR),
+        (
+            H2ErrorCode::FRAME_SIZE_ERROR,
+            HttpErrorCode::FRAME_SIZE_ERROR,
+        ),
+        (
+            H2ErrorCode::COMPRESSION_ERROR,
+            HttpErrorCode::COMPRESSION_ERROR,
+        ),
+    ];
+    for upstream in [false, true] {
+        for (wire_code, code) in codes {
+            let mut payload = [0; 8];
+            payload[4..].copy_from_slice(&wire_code.as_u32().to_be_bytes());
+            let goaway = eof_frame(FrameType::GOAWAY, 0, 0, &payload);
+            let (input, last) = if upstream {
+                let settings = eof_frame(FrameType::SETTINGS, 0, 0, &[]);
+                ([settings, goaway].concat(), 0)
+            } else {
+                (eof_script(&[eof_request(1, false, true), goaway]), 1)
+            };
+            for owned in [true, false] {
+                assert_eq!(
+                    failed_connection_goaways(owned, upstream, input.clone()),
+                    (
+                        vec![(StreamId::new(last), H2ErrorCode::NO_ERROR)],
+                        Some(code)
+                    ),
+                    "{code:?}, owned {owned}, upstream {upstream}"
+                );
+            }
+        }
+    }
+}
+
+/// An error code that names an HTTP/2 error goes into the GOAWAY unchanged. Other codes map
+/// as a stream reset maps them: INTERNAL_ERROR for transport, timeout and local failures, and
+/// PROTOCOL_ERROR for a message error.
+#[test]
+fn connection_error_goaway_code_keeps_http2_codes() {
+    for raw in 0..=HttpErrorCode::HTTP_1_1_REQUIRED.as_u16() {
+        assert_eq!(
+            connection_error_goaway_code(HttpErrorCode::from_u16(raw)),
+            H2ErrorCode::from_u32(u32::from(raw))
+        );
+    }
+    for code in [
+        HttpErrorCode::INVALID_STATE_TRANSITION,
+        HttpErrorCode::HEADER_PARSE_ERROR,
+        HttpErrorCode::BODY_PARSE_ERROR,
+        HttpErrorCode::READ_TIMEOUT,
+        HttpErrorCode::WRITE_TIMEOUT,
+        HttpErrorCode::CORO_CANCELLED,
+        HttpErrorCode::TRANSPORT_EOF,
+        HttpErrorCode::TRANSPORT_READ_ERROR,
+        HttpErrorCode::TRANSPORT_WRITE_ERROR,
+        HttpErrorCode::DROPPED,
+        HttpErrorCode::CONTENT_LENGTH_MISMATCH,
+    ] {
+        assert_eq!(
+            connection_error_goaway_code(code),
+            H2ErrorCode::INTERNAL_ERROR,
+            "{code:?}"
+        );
+    }
+    assert_eq!(
+        connection_error_goaway_code(HttpErrorCode::MESSAGE_ERROR),
+        H2ErrorCode::PROTOCOL_ERROR
+    );
 }
 
 #[test]

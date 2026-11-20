@@ -12,6 +12,8 @@ use std::time::Instant;
 use roxygen_codec::CodecSetting;
 use roxygen_codec::H2ErrorCode;
 use roxygen_codec::HttpExceptionDirection;
+use roxygen_codec::error_adapter::http_error_code_to_h2_error_code;
+use roxygen_core::error::HttpErrorCode;
 use roxygen_core::flow_control::Window;
 use roxygen_core::http::TransportDirection;
 use roxygen_core::ids::StreamId;
@@ -79,6 +81,16 @@ pub fn peer_goaway_refuses(
     direction: TransportDirection,
 ) -> bool {
     stream.get() > last_good_stream.get() && (stream.get() % 2 == 1) == direction.is_upstream()
+}
+
+/// The code that a failed connection's GOAWAY carries. An error code that names
+/// an HTTP/2 error, as every codec connection error does, is sent unchanged.
+pub const fn connection_error_goaway_code(code: HttpErrorCode) -> H2ErrorCode {
+    if code.as_u16() <= HttpErrorCode::HTTP_1_1_REQUIRED.as_u16() {
+        H2ErrorCode::from_u32(code.as_u16() as u32)
+    } else {
+        http_error_code_to_h2_error_code(code, false)
+    }
 }
 
 /// The state transition following successful GOAWAY generation.

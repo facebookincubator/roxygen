@@ -134,6 +134,7 @@ use crate::http2::protocol::CodecFailureDisposition;
 use crate::http2::protocol::GoawayPhase;
 use crate::http2::protocol::PeerSetting;
 use crate::http2::protocol::SentGoaway;
+use crate::http2::protocol::connection_error_goaway_code;
 use crate::http2::protocol::peer_goaway_refuses;
 use crate::http2::protocol::plan_goaway;
 use crate::http2::rate_limit::RateLimitKind;
@@ -6713,13 +6714,17 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
                 } else if self.core.initiate_drain_with(DrainTrigger::PeerGoaway) {
                     self.core.set_draining_ingress_grace(false);
                     self.drain_trigger = None;
-                    self.peer_goaway_generation = CallbackGoawayGeneration::Pending;
-                    actions.push(CodecCallbackAction::Generate(OwnedEgressFrame::Goaway {
-                        last_stream: StreamId::MAX,
-                        code: H2ErrorCode::NO_ERROR,
-                        debug_data: None,
-                    }));
+                } else {
+                    return actions.into();
                 }
+                // A peer's error gets NO_ERROR too, since the error is the peer's. The codec
+                // closes on this reply, so the connection failure writes no second GOAWAY.
+                self.peer_goaway_generation = CallbackGoawayGeneration::Pending;
+                actions.push(CodecCallbackAction::Generate(OwnedEgressFrame::Goaway {
+                    last_stream: StreamId::MAX,
+                    code: H2ErrorCode::NO_ERROR,
+                    debug_data: None,
+                }));
             }
             CodecEvent::PushMessageBegin {
                 stream,
@@ -10731,7 +10736,7 @@ fn fail_connection(
         state.reset_after_draining_writes |= reset;
         state.fin_after_failure |= reset && state.codec.protocol() == CodecProtocol::Http2;
         state.reads_closed = true;
-        let wire_code = http_error_code_to_h2_error_code(error.code(), false);
+        let wire_code = connection_error_goaway_code(error.code());
         let _ = generate_goaway(&mut state, wire_code);
         let core_available = state.core.is_some();
         if !core_available && state.deferred_connection_error.is_none() {

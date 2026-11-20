@@ -12001,14 +12001,16 @@ pub mod h2 {
     fn assert_real_peer_goaway(code: H2ErrorCode) {
         let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::Goaway(code));
         let outcome = run_downstream_bytes(input, 200, 0);
+        // The reply carries NO_ERROR whatever the peer's code.
+        assert_eq!(
+            decode_server_frames(&outcome.wire).goaways,
+            [(StreamId::new(1), H2ErrorCode::NO_ERROR)]
+        );
         if code == H2ErrorCode::NO_ERROR {
             assert_eq!(outcome.error, None);
-            assert_eq!(
-                decode_server_frames(&outcome.wire).goaways,
-                [(StreamId::new(1), H2ErrorCode::NO_ERROR)]
-            );
         } else {
-            assert_eq!(outcome.error, Some(HttpErrorCode::INTERNAL_ERROR));
+            let peer_code = u16::try_from(code.as_u32()).expect("a known HTTP/2 code");
+            assert_eq!(outcome.error, Some(HttpErrorCode::from_u16(peer_code)));
             assert_eq!(outcome.close, FixtureClose::ShutdownWrite);
         }
     }
@@ -19964,7 +19966,7 @@ pub mod h2 {
         (fn h2_downstream_session_test_receive_goaway_error_with_open_stream() => MappedContract::Goaway) => {
             #[test]
             fn h2_downstream_session_test_receive_goaway_error_with_open_stream() {
-                assert_real_peer_goaway(H2ErrorCode::INTERNAL_ERROR);
+                assert_real_peer_goaway(H2ErrorCode::PROTOCOL_ERROR);
             }
         };
         (fn h2_qdownstream_session_test_stream_after_goaway() => MappedContract::Goaway) => {

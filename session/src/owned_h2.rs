@@ -4387,13 +4387,17 @@ where
                     if let Some(observation) = self.state.observation.as_deref_mut() {
                         observation.drain(DrainTrigger::PeerGoaway);
                     }
-                    actions.push(CodecCallbackAction::Generate(OwnedEgressFrame::Goaway {
-                        last_stream: StreamId::MAX,
-                        code: H2ErrorCode::NO_ERROR,
-                        debug_data: None,
-                    }));
-                    self.peer_goaway_pending = true;
+                } else {
+                    return actions.into();
                 }
+                // A peer's error gets NO_ERROR too, since the error is the peer's. The codec
+                // closes on this reply, so the connection failure writes no second GOAWAY.
+                actions.push(CodecCallbackAction::Generate(OwnedEgressFrame::Goaway {
+                    last_stream: StreamId::MAX,
+                    code: H2ErrorCode::NO_ERROR,
+                    debug_data: None,
+                }));
+                self.peer_goaway_pending = true;
             }
             CodecEvent::PingRequest { data } => {
                 if self.rate_limited(RateLimitKind::ControlFrames) {
@@ -5522,7 +5526,7 @@ where
             None,
             || self.cancellation.request_cancellation(),
         );
-        let wire = http_error_code_to_h2_error_code(error.code(), false);
+        let wire = protocol::connection_error_goaway_code(error.code());
         let generated = self.generate_goaway(wire);
         for id in self.streams.ids_in_order() {
             self.reset_stream(id, error.clone(), false, None);
