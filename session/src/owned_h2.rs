@@ -575,6 +575,8 @@ struct Control {
     drain: Cell<bool>,
     cancel: Cell<bool>,
     complete: Cell<bool>,
+    /// Set by `complete_handshake`.
+    handshake_complete: Cell<bool>,
     active_incoming: Cell<usize>,
     ready: Arc<ReadyQueue>,
     upstream: Option<Rc<upstream::Admission>>,
@@ -596,6 +598,12 @@ struct Control {
 }
 
 impl Control {
+    /// Marks the connection handshake complete. The session calls it for every non-ACK
+    /// SETTINGS frame it processes; the peer's first one sets the flag.
+    fn complete_handshake(&self) {
+        self.handshake_complete.set(true);
+    }
+
     /// Whether `amount` more credit can wait for the session's next poll: an idle session
     /// woken now would only return it, without emitting, before doing anything else.
     fn can_fold(&self, amount: usize) -> bool {
@@ -637,6 +645,19 @@ impl OwnedH2Handle {
     pub fn cancel(&self) {
         self.0.cancel.set(true);
         self.0.ready.wake();
+    }
+
+    /// Whether the connection handshake has completed: the session has processed the peer's
+    /// first SETTINGS frame. It stays true once set.
+    pub fn handshake_complete(&self) -> bool {
+        self.0.handshake_complete.get()
+    }
+
+    /// Whether the session has finished: true once its run has completed, with or without an
+    /// error. A session that was never run, or whose run was dropped before completing, has not
+    /// finished. A run that unwound out of a poll finishes when a later poll returns its error.
+    pub fn is_finished(&self) -> bool {
+        self.0.complete.get()
     }
 }
 
@@ -1555,8 +1576,8 @@ where
 {
     driver: Option<Driver<A, UPSTREAM>>,
     /// Set while a poll runs and cleared as it returns, so it stays set only after a poll that
-    /// unwound. Such a run returns `Err` without touching its driver again, and its
-    /// abandonment does not assert that its cleanup joined.
+    /// unwound. Such a run publishes `complete` and returns `Err` without running its driver
+    /// again, and its abandonment does not assert that its cleanup joined.
     poisoned: bool,
 }
 
@@ -1641,6 +1662,9 @@ where
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         if this.poisoned {
+            if let Some(driver) = &this.driver {
+                driver.connection.state.control.complete.set(true);
+            }
             return Poll::Ready(Err(poisoned_run()));
         }
         let Some(driver) = this.driver.as_mut() else {
@@ -1962,7 +1986,18 @@ impl<A: OwnedApplication> OwnedH2Session<A> {
         application: A,
         options: OwnedH2Options,
     ) -> Result<(Self, OwnedH2Handle), HttpError> {
-        let (driver, handle) = Driver::<A, false>::new(application, options)?;
+        Self::new_with(options, |_| application)
+    }
+
+    /// Creates the session as `new` does, with the application that `make` builds from the
+    /// session's handle, so the application can keep the handle and drain or cancel its own
+    /// session. `make` runs once, after every check that can fail creation, so it does not run
+    /// for a session that returns an error.
+    pub fn new_with(
+        options: OwnedH2Options,
+        make: impl FnOnce(&OwnedH2Handle) -> A,
+    ) -> Result<(Self, OwnedH2Handle), HttpError> {
+        let (driver, handle) = Driver::<A, false>::new_with(options, make)?;
         Ok((Self(Some(driver)), handle))
     }
 
@@ -2049,6 +2084,13 @@ where
     }
 
     fn new(application: A, options: OwnedH2Options) -> Result<(Self, OwnedH2Handle), HttpError> {
+        Self::new_with(options, |_| application)
+    }
+
+    fn new_with(
+        options: OwnedH2Options,
+        make: impl FnOnce(&OwnedH2Handle) -> A,
+    ) -> Result<(Self, OwnedH2Handle), HttpError> {
         let OwnedH2Options {
             context,
             transport,
@@ -2143,6 +2185,7 @@ where
             drain: Cell::new(false),
             cancel: Cell::new(false),
             complete: Cell::new(false),
+            handshake_complete: Cell::new(false),
             active_incoming: Cell::new(0),
             ready,
             upstream,
@@ -2213,6 +2256,8 @@ where
         )?;
         let read_wake = IoWake::new(&control.ready, !read.uses_reader());
         let write_wake = IoWake::new(&control.ready, write_queue.is_none());
+        let handle = OwnedH2Handle(control);
+        let application = make(&handle);
         Ok((
             Self {
                 context,
@@ -2223,7 +2268,7 @@ where
                     codec,
                     state: ConnectionState {
                         observer,
-                        control: Rc::clone(&control),
+                        control: Rc::clone(&handle.0),
                         config: io,
                         scheduler: PriorityQueue::default(),
                         write_fences: VecDeque::new(),
@@ -2276,7 +2321,7 @@ where
                 unarmed_write: false,
                 teardown: None,
             },
-            OwnedH2Handle(control),
+            handle,
         ))
     }
 
@@ -4317,6 +4362,7 @@ where
                     self.fail_rate_limit(RateLimitKind::ControlFrames);
                     return actions.into();
                 }
+                self.state.control.complete_handshake();
                 if let Some(observation) = self.state.observation.as_deref() {
                     observation.settings(
                         &settings,

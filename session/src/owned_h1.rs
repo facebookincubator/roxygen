@@ -436,7 +436,17 @@ struct Control {
     drain: Cell<bool>,
     cancel: Cell<bool>,
     complete: Cell<bool>,
+    /// Set by `complete_handshake`.
+    handshake_complete: Cell<bool>,
     task: Arc<TaskWaker>,
+}
+
+impl Control {
+    /// Marks the connection handshake complete. The driver calls it as it delivers a validated
+    /// request head to its exchange, and only there.
+    fn complete_handshake(&self) {
+        self.handshake_complete.set(true);
+    }
 }
 
 /// Owner-local control of one owned HTTP/1.1 connection; the driver acts on each request in
@@ -461,6 +471,19 @@ impl OwnedH1Handle {
     pub fn cancel(&self) {
         self.0.cancel.set(true);
         self.0.task.wake();
+    }
+
+    /// Whether the connection handshake has completed: the driver has validated the first
+    /// request head and delivered it to its exchange. It stays true once set.
+    pub fn handshake_complete(&self) -> bool {
+        self.0.handshake_complete.get()
+    }
+
+    /// Whether the session has finished: true once its run has completed, with or without an
+    /// error. A session that was never run, or whose run was dropped before completing, has not
+    /// finished. A run that resumes a callback panic has finished when the panic resumes.
+    pub fn is_finished(&self) -> bool {
+        self.0.complete.get()
     }
 }
 
@@ -754,7 +777,17 @@ impl<A: OwnedApplication> OwnedH1Session<A> {
         application: A,
         options: OwnedH1Options,
     ) -> Result<(Self, OwnedH1Handle), HttpError> {
-        let (driver, handle) = Driver::new(application, options)?;
+        Self::new_with(options, |_| application)
+    }
+
+    /// Creates the session as `new` does, with the application that `make` builds from the
+    /// session's handle, as `OwnedH2Session::new_with` does. `make` runs once, after every check
+    /// that can fail creation, so it does not run for a session that returns an error.
+    pub fn new_with(
+        options: OwnedH1Options,
+        make: impl FnOnce(&OwnedH1Handle) -> A,
+    ) -> Result<(Self, OwnedH1Handle), HttpError> {
+        let (driver, handle) = Driver::new(options, make)?;
         Ok((Self(driver), handle))
     }
 
@@ -1082,7 +1115,10 @@ impl<A: OwnedApplication> CodecInput<'_, A> {
 }
 
 impl<A: OwnedApplication> Driver<A> {
-    fn new(application: A, options: OwnedH1Options) -> Result<(Self, OwnedH1Handle), HttpError> {
+    fn new(
+        options: OwnedH1Options,
+        make: impl FnOnce(&OwnedH1Handle) -> A,
+    ) -> Result<(Self, OwnedH1Handle), HttpError> {
         let OwnedH1Options {
             context,
             transport,
@@ -1112,6 +1148,7 @@ impl<A: OwnedApplication> Driver<A> {
             drain: Cell::new(false),
             cancel: Cell::new(false),
             complete: Cell::new(false),
+            handshake_complete: Cell::new(false),
             task: Arc::clone(&task),
         });
         let read_wake = Signal::new(&task);
@@ -1140,12 +1177,14 @@ impl<A: OwnedApplication> Driver<A> {
             http1.upgrade_policy == Http1UpgradePolicy::AsOrdinaryRequest,
         );
         codec.set_add_date_header_to_response(io.add_date_header_to_response);
+        let handle = OwnedH1Handle(control);
+        let application = make(&handle);
         Ok((
             Self {
                 context,
                 transport,
                 application,
-                control: Rc::clone(&control),
+                control: Rc::clone(&handle.0),
                 config: io,
                 codec: IngressCodec::new(codec),
                 exchange: None,
@@ -1185,7 +1224,7 @@ impl<A: OwnedApplication> Driver<A> {
                 budget_yield: None,
                 started: false,
             },
-            OwnedH1Handle(control),
+            handle,
         ))
     }
 
@@ -1681,6 +1720,7 @@ impl<A: OwnedApplication> Driver<A> {
                 source = source.retire_empty_body(&mut context)?;
             }
             exchange.started = true;
+            self.control.complete_handshake();
             exchange
                 .application
                 .as_mut()

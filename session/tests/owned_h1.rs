@@ -274,6 +274,9 @@ struct H1Probe {
     response_stopped: RefCell<Vec<Option<HttpErrorCode>>>,
     /// The application's `cancel_in`, for the `byte_event` callback.
     cancel_in: CancelIn,
+    /// Whether the session's handshake had completed when `request` ran, recorded when
+    /// `H1App::session` is set.
+    handshake_at_request: Cell<Option<bool>>,
 }
 
 impl HttpByteEventCallback for H1Probe {
@@ -330,6 +333,8 @@ struct H1App {
     script_held: Rc<RefCell<Option<HttpSourceHolder>>>,
     /// Each response body starts with a suspension that this probe releases.
     response_resume: Option<Rc<ResumeProbe>>,
+    /// The handle of the session serving this application, which `new_with` supplies.
+    session: Option<OwnedH1Handle>,
 }
 
 /// Where an exchange with `H1App::stop_request` stops its request body.
@@ -507,6 +512,7 @@ impl H1App {
                 stop_request: None,
                 script_held: Rc::default(),
                 response_resume: None,
+                session: None,
             },
             probes,
         )
@@ -534,6 +540,7 @@ struct H1Exchange {
     interim: VecDeque<HttpHeaderEvent>,
     header: Option<HttpHeaderEvent>,
     body: VecDeque<HttpBodyEvent>,
+    session: Option<OwnedH1Handle>,
 }
 
 impl OwnedApplication for H1App {
@@ -608,6 +615,7 @@ impl OwnedApplication for H1App {
             interim: response.interim_events(),
             header: Some(header),
             body,
+            session: self.session.clone(),
         }
     }
 }
@@ -633,6 +641,11 @@ impl H1Exchange {
 
 impl OwnedExchange for H1Exchange {
     fn request(&mut self, mut head: Box<HttpMessage>, body: HttpStreamSourceOwner, eom: bool) {
+        if let Some(session) = &self.session {
+            self.probe
+                .handshake_at_request
+                .set(Some(session.handshake_complete()));
+        }
         record_head(&self.probe, &mut head, eom);
         cancel_from(&self.cancel_in, "request");
         drain_from(&self.drain_in, "request");
@@ -2294,6 +2307,143 @@ fn drain_closes_after_the_in_flight_response() {
         CloseKind::ShutdownWrite,
         "then the transport closes"
     );
+}
+
+/// The handshake completes when the driver delivers the first request head, after validating
+/// it: not before the run, not while the head is still arriving although its exchange exists,
+/// and already when the application's `request` runs.
+#[test]
+fn h1_handshake_complete_after_first_head() {
+    let (before, partial_head, at_request, delivered, after, wire) = run_on_host(|context| {
+        Box::pin(async move {
+            let rest = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = ScriptedTransport::new([
+                ReadAction::Data(b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec()),
+                ReadAction::WaitData(Arc::clone(&rest), b"\r\n".to_vec()),
+                ReadAction::Eof,
+            ]);
+            let (application, probes) = H1App::new(vec![Response::fixed(200, b"hello")]);
+            let (session, handle) =
+                OwnedH1Session::new_with(owned_options(context.clone(), transport), |handle| {
+                    let mut application = application;
+                    application.session = Some(handle.clone());
+                    application
+                })
+                .unwrap();
+            let before = handle.handshake_complete();
+            let script = async {
+                // The request line opened the exchange, and the driver waits for the rest of
+                // the head.
+                for _ in 0..64 {
+                    if probes.borrow().len() == 1 && state.borrow().reads.len() == 1 {
+                        break;
+                    }
+                    context.host().yield_to_io().await;
+                }
+                let partial_head = (probes.borrow().len() == 1 && state.borrow().reads.len() == 1)
+                    .then(|| handle.handshake_complete());
+                rest.notify_one();
+                for _ in 0..64 {
+                    if probes.borrow()[0].method.borrow().is_some() {
+                        break;
+                    }
+                    context.host().yield_to_io().await;
+                }
+                let delivered = probes.borrow()[0]
+                    .method
+                    .borrow()
+                    .is_some()
+                    .then(|| handle.handshake_complete());
+                (partial_head, delivered)
+            };
+            let (result, (partial_head, delivered)) = futures::join!(session.run(), script);
+            let at_request = probes.borrow()[0].handshake_at_request.get();
+            (
+                before,
+                partial_head,
+                at_request,
+                delivered,
+                handle.handshake_complete(),
+                wire_of(&state, result),
+            )
+        })
+    });
+    assert!(!before, "a session that has not run has no handshake");
+    assert_eq!(
+        partial_head,
+        Some(false),
+        "an exchange whose head is still arriving does not complete the handshake"
+    );
+    assert_eq!(
+        at_request,
+        Some(true),
+        "the handshake is complete when the application's request runs"
+    );
+    assert_eq!(
+        delivered,
+        Some(true),
+        "a delivered head completed the handshake"
+    );
+    assert!(after, "the handshake stays complete");
+    assert_eq!(wire.error, None);
+    assert!(
+        wire.output.ends_with(b"\r\n\r\nhello"),
+        "{:?}",
+        String::from_utf8_lossy(&wire.output)
+    );
+}
+
+/// The handle reports the session finished only once its run completed: not before the run, and
+/// not while the served connection waits for its next request.
+#[test]
+fn is_finished_after_run_completes() {
+    let (before, waiting, after, wire) = run_on_host(|context| {
+        Box::pin(async move {
+            let eof = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = ScriptedTransport::new([
+                ReadAction::Data(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec()),
+                ReadAction::WaitEof(Arc::clone(&eof)),
+            ]);
+            let (application, probes) = H1App::new(vec![Response::fixed(200, b"hello")]);
+            let (session, handle) =
+                OwnedH1Session::new(application, owned_options(context.clone(), transport))
+                    .unwrap();
+            let before = handle.is_finished();
+            let served = || {
+                probes
+                    .borrow()
+                    .first()
+                    .is_some_and(|probe| probe.completed.get() == 1)
+                    && state.borrow().reads.is_empty()
+            };
+            let script = async {
+                for _ in 0..64 {
+                    if served() {
+                        break;
+                    }
+                    context.host().yield_to_io().await;
+                }
+                let waiting = served().then(|| handle.is_finished());
+                eof.notify_one();
+                waiting
+            };
+            let (result, waiting) = futures::join!(session.run(), script);
+            (
+                before,
+                waiting,
+                handle.is_finished(),
+                wire_of(&state, result),
+            )
+        })
+    });
+    assert!(!before, "a session that has not run has not finished");
+    assert_eq!(
+        waiting,
+        Some(false),
+        "a run waiting for the next request has not finished"
+    );
+    assert!(after, "a completed run has finished");
+    assert_eq!(wire.error, None);
 }
 
 #[test]

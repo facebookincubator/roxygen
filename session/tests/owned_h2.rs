@@ -4136,6 +4136,182 @@ fn a_panicking_application_drop_after_completion_is_reported() {
     });
 }
 
+/// An application built with the handle of the session that will run it, which drains that
+/// session when its first stream opens.
+struct DrainingApplication {
+    application: Application,
+    handle: OwnedH2Handle,
+    /// Whether the drain request changed the session's state.
+    drained: Rc<Cell<Option<bool>>>,
+}
+
+impl OwnedH2Application for DrainingApplication {
+    type Exchange = Exchange;
+
+    fn new_exchange(&self, stream: StreamId, ingress: IngressCompletion) -> Exchange {
+        if self.drained.get().is_none() {
+            self.drained
+                .set(Some(matches!(self.handle.initiate_drain(), Ok(true))));
+        }
+        self.application.new_exchange(stream, ingress)
+    }
+}
+
+/// `new_with` hands the application the session's handle before the session stores it, so the
+/// application can drain its own session: the drain it requests when stream 1 opens sends the
+/// GOAWAYs, and stream 1 still gets its response.
+#[test]
+fn new_with_app_can_drain_through_handle() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let (transport, state) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+            let (application, probes) = Application::new(vec![Reply::Body(1)]);
+            let drained = Rc::new(Cell::new(None));
+            let (session, _) = OwnedH2Session::new_with(options(context, transport), |handle| {
+                DrainingApplication {
+                    application,
+                    handle: handle.clone(),
+                    drained: Rc::clone(&drained),
+                }
+            })
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .expect("the drained connection finishes")
+                .expect("the drained run succeeds");
+            assert_eq!(
+                drained.get(),
+                Some(true),
+                "the application's handle drained its own session"
+            );
+            let decoded = decode_server_frames(&state.borrow().writes.concat());
+            assert_eq!(
+                decoded.goaways,
+                [
+                    (StreamId::new(0x7fff_ffff), H2ErrorCode::NO_ERROR),
+                    (StreamId::new(1), H2ErrorCode::NO_ERROR)
+                ],
+                "the drain's first GOAWAY, then the final one covering stream 1"
+            );
+            assert_eq!(decoded.header_statuses, [(StreamId::new(1), 200)]);
+            assert_eq!(probes.borrow()[0].completed.get(), 1);
+        })
+    });
+}
+
+/// The handshake completes when the session processes the client's first SETTINGS: not before
+/// the run, and not once the client preface alone has been parsed.
+#[test]
+fn h2_handshake_complete_false_until_client_settings() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let send_settings = Arc::new(tokio::sync::Notify::new());
+            let eof = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(CONNECTION_PREFACE.to_vec()),
+                FixtureRead::WaitData(
+                    Arc::clone(&send_settings),
+                    eof_frame(FrameType::SETTINGS, 0, 0, &[]),
+                ),
+                FixtureRead::WaitDataEof(Arc::clone(&eof), Vec::new()),
+            ]);
+            let (application, _) = Application::new(Vec::new());
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            assert!(
+                !handle.handshake_complete(),
+                "a session that has not run has no handshake"
+            );
+            let script = async {
+                // The driver parses each read in the turn that completes it, so once it has
+                // started the second read it has parsed the preface.
+                wait_until(|| state.borrow().reads.len() == 1).await;
+                let after_preface = handle.handshake_complete();
+                send_settings.notify_one();
+                wait_until(|| {
+                    decode_server_frames_with_requests(&state.borrow().writes.concat(), 0)
+                        .settings_acks
+                        == 1
+                })
+                .await;
+                let after_settings = handle.handshake_complete();
+                eof.notify_one();
+                (after_preface, after_settings)
+            };
+            let (run, (after_preface, after_settings)) =
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    tokio::join!(session.run(), script)
+                })
+                .await
+                .expect("the connection ends at the peer's EOF");
+            run.expect("a connection without streams ends cleanly at EOF");
+            assert_eq!(
+                state.borrow().reads.len(),
+                0,
+                "the driver read the preface, the SETTINGS and the EOF"
+            );
+            assert!(
+                !after_preface,
+                "the client preface alone does not complete the handshake"
+            );
+            assert!(
+                after_settings,
+                "the client's first SETTINGS completes the handshake"
+            );
+            assert!(handle.handshake_complete(), "the handshake stays complete");
+        })
+    });
+}
+
+/// The handle reports the session finished only once its run completed: not before the run, and
+/// not while the served connection waits for the peer.
+#[test]
+fn is_finished_after_run_completes() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let eof = Arc::new(tokio::sync::Notify::new());
+            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::Data(input),
+                FixtureRead::WaitDataEof(Arc::clone(&eof), Vec::new()),
+            ]);
+            let (application, probes) = Application::new(vec![Reply::Body(1)]);
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            assert!(
+                !handle.is_finished(),
+                "a session that has not run has not finished"
+            );
+            let served = || {
+                probes
+                    .borrow()
+                    .first()
+                    .is_some_and(|probe| probe.completed.get() == 1)
+                    && state.borrow().reads.is_empty()
+            };
+            let script = async {
+                wait_until(served).await;
+                let waiting = served().then(|| handle.is_finished());
+                eof.notify_one();
+                waiting
+            };
+            let (run, waiting) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(session.run(), script)
+            })
+            .await
+            .expect("the connection ends at the peer's EOF");
+            run.expect("the served connection ends cleanly at EOF");
+            assert_eq!(
+                waiting,
+                Some(false),
+                "a run waiting for its peer has not finished"
+            );
+            assert!(handle.is_finished(), "a completed run has finished");
+        })
+    });
+}
+
 /// Polling a run after it completed returns an error.
 #[test]
 fn polling_a_finished_run_returns_an_error() {
@@ -4379,9 +4555,9 @@ fn eof_abort_cancel_panic_keeps_transport_eof() {
 }
 
 /// A run whose poll unwinds, which only a fault in the run's own code can cause, is poisoned.
-/// Its next poll returns `Err(INTERNAL_ERROR)` without running the driver, and dropping it
-/// abandons the driver, cancelling its read, resetting the transport once and reporting
-/// `Destroy`, without the join assertion.
+/// Its next poll returns `Err(INTERNAL_ERROR)` without running the driver, after which the handle
+/// reports the session finished, and dropping it abandons the driver, cancelling its read,
+/// resetting the transport once and reporting `Destroy`, without the join assertion.
 #[cfg(panic = "unwind")]
 #[test]
 fn a_run_whose_poll_unwinds_is_poisoned() {
@@ -4459,7 +4635,7 @@ fn a_run_whose_poll_unwinds_is_poisoned() {
                 resets: Cell::new(0),
             });
             let (application, _) = Application::new(Vec::new());
-            let (mut session, _) =
+            let (mut session, handle) =
                 OwnedH2Session::new(application, options(context, transport.clone())).unwrap();
             let events = Rc::new(RefCell::new(Vec::new()));
             session
@@ -4477,6 +4653,10 @@ fn a_run_whose_poll_unwinds_is_poisoned() {
             .await;
             let panic = unwound.expect_err("the faulted poll unwinds");
             assert_eq!(panic.downcast_ref::<&str>(), Some(&"owned H2 run fault"));
+            assert!(
+                !handle.is_finished(),
+                "a run that unwound out of a poll has not finished"
+            );
             assert_eq!(
                 transport.reads.get(),
                 1,
@@ -4488,6 +4668,10 @@ fn a_run_whose_poll_unwinds_is_poisoned() {
                 panic!("a poisoned run is ready with an error");
             };
             assert_eq!(error.code(), HttpErrorCode::INTERNAL_ERROR);
+            assert!(
+                handle.is_finished(),
+                "a poisoned run that returned its error has finished"
+            );
             assert_eq!(
                 transport.reads.get(),
                 1,

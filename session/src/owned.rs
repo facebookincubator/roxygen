@@ -58,9 +58,11 @@ pub trait OwnedExchange: 'static {
         context: &mut Context<'_>,
     ) -> Poll<Result<HttpHeaderEvent, HttpError>>;
     /// Produces at most `maximum` data bytes, the driver's allowance for one data event. On
-    /// HTTP/2 the allowance follows flow-control credit and frame size, on HTTP/1.1 the driver's
-    /// write allowance. Preserve source terminal handling, byte-event registrations, padding,
-    /// and suspension events.
+    /// HTTP/2 the allowance is fixed at `min(UniplexConfig::buffer_limit, 64 KiB)`, whatever the
+    /// stream's flow-control credit or frame size: the driver sends the event's data as credit
+    /// allows, and resets the stream if the event holds more data than the allowance. On
+    /// HTTP/1.1 it is the driver's write allowance. Preserve source terminal handling,
+    /// byte-event registrations, padding, and suspension events.
     fn poll_body(
         &mut self,
         context: &mut Context<'_>,
