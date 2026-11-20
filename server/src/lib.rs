@@ -202,3 +202,7 @@ mod native_readiness_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../tests/native_lifecycle_readiness.rs"]
 mod native_lifecycle_readiness_tests;
+
+#[cfg(test)]
+#[path = "../tests/tls_session_facts.rs"]
+mod tls_session_facts_tests;

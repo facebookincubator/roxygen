@@ -96,6 +96,9 @@ pub mod tls;
 
 pub use byte_stream::TransportRetirement;
 pub use byte_stream::TransportRetirementError;
+pub use tls::TlsHandshakeFailureKind;
+pub use tls::tls_handshake_failure_kind;
+pub use tls::tls_handshake_rustls_error;
 
 #[cfg(test)]
 static TEST_PROCESS_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

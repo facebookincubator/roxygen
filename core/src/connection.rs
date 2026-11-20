@@ -83,6 +83,26 @@ impl UpstreamOrigin {
     }
 }
 
+/// Facts about a completed TLS handshake.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct TlsSessionFacts {
+    /// The negotiated protocol version's wire value, such as `0x0304` for
+    /// TLS 1.3 or `0x0303` for TLS 1.2.
+    pub protocol_version: u16,
+    /// Whether the handshake resumed an earlier session.
+    pub resumed: bool,
+}
+
+impl TlsSessionFacts {
+    pub const fn new(protocol_version: u16, resumed: bool) -> Self {
+        Self {
+            protocol_version,
+            resumed,
+        }
+    }
+}
+
 /// An immutable, transferable snapshot supplied by a trusted connector/acceptor.
 ///
 /// Holding a snapshot does not keep the session alive. The identity bytes use
@@ -101,6 +121,7 @@ pub struct ConnectionContext {
     negotiated_application_protocol: Option<Box<[u8]>>,
     tls_cipher_suite: Option<Box<str>>,
     tls_key_exchange_group: Option<Box<str>>,
+    tls_session: Option<TlsSessionFacts>,
 }
 
 impl ConnectionContext {
@@ -122,6 +143,7 @@ impl ConnectionContext {
             negotiated_application_protocol: None,
             tls_cipher_suite: None,
             tls_key_exchange_group: None,
+            tls_session: None,
         }
     }
 
@@ -160,6 +182,13 @@ impl ConnectionContext {
         self
     }
 
+    /// Records the protocol version and resumption of a completed TLS
+    /// handshake.
+    pub fn with_tls_session(mut self, session: TlsSessionFacts) -> Self {
+        self.tls_session = Some(session);
+        self
+    }
+
     /// Returns the selected wire protocol, independently of any request head.
     pub fn http_protocol(&self) -> Option<CodecProtocol> {
         self.http_protocol
@@ -187,6 +216,13 @@ impl ConnectionContext {
         self.tls_key_exchange_group.as_deref()
     }
 
+    /// Returns the protocol version and resumption of the TLS handshake, or
+    /// `None` when the connection is not TLS or the acceptor did not record
+    /// them.
+    pub fn tls_session(&self) -> Option<TlsSessionFacts> {
+        self.tls_session
+    }
+
     /// Returns the immediate local endpoint.
     pub fn local_endpoint(&self) -> &TransportEndpoint {
         &self.local_endpoint
@@ -203,6 +239,11 @@ impl ConnectionContext {
     }
 
     /// Returns the transport's unmodified identity encoding.
+    ///
+    /// For a connection that `roxygen_server` accepted over TLS, this is the
+    /// DER of the leaf certificate the client presented, once the server's
+    /// certificate verifier has accepted it. It is `None` when the client
+    /// presented no certificate.
     pub fn peer_identity(&self) -> Option<&[u8]> {
         self.peer_identity.as_deref()
     }

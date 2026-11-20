@@ -111,6 +111,8 @@ pub mod stream_source;
 pub mod stream_source_holder;
 pub mod url;
 
+pub use connection::TlsSessionFacts;
+
 #[cfg(test)]
 #[path = "../tests/body_event_queue.rs"]
 mod body_event_queue_tests;

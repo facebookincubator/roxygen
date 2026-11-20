@@ -48,6 +48,7 @@ mod tcp_tls {
     use roxygen_core::byte_event::HttpByteEvent;
     use roxygen_core::byte_event::HttpByteEventCallback;
     use roxygen_core::byte_event::HttpByteEventRegistration;
+    use roxygen_core::connection::TlsSessionFacts;
     use roxygen_core::error::HttpError;
     use roxygen_core::error::HttpErrorCode;
     use roxygen_core::ids::StreamId;
@@ -92,6 +93,7 @@ mod tcp_tls {
     use tokio_rustls::TlsAcceptor;
     use tokio_rustls::TlsConnector;
 
+    use crate::TlsHandshakeFailureKind;
     use crate::byte_event::ByteEventWriteFlags;
     use crate::byte_stream::ByteEventCapability;
     use crate::byte_stream::ByteEventWriteState;
@@ -149,6 +151,8 @@ mod tcp_tls {
     use crate::tls::TlsTransport;
     use crate::tls::await_handshake_with_deadline;
     use crate::tls::tls_error;
+    use crate::tls_handshake_failure_kind;
+    use crate::tls_handshake_rustls_error;
 
     std::thread_local! {
         static ESCAPED_TCP: RefCell<Option<(
@@ -6065,6 +6069,11 @@ mod tcp_tls {
                                 Some("X25519"),
                             );
                             assert!(transport.connection_info().protocol_version().is_some());
+                            assert_eq!(
+                                transport.connection_info().session_facts(),
+                                Some(TlsSessionFacts::new(0x0304, false)),
+                                "a first TLS 1.3 connection",
+                            );
                             transport.close(&context).unwrap();
 
                             let untrusted = TlsClientOptions::new("localhost");
@@ -12065,7 +12074,11 @@ mod tcp_tls {
                 )
                 .await;
                 refused_tx
-                    .send(accept.err().map(|error| error.code()))
+                    .send(
+                        accept
+                            .err()
+                            .map(|error| (error.code(), tls_handshake_failure_kind(&error))),
+                    )
                     .unwrap();
             })
             .unwrap();
@@ -12074,11 +12087,374 @@ mod tcp_tls {
         quiescing_tx.send(()).unwrap();
         assert_eq!(
             refused_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
-            Some(HttpErrorCode::DROPPED),
-            "a TLS accept that starts after quiesce begins is refused before its handshake"
+            Some((HttpErrorCode::DROPPED, TlsHandshakeFailureKind::Cancelled)),
+            "a TLS accept that starts after quiesce begins is refused before its handshake, \
+             which counts as a cancellation"
         );
         await_quiesce(quiesced);
         assert_eq!(runtime.join().unwrap().workers_forced, 0);
         drop(client);
+    }
+
+    /// Accepts one loopback connection, drives its client side with `client`,
+    /// and returns the error from `TlsTransport::accept`.
+    fn tls_accept_error<Client>(
+        options: TlsServerOptions,
+        timeout: Duration,
+        cancellation: CancellationToken,
+        client: impl FnOnce(TcpStream) -> Client + 'static,
+    ) -> HttpError
+    where
+        Client: Future<Output = ()> + 'static,
+    {
+        tls_accept_error_observed(options, timeout, cancellation, |stream, _| client(stream))
+    }
+
+    /// Like `tls_accept_error`, and also passes `client` a nonblocking clone
+    /// of the accepted socket, so it can see which bytes the server has read.
+    fn tls_accept_error_observed<Client>(
+        options: TlsServerOptions,
+        timeout: Duration,
+        cancellation: CancellationToken,
+        client: impl FnOnce(TcpStream, std::net::TcpStream) -> Client + 'static,
+    ) -> HttpError
+    where
+        Client: Future<Output = ()> + 'static,
+    {
+        Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(LocalSet::new().run_until(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let stream = TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (accepted, _) = listener.accept().await.unwrap();
+                let accepted = accepted.into_std().unwrap();
+                let client =
+                    tokio::task::spawn_local(client(stream, accepted.try_clone().unwrap()));
+                let (worker, driver) = WorkerDriver::new(8).unwrap();
+                let call = worker
+                    .call_local(move |context| async move {
+                        match TlsTransport::accept(
+                            &context,
+                            accepted,
+                            options,
+                            limits(),
+                            timeout,
+                            cancellation,
+                        )
+                        .await
+                        {
+                            Ok(_) => panic!("the TLS accept must fail"),
+                            Err(error) => error,
+                        }
+                    })
+                    .unwrap();
+                let driver_task = tokio::task::spawn_local(driver);
+                let error = time::timeout(Duration::from_secs(10), call)
+                    .await
+                    .expect("the TLS accept must finish")
+                    .unwrap();
+                time::timeout(Duration::from_secs(10), client)
+                    .await
+                    .expect("the client must finish")
+                    .unwrap();
+                worker.begin_shutdown();
+                time::timeout(Duration::from_secs(10), driver_task)
+                    .await
+                    .expect("worker shutdown must remain bounded")
+                    .unwrap();
+                error
+            }))
+    }
+
+    /// Reads from `stream` until the server closes it or 10 s pass.
+    async fn read_until_closed(mut stream: impl AsyncRead + Unpin) {
+        let mut buffer = [0; 1024];
+        let _ = time::timeout(Duration::from_secs(10), async {
+            while matches!(stream.read(&mut buffer).await, Ok(read) if read > 0) {}
+        })
+        .await;
+    }
+
+    #[test]
+    fn tls_failure_kind_untrusted_client_certificate() {
+        let server = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "trusted client CA");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let trusted_ca = ca_params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap();
+        // Self-signed, so its issuer is not the trusted CA.
+        let untrusted_client =
+            rcgen::generate_simple_self_signed(vec!["client".to_owned()]).unwrap();
+        let options = TlsServerOptions::new_with_client_auth(
+            vec![server.cert.der().to_vec().into_boxed_slice()],
+            server
+                .signing_key
+                .serialized_der()
+                .to_vec()
+                .into_boxed_slice(),
+            Vec::new(),
+            vec![trusted_ca.der().to_vec().into_boxed_slice()],
+        )
+        .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(server.cert.der().to_vec()))
+            .unwrap();
+        let client_config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_client_auth_cert(
+                    vec![CertificateDer::from(untrusted_client.cert.der().to_vec())],
+                    PrivateKeyDer::try_from(untrusted_client.signing_key.serialized_der().to_vec())
+                        .unwrap(),
+                )
+                .unwrap();
+
+        let error = tls_accept_error(
+            options,
+            Duration::from_secs(10),
+            CancellationToken::never(),
+            move |stream| async move {
+                // A TLS 1.3 client finishes its handshake before the server
+                // checks its certificate, then reads the server's alert.
+                if let Ok(tls) = TlsConnector::from(Arc::new(client_config))
+                    .connect(ServerName::try_from("localhost").unwrap(), stream)
+                    .await
+                {
+                    read_until_closed(tls).await;
+                }
+            },
+        );
+
+        assert_eq!(
+            tls_handshake_failure_kind(&error),
+            TlsHandshakeFailureKind::Certificate,
+            "{error:?}"
+        );
+        assert!(
+            matches!(
+                tls_handshake_rustls_error(&error),
+                Some(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::UnknownIssuer
+                ))
+            ),
+            "{:?}",
+            tls_handshake_rustls_error(&error)
+        );
+    }
+
+    #[test]
+    fn tls_failure_kind_plaintext_bytes() {
+        let (_, server_config) = tls_fixture();
+        let options = TlsServerOptions::from_rustls_config(Arc::unwrap_or_clone(server_config));
+
+        let error = tls_accept_error(
+            options,
+            Duration::from_secs(10),
+            CancellationToken::never(),
+            |mut stream| async move {
+                stream
+                    .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .await
+                    .unwrap();
+                read_until_closed(stream).await;
+            },
+        );
+
+        assert_eq!(
+            tls_handshake_failure_kind(&error),
+            TlsHandshakeFailureKind::Protocol,
+            "{error:?}"
+        );
+        assert!(
+            tls_handshake_rustls_error(&error).is_some(),
+            "rustls rejected the bytes: {error:?}"
+        );
+    }
+
+    /// A client's first TLS flight, its ClientHello.
+    fn client_hello() -> Vec<u8> {
+        let mut client_hello = Vec::new();
+        rustls::ClientConnection::new(
+            Arc::new(
+                ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(RootCertStore::empty())
+                .with_no_client_auth(),
+            ),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap()
+        .write_tls(&mut client_hello)
+        .unwrap();
+        client_hello
+    }
+
+    #[test]
+    fn tls_failure_kind_client_eof_mid_handshake() {
+        let (_, server_config) = tls_fixture();
+        let options = TlsServerOptions::from_rustls_config(Arc::unwrap_or_clone(server_config));
+        let client_hello = client_hello();
+
+        let error = tls_accept_error(
+            options,
+            Duration::from_secs(10),
+            CancellationToken::never(),
+            move |mut stream| async move {
+                // Half a ClientHello, then FIN.
+                stream
+                    .write_all(&client_hello[..client_hello.len() / 2])
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+                read_until_closed(stream).await;
+            },
+        );
+
+        assert_eq!(
+            tls_handshake_failure_kind(&error),
+            TlsHandshakeFailureKind::Eof,
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn tls_failure_kind_tcp_reset() {
+        let (_, server_config) = tls_fixture();
+        let options = TlsServerOptions::from_rustls_config(Arc::unwrap_or_clone(server_config));
+        let client_hello = client_hello();
+
+        let error = tls_accept_error_observed(
+            options,
+            Duration::from_secs(10),
+            CancellationToken::never(),
+            move |mut stream, accepted| async move {
+                // Half a ClientHello. Wait for all of it to reach the server's
+                // socket without yielding, so the worker cannot read any first.
+                let half = &client_hello[..client_hello.len() / 2];
+                stream.write_all(half).await.unwrap();
+                let mut queued = vec![0; half.len()];
+                let deadline = time::Instant::now() + Duration::from_secs(10);
+                while !matches!(accepted.peek(&mut queued), Ok(peeked) if peeked == half.len()) {
+                    assert!(time::Instant::now() < deadline, "the bytes must arrive");
+                    std::thread::yield_now();
+                }
+                // Once the handshake has read all of them, it waits for the rest.
+                loop {
+                    match accepted.peek(&mut [0]) {
+                        Ok(_) => tokio::task::yield_now().await,
+                        Err(error) => {
+                            assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+                            break;
+                        }
+                    }
+                }
+                #[expect(deprecated, reason = "Tokio's only linger-zero reset setter")]
+                let linger = stream.set_linger(Some(Duration::ZERO));
+                linger.unwrap();
+                drop(stream);
+            },
+        );
+
+        assert_eq!(
+            tls_handshake_failure_kind(&error),
+            TlsHandshakeFailureKind::Io,
+            "{error:?}"
+        );
+        assert_eq!(
+            error.code(),
+            HttpErrorCode::TRANSPORT_READ_ERROR,
+            "the handshake's read of the reset socket failed: {error:?}"
+        );
+    }
+
+    #[test]
+    fn tls_failure_kind_stalled_handshake() {
+        let (_, server_config) = tls_fixture();
+        let options = TlsServerOptions::from_rustls_config(Arc::unwrap_or_clone(server_config));
+
+        // The client connects and never sends a ClientHello.
+        let error = tls_accept_error(
+            options,
+            Duration::from_millis(100),
+            CancellationToken::never(),
+            read_until_closed,
+        );
+
+        assert_eq!(
+            tls_handshake_failure_kind(&error),
+            TlsHandshakeFailureKind::Timeout,
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn tls_failure_kind_cancellation() {
+        let (_, server_config) = tls_fixture();
+        let options = TlsServerOptions::from_rustls_config(Arc::unwrap_or_clone(server_config));
+        let cancellation = CancellationSource::new();
+        let token = cancellation.token();
+
+        // The client never sends a ClientHello, and cancels the accept once it
+        // is waiting for one.
+        let error = tls_accept_error(
+            options,
+            Duration::from_secs(10),
+            token,
+            move |stream| async move {
+                time::sleep(Duration::from_millis(50)).await;
+                cancellation.request_cancellation();
+                read_until_closed(stream).await;
+            },
+        );
+
+        assert_eq!(
+            tls_handshake_failure_kind(&error),
+            TlsHandshakeFailureKind::Cancelled,
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn tls_failure_kind_maps_other_rustls_errors_and_unknown_codes() {
+        let rustls_failure =
+            |error: rustls::Error| tls_error(io::Error::new(io::ErrorKind::InvalidData, error));
+        for (error, kind) in [
+            (
+                rustls_failure(rustls::Error::NoCertificatesPresented),
+                TlsHandshakeFailureKind::Certificate,
+            ),
+            (
+                rustls_failure(rustls::Error::InvalidCertRevocationList(
+                    rustls::CertRevocationListError::BadSignature,
+                )),
+                TlsHandshakeFailureKind::Certificate,
+            ),
+            (
+                rustls_failure(rustls::Error::AlertReceived(
+                    rustls::AlertDescription::HandshakeFailure,
+                )),
+                TlsHandshakeFailureKind::Protocol,
+            ),
+            (
+                HttpError::new(HttpErrorCode::ENHANCE_YOUR_CALM),
+                TlsHandshakeFailureKind::Other,
+            ),
+        ] {
+            assert_eq!(tls_handshake_failure_kind(&error), kind, "{error:?}");
+        }
     }
 }

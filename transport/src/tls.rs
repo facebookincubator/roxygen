@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use roxygen_core::buf_queue::BufQueue;
 use roxygen_core::byte_event::HttpByteEventRegistration;
+use roxygen_core::connection::TlsSessionFacts;
 use roxygen_core::error::HttpError;
 use roxygen_core::error::HttpErrorCode;
 use roxygen_core::message::SocketAddress;
@@ -1835,6 +1836,7 @@ pub struct TlsConnectionInfo {
     cipher_suite: Option<Box<str>>,
     key_exchange_group: Option<Box<str>>,
     protocol_version: Option<Box<str>>,
+    protocol_version_number: Option<u16>,
     session_resumed: bool,
 }
 
@@ -1864,6 +1866,13 @@ impl TlsConnectionInfo {
 
     pub const fn session_resumed(&self) -> bool {
         self.session_resumed
+    }
+
+    /// Returns the negotiated protocol version's wire value and whether the
+    /// session was resumed, or `None` if no version was negotiated.
+    pub fn session_facts(&self) -> Option<TlsSessionFacts> {
+        self.protocol_version_number
+            .map(|version| TlsSessionFacts::new(version, self.session_resumed))
     }
 }
 
@@ -2040,6 +2049,7 @@ impl TlsTransport {
                 protocol_version: connection
                     .protocol_version()
                     .map(|version| format!("{version:?}").into_boxed_str()),
+                protocol_version_number: connection.protocol_version().map(u16::from),
                 session_resumed: matches!(
                     connection.handshake_kind(),
                     Some(HandshakeKind::Resumed)
@@ -2398,8 +2408,84 @@ fn connection_info(
         protocol_version: connection
             .protocol_version()
             .map(|version| format!("{version:?}").into_boxed_str()),
+        protocol_version_number: connection.protocol_version().map(u16::from),
         session_resumed: matches!(connection.handshake_kind(), Some(HandshakeKind::Resumed)),
     }
+}
+
+/// Why a TLS handshake failed, as [`tls_handshake_failure_kind`] reports it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum TlsHandshakeFailureKind {
+    /// The peer presented no certificate where one is required, or rustls's
+    /// certificate verification rejected it. On connect, a rejection by an
+    /// application [`TlsCertificateVerifier`] reports `Protocol`, and a
+    /// [`TlsPeerIdentityVerifier`] rejection is classified like any other
+    /// error.
+    Certificate,
+    /// rustls rejected the handshake for another reason: bytes that are not
+    /// TLS, a peer alert, or no shared protocol version or cipher suite.
+    Protocol,
+    /// The peer closed the connection before the handshake finished.
+    Eof,
+    /// Reading or writing the socket failed, for example after a reset.
+    Io,
+    /// The handshake missed its deadline.
+    Timeout,
+    /// The handshake was cancelled, or its worker stopped.
+    Cancelled,
+    /// Any other failure, such as a full worker command queue.
+    Other,
+}
+
+/// Classifies an error returned by [`TlsTransport::accept`] or
+/// [`TlsTransport::connect`].
+///
+/// A failed handshake keeps the I/O error rustls or the socket returned as
+/// the error's [`source`](std::error::Error::source), so the kind does not
+/// depend on the error's code or message. Errors the transport raises
+/// itself are classified by code: `READ_TIMEOUT` is `Timeout`, and
+/// `CORO_CANCELLED` and `DROPPED` are `Cancelled`.
+///
+/// `Certificate` covers only rustls's certificate verification errors. On
+/// connect, an application [`TlsCertificateVerifier`] rejection reaches
+/// rustls as a general error and reports `Protocol`. A
+/// [`TlsPeerIdentityVerifier`] rejection is returned unchanged and is
+/// classified like any other error: by an `io::Error` cause if the
+/// application attached one, otherwise by its code.
+pub fn tls_handshake_failure_kind(error: &HttpError) -> TlsHandshakeFailureKind {
+    let Some(cause) = handshake_io_error(error) else {
+        return match error.code() {
+            HttpErrorCode::READ_TIMEOUT => TlsHandshakeFailureKind::Timeout,
+            HttpErrorCode::CORO_CANCELLED | HttpErrorCode::DROPPED => {
+                TlsHandshakeFailureKind::Cancelled
+            }
+            _ => TlsHandshakeFailureKind::Other,
+        };
+    };
+    match rustls_error(cause) {
+        Some(
+            rustls::Error::InvalidCertificate(_)
+            | rustls::Error::NoCertificatesPresented
+            | rustls::Error::InvalidCertRevocationList(_),
+        ) => TlsHandshakeFailureKind::Certificate,
+        Some(_) => TlsHandshakeFailureKind::Protocol,
+        None if cause.kind() == io::ErrorKind::UnexpectedEof => TlsHandshakeFailureKind::Eof,
+        None => TlsHandshakeFailureKind::Io,
+    }
+}
+
+/// Returns the rustls error behind a failed handshake, if there is one.
+pub fn tls_handshake_rustls_error(error: &HttpError) -> Option<&rustls::Error> {
+    rustls_error(handshake_io_error(error)?)
+}
+
+fn handshake_io_error(error: &HttpError) -> Option<&io::Error> {
+    std::error::Error::source(error)?.downcast_ref::<io::Error>()
+}
+
+fn rustls_error(error: &io::Error) -> Option<&rustls::Error> {
+    error.get_ref()?.downcast_ref::<rustls::Error>()
 }
 
 pub(crate) fn tls_error(error: std::io::Error) -> HttpError {
@@ -2417,6 +2503,7 @@ pub(crate) fn tls_error(error: std::io::Error) -> HttpError {
         },
         error.to_string().as_bytes(),
     )
+    .with_cause(Arc::new(error))
 }
 
 fn tls_message_error(prefix: &'static [u8], error: impl std::fmt::Display) -> HttpError {
