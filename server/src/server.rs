@@ -72,12 +72,17 @@ use crate::acceptor::NewConnectionFilter;
 use crate::acceptor::ServerSessionConfig;
 use crate::acceptor::SessionControl;
 use crate::acceptor::TlsHandshakeObserver;
+use crate::acceptor::WorkerApp;
 use crate::acceptor::accept_session;
 use crate::acceptor::invoke_accept_callback;
 use crate::acceptor::run_session;
 pub use crate::connection::ServeTransportOptions;
 pub use crate::connection::ServerConnection;
 pub use crate::connection::serve_transport;
+use crate::owned_application::OwnedApplicationFactory;
+use crate::owned_application::OwnedConnectionFactory;
+use crate::owned_application::StopAbandon;
+use crate::owned_application::WorkerView;
 
 const DEFAULT_COMMAND_CAPACITY: usize = 1_024;
 const DEFAULT_BACKLOG: i32 = 1_024;
@@ -543,6 +548,13 @@ pub type HandlerFactory = Arc<dyn Fn(usize) -> HttpHandlerRef + Send + Sync>;
 /// The context can register asynchronous cleanup that is joined at worker exit.
 pub type WorkerHandlerFactory = Arc<dyn Fn(WorkerContext, usize) -> HttpHandlerRef + Send + Sync>;
 
+/// What each worker calls once, on itself, to build what it serves its connections with.
+#[derive(Clone)]
+enum WorkerAppFactory {
+    Handler(WorkerHandlerFactory),
+    Owned(OwnedApplicationFactory),
+}
+
 pub trait ServerFilterFactory: Send + Sync + 'static {
     fn make_filter_factory(&self) -> Rc<dyn FilterFactory>;
 
@@ -812,7 +824,7 @@ impl Future for StopAccepting {
 struct WorkerConfig {
     index: usize,
     acceptor: AcceptorConfig,
-    handler_factory: WorkerHandlerFactory,
+    app_factory: WorkerAppFactory,
     filter_factories: Vec<Arc<dyn ServerFilterFactory>>,
     observer: Option<Arc<dyn ServerObserver>>,
     draining: Arc<AtomicBool>,
@@ -977,6 +989,7 @@ pub struct HttpServerControl {
     commands: Vec<mpsc::UnboundedSender<WorkerCommand>>,
     worker_handles: Arc<[WorkerHandle]>,
     accept_counters: Arc<[Arc<AcceptCounters>]>,
+    abandon: Arc<watch::Sender<bool>>,
 }
 
 impl HttpServerControl {
@@ -990,6 +1003,15 @@ impl HttpServerControl {
         self.worker_handles
             .iter()
             .map(WorkerHandle::poll_stats)
+            .collect()
+    }
+
+    /// A read-only view of each worker, in worker index order.
+    pub fn workers(&self) -> Vec<WorkerView> {
+        self.worker_handles
+            .iter()
+            .enumerate()
+            .map(|(index, handle)| WorkerView::new(index, handle.clone()))
             .collect()
     }
 
@@ -1042,6 +1064,18 @@ impl HttpServerControl {
         true
     }
 
+    /// Fires every worker's `StopAbandon`: each worker of an owned application drops its
+    /// pending `worker_stopping` future on its own thread and stops. Idempotent; non-blocking.
+    pub fn abandon_stopping(&self) {
+        self.abandon.send_replace(true);
+    }
+
+    /// Starts a forced stop without waiting for it: every worker aborts and joins its sessions.
+    /// Returns false if a forced stop has already started or the server has stopped.
+    ///
+    /// This does not fire `abandon_stopping()`. A worker whose `worker_stopping` future never
+    /// resolves stays in it; a caller holding only the control calls `abandon_stopping()` after
+    /// its own bound, or wakes that future through its own signal.
     pub fn force_stop(&self) -> bool {
         let previous = self
             .state
@@ -1070,6 +1104,7 @@ pub struct HttpServer {
     worker_handles: Arc<[WorkerHandle]>,
     accept_counters: Arc<[Arc<AcceptCounters>]>,
     commands: Vec<mpsc::UnboundedSender<WorkerCommand>>,
+    abandon: Arc<watch::Sender<bool>>,
     tls_credentials: Option<Arc<dyn TlsCredentialProvider>>,
     tls: Option<Arc<ArcSwap<TlsServerOptions>>>,
     callback_failure: Arc<Mutex<Option<CallbackFailure>>>,
@@ -1092,8 +1127,31 @@ impl HttpServer {
     /// Starts a server whose handlers are constructed with their owning worker.
     /// Worker cleanup scopes release application resources before the workers are joined.
     pub fn start_with_worker_factory(
-        mut config: ServerConfig,
+        config: ServerConfig,
         handler_factory: WorkerHandlerFactory,
+        observer: Option<Arc<dyn ServerObserver>>,
+    ) -> Result<Self, HttpServerError> {
+        Self::start_workers(config, WorkerAppFactory::Handler(handler_factory), observer)
+    }
+
+    /// Starts the workers with the owned application. Returns the owner; keep it on this
+    /// thread.
+    ///
+    /// `config` must enable `owned_http1` and `owned_http2`, and must set no filter factories,
+    /// statistics factory or session lifecycle observer factory; the server-level
+    /// `lifecycle_observer` is allowed.
+    pub fn start_owned(
+        config: ServerConfig,
+        factory: OwnedApplicationFactory,
+        observer: Option<Arc<dyn ServerObserver>>,
+    ) -> Result<Self, HttpServerError> {
+        check_owned_application(&config).map_err(HttpServerError::InvalidConfig)?;
+        Self::start_workers(config, WorkerAppFactory::Owned(factory), observer)
+    }
+
+    fn start_workers(
+        mut config: ServerConfig,
+        app_factory: WorkerAppFactory,
         observer: Option<Arc<dyn ServerObserver>>,
     ) -> Result<Self, HttpServerError> {
         if config.command_capacity == 0 {
@@ -1231,12 +1289,14 @@ impl HttpServer {
         let accept_counters: Arc<[Arc<AcceptCounters>]> = (0..num_io_threads)
             .map(|_| Arc::new(AcceptCounters::default()))
             .collect();
+        let abandon = Arc::new(watch::Sender::new(false));
         let control = HttpServerControl {
             state: Arc::clone(&state),
             draining: Arc::clone(&draining),
             commands: commands.clone(),
             worker_handles: Arc::clone(&worker_handles),
             accept_counters: Arc::clone(&accept_counters),
+            abandon: Arc::clone(&abandon),
         };
         let mut startup_receivers = Vec::with_capacity(num_io_threads);
         let mut owned_listeners = Some(listeners);
@@ -1251,7 +1311,7 @@ impl HttpServer {
             let worker_config = WorkerConfig {
                 index,
                 acceptor: acceptor.clone(),
-                handler_factory: Arc::clone(&handler_factory),
+                app_factory: app_factory.clone(),
                 filter_factories: config.filter_factories.clone(),
                 observer: observer.clone(),
                 draining: Arc::clone(&draining),
@@ -1321,6 +1381,7 @@ impl HttpServer {
             worker_handles,
             accept_counters,
             commands,
+            abandon,
             tls_credentials: config.tls_credentials,
             tls,
             callback_failure,
@@ -1339,6 +1400,7 @@ impl HttpServer {
             commands: self.commands.clone(),
             worker_handles: Arc::clone(&self.worker_handles),
             accept_counters: Arc::clone(&self.accept_counters),
+            abandon: Arc::clone(&self.abandon),
         }
     }
 
@@ -1371,10 +1433,13 @@ impl HttpServer {
         self.control().drain()
     }
 
+    /// Abandons graceful worker stop (as `HttpServerControl::abandon_stopping` does), so no
+    /// worker waits on a `worker_stopping` future, then force-stops and joins every worker.
     pub fn force_stop(&self) -> Result<bool, HttpServerError> {
         if self.state() == HttpServerState::Stopped && self.workers.borrow().is_empty() {
             return Ok(false);
         }
+        self.abandon.send_replace(true);
         let previous = self.state();
         if !matches!(previous, HttpServerState::ForceStopping) {
             let _ = self.drain();
@@ -1388,7 +1453,9 @@ impl HttpServer {
         Ok(true)
     }
 
-    /// Waits for a previously requested graceful drain and joins every worker.
+    /// Waits for a previously requested graceful drain and joins every worker. With an owned
+    /// application, it also waits for every worker's `worker_stopping` future; a caller that
+    /// needs a bound calls `HttpServerControl::abandon_stopping` first.
     pub fn wait_for_stop(&self) -> Result<bool, HttpServerError> {
         match self.state() {
             HttpServerState::Stopped => return Ok(false),
@@ -1401,6 +1468,13 @@ impl HttpServer {
         }
         self.finish_workers()?;
         Ok(true)
+    }
+
+    /// Joins every worker thread. It does not stop the workers: call it after they have closed
+    /// (`WorkerView::closed()`), or after `HttpServerControl::abandon_stopping` once their stop
+    /// has started. It never detaches a thread.
+    pub fn join(self) -> Result<(), HttpServerError> {
+        self.finish_workers()
     }
 
     fn finish_workers(&self) -> Result<(), HttpServerError> {
@@ -1470,34 +1544,61 @@ async fn worker_loop(
     config: WorkerConfig,
     started: SyncSender<Result<(), String>>,
 ) {
-    let user_handler = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        (config.handler_factory)(context.clone(), config.index)
-    })) {
-        Ok(handler) => handler,
-        Err(_) => {
-            record_callback_failure(
-                &config.callback_failure,
-                config.index,
-                ServerCallbackStage::HandlerFactory,
-            );
-            let _ = started.send(Err("handler factory panicked".to_owned()));
-            context.handle().begin_shutdown();
-            return;
+    let app = match &config.app_factory {
+        WorkerAppFactory::Handler(handler_factory) => {
+            let user_handler = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler_factory(context.clone(), config.index)
+            })) {
+                Ok(handler) => handler,
+                Err(_) => {
+                    record_callback_failure(
+                        &config.callback_failure,
+                        config.index,
+                        ServerCallbackStage::HandlerFactory,
+                    );
+                    let _ = started.send(Err("handler factory panicked".to_owned()));
+                    context.handle().begin_shutdown();
+                    return;
+                }
+            };
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                build_handler(user_handler, &config.filter_factories)
+            })) {
+                Ok(handler) => WorkerApp::Handler(handler),
+                Err(_) => {
+                    record_callback_failure(
+                        &config.callback_failure,
+                        config.index,
+                        ServerCallbackStage::FilterConstruction,
+                    );
+                    let _ = started.send(Err("filter factory panicked".to_owned()));
+                    context.handle().begin_shutdown();
+                    return;
+                }
+            }
         }
-    };
-    let handler = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        build_handler(user_handler, &config.filter_factories)
-    })) {
-        Ok(handler) => handler,
-        Err(_) => {
-            record_callback_failure(
-                &config.callback_failure,
-                config.index,
-                ServerCallbackStage::FilterConstruction,
-            );
-            let _ = started.send(Err("filter factory panicked".to_owned()));
-            context.handle().begin_shutdown();
-            return;
+        WorkerAppFactory::Owned(factory) => {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                factory(context.clone(), config.index)
+            })) {
+                Ok(Ok(factory)) => WorkerApp::Owned(factory),
+                Ok(Err(error)) => {
+                    let _ = started.send(Err(error.to_string()));
+                    context.handle().begin_shutdown();
+                    return;
+                }
+                Err(payload) => {
+                    record_callback_failure(
+                        &config.callback_failure,
+                        config.index,
+                        ServerCallbackStage::HandlerFactory,
+                    );
+                    discard_panicking_value(payload);
+                    let _ = started.send(Err("owned application factory panicked".to_owned()));
+                    context.handle().begin_shutdown();
+                    return;
+                }
+            }
         }
     };
     if let Some(observer) = config.observer.as_ref() {
@@ -1718,7 +1819,7 @@ async fn worker_loop(
                     controls.insert(id, Rc::clone(&slot));
                     let lifecycle_observer = config.lifecycle_observer.clone();
                     let context = context.clone();
-                    let handler = Rc::clone(&handler);
+                    let app = app.clone();
                     let acceptor = Rc::clone(&acceptor);
                     let draining = Arc::clone(&config.draining);
                     let callback_failure = Arc::clone(&config.callback_failure);
@@ -1729,13 +1830,14 @@ async fn worker_loop(
                     let gate = probe.as_ref().and_then(|probe| probe.take_gate(worker_index, id));
                     let task = sessions.spawn_local(async move {
                         let socket = socket.into_session();
+                        let connection_id = ConnectionId {
+                            worker: worker_id,
+                            serial: id,
+                        };
                         let lifecycle = lifecycle_observer.map(|observer| {
                             ConnectionLifecycle::accepted(
                                 observer,
-                                ConnectionId {
-                                    worker: worker_id,
-                                    serial: id,
-                                },
+                                connection_id,
                                 worker_index,
                                 Arc::clone(&callback_failure),
                             )
@@ -1751,7 +1853,8 @@ async fn worker_loop(
                         let result = match accept_session(
                             context,
                             socket,
-                            handler,
+                            app,
+                            connection_id,
                             Rc::clone(&acceptor),
                             draining,
                             worker_index,
@@ -1959,7 +2062,42 @@ async fn worker_loop(
     }
     sessions.abort_all();
     while sessions.join_next().await.is_some() {}
+    if let WorkerApp::Owned(factory) = &app {
+        await_worker_stopping(factory.as_ref(), &config).await;
+    }
     context.handle().begin_shutdown();
+}
+
+/// Runs the owned application's `worker_stopping` and waits for its future, or for the owner to
+/// abandon graceful stop: an abandon that has fired before the first poll drops the future
+/// unpolled, and the abandon is checked before each poll. The future is dropped on this thread.
+/// A panic in the call, a poll or the drop is recorded as the worker's callback failure.
+async fn await_worker_stopping(factory: &dyn OwnedConnectionFactory, config: &WorkerConfig) {
+    let abandon = StopAbandon::new(config.control.abandon.subscribe());
+    let mut stopping = None;
+    invoke_callback(config, ServerCallbackStage::HandlerFactory, || {
+        stopping = factory.worker_stopping(abandon.clone());
+    });
+    let Some(mut stopping) = stopping else {
+        return;
+    };
+    if !abandon.is_abandoned() {
+        let mut abandoned = std::pin::pin!(abandon.abandoned());
+        std::future::poll_fn(|context| {
+            if abandoned.as_mut().poll(context).is_ready() {
+                return Poll::Ready(());
+            }
+            let mut poll = Poll::Ready(());
+            invoke_callback(config, ServerCallbackStage::HandlerFactory, || {
+                poll = stopping.as_mut().poll(context);
+            });
+            poll
+        })
+        .await;
+    }
+    invoke_callback(config, ServerCallbackStage::HandlerFactory, || {
+        drop(stopping);
+    });
 }
 
 /// Every worker's accepted-socket queue and counters, which worker 0 hands sockets to in turn.
@@ -2145,6 +2283,28 @@ pub(crate) fn accept_retry_delay(error: &io::Error) -> Option<Duration> {
         _ => false,
     };
     (!per_connection).then_some(ACCEPT_ERROR_BACKOFF)
+}
+
+/// Rejects a configuration that `HttpServer::start_owned` does not support: an owned
+/// application serves both protocols on the owned drivers, and the classic per-session hooks
+/// apply only to the built-in sessions around a handler.
+fn check_owned_application(config: &ServerConfig) -> Result<(), &'static str> {
+    if !config.session.owned_http1 {
+        return Err("start_owned requires owned_http1");
+    }
+    if !config.session.owned_http2 {
+        return Err("start_owned requires owned_http2");
+    }
+    if !config.filter_factories.is_empty() {
+        return Err("start_owned does not support filter_factories");
+    }
+    if config.session.stats_factory.is_some() {
+        return Err("start_owned does not support stats_factory");
+    }
+    if config.session.lifecycle_observer_factory.is_some() {
+        return Err("start_owned does not support lifecycle_observer_factory");
+    }
+    Ok(())
 }
 
 fn build_handler(

@@ -136,6 +136,7 @@ pub mod acceptor;
 pub mod connection;
 pub mod expect_continue;
 pub mod experimental;
+pub mod owned_application;
 pub mod scoped_server;
 pub mod server;
 pub mod shutdown;
@@ -143,6 +144,13 @@ pub mod shutdown;
 pub use acceptor::ConnectionId;
 pub use acceptor::ConnectionLifecycleObserver;
 pub use acceptor::ConnectionOutcome;
+pub use owned_application::OwnedApplicationFactory;
+pub use owned_application::OwnedAttached;
+pub use owned_application::OwnedConnectionAttach;
+pub use owned_application::OwnedConnectionControl;
+pub use owned_application::OwnedConnectionFactory;
+pub use owned_application::StopAbandon;
+pub use owned_application::WorkerView;
 pub use server::AcceptDistribution;
 pub use server::AcceptStats;
 pub use server::StopAccepting;
@@ -214,3 +222,7 @@ mod tls_session_facts_tests;
 #[cfg(test)]
 #[path = "../tests/owned_deadlines.rs"]
 mod owned_deadlines_tests;
+
+#[cfg(test)]
+#[path = "../tests/owned_application.rs"]
+mod owned_application_tests;

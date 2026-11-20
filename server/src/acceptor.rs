@@ -36,8 +36,12 @@ use roxygen_session::http2::Http2SessionConfig;
 use roxygen_session::http2::StreamReceiveWindowMode;
 use roxygen_session::http2::rate_limit::Http2RateLimitConfig;
 use roxygen_session::http2::stats::Http2SessionStats;
+use roxygen_session::owned::OwnedApplication;
+use roxygen_session::owned_h1::Http1DriverConfig;
 use roxygen_session::owned_h1::OwnedH1Handle;
+use roxygen_session::owned_h1::OwnedH1Options;
 use roxygen_session::owned_h2::OwnedH2Handle;
+use roxygen_session::owned_h2::OwnedH2Options;
 use roxygen_session::session::LifecycleObserver;
 use roxygen_session::uniplex::UniplexConfig;
 use roxygen_session::uniplex::UniplexHandle;
@@ -53,6 +57,8 @@ use roxygen_transport::tls::TlsServerOptions;
 use roxygen_transport::tls::TlsTransport;
 
 use crate::connection::bind_connection;
+use crate::owned_application::OwnedConnectionAttach;
+use crate::owned_application::OwnedConnectionFactory;
 use crate::server::CallbackFailure;
 use crate::server::ServerCallbackStage;
 use crate::server::discard_panicking_value;
@@ -62,8 +68,11 @@ mod handler_application;
 mod owned_http1;
 mod owned_http2;
 
+use handler_application::HandlerApplication;
 use owned_http1::OwnedHttp1Session;
 use owned_http2::OwnedHttp2Session;
+#[cfg(test)]
+pub(crate) use owned_http2::fault_next_http2_run;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectionInfo {
@@ -689,9 +698,30 @@ impl SessionHandshake {
 /// The downstream session an accepted connection runs.
 pub(crate) enum ServerSession {
     Uniplex(UniplexSession),
-    OwnedHttp1(OwnedHttp1Session),
-    OwnedHttp2(OwnedHttp2Session),
+    OwnedHttp1(OwnedHttp1Session<HandlerApplication>),
+    OwnedHttp2(OwnedHttp2Session<HandlerApplication>),
+    /// A session of an application that `HttpServer::start_owned` hosts.
+    Hosted(Box<dyn HostedSession>),
 }
+
+/// An unrun owned session of a hosted application, whose type the box erases.
+pub(crate) trait HostedSession {
+    fn run(self: Box<Self>) -> RunFuture;
+}
+
+impl<A: OwnedApplication> HostedSession for OwnedHttp1Session<A> {
+    fn run(self: Box<Self>) -> RunFuture {
+        Box::pin((*self).run())
+    }
+}
+
+impl<A: OwnedApplication> HostedSession for OwnedHttp2Session<A> {
+    fn run(self: Box<Self>) -> RunFuture {
+        Box::pin((*self).run())
+    }
+}
+
+type RunFuture = Pin<Box<dyn Future<Output = Result<UniplexRunSummary, HttpError>> + 'static>>;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -699,16 +729,16 @@ pub(crate) enum ServerSessionKind {
     Uniplex,
     OwnedHttp1,
     OwnedHttp2,
+    Hosted,
 }
 
 impl ServerSession {
-    pub(crate) fn run(
-        self,
-    ) -> Pin<Box<dyn Future<Output = Result<UniplexRunSummary, HttpError>> + 'static>> {
+    pub(crate) fn run(self) -> RunFuture {
         match self {
             Self::Uniplex(session) => session.run(),
             Self::OwnedHttp1(session) => Box::pin(session.run()),
             Self::OwnedHttp2(session) => Box::pin(session.run()),
+            Self::Hosted(session) => session.run(),
         }
     }
 
@@ -718,6 +748,7 @@ impl ServerSession {
             Self::Uniplex(_) => ServerSessionKind::Uniplex,
             Self::OwnedHttp1(_) => ServerSessionKind::OwnedHttp1,
             Self::OwnedHttp2(_) => ServerSessionKind::OwnedHttp2,
+            Self::Hosted(_) => ServerSessionKind::Hosted,
         }
     }
 }
@@ -730,10 +761,20 @@ pub(crate) struct AcceptedSession {
     pub retirement: Option<TransportRetirement>,
 }
 
+/// What a worker serves its connections with.
+#[derive(Clone)]
+pub(crate) enum WorkerApp {
+    /// The worker's handler, through `HandlerApplication` on the owned drivers.
+    Handler(HttpHandlerRef),
+    /// The worker's connection factory of an application that `HttpServer::start_owned` hosts.
+    Owned(Rc<dyn OwnedConnectionFactory>),
+}
+
 pub(crate) async fn accept_session(
     context: WorkerContext,
     socket: std::net::TcpStream,
-    handler: HttpHandlerRef,
+    app: WorkerApp,
+    id: ConnectionId,
     config: Rc<AcceptorConfig>,
     draining: Arc<AtomicBool>,
     worker_index: usize,
@@ -824,6 +865,24 @@ pub(crate) async fn accept_session(
             || observer.on_success(&connection),
         )?;
     }
+    let handler = match app {
+        WorkerApp::Handler(handler) => handler,
+        WorkerApp::Owned(factory) => {
+            return Ok(attach_owned_session(
+                transport,
+                OwnedSessionAttachment {
+                    context: &context,
+                    factory: &*factory,
+                    id,
+                    config: &config,
+                    connection,
+                    draining: &draining,
+                    worker_index,
+                    callback_failure: &callback_failure,
+                },
+            )?);
+        }
+    };
     Ok(attach_session(
         transport,
         SessionAttachment {
@@ -910,7 +969,7 @@ pub(crate) fn attach_session(
         context,
         handler,
         config,
-        mut connection,
+        connection,
         draining,
         transport_limits,
         worker_index,
@@ -919,78 +978,24 @@ pub(crate) fn attach_session(
     config.session.check_owned().map_err(|message| {
         HttpError::with_message(HttpErrorCode::INVALID_STATE_TRANSITION, message.as_bytes())
     })?;
-    if !context.handle().is_accepting() || context.is_cancelled() {
-        return Err(HttpError::with_message(
-            HttpErrorCode::DROPPED,
-            b"server admission closed",
-        ));
-    }
-    if config.session.non_abortive_close {
-        match &transport {
-            AcceptedTransport::ByteStream(transport) if !connection.secure => {
-                transport.enable_non_abortive_close(context)?;
-            }
-            AcceptedTransport::ByteStream(_) | AcceptedTransport::Tls(_) => {
-                return Err(HttpError::with_message(
-                    HttpErrorCode::INVALID_STATE_TRANSITION,
-                    NON_ABORTIVE_CLOSE_WITH_TLS.as_bytes(),
-                ));
-            }
-        }
-    }
-    if let Some(filter) = config.connection_filter.as_ref() {
-        let accepted =
-            catch_unwind(AssertUnwindSafe(|| filter.accept(&connection))).unwrap_or(false);
-        if !accepted {
-            transport.close_with_reset(context)?;
-            return Err(HttpError::with_message(
-                HttpErrorCode::CONNECT_ERROR,
-                b"connection rejected by server admission filter",
-            ));
-        }
-    }
-    connection.zero_copy_enabled =
-        transport.enable_zero_copy(context, config.zero_copy_threshold)?;
-    if let Some(observer) = config.connection_observer.as_ref() {
-        invoke_accept_callback(
-            callback_failure,
+    let PreparedSession {
+        transport,
+        connection,
+        uniplex,
+        #[cfg(test)]
+        retirement,
+    } = prepare_session(
+        transport,
+        SessionPreparation {
+            context,
+            config,
+            connection,
+            transport_limits,
             worker_index,
-            ServerCallbackStage::AcceptedConnectionObserver,
-            || observer.on_accepted(&connection),
-        )?;
-    }
+            callback_failure,
+        },
+    )?;
     let handler = bind_connection(handler, Arc::clone(&connection.context));
-    #[cfg(test)]
-    let retirement = match &transport {
-        AcceptedTransport::ByteStream(transport) => transport.retirement(),
-        AcceptedTransport::Tls(transport) => transport.retirement(),
-    };
-    let transport = transport.into_uniplex();
-
-    let mut uniplex = UniplexConfig {
-        buffer_limit: config.session.connection_flow_control as usize,
-        ingress_buffer_limit: config.session.stream_flow_control,
-        maximum_read_size: config.session.stream_flow_control as usize,
-        read_allocation_size: config.session.read_allocation_size,
-        maximum_write_size: config.session.byte_stream_limits.maximum_write_size(),
-        read_timeout: config.session.connection_idle_timeout,
-        stream_read_timeout: config.session.stream_read_timeout,
-        write_timeout: config.session.write_timeout,
-        drain_request_body_on_drop: false,
-        wait_for_http1_response_on_drain: false,
-        abort_exchanges_on_eof: config.session.abort_exchanges_on_eof,
-        deliver_ingress_before_abort: false,
-        unframed_bodiless_http1_requests: false,
-        non_abortive_close: config.session.non_abortive_close,
-        exact_method_tokens: config.session.exact_method_tokens,
-        verbatim_http2_header_values: config.session.verbatim_http2_header_values,
-        add_date_header_to_response: config.session.add_date_header_to_response,
-    };
-    if let Some(limits) = transport_limits {
-        uniplex.maximum_read_size = uniplex.maximum_read_size.min(limits.maximum_read_size());
-        uniplex.read_allocation_size = uniplex.read_allocation_size.min(limits.maximum_read_size());
-        uniplex.maximum_write_size = uniplex.maximum_write_size.min(limits.maximum_write_size());
-    }
     if config.session.owned_http1 && connection.protocol == CodecProtocol::Http11 {
         let io = UniplexConfig {
             drain_request_body_on_drop: true,
@@ -1002,7 +1007,7 @@ pub(crate) fn attach_session(
             handler,
             &connection.context,
             io,
-            config.session.owned_deadlines,
+            owned_http1_driver_config(&config.session, Http1DriverConfig::default()),
         )?;
         return admit_session(
             context,
@@ -1121,6 +1126,256 @@ pub(crate) fn attach_session(
     )
 }
 
+/// The inputs of the setup that every accepted session shares.
+struct SessionPreparation<'a> {
+    context: &'a WorkerContext,
+    config: &'a AcceptorConfig,
+    connection: ConnectionInfo,
+    transport_limits: Option<ByteStreamLimits>,
+    worker_index: usize,
+    callback_failure: &'a Arc<Mutex<Option<CallbackFailure>>>,
+}
+
+/// An admitted connection's transport and session I/O configuration.
+struct PreparedSession {
+    transport: Rc<dyn UniplexTransport>,
+    connection: ConnectionInfo,
+    uniplex: UniplexConfig,
+    #[cfg(test)]
+    retirement: Option<TransportRetirement>,
+}
+
+/// Admits the connection and prepares its transport: the admission and filter checks, socket
+/// options and the connection observer's `on_accepted`.
+fn prepare_session(
+    transport: AcceptedTransport,
+    preparation: SessionPreparation<'_>,
+) -> Result<PreparedSession, HttpError> {
+    let SessionPreparation {
+        context,
+        config,
+        mut connection,
+        transport_limits,
+        worker_index,
+        callback_failure,
+    } = preparation;
+    if !context.handle().is_accepting() || context.is_cancelled() {
+        return Err(HttpError::with_message(
+            HttpErrorCode::DROPPED,
+            b"server admission closed",
+        ));
+    }
+    if config.session.non_abortive_close {
+        match &transport {
+            AcceptedTransport::ByteStream(transport) if !connection.secure => {
+                transport.enable_non_abortive_close(context)?;
+            }
+            AcceptedTransport::ByteStream(_) | AcceptedTransport::Tls(_) => {
+                return Err(HttpError::with_message(
+                    HttpErrorCode::INVALID_STATE_TRANSITION,
+                    NON_ABORTIVE_CLOSE_WITH_TLS.as_bytes(),
+                ));
+            }
+        }
+    }
+    if let Some(filter) = config.connection_filter.as_ref() {
+        let accepted =
+            catch_unwind(AssertUnwindSafe(|| filter.accept(&connection))).unwrap_or(false);
+        if !accepted {
+            transport.close_with_reset(context)?;
+            return Err(HttpError::with_message(
+                HttpErrorCode::CONNECT_ERROR,
+                b"connection rejected by server admission filter",
+            ));
+        }
+    }
+    connection.zero_copy_enabled =
+        transport.enable_zero_copy(context, config.zero_copy_threshold)?;
+    if let Some(observer) = config.connection_observer.as_ref() {
+        invoke_accept_callback(
+            callback_failure,
+            worker_index,
+            ServerCallbackStage::AcceptedConnectionObserver,
+            || observer.on_accepted(&connection),
+        )?;
+    }
+    #[cfg(test)]
+    let retirement = match &transport {
+        AcceptedTransport::ByteStream(transport) => transport.retirement(),
+        AcceptedTransport::Tls(transport) => transport.retirement(),
+    };
+    let transport = transport.into_uniplex();
+
+    let mut uniplex = UniplexConfig {
+        buffer_limit: config.session.connection_flow_control as usize,
+        ingress_buffer_limit: config.session.stream_flow_control,
+        maximum_read_size: config.session.stream_flow_control as usize,
+        read_allocation_size: config.session.read_allocation_size,
+        maximum_write_size: config.session.byte_stream_limits.maximum_write_size(),
+        read_timeout: config.session.connection_idle_timeout,
+        stream_read_timeout: config.session.stream_read_timeout,
+        write_timeout: config.session.write_timeout,
+        drain_request_body_on_drop: false,
+        wait_for_http1_response_on_drain: false,
+        abort_exchanges_on_eof: config.session.abort_exchanges_on_eof,
+        deliver_ingress_before_abort: false,
+        unframed_bodiless_http1_requests: false,
+        non_abortive_close: config.session.non_abortive_close,
+        exact_method_tokens: config.session.exact_method_tokens,
+        verbatim_http2_header_values: config.session.verbatim_http2_header_values,
+        add_date_header_to_response: config.session.add_date_header_to_response,
+    };
+    if let Some(limits) = transport_limits {
+        uniplex.maximum_read_size = uniplex.maximum_read_size.min(limits.maximum_read_size());
+        uniplex.read_allocation_size = uniplex.read_allocation_size.min(limits.maximum_read_size());
+        uniplex.maximum_write_size = uniplex.maximum_write_size.min(limits.maximum_write_size());
+    }
+    Ok(PreparedSession {
+        transport,
+        connection,
+        uniplex,
+        #[cfg(test)]
+        retirement,
+    })
+}
+
+/// The inputs of an accepted connection that a hosted application serves.
+pub(crate) struct OwnedSessionAttachment<'a> {
+    pub context: &'a WorkerContext,
+    pub factory: &'a dyn OwnedConnectionFactory,
+    pub id: ConnectionId,
+    pub config: &'a AcceptorConfig,
+    pub connection: ConnectionInfo,
+    pub draining: &'a AtomicBool,
+    pub worker_index: usize,
+    pub callback_failure: &'a Arc<Mutex<Option<CallbackFailure>>>,
+}
+
+/// Prepares an accepted connection as `attach_session` does, then hands it to the hosted
+/// application's `attach`, and admits the session that `attach` returns.
+pub(crate) fn attach_owned_session(
+    transport: AcceptedTransport,
+    attachment: OwnedSessionAttachment<'_>,
+) -> Result<AcceptedSession, HttpError> {
+    let OwnedSessionAttachment {
+        context,
+        factory,
+        id,
+        config,
+        connection,
+        draining,
+        worker_index,
+        callback_failure,
+    } = attachment;
+    let PreparedSession {
+        transport,
+        connection,
+        uniplex,
+        #[cfg(test)]
+        retirement,
+    } = prepare_session(
+        transport,
+        SessionPreparation {
+            context,
+            config,
+            connection,
+            transport_limits: None,
+            worker_index,
+            callback_failure,
+        },
+    )?;
+    let io = UniplexConfig {
+        drain_request_body_on_drop: true,
+        ..uniplex
+    };
+    let attach = OwnedConnectionAttach::new(
+        context,
+        worker_index,
+        id,
+        &connection,
+        &config.session,
+        transport,
+        io,
+    );
+    let (session, control) = invoke_accept_callback(
+        callback_failure,
+        worker_index,
+        ServerCallbackStage::HandlerFactory,
+        || factory.attach(attach),
+    )??
+    .into_parts();
+    admit_session(
+        context,
+        Some(draining),
+        connection.protocol,
+        session,
+        control,
+        #[cfg(test)]
+        retirement,
+    )
+}
+
+/// A hosted application's HTTP/1.1 session on `transport`, with the driver configuration
+/// `http1` and the fields that `config` overrides.
+pub(crate) fn hosted_http1_session<A: OwnedApplication>(
+    context: &WorkerContext,
+    transport: Rc<dyn UniplexTransport>,
+    io: UniplexConfig,
+    config: &ServerSessionConfig,
+    http1: Http1DriverConfig,
+    make: impl FnOnce(&OwnedH1Handle) -> A,
+) -> Result<(ServerSession, SessionControl), HttpError> {
+    let (session, handle, finished) = OwnedHttp1Session::new_with(
+        context,
+        OwnedH1Options {
+            context: context.clone(),
+            transport: Rc::clone(&transport),
+            io,
+            http1: owned_http1_driver_config(config, http1),
+        },
+        std::future::ready(()),
+        make,
+    )?;
+    Ok((
+        ServerSession::Hosted(Box::new(session)),
+        SessionControl {
+            handle: SessionHandle::OwnedHttp1 { handle, finished },
+            transport,
+            context: context.clone(),
+        },
+    ))
+}
+
+/// A hosted application's HTTP/2 session on `transport`, with the configuration that the
+/// built-in owned HTTP/2 path derives from `config`.
+pub(crate) fn hosted_http2_session<A: OwnedApplication>(
+    context: &WorkerContext,
+    transport: Rc<dyn UniplexTransport>,
+    io: UniplexConfig,
+    config: &ServerSessionConfig,
+    make: impl FnOnce(&OwnedH2Handle, &Rc<Cell<bool>>) -> A,
+) -> Result<(ServerSession, SessionControl), HttpError> {
+    let (session, handle, finished) = OwnedHttp2Session::new_with(
+        context,
+        OwnedH2Options {
+            context: context.clone(),
+            transport: Rc::clone(&transport),
+            io,
+            http2: owned_http2_session_config(config),
+        },
+        std::future::ready(()),
+        make,
+    )?;
+    Ok((
+        ServerSession::Hosted(Box::new(session)),
+        SessionControl {
+            handle: SessionHandle::OwnedHttp2 { handle, finished },
+            transport,
+            context: context.clone(),
+        },
+    ))
+}
+
 fn admit_session(
     context: &WorkerContext,
     draining: Option<&AtomicBool>,
@@ -1208,6 +1463,18 @@ pub(crate) fn owned_http2_session_config(config: &ServerSessionConfig) -> Http2S
         ping_probes: None,
         deadlines: config.owned_deadlines,
         ..http2
+    }
+}
+
+/// `http1` with each field that has a `ServerSessionConfig` twin taken from `config`: the
+/// connection deadlines.
+pub(crate) fn owned_http1_driver_config(
+    config: &ServerSessionConfig,
+    http1: Http1DriverConfig,
+) -> Http1DriverConfig {
+    Http1DriverConfig {
+        deadlines: config.owned_deadlines,
+        ..http1
     }
 }
 

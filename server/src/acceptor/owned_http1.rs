@@ -11,7 +11,6 @@ use std::cell::Cell;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
-use std::panic::resume_unwind;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::Context;
@@ -23,10 +22,11 @@ use roxygen_core::handler::HandlerSessionContext;
 use roxygen_core::handler::HttpHandlerRef;
 use roxygen_runtime::keep_alive::KeepAliveOwner;
 use roxygen_runtime::panic::discard_panic;
+use roxygen_runtime::worker::ContainedPanicScope;
 use roxygen_runtime::worker::WorkerCleanupTask;
 use roxygen_runtime::worker::WorkerCleanupTaskRegistration;
 use roxygen_runtime::worker::WorkerContext;
-use roxygen_session::OwnedConnectionDeadlines;
+use roxygen_session::owned::OwnedApplication;
 use roxygen_session::owned_h1::Http1DriverConfig;
 use roxygen_session::owned_h1::OwnedH1Handle;
 use roxygen_session::owned_h1::OwnedH1Options;
@@ -41,31 +41,34 @@ use super::handler_application::failure;
 type RunFuture = Pin<Box<dyn Future<Output = Result<UniplexRunSummary, HttpError>> + 'static>>;
 
 /// One owned HTTP/1.1 connection and the worker cleanup that retires it.
-pub(crate) struct OwnedHttp1Session {
-    // Declared first, so an unrun session releases its handler context before `cleanup`
-    // activates the owner's finalization.
-    session: OwnedH1Session<HandlerApplication>,
+pub(crate) struct OwnedHttp1Session<A: OwnedApplication> {
+    // Declared first, so an unrun session releases its application before `cleanup` activates
+    // the application's finalization.
+    session: OwnedH1Session<A>,
     cleanup: Cleanup,
 }
 
 /// A worker cleanup task reserved at construction, activated when the run ends or when the
 /// session or its run future is dropped. It finishes an abandoned (already cancelled) run,
-/// then finalizes the owner of the handler contexts once every context is released.
+/// then runs the application's finalization.
 struct Cleanup {
     registration: WorkerCleanupTaskRegistration,
     abandoned: Rc<Cell<Option<RunFuture>>>,
     handle: OwnedH1Handle,
     finished: Rc<Cell<bool>>,
+    context: WorkerContext,
 }
 
-impl OwnedHttp1Session {
+impl OwnedHttp1Session<HandlerApplication> {
+    /// A session that serves `handler`, whose handler contexts the cleanup finalizes once every
+    /// one is released.
     pub(crate) fn new(
         context: &WorkerContext,
         transport: Rc<dyn UniplexTransport>,
         handler: HttpHandlerRef,
         connection: &ConnectionContext,
         io: UniplexConfig,
-        deadlines: OwnedConnectionDeadlines,
+        http1: Http1DriverConfig,
     ) -> Result<(Self, OwnedH1Handle, Rc<Cell<bool>>), HttpError> {
         let mut owner = KeepAliveOwner::new_for_worker((), context.handle())
             .map_err(|error| failure(error.to_string().as_bytes()))?;
@@ -74,6 +77,29 @@ impl OwnedHttp1Session {
             connection.peer_identity().map(Rc::from),
         )
         .map_err(|error| failure(error.to_string().as_bytes()))?;
+        Self::new_with(
+            context,
+            OwnedH1Options {
+                context: context.clone(),
+                transport,
+                io,
+                http1,
+            },
+            async move { owner.finalize().await },
+            |_| HandlerApplication::new(handler, base),
+        )
+    }
+}
+
+impl<A: OwnedApplication> OwnedHttp1Session<A> {
+    /// A session whose application `make` builds from its handle. The cleanup runs `finalize`
+    /// once the run has finished.
+    pub(crate) fn new_with(
+        context: &WorkerContext,
+        options: OwnedH1Options,
+        finalize: impl Future<Output = ()> + 'static,
+        make: impl FnOnce(&OwnedH1Handle) -> A,
+    ) -> Result<(Self, OwnedH1Handle, Rc<Cell<bool>>), HttpError> {
         let abandoned: Rc<Cell<Option<RunFuture>>> = Rc::default();
         let finished = Rc::new(Cell::new(false));
         let registration = context
@@ -97,22 +123,11 @@ impl OwnedHttp1Session {
                         .await;
                         finished.set(true);
                     }
-                    owner.finalize().await;
+                    finalize.await;
                 }
             })
             .map_err(|error| failure(error.to_string().as_bytes()))?;
-        let (session, handle) = OwnedH1Session::new(
-            HandlerApplication::new(handler, base),
-            OwnedH1Options {
-                context: context.clone(),
-                transport,
-                io,
-                http1: Http1DriverConfig {
-                    deadlines,
-                    ..Http1DriverConfig::default()
-                },
-            },
-        )?;
+        let (session, handle) = OwnedH1Session::new_with(options, make)?;
         Ok((
             Self {
                 session,
@@ -121,6 +136,7 @@ impl OwnedHttp1Session {
                     abandoned,
                     handle: handle.clone(),
                     finished: Rc::clone(&finished),
+                    context: context.clone(),
                 },
             },
             handle,
@@ -128,9 +144,9 @@ impl OwnedHttp1Session {
         ))
     }
 
-    /// Runs the connection, then waits for its handler contexts to be released. Dropping
-    /// the returned future before it completes cancels the connection, whose run then
-    /// finishes in the worker cleanup task.
+    /// Runs the connection, then waits for its cleanup's finalization. Dropping the returned
+    /// future before it completes cancels the connection, whose run then finishes in the
+    /// worker cleanup task.
     pub(crate) fn run(self) -> OwnedHttp1Run {
         OwnedHttp1Run {
             run: Some(Box::pin(self.session.run())),
@@ -158,13 +174,18 @@ impl Future for OwnedHttp1Run {
                 Ok(Poll::Pending) => return Poll::Pending,
                 Ok(Poll::Ready(result)) => result,
                 Err(panic) => {
-                    // The driver rethrows a callback panic only after its cleanup has joined,
-                    // so the run is finished. Dropping the registration finalizes the owner.
-                    this.run = None;
-                    if let Some(cleanup) = this.cleanup.take() {
-                        cleanup.finished.set(true);
+                    // The driver resumes a callback panic only after its cleanup has joined,
+                    // so the run has finished. The panic fails only this connection.
+                    if let Some(cleanup) = this.cleanup.as_ref() {
+                        cleanup.context.record_contained_panic(
+                            ContainedPanicScope::Connection,
+                            "owned_http1_run",
+                            None,
+                            &*panic,
+                        );
                     }
-                    resume_unwind(panic);
+                    discard_panic(panic);
+                    Err(failure(b"owned connection panicked"))
                 }
             };
             this.run = None;

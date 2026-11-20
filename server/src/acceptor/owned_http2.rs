@@ -11,7 +11,6 @@ use std::cell::Cell;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
-use std::panic::resume_unwind;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::Context;
@@ -23,10 +22,12 @@ use roxygen_core::handler::HandlerSessionContext;
 use roxygen_core::handler::HttpHandlerRef;
 use roxygen_runtime::keep_alive::KeepAliveOwner;
 use roxygen_runtime::panic::discard_panic;
+use roxygen_runtime::worker::ContainedPanicScope;
 use roxygen_runtime::worker::WorkerCleanupTask;
 use roxygen_runtime::worker::WorkerCleanupTaskRegistration;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_session::http2::Http2SessionConfig;
+use roxygen_session::owned::OwnedApplication;
 use roxygen_session::owned_h2::OwnedH2Handle;
 use roxygen_session::owned_h2::OwnedH2Options;
 use roxygen_session::owned_h2::OwnedH2Session;
@@ -42,24 +43,27 @@ use super::handler_application::failure;
 type RunFuture = Pin<Box<dyn Future<Output = Result<UniplexRunSummary, HttpError>> + 'static>>;
 
 /// One owned HTTP/2 connection and the worker cleanup that retires it.
-pub(crate) struct OwnedHttp2Session {
-    // Declared first, so an unrun session releases its handler context before `cleanup`
-    // activates the owner's finalization.
-    session: OwnedH2Session<HandlerApplication>,
+pub(crate) struct OwnedHttp2Session<A: OwnedApplication> {
+    // Declared first, so an unrun session releases its application before `cleanup` activates
+    // the application's finalization.
+    session: OwnedH2Session<A>,
     cleanup: Cleanup,
 }
 
 /// A worker cleanup task reserved at construction, activated when the run ends or when the
 /// session or its run future is dropped. It finishes an abandoned (already cancelled) run,
-/// then finalizes the owner of the handler contexts once every context is released.
+/// then runs the application's finalization.
 struct Cleanup {
     registration: WorkerCleanupTaskRegistration,
     abandoned: Rc<Cell<Option<RunFuture>>>,
     handle: OwnedH2Handle,
     finished: Rc<Cell<bool>>,
+    context: WorkerContext,
 }
 
-impl OwnedHttp2Session {
+impl OwnedHttp2Session<HandlerApplication> {
+    /// A session that serves `handler`, whose handler contexts the cleanup finalizes once every
+    /// one is released.
     pub(crate) fn new(
         context: &WorkerContext,
         transport: Rc<dyn UniplexTransport>,
@@ -75,6 +79,30 @@ impl OwnedHttp2Session {
             connection.peer_identity().map(Rc::from),
         )
         .map_err(|error| failure(error.to_string().as_bytes()))?;
+        Self::new_with(
+            context,
+            OwnedH2Options {
+                context: context.clone(),
+                transport,
+                io,
+                http2,
+            },
+            async move { owner.finalize().await },
+            |_, _| HandlerApplication::new(handler, base),
+        )
+    }
+}
+
+impl<A: OwnedApplication> OwnedHttp2Session<A> {
+    /// A session whose application `make` builds from its handle and its finished flag, which
+    /// is set once the run has ended, however it ended. The cleanup runs `finalize` once the
+    /// run has finished.
+    pub(crate) fn new_with(
+        context: &WorkerContext,
+        options: OwnedH2Options,
+        finalize: impl Future<Output = ()> + 'static,
+        make: impl FnOnce(&OwnedH2Handle, &Rc<Cell<bool>>) -> A,
+    ) -> Result<(Self, OwnedH2Handle, Rc<Cell<bool>>), HttpError> {
         let abandoned: Rc<Cell<Option<RunFuture>>> = Rc::default();
         let finished = Rc::new(Cell::new(false));
         let registration = context
@@ -98,19 +126,12 @@ impl OwnedHttp2Session {
                         .await;
                         finished.set(true);
                     }
-                    owner.finalize().await;
+                    finalize.await;
                 }
             })
             .map_err(|error| failure(error.to_string().as_bytes()))?;
-        let (session, handle) = OwnedH2Session::new(
-            HandlerApplication::new(handler, base),
-            OwnedH2Options {
-                context: context.clone(),
-                transport,
-                io,
-                http2,
-            },
-        )?;
+        let (session, handle) =
+            OwnedH2Session::new_with(options, |handle| make(handle, &finished))?;
         Ok((
             Self {
                 session,
@@ -119,6 +140,7 @@ impl OwnedHttp2Session {
                     abandoned,
                     handle: handle.clone(),
                     finished: Rc::clone(&finished),
+                    context: context.clone(),
                 },
             },
             handle,
@@ -133,17 +155,47 @@ impl OwnedHttp2Session {
         self.session.add_lifecycle_observer(observer)
     }
 
-    /// Runs the connection, then waits for its handler contexts to be released. Dropping
-    /// the returned future before it completes cancels the connection, whose run then
-    /// finishes in the worker cleanup task.
+    /// Runs the connection, then waits for its cleanup's finalization. Dropping the returned
+    /// future before it completes cancels the connection, whose run then finishes in the
+    /// worker cleanup task.
     pub(crate) fn run(self) -> OwnedHttp2Run {
+        let run: RunFuture = Box::pin(self.session.run());
+        #[cfg(test)]
+        let run = if RUN_FAULT.take() {
+            faulted_run(run)
+        } else {
+            run
+        };
         OwnedHttp2Run {
-            run: Some(Box::pin(self.session.run())),
+            run: Some(run),
             cleanup: Some(self.cleanup),
             finalizing: None,
             result: None,
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RUN_FAULT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes the next owned HTTP/2 run started on this thread unwind out of its first poll, as a
+/// fault in the driver's own code could. The driver is never polled; dropping the faulted run
+/// drops it unstarted.
+#[cfg(test)]
+pub(crate) fn fault_next_http2_run() {
+    RUN_FAULT.set(true);
+}
+
+#[cfg(test)]
+fn faulted_run(unstarted: RunFuture) -> RunFuture {
+    Box::pin(std::future::poll_fn(
+        move |_: &mut Context<'_>| -> Poll<Result<UniplexRunSummary, HttpError>> {
+            let _unstarted = &unstarted;
+            panic!("owned HTTP/2 run fault")
+        },
+    ))
 }
 
 pub(crate) struct OwnedHttp2Run {
@@ -163,13 +215,18 @@ impl Future for OwnedHttp2Run {
                 Ok(Poll::Pending) => return Poll::Pending,
                 Ok(Poll::Ready(result)) => result,
                 Err(panic) => {
-                    // The driver rethrows a callback panic only after its cleanup has joined,
-                    // so the run is finished. Dropping the registration finalizes the owner.
-                    this.run = None;
-                    if let Some(cleanup) = this.cleanup.take() {
-                        cleanup.finished.set(true);
+                    // A run whose poll unwound is poisoned, and dropping it resets its
+                    // transport. The panic fails only this connection.
+                    if let Some(cleanup) = this.cleanup.as_ref() {
+                        cleanup.context.record_contained_panic(
+                            ContainedPanicScope::Connection,
+                            "owned_http2_run",
+                            None,
+                            &*panic,
+                        );
                     }
-                    resume_unwind(panic);
+                    discard_panic(panic);
+                    Err(failure(b"owned connection panicked"))
                 }
             };
             this.run = None;
