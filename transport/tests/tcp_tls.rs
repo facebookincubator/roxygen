@@ -29,8 +29,8 @@ mod tcp_tls {
     use std::pin::Pin;
     use std::rc::Rc;
     use std::sync::Arc;
-    #[cfg(unix)]
     use std::sync::Mutex;
+    use std::sync::OnceLock;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -93,7 +93,11 @@ mod tcp_tls {
     use tokio_rustls::TlsAcceptor;
     use tokio_rustls::TlsConnector;
 
+    use crate::TlsAlpnMismatch;
+    use crate::TlsClientTrust;
+    use crate::TlsClientVerification;
     use crate::TlsHandshakeFailureKind;
+    use crate::TlsServerSettings;
     use crate::byte_event::ByteEventWriteFlags;
     use crate::byte_stream::ByteEventCapability;
     use crate::byte_stream::ByteEventWriteState;
@@ -12456,5 +12460,877 @@ mod tcp_tls {
         ] {
             assert_eq!(tls_handshake_failure_kind(&error), kind, "{error:?}");
         }
+    }
+
+    /// A CA certificate with the parameters and key that issue under it.
+    struct TestCa {
+        params: rcgen::CertificateParams,
+        key: rcgen::KeyPair,
+        der: Box<[u8]>,
+        pem: String,
+    }
+
+    impl TestCa {
+        /// A self-signed CA named `name`.
+        fn root(name: &str) -> Self {
+            let params = ca_params(name);
+            let key = rcgen::KeyPair::generate().unwrap();
+            let certificate = params.self_signed(&key).unwrap();
+            Self {
+                der: certificate.der().to_vec().into(),
+                pem: certificate.pem(),
+                params,
+                key,
+            }
+        }
+
+        /// A CA with `params` and its own new key, issued by this CA.
+        fn issue_ca(&self, params: rcgen::CertificateParams) -> Self {
+            self.issue_ca_with_key(params, rcgen::KeyPair::generate().unwrap())
+        }
+
+        /// A CA with `params` and `key`, issued by this CA.
+        fn issue_ca_with_key(&self, params: rcgen::CertificateParams, key: rcgen::KeyPair) -> Self {
+            let certificate = params
+                .signed_by(&key, &rcgen::Issuer::from_params(&self.params, &self.key))
+                .unwrap();
+            Self {
+                der: certificate.der().to_vec().into(),
+                pem: certificate.pem(),
+                params,
+                key,
+            }
+        }
+
+        /// A client certificate issued by this CA, and its private key.
+        fn issue_client(&self) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+            let mut params = rcgen::CertificateParams::new(vec!["client".to_owned()]).unwrap();
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "client");
+            let key = rcgen::KeyPair::generate().unwrap();
+            let certificate = params
+                .signed_by(&key, &rcgen::Issuer::from_params(&self.params, &self.key))
+                .unwrap();
+            (
+                certificate.der().clone(),
+                PrivateKeyDer::try_from(key.serialized_der().to_vec()).unwrap(),
+            )
+        }
+
+        fn certificate(&self) -> CertificateDer<'static> {
+            CertificateDer::from(self.der.to_vec())
+        }
+    }
+
+    /// Unconstrained CA parameters with the common name `name`.
+    fn ca_params(name: &str) -> rcgen::CertificateParams {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+    }
+
+    /// The server's self-signed `localhost` certificate and its key.
+    struct ServerIdentity {
+        certificate: Box<[u8]>,
+        key: Box<[u8]>,
+    }
+
+    impl ServerIdentity {
+        fn new() -> Self {
+            let generated =
+                rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+            Self {
+                certificate: generated.cert.der().to_vec().into(),
+                key: generated.signing_key.serialized_der().to_vec().into(),
+            }
+        }
+
+        fn settings(&self) -> TlsServerSettings {
+            TlsServerSettings::new(vec![self.certificate.clone()], self.key.clone())
+        }
+
+        /// A client that trusts this server, offers `versions` and presents
+        /// `client`'s certificate chain and key, if any.
+        fn client(
+            &self,
+            client: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+            versions: &[&'static rustls::SupportedProtocolVersion],
+        ) -> ClientConfig {
+            let builder = self.client_builder(versions);
+            match client {
+                Some((chain, key)) => builder.with_client_auth_cert(chain, key).unwrap(),
+                None => builder.with_no_client_auth(),
+            }
+        }
+
+        /// A client config builder that trusts this server and offers `versions`.
+        fn client_builder(
+            &self,
+            versions: &[&'static rustls::SupportedProtocolVersion],
+        ) -> rustls::ConfigBuilder<ClientConfig, rustls::client::WantsClientCert> {
+            let mut roots = RootCertStore::empty();
+            roots
+                .add(CertificateDer::from(self.certificate.to_vec()))
+                .unwrap();
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(versions)
+                .unwrap()
+                .with_root_certificates(roots)
+        }
+    }
+
+    /// What one TLS accept with client verification observed.
+    struct ClientAuthOutcome {
+        /// The accept's result: the client certificate the server exposes, if any.
+        server: Result<Option<PeerIdentity>, HttpError>,
+        /// The client's handshake result, with the protocol ALPN selected.
+        client_handshake: Result<Option<Vec<u8>>, io::Error>,
+        /// What the client read after sending `ping`.
+        client_received: Vec<u8>,
+    }
+
+    /// Accepts one loopback TLS connection with `options` from a client using
+    /// `client_config`. After a handshake that succeeds on both sides, the
+    /// client sends `ping`, and the server answers `pong` and closes.
+    fn accept_with_client_auth(
+        options: TlsServerOptions,
+        client_config: ClientConfig,
+    ) -> ClientAuthOutcome {
+        Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(LocalSet::new().run_until(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let stream = TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (accepted, _) = listener.accept().await.unwrap();
+                let accepted = accepted.into_std().unwrap();
+                let client = tokio::task::spawn_local(async move {
+                    let mut tls = match TlsConnector::from(Arc::new(client_config))
+                        .connect(ServerName::try_from("localhost").unwrap(), stream)
+                        .await
+                    {
+                        Ok(tls) => tls,
+                        Err(error) => return (Err(error), Vec::new()),
+                    };
+                    let protocol = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+                    // A TLS 1.3 client finishes its handshake before the server
+                    // checks its certificate, then reads the server's alert.
+                    let mut received = Vec::new();
+                    if tls.write_all(b"ping").await.is_ok() {
+                        let _ =
+                            time::timeout(Duration::from_secs(10), tls.read_to_end(&mut received))
+                                .await;
+                    }
+                    (Ok(protocol), received)
+                });
+                let (worker, driver) = WorkerDriver::new(8).unwrap();
+                let call = worker
+                    .call_local(move |context| async move {
+                        let transport = TlsTransport::accept(
+                            &context,
+                            accepted,
+                            options,
+                            limits(),
+                            Duration::from_secs(10),
+                            CancellationToken::never(),
+                        )
+                        .await?;
+                        let identity = transport.peer_identity(&context).unwrap();
+                        let stream = transport.into_byte_stream();
+                        let request = stream
+                            .read(
+                                &context,
+                                4,
+                                4,
+                                Duration::from_secs(10),
+                                CancellationToken::never(),
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(read_bytes(request), b"ping");
+                        stream
+                            .write(
+                                &context,
+                                queue(&[b"pong"]),
+                                Duration::from_secs(10),
+                                CancellationToken::never(),
+                            )
+                            .await
+                            .unwrap();
+                        stream.close(&context).unwrap();
+                        Ok(identity)
+                    })
+                    .unwrap();
+                let driver_task = tokio::task::spawn_local(driver);
+                let server = time::timeout(Duration::from_secs(10), call)
+                    .await
+                    .expect("the TLS accept must finish")
+                    .unwrap();
+                let (client_handshake, client_received) =
+                    time::timeout(Duration::from_secs(10), client)
+                        .await
+                        .expect("the client must finish")
+                        .unwrap();
+                worker.begin_shutdown();
+                time::timeout(Duration::from_secs(10), driver_task)
+                    .await
+                    .expect("worker shutdown must remain bounded")
+                    .unwrap();
+                ClientAuthOutcome {
+                    server,
+                    client_handshake,
+                    client_received,
+                }
+            }))
+    }
+
+    /// Returns the rustls error that failed the server's accept.
+    fn rejected_certificate(outcome: &ClientAuthOutcome) -> &rustls::Error {
+        let error = outcome
+            .server
+            .as_ref()
+            .expect_err("the server must reject the client");
+        assert_eq!(
+            tls_handshake_failure_kind(error),
+            TlsHandshakeFailureKind::Certificate,
+            "{error:?}"
+        );
+        tls_handshake_rustls_error(error).expect("rustls failed the handshake")
+    }
+
+    fn bundle(certificates: &[&TestCa]) -> TlsClientTrust {
+        TlsClientTrust::from_der(certificates.iter().map(|ca| ca.der.clone()).collect()).unwrap()
+    }
+
+    #[test]
+    fn if_presented_accepts_anonymous_client() {
+        let server = ServerIdentity::new();
+        let root = TestCa::root("client root CA");
+        let options = TlsServerOptions::from_settings(
+            server
+                .settings()
+                .with_client_verification(TlsClientVerification::IfPresented(bundle(&[&root]))),
+        )
+        .unwrap();
+
+        let outcome =
+            accept_with_client_auth(options, server.client(None, rustls::DEFAULT_VERSIONS));
+
+        assert_eq!(
+            outcome.server.unwrap(),
+            None,
+            "a client without a certificate has no peer identity"
+        );
+        assert_eq!(
+            outcome.client_received, b"pong",
+            "application bytes flow both ways after the handshake"
+        );
+    }
+
+    #[test]
+    fn always_rejects_anonymous() {
+        let server = ServerIdentity::new();
+        let root = TestCa::root("client root CA");
+        let options = TlsServerOptions::from_settings(
+            server
+                .settings()
+                .with_client_verification(TlsClientVerification::Always(bundle(&[&root]))),
+        )
+        .unwrap();
+
+        let outcome =
+            accept_with_client_auth(options, server.client(None, rustls::DEFAULT_VERSIONS));
+
+        assert!(
+            matches!(
+                rejected_certificate(&outcome),
+                rustls::Error::NoCertificatesPresented
+            ),
+            "{:?}",
+            outcome.server.err()
+        );
+    }
+
+    #[test]
+    fn if_presented_exposes_valid_client_der() {
+        let server = ServerIdentity::new();
+        let root = TestCa::root("client root CA");
+        let intermediate = root.issue_ca(ca_params("client intermediate CA"));
+        let (leaf, key) = intermediate.issue_client();
+        let options = TlsServerOptions::from_settings(server.settings().with_client_verification(
+            TlsClientVerification::IfPresented(bundle(&[&root, &intermediate])),
+        ))
+        .unwrap();
+
+        let outcome = accept_with_client_auth(
+            options,
+            server.client(
+                Some((vec![leaf.clone(), intermediate.certificate()], key)),
+                rustls::DEFAULT_VERSIONS,
+            ),
+        );
+
+        assert_eq!(
+            outcome.server.unwrap(),
+            Some(PeerIdentity::new(leaf.as_ref())),
+            "the server exposes the client's leaf"
+        );
+        assert_eq!(outcome.client_received, b"pong");
+    }
+
+    #[test]
+    fn if_presented_rejects_untrusted_certificate_in_handshake() {
+        let server = ServerIdentity::new();
+        let trusted = TestCa::root("trusted client CA");
+        let untrusted = TestCa::root("untrusted client CA");
+        let (leaf, key) = untrusted.issue_client();
+        let options = TlsServerOptions::from_settings(
+            server
+                .settings()
+                .with_client_verification(TlsClientVerification::IfPresented(bundle(&[&trusted]))),
+        )
+        .unwrap();
+
+        // Under TLS 1.2 the server checks the certificate before its Finished,
+        // so the client's handshake fails too.
+        let outcome = accept_with_client_auth(
+            options,
+            server.client(Some((vec![leaf], key)), &[&rustls::version::TLS12]),
+        );
+
+        assert!(
+            matches!(
+                rejected_certificate(&outcome),
+                rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)
+            ),
+            "{:?}",
+            outcome.server.as_ref().err()
+        );
+        assert!(
+            outcome.client_handshake.is_err(),
+            "the client's handshake fails"
+        );
+    }
+
+    #[test]
+    fn bundle_intermediate_validates_leaf() {
+        let server = ServerIdentity::new();
+        let root = TestCa::root("client root CA");
+        let intermediate = root.issue_ca(ca_params("client intermediate CA"));
+        let (leaf, key) = intermediate.issue_client();
+        let options = TlsServerOptions::from_settings(server.settings().with_client_verification(
+            TlsClientVerification::IfPresented(bundle(&[&root, &intermediate])),
+        ))
+        .unwrap();
+
+        // The client sends only its leaf; the bundle supplies the intermediate.
+        let outcome = accept_with_client_auth(
+            options,
+            server.client(Some((vec![leaf.clone()], key)), rustls::DEFAULT_VERSIONS),
+        );
+
+        assert_eq!(
+            outcome.server.unwrap(),
+            Some(PeerIdentity::new(leaf.as_ref()))
+        );
+    }
+
+    #[test]
+    fn expired_bundle_intermediate_is_rejected() {
+        let server = ServerIdentity::new();
+        let root = TestCa::root("client root CA");
+        let mut expired = ca_params("expired client intermediate CA");
+        expired.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        expired.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        let intermediate = root.issue_ca(expired);
+        let (leaf, key) = intermediate.issue_client();
+        let options = TlsServerOptions::from_settings(server.settings().with_client_verification(
+            TlsClientVerification::IfPresented(bundle(&[&root, &intermediate])),
+        ))
+        .unwrap();
+
+        // The bundle intermediate is a path member whose validity is checked,
+        // not a trust anchor.
+        let outcome = accept_with_client_auth(
+            options,
+            server.client(Some((vec![leaf], key)), rustls::DEFAULT_VERSIONS),
+        );
+
+        assert!(
+            matches!(
+                rejected_certificate(&outcome),
+                rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::Expired
+                        | rustls::CertificateError::ExpiredContext { .. }
+                )
+            ),
+            "{:?}",
+            outcome.server.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn self_issued_certificate_signed_by_another_key_is_an_intermediate() {
+        let server = ServerIdentity::new();
+        let root = TestCa::root("shared client CA name");
+        // The same subject Name as `root`, with its own key, signed by `root`.
+        let self_issued = root.issue_ca(ca_params("shared client CA name"));
+        let unrelated = TestCa::root("unrelated client CA");
+        let (leaf, key) = self_issued.issue_client();
+        let accept = |trust| {
+            let options = TlsServerOptions::from_settings(
+                server
+                    .settings()
+                    .with_client_verification(TlsClientVerification::IfPresented(trust)),
+            )
+            .unwrap();
+            accept_with_client_auth(
+                options,
+                server.client(
+                    Some((vec![leaf.clone()], key.clone_key())),
+                    rustls::DEFAULT_VERSIONS,
+                ),
+            )
+        };
+
+        // Not an anchor, so nothing in this bundle anchors the leaf's chain.
+        let without_root = accept(bundle(&[&self_issued, &unrelated]));
+        rejected_certificate(&without_root);
+
+        // As an intermediate it chains to the root that signed it.
+        let with_root = accept(bundle(&[&self_issued, &unrelated, &root]));
+        assert_eq!(
+            with_root.server.unwrap(),
+            Some(PeerIdentity::new(leaf.as_ref()))
+        );
+    }
+
+    /// Records the CertificateRequest's CA names and presents no certificate.
+    #[derive(Debug, Default)]
+    struct HintRecorder(Mutex<Option<Vec<Vec<u8>>>>);
+
+    impl rustls::client::ResolvesClientCert for HintRecorder {
+        fn resolve(
+            &self,
+            root_hint_subjects: &[&[u8]],
+            _: &[rustls::SignatureScheme],
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            *self.0.lock().unwrap() = Some(
+                root_hint_subjects
+                    .iter()
+                    .map(|subject| subject.to_vec())
+                    .collect(),
+            );
+            None
+        }
+
+        fn has_certs(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn certificate_request_lists_every_bundle_subject() {
+        let server = ServerIdentity::new();
+        let root = TestCa::root("client root CA");
+        let first = root.issue_ca(ca_params("first client intermediate CA"));
+        let second = root.issue_ca(ca_params("second client intermediate CA"));
+        let options = TlsServerOptions::from_settings(server.settings().with_client_verification(
+            TlsClientVerification::IfPresented(bundle(&[&root, &first, &second])),
+        ))
+        .unwrap();
+        let recorder = Arc::new(HintRecorder::default());
+
+        let outcome = accept_with_client_auth(
+            options,
+            server
+                .client_builder(rustls::DEFAULT_VERSIONS)
+                .with_client_cert_resolver(Arc::clone(&recorder) as _),
+        );
+
+        assert_eq!(outcome.server.unwrap(), None);
+        let mut hinted = recorder
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the server requested a certificate");
+        hinted.sort();
+        // rustls's own reading of each certificate's subject Name.
+        let mut subjects = RootCertStore::empty();
+        for ca in [&root, &first, &second] {
+            subjects.add(ca.certificate()).unwrap();
+        }
+        let mut expected: Vec<Vec<u8>> = subjects
+            .subjects()
+            .iter()
+            .map(|subject| subject.as_ref().to_vec())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            hinted, expected,
+            "the root and both intermediates are hinted"
+        );
+    }
+
+    /// A file under the temporary directory, removed when dropped.
+    struct TemporaryFile(std::path::PathBuf);
+
+    impl TemporaryFile {
+        fn new(name: &str, contents: &[u8]) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("roxygen-transport-{}-{name}", std::process::id()));
+            std::fs::write(&path, contents).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TemporaryFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn trust_from_non_default_bundle_path() {
+        let server = ServerIdentity::new();
+        let root = TestCa::root("client root CA");
+        let intermediate = root.issue_ca(ca_params("client intermediate CA"));
+        let (leaf, key) = intermediate.issue_client();
+        let file = TemporaryFile::new(
+            "trust_from_non_default_bundle_path.pem",
+            format!("{}{}", root.pem, intermediate.pem).as_bytes(),
+        );
+        let trust = TlsClientTrust::from_pem_file(&file.0).unwrap();
+        let options = TlsServerOptions::from_settings(
+            server
+                .settings()
+                .with_client_verification(TlsClientVerification::IfPresented(trust)),
+        )
+        .unwrap();
+
+        let outcome = accept_with_client_auth(
+            options,
+            server.client(Some((vec![leaf.clone()], key)), rustls::DEFAULT_VERSIONS),
+        );
+
+        assert_eq!(
+            outcome.server.unwrap(),
+            Some(PeerIdentity::new(leaf.as_ref())),
+            "the bundle read from the file anchors and completes the chain"
+        );
+    }
+
+    #[test]
+    fn client_trust_rejects_an_unreadable_bundle() {
+        let root = TestCa::root("client root CA");
+        let truncated = root.der[..root.der.len() - 1].into();
+        let no_certificates = TemporaryFile::new(
+            "client_trust_rejects_an_unreadable_bundle.pem",
+            b"no PEM certificates here\n",
+        );
+        let missing = std::env::temp_dir().join(format!(
+            "roxygen-transport-{}-client_trust_rejects_an_unreadable_bundle.missing",
+            std::process::id()
+        ));
+
+        for (case, result) in [
+            ("empty", TlsClientTrust::from_der(Vec::new())),
+            (
+                "not DER",
+                TlsClientTrust::from_der(vec![b"not a certificate".to_vec().into()]),
+            ),
+            (
+                "truncated",
+                TlsClientTrust::from_der(vec![root.der.clone(), truncated]),
+            ),
+            (
+                "no PEM certificates",
+                TlsClientTrust::from_pem_file(&no_certificates.0),
+            ),
+            ("missing file", TlsClientTrust::from_pem_file(&missing)),
+        ] {
+            let error = result.expect_err(case);
+            assert_eq!(
+                error.code(),
+                HttpErrorCode::INADEQUATE_SECURITY,
+                "{case}: {error:?}"
+            );
+        }
+    }
+
+    /// Splits the DER element at the front of `input` into its header, its
+    /// contents and the bytes after it. Test certificates have lengths below
+    /// 64 KiB.
+    fn split_der(input: &[u8]) -> (&[u8], &[u8], &[u8]) {
+        let (header_length, length) = match input[1] {
+            short @ 0..=0x7f => (2, usize::from(short)),
+            0x81 => (3, usize::from(input[2])),
+            0x82 => (4, usize::from(u16::from_be_bytes([input[2], input[3]]))),
+            other => panic!("unexpected DER length octet {other:#x}"),
+        };
+        let (header, rest) = input.split_at(header_length);
+        let (contents, rest) = rest.split_at(length);
+        (header, contents, rest)
+    }
+
+    /// The DER elements in `contents`, each with its header.
+    fn der_children(mut contents: &[u8]) -> Vec<Vec<u8>> {
+        std::iter::from_fn(|| {
+            (!contents.is_empty()).then(|| {
+                let (header, element, rest) = split_der(contents);
+                contents = rest;
+                [header, element].concat()
+            })
+        })
+        .collect()
+    }
+
+    /// A DER element with the shortest length encoding.
+    fn der_encode(tag: u8, contents: &[u8]) -> Vec<u8> {
+        let length = u16::try_from(contents.len()).unwrap();
+        let [high, low] = length.to_be_bytes();
+        let header = match length {
+            0..=0x7f => vec![tag, low],
+            0x80..=0xff => vec![tag, 0x81, low],
+            _ => vec![tag, 0x82, high, low],
+        };
+        [&header, contents].concat()
+    }
+
+    /// `certificate` with its TBSCertificate fields changed by `edit` and the
+    /// enclosing lengths re-encoded. The signature is not updated, which the
+    /// structural checks of `TlsClientTrust::from_der` do not look at.
+    fn edit_tbs_fields(certificate: &[u8], edit: impl FnOnce(&mut Vec<Vec<u8>>)) -> Box<[u8]> {
+        let (_, certificate_contents, _) = split_der(certificate);
+        let mut parts = der_children(certificate_contents);
+        let (_, tbs_contents, _) = split_der(&parts[0]);
+        let mut fields = der_children(tbs_contents);
+        assert_eq!(
+            fields.iter().map(|field| field[0]).collect::<Vec<_>>(),
+            [0xa0, 0x02, 0x30, 0x30, 0x30, 0x30, 0x30, 0xa3],
+            "version, serial number, signature, issuer, validity, subject, subject public key \
+             info and extensions"
+        );
+        edit(&mut fields);
+        parts[0] = der_encode(0x30, &fields.concat());
+        der_encode(0x30, &parts.concat()).into()
+    }
+
+    /// Asserts that `TlsClientTrust::from_der` rejects `certificate`.
+    fn assert_trust_rejects(case: &str, certificate: Box<[u8]>) {
+        let error = TlsClientTrust::from_der(vec![certificate]).expect_err(case);
+        assert_eq!(
+            error.code(),
+            HttpErrorCode::INADEQUATE_SECURITY,
+            "{case}: {error:?}"
+        );
+    }
+
+    /// Asserts that webpki does not accept `certificate` as a trust anchor,
+    /// and that `TlsClientTrust::from_der` rejects it too.
+    fn assert_unreadable_certificate(case: &str, certificate: Box<[u8]>) {
+        assert!(
+            RootCertStore::empty()
+                .add(CertificateDer::from(certificate.to_vec()))
+                .is_err(),
+            "{case}: webpki rejects it"
+        );
+        assert_trust_rejects(case, certificate);
+    }
+
+    #[test]
+    fn client_trust_rejects_non_minimal_der_lengths() {
+        let root = TestCa::root("client root CA");
+        assert_eq!(
+            edit_tbs_fields(&root.der, |_| {}),
+            root.der,
+            "re-encoding an unchanged certificate gives the same bytes"
+        );
+        TlsClientTrust::from_der(vec![root.der.clone()]).expect("the unchanged certificate");
+
+        assert_eq!(root.der[..2], [0x30, 0x82], "two length octets");
+        assert_unreadable_certificate(
+            "a leading zero length octet",
+            [&[0x30, 0x83, 0x00][..], &root.der[2..]].concat().into(),
+        );
+        assert_unreadable_certificate(
+            "the long form for a length below 128",
+            edit_tbs_fields(&root.der, |fields| {
+                let (_, version, _) = split_der(&fields[0]);
+                fields[0] = [
+                    &[0xa0, 0x81, u8::try_from(version.len()).unwrap()][..],
+                    version,
+                ]
+                .concat();
+            }),
+        );
+    }
+
+    #[test]
+    fn client_trust_rejects_unknown_fields_after_the_subject_public_key_info() {
+        let root = TestCa::root("client root CA");
+        TlsClientTrust::from_der(vec![edit_tbs_fields(&root.der, |fields| {
+            fields.pop();
+        })])
+        .expect("the extensions are optional");
+
+        assert_unreadable_certificate(
+            "an INTEGER after the extensions",
+            edit_tbs_fields(&root.der, |fields| fields.push(vec![0x02, 0x01, 0x00])),
+        );
+        // webpki accepts no unique identifiers, so neither does the trust.
+        assert_unreadable_certificate(
+            "an issuer unique identifier before the extensions",
+            edit_tbs_fields(&root.der, |fields| {
+                fields.insert(7, vec![0x81, 0x02, 0x00, 0x00]);
+            }),
+        );
+    }
+
+    #[test]
+    fn client_trust_rejects_trailing_data_inside_certificate_fields() {
+        let root = TestCa::root("client root CA");
+        let with_trailing_null = |index: usize| {
+            edit_tbs_fields(&root.der, |fields| {
+                let (header, contents, _) = split_der(&fields[index]);
+                fields[index] = der_encode(header[0], &[contents, &[0x05, 0x00]].concat());
+            })
+        };
+
+        assert_unreadable_certificate("a NULL inside the version", with_trailing_null(0));
+        assert_unreadable_certificate("a NULL inside the extensions", with_trailing_null(7));
+        // webpki keeps an anchor's subject public key info unparsed, and rejects
+        // the extra NULL only when it verifies a signature with the key.
+        assert_trust_rejects(
+            "a NULL inside the subject public key info",
+            with_trailing_null(6),
+        );
+    }
+
+    type SignatureAlgorithm = &'static dyn rustls::pki_types::SignatureVerificationAlgorithm;
+
+    /// ring's default provider without Ed25519 signature verification.
+    fn ring_without_ed25519_verification() -> Arc<rustls::crypto::CryptoProvider> {
+        // The provider needs `'static` lists; a static keeps them reachable.
+        static ALGORITHMS: OnceLock<(
+            Vec<SignatureAlgorithm>,
+            Vec<(rustls::SignatureScheme, &'static [SignatureAlgorithm])>,
+        )> = OnceLock::new();
+        let mut provider = rustls::crypto::ring::default_provider();
+        let defaults = provider.signature_verification_algorithms;
+        let (all, mapping) = ALGORITHMS.get_or_init(|| {
+            (
+                defaults
+                    .all
+                    .iter()
+                    .copied()
+                    .filter(|algorithm| {
+                        algorithm.public_key_alg_id() != rustls::pki_types::alg_id::ED25519
+                    })
+                    .collect(),
+                defaults
+                    .mapping
+                    .iter()
+                    .filter(|(scheme, _)| *scheme != rustls::SignatureScheme::ED25519)
+                    .cloned()
+                    .collect(),
+            )
+        });
+        provider.signature_verification_algorithms =
+            rustls::crypto::WebPkiSupportedAlgorithms { all, mapping };
+        Arc::new(provider)
+    }
+
+    #[test]
+    fn client_verification_uses_the_settings_provider() {
+        let server = ServerIdentity::new();
+        let root = TestCa::root("client root CA");
+        // An Ed25519 intermediate, so the leaf carries an Ed25519 signature.
+        let intermediate = root.issue_ca_with_key(
+            ca_params("Ed25519 client intermediate CA"),
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap(),
+        );
+        let (leaf, key) = intermediate.issue_client();
+        let accept = |settings: TlsServerSettings| {
+            let options = TlsServerOptions::from_settings(settings.with_client_verification(
+                TlsClientVerification::IfPresented(bundle(&[&root, &intermediate])),
+            ))
+            .unwrap();
+            accept_with_client_auth(
+                options,
+                server.client(
+                    Some((vec![leaf.clone()], key.clone_key())),
+                    rustls::DEFAULT_VERSIONS,
+                ),
+            )
+        };
+
+        let default_provider = accept(server.settings());
+        assert_eq!(
+            default_provider.server.unwrap(),
+            Some(PeerIdentity::new(leaf.as_ref())),
+            "the default provider verifies Ed25519"
+        );
+
+        let restricted = accept(
+            server
+                .settings()
+                .with_crypto_provider(ring_without_ed25519_verification()),
+        );
+        assert!(
+            matches!(
+                rejected_certificate(&restricted),
+                rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::UnsupportedSignatureAlgorithmContext { .. }
+                )
+            ),
+            "the settings' provider cannot verify the leaf: {:?}",
+            restricted.server.as_ref().err()
+        );
+    }
+
+    #[test]
+    fn settings_alpn_protocols_are_negotiated() {
+        let server = ServerIdentity::new();
+        let options = TlsServerOptions::from_settings(
+            server
+                .settings()
+                .with_alpn(vec![b"http/1.1".to_vec().into()], TlsAlpnMismatch::Reject),
+        )
+        .unwrap();
+        let mut client = server.client(None, rustls::DEFAULT_VERSIONS);
+        client.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let outcome = accept_with_client_auth(options, client);
+
+        assert_eq!(outcome.server.unwrap(), None);
+        assert_eq!(
+            outcome.client_handshake.unwrap().as_deref(),
+            Some(&b"http/1.1"[..]),
+            "the server selects its only protocol"
+        );
+    }
+
+    #[test]
+    fn continue_without_alpn_is_not_supported_yet() {
+        let server = ServerIdentity::new();
+
+        let error = TlsServerOptions::from_settings(server.settings().with_alpn(
+            vec![b"h2".to_vec().into()],
+            TlsAlpnMismatch::ContinueWithoutAlpn,
+        ))
+        .err()
+        .expect("the option must not silently do nothing");
+
+        assert_eq!(error.code(), HttpErrorCode::INADEQUATE_SECURITY);
+        assert_eq!(error.message(), b"ContinueWithoutAlpn is not supported yet");
     }
 }

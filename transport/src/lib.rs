@@ -84,8 +84,20 @@
 //!
 //! Clients offer TLS 1.2 and 1.3 and the ALPN protocols `h2` and `http/1.1` by
 //! default. Client options without a provider set, and server options not
-//! built from a rustls `ServerConfig`, use the process-wide rustls
+//! built from a rustls `ServerConfig` or given a provider with
+//! [`TlsServerSettings::with_crypto_provider`], use the process-wide rustls
 //! `CryptoProvider` if one is installed, and ring otherwise.
+//!
+//! # TLS client certificates
+//!
+//! A server built with
+//! [`TlsServerOptions::from_settings`](tls::TlsServerOptions::from_settings)
+//! requests client certificates as its [`TlsClientVerification`] says: never,
+//! optionally (a client that sends none is accepted, and a chain it sends must
+//! verify), or always. A [`TlsClientTrust`] bundle anchors the check at its
+//! self-signed certificates; its other certificates complete client chains and
+//! have their validity checked like the intermediates a client sends. The
+//! accepted connection's peer identity is the client's leaf certificate.
 
 pub mod byte_event;
 pub mod byte_stream;
@@ -96,7 +108,11 @@ pub mod tls;
 
 pub use byte_stream::TransportRetirement;
 pub use byte_stream::TransportRetirementError;
+pub use tls::TlsAlpnMismatch;
+pub use tls::TlsClientTrust;
+pub use tls::TlsClientVerification;
 pub use tls::TlsHandshakeFailureKind;
+pub use tls::TlsServerSettings;
 pub use tls::tls_handshake_failure_kind;
 pub use tls::tls_handshake_rustls_error;
 

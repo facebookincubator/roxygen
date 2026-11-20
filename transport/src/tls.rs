@@ -39,6 +39,7 @@ use roxygen_runtime::worker::WorkerContext;
 use roxygen_runtime::worker::WorkerState;
 use rustls::ClientConfig;
 use rustls::DigitallySignedStruct;
+use rustls::DistinguishedName;
 use rustls::HandshakeKind;
 use rustls::NamedGroup;
 use rustls::RootCertStore;
@@ -61,8 +62,11 @@ use rustls::crypto::verify_tls13_signature;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::ServerName;
+use rustls::pki_types::UnixTime;
 use rustls::server::ParsedCertificate;
 use rustls::server::WebPkiClientVerifier;
+use rustls::server::danger::ClientCertVerified;
+use rustls::server::danger::ClientCertVerifier;
 use tokio::io::AsyncBufRead;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -1828,6 +1832,171 @@ fn is_name_mismatch(error: &rustls::Error) -> bool {
     )
 }
 
+/// Whether a TLS server requests a client certificate, and how it verifies one.
+#[derive(Clone, Debug)]
+pub enum TlsClientVerification {
+    /// Sends no CertificateRequest.
+    DoNotRequest,
+    /// Requests a certificate. A client that sends none is accepted; a
+    /// presented chain that does not verify fails the handshake.
+    IfPresented(TlsClientTrust),
+    /// Requests a certificate and fails the handshake unless one is presented
+    /// and verifies.
+    Always(TlsClientTrust),
+}
+
+/// A CA bundle that client certificates are verified against, with the
+/// semantics of a trusted certificate store.
+///
+/// The bundle's self-signed certificates are the trust anchors: a certificate
+/// is self-signed if it names itself as its issuer and the server's crypto
+/// provider verifies its signature with its own public key. Every other bundle
+/// certificate is an intermediate that can complete a client's chain, and its
+/// validity period and constraints are checked like those of the
+/// intermediates the client presents. The server's CertificateRequest names
+/// the subject of every bundle certificate.
+#[derive(Clone, Debug)]
+pub struct TlsClientTrust {
+    certificates: Arc<[CertificateDer<'static>]>,
+}
+
+impl TlsClientTrust {
+    /// Uses the DER certificates in `certificates`. Fails if it is empty or
+    /// holds a value whose certificate fields do not parse as DER. The
+    /// contents of the Names, the validity, the AlgorithmIdentifiers and the
+    /// extensions are not checked here. A certificate with issuer or subject
+    /// unique identifiers also fails, as webpki cannot use it.
+    pub fn from_der(certificates: Vec<Box<[u8]>>) -> Result<Self, HttpError> {
+        if certificates.is_empty() {
+            return Err(HttpError::with_message(
+                HttpErrorCode::INADEQUATE_SECURITY,
+                b"TLS client CA bundle contains no certificates",
+            ));
+        }
+        let certificates = certificates
+            .into_iter()
+            .map(|certificate| {
+                CertificateFields::read(&certificate).ok_or_else(unreadable_client_ca)?;
+                Ok(CertificateDer::from(certificate.into_vec()))
+            })
+            .collect::<Result<_, HttpError>>()?;
+        Ok(Self { certificates })
+    }
+
+    /// Uses the PEM certificates in the file at `path`. The file is read with
+    /// blocking I/O, so call this while building settings, not on a worker.
+    /// Fails if the file cannot be read or holds no certificates.
+    pub fn from_pem_file(path: &Path) -> Result<Self, HttpError> {
+        let pem = std::fs::read(path)
+            .map_err(|error| tls_message_error(b"failed to read TLS client CA file: ", error))?;
+        let certificates = rustls_pemfile::certs(&mut &*pem)
+            .map(|certificate| certificate.map(|certificate| certificate.to_vec().into()))
+            .collect::<Result<_, _>>()
+            .map_err(|error| tls_message_error(b"invalid TLS client CA file: ", error))?;
+        Self::from_der(certificates)
+    }
+
+    fn verifier(
+        &self,
+        provider: &Arc<CryptoProvider>,
+        allow_unauthenticated: bool,
+    ) -> Result<Arc<dyn ClientCertVerifier>, HttpError> {
+        let mut anchors = RootCertStore::empty();
+        let mut intermediates = Vec::new();
+        let mut intermediate_subjects = Vec::new();
+        for certificate in self.certificates.iter() {
+            let fields = CertificateFields::read(certificate).ok_or_else(unreadable_client_ca)?;
+            if fields.is_self_signed(&provider.signature_verification_algorithms) {
+                anchors
+                    .add(certificate.clone())
+                    .map_err(|error| tls_message_error(b"invalid TLS client CA: ", error))?;
+            } else {
+                intermediate_subjects.push(DistinguishedName::in_sequence(fields.subject));
+                intermediates.push(certificate.clone());
+            }
+        }
+        // The builder hints the anchors' subjects; adding the intermediates'
+        // hints every bundle subject.
+        let mut builder =
+            WebPkiClientVerifier::builder_with_provider(Arc::new(anchors), Arc::clone(provider))
+                .add_root_hint_subjects(intermediate_subjects);
+        if allow_unauthenticated {
+            builder = builder.allow_unauthenticated();
+        }
+        let inner = builder
+            .build()
+            .map_err(|error| tls_message_error(b"invalid TLS client verifier: ", error))?;
+        Ok(Arc::new(BundleClientVerifier {
+            inner,
+            intermediates,
+        }))
+    }
+}
+
+/// What a TLS server does when a client's ALPN protocols include none of its own.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TlsAlpnMismatch {
+    /// Fails the handshake with a `no_application_protocol` alert.
+    #[default]
+    Reject,
+    /// Completes the handshake without selecting a protocol. Not supported
+    /// yet: [`TlsServerOptions::from_settings`] rejects it.
+    ContinueWithoutAlpn,
+}
+
+/// Settings for [`TlsServerOptions::from_settings`]: the server's certificate
+/// chain and key, and builder methods for its other choices.
+///
+/// By default the server offers no ALPN protocols, requests no client
+/// certificate, and uses the installed process-default crypto provider, else
+/// ring. Session tickets use ring's ticketer, as `TlsServerOptions::new` does.
+#[non_exhaustive]
+pub struct TlsServerSettings {
+    certificate_chain_der: Vec<Box<[u8]>>,
+    private_key_der: Box<[u8]>,
+    alpn_protocols: Vec<Box<[u8]>>,
+    alpn_mismatch: TlsAlpnMismatch,
+    client_verification: TlsClientVerification,
+    crypto_provider: Option<Arc<CryptoProvider>>,
+}
+
+impl TlsServerSettings {
+    /// Takes the server's certificate chain, leaf first, and its private key,
+    /// all DER.
+    pub fn new(certificate_chain_der: Vec<Box<[u8]>>, private_key_der: Box<[u8]>) -> Self {
+        Self {
+            certificate_chain_der,
+            private_key_der,
+            alpn_protocols: Vec::new(),
+            alpn_mismatch: TlsAlpnMismatch::Reject,
+            client_verification: TlsClientVerification::DoNotRequest,
+            crypto_provider: None,
+        }
+    }
+
+    /// Sets the ALPN protocols in the server's order of preference, and what
+    /// to do when a client offers none of them.
+    pub fn with_alpn(mut self, protocols: Vec<Box<[u8]>>, mismatch: TlsAlpnMismatch) -> Self {
+        self.alpn_protocols = protocols;
+        self.alpn_mismatch = mismatch;
+        self
+    }
+
+    /// Sets whether the server requests client certificates and how it
+    /// verifies them.
+    pub fn with_client_verification(mut self, verification: TlsClientVerification) -> Self {
+        self.client_verification = verification;
+        self
+    }
+
+    /// Sets the provider for the handshake and for verifying client
+    /// certificates, instead of the installed process default, else ring.
+    pub fn with_crypto_provider(mut self, provider: Arc<CryptoProvider>) -> Self {
+        self.crypto_provider = Some(provider);
+        self
+    }
+}
+
 /// Runtime-neutral certificate and ALPN settings for accepted TLS streams.
 #[derive(Clone)]
 pub struct TlsServerOptions {
@@ -1835,6 +2004,50 @@ pub struct TlsServerOptions {
 }
 
 impl TlsServerOptions {
+    /// Builds server options from `settings`. Fails if the certificate chain
+    /// or key is invalid, if a client trust has no self-signed certificate
+    /// that the provider verifies, or for [`TlsAlpnMismatch::ContinueWithoutAlpn`],
+    /// which is not supported yet.
+    pub fn from_settings(settings: TlsServerSettings) -> Result<Self, HttpError> {
+        if settings.alpn_mismatch == TlsAlpnMismatch::ContinueWithoutAlpn {
+            return Err(HttpError::with_message(
+                HttpErrorCode::INADEQUATE_SECURITY,
+                b"ContinueWithoutAlpn is not supported yet",
+            ));
+        }
+        let provider = settings
+            .crypto_provider
+            .unwrap_or_else(default_crypto_provider);
+        let certificates = settings
+            .certificate_chain_der
+            .into_iter()
+            .map(|certificate| CertificateDer::from(certificate.into_vec()))
+            .collect();
+        let private_key = PrivateKeyDer::try_from(settings.private_key_der.into_vec())
+            .map_err(|error| tls_message_error(b"invalid TLS private key: ", error))?;
+        let verifier = match &settings.client_verification {
+            TlsClientVerification::DoNotRequest => WebPkiClientVerifier::no_client_auth(),
+            TlsClientVerification::IfPresented(trust) => trust.verifier(&provider, true)?,
+            TlsClientVerification::Always(trust) => trust.verifier(&provider, false)?,
+        };
+        let mut config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|error| tls_message_error(b"invalid TLS server provider: ", error))?
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certificates, private_key)
+            .map_err(|error| tls_message_error(b"invalid TLS server certificate: ", error))?;
+        config.ticketer = rustls::crypto::ring::Ticketer::new()
+            .map_err(|error| tls_message_error(b"failed to initialize TLS tickets: ", error))?;
+        config.alpn_protocols = settings
+            .alpn_protocols
+            .into_iter()
+            .map(|protocol| protocol.into_vec())
+            .collect();
+        Ok(Self {
+            config: Arc::new(config),
+        })
+    }
+
     /// Uses a complete rustls server configuration, including authentication, ALPN and tickets.
     pub fn from_rustls_config(config: ServerConfig) -> Self {
         Self {
@@ -1910,6 +2123,212 @@ impl TlsServerOptions {
         Ok(Self {
             config: Arc::new(config),
         })
+    }
+}
+
+fn unreadable_client_ca() -> HttpError {
+    HttpError::with_message(
+        HttpErrorCode::INADEQUATE_SECURITY,
+        b"invalid TLS client CA: not a DER certificate",
+    )
+}
+
+/// Verifies client certificates against a bundle's anchors, with the bundle's
+/// other certificates as path-building intermediates, so that their validity
+/// is checked like that of the intermediates a client presents.
+#[derive(Debug)]
+struct BundleClientVerifier {
+    inner: Arc<dyn ClientCertVerifier>,
+    intermediates: Vec<CertificateDer<'static>>,
+}
+
+impl ClientCertVerifier for BundleClientVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        let candidates: Vec<_> = intermediates
+            .iter()
+            .chain(&self.intermediates)
+            .map(|certificate| CertificateDer::from(certificate.as_ref()))
+            .collect();
+        self.inner.verify_client_cert(end_entity, &candidates, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner
+            .verify_tls12_signature(message, certificate, signature)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner
+            .verify_tls13_signature(message, certificate, signature)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// The parts of a DER certificate that the bundle split reads.
+struct CertificateFields<'a> {
+    /// The whole TBSCertificate encoding, which the signature covers.
+    tbs_certificate: &'a [u8],
+    /// The contents of the issuer Name.
+    issuer: &'a [u8],
+    /// The contents of the subject Name.
+    subject: &'a [u8],
+    /// The contents of the subject public key's AlgorithmIdentifier.
+    public_key_algorithm: &'a [u8],
+    /// The subject public key, without its BIT STRING's unused-bits octet.
+    public_key: &'a [u8],
+    /// The contents of the certificate's signatureAlgorithm.
+    signature_algorithm: &'a [u8],
+    /// The signature, without its BIT STRING's unused-bits octet.
+    signature: &'a [u8],
+}
+
+impl<'a> CertificateFields<'a> {
+    /// Reads `der`, or returns `None` if it is not a certificate. Every length
+    /// must use the shortest form and fit its enclosing element, and the
+    /// certificate and its version, subject public key info and extensions
+    /// must hold nothing else. Names, the validity and the extension contents
+    /// are left to webpki.
+    fn read(der: &'a [u8]) -> Option<Self> {
+        let certificate = der_only_element(der, DER_SEQUENCE)?;
+        let (tbs, rest) = der_element(certificate, DER_SEQUENCE)?;
+        let tbs_certificate = &certificate[..certificate.len() - rest.len()];
+        let (signature_algorithm, rest) = der_element(rest, DER_SEQUENCE)?;
+        let signature = der_only_element(rest, DER_BIT_STRING)?;
+
+        let tbs = match tbs.first() {
+            Some(&DER_EXPLICIT_VERSION) => {
+                let (version, rest) = der_element(tbs, DER_EXPLICIT_VERSION)?;
+                der_only_element(version, DER_INTEGER)?;
+                rest
+            }
+            _ => tbs,
+        };
+        let (_serial_number, rest) = der_element(tbs, DER_INTEGER)?;
+        let (_tbs_signature_algorithm, rest) = der_element(rest, DER_SEQUENCE)?;
+        let (issuer, rest) = der_element(rest, DER_SEQUENCE)?;
+        let (_validity, rest) = der_element(rest, DER_SEQUENCE)?;
+        let (subject, rest) = der_element(rest, DER_SEQUENCE)?;
+        let (public_key_info, extensions) = der_element(rest, DER_SEQUENCE)?;
+        // Only the extensions may follow: like webpki, the walk accepts no
+        // unique identifiers.
+        if !extensions.is_empty() {
+            der_only_element(
+                der_only_element(extensions, DER_EXPLICIT_EXTENSIONS)?,
+                DER_SEQUENCE,
+            )?;
+        }
+        let (public_key_algorithm, rest) = der_element(public_key_info, DER_SEQUENCE)?;
+        let public_key = der_only_element(rest, DER_BIT_STRING)?;
+        Some(Self {
+            tbs_certificate,
+            issuer,
+            subject,
+            public_key_algorithm,
+            public_key: bit_string_bytes(public_key)?,
+            signature_algorithm,
+            signature: bit_string_bytes(signature)?,
+        })
+    }
+
+    /// Whether the certificate is self-signed: it names itself as its issuer,
+    /// and one of `algorithms` verifies its signature with its own public key,
+    /// matching both AlgorithmIdentifiers as webpki does.
+    fn is_self_signed(&self, algorithms: &WebPkiSupportedAlgorithms) -> bool {
+        self.issuer == self.subject
+            && algorithms.all.iter().any(|algorithm| {
+                algorithm.public_key_alg_id().as_ref() == self.public_key_algorithm
+                    && algorithm.signature_alg_id().as_ref() == self.signature_algorithm
+                    && algorithm
+                        .verify_signature(self.public_key, self.tbs_certificate, self.signature)
+                        .is_ok()
+            })
+    }
+}
+
+const DER_INTEGER: u8 = 0x02;
+const DER_BIT_STRING: u8 = 0x03;
+const DER_SEQUENCE: u8 = 0x30;
+/// The tag of the TBSCertificate's optional `[0] EXPLICIT` version.
+const DER_EXPLICIT_VERSION: u8 = 0xa0;
+/// The tag of the TBSCertificate's optional `[3] EXPLICIT` extensions.
+const DER_EXPLICIT_EXTENSIONS: u8 = 0xa3;
+
+/// Splits the DER element tagged `tag` off the front of `input`, returning its
+/// contents and the bytes after it, or `None` if `input` does not start with
+/// such an element.
+fn der_element(input: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
+    let (&actual, rest) = input.split_first()?;
+    if actual != tag {
+        return None;
+    }
+    let (&first, rest) = rest.split_first()?;
+    let (length, rest) = if first < 0x80 {
+        (usize::from(first), rest)
+    } else {
+        // The long form: the low bits count the big-endian length octets.
+        let count = usize::from(first & 0x7f);
+        if count == 0 || count > 4 {
+            return None;
+        }
+        let (octets, rest) = rest.split_at_checked(count)?;
+        let length = octets
+            .iter()
+            .fold(0, |length, octet| (length << 8) | usize::from(*octet));
+        // DER uses the long form only for lengths of 128 or more, with no
+        // leading zero octet.
+        if length < 0x80 || octets.first() == Some(&0) {
+            return None;
+        }
+        (length, rest)
+    };
+    rest.split_at_checked(length)
+}
+
+/// Returns the contents of the DER element tagged `tag` that makes up all of
+/// `input`, or `None` if `input` is not exactly such an element.
+fn der_only_element(input: &[u8], tag: u8) -> Option<&[u8]> {
+    match der_element(input, tag)? {
+        (contents, []) => Some(contents),
+        _ => None,
+    }
+}
+
+/// Returns the bytes of a BIT STRING's contents, or `None` unless it has no
+/// unused bits.
+fn bit_string_bytes(contents: &[u8]) -> Option<&[u8]> {
+    match contents.split_first()? {
+        (0, bytes) => Some(bytes),
+        _ => None,
     }
 }
 
@@ -2641,6 +3060,7 @@ mod tests {
 
     use super::TlsClientOptions;
     use super::TlsServerOptions;
+    use super::TlsServerSettings;
     use super::build_client_config;
     use super::select_default_ca_path;
 
@@ -2672,9 +3092,9 @@ mod tests {
         provider
     }
 
-    /// Returns the providers of a client, a server, and a mutual-TLS server
-    /// config, built without an explicit provider.
-    fn fallback_config_providers() -> [Arc<CryptoProvider>; 3] {
+    /// Returns the providers of a client, a server, a mutual-TLS server and a
+    /// settings-built server config, built without an explicit provider.
+    fn fallback_config_providers() -> [Arc<CryptoProvider>; 4] {
         let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
             .expect("test certificate");
         let certificate = generated.cert.der().to_vec().into_boxed_slice();
@@ -2694,15 +3114,19 @@ mod tests {
         .unwrap();
         let mutual = TlsServerOptions::new_with_client_auth(
             vec![certificate.clone()],
-            private_key,
+            private_key.clone(),
             vec![b"h2".to_vec().into_boxed_slice()],
-            vec![certificate],
+            vec![certificate.clone()],
         )
         .unwrap();
+        let settings =
+            TlsServerOptions::from_settings(TlsServerSettings::new(vec![certificate], private_key))
+                .unwrap();
         [
             client.crypto_provider(),
             server.config.crypto_provider(),
             mutual.config.crypto_provider(),
+            settings.config.crypto_provider(),
         ]
         .map(Arc::clone)
     }
