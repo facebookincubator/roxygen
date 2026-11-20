@@ -22,6 +22,8 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::rc::Weak;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
@@ -63,7 +65,11 @@ use rustls::pki_types::CertificateDer;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::ServerName;
 use rustls::pki_types::UnixTime;
+use rustls::server::NoServerSessionStorage;
 use rustls::server::ParsedCertificate;
+use rustls::server::ProducesTickets;
+use rustls::server::ServerSessionMemoryCache;
+use rustls::server::StoresServerSessions;
 use rustls::server::WebPkiClientVerifier;
 use rustls::server::danger::ClientCertVerified;
 use rustls::server::danger::ClientCertVerifier;
@@ -1896,30 +1902,64 @@ impl TlsClientTrust {
         Self::from_der(certificates)
     }
 
-    fn verifier(
-        &self,
+    /// Splits the bundle into the certificates that `provider` verifies as
+    /// self-signed, the anchors, and the intermediates.
+    fn roles(&self, provider: &CryptoProvider) -> Result<ClientTrustRoles, HttpError> {
+        let mut roles = ClientTrustRoles::default();
+        for certificate in self.certificates.iter() {
+            let fields = CertificateFields::read(certificate).ok_or_else(unreadable_client_ca)?;
+            if fields.is_self_signed(&provider.signature_verification_algorithms) {
+                roles.anchors.push(certificate.clone());
+            } else {
+                roles
+                    .intermediate_subjects
+                    .push(DistinguishedName::in_sequence(fields.subject));
+                roles.intermediates.push(certificate.clone());
+            }
+        }
+        Ok(roles)
+    }
+}
+
+/// A client trust bundle's certificates in the roles one provider gives them.
+#[derive(Default)]
+struct ClientTrustRoles {
+    anchors: Vec<CertificateDer<'static>>,
+    intermediates: Vec<CertificateDer<'static>>,
+    intermediate_subjects: Vec<DistinguishedName>,
+}
+
+impl ClientTrustRoles {
+    /// Hashes the anchors and the intermediates each in sorted order, so that
+    /// the bundle's order does not matter.
+    fn digest(&self) -> TrustDigest {
+        let sorted_sha256 = |certificates: &[CertificateDer<'static>]| {
+            let mut sorted: Vec<&[u8]> = certificates.iter().map(AsRef::as_ref).collect();
+            sorted.sort_unstable();
+            certificates_sha256(sorted)
+        };
+        TrustDigest {
+            anchors: sorted_sha256(&self.anchors),
+            intermediates: sorted_sha256(&self.intermediates),
+        }
+    }
+
+    fn into_verifier(
+        self,
         provider: &Arc<CryptoProvider>,
         allow_unauthenticated: bool,
     ) -> Result<Arc<dyn ClientCertVerifier>, HttpError> {
         let mut anchors = RootCertStore::empty();
-        let mut intermediates = Vec::new();
-        let mut intermediate_subjects = Vec::new();
-        for certificate in self.certificates.iter() {
-            let fields = CertificateFields::read(certificate).ok_or_else(unreadable_client_ca)?;
-            if fields.is_self_signed(&provider.signature_verification_algorithms) {
-                anchors
-                    .add(certificate.clone())
-                    .map_err(|error| tls_message_error(b"invalid TLS client CA: ", error))?;
-            } else {
-                intermediate_subjects.push(DistinguishedName::in_sequence(fields.subject));
-                intermediates.push(certificate.clone());
-            }
+        for anchor in self.anchors {
+            anchors
+                .add(anchor)
+                .map_err(|error| tls_message_error(b"invalid TLS client CA: ", error))?;
         }
         // The builder hints the anchors' subjects; adding the intermediates'
         // hints every bundle subject.
         let mut builder =
             WebPkiClientVerifier::builder_with_provider(Arc::new(anchors), Arc::clone(provider))
-                .add_root_hint_subjects(intermediate_subjects);
+                .add_root_hint_subjects(self.intermediate_subjects);
         if allow_unauthenticated {
             builder = builder.allow_unauthenticated();
         }
@@ -1928,7 +1968,7 @@ impl TlsClientTrust {
             .map_err(|error| tls_message_error(b"invalid TLS client verifier: ", error))?;
         Ok(Arc::new(BundleClientVerifier {
             inner,
-            intermediates,
+            intermediates: self.intermediates,
         }))
     }
 }
@@ -1949,7 +1989,9 @@ pub enum TlsAlpnMismatch {
 ///
 /// By default the server offers no ALPN protocols, requests no client
 /// certificate, and uses the installed process-default crypto provider, else
-/// ring. Session tickets use ring's ticketer, as `TlsServerOptions::new` does.
+/// ring. Each set of options issues tickets from its own ring ticketer, as
+/// `TlsServerOptions::new` does, unless the settings carry a
+/// [`TlsServerResumption`].
 #[non_exhaustive]
 pub struct TlsServerSettings {
     certificate_chain_der: Vec<Box<[u8]>>,
@@ -1958,6 +2000,7 @@ pub struct TlsServerSettings {
     alpn_mismatch: TlsAlpnMismatch,
     client_verification: TlsClientVerification,
     crypto_provider: Option<Arc<CryptoProvider>>,
+    resumption: Option<TlsServerResumption>,
 }
 
 impl TlsServerSettings {
@@ -1971,6 +2014,7 @@ impl TlsServerSettings {
             alpn_mismatch: TlsAlpnMismatch::Reject,
             client_verification: TlsClientVerification::DoNotRequest,
             crypto_provider: None,
+            resumption: None,
         }
     }
 
@@ -1995,6 +2039,204 @@ impl TlsServerSettings {
         self.crypto_provider = Some(provider);
         self
     }
+
+    /// Uses `resumption`'s ticketer and session cache. Options built with
+    /// clones of it share them while their settings keep the same client
+    /// verification mode, trust bundle certificates and certificate chain.
+    /// When one of those changes, the shared state is replaced with a new
+    /// ticketer and an empty cache, so a session does not resume across a
+    /// change of client authentication or server identity. The crypto
+    /// provider is not compared: a caller that changes which signatures the
+    /// provider verifies passes a new `TlsServerResumption`, which starts with
+    /// fresh state.
+    ///
+    /// Without this, each [`TlsServerOptions::from_settings`] call makes its
+    /// own ring ticketer and a cache of 256 sessions.
+    pub fn with_resumption(mut self, resumption: TlsServerResumption) -> Self {
+        self.resumption = Some(resumption);
+        self
+    }
+}
+
+type TicketerFactory =
+    Arc<dyn Fn() -> Result<Arc<dyn ProducesTickets>, rustls::Error> + Send + Sync>;
+
+/// Session resumption state that TLS server options built with
+/// [`TlsServerSettings::with_resumption`] share: a ticketer and an optional
+/// session cache. Clones share one state.
+#[derive(Clone)]
+pub struct TlsServerResumption {
+    make_ticketer: Option<TicketerFactory>,
+    session_cache_capacity: Option<usize>,
+    state: Arc<Mutex<ResumptionState>>,
+}
+
+impl TlsServerResumption {
+    /// Issues tickets with ring's ticketer, and caches up to
+    /// `session_cache_capacity` sessions for TLS 1.2 clients that resume by
+    /// session ID. Fails if ring cannot make the ticketer.
+    pub fn new(session_cache_capacity: usize) -> Result<Self, HttpError> {
+        Self::with_ring_ticketer(Some(session_cache_capacity))
+    }
+
+    /// Issues tickets with ring's ticketer and keeps no session cache, so
+    /// TLS 1.2 clients cannot resume by session ID. Fails if ring cannot make
+    /// the ticketer.
+    pub fn tickets_only() -> Result<Self, HttpError> {
+        Self::with_ring_ticketer(None)
+    }
+
+    /// Issues no tickets and keeps no session cache, so sessions do not
+    /// resume.
+    pub fn disabled() -> Self {
+        Self::unbound(None, None, Ok(None))
+    }
+
+    /// Issues tickets from `make_ticketer` instead of ring's ticketer, for
+    /// example to keep them on the provider that runs the handshake. It is
+    /// called once before this returns, and again by each
+    /// [`TlsServerOptions::from_settings`] call that replaces the state
+    /// because the settings changed. Each call must return a ticketer with new
+    /// keys: returning the same ticketer again would let tickets resume across
+    /// those changes. The returned value keeps the session cache choice but
+    /// does not share state with `self`.
+    ///
+    /// If the first call fails, every `from_settings` call with the returned
+    /// value fails, and `make_ticketer` is not called again. A later call that
+    /// fails fails its `from_settings` call and leaves the state as it was.
+    /// On a [`disabled`](Self::disabled) value, which issues no tickets, this
+    /// returns `self` and does not call `make_ticketer`.
+    pub fn with_ticketer(
+        self,
+        make_ticketer: Arc<
+            dyn Fn() -> Result<Arc<dyn ProducesTickets>, rustls::Error> + Send + Sync,
+        >,
+    ) -> Self {
+        if self.make_ticketer.is_none() {
+            return self;
+        }
+        let first = make_ticketer().map(Some);
+        Self::unbound(Some(make_ticketer), self.session_cache_capacity, first)
+    }
+
+    fn with_ring_ticketer(session_cache_capacity: Option<usize>) -> Result<Self, HttpError> {
+        let make_ticketer: TicketerFactory = Arc::new(rustls::crypto::ring::Ticketer::new);
+        let first = make_ticketer().map_err(ticket_error)?;
+        Ok(Self::unbound(
+            Some(make_ticketer),
+            session_cache_capacity,
+            Ok(Some(first)),
+        ))
+    }
+
+    fn unbound(
+        make_ticketer: Option<TicketerFactory>,
+        session_cache_capacity: Option<usize>,
+        first_ticketer: Result<Option<Arc<dyn ProducesTickets>>, rustls::Error>,
+    ) -> Self {
+        Self {
+            make_ticketer,
+            session_cache_capacity,
+            state: Arc::new(Mutex::new(ResumptionState::Unbound(first_ticketer))),
+        }
+    }
+
+    /// Returns the state bound to `key`. The first call binds the unbound
+    /// state; a call with another key replaces it, unless making the new
+    /// ticketer fails. If making the first ticketer failed, every call returns
+    /// that error.
+    fn bind(&self, key: ResumptionKey) -> Result<BoundResumption, HttpError> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let bound = match &*state {
+            ResumptionState::Unbound(Err(error)) => return Err(ticket_error(error)),
+            ResumptionState::Unbound(Ok(ticketer)) => BoundResumption {
+                key,
+                ticketer: ticketer.clone(),
+                sessions: self.new_sessions(),
+            },
+            ResumptionState::Bound(bound) if bound.key == key => return Ok(bound.clone()),
+            ResumptionState::Bound(_) => BoundResumption {
+                key,
+                ticketer: self
+                    .make_ticketer
+                    .as_ref()
+                    .map(|make_ticketer| make_ticketer())
+                    .transpose()
+                    .map_err(ticket_error)?,
+                sessions: self.new_sessions(),
+            },
+        };
+        *state = ResumptionState::Bound(bound.clone());
+        Ok(bound)
+    }
+
+    fn new_sessions(&self) -> Arc<dyn StoresServerSessions> {
+        match self.session_cache_capacity {
+            Some(capacity) => ServerSessionMemoryCache::new(capacity),
+            None => Arc::new(NoServerSessionStorage {}),
+        }
+    }
+}
+
+enum ResumptionState {
+    /// Not used yet: the first ticketer, `None` without tickets, or the error
+    /// from making it.
+    Unbound(Result<Option<Arc<dyn ProducesTickets>>, rustls::Error>),
+    Bound(BoundResumption),
+}
+
+#[derive(Clone)]
+struct BoundResumption {
+    key: ResumptionKey,
+    ticketer: Option<Arc<dyn ProducesTickets>>,
+    sessions: Arc<dyn StoresServerSessions>,
+}
+
+/// The settings that resumption state is bound to. rustls requires the
+/// configurations that share a ticketer or session cache to authenticate
+/// clients and present the server's identity in the same way, and does not
+/// check it.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ResumptionKey {
+    client_verification: ClientVerificationKey,
+    certificate_chain: [u8; 32],
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ClientVerificationKey {
+    DoNotRequest,
+    IfPresented(TrustDigest),
+    Always(TrustDigest),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct TrustDigest {
+    anchors: [u8; 32],
+    intermediates: [u8; 32],
+}
+
+/// SHA-256 over `certificates`, each preceded by its length as eight
+/// big-endian octets.
+fn certificates_sha256<'a>(certificates: impl IntoIterator<Item = &'a [u8]>) -> [u8; 32] {
+    let mut context = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+        .tls13()
+        .expect("should be a TLS 1.3 cipher suite")
+        .common
+        .hash_provider
+        .start();
+    for certificate in certificates {
+        context.update(&(certificate.len() as u64).to_be_bytes());
+        context.update(certificate);
+    }
+    context
+        .finish()
+        .as_ref()
+        .try_into()
+        .expect("should be a 32-byte SHA-256 output")
+}
+
+fn ticket_error(error: impl fmt::Display) -> HttpError {
+    tls_message_error(b"failed to initialize TLS tickets: ", error)
 }
 
 /// Runtime-neutral certificate and ALPN settings for accepted TLS streams.
@@ -2006,8 +2248,8 @@ pub struct TlsServerOptions {
 impl TlsServerOptions {
     /// Builds server options from `settings`. Fails if the certificate chain
     /// or key is invalid, if a client trust has no self-signed certificate
-    /// that the provider verifies, or for [`TlsAlpnMismatch::ContinueWithoutAlpn`],
-    /// which is not supported yet.
+    /// that the provider verifies, if a ticketer cannot be made, or for
+    /// [`TlsAlpnMismatch::ContinueWithoutAlpn`], which is not supported yet.
     pub fn from_settings(settings: TlsServerSettings) -> Result<Self, HttpError> {
         if settings.alpn_mismatch == TlsAlpnMismatch::ContinueWithoutAlpn {
             return Err(HttpError::with_message(
@@ -2018,6 +2260,8 @@ impl TlsServerOptions {
         let provider = settings
             .crypto_provider
             .unwrap_or_else(default_crypto_provider);
+        let certificate_chain_key =
+            certificates_sha256(settings.certificate_chain_der.iter().map(AsRef::as_ref));
         let certificates = settings
             .certificate_chain_der
             .into_iter()
@@ -2025,10 +2269,21 @@ impl TlsServerOptions {
             .collect();
         let private_key = PrivateKeyDer::try_from(settings.private_key_der.into_vec())
             .map_err(|error| tls_message_error(b"invalid TLS private key: ", error))?;
-        let verifier = match &settings.client_verification {
-            TlsClientVerification::DoNotRequest => WebPkiClientVerifier::no_client_auth(),
-            TlsClientVerification::IfPresented(trust) => trust.verifier(&provider, true)?,
-            TlsClientVerification::Always(trust) => trust.verifier(&provider, false)?,
+        let (verifier, client_verification_key) = match &settings.client_verification {
+            TlsClientVerification::DoNotRequest => (
+                WebPkiClientVerifier::no_client_auth(),
+                ClientVerificationKey::DoNotRequest,
+            ),
+            TlsClientVerification::IfPresented(trust) => {
+                let roles = trust.roles(&provider)?;
+                let key = ClientVerificationKey::IfPresented(roles.digest());
+                (roles.into_verifier(&provider, true)?, key)
+            }
+            TlsClientVerification::Always(trust) => {
+                let roles = trust.roles(&provider)?;
+                let key = ClientVerificationKey::Always(roles.digest());
+                (roles.into_verifier(&provider, false)?, key)
+            }
         };
         let mut config = ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
@@ -2036,16 +2291,40 @@ impl TlsServerOptions {
             .with_client_cert_verifier(verifier)
             .with_single_cert(certificates, private_key)
             .map_err(|error| tls_message_error(b"invalid TLS server certificate: ", error))?;
-        config.ticketer = rustls::crypto::ring::Ticketer::new()
-            .map_err(|error| tls_message_error(b"failed to initialize TLS tickets: ", error))?;
         config.alpn_protocols = settings
             .alpn_protocols
             .into_iter()
             .map(|protocol| protocol.into_vec())
             .collect();
+        match &settings.resumption {
+            Some(resumption) => {
+                let bound = resumption.bind(ResumptionKey {
+                    client_verification: client_verification_key,
+                    certificate_chain: certificate_chain_key,
+                })?;
+                if let Some(ticketer) = bound.ticketer {
+                    config.ticketer = ticketer;
+                }
+                config.session_storage = bound.sessions;
+            }
+            None => {
+                config.ticketer = rustls::crypto::ring::Ticketer::new().map_err(ticket_error)?;
+            }
+        }
         Ok(Self {
             config: Arc::new(config),
         })
+    }
+
+    /// A copy of these options that offers no ALPN protocols. It shares their
+    /// ticketer and session cache, so a session resumes on either.
+    #[cfg(test)]
+    pub(crate) fn without_alpn(&self) -> Self {
+        let mut config = ServerConfig::clone(&self.config);
+        config.alpn_protocols.clear();
+        Self {
+            config: Arc::new(config),
+        }
     }
 
     /// Uses a complete rustls server configuration, including authentication, ALPN and tickets.

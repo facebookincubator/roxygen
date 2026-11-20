@@ -73,6 +73,7 @@ mod tcp_tls {
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::PrivateKeyDer;
     use rustls::pki_types::ServerName;
+    use rustls::server::ProducesTickets;
     use tokio::io::AsyncBufRead;
     use tokio::io::AsyncRead;
     use tokio::io::AsyncReadExt;
@@ -97,6 +98,7 @@ mod tcp_tls {
     use crate::TlsClientTrust;
     use crate::TlsClientVerification;
     use crate::TlsHandshakeFailureKind;
+    use crate::TlsServerResumption;
     use crate::TlsServerSettings;
     use crate::byte_event::ByteEventWriteFlags;
     use crate::byte_stream::ByteEventCapability;
@@ -12518,6 +12520,20 @@ mod tcp_tls {
             )
         }
 
+        /// A `localhost` server certificate issued by this CA, and its private
+        /// key, both DER.
+        fn issue_server(&self) -> (Box<[u8]>, Box<[u8]>) {
+            let params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+            let key = rcgen::KeyPair::generate().unwrap();
+            let certificate = params
+                .signed_by(&key, &rcgen::Issuer::from_params(&self.params, &self.key))
+                .unwrap();
+            (
+                certificate.der().to_vec().into(),
+                key.serialized_der().to_vec().into(),
+            )
+        }
+
         fn certificate(&self) -> CertificateDer<'static> {
             CertificateDer::from(self.der.to_vec())
         }
@@ -12587,6 +12603,8 @@ mod tcp_tls {
     struct ClientAuthOutcome {
         /// The accept's result: the client certificate the server exposes, if any.
         server: Result<Option<PeerIdentity>, HttpError>,
+        /// Whether the server resumed a session.
+        server_resumed: bool,
         /// The client's handshake result, with the protocol ALPN selected.
         client_handshake: Result<Option<Vec<u8>>, io::Error>,
         /// What the client read after sending `ping`.
@@ -12643,6 +12661,7 @@ mod tcp_tls {
                         )
                         .await?;
                         let identity = transport.peer_identity(&context).unwrap();
+                        let resumed = transport.connection_info().session_resumed();
                         let stream = transport.into_byte_stream();
                         let request = stream
                             .read(
@@ -12665,7 +12684,7 @@ mod tcp_tls {
                             .await
                             .unwrap();
                         stream.close(&context).unwrap();
-                        Ok(identity)
+                        Ok((identity, resumed))
                     })
                     .unwrap();
                 let driver_task = tokio::task::spawn_local(driver);
@@ -12684,7 +12703,8 @@ mod tcp_tls {
                     .expect("worker shutdown must remain bounded")
                     .unwrap();
                 ClientAuthOutcome {
-                    server,
+                    server_resumed: matches!(server, Ok((_, true))),
+                    server: server.map(|(identity, _)| identity),
                     client_handshake,
                     client_received,
                 }
@@ -13332,5 +13352,636 @@ mod tcp_tls {
 
         assert_eq!(error.code(), HttpErrorCode::INADEQUATE_SECURITY);
         assert_eq!(error.message(), b"ContinueWithoutAlpn is not supported yet");
+    }
+
+    #[test]
+    fn reload_keeps_ticket_keys() {
+        let server = ServerIdentity::new();
+        let resumption = TlsServerResumption::new(256).unwrap();
+        let load = || {
+            TlsServerOptions::from_settings(server.settings().with_resumption(resumption.clone()))
+                .unwrap()
+        };
+        let client = server.client(None, &[&rustls::version::TLS13]);
+
+        let first = accept_with_client_auth(load(), client.clone());
+        assert!(
+            !first.server_resumed,
+            "the first connection is a full handshake"
+        );
+
+        let reloaded = accept_with_client_auth(load(), client);
+        assert!(
+            reloaded.server_resumed,
+            "a reload with the same resumption state decrypts the ticket"
+        );
+        assert_eq!(
+            reloaded.client_received, b"pong",
+            "application bytes flow both ways on the resumed session"
+        );
+    }
+
+    /// Makes `client` resume TLS 1.2 sessions only by session ID, from a
+    /// session store of its own.
+    fn resume_by_session_id_only(client: &mut ClientConfig) {
+        client.resumption = rustls::client::Resumption::in_memory_sessions(8)
+            .tls12_resumption(rustls::client::Tls12Resumption::SessionIdOnly);
+    }
+
+    /// A TLS 1.2 client that trusts `server`, resumes only by session ID, and
+    /// has its own session store.
+    fn session_id_client(server: &ServerIdentity) -> ClientConfig {
+        let mut client = server.client(None, &[&rustls::version::TLS12]);
+        resume_by_session_id_only(&mut client);
+        client
+    }
+
+    #[test]
+    fn session_cache_capacity_is_honored() {
+        let server = ServerIdentity::new();
+        let resumption = TlsServerResumption::new(2).unwrap();
+        let load = || {
+            TlsServerOptions::from_settings(server.settings().with_resumption(resumption.clone()))
+                .unwrap()
+        };
+        let options = load();
+        let clients: Vec<ClientConfig> = (0..3).map(|_| session_id_client(&server)).collect();
+        for client in &clients {
+            assert!(!connect_resumes(options.clone(), client.clone()));
+        }
+
+        // The reconnects go to reloaded options with unchanged settings, which
+        // share the cache. Newest first, because a resumed handshake stores no
+        // new session.
+        let reloaded = load();
+        let resumed: Vec<bool> = clients
+            .iter()
+            .rev()
+            .map(|client| connect_resumes(reloaded.clone(), client.clone()))
+            .collect();
+        assert_eq!(
+            resumed,
+            [true, true, false],
+            "the shared cache keeps the two newest sessions and evicted the oldest"
+        );
+    }
+
+    /// Whether the server resumed a session when `client` connected to
+    /// `options`. Panics unless the handshake succeeded on both sides and
+    /// `ping`/`pong` crossed it, so a failed handshake never counts as a full
+    /// one.
+    fn connect_resumes(options: TlsServerOptions, client: ClientConfig) -> bool {
+        let outcome = accept_with_client_auth(options, client);
+        assert!(
+            outcome.server.is_ok(),
+            "the server completes the handshake: {:?}",
+            outcome.server.as_ref().err()
+        );
+        assert_eq!(
+            outcome.client_received, b"pong",
+            "application bytes cross the connection"
+        );
+        outcome.server_resumed
+    }
+
+    /// Whether `client` resumes when it connects a second time to the options
+    /// that `settings` with `resumption` build.
+    fn reconnect_resumes(
+        settings: TlsServerSettings,
+        resumption: TlsServerResumption,
+        client: ClientConfig,
+    ) -> bool {
+        let options =
+            TlsServerOptions::from_settings(settings.with_resumption(resumption)).unwrap();
+        assert!(!connect_resumes(options.clone(), client.clone()));
+        connect_resumes(options, client)
+    }
+
+    #[test]
+    fn tickets_only_has_no_session_id_cache() {
+        let server = ServerIdentity::new();
+
+        assert!(
+            reconnect_resumes(
+                server.settings(),
+                TlsServerResumption::new(256).unwrap(),
+                session_id_client(&server)
+            ),
+            "a session cache resumes a TLS 1.2 session ID"
+        );
+        assert!(
+            !reconnect_resumes(
+                server.settings(),
+                TlsServerResumption::tickets_only().unwrap(),
+                session_id_client(&server)
+            ),
+            "tickets only keeps no session to resume by ID"
+        );
+        assert!(
+            reconnect_resumes(
+                server.settings(),
+                TlsServerResumption::tickets_only().unwrap(),
+                server.client(None, &[&rustls::version::TLS13])
+            ),
+            "tickets only still resumes a TLS 1.3 ticket"
+        );
+    }
+
+    type TicketerFactory =
+        Arc<dyn Fn() -> Result<Arc<dyn ProducesTickets>, rustls::Error> + Send + Sync>;
+
+    /// The calls that a `counting_ticketer` factory and its ticketers saw.
+    #[derive(Debug, Default)]
+    struct TicketerCounts {
+        made: AtomicUsize,
+        encrypted: AtomicUsize,
+        decrypted: AtomicUsize,
+    }
+
+    impl TicketerCounts {
+        fn made(&self) -> usize {
+            self.made.load(Ordering::SeqCst)
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingTicketer {
+        inner: Arc<dyn ProducesTickets>,
+        counts: Arc<TicketerCounts>,
+    }
+
+    impl ProducesTickets for CountingTicketer {
+        fn enabled(&self) -> bool {
+            self.inner.enabled()
+        }
+
+        fn lifetime(&self) -> u32 {
+            self.inner.lifetime()
+        }
+
+        fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
+            self.counts.encrypted.fetch_add(1, Ordering::SeqCst);
+            self.inner.encrypt(plain)
+        }
+
+        fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
+            self.counts.decrypted.fetch_add(1, Ordering::SeqCst);
+            self.inner.decrypt(cipher)
+        }
+    }
+
+    /// A factory of counting ring ticketers whose call number `fail_on`, if
+    /// any, fails.
+    fn counting_ticketer(fail_on: Option<usize>) -> (Arc<TicketerCounts>, TicketerFactory) {
+        let counts = Arc::new(TicketerCounts::default());
+        let factory_counts = Arc::clone(&counts);
+        let factory: TicketerFactory = Arc::new(move || {
+            let call = factory_counts.made.fetch_add(1, Ordering::SeqCst) + 1;
+            if fail_on == Some(call) {
+                return Err(rustls::Error::General("ticketer unavailable".to_owned()));
+            }
+            Ok(Arc::new(CountingTicketer {
+                inner: rustls::crypto::ring::Ticketer::new()?,
+                counts: Arc::clone(&factory_counts),
+            }))
+        });
+        (counts, factory)
+    }
+
+    #[test]
+    fn with_ticketer_uses_the_given_ticketer() {
+        let server = ServerIdentity::new();
+        let (counts, factory) = counting_ticketer(None);
+        let resumption = TlsServerResumption::new(256)
+            .unwrap()
+            .with_ticketer(factory);
+        assert_eq!(counts.made(), 1, "with_ticketer makes the first ticketer");
+        let load = || {
+            TlsServerOptions::from_settings(server.settings().with_resumption(resumption.clone()))
+                .unwrap()
+        };
+        let client = server.client(None, &[&rustls::version::TLS13]);
+
+        let first = load();
+        assert_eq!(counts.made(), 1, "the first options use that ticketer");
+        assert!(!accept_with_client_auth(first, client.clone()).server_resumed);
+        assert!(
+            counts.encrypted.load(Ordering::SeqCst) > 0,
+            "the given ticketer encrypts the tickets"
+        );
+
+        let reloaded = load();
+        assert_eq!(
+            counts.made(),
+            1,
+            "a reload with unchanged settings makes none"
+        );
+        assert!(accept_with_client_auth(reloaded, client).server_resumed);
+        assert!(
+            counts.decrypted.load(Ordering::SeqCst) > 0,
+            "the given ticketer decrypts the resumed ticket"
+        );
+    }
+
+    #[test]
+    fn with_ticketer_keeps_the_session_cache_choice() {
+        let server = ServerIdentity::new();
+        let session_id_resumes = |resumption: TlsServerResumption| {
+            reconnect_resumes(
+                server.settings(),
+                resumption.with_ticketer(counting_ticketer(None).1),
+                session_id_client(&server),
+            )
+        };
+
+        assert!(
+            session_id_resumes(TlsServerResumption::new(256).unwrap()),
+            "the session cache of `new` stays with the given ticketer"
+        );
+        assert!(
+            !session_id_resumes(TlsServerResumption::tickets_only().unwrap()),
+            "tickets only stays without a session cache with the given ticketer"
+        );
+    }
+
+    #[test]
+    fn disabled_resumption_never_resumes() {
+        let server = ServerIdentity::new();
+        let (counts, factory) = counting_ticketer(None);
+        let disabled = TlsServerResumption::disabled().with_ticketer(factory);
+
+        assert!(
+            !reconnect_resumes(
+                server.settings(),
+                disabled.clone(),
+                server.client(None, &[&rustls::version::TLS13])
+            ),
+            "a TLS 1.3 client gets no ticket"
+        );
+        assert!(
+            !reconnect_resumes(
+                server.settings(),
+                disabled,
+                server.client(None, &[&rustls::version::TLS12])
+            ),
+            "a TLS 1.2 client gets neither a session ID nor a ticket"
+        );
+        assert_eq!(
+            counts.made(),
+            0,
+            "with_ticketer on a disabled value makes no ticketer"
+        );
+    }
+
+    #[test]
+    fn ticketer_factory_error_fails_from_settings() {
+        let server = ServerIdentity::new();
+        let (counts, factory) = counting_ticketer(Some(1));
+        let resumption = TlsServerResumption::new(256)
+            .unwrap()
+            .with_ticketer(factory);
+
+        for _ in 0..2 {
+            let error = TlsServerOptions::from_settings(
+                server.settings().with_resumption(resumption.clone()),
+            )
+            .err()
+            .expect("options must not build without their ticketer");
+            assert_eq!(error.code(), HttpErrorCode::INADEQUATE_SECURITY);
+            assert!(
+                error
+                    .message()
+                    .starts_with(b"failed to initialize TLS tickets: "),
+                "{error:?}"
+            );
+        }
+        assert_eq!(counts.made(), 1, "the failed first call is not retried");
+    }
+
+    /// Presents a client certificate once `present` is set, and none before.
+    #[derive(Debug)]
+    struct SwitchedClientCertificate {
+        present: AtomicBool,
+        certified: Arc<rustls::sign::CertifiedKey>,
+    }
+
+    impl SwitchedClientCertificate {
+        fn new(leaf: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> Self {
+            let key = rustls::crypto::ring::default_provider()
+                .key_provider
+                .load_private_key(key)
+                .unwrap();
+            Self {
+                present: AtomicBool::new(false),
+                certified: Arc::new(rustls::sign::CertifiedKey::new(vec![leaf], key)),
+            }
+        }
+    }
+
+    impl rustls::client::ResolvesClientCert for SwitchedClientCertificate {
+        fn resolve(
+            &self,
+            _: &[&[u8]],
+            _: &[rustls::SignatureScheme],
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            self.present
+                .load(Ordering::SeqCst)
+                .then(|| Arc::clone(&self.certified))
+        }
+
+        fn has_certs(&self) -> bool {
+            true
+        }
+    }
+
+    /// A session made under `IfPresented` by a client that presents no
+    /// certificate must not resume after a reload to `Always` over the same
+    /// bundle and resumption value: the same client, now presenting a
+    /// certificate, gets a full handshake that verifies it. `configure`
+    /// finishes the client configuration for `versions`.
+    fn assert_client_verification_change_does_not_resume(
+        versions: &[&'static rustls::SupportedProtocolVersion],
+        configure: impl FnOnce(&mut ClientConfig),
+    ) {
+        let server = ServerIdentity::new();
+        let root = TestCa::root("client root CA");
+        let (leaf, key) = root.issue_client();
+        let resumption = TlsServerResumption::new(256).unwrap();
+        let load = |verification: TlsClientVerification| {
+            TlsServerOptions::from_settings(
+                server
+                    .settings()
+                    .with_client_verification(verification)
+                    .with_resumption(resumption.clone()),
+            )
+            .unwrap()
+        };
+        // One client configuration throughout, because a rustls client offers
+        // a stored session only with the certificate resolver that stored it.
+        let certificate = Arc::new(SwitchedClientCertificate::new(leaf.clone(), key));
+        let mut client = server
+            .client_builder(versions)
+            .with_client_cert_resolver(Arc::clone(&certificate) as _);
+        configure(&mut client);
+
+        let anonymous = accept_with_client_auth(
+            load(TlsClientVerification::IfPresented(bundle(&[&root]))),
+            client.clone(),
+        );
+        assert_eq!(anonymous.server.unwrap(), None);
+
+        certificate.present.store(true, Ordering::SeqCst);
+        let reloaded = accept_with_client_auth(
+            load(TlsClientVerification::Always(bundle(&[&root]))),
+            client,
+        );
+        assert!(
+            !reloaded.server_resumed,
+            "a session without a client certificate does not resume where one is required"
+        );
+        assert_eq!(
+            reloaded.server.unwrap(),
+            Some(PeerIdentity::new(leaf.as_ref())),
+            "the full handshake verifies the client's certificate"
+        );
+    }
+
+    #[test]
+    fn reload_with_changed_client_verification_does_not_resume_old_sessions() {
+        assert_client_verification_change_does_not_resume(&[&rustls::version::TLS13], |_| {});
+    }
+
+    #[test]
+    fn reload_with_changed_client_verification_does_not_resume_old_session_ids() {
+        assert_client_verification_change_does_not_resume(
+            &[&rustls::version::TLS12],
+            resume_by_session_id_only,
+        );
+    }
+
+    #[test]
+    fn reload_with_changed_trust_bundle_gets_fresh_ticketer() {
+        let server = ServerIdentity::new();
+        let first_root = TestCa::root("first client root CA");
+        let second_root = TestCa::root("second client root CA");
+        let (counts, factory) = counting_ticketer(None);
+        let resumption = TlsServerResumption::new(256)
+            .unwrap()
+            .with_ticketer(factory);
+        let load = |trust: &[&TestCa]| {
+            TlsServerOptions::from_settings(
+                server
+                    .settings()
+                    .with_client_verification(TlsClientVerification::IfPresented(bundle(trust)))
+                    .with_resumption(resumption.clone()),
+            )
+            .unwrap()
+        };
+        let client = server.client(None, &[&rustls::version::TLS13]);
+
+        let first = load(&[&first_root]);
+        assert_eq!(counts.made(), 1);
+        assert!(!connect_resumes(first, client.clone()));
+
+        let widened = load(&[&first_root, &second_root]);
+        assert_eq!(counts.made(), 2, "another trust anchor gets a new ticketer");
+        assert!(
+            !connect_resumes(widened, client.clone()),
+            "a session from the old bundle does not resume"
+        );
+
+        let reordered = load(&[&second_root, &first_root]);
+        assert_eq!(
+            counts.made(),
+            2,
+            "the bundle's order is not part of the key"
+        );
+        assert!(connect_resumes(reordered, client.clone()));
+
+        let first_intermediate = first_root.issue_ca(ca_params("first client intermediate CA"));
+        let second_intermediate = first_root.issue_ca(ca_params("second client intermediate CA"));
+        let with_intermediates = load(&[
+            &second_root,
+            &first_root,
+            &first_intermediate,
+            &second_intermediate,
+        ]);
+        assert_eq!(
+            counts.made(),
+            3,
+            "other intermediates under the same anchors get a new ticketer"
+        );
+        assert!(
+            !connect_resumes(with_intermediates, client.clone()),
+            "a session from before the intermediates changed does not resume"
+        );
+
+        let intermediates_reordered = load(&[
+            &second_intermediate,
+            &second_root,
+            &first_intermediate,
+            &first_root,
+        ]);
+        assert_eq!(
+            counts.made(),
+            3,
+            "the intermediates' order is not part of the key"
+        );
+        assert!(connect_resumes(intermediates_reordered, client));
+    }
+
+    #[test]
+    fn reload_with_changed_certificate_chain_does_not_resume() {
+        let server_ca = TestCa::root("server CA");
+        let resumption = TlsServerResumption::new(256).unwrap();
+        let load = |(certificate, key): (Box<[u8]>, Box<[u8]>)| {
+            TlsServerOptions::from_settings(
+                TlsServerSettings::new(vec![certificate], key).with_resumption(resumption.clone()),
+            )
+            .unwrap()
+        };
+        let mut roots = RootCertStore::empty();
+        roots.add(server_ca.certificate()).unwrap();
+        let client =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+
+        let first = accept_with_client_auth(load(server_ca.issue_server()), client.clone());
+        assert!(!first.server_resumed);
+
+        let reloaded = accept_with_client_auth(load(server_ca.issue_server()), client);
+        assert!(
+            !reloaded.server_resumed,
+            "a session made under another certificate does not resume"
+        );
+        assert_eq!(
+            reloaded.client_received, b"pong",
+            "the client verifies the new chain in a full handshake"
+        );
+    }
+
+    #[test]
+    fn reload_with_changed_settings_keeps_the_session_cache_choice() {
+        let server = ServerIdentity::new();
+        let other = ServerIdentity::new();
+        let session_id_resumes_after_change = |resumption: TlsServerResumption| {
+            TlsServerOptions::from_settings(server.settings().with_resumption(resumption.clone()))
+                .unwrap();
+            reconnect_resumes(other.settings(), resumption, session_id_client(&other))
+        };
+
+        assert!(
+            session_id_resumes_after_change(TlsServerResumption::new(256).unwrap()),
+            "the empty cache made for the changed chain resumes a TLS 1.2 session ID"
+        );
+        assert!(
+            !session_id_resumes_after_change(TlsServerResumption::tickets_only().unwrap()),
+            "tickets only stays without a session cache after the chain changes"
+        );
+    }
+
+    #[test]
+    fn failed_reload_keeps_the_bound_resumption_state() {
+        let server = ServerIdentity::new();
+        let other = ServerIdentity::new();
+        let (counts, factory) = counting_ticketer(Some(2));
+        let resumption = TlsServerResumption::new(256)
+            .unwrap()
+            .with_ticketer(factory);
+        let load = |settings: TlsServerSettings| {
+            TlsServerOptions::from_settings(settings.with_resumption(resumption.clone()))
+        };
+        let client = server.client(None, &[&rustls::version::TLS13]);
+        let original_resumes = || {
+            accept_with_client_auth(load(server.settings()).unwrap(), client.clone()).server_resumed
+        };
+
+        assert!(
+            !accept_with_client_auth(load(server.settings()).unwrap(), client.clone())
+                .server_resumed
+        );
+
+        let error = load(other.settings())
+            .err()
+            .expect("the changed chain needs a ticketer, and making it fails");
+        assert_eq!(error.code(), HttpErrorCode::INADEQUATE_SECURITY);
+        assert_eq!(counts.made(), 2);
+        assert!(
+            original_resumes(),
+            "the failed reload left the state bound to the original settings"
+        );
+
+        // These reloads also change the settings, but fail before binding.
+        let anchorless =
+            TestCa::root("client root CA").issue_ca(ca_params("client intermediate CA"));
+        let failing_reloads = [
+            (
+                "the client verifier",
+                server
+                    .settings()
+                    .with_client_verification(TlsClientVerification::IfPresented(bundle(&[
+                        &anchorless,
+                    ]))),
+                &b"invalid TLS client verifier: "[..],
+            ),
+            (
+                "the certificate",
+                TlsServerSettings::new(vec![other.certificate.clone()], server.key.clone()),
+                &b"invalid TLS server certificate: "[..],
+            ),
+        ];
+        for (failing_part, settings, message) in failing_reloads {
+            let error = load(settings).err().expect("the reload must fail");
+            assert!(error.message().starts_with(message), "{error:?}");
+            assert_eq!(
+                counts.made(),
+                2,
+                "a reload that fails building {failing_part} makes no ticketer"
+            );
+            assert!(
+                original_resumes(),
+                "a reload that fails building {failing_part} leaves the state bound to the original settings"
+            );
+        }
+    }
+
+    #[test]
+    fn alpn_clone_shares_resumption_with_its_source() {
+        let server = ServerIdentity::new();
+        let source = TlsServerOptions::from_settings(
+            server
+                .settings()
+                .with_alpn(vec![b"h2".to_vec().into()], TlsAlpnMismatch::Reject)
+                .with_resumption(TlsServerResumption::new(256).unwrap()),
+        )
+        .unwrap();
+        let mut client = server.client(None, &[&rustls::version::TLS13]);
+        client.alpn_protocols = vec![b"h2".to_vec()];
+
+        let first = accept_with_client_auth(source.clone(), client.clone());
+        assert_eq!(first.client_handshake.unwrap().as_deref(), Some(&b"h2"[..]));
+
+        let clone = accept_with_client_auth(source.without_alpn(), client);
+        assert_eq!(
+            clone.client_handshake.unwrap(),
+            None,
+            "the clone negotiates no protocol"
+        );
+        assert!(
+            clone.server_resumed,
+            "the clone resumes the source's session"
+        );
+    }
+
+    #[test]
+    fn resumption_can_move_between_threads() {
+        fn assert_send_sync<Value: Send + Sync>() {}
+        fn assert_send<Value: Send>() {}
+
+        assert_send_sync::<TlsServerResumption>();
+        assert_send::<TlsServerSettings>();
     }
 }

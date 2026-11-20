@@ -98,6 +98,15 @@
 //! self-signed certificates; its other certificates complete client chains and
 //! have their validity checked like the intermediates a client sends. The
 //! accepted connection's peer identity is the client's leaf certificate.
+//!
+//! # TLS session resumption
+//!
+//! By default each set of server options from `from_settings` issues tickets
+//! from its own ring ticketer, so clients cannot resume a session made before
+//! the server reloads its credentials. Settings given a [`TlsServerResumption`]
+//! share its ticketer and session cache with the other options built from it,
+//! as long as the client verification and the certificate chain stay the
+//! same.
 
 pub mod byte_event;
 pub mod byte_stream;
@@ -112,6 +121,7 @@ pub use tls::TlsAlpnMismatch;
 pub use tls::TlsClientTrust;
 pub use tls::TlsClientVerification;
 pub use tls::TlsHandshakeFailureKind;
+pub use tls::TlsServerResumption;
 pub use tls::TlsServerSettings;
 pub use tls::tls_handshake_failure_kind;
 pub use tls::tls_handshake_rustls_error;
