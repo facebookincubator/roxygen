@@ -230,3 +230,7 @@ mod owned_application_tests;
 #[cfg(test)]
 #[path = "../tests/extended_connect.rs"]
 mod extended_connect_tests;
+
+#[cfg(test)]
+#[path = "../tests/tls_alpn_fallback.rs"]
+mod tls_alpn_fallback_tests;

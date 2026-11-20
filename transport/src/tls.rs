@@ -65,6 +65,7 @@ use rustls::pki_types::CertificateDer;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::ServerName;
 use rustls::pki_types::UnixTime;
+use rustls::server::Acceptor;
 use rustls::server::NoServerSessionStorage;
 use rustls::server::ParsedCertificate;
 use rustls::server::ProducesTickets;
@@ -78,6 +79,7 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::ReadBuf;
 use tokio::time::Instant;
+use tokio_rustls::LazyConfigAcceptor;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
@@ -1979,8 +1981,14 @@ pub enum TlsAlpnMismatch {
     /// Fails the handshake with a `no_application_protocol` alert.
     #[default]
     Reject,
-    /// Completes the handshake without selecting a protocol. Not supported
-    /// yet: [`TlsServerOptions::from_settings`] rejects it.
+    /// Completes the handshake without selecting a protocol. The server reads
+    /// the first ClientHello before it picks a configuration: an offer that
+    /// includes one of its protocols negotiates as under `Reject`, and an offer
+    /// that includes none continues on a copy of the configuration that
+    /// offers no protocols. The copy shares the resumption state, so a session
+    /// resumes on either. A client that sends no ALPN gets no protocol under
+    /// either choice. One handshake timeout covers both the ClientHello read
+    /// and the rest of the handshake.
     ContinueWithoutAlpn,
 }
 
@@ -2019,7 +2027,8 @@ impl TlsServerSettings {
     }
 
     /// Sets the ALPN protocols in the server's order of preference, and what
-    /// to do when a client offers none of them.
+    /// to do when a client's offer includes none of them (see
+    /// [`TlsAlpnMismatch`]).
     pub fn with_alpn(mut self, protocols: Vec<Box<[u8]>>, mismatch: TlsAlpnMismatch) -> Self {
         self.alpn_protocols = protocols;
         self.alpn_mismatch = mismatch;
@@ -2243,20 +2252,20 @@ fn ticket_error(error: impl fmt::Display) -> HttpError {
 #[derive(Clone)]
 pub struct TlsServerOptions {
     config: Arc<ServerConfig>,
+    /// The configuration for a client whose ALPN offer includes none of
+    /// `config`'s protocols. Present only for
+    /// [`TlsAlpnMismatch::ContinueWithoutAlpn`] with protocols to offer.
+    config_without_alpn: Option<Arc<ServerConfig>>,
 }
 
 impl TlsServerOptions {
     /// Builds server options from `settings`. Fails if the certificate chain
     /// or key is invalid, if a client trust has no self-signed certificate
-    /// that the provider verifies, if a ticketer cannot be made, or for
-    /// [`TlsAlpnMismatch::ContinueWithoutAlpn`], which is not supported yet.
+    /// that the provider verifies, or if a ticketer cannot be made. Under
+    /// [`TlsAlpnMismatch::ContinueWithoutAlpn`] with protocols to offer, it
+    /// also builds the configuration copy without ALPN, once per call rather
+    /// than once per connection.
     pub fn from_settings(settings: TlsServerSettings) -> Result<Self, HttpError> {
-        if settings.alpn_mismatch == TlsAlpnMismatch::ContinueWithoutAlpn {
-            return Err(HttpError::with_message(
-                HttpErrorCode::INADEQUATE_SECURITY,
-                b"ContinueWithoutAlpn is not supported yet",
-            ));
-        }
         let provider = settings
             .crypto_provider
             .unwrap_or_else(default_crypto_provider);
@@ -2311,19 +2320,26 @@ impl TlsServerOptions {
                 config.ticketer = rustls::crypto::ring::Ticketer::new().map_err(ticket_error)?;
             }
         }
-        Ok(Self {
+        let continue_without_alpn = settings.alpn_mismatch == TlsAlpnMismatch::ContinueWithoutAlpn
+            && !config.alpn_protocols.is_empty();
+        let mut options = Self {
             config: Arc::new(config),
-        })
+            config_without_alpn: None,
+        };
+        if continue_without_alpn {
+            options.config_without_alpn = Some(options.without_alpn().config);
+        }
+        Ok(options)
     }
 
     /// A copy of these options that offers no ALPN protocols. It shares their
     /// ticketer and session cache, so a session resumes on either.
-    #[cfg(test)]
     pub(crate) fn without_alpn(&self) -> Self {
         let mut config = ServerConfig::clone(&self.config);
         config.alpn_protocols.clear();
         Self {
             config: Arc::new(config),
+            config_without_alpn: None,
         }
     }
 
@@ -2331,6 +2347,7 @@ impl TlsServerOptions {
     pub fn from_rustls_config(config: ServerConfig) -> Self {
         Self {
             config: Arc::new(config),
+            config_without_alpn: None,
         }
     }
 
@@ -2359,6 +2376,7 @@ impl TlsServerOptions {
             .collect();
         Ok(Self {
             config: Arc::new(config),
+            config_without_alpn: None,
         })
     }
 
@@ -2401,6 +2419,7 @@ impl TlsServerOptions {
             .collect();
         Ok(Self {
             config: Arc::new(config),
+            config_without_alpn: None,
         })
     }
 }
@@ -2797,12 +2816,22 @@ impl TlsTransport {
             let mut wire = OwnedCiphertextStream::new(stream);
             let close = wire.close_mode();
             wire.start_background(&setup_context)?;
-            let tls = match await_handshake_with_deadline(
-                TlsAcceptor::from(options.config).accept(wire),
-                &deadline,
-                cancellation,
-            )
-            .await
+            let handshake = async move {
+                let Some(config_without_alpn) = options.config_without_alpn else {
+                    return TlsAcceptor::from(options.config).accept(wire).await;
+                };
+                let start = LazyConfigAcceptor::new(Acceptor::default(), wire).await?;
+                let config = if offers_no_server_protocol(
+                    start.client_hello().alpn(),
+                    &options.config.alpn_protocols,
+                ) {
+                    config_without_alpn
+                } else {
+                    options.config
+                };
+                start.into_stream(config).await
+            };
+            let tls = match await_handshake_with_deadline(handshake, &deadline, cancellation).await
             {
                 Ok(result) => result.map_err(tls_error)?,
                 Err(AwaitError::Cancelled) => {
@@ -2908,6 +2937,23 @@ impl TlsTransport {
     pub fn retirement(&self) -> Option<TransportRetirement> {
         self.stream.retirement()
     }
+}
+
+/// Whether a ClientHello's ALPN offer includes none of `server_protocols`, by
+/// the exact byte comparison that rustls makes, so that a configuration
+/// offering them would fail the handshake with `no_application_protocol`. A
+/// ClientHello without the ALPN extension gets no protocol and no alert.
+fn offers_no_server_protocol<'a>(
+    offered: Option<impl Iterator<Item = &'a [u8]>>,
+    server_protocols: &[Vec<u8>],
+) -> bool {
+    offered.is_some_and(|mut offered| {
+        !offered.any(|protocol| {
+            server_protocols
+                .iter()
+                .any(|server_protocol| server_protocol.as_slice() == protocol)
+        })
+    })
 }
 
 pub(crate) async fn await_handshake_with_deadline<F>(

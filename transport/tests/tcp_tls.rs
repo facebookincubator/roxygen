@@ -12127,6 +12127,20 @@ mod tcp_tls {
     where
         Client: Future<Output = ()> + 'static,
     {
+        tls_accept_error_timed(options, timeout, cancellation, client).0
+    }
+
+    /// Like `tls_accept_error_observed`, and also returns how long the accept
+    /// took, from just before `TlsTransport::accept` until it failed.
+    fn tls_accept_error_timed<Client>(
+        options: TlsServerOptions,
+        timeout: Duration,
+        cancellation: CancellationToken,
+        client: impl FnOnce(TcpStream, std::net::TcpStream) -> Client + 'static,
+    ) -> (HttpError, Duration)
+    where
+        Client: Future<Output = ()> + 'static,
+    {
         Builder::new_current_thread()
             .enable_all()
             .build()
@@ -12143,6 +12157,7 @@ mod tcp_tls {
                 let (worker, driver) = WorkerDriver::new(8).unwrap();
                 let call = worker
                     .call_local(move |context| async move {
+                        let started = time::Instant::now();
                         match TlsTransport::accept(
                             &context,
                             accepted,
@@ -12154,7 +12169,7 @@ mod tcp_tls {
                         .await
                         {
                             Ok(_) => panic!("the TLS accept must fail"),
-                            Err(error) => error,
+                            Err(error) => (error, started.elapsed()),
                         }
                     })
                     .unwrap();
@@ -12290,22 +12305,23 @@ mod tcp_tls {
 
     /// A client's first TLS flight, its ClientHello.
     fn client_hello() -> Vec<u8> {
-        let mut client_hello = Vec::new();
-        rustls::ClientConnection::new(
-            Arc::new(
-                ClientConfig::builder_with_provider(Arc::new(
-                    rustls::crypto::ring::default_provider(),
-                ))
+        client_hello_offering(Vec::new())
+    }
+
+    /// A ClientHello that offers the ALPN `protocols`.
+    fn client_hello_offering(protocols: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()
                 .unwrap()
                 .with_root_certificates(RootCertStore::empty())
-                .with_no_client_auth(),
-            ),
-            ServerName::try_from("localhost").unwrap(),
-        )
-        .unwrap()
-        .write_tls(&mut client_hello)
-        .unwrap();
+                .with_no_client_auth();
+        config.alpn_protocols = protocols;
+        let mut client_hello = Vec::new();
+        rustls::ClientConnection::new(Arc::new(config), ServerName::try_from("localhost").unwrap())
+            .unwrap()
+            .write_tls(&mut client_hello)
+            .unwrap();
         client_hello
     }
 
@@ -12605,6 +12621,8 @@ mod tcp_tls {
         server: Result<Option<PeerIdentity>, HttpError>,
         /// Whether the server resumed a session.
         server_resumed: bool,
+        /// The protocol ALPN selected, as the accepted transport reports it.
+        server_protocol: Option<Vec<u8>>,
         /// The client's handshake result, with the protocol ALPN selected.
         client_handshake: Result<Option<Vec<u8>>, io::Error>,
         /// What the client read after sending `ping`.
@@ -12662,6 +12680,10 @@ mod tcp_tls {
                         .await?;
                         let identity = transport.peer_identity(&context).unwrap();
                         let resumed = transport.connection_info().session_resumed();
+                        let protocol = transport
+                            .connection_info()
+                            .application_protocol()
+                            .map(<[u8]>::to_vec);
                         let stream = transport.into_byte_stream();
                         let request = stream
                             .read(
@@ -12684,7 +12706,7 @@ mod tcp_tls {
                             .await
                             .unwrap();
                         stream.close(&context).unwrap();
-                        Ok((identity, resumed))
+                        Ok((identity, resumed, protocol))
                     })
                     .unwrap();
                 let driver_task = tokio::task::spawn_local(driver);
@@ -12702,9 +12724,14 @@ mod tcp_tls {
                     .await
                     .expect("worker shutdown must remain bounded")
                     .unwrap();
+                let (server_resumed, server_protocol) = match &server {
+                    Ok((_, resumed, protocol)) => (*resumed, protocol.clone()),
+                    Err(_) => (false, None),
+                };
                 ClientAuthOutcome {
-                    server_resumed: matches!(server, Ok((_, true))),
-                    server: server.map(|(identity, _)| identity),
+                    server_resumed,
+                    server_protocol,
+                    server: server.map(|(identity, _, _)| identity),
                     client_handshake,
                     client_received,
                 }
@@ -13340,21 +13367,6 @@ mod tcp_tls {
     }
 
     #[test]
-    fn continue_without_alpn_is_not_supported_yet() {
-        let server = ServerIdentity::new();
-
-        let error = TlsServerOptions::from_settings(server.settings().with_alpn(
-            vec![b"h2".to_vec().into()],
-            TlsAlpnMismatch::ContinueWithoutAlpn,
-        ))
-        .err()
-        .expect("the option must not silently do nothing");
-
-        assert_eq!(error.code(), HttpErrorCode::INADEQUATE_SECURITY);
-        assert_eq!(error.message(), b"ContinueWithoutAlpn is not supported yet");
-    }
-
-    #[test]
     fn reload_keeps_ticket_keys() {
         let server = ServerIdentity::new();
         let resumption = TlsServerResumption::new(256).unwrap();
@@ -13973,6 +13985,289 @@ mod tcp_tls {
         assert!(
             clone.server_resumed,
             "the clone resumes the source's session"
+        );
+    }
+
+    /// The ALPN protocols that the `ContinueWithoutAlpn` tests' servers offer,
+    /// in order of preference.
+    fn h2_and_http1() -> Vec<Box<[u8]>> {
+        vec![b"h2".to_vec().into(), b"http/1.1".to_vec().into()]
+    }
+
+    /// A protocol that no test server offers.
+    const UNKNOWN_PROTOCOL: &[u8] = b"x-unknown/1";
+
+    #[test]
+    fn alpn_no_overlap_continues_without_alpn() {
+        let server = ServerIdentity::new();
+        let options = TlsServerOptions::from_settings(
+            server
+                .settings()
+                .with_alpn(h2_and_http1(), TlsAlpnMismatch::ContinueWithoutAlpn),
+        )
+        .unwrap();
+        let mut client = server.client(None, rustls::DEFAULT_VERSIONS);
+        client.alpn_protocols = vec![UNKNOWN_PROTOCOL.to_vec()];
+
+        let outcome = accept_with_client_auth(options, client);
+
+        assert!(
+            outcome.server.is_ok(),
+            "the server completes the handshake: {:?}",
+            outcome.server.as_ref().err()
+        );
+        assert_eq!(
+            outcome
+                .client_handshake
+                .expect("the client completes the handshake"),
+            None,
+            "the client sees no protocol selected"
+        );
+        assert_eq!(
+            outcome.server_protocol, None,
+            "the server selected no protocol"
+        );
+        assert_eq!(
+            outcome.client_received, b"pong",
+            "application bytes flow both ways"
+        );
+    }
+
+    #[test]
+    fn alpn_overlap_negotiates_h2() {
+        let server = ServerIdentity::new();
+        let options = TlsServerOptions::from_settings(
+            server
+                .settings()
+                .with_alpn(h2_and_http1(), TlsAlpnMismatch::ContinueWithoutAlpn),
+        )
+        .unwrap();
+        let mut client = server.client(None, rustls::DEFAULT_VERSIONS);
+        client.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let outcome = accept_with_client_auth(options, client);
+
+        assert!(
+            outcome.server.is_ok(),
+            "the server completes the handshake: {:?}",
+            outcome.server.as_ref().err()
+        );
+        assert_eq!(
+            outcome
+                .client_handshake
+                .expect("the client completes the handshake")
+                .as_deref(),
+            Some(&b"h2"[..]),
+            "the client sees the server's first preference"
+        );
+        assert_eq!(
+            outcome.server_protocol.as_deref(),
+            Some(&b"h2"[..]),
+            "the server selected its first preference"
+        );
+    }
+
+    #[test]
+    fn reject_mode_sends_no_application_protocol() {
+        let server = ServerIdentity::new();
+        let options = TlsServerOptions::from_settings(
+            server
+                .settings()
+                .with_alpn(vec![b"h2".to_vec().into()], TlsAlpnMismatch::Reject),
+        )
+        .unwrap();
+        let mut client = server.client(None, rustls::DEFAULT_VERSIONS);
+        client.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+        let outcome = accept_with_client_auth(options, client);
+
+        let client_error = outcome
+            .client_handshake
+            .expect_err("the client's handshake fails");
+        assert!(
+            matches!(
+                client_error
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<rustls::Error>()),
+                Some(rustls::Error::AlertReceived(
+                    rustls::AlertDescription::NoApplicationProtocol
+                ))
+            ),
+            "the client receives the no_application_protocol alert: {client_error:?}"
+        );
+        let server_error = outcome
+            .server
+            .as_ref()
+            .expect_err("the server's accept fails");
+        assert!(
+            matches!(
+                tls_handshake_rustls_error(server_error),
+                Some(rustls::Error::NoApplicationProtocol)
+            ),
+            "{server_error:?}"
+        );
+        assert_eq!(
+            tls_handshake_failure_kind(server_error),
+            TlsHandshakeFailureKind::Protocol,
+            "{server_error:?}"
+        );
+    }
+
+    #[test]
+    fn one_deadline_covers_client_hello_and_handshake() {
+        const TIMEOUT: Duration = Duration::from_secs(1);
+        let server = ServerIdentity::new();
+        let options = TlsServerOptions::from_settings(
+            server
+                .settings()
+                .with_alpn(h2_and_http1(), TlsAlpnMismatch::ContinueWithoutAlpn),
+        )
+        .unwrap();
+        let client_hello = client_hello_offering(vec![UNKNOWN_PROTOCOL.to_vec()]);
+
+        let (error, elapsed) = tls_accept_error_timed(
+            options,
+            TIMEOUT,
+            CancellationToken::never(),
+            move |mut stream, _| async move {
+                // Most of the budget passes before the ClientHello arrives.
+                // The server then answers it and waits for a client flight
+                // that never comes.
+                time::sleep(TIMEOUT * 4 / 5).await;
+                stream.write_all(&client_hello).await.unwrap();
+                read_until_closed(stream).await;
+            },
+        );
+
+        assert_eq!(error.code(), HttpErrorCode::READ_TIMEOUT, "{error:?}");
+        assert_eq!(error.message(), b"TLS handshake timed out");
+        assert!(
+            elapsed >= TIMEOUT && elapsed < TIMEOUT * 3 / 2,
+            "one deadline from the start of the accept bounds both the ClientHello read and the \
+             rest of the handshake; a timeout for each would take at least 1.8 s: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn no_overlap_session_resumes_with_shared_tickets() {
+        let server = ServerIdentity::new();
+        let options = TlsServerOptions::from_settings(
+            server
+                .settings()
+                .with_alpn(h2_and_http1(), TlsAlpnMismatch::ContinueWithoutAlpn)
+                .with_resumption(TlsServerResumption::new(256).unwrap()),
+        )
+        .unwrap();
+        let mut client = server.client(None, &[&rustls::version::TLS13]);
+        client.alpn_protocols = vec![UNKNOWN_PROTOCOL.to_vec()];
+
+        // `connect_resumes` also checks that `ping`/`pong` crossed, so the
+        // client read past the ticket that the server sent after its handshake.
+        assert!(
+            !connect_resumes(options.clone(), client.clone()),
+            "the first connection is a full handshake"
+        );
+        let resumed = accept_with_client_auth(options.clone(), client);
+        assert!(
+            resumed.server_resumed,
+            "the second connection resumes the first one's session"
+        );
+        assert_eq!(
+            resumed
+                .client_handshake
+                .expect("the client completes the handshake"),
+            None,
+            "the client sees no protocol selected on the resumed session"
+        );
+        assert_eq!(
+            resumed.server_protocol, None,
+            "the server selected no protocol on the resumed session"
+        );
+
+        // Clones of a client config share its session store.
+        let mut h2_client = server.client(None, &[&rustls::version::TLS13]);
+        h2_client.alpn_protocols = vec![b"h2".to_vec()];
+        let h2 = accept_with_client_auth(options.clone(), h2_client.clone());
+        assert_eq!(h2.server_protocol.as_deref(), Some(&b"h2"[..]));
+        assert!(!h2.server_resumed, "a new client makes a full handshake");
+        let mut switched = h2_client;
+        switched.alpn_protocols = vec![UNKNOWN_PROTOCOL.to_vec()];
+        let crossed = accept_with_client_auth(options, switched);
+        assert!(
+            crossed.server_resumed,
+            "a session made while h2 was negotiated resumes on the handshake without ALPN, \
+             which shares the server's tickets"
+        );
+        assert_eq!(crossed.server_protocol, None);
+    }
+
+    #[test]
+    fn continue_without_alpn_keeps_failure_kinds() {
+        let server = ServerIdentity::new();
+        let options = || {
+            TlsServerOptions::from_settings(
+                server
+                    .settings()
+                    .with_alpn(h2_and_http1(), TlsAlpnMismatch::ContinueWithoutAlpn),
+            )
+            .unwrap()
+        };
+
+        let plaintext = tls_accept_error(
+            options(),
+            Duration::from_secs(10),
+            CancellationToken::never(),
+            |mut stream| async move {
+                stream
+                    .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .await
+                    .unwrap();
+                read_until_closed(stream).await;
+            },
+        );
+        assert_eq!(
+            tls_handshake_failure_kind(&plaintext),
+            TlsHandshakeFailureKind::Protocol,
+            "{plaintext:?}"
+        );
+        assert!(
+            tls_handshake_rustls_error(&plaintext).is_some(),
+            "rustls rejected the bytes: {plaintext:?}"
+        );
+
+        let client_hello = client_hello_offering(vec![UNKNOWN_PROTOCOL.to_vec()]);
+        let eof = tls_accept_error(
+            options(),
+            Duration::from_secs(10),
+            CancellationToken::never(),
+            move |mut stream| async move {
+                // Half a ClientHello, then FIN.
+                stream
+                    .write_all(&client_hello[..client_hello.len() / 2])
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+                read_until_closed(stream).await;
+            },
+        );
+        assert_eq!(
+            tls_handshake_failure_kind(&eof),
+            TlsHandshakeFailureKind::Eof,
+            "{eof:?}"
+        );
+        assert_eq!(eof.code(), HttpErrorCode::TRANSPORT_EOF, "{eof:?}");
+
+        // The client connects and never sends a ClientHello.
+        let stalled = tls_accept_error(
+            options(),
+            Duration::from_millis(100),
+            CancellationToken::never(),
+            read_until_closed,
+        );
+        assert_eq!(
+            tls_handshake_failure_kind(&stalled),
+            TlsHandshakeFailureKind::Timeout,
+            "{stalled:?}"
         );
     }
 
