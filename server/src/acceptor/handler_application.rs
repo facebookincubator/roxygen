@@ -12,6 +12,9 @@
 //! task per request. A request without a body is first offered to
 //! `HttpHandler::respond_now`, whose whole response the exchange holds inline. The
 //! owned HTTP/1.1 and HTTP/2 session wrappers share it.
+//!
+//! The exchanges of one connection share its handler and base context, and an
+//! exchange clones the context only for a request it passes to `handle_request`.
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -71,21 +74,27 @@ fn failed_handler(error: HttpError) -> LocalHandlerFuture {
     Box::pin(std::future::ready(Err(error)))
 }
 
-/// Invokes the server's handler for each exchange of one connection.
-pub(crate) struct HandlerApplication {
+/// The handler and base context that the exchanges of one connection share.
+struct Shared {
     handler: HttpHandlerRef,
     base: HandlerSessionContext,
 }
 
+/// Invokes the server's handler for each exchange of one connection.
+pub(crate) struct HandlerApplication {
+    shared: Rc<Shared>,
+}
+
 impl HandlerApplication {
     pub(crate) fn new(handler: HttpHandlerRef, base: HandlerSessionContext) -> Self {
-        Self { handler, base }
+        Self {
+            shared: Rc::new(Shared { handler, base }),
+        }
     }
 
     fn exchange(&self) -> HandlerExchange {
         HandlerExchange {
-            handler: Rc::clone(&self.handler),
-            context: Some(self.base.clone()),
+            shared: Rc::clone(&self.shared),
             state: ExchangeState::AwaitingRequest,
         }
     }
@@ -134,8 +143,7 @@ enum ExchangeState {
 }
 
 pub(crate) struct HandlerExchange {
-    handler: HttpHandlerRef,
-    context: Option<HandlerSessionContext>,
+    shared: Rc<Shared>,
     state: ExchangeState,
 }
 
@@ -208,14 +216,14 @@ impl HandlerExchange {
             | ExchangeState::AwaitingRequest
             | ExchangeState::Retired => {}
         }
-        self.context.take();
     }
 
     /// Offers a request without a body to `respond_now`, under the same unwind
     /// boundary as `handle_request`. Returns the head when `respond_now`
     /// returns `None`.
     fn try_respond_now(&mut self, mut head: Box<HttpMessage>) -> Option<Box<HttpMessage>> {
-        let response = match catch_unwind(AssertUnwindSafe(|| self.handler.respond_now(&head))) {
+        let handler = &self.shared.handler;
+        let response = match catch_unwind(AssertUnwindSafe(|| handler.respond_now(&head))) {
             Ok(None) => return Some(head),
             Ok(Some(response)) => response,
             Err(panic) => {
@@ -266,10 +274,10 @@ fn fixed_body(body: &mut Option<BufQueue>, maximum: u32) -> Result<HttpBodyEvent
 
 impl OwnedExchange for HandlerExchange {
     fn request(&mut self, head: Box<HttpMessage>, body: HttpStreamSourceOwner, eom: bool) {
-        let context = self
-            .context
-            .take()
-            .expect("an exchange receives one request");
+        assert!(
+            matches!(self.state, ExchangeState::AwaitingRequest),
+            "an exchange receives one request"
+        );
         let head = if eom {
             match self.try_respond_now(head) {
                 Some(head) => head,
@@ -286,8 +294,9 @@ impl OwnedExchange for HandlerExchange {
                     HttpHybridSource::from_header_event_only(head)
                 };
                 let request = HttpSourceHolder::new(Box::new(source));
+                let Shared { handler, base } = &*self.shared;
                 catch_unwind(AssertUnwindSafe(|| {
-                    self.handler.handle_request(context, request)
+                    handler.handle_request(base.clone(), request)
                 }))
                 .unwrap_or_else(|panic| {
                     discard_panic(panic);
@@ -380,8 +389,11 @@ mod tests {
 
     use bytes::Bytes;
     use roxygen_core::buf_queue::BufQueue;
+    use roxygen_core::handler::FixedResponse;
     use roxygen_core::handler::HttpHandler;
     use roxygen_core::source::LocalSourceFuture;
+    use roxygen_core::stream_source::HttpStreamSource;
+    use roxygen_runtime::keep_alive::KeepAliveOwner;
 
     use super::*;
 
@@ -460,6 +472,30 @@ mod tests {
         }
     }
 
+    /// Finalizes `owner`, which no reference may still hold.
+    fn finalize(mut owner: KeepAliveOwner<()>) {
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        let finalized = std::pin::pin!(owner.finalize()).poll(&mut context);
+        assert!(finalized.is_ready(), "no reference remains");
+    }
+
+    /// The references on `owner` besides its own.
+    fn references(owner: &KeepAliveOwner<()>) -> u64 {
+        owner.num_keep_alives() - 1
+    }
+
+    /// Builds an exchange in `state` whose base context holds a reference on
+    /// `owner`.
+    fn exchange_in(owner: &KeepAliveOwner<()>, state: ExchangeState) -> HandlerExchange {
+        HandlerExchange {
+            shared: Rc::new(Shared {
+                handler: Rc::new(NoHandler),
+                base: HandlerSessionContext::acquire(owner).expect("the owner accepts work"),
+            }),
+            state,
+        }
+    }
+
     /// A body read pending when the driver's allowance grows still returns at
     /// most the allowance it started with, polled in place or read through a
     /// future.
@@ -472,15 +508,15 @@ mod tests {
                 primed: Rc::new(Cell::new(false)),
                 maxima: Rc::clone(&maxima),
             };
-            let mut exchange = HandlerExchange {
-                handler: Rc::new(NoHandler),
-                context: None,
-                state: ExchangeState::Responding {
+            let owner = KeepAliveOwner::new(());
+            let mut exchange = exchange_in(
+                &owner,
+                ExchangeState::Responding {
                     response: HttpSourceHolder::new(Box::new(source)),
                     header_read: None,
                     body_read: None,
                 },
-            };
+            );
             let mut context = Context::from_waker(std::task::Waker::noop());
             assert!(exchange.poll_body(&mut context, 3).is_pending());
             let Poll::Ready(Ok(event)) = exchange.poll_body(&mut context, 8) else {
@@ -498,23 +534,23 @@ mod tests {
             };
             assert_eq!(error.code(), HttpErrorCode::DROPPED, "polling {polling}");
             exchange.complete();
+            finalize(owner);
         }
     }
 
-    fn fixed_exchange(body: &'static [u8]) -> HandlerExchange {
+    fn fixed_exchange(owner: &KeepAliveOwner<()>, body: &'static [u8]) -> HandlerExchange {
         let mut head = HttpMessage::new();
         head.set_status_code(200).expect("a response head");
-        HandlerExchange {
-            handler: Rc::new(NoHandler),
-            context: None,
-            state: ExchangeState::Fixed {
+        exchange_in(
+            owner,
+            ExchangeState::Fixed {
                 head: Some(Box::new(head)),
                 body: Some(
                     BufQueue::from_bytes(Bytes::from_static(body), body.len())
                         .expect("the body fits its queue"),
                 ),
             },
-        }
+        )
     }
 
     /// A fixed response splits its body by each poll's allowance and ends the
@@ -522,8 +558,9 @@ mod tests {
     /// poll after the end fails as a consumed response source does.
     #[test]
     fn a_fixed_response_splits_its_body_by_the_allowance() {
+        let owner = KeepAliveOwner::new(());
         let mut context = Context::from_waker(std::task::Waker::noop());
-        let mut exchange = fixed_exchange(AVAILABLE);
+        let mut exchange = fixed_exchange(&owner, AVAILABLE);
         let Poll::Ready(Ok(head)) = exchange.poll_headers(&mut context) else {
             panic!("the head is ready");
         };
@@ -560,7 +597,7 @@ mod tests {
         assert!(!exchange.handler_active());
         exchange.complete();
 
-        let mut exchange = fixed_exchange(b"");
+        let mut exchange = fixed_exchange(&owner, b"");
         let Poll::Ready(Ok(head)) = exchange.poll_headers(&mut context) else {
             panic!("the head is ready");
         };
@@ -570,5 +607,88 @@ mod tests {
             true,
         );
         assert!(matches!(exchange.state, ExchangeState::Retired));
+        drop(exchange);
+        finalize(owner);
+    }
+
+    /// Answers from `respond_now` while `answer` is set, and otherwise keeps
+    /// each context that `handle_request` receives.
+    #[derive(Default)]
+    struct AnswerOrKeep {
+        answer: Cell<bool>,
+        kept: RefCell<Vec<HandlerSessionContext>>,
+    }
+
+    impl HttpHandler for AnswerOrKeep {
+        fn respond_now(&self, _request: &HttpMessage) -> Option<Result<FixedResponse, HttpError>> {
+            self.answer.get().then(|| {
+                let mut head = HttpMessage::new();
+                head.set_status_code(204).expect("a response head");
+                Ok(FixedResponse::new(head, BufQueue::new(0)))
+            })
+        }
+
+        fn handle_request(
+            &self,
+            context: HandlerSessionContext,
+            _request: HttpSourceHolder,
+        ) -> LocalHandlerFuture {
+            self.kept.borrow_mut().push(context);
+            failed_handler(failure(b"kept"))
+        }
+    }
+
+    fn request_without_body(exchange: &mut HandlerExchange) {
+        let mut head = HttpMessage::new();
+        head.set_method(roxygen_core::http::HttpMethod::Get)
+            .expect("a request head");
+        let body =
+            HttpStreamSource::new_async(Some(StreamId::new(1)), None, 8).expect("a body source");
+        exchange.request(Box::new(head), HttpStreamSourceOwner::new(body), true);
+    }
+
+    /// A request answered by `respond_now` takes no keep-alive reference, and
+    /// `handle_request` receives a clone of the connection's base context that
+    /// keeps the owner referenced until the handler drops it. The base itself is
+    /// released with the application and the last of its exchanges.
+    #[test]
+    fn only_a_handled_request_clones_the_base_context() {
+        let owner = KeepAliveOwner::new(());
+        let handler = Rc::new(AnswerOrKeep::default());
+        let base =
+            HandlerSessionContext::acquire_with_peer_identity(&owner, Some(Rc::from(&b"peer"[..])))
+                .expect("the owner accepts work");
+        let application = HandlerApplication::new(handler.clone(), base);
+        assert_eq!(references(&owner), 1);
+
+        handler.answer.set(true);
+        let mut answered = application.exchange();
+        request_without_body(&mut answered);
+        assert_eq!(references(&owner), 1);
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        let Poll::Ready(Ok(head)) = answered.poll_headers(&mut context) else {
+            panic!("the answer's head is ready");
+        };
+        assert_eq!(head.headers().response_status(), Some(204));
+        assert!(head.eom());
+        answered.complete();
+
+        handler.answer.set(false);
+        let mut handled = application.exchange();
+        request_without_body(&mut handled);
+        assert_eq!(references(&owner), 2);
+        assert_eq!(handler.kept.borrow()[0].peer_identity(), Some(&b"peer"[..]));
+        assert!(handled.handler_active());
+        handled.complete();
+        assert_eq!(references(&owner), 2, "the handler keeps its context");
+        handler.kept.borrow_mut().clear();
+        assert_eq!(references(&owner), 1);
+
+        let unrequested = application.exchange();
+        drop(application);
+        assert_eq!(references(&owner), 1, "an exchange keeps the base");
+        drop(unrequested);
+        assert_eq!(references(&owner), 0);
+        finalize(owner);
     }
 }
