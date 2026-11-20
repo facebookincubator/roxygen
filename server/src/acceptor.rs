@@ -111,6 +111,184 @@ pub trait AcceptedConnectionObserver: Send + Sync + 'static {
     fn on_registered(&self) {}
 }
 
+/// Identifies a connection that an `HttpServer` accepted: the index of the worker that serves
+/// it, and that worker's serial number for it. Each worker numbers its connections from 1, and
+/// the serial wraps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct ConnectionId {
+    pub worker: u32,
+    pub serial: u64,
+}
+
+/// How an accepted connection ended, as `ConnectionLifecycleObserver::on_socket_closed`
+/// reports it.
+#[derive(Clone, Copy, Debug)]
+pub enum ConnectionOutcome<'a> {
+    /// The TLS handshake failed or missed `ServerSessionConfig::tls_handshake_timeout`.
+    TlsFailed(&'a HttpError),
+    /// The connection ended before its session ran, for a reason other than its TLS handshake:
+    /// the connection filter refused it, the server had stopped admitting sessions, an accept
+    /// callback panicked or the connection's setup failed.
+    Rejected(&'a HttpError),
+    /// The session ran and returned `result`. `protocol` is the protocol it served.
+    /// `handshake_complete` is whether its driver completed the connection handshake, as
+    /// `ConnectionLifecycleObserver::on_protocol_established` describes. It is always false for
+    /// a `UniplexSession`, which does not track the handshake.
+    Closed {
+        protocol: CodecProtocol,
+        handshake_complete: bool,
+        result: &'a Result<UniplexRunSummary, HttpError>,
+    },
+    /// The connection was dropped before it reached another outcome, as by a forced stop or a
+    /// panic.
+    Aborted,
+}
+
+/// Observes each connection that an `HttpServer` accepts, from the start of its session task on
+/// its worker to its close, in both accept distributions and with every session mode.
+///
+/// Every callback runs in the connection's session task, on the worker that serves the
+/// connection. `on_socket_accepted` comes first, when the task starts and before any TLS
+/// handshake, and `on_socket_closed` comes last, exactly once. A socket whose session task never
+/// starts, one that `AcceptStats::handoff_dropped` or `AcceptStats::closed_at_force_stop`
+/// counts, is not reported. A panicking callback does not affect the connection: the server
+/// records the first panic, and its stop then fails with `HttpServerError::CallbackPanic`
+/// naming `ServerCallbackStage::ConnectionLifecycleObserver`.
+pub trait ConnectionLifecycleObserver: Send + Sync + 'static {
+    /// Called when the connection's session task starts, before the TLS handshake.
+    fn on_socket_accepted(&self, _id: ConnectionId) {}
+
+    /// Called once, after the driver poll in which an owned session (`owned_http1` or
+    /// `owned_http2`) completes its connection handshake: an HTTP/2 session has processed the
+    /// peer's first SETTINGS frame, or an HTTP/1.1 session has delivered its first request
+    /// head. A `UniplexSession` never reports it.
+    fn on_protocol_established(&self, _id: ConnectionId, _protocol: CodecProtocol) {}
+
+    /// Called once, when the connection ends, with its outcome.
+    fn on_socket_closed(&self, _id: ConnectionId, _outcome: &ConnectionOutcome<'_>) {}
+}
+
+/// Reports one connection's lifecycle to a `ConnectionLifecycleObserver`. Dropping it without
+/// `close` reports `ConnectionOutcome::Aborted`. A callback panic is recorded as the worker's
+/// callback failure and otherwise ignored.
+pub(crate) struct ConnectionLifecycle {
+    observer: Arc<dyn ConnectionLifecycleObserver>,
+    id: ConnectionId,
+    worker_index: usize,
+    callback_failure: Arc<Mutex<Option<CallbackFailure>>>,
+    established: bool,
+    closed: bool,
+}
+
+impl ConnectionLifecycle {
+    /// Reports the accepted socket.
+    pub(crate) fn accepted(
+        observer: Arc<dyn ConnectionLifecycleObserver>,
+        id: ConnectionId,
+        worker_index: usize,
+        callback_failure: Arc<Mutex<Option<CallbackFailure>>>,
+    ) -> Self {
+        let lifecycle = Self {
+            observer,
+            id,
+            worker_index,
+            callback_failure,
+            established: false,
+            closed: false,
+        };
+        lifecycle.invoke(|observer| observer.on_socket_accepted(id));
+        lifecycle
+    }
+
+    /// Continues the lifecycle with the session admitted for the connection, which serves
+    /// `protocol` and is controlled by `control`.
+    pub(crate) fn admitted(
+        self,
+        protocol: CodecProtocol,
+        control: &SessionControl,
+    ) -> SessionLifecycle {
+        SessionLifecycle {
+            lifecycle: self,
+            protocol,
+            handshake: control.handshake(),
+        }
+    }
+
+    /// Reports the established protocol, once.
+    fn established(&mut self, protocol: CodecProtocol) {
+        if !self.established {
+            self.established = true;
+            self.invoke(|observer| observer.on_protocol_established(self.id, protocol));
+        }
+    }
+
+    /// Reports how the connection ended.
+    pub(crate) fn close(mut self, outcome: &ConnectionOutcome<'_>) {
+        self.report_closed(outcome);
+    }
+
+    fn report_closed(&mut self, outcome: &ConnectionOutcome<'_>) {
+        if !self.closed {
+            self.closed = true;
+            self.invoke(|observer| observer.on_socket_closed(self.id, outcome));
+        }
+    }
+
+    fn invoke(&self, callback: impl FnOnce(&dyn ConnectionLifecycleObserver)) {
+        let _ = invoke_accept_callback(
+            &self.callback_failure,
+            self.worker_index,
+            ServerCallbackStage::ConnectionLifecycleObserver,
+            || callback(&*self.observer),
+        );
+    }
+}
+
+impl Drop for ConnectionLifecycle {
+    fn drop(&mut self) {
+        self.report_closed(&ConnectionOutcome::Aborted);
+    }
+}
+
+/// The lifecycle of a connection whose session was admitted.
+pub(crate) struct SessionLifecycle {
+    lifecycle: ConnectionLifecycle,
+    protocol: CodecProtocol,
+    handshake: SessionHandshake,
+}
+
+impl SessionLifecycle {
+    /// Runs `session` as `run_session` does. An owned session also reports its protocol after
+    /// the poll in which its driver first completes the connection handshake.
+    pub(crate) async fn run(
+        &mut self,
+        session: ServerSession,
+    ) -> Result<UniplexRunSummary, HttpError> {
+        if matches!(self.handshake, SessionHandshake::Untracked) {
+            return session.run().await;
+        }
+        let mut run = session.run();
+        std::future::poll_fn(|context| {
+            let poll = run.as_mut().poll(context);
+            if !self.lifecycle.established && self.handshake.is_complete() {
+                self.lifecycle.established(self.protocol);
+            }
+            poll
+        })
+        .await
+    }
+
+    /// Reports that the session returned `result`.
+    pub(crate) fn close(self, result: &Result<UniplexRunSummary, HttpError>) {
+        let handshake_complete = self.handshake.is_complete();
+        self.lifecycle.close(&ConnectionOutcome::Closed {
+            protocol: self.protocol,
+            handshake_complete,
+            result,
+        });
+    }
+}
+
 #[cfg(test)]
 type AcceptedSocketProfile = dyn Fn(&std::net::TcpStream) -> Result<(), HttpError> + Send + Sync;
 
@@ -463,6 +641,36 @@ impl SessionControl {
     pub(crate) fn force_stop(&self) {
         let _ = self.transport.close_with_reset(&self.context);
     }
+
+    fn handshake(&self) -> SessionHandshake {
+        match &self.handle {
+            SessionHandle::Uniplex(_) => SessionHandshake::Untracked,
+            SessionHandle::OwnedHttp1 { handle, .. } => {
+                SessionHandshake::OwnedHttp1(handle.clone())
+            }
+            SessionHandle::OwnedHttp2 { handle, .. } => {
+                SessionHandshake::OwnedHttp2(handle.clone())
+            }
+        }
+    }
+}
+
+/// Reads whether a session's driver has completed its connection handshake.
+enum SessionHandshake {
+    /// A `UniplexSession` does not track the handshake.
+    Untracked,
+    OwnedHttp1(OwnedH1Handle),
+    OwnedHttp2(OwnedH2Handle),
+}
+
+impl SessionHandshake {
+    fn is_complete(&self) -> bool {
+        match self {
+            Self::Untracked => false,
+            Self::OwnedHttp1(handle) => handle.handshake_complete(),
+            Self::OwnedHttp2(handle) => handle.handshake_complete(),
+        }
+    }
 }
 
 /// The downstream session an accepted connection runs.
@@ -504,6 +712,7 @@ impl ServerSession {
 pub(crate) struct AcceptedSession {
     pub control: SessionControl,
     pub session: ServerSession,
+    pub protocol: CodecProtocol,
     #[cfg(test)]
     pub retirement: Option<TransportRetirement>,
 }
@@ -516,7 +725,7 @@ pub(crate) async fn accept_session(
     draining: Arc<AtomicBool>,
     worker_index: usize,
     callback_failure: Arc<Mutex<Option<CallbackFailure>>>,
-) -> Result<AcceptedSession, HttpError> {
+) -> Result<AcceptedSession, AcceptFailure> {
     socket.set_nodelay(true).map_err(|error| {
         HttpError::with_message(HttpErrorCode::CONNECT_ERROR, error.to_string().as_bytes())
             .with_cause(Arc::new(error))
@@ -562,7 +771,7 @@ pub(crate) async fn accept_session(
                         || observer.on_error(&error),
                     );
                 }
-                return Err(error);
+                return Err(AcceptFailure::Tls(error));
             }
         };
         let protocol = match tls.connection_info().application_protocol() {
@@ -602,7 +811,7 @@ pub(crate) async fn accept_session(
             || observer.on_success(&connection),
         )?;
     }
-    attach_session(
+    Ok(attach_session(
         transport,
         SessionAttachment {
             context: &context,
@@ -614,7 +823,36 @@ pub(crate) async fn accept_session(
             worker_index,
             callback_failure: &callback_failure,
         },
-    )
+    )?)
+}
+
+/// Why `accept_session` returned no session.
+pub(crate) enum AcceptFailure {
+    /// The TLS handshake failed.
+    Tls(HttpError),
+    /// Anything else ended the connection before its session started.
+    Rejected(HttpError),
+}
+
+impl AcceptFailure {
+    pub(crate) fn outcome(&self) -> ConnectionOutcome<'_> {
+        match self {
+            Self::Tls(error) => ConnectionOutcome::TlsFailed(error),
+            Self::Rejected(error) => ConnectionOutcome::Rejected(error),
+        }
+    }
+
+    pub(crate) fn into_error(self) -> HttpError {
+        match self {
+            Self::Tls(error) | Self::Rejected(error) => error,
+        }
+    }
+}
+
+impl From<HttpError> for AcceptFailure {
+    fn from(error: HttpError) -> Self {
+        Self::Rejected(error)
+    }
 }
 
 pub(crate) fn connection_info(
@@ -755,6 +993,7 @@ pub(crate) fn attach_session(
         return admit_session(
             context,
             draining,
+            connection.protocol,
             ServerSession::OwnedHttp1(session),
             SessionControl {
                 handle: SessionHandle::OwnedHttp1 { handle, finished },
@@ -790,6 +1029,7 @@ pub(crate) fn attach_session(
         return admit_session(
             context,
             draining,
+            connection.protocol,
             ServerSession::OwnedHttp2(session),
             SessionControl {
                 handle: SessionHandle::OwnedHttp2 { handle, finished },
@@ -855,6 +1095,7 @@ pub(crate) fn attach_session(
     admit_session(
         context,
         draining,
+        connection.protocol,
         ServerSession::Uniplex(session),
         SessionControl {
             handle: SessionHandle::Uniplex(handle),
@@ -869,6 +1110,7 @@ pub(crate) fn attach_session(
 fn admit_session(
     context: &WorkerContext,
     draining: Option<&AtomicBool>,
+    protocol: CodecProtocol,
     session: ServerSession,
     control: SessionControl,
     #[cfg(test)] retirement: Option<TransportRetirement>,
@@ -885,6 +1127,7 @@ fn admit_session(
     Ok(AcceptedSession {
         control,
         session,
+        protocol,
         #[cfg(test)]
         retirement,
     })

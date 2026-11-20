@@ -139,6 +139,9 @@ pub mod scoped_server;
 pub mod server;
 pub mod shutdown;
 
+pub use acceptor::ConnectionId;
+pub use acceptor::ConnectionLifecycleObserver;
+pub use acceptor::ConnectionOutcome;
 pub use server::AcceptDistribution;
 pub use server::AcceptStats;
 pub use server::StopAccepting;

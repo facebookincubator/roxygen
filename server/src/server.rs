@@ -64,6 +64,9 @@ use tokio::task::JoinSet;
 
 use crate::acceptor::AcceptedConnectionObserver;
 use crate::acceptor::AcceptorConfig;
+use crate::acceptor::ConnectionId;
+use crate::acceptor::ConnectionLifecycle;
+use crate::acceptor::ConnectionLifecycleObserver;
 use crate::acceptor::NON_ABORTIVE_CLOSE_WITH_TLS;
 use crate::acceptor::NewConnectionFilter;
 use crate::acceptor::ServerSessionConfig;
@@ -529,6 +532,11 @@ impl DequeueHoldForTest {
     }
 }
 
+/// Runs on a worker right after it spawns a session task, before the worker polls anything
+/// else, so a test can act while that task has not started.
+#[cfg(test)]
+pub(crate) type SessionSpawnedHookForTest = dyn Fn() + Send + Sync;
+
 pub type HandlerFactory = Arc<dyn Fn(usize) -> HttpHandlerRef + Send + Sync>;
 
 /// Constructs worker-local application state on the worker serving its requests.
@@ -623,6 +631,10 @@ pub struct ServerConfig {
     pub tls_credentials: Option<Arc<dyn TlsCredentialProvider>>,
     pub tls_observer: Option<Arc<dyn TlsHandshakeObserver>>,
     pub connection_observer: Option<Arc<dyn AcceptedConnectionObserver>>,
+    /// Observes every accepted connection, from the start of its session task on a worker to
+    /// its close, under a `ConnectionId`. Unlike `ServerSessionConfig::stats_factory`, every
+    /// session mode accepts it. `None`, the default, observes nothing.
+    pub lifecycle_observer: Option<Arc<dyn ConnectionLifecycleObserver>>,
     pub zero_copy_enable_threshold: usize,
     /// Limits on each worker's blocking pool. The default keeps Tokio's,
     /// 512 threads with a 10 s keep-alive per worker.
@@ -633,6 +645,8 @@ pub struct ServerConfig {
     pub(crate) admission_probe: Option<Arc<AdmissionProbe>>,
     #[cfg(test)]
     pub(crate) dequeue_hold_for_test: Option<Arc<DequeueHoldForTest>>,
+    #[cfg(test)]
+    pub(crate) session_spawned_for_test: Option<Arc<SessionSpawnedHookForTest>>,
 }
 
 impl Default for ServerConfig {
@@ -650,6 +664,7 @@ impl Default for ServerConfig {
             tls_credentials: None,
             tls_observer: None,
             connection_observer: None,
+            lifecycle_observer: None,
             zero_copy_enable_threshold: 0,
             worker_blocking_pool: BlockingPoolLimits::default(),
             #[cfg(test)]
@@ -658,6 +673,8 @@ impl Default for ServerConfig {
             admission_probe: None,
             #[cfg(test)]
             dequeue_hold_for_test: None,
+            #[cfg(test)]
+            session_spawned_for_test: None,
         }
     }
 }
@@ -718,6 +735,7 @@ pub enum ServerCallbackStage {
     SessionForceStop,
     ObserverStop,
     FilterStop,
+    ConnectionLifecycleObserver,
 }
 
 #[derive(Clone, Copy)]
@@ -804,12 +822,15 @@ struct WorkerConfig {
     lifecycle_started: Arc<AtomicBool>,
     accept_distribution: AcceptDistribution,
     accept_counters: Arc<[Arc<AcceptCounters>]>,
+    lifecycle_observer: Option<Arc<dyn ConnectionLifecycleObserver>>,
     #[cfg(test)]
     session_retirement_probe: Option<Arc<SessionRetirementProbe>>,
     #[cfg(test)]
     admission_probe: Option<Arc<AdmissionProbe>>,
     #[cfg(test)]
     dequeue_hold_for_test: Option<Arc<DequeueHoldForTest>>,
+    #[cfg(test)]
+    session_spawned_for_test: Option<Arc<SessionSpawnedHookForTest>>,
 }
 
 /// A snapshot of one worker's accept counters.
@@ -826,9 +847,11 @@ pub struct AcceptStats {
     /// [`AcceptDistribution::Worker0`] mode drops sockets.
     pub handoff_dropped: u64,
     /// Gauge: sockets accepted but not yet turned into sessions (held by a listener task awaiting
-    /// queue capacity, or queued in the accepted-socket queue).
+    /// queue capacity, queued in the accepted-socket queue, or held by a session task that
+    /// has not started).
     pub pending_handoff: u64,
-    /// Sockets closed unsessionized by a forced stop.
+    /// Sockets closed unsessionized by a forced stop, including one whose
+    /// session task the stop cancelled before the task started.
     pub closed_at_force_stop: u64,
 }
 
@@ -888,8 +911,9 @@ impl AcceptCounters {
 }
 
 /// An accepted socket that is not a session yet. It counts in its worker's `pending_handoff`
-/// until it becomes a session or is closed. Dropping it any other way, such as with an aborted
-/// listener task or a closed queue, counts it in `closed_at_force_stop`.
+/// until its session task starts or it is closed. Dropping it any other way, such as with an
+/// aborted listener task, a closed queue or a session task cancelled before it started, counts it
+/// in `closed_at_force_stop`.
 struct PendingSocket {
     stream: Option<TcpStream>,
     counters: Arc<AcceptCounters>,
@@ -921,7 +945,7 @@ impl PendingSocket {
             .expect("a pending socket leaves the count once")
     }
 
-    /// Hands the socket to a new session.
+    /// Hands the socket to the session task that has just started for it.
     fn into_session(mut self) -> TcpStream {
         self.leave()
     }
@@ -1241,12 +1265,15 @@ impl HttpServer {
                 lifecycle_started: Arc::clone(&lifecycle_started[index]),
                 accept_distribution: config.socket.accept_distribution,
                 accept_counters: Arc::clone(&accept_counters),
+                lifecycle_observer: config.lifecycle_observer.clone(),
                 #[cfg(test)]
                 session_retirement_probe: config.session_retirement_probe.clone(),
                 #[cfg(test)]
                 admission_probe: config.admission_probe.clone(),
                 #[cfg(test)]
                 dequeue_hold_for_test: config.dequeue_hold_for_test.clone(),
+                #[cfg(test)]
+                session_spawned_for_test: config.session_spawned_for_test.clone(),
             };
             let worker_accepted = if per_worker_accept {
                 vec![accepted_senders[index].clone()]
@@ -1557,6 +1584,7 @@ async fn worker_loop(
     let _ = started.send(Ok(()));
 
     let mut next_session = 1_u64;
+    let worker_id = u32::try_from(config.index).unwrap_or(u32::MAX);
     let mut controls: BTreeMap<u64, Rc<RefCell<Option<SessionControl>>>> = BTreeMap::new();
     let mut task_sessions = HashMap::new();
     let mut sessions: JoinSet<(u64, Result<UniplexRunSummary, HttpError>)> = JoinSet::new();
@@ -1680,7 +1708,6 @@ async fn worker_loop(
                 accepted_receiver.recv().await
             }, if receiving && (per_worker_accept || !drain_requested) => {
                 if let Some(socket) = accepted {
-                    let socket = socket.into_session();
                     let id = next_session;
                     next_session = next_session.wrapping_add(1);
                     let slot = Rc::new(RefCell::new(None));
@@ -1689,6 +1716,7 @@ async fn worker_loop(
                         probe.confirm(id != 0 && !controls.contains_key(&id));
                     }
                     controls.insert(id, Rc::clone(&slot));
+                    let lifecycle_observer = config.lifecycle_observer.clone();
                     let context = context.clone();
                     let handler = Rc::clone(&handler);
                     let acceptor = Rc::clone(&acceptor);
@@ -1700,6 +1728,18 @@ async fn worker_loop(
                     #[cfg(test)]
                     let gate = probe.as_ref().and_then(|probe| probe.take_gate(worker_index, id));
                     let task = sessions.spawn_local(async move {
+                        let socket = socket.into_session();
+                        let lifecycle = lifecycle_observer.map(|observer| {
+                            ConnectionLifecycle::accepted(
+                                observer,
+                                ConnectionId {
+                                    worker: worker_id,
+                                    serial: id,
+                                },
+                                worker_index,
+                                Arc::clone(&callback_failure),
+                            )
+                        });
                         #[cfg(test)]
                         let key = SessionRetirementKey {
                             worker_index,
@@ -1727,6 +1767,9 @@ async fn worker_loop(
                                         SessionRetirementRecord::TransportBound(accepted.retirement),
                                     );
                                 }
+                                let mut lifecycle = lifecycle.map(|lifecycle| {
+                                    lifecycle.admitted(accepted.protocol, &accepted.control)
+                                });
                                 slot.replace(Some(accepted.control));
                                 let notification = acceptor.connection_observer.as_ref().map_or(Ok(()), |observer| {
                                     invoke_accept_callback(
@@ -1749,20 +1792,32 @@ async fn worker_loop(
                                 }
                                 drop(acceptor);
                                 drop(callback_failure);
-                                let result = run_session(accepted.session).await;
+                                let result = match lifecycle.as_mut() {
+                                    Some(lifecycle) => lifecycle.run(accepted.session).await,
+                                    None => run_session(accepted.session).await,
+                                };
                                 slot.borrow_mut().take();
                                 #[cfg(test)]
                                 {
                                     run_returned = true;
                                 }
-                                if let Err(error) = notification {
+                                let result = if let Err(error) = notification {
                                     discard_panicking_value(result);
                                     Err(error)
                                 } else {
                                     result
+                                };
+                                if let Some(lifecycle) = lifecycle {
+                                    lifecycle.close(&result);
                                 }
+                                result
                             }
-                            Err(error) => Err(error),
+                            Err(failure) => {
+                                if let Some(lifecycle) = lifecycle {
+                                    lifecycle.close(&failure.outcome());
+                                }
+                                Err(failure.into_error())
+                            }
                         };
                         #[cfg(test)]
                         {
@@ -1800,6 +1855,10 @@ async fn worker_loop(
                             },
                             SessionRetirementRecord::Registered,
                         );
+                    }
+                    #[cfg(test)]
+                    if let Some(hook) = &config.session_spawned_for_test {
+                        hook();
                     }
                 } else {
                     receiving = false;

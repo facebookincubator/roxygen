@@ -5,6 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Write;
@@ -86,6 +88,10 @@ use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
+use crate::AcceptDistribution;
+use crate::ConnectionId;
+use crate::ConnectionLifecycleObserver;
+use crate::ConnectionOutcome;
 use crate::acceptor::AcceptedConnectionObserver;
 use crate::acceptor::ConnectionInfo;
 use crate::acceptor::ServerSessionConfig;
@@ -4722,5 +4728,658 @@ fn owned_http1_echoes_a_large_chunked_body_as_it_arrives() {
     assert!(
         owned_body == body[..],
         "the owned echo differs from the request body"
+    );
+}
+
+/// What a `ConnectionLifecycleObserver` callback reported, with the outcome's borrowed fields
+/// copied out.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LifecycleRecord {
+    Accepted(ConnectionId),
+    Established(ConnectionId, CodecProtocol),
+    Closed(ConnectionId, RecordedOutcome),
+}
+
+/// An owned copy of a `ConnectionOutcome`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RecordedOutcome {
+    TlsFailed(HttpErrorCode),
+    Rejected(HttpErrorCode),
+    Closed {
+        protocol: CodecProtocol,
+        handshake_complete: bool,
+        result: Result<(), HttpErrorCode>,
+    },
+    Aborted,
+}
+
+impl RecordedOutcome {
+    fn copy(outcome: &ConnectionOutcome<'_>) -> Self {
+        match outcome {
+            ConnectionOutcome::TlsFailed(error) => Self::TlsFailed(error.code()),
+            ConnectionOutcome::Rejected(error) => Self::Rejected(error.code()),
+            ConnectionOutcome::Closed {
+                protocol,
+                handshake_complete,
+                result,
+            } => Self::Closed {
+                protocol: *protocol,
+                handshake_complete: *handshake_complete,
+                result: result.as_ref().map(drop).map_err(HttpError::code),
+            },
+            ConnectionOutcome::Aborted => Self::Aborted,
+        }
+    }
+}
+
+/// Where a connection lifecycle callback ran: its thread, and the Tokio task it ran in, if any.
+#[derive(Clone, Copy, Debug)]
+struct CallbackContext {
+    thread: thread::ThreadId,
+    task: Option<tokio::task::Id>,
+}
+
+/// Records every connection lifecycle callback and where it ran.
+#[derive(Default)]
+struct LifecycleRecorder {
+    records: Mutex<Vec<(LifecycleRecord, CallbackContext)>>,
+}
+
+impl LifecycleRecorder {
+    fn record(&self, record: LifecycleRecord) {
+        let context = CallbackContext {
+            thread: thread::current().id(),
+            task: tokio::task::try_id(),
+        };
+        self.records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((record, context));
+    }
+
+    fn records(&self) -> Vec<LifecycleRecord> {
+        self.records_with_context()
+            .into_iter()
+            .map(|(record, _)| record)
+            .collect()
+    }
+
+    fn records_with_context(&self) -> Vec<(LifecycleRecord, CallbackContext)> {
+        self.records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn count(&self, matches: impl Fn(&LifecycleRecord) -> bool) -> usize {
+        self.records()
+            .iter()
+            .filter(|record| matches(record))
+            .count()
+    }
+
+    fn accepted(&self) -> usize {
+        self.count(|record| matches!(record, LifecycleRecord::Accepted(_)))
+    }
+
+    fn closed(&self) -> usize {
+        self.count(|record| matches!(record, LifecycleRecord::Closed(..)))
+    }
+
+    /// Waits up to `REQUEST_TIMEOUT` for `expected` closed callbacks.
+    fn wait_closed(&self, expected: usize) -> bool {
+        wait_until(|| self.closed() >= expected)
+    }
+}
+
+impl ConnectionLifecycleObserver for LifecycleRecorder {
+    fn on_socket_accepted(&self, id: ConnectionId) {
+        self.record(LifecycleRecord::Accepted(id));
+    }
+
+    fn on_protocol_established(&self, id: ConnectionId, protocol: CodecProtocol) {
+        self.record(LifecycleRecord::Established(id, protocol));
+    }
+
+    fn on_socket_closed(&self, id: ConnectionId, outcome: &ConnectionOutcome<'_>) {
+        self.record(LifecycleRecord::Closed(id, RecordedOutcome::copy(outcome)));
+    }
+}
+
+/// A one-worker server configuration without signal handlers that reports to `recorder`.
+fn lifecycle_config(recorder: &Arc<LifecycleRecorder>) -> ServerConfig {
+    ServerConfig {
+        num_io_threads: 1,
+        shutdown_on_signals: Vec::new(),
+        lifecycle_observer: Some(Arc::clone(recorder) as Arc<dyn ConnectionLifecycleObserver>),
+        ..ServerConfig::default()
+    }
+}
+
+/// A GET that closes its connection.
+const CLOSE_REQUEST: &[u8] = b"GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+/// The first connection on worker 0.
+const FIRST_CONNECTION: ConnectionId = ConnectionId {
+    worker: 0,
+    serial: 1,
+};
+
+#[test]
+fn lifecycle_balances_on_tls_failure() {
+    let recorder = Arc::new(LifecycleRecorder::default());
+    let (options, _) = generated_tls();
+    let config = ServerConfig {
+        tls_credentials: tls_config(options).tls_credentials,
+        ..lifecycle_config(&recorder)
+    };
+    let server = start_tls(config, Arc::new(HandlerStats::default()), None);
+
+    // Plaintext HTTP where a ClientHello belongs fails the handshake.
+    let _ = plain_request(server.address().unwrap(), CLOSE_REQUEST);
+    assert!(recorder.wait_closed(1), "{:?}", recorder.records());
+
+    let records = recorder.records();
+    assert_eq!(
+        records.len(),
+        2,
+        "one accepted and one closed callback: {records:?}"
+    );
+    assert_eq!(records[0], LifecycleRecord::Accepted(FIRST_CONNECTION));
+    assert!(
+        matches!(
+            records[1],
+            LifecycleRecord::Closed(FIRST_CONNECTION, RecordedOutcome::TlsFailed(_))
+        ),
+        "{records:?}"
+    );
+    assert_eq!(server.control().accept_stats()[0].accepted, 1);
+}
+
+/// A one-worker plaintext owned HTTP/2 server that reports to `recorder`.
+fn owned_http2_lifecycle_server(recorder: &Arc<LifecycleRecorder>) -> ScopedHttpServer {
+    let config = ServerConfig {
+        plaintext_protocol: CodecProtocol::Http2,
+        session: untimed_owned_session(false, true),
+        ..lifecycle_config(recorder)
+    };
+    start_plain(config, Arc::new(HandlerStats::default()))
+}
+
+#[test]
+fn lifecycle_reports_stalled_preface_without_protocol_established() {
+    let recorder = Arc::new(LifecycleRecorder::default());
+    let server = owned_http2_lifecycle_server(&recorder);
+
+    // The client preface without the SETTINGS frame that completes the handshake.
+    let mut client =
+        TcpStream::connect_timeout(&server.address().unwrap(), REQUEST_TIMEOUT).unwrap();
+    client
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .unwrap();
+    assert!(wait_until(|| recorder.accepted() == 1));
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        recorder.records(),
+        [LifecycleRecord::Accepted(FIRST_CONNECTION)],
+        "a stalled preface establishes no protocol"
+    );
+
+    drop(client);
+    assert!(recorder.wait_closed(1), "{:?}", recorder.records());
+    let records = recorder.records();
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert!(
+        matches!(
+            records[1],
+            LifecycleRecord::Closed(
+                FIRST_CONNECTION,
+                RecordedOutcome::Closed {
+                    protocol: CodecProtocol::Http2,
+                    handshake_complete: false,
+                    ..
+                }
+            )
+        ),
+        "{records:?}"
+    );
+}
+
+#[test]
+fn lifecycle_reports_closed_h2_with_handshake() {
+    let recorder = Arc::new(LifecycleRecorder::default());
+    let server = owned_http2_lifecycle_server(&recorder);
+
+    assert_eq!(h2_plain_request(server.address().unwrap()), b"OK");
+    assert!(recorder.wait_closed(1), "{:?}", recorder.records());
+    let records = recorder.records();
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert_eq!(records[0], LifecycleRecord::Accepted(FIRST_CONNECTION));
+    assert_eq!(
+        records[1],
+        LifecycleRecord::Established(FIRST_CONNECTION, CodecProtocol::Http2)
+    );
+    // The client's close ends the run, with or without an error.
+    assert!(
+        matches!(
+            records[2],
+            LifecycleRecord::Closed(
+                FIRST_CONNECTION,
+                RecordedOutcome::Closed {
+                    protocol: CodecProtocol::Http2,
+                    handshake_complete: true,
+                    ..
+                }
+            )
+        ),
+        "{records:?}"
+    );
+}
+
+#[test]
+fn lifecycle_reports_rejected_connection() {
+    let recorder = Arc::new(LifecycleRecorder::default());
+    let config = ServerConfig {
+        new_connection_filter: Some(Arc::new(|_: &ConnectionInfo| false)),
+        ..lifecycle_config(&recorder)
+    };
+    let server = start_plain(config, Arc::new(HandlerStats::default()));
+
+    let _ = plain_request(server.address().unwrap(), CLOSE_REQUEST);
+    assert!(recorder.wait_closed(1), "{:?}", recorder.records());
+    assert_eq!(
+        recorder.records(),
+        [
+            LifecycleRecord::Accepted(FIRST_CONNECTION),
+            LifecycleRecord::Closed(
+                FIRST_CONNECTION,
+                RecordedOutcome::Rejected(HttpErrorCode::CONNECT_ERROR)
+            ),
+        ]
+    );
+}
+
+/// Starts a server whose handlers are `stats`'s, and returns it with each worker's handle and
+/// thread, in worker index order.
+fn start_with_workers(
+    config: ServerConfig,
+    stats: &Arc<HandlerStats>,
+) -> (HttpServer, Vec<(WorkerHandle, thread::ThreadId)>) {
+    let workers = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&workers);
+    let factory = handler_factory(Arc::clone(stats), false);
+    let server = HttpServer::start_with_worker_factory(
+        config,
+        Arc::new(move |context: WorkerContext, index| {
+            captured.lock().unwrap().push((
+                index,
+                context.handle().clone(),
+                thread::current().id(),
+            ));
+            factory(index)
+        }),
+        None,
+    )
+    .unwrap();
+    let mut workers = std::mem::take(&mut *workers.lock().unwrap());
+    workers.sort_by_key(|(index, _, _)| *index);
+    let workers = workers
+        .into_iter()
+        .map(|(_, handle, thread)| (handle, thread))
+        .collect();
+    (server, workers)
+}
+
+/// Blocks `worker`'s thread, so it polls none of its tasks, until the returned sender is
+/// dropped.
+fn stall_worker(worker: &WorkerHandle) -> mpsc::Sender<()> {
+    let (started, running) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    worker
+        .submit(move |_| {
+            let _ = started.send(());
+            let _ = released.recv();
+        })
+        .expect("the worker admits the blocking command");
+    running
+        .recv_timeout(REQUEST_TIMEOUT)
+        .expect("the worker runs the blocking command");
+    release
+}
+
+/// Completes a TLS handshake and one keep-alive GET, and returns the open connection.
+fn tls_keep_alive_request(
+    address: SocketAddr,
+    certificate: &[u8],
+) -> StreamOwned<ClientConnection, TcpStream> {
+    let socket = TcpStream::connect_timeout(&address, REQUEST_TIMEOUT).unwrap();
+    socket.set_read_timeout(Some(REQUEST_TIMEOUT)).unwrap();
+    let mut stream = StreamOwned::new(tls_client(certificate), socket);
+    stream
+        .write_all(b"GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    while !(response.ends_with(b"\r\n\r\nOK") || response.ends_with(b"\r\n0\r\n\r\n")) {
+        let read = stream.read(&mut chunk).unwrap();
+        assert_ne!(read, 0, "the server closed the keep-alive connection");
+        response.extend_from_slice(&chunk[..read]);
+    }
+    assert_ok_response(&response);
+    stream
+}
+
+/// Asserts, for each worker, `accepted = sessions started + handoff_dropped +
+/// closed_at_force_stop + pending_handoff`, counting the sessions it started from `recorder`'s
+/// accepted callbacks.
+fn assert_accept_balance(server: &HttpServer, recorder: &LifecycleRecorder) {
+    for (worker, stats) in server.control().accept_stats().iter().enumerate() {
+        let started = recorder.count(|record| {
+            matches!(record, LifecycleRecord::Accepted(id) if id.worker as usize == worker)
+        }) as u64;
+        assert_eq!(
+            stats.accepted,
+            started + stats.handoff_dropped + stats.closed_at_force_stop + stats.pending_handoff,
+            "worker {worker}: {started} sessions started, {stats:?}"
+        );
+    }
+}
+
+#[test]
+fn lifecycle_balances_on_force_stop() {
+    let recorder = Arc::new(LifecycleRecorder::default());
+    let (options, certificate) = generated_tls();
+    let mut config = ServerConfig {
+        num_io_threads: 2,
+        session: untimed_owned_session(true, false),
+        tls_credentials: tls_config(options).tls_credentials,
+        ..lifecycle_config(&recorder)
+    };
+    config.socket.accept_distribution = AcceptDistribution::Worker0;
+    let (server, workers) = start_with_workers(config, &Arc::new(HandlerStats::default()));
+    let address = server.address().unwrap();
+    let stall = stall_worker(&workers[1].0);
+
+    // Worker 0 hands sockets to workers 0, 1, 0 in turn: a served keep-alive session, a socket
+    // queued behind the stalled worker 1, and a client that never sends its ClientHello.
+    let _served = tls_keep_alive_request(address, &certificate);
+    let _queued = TcpStream::connect_timeout(&address, REQUEST_TIMEOUT).unwrap();
+    let _silent = SilentClient::connect(address);
+    assert!(
+        wait_until(
+            || recorder.accepted() == 2 && server.control().accept_stats()[1].pending_handoff == 1
+        ),
+        "{:?} {:?}",
+        recorder.records(),
+        server.control().accept_stats()
+    );
+    let mid_handshake = ConnectionId {
+        worker: 0,
+        serial: 2,
+    };
+    assert_eq!(
+        recorder.records(),
+        [
+            LifecycleRecord::Accepted(FIRST_CONNECTION),
+            LifecycleRecord::Established(FIRST_CONNECTION, CodecProtocol::Http11),
+            LifecycleRecord::Accepted(mid_handshake),
+        ]
+    );
+
+    // Worker 1 sees the forced stop before it can dequeue its socket.
+    assert!(server.control().force_stop());
+    drop(stall);
+    assert!(server.force_stop().unwrap());
+
+    let mut closed: Vec<_> = recorder.records()[3..].to_vec();
+    closed.sort_by_key(|record| match record {
+        LifecycleRecord::Closed(id, _) => id.serial,
+        _ => u64::MAX,
+    });
+    assert_eq!(
+        closed,
+        [
+            LifecycleRecord::Closed(FIRST_CONNECTION, RecordedOutcome::Aborted),
+            LifecycleRecord::Closed(mid_handshake, RecordedOutcome::Aborted),
+        ],
+        "both sessions report Aborted once"
+    );
+    let stats = server.control().accept_stats();
+    assert_eq!(stats[1].closed_at_force_stop, 1, "{stats:?}");
+    assert_accept_balance(&server, &recorder);
+}
+
+#[test]
+fn lifecycle_balances_when_force_stop_cancels_unstarted_session_task() {
+    let recorder = Arc::new(LifecycleRecorder::default());
+    let (spawned, spawn_seen) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let released = Mutex::new(released);
+    let config = ServerConfig {
+        session_spawned_for_test: Some(Arc::new(move || {
+            let _ = spawned.send(());
+            let _ = released
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recv();
+        })),
+        ..lifecycle_config(&recorder)
+    };
+    let server = start_plain(config, Arc::new(HandlerStats::default()));
+
+    let _client = TcpStream::connect_timeout(&server.address().unwrap(), REQUEST_TIMEOUT).unwrap();
+    spawn_seen
+        .recv_timeout(REQUEST_TIMEOUT)
+        .expect("the worker spawns the connection's session task");
+    // The worker sees the forced stop before it polls the session task it just spawned.
+    assert!(server.control().force_stop());
+    drop(release);
+    assert!(server.force_stop().unwrap());
+
+    assert_accept_balance(&server, &recorder);
+    let stats = server.control().accept_stats();
+    assert_eq!(
+        stats[0].closed_at_force_stop, 1,
+        "the socket of a session task that never started is closed unsessionized: {stats:?}"
+    );
+    assert_eq!(stats[0].pending_handoff, 0, "{stats:?}");
+    assert_eq!(
+        recorder.records(),
+        [],
+        "a session task that never started reports nothing"
+    );
+}
+
+/// Counts each connection lifecycle callback, then panics.
+#[derive(Default)]
+struct PanickingLifecycleObserver {
+    accepted: AtomicUsize,
+    established: AtomicUsize,
+    closed: AtomicUsize,
+}
+
+impl ConnectionLifecycleObserver for PanickingLifecycleObserver {
+    fn on_socket_accepted(&self, _id: ConnectionId) {
+        self.accepted.fetch_add(1, Ordering::Relaxed);
+        panic!("accepted callback panic");
+    }
+
+    fn on_protocol_established(&self, _id: ConnectionId, _protocol: CodecProtocol) {
+        self.established.fetch_add(1, Ordering::Relaxed);
+        panic!("established callback panic");
+    }
+
+    fn on_socket_closed(&self, _id: ConnectionId, _outcome: &ConnectionOutcome<'_>) {
+        self.closed.fetch_add(1, Ordering::Relaxed);
+        panic!("closed callback panic");
+    }
+}
+
+#[test]
+fn lifecycle_observer_panic_is_contained() {
+    let observer = Arc::new(PanickingLifecycleObserver::default());
+    let config = ServerConfig {
+        num_io_threads: 1,
+        shutdown_on_signals: Vec::new(),
+        session: untimed_session(true),
+        lifecycle_observer: Some(Arc::clone(&observer) as Arc<dyn ConnectionLifecycleObserver>),
+        ..ServerConfig::default()
+    };
+    let server = start_plain(config, Arc::new(HandlerStats::default()));
+
+    // Every callback panics, and the worker serves both connections in full.
+    for _ in 0..2 {
+        assert_ok_response(&get_request(server.address().unwrap()));
+    }
+    assert_eq!(wait_for_count(&observer.closed, 2), 2);
+    assert_eq!(observer.accepted.load(Ordering::Relaxed), 2);
+    assert_eq!(observer.established.load(Ordering::Relaxed), 2);
+    assert!(
+        matches!(
+            server.force_stop(),
+            Err(HttpServerError::CallbackPanic {
+                worker_index: 0,
+                stage: ServerCallbackStage::ConnectionLifecycleObserver,
+            })
+        ),
+        "the first panic is reported at stop"
+    );
+}
+
+#[test]
+fn lifecycle_hooks_fire_on_serving_worker_in_both_accept_modes() {
+    const CONNECTIONS: usize = 32;
+    let mut modes = vec![AcceptDistribution::Worker0];
+    if cfg!(unix) {
+        modes.push(AcceptDistribution::PerWorkerReusePort);
+    }
+    for mode in modes {
+        let recorder = Arc::new(LifecycleRecorder::default());
+        let mut config = ServerConfig {
+            num_io_threads: 2,
+            session: untimed_session(true),
+            ..lifecycle_config(&recorder)
+        };
+        config.socket.accept_distribution = mode;
+        config.socket.reuse_port = mode == AcceptDistribution::PerWorkerReusePort;
+        let (server, workers) = start_with_workers(config, &Arc::new(HandlerStats::default()));
+        for _ in 0..CONNECTIONS {
+            assert_ok_response(&get_request(server.address().unwrap()));
+        }
+        assert!(
+            recorder.wait_closed(CONNECTIONS),
+            "{mode:?}: {:?}",
+            recorder.records()
+        );
+
+        let mut connections = BTreeMap::<(u32, u64), Vec<LifecycleRecord>>::new();
+        let mut tasks = BTreeMap::<(u32, u64), Vec<Option<tokio::task::Id>>>::new();
+        for (record, context) in recorder.records_with_context() {
+            let (LifecycleRecord::Accepted(id)
+            | LifecycleRecord::Established(id, _)
+            | LifecycleRecord::Closed(id, _)) = record.clone();
+            assert_eq!(
+                context.thread, workers[id.worker as usize].1,
+                "{mode:?}: {record:?} runs on the thread of the worker it names"
+            );
+            tasks
+                .entry((id.worker, id.serial))
+                .or_default()
+                .push(context.task);
+            connections
+                .entry((id.worker, id.serial))
+                .or_default()
+                .push(record);
+        }
+        assert_eq!(connections.len(), CONNECTIONS, "{mode:?}: {connections:?}");
+        // Every callback for a connection runs in one task, which serves no other connection:
+        // the connection's session task.
+        let session_tasks: HashSet<_> = tasks
+            .iter()
+            .map(|(connection, tasks)| {
+                assert!(
+                    tasks[0].is_some() && tasks.iter().all(|task| *task == tasks[0]),
+                    "{mode:?}: every callback for connection {connection:?} runs in one task: \
+                     {tasks:?}"
+                );
+                tasks[0]
+            })
+            .collect();
+        assert_eq!(
+            session_tasks.len(),
+            CONNECTIONS,
+            "{mode:?}: each connection's callbacks run in a task of their own: {tasks:?}"
+        );
+        for ((worker, serial), records) in &connections {
+            let id = ConnectionId {
+                worker: *worker,
+                serial: *serial,
+            };
+            assert_eq!(
+                records[..2],
+                [
+                    LifecycleRecord::Accepted(id),
+                    LifecycleRecord::Established(id, CodecProtocol::Http11),
+                ],
+                "{mode:?}"
+            );
+            assert!(
+                matches!(
+                    records[2..],
+                    [LifecycleRecord::Closed(
+                        _,
+                        RecordedOutcome::Closed {
+                            protocol: CodecProtocol::Http11,
+                            handshake_complete: true,
+                            ..
+                        }
+                    )]
+                ),
+                "{mode:?}: {records:?}"
+            );
+        }
+        for worker in 0..2_u32 {
+            let served = connections.keys().filter(|(w, _)| *w == worker).count() as u64;
+            assert!(served > 0, "{mode:?}: worker {worker} serves connections");
+            assert!(
+                connections
+                    .keys()
+                    .filter(|(w, _)| *w == worker)
+                    .map(|(_, serial)| *serial)
+                    .eq(1..=served),
+                "{mode:?}: worker {worker} numbers its connections from 1"
+            );
+        }
+        assert_accept_balance(&server, &recorder);
+        assert!(server.force_stop().unwrap());
+    }
+}
+
+#[test]
+fn lifecycle_classic_session_reports_no_handshake() {
+    let recorder = Arc::new(LifecycleRecorder::default());
+    let server = start_plain(
+        lifecycle_config(&recorder),
+        Arc::new(HandlerStats::default()),
+    );
+
+    assert_ok_response(&get_request(server.address().unwrap()));
+    assert!(recorder.wait_closed(1), "{:?}", recorder.records());
+    let records = recorder.records();
+    assert_eq!(records.len(), 2, "no protocol is established: {records:?}");
+    assert_eq!(records[0], LifecycleRecord::Accepted(FIRST_CONNECTION));
+    assert!(
+        matches!(
+            records[1],
+            LifecycleRecord::Closed(
+                FIRST_CONNECTION,
+                RecordedOutcome::Closed {
+                    protocol: CodecProtocol::Http11,
+                    handshake_complete: false,
+                    ..
+                }
+            )
+        ),
+        "{records:?}"
     );
 }
