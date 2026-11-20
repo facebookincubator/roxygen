@@ -13,6 +13,8 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
@@ -45,21 +47,24 @@ pub enum SessionHandleError {
 }
 
 struct KeepAliveCounters {
-    count: u64,
     owner_released: bool,
     next_waiter_id: u64,
     waiters: BTreeMap<u64, Waker>,
 }
 
 struct KeepAliveState {
+    /// The references, including the owner's implicit one until it is released. Token clones
+    /// and releases change it without the lock; a release that reaches zero then takes the lock
+    /// to wake the waiters. Changes that depend on `owner_released` hold the lock.
+    count: AtomicU64,
     counters: Mutex<KeepAliveCounters>,
 }
 
 impl KeepAliveState {
     fn new() -> Self {
         Self {
+            count: AtomicU64::new(1),
             counters: Mutex::new(KeepAliveCounters {
-                count: 1,
                 owner_released: false,
                 next_waiter_id: 1,
                 waiters: BTreeMap::new(),
@@ -73,58 +78,84 @@ impl KeepAliveState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Adds one reference unless the count would overflow, and returns whether it did.
+    fn increment(&self) -> bool {
+        let mut count = self.count.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = count.checked_add(1) else {
+                return false;
+            };
+            match self.count.compare_exchange_weak(
+                count,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(current) => count = current,
+            }
+        }
+    }
+
+    /// Drops one reference and returns how many remain.
+    fn decrement(&self, underflow: &str) -> u64 {
+        let mut count = self.count.load(Ordering::Relaxed);
+        loop {
+            let next = count.checked_sub(1).expect(underflow);
+            match self
+                .count
+                .compare_exchange_weak(count, next, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => return next,
+                Err(current) => count = current,
+            }
+        }
+    }
+
     fn acquire_from_owner(&self) -> Result<(), KeepAliveError> {
-        let mut counters = self.counters();
+        let counters = self.counters();
         if counters.owner_released {
             return Err(KeepAliveError::OwnerReleased);
         }
-        counters.count = counters
-            .count
-            .checked_add(1)
-            .ok_or(KeepAliveError::RefCountOverflow)?;
+        if !self.increment() {
+            return Err(KeepAliveError::RefCountOverflow);
+        }
         Ok(())
     }
 
     fn clone_existing(&self) {
-        let mut counters = self.counters();
-        debug_assert!(counters.count > 0);
-        counters.count = counters
-            .count
-            .checked_add(1)
-            .expect("a live keep-alive reference count cannot overflow");
+        debug_assert!(self.count.load(Ordering::Relaxed) > 0);
+        assert!(
+            self.increment(),
+            "a live keep-alive reference count cannot overflow"
+        );
     }
 
     fn release_reference(&self) {
-        let waiters = {
-            let mut counters = self.counters();
-            debug_assert!(counters.count > 0);
-            counters.count = counters
-                .count
-                .checked_sub(1)
-                .expect("a live keep-alive reference cannot underflow");
-            if counters.count == 0 {
-                std::mem::take(&mut counters.waiters)
-            } else {
-                BTreeMap::new()
-            }
-        };
+        if self.decrement("a live keep-alive reference cannot underflow") != 0 {
+            return;
+        }
+        // A waiter registers under the lock after it reads a nonzero count, so taking the
+        // waiters under the lock after the count reached zero finds every one.
+        let waiters = std::mem::take(&mut self.counters().waiters);
         for (_, waker) in waiters {
             waker.wake();
+        }
+    }
+
+    /// Releases the owner's implicit reference once. Call with the lock held.
+    fn release_owner_reference(&self, counters: &mut KeepAliveCounters) {
+        if !counters.owner_released {
+            counters.owner_released = true;
+            self.decrement("the implicit keep-alive reference cannot underflow");
         }
     }
 
     fn release_owner(&self) -> u64 {
         let (remaining, waiters) = {
             let mut counters = self.counters();
-            if !counters.owner_released {
-                counters.owner_released = true;
-                debug_assert!(counters.count > 0);
-                counters.count = counters
-                    .count
-                    .checked_sub(1)
-                    .expect("the implicit keep-alive reference cannot underflow");
-            }
-            let remaining = counters.count;
+            self.release_owner_reference(&mut counters);
+            let remaining = self.count.load(Ordering::Acquire);
             let waiters = if remaining == 0 {
                 std::mem::take(&mut counters.waiters)
             } else {
@@ -139,7 +170,7 @@ impl KeepAliveState {
     }
 
     fn count(&self) -> u64 {
-        self.counters().count
+        self.count.load(Ordering::Acquire)
     }
 
     fn owner_released(&self) -> bool {
@@ -365,15 +396,8 @@ impl<T> Future for ZeroRefs<'_, T> {
 
         let state = Arc::clone(&self.owner.state);
         let mut counters = state.counters();
-        if !counters.owner_released {
-            counters.owner_released = true;
-            debug_assert!(counters.count > 0);
-            counters.count = counters
-                .count
-                .checked_sub(1)
-                .expect("the implicit keep-alive reference cannot underflow");
-        }
-        if counters.count == 0 {
+        state.release_owner_reference(&mut counters);
+        if state.count() == 0 {
             if let Some(waiter_id) = self.waiter_id.take() {
                 counters.waiters.remove(&waiter_id);
             }
@@ -641,5 +665,79 @@ mod owner_drop_tests {
         assert!(state.owner_released());
         assert_eq!(state.count(), 0);
         assert_eq!(drops.get(), 1);
+    }
+}
+
+#[cfg(test)]
+mod count_tests {
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::task::Context;
+    use std::task::Wake;
+    use std::task::Waker;
+    use std::time::Duration;
+
+    use super::KeepAliveOwner;
+
+    #[derive(Default)]
+    struct Wakes(AtomicUsize);
+
+    impl Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn token_clones_and_releases_above_zero_skip_the_lock() {
+        let mut owner = KeepAliveOwner::new(());
+        let token = owner.acquire_keep_alive().expect("open owner");
+        let held = owner.state.counters();
+        let (done, finished) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            drop(token.clone());
+            done.send(()).expect("the test waits");
+            token
+        });
+        let unblocked = finished.recv_timeout(Duration::from_secs(5)).is_ok();
+        drop(held);
+        let token = worker.join().expect("the worker completes");
+        assert!(
+            unblocked,
+            "a clone and a release that leaves references do not wait for the lock"
+        );
+        assert_eq!(owner.num_keep_alives(), 2);
+        drop(token);
+        futures::executor::block_on(owner.finalize());
+    }
+
+    #[test]
+    fn the_last_release_on_another_thread_wakes_the_zero_waiter() {
+        for _ in 0..200 {
+            let mut owner = KeepAliveOwner::new(());
+            let token = owner.acquire_keep_alive().expect("open owner");
+            let wakes = Arc::new(Wakes::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut context = Context::from_waker(&waker);
+            {
+                let mut wait = pin!(owner.zero_refs());
+                let releasing = std::thread::spawn(move || drop(token));
+                let first = wait.as_mut().poll(&mut context);
+                releasing.join().expect("the release completes");
+                if first.is_pending() {
+                    assert_eq!(
+                        wakes.0.load(Ordering::SeqCst),
+                        1,
+                        "the release that reached zero woke the registered waiter"
+                    );
+                }
+                assert!(wait.as_mut().poll(&mut context).is_ready());
+            }
+            assert_eq!(owner.num_keep_alives(), 0);
+            futures::executor::block_on(owner.finalize());
+        }
     }
 }
