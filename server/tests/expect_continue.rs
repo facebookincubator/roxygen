@@ -20,6 +20,7 @@ use roxygen_core::error::HttpErrorCode;
 use roxygen_core::events::HttpBodyEvent;
 use roxygen_core::events::HttpHeaderEvent;
 use roxygen_core::fixed_source::HttpFixedSource;
+use roxygen_core::handler::FixedResponse;
 use roxygen_core::handler::HandlerSessionContext;
 use roxygen_core::handler::HttpHandler;
 use roxygen_core::handler::HttpHandlerRef;
@@ -508,4 +509,48 @@ fn reentrant_response_stop_is_safe() {
 
     target.borrow_mut().take();
     ready(owner.finalize());
+}
+
+/// Answers through `respond_now` and counts its calls.
+struct RespondNowHandler(Rc<Cell<usize>>);
+
+impl HttpHandler for RespondNowHandler {
+    fn handle_request(
+        &self,
+        _context: HandlerSessionContext,
+        _request: HttpSourceHolder,
+    ) -> LocalHandlerFuture {
+        Box::pin(std::future::ready(Ok(fixed_response())))
+    }
+
+    fn respond_now(&self, _request: &HttpMessage) -> Option<Result<FixedResponse, HttpError>> {
+        self.0.set(self.0.get() + 1);
+        Some(Ok(FixedResponse::new(
+            response_message(),
+            body(b"MOCK BODY"),
+        )))
+    }
+}
+
+#[test]
+fn respond_now_forwards_only_a_request_without_an_expectation() {
+    let calls = Rc::new(Cell::new(0));
+    let handler = ExpectContinueWrapperHandler::new(Rc::new(RespondNowHandler(Rc::clone(&calls))));
+    let Some(Ok(response)) = handler.respond_now(&request_message(None)) else {
+        panic!("a request without an expectation is forwarded");
+    };
+    assert_eq!(response.head().response_status(), Some(200));
+    assert_eq!(calls.get(), 1);
+    for request in [
+        request_message(Some(b"100-continue")),
+        request_message(Some(b"unsupported")),
+        request_message_named("expect", Some(b"100-continue")),
+    ] {
+        assert!(handler.respond_now(&request).is_none());
+    }
+    assert_eq!(
+        calls.get(),
+        1,
+        "requests with an expectation stay with the wrapper"
+    );
 }

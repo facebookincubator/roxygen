@@ -154,9 +154,12 @@ config.session.write_timeout = Duration::ZERO;
 
 The server adapts each `HttpHandler` to the drivers' `OwnedApplication` trait,
 so each request still has a boxed handler future and boxed request and
-response sources. An application that implements `OwnedApplication` itself
-exchanges header and body events with the driver directly, but it runs the
-drivers on connections it accepts, and that path does not have an example yet.
+response sources. A handler that implements `HttpHandler::respond_now` can
+answer a request without a body synchronously with a whole `FixedResponse`,
+which skips the request source, the handler future and the response source. An
+application that implements `OwnedApplication` itself exchanges header and
+body events with the driver directly, but it runs the drivers on connections
+it accepts, and that path does not have an example yet.
 
 On the client, `roxygen_client::experimental::owned` provides
 `OwnedClientSession` and a pool, `OwnedHttpSessionPool`. You reserve a slot,

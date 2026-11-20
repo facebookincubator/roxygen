@@ -23,11 +23,13 @@ use roxygen_core::connection::TransportSecurity;
 use roxygen_core::connection::UpstreamOrigin;
 use roxygen_core::error::HttpError;
 use roxygen_core::error::HttpErrorCode;
+use roxygen_core::handler::FixedResponse;
 use roxygen_core::handler::HandlerSessionContext;
 use roxygen_core::handler::HttpHandler;
 use roxygen_core::handler::HttpHandlerRef;
 use roxygen_core::handler::LocalHandlerFuture;
 use roxygen_core::http::CodecProtocol;
+use roxygen_core::message::HttpMessage;
 use roxygen_core::source_holder::HttpSourceHolder;
 use roxygen_runtime::cancellation::CancellationSource;
 use roxygen_runtime::cancellation::CancellationToken;
@@ -317,6 +319,13 @@ impl HttpHandler for ConnectionHandler {
             Err(error) => Box::pin(std::future::ready(Err(error))),
         }
     }
+
+    /// The owned drivers build their base context with this connection's peer
+    /// identity and without a connection context, so the metadata check in
+    /// `handle_request` passes for every request that they offer here.
+    fn respond_now(&self, request: &HttpMessage) -> Option<Result<FixedResponse, HttpError>> {
+        self.handler.respond_now(request)
+    }
 }
 
 struct AdmissionHandler {
@@ -326,22 +335,36 @@ struct AdmissionHandler {
     local: CancellationToken,
 }
 
+impl AdmissionHandler {
+    fn admits(&self) -> bool {
+        self.worker.is_accepting()
+            && !self.external.is_cancellation_requested()
+            && !self.local.is_cancellation_requested()
+    }
+}
+
 impl HttpHandler for AdmissionHandler {
     fn handle_request(
         &self,
         context: HandlerSessionContext,
         request: HttpSourceHolder,
     ) -> LocalHandlerFuture {
-        if !self.worker.is_accepting()
-            || self.external.is_cancellation_requested()
-            || self.local.is_cancellation_requested()
-        {
+        if !self.admits() {
             return Box::pin(std::future::ready(Err(connection_error(
                 HttpErrorCode::DROPPED,
                 b"server request admission closed",
             ))));
         }
         self.handler.handle_request(context, request)
+    }
+
+    /// With admission closed, the request goes to `handle_request`, which fails
+    /// it with the admission error.
+    fn respond_now(&self, request: &HttpMessage) -> Option<Result<FixedResponse, HttpError>> {
+        if !self.admits() {
+            return None;
+        }
+        self.handler.respond_now(request)
     }
 }
 
@@ -506,4 +529,101 @@ pub(crate) fn run_session_for_test(
 
 fn connection_error(code: HttpErrorCode, message: &[u8]) -> HttpError {
     HttpError::with_message(code, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    use roxygen_core::buf_queue::BufQueue;
+    use roxygen_core::fixed_source::HttpFixedSource;
+    use roxygen_runtime::keep_alive::KeepAliveOwner;
+    use roxygen_runtime::managed::RuntimeConfig;
+    use roxygen_runtime::managed::RuntimeOwner;
+
+    use super::*;
+
+    /// Answers through either method and counts the calls that reach it.
+    struct Counted(Rc<Cell<usize>>);
+
+    impl HttpHandler for Counted {
+        fn handle_request(
+            &self,
+            _context: HandlerSessionContext,
+            _request: HttpSourceHolder,
+        ) -> LocalHandlerFuture {
+            self.0.set(self.0.get() + 1);
+            Box::pin(std::future::ready(Ok(HttpSourceHolder::new(Box::new(
+                HttpFixedSource::make_fixed_response(200, None).expect("a response"),
+            )))))
+        }
+
+        fn respond_now(&self, _request: &HttpMessage) -> Option<Result<FixedResponse, HttpError>> {
+            self.0.set(self.0.get() + 1);
+            Some(Ok(FixedResponse::new(HttpMessage::new(), BufQueue::new(0))))
+        }
+    }
+
+    /// Once external cancellation, local cancellation or the worker closes
+    /// admission, `respond_now` leaves the request to `handle_request`, which
+    /// fails it with the admission error before the wrapped handler.
+    #[test]
+    fn closed_admission_leaves_the_request_to_handle_request() {
+        let mut owner = RuntimeOwner::start(RuntimeConfig {
+            workers: 1,
+            command_capacity: 4,
+        })
+        .expect("owner starts");
+        let runtime = owner.handle();
+        let worker = runtime.worker(0).expect("worker exists");
+        let mut keep_alive = KeepAliveOwner::new(());
+        let request = HttpMessage::new();
+        for closing in ["external", "local", "worker"] {
+            let reached = Rc::new(Cell::new(0));
+            let external = CancellationSource::new();
+            let local = CancellationSource::new();
+            let admission = AdmissionHandler {
+                handler: Rc::new(Counted(Rc::clone(&reached))),
+                worker: worker.clone(),
+                external: external.token(),
+                local: local.token(),
+            };
+            assert!(
+                matches!(admission.respond_now(&request), Some(Ok(_))),
+                "{closing}: an open admission forwards"
+            );
+            match closing {
+                "external" => assert!(external.request_cancellation()),
+                "local" => assert!(local.request_cancellation()),
+                _ => drop(runtime.quiesce(Duration::from_secs(10))),
+            }
+            assert!(admission.respond_now(&request).is_none(), "{closing}");
+            let context = HandlerSessionContext::acquire(&keep_alive).expect("a context");
+            let mut handled = admission.handle_request(context, HttpSourceHolder::empty());
+            let Poll::Ready(Err(error)) = handled
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("{closing}: the request fails at once");
+            };
+            assert_eq!(error.code(), HttpErrorCode::DROPPED, "{closing}");
+            assert_eq!(error.message(), b"server request admission closed");
+            assert_eq!(
+                reached.get(),
+                1,
+                "{closing}: only the open call is forwarded"
+            );
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("application runtime")
+            .block_on(async {
+                keep_alive.finalize().await;
+                runtime.quiesce(Duration::from_secs(10)).await
+            })
+            .expect("the worker quiesces");
+        assert_eq!(owner.join().expect("physical join").workers_forced, 0);
+    }
 }

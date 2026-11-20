@@ -9,7 +9,9 @@
 //!
 //! Each exchange invokes the handler when its request head arrives and polls the
 //! handler future and the response source inline from the driver's poll, with no
-//! task per request. The owned HTTP/1.1 and HTTP/2 session wrappers share it.
+//! task per request. A request without a body is first offered to
+//! `HttpHandler::respond_now`, whose whole response the exchange holds inline. The
+//! owned HTTP/1.1 and HTTP/2 session wrappers share it.
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -19,6 +21,7 @@ use std::rc::Rc;
 use std::task::Context;
 use std::task::Poll;
 
+use roxygen_core::buf_queue::BufQueue;
 use roxygen_core::error::HttpError;
 use roxygen_core::error::HttpErrorCode;
 use roxygen_core::events::HttpBodyEvent;
@@ -62,6 +65,10 @@ fn handler_panic_error() -> HttpError {
 
 pub(crate) fn failure(message: &[u8]) -> HttpError {
     HttpError::with_message(HttpErrorCode::INTERNAL_ERROR, message)
+}
+
+fn failed_handler(error: HttpError) -> LocalHandlerFuture {
+    Box::pin(std::future::ready(Err(error)))
 }
 
 /// Invokes the server's handler for each exchange of one connection.
@@ -117,6 +124,12 @@ enum ExchangeState {
         header_read: Option<HolderHeaderRead>,
         body_read: Option<BodyRead>,
     },
+    /// A response from `respond_now`, read as `HttpFixedSource` reads. The head
+    /// is taken by the header poll, and the body by the poll that ends it.
+    Fixed {
+        head: Option<Box<HttpMessage>>,
+        body: Option<BufQueue>,
+    },
     Retired,
 }
 
@@ -163,7 +176,9 @@ impl HandlerExchange {
                     };
                 }
                 ExchangeState::Responding { .. } => return Poll::Ready(Ok(())),
-                ExchangeState::AwaitingRequest | ExchangeState::Retired => {
+                ExchangeState::AwaitingRequest
+                | ExchangeState::Fixed { .. }
+                | ExchangeState::Retired => {
                     return Poll::Ready(Err(HttpError::with_message(
                         HttpErrorCode::INVALID_STATE_TRANSITION,
                         b"owned exchange polled without a request",
@@ -189,10 +204,64 @@ impl HandlerExchange {
                     discard_panic(panic);
                 }
             }
-            ExchangeState::AwaitingRequest | ExchangeState::Retired => {}
+            ExchangeState::Fixed { .. }
+            | ExchangeState::AwaitingRequest
+            | ExchangeState::Retired => {}
         }
         self.context.take();
     }
+
+    /// Offers a request without a body to `respond_now`, under the same unwind
+    /// boundary as `handle_request`. Returns the head when `respond_now`
+    /// returns `None`.
+    fn try_respond_now(&mut self, mut head: Box<HttpMessage>) -> Option<Box<HttpMessage>> {
+        let response = match catch_unwind(AssertUnwindSafe(|| self.handler.respond_now(&head))) {
+            Ok(None) => return Some(head),
+            Ok(Some(response)) => response,
+            Err(panic) => {
+                discard_panic(panic);
+                Err(handler_panic_error())
+            }
+        };
+        self.state = match response {
+            Ok(response) => {
+                let (response, body) = response.into_parts();
+                *head = response;
+                ExchangeState::Fixed {
+                    head: Some(head),
+                    body: Some(body),
+                }
+            }
+            Err(error) => ExchangeState::Handling(failed_handler(error)),
+        };
+        None
+    }
+}
+
+fn fixed_header(
+    head: Option<Box<HttpMessage>>,
+    body: &Option<BufQueue>,
+) -> Result<HttpHeaderEvent, HttpError> {
+    let head = head.ok_or_else(|| {
+        HttpError::with_message(
+            HttpErrorCode::INVALID_STATE_TRANSITION,
+            b"response header was already read",
+        )
+    })?;
+    HttpHeaderEvent::from_boxed_headers(head, body.as_ref().is_none_or(BufQueue::is_empty))
+        .map_err(|error| failure(error.to_string().as_bytes()))
+}
+
+fn fixed_body(body: &mut Option<BufQueue>, maximum: u32) -> Result<HttpBodyEvent, HttpError> {
+    let rest = body.as_mut().ok_or_else(|| {
+        HttpError::with_message(HttpErrorCode::DROPPED, b"HTTP source is no longer readable")
+    })?;
+    let data = rest.split_at_most(maximum as usize);
+    let eom = rest.is_empty();
+    if eom {
+        *body = None;
+    }
+    Ok(HttpBodyEvent::body(data, eom))
 }
 
 impl OwnedExchange for HandlerExchange {
@@ -201,6 +270,14 @@ impl OwnedExchange for HandlerExchange {
             .context
             .take()
             .expect("an exchange receives one request");
+        let head = if eom {
+            match self.try_respond_now(head) {
+                Some(head) => head,
+                None => return,
+            }
+        } else {
+            head
+        };
         let future = match HttpHeaderEvent::from_boxed_headers(head, eom) {
             Ok(head) => {
                 let source = if body.source().is_some() {
@@ -214,13 +291,10 @@ impl OwnedExchange for HandlerExchange {
                 }))
                 .unwrap_or_else(|panic| {
                     discard_panic(panic);
-                    Box::pin(std::future::ready(Err(handler_panic_error())))
+                    failed_handler(handler_panic_error())
                 })
             }
-            Err(error) => Box::pin(std::future::ready(Err(HttpError::with_message(
-                HttpErrorCode::INTERNAL_ERROR,
-                error.to_string().as_bytes(),
-            )))),
+            Err(error) => failed_handler(failure(error.to_string().as_bytes())),
         };
         self.state = ExchangeState::Handling(future);
     }
@@ -229,6 +303,9 @@ impl OwnedExchange for HandlerExchange {
         &mut self,
         context: &mut Context<'_>,
     ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        if let ExchangeState::Fixed { head, body } = &mut self.state {
+            return Poll::Ready(fixed_header(head.take(), body));
+        }
         std::task::ready!(self.poll_handler(context))?;
         let ExchangeState::Responding {
             response,
@@ -249,16 +326,19 @@ impl OwnedExchange for HandlerExchange {
         context: &mut Context<'_>,
         maximum: u32,
     ) -> Poll<Result<HttpBodyEvent, HttpError>> {
-        let ExchangeState::Responding {
-            response,
-            body_read,
-            ..
-        } = &mut self.state
-        else {
-            return Poll::Ready(Err(HttpError::with_message(
-                HttpErrorCode::INVALID_STATE_TRANSITION,
-                b"owned body polled before its head",
-            )));
+        let (response, body_read) = match &mut self.state {
+            ExchangeState::Responding {
+                response,
+                body_read,
+                ..
+            } => (response, body_read),
+            ExchangeState::Fixed { body, .. } => return Poll::Ready(fixed_body(body, maximum)),
+            _ => {
+                return Poll::Ready(Err(HttpError::with_message(
+                    HttpErrorCode::INVALID_STATE_TRANSITION,
+                    b"owned body polled before its head",
+                )));
+            }
         };
         // A pending read keeps the allowance it started with. While it waits, the
         // driver serializes no more output for this exchange, so the allowance can
@@ -419,5 +499,76 @@ mod tests {
             assert_eq!(error.code(), HttpErrorCode::DROPPED, "polling {polling}");
             exchange.complete();
         }
+    }
+
+    fn fixed_exchange(body: &'static [u8]) -> HandlerExchange {
+        let mut head = HttpMessage::new();
+        head.set_status_code(200).expect("a response head");
+        HandlerExchange {
+            handler: Rc::new(NoHandler),
+            context: None,
+            state: ExchangeState::Fixed {
+                head: Some(Box::new(head)),
+                body: Some(
+                    BufQueue::from_bytes(Bytes::from_static(body), body.len())
+                        .expect("the body fits its queue"),
+                ),
+            },
+        }
+    }
+
+    /// A fixed response splits its body by each poll's allowance and ends the
+    /// message with its last byte, or with its head when the body is empty. A
+    /// poll after the end fails as a consumed response source does.
+    #[test]
+    fn a_fixed_response_splits_its_body_by_the_allowance() {
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        let mut exchange = fixed_exchange(AVAILABLE);
+        let Poll::Ready(Ok(head)) = exchange.poll_headers(&mut context) else {
+            panic!("the head is ready");
+        };
+        assert!(!head.eom());
+        assert_eq!(head.headers().response_status(), Some(200));
+        let mut events = Vec::new();
+        for maximum in [4, 0, 4, 100] {
+            let Poll::Ready(Ok(event)) = exchange.poll_body(&mut context, maximum) else {
+                panic!("a body event is ready");
+            };
+            let data = event.as_body().expect("a body event");
+            events.push((
+                data.coalesce(usize::MAX).expect("data").to_vec(),
+                event.eom(),
+            ));
+        }
+        assert_eq!(
+            events,
+            [
+                (b"0123".to_vec(), false),
+                (Vec::new(), false),
+                (b"4567".to_vec(), false),
+                (b"89".to_vec(), true),
+            ]
+        );
+        let Poll::Ready(Err(error)) = exchange.poll_body(&mut context, 8) else {
+            panic!("the consumed response fails the next read");
+        };
+        assert_eq!(error.code(), HttpErrorCode::DROPPED);
+        let Poll::Ready(Err(error)) = exchange.poll_headers(&mut context) else {
+            panic!("the head is read once");
+        };
+        assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+        assert!(!exchange.handler_active());
+        exchange.complete();
+
+        let mut exchange = fixed_exchange(b"");
+        let Poll::Ready(Ok(head)) = exchange.poll_headers(&mut context) else {
+            panic!("the head is ready");
+        };
+        assert!(head.eom(), "an empty body ends the message with its head");
+        exchange.cancel(
+            &HttpError::with_message(HttpErrorCode::CANCEL, b"reset"),
+            true,
+        );
+        assert!(matches!(exchange.state, ExchangeState::Retired));
     }
 }

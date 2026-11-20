@@ -583,3 +583,74 @@ mod hybrid_source {
         assert!(!combined.readable());
     }
 }
+
+mod fixed_response {
+    use super::*;
+    use crate::handler::FixedResponse;
+
+    fn fields(message: &HttpMessage) -> Vec<(Vec<u8>, Vec<u8>)> {
+        message
+            .headers()
+            .iter()
+            .map(|(_, name, value)| (name.to_vec(), value.to_vec()))
+            .collect()
+    }
+
+    /// A head without `Content-Length`, with a stale one, and with an empty body.
+    fn heads() -> [(HttpMessage, &'static [u8]); 3] {
+        let mut typed = response(200);
+        typed
+            .headers_mut()
+            .add(HttpHeaderCode::ContentType, b"text/plain");
+        let mut stale = typed.clone();
+        stale
+            .headers_mut()
+            .add(HttpHeaderCode::ContentLength, b"99");
+        stale.headers_mut().add("X-After", b"1");
+        [(typed, b"body"), (stale, b"body"), (response(204), b"")]
+    }
+
+    #[test]
+    fn new_frames_the_response_as_a_fixed_source_does() {
+        for (head, body) in heads() {
+            let source = HttpFixedSource::new(head.clone(), Some(queue(body)));
+            let (fixed, fixed_body) = FixedResponse::new(head, queue(body)).into_parts();
+            assert_eq!(fields(&fixed), fields(source.message().unwrap()));
+            assert_eq!(fixed_body.chain_length(), body.len());
+        }
+    }
+
+    #[test]
+    fn from_parts_sends_the_head_as_it_is() {
+        let mut head = response(200);
+        head.headers_mut()
+            .add(HttpHeaderCode::ContentType, b"text/plain");
+        head.headers_mut().share_entries();
+        let fixed = FixedResponse::from_parts(head.clone(), queue(b"body"));
+        assert_eq!(fields(fixed.head()), fields(&head));
+        assert!(!fixed.head().headers().exists(HttpHeaderCode::ContentLength));
+
+        // A response to HEAD carries the length of a body that it does not send.
+        let mut bodiless = response(200);
+        bodiless
+            .headers_mut()
+            .add(HttpHeaderCode::ContentLength, b"4");
+        let fixed = FixedResponse::from_parts(bodiless, BufQueue::new(0));
+        assert_eq!(
+            fixed
+                .head()
+                .headers()
+                .get_single_or_empty(HttpHeaderCode::ContentLength),
+            b"4"
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "Content-Length differs from the length of its body")]
+    fn from_parts_rejects_a_stale_content_length_in_debug_builds() {
+        let mut head = response(200);
+        head.headers_mut().add(HttpHeaderCode::ContentLength, b"5");
+        let _ = FixedResponse::from_parts(head, queue(b"body"));
+    }
+}

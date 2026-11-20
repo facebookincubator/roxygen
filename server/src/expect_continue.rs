@@ -20,6 +20,7 @@ use roxygen_core::error::HttpErrorCode;
 use roxygen_core::events::HttpBodyEvent;
 use roxygen_core::events::HttpHeaderEvent;
 use roxygen_core::fixed_source::HttpFixedSource;
+use roxygen_core::handler::FixedResponse;
 use roxygen_core::handler::HandlerSessionContext;
 use roxygen_core::handler::HttpHandler;
 use roxygen_core::handler::HttpHandlerRef;
@@ -83,6 +84,15 @@ impl HttpHandler for ExpectContinueWrapperHandler {
                 ExpectContinueWrapperResponse::new(context, request, next_handler),
             )))
         })
+    }
+
+    /// Forwards a request without `Expect`, which `handle_request` passes to the
+    /// wrapped handler unchanged.
+    fn respond_now(&self, request: &HttpMessage) -> Option<Result<FixedResponse, HttpError>> {
+        if request.headers().exists(EXPECT) {
+            return None;
+        }
+        self.next_handler.respond_now(request)
     }
 }
 

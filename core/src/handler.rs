@@ -23,10 +23,15 @@ use roxygen_runtime::keep_alive::KeepAliveError;
 use roxygen_runtime::keep_alive::KeepAliveOwner;
 use roxygen_runtime::keep_alive::KeepAlivePtr;
 
+use crate::buf_queue::BufQueue;
 use crate::connection::ConnectionContext;
 use crate::error::HttpError;
 use crate::error::HttpErrorCode;
 use crate::exchange::ExchangeCompletion;
+use crate::fixed_source::DECIMAL_DIGITS;
+use crate::fixed_source::format_decimal;
+use crate::headers::HttpHeaderCode;
+use crate::message::HttpMessage;
 use crate::source_holder::HttpSourceHolder;
 
 /// Cumulative counts of accepted shared responses, in total and by status class.
@@ -322,6 +327,62 @@ impl Drop for HandlerFuture {
     }
 }
 
+/// A whole response in memory, which [`HttpHandler::respond_now`] returns.
+pub struct FixedResponse {
+    head: HttpMessage,
+    body: BufQueue,
+}
+
+impl FixedResponse {
+    /// Sets `Content-Length` in `head` to the length of `body`, as
+    /// `HttpFixedSource::new` does with a body.
+    pub fn new(mut head: HttpMessage, body: BufQueue) -> Self {
+        let mut digits = [0; DECIMAL_DIGITS];
+        head.headers_mut().set(
+            HttpHeaderCode::ContentLength,
+            format_decimal(body.chain_length(), &mut digits),
+        );
+        Self { head, body }
+    }
+
+    /// Sends `head` as it is, so it carries the framing headers that the
+    /// response needs. The header entries are left untouched, so a head whose
+    /// entries are shared with its clones stays shared.
+    ///
+    /// Debug builds panic when a `Content-Length` in `head` differs from the
+    /// length of a body that is not empty.
+    pub fn from_parts(head: HttpMessage, body: BufQueue) -> Self {
+        debug_assert!(
+            body.is_empty() || content_length_matches(&head, body.chain_length()),
+            "a fixed response's Content-Length differs from the length of its body"
+        );
+        Self { head, body }
+    }
+
+    pub fn head(&self) -> &HttpMessage {
+        &self.head
+    }
+
+    pub fn body(&self) -> &BufQueue {
+        &self.body
+    }
+
+    pub fn into_parts(self) -> (HttpMessage, BufQueue) {
+        (self.head, self.body)
+    }
+}
+
+/// Whether every `Content-Length` in `head` is `length`.
+fn content_length_matches(head: &HttpMessage, length: usize) -> bool {
+    head.headers()
+        .iter()
+        .filter(|&(code, _, _)| code == HttpHeaderCode::ContentLength)
+        .all(|(_, _, value)| {
+            std::str::from_utf8(value.trim_ascii())
+                .is_ok_and(|value| value.parse::<usize>() == Ok(length))
+        })
+}
+
 /// An owner-local HTTP request handler.
 ///
 /// The request source is transferred into the invocation and the response
@@ -333,4 +394,19 @@ pub trait HttpHandler: 'static {
         context: HandlerSessionContext,
         request_source: HttpSourceHolder,
     ) -> LocalHandlerFuture;
+
+    /// Answers a request synchronously with a whole response, or returns `None`
+    /// to leave the request to [`Self::handle_request`].
+    ///
+    /// Only the experimental owned HTTP/1.1 and HTTP/2 drivers call this, with
+    /// the head of each request without a body, and they send the response it
+    /// returns without a request source, a handler future or a response source.
+    /// An error or a panic is answered as the same failure of `handle_request`
+    /// is. Other sessions call only `handle_request`, so it must still answer
+    /// every request, and answer it as this method would.
+    /// [`FixedResponse::new`] sets `Content-Length` as `HttpFixedSource::new`
+    /// does, and [`FixedResponse::from_parts`] sends the head as it is.
+    fn respond_now(&self, _request: &HttpMessage) -> Option<Result<FixedResponse, HttpError>> {
+        None
+    }
 }
