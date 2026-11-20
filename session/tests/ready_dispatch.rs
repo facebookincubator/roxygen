@@ -1575,7 +1575,6 @@ fn initial_ingress_meta(complete: bool) -> Box<IngressMeta> {
     Box::new(IngressMeta {
         complete,
         discard: false,
-        message: None,
         expected_content_length: None,
         received_body_length: 0,
         request_get: false,

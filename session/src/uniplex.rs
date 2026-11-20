@@ -726,9 +726,6 @@ static READY_DISPATCH: LazyLock<bool> =
 struct IngressMeta {
     complete: bool,
     discard: bool,
-    /// Read only by HTTP/2's `INVALID_STATE_TRANSITION` failure, so HTTP/1.1
-    /// leaves it `None`.
-    message: Option<roxygen_core::message::HttpMessage>,
     expected_content_length: Option<u64>,
     received_body_length: u64,
     request_get: bool,
@@ -1732,19 +1729,6 @@ impl DriverState {
         if self.fatal_error.is_none() {
             self.fatal_error = Some(error);
         }
-    }
-
-    /// Reads a stream's `IngressMeta` message, or returns `None` when the stream
-    /// has no `IngressMeta`.
-    #[cfg(test)]
-    pub(crate) fn with_ingress_message_for_test<R>(
-        &self,
-        stream: StreamId,
-        read: impl FnOnce(Option<&roxygen_core::message::HttpMessage>) -> R,
-    ) -> Option<R> {
-        self.ingress_meta
-            .get(&stream)
-            .map(|meta| read(meta.message.as_ref()))
     }
 
     fn h1_close_rejects_egress(&self, stream: StreamId) -> bool {
@@ -3881,7 +3865,6 @@ impl UniplexSession {
                 Box::new(IngressMeta {
                     complete: false,
                     discard: false,
-                    message: None,
                     expected_content_length: None,
                     received_body_length: 0,
                     request_get: false,
@@ -3893,7 +3876,6 @@ impl UniplexSession {
                 Box::new(IngressMeta {
                     complete: true,
                     discard: false,
-                    message: None,
                     expected_content_length: None,
                     received_body_length: 0,
                     request_get: false,
@@ -6195,7 +6177,6 @@ impl SessionCodecCallback<'_> {
             Box::new(IngressMeta {
                 complete: false,
                 discard: false,
-                message: None,
                 expected_content_length: None,
                 received_body_length: 0,
                 request_get: false,
@@ -6281,7 +6262,6 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
                     Box::new(IngressMeta {
                         complete: false,
                         discard: false,
-                        message: None,
                         expected_content_length: None,
                         received_body_length: 0,
                         request_get: false,
@@ -6362,14 +6342,9 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
                 stream,
                 mut message,
             } => {
-                let keep_copy = self.core.protocol() == CodecProtocol::Http2;
                 if request_has_forbidden_body(&mut message) {
                     if let Some(meta) = self.ingress_meta.get_mut(&stream) {
                         meta.discard = true;
-                        if keep_copy {
-                            message.headers_mut().share_entries();
-                            meta.message = Some((*message).clone());
-                        }
                     }
                     let mut error = HttpError::with_message(
                         HttpErrorCode::HEADER_PARSE_ERROR,
@@ -6435,10 +6410,6 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
                         meta.request_get = self.core.direction().is_downstream()
                             && message.method().ok().flatten()
                                 == Some(roxygen_core::http::HttpMethod::Get);
-                        if keep_copy {
-                            message.headers_mut().share_entries();
-                            meta.message = Some((*message).clone());
-                        }
                     }
                     self.core.check_for_upgrade(stream, &message, true);
                     if let Err(error) = self.core.ingress_headers(stream, *message, false) {
@@ -6564,14 +6535,9 @@ impl HttpCodecCallback for SessionCodecCallback<'_> {
                             {
                                 actions.push(self.closed_stream_frame(stream, false));
                             } else if self.failures.is_empty() && !self.stream_is_upgraded(stream) {
-                                let mut error = HttpError::with_message(
+                                let error = HttpError::with_message(
                                     HttpErrorCode::INVALID_STATE_TRANSITION,
                                     b"ingress source rejected body bytes",
-                                );
-                                error.set_http_message(
-                                    self.ingress_meta
-                                        .get(&stream)
-                                        .and_then(|meta| meta.message.clone()),
                                 );
                                 self.failures.push(CodecFailure {
                                     stream,

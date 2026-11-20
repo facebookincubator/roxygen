@@ -5,9 +5,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! An HTTP/1 session does not keep a copy of an ingress message. HTTP/2 keeps
-//! a copy that only its `INVALID_STATE_TRANSITION` failure reads, and that copy
-//! shares the delivered message's header entries.
+//! Sessions do not keep a copy of an ingress message. These tests see a kept copy
+//! only when it shares the delivered header entries, because a handler's change to
+//! the delivered headers then moves them, or when an error attaches it; a deep copy
+//! kept anywhere else is invisible here. An error for HTTP/2 body bytes after the
+//! end of the stream carries the request head only while the handler has not read
+//! it.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -15,16 +18,20 @@ use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::rc::Rc;
 use std::rc::Weak;
+use std::task::Context;
+use std::task::Poll;
 use std::time::Duration;
 
 use roxygen_codec::CodecEvent;
 use roxygen_codec::EgressFrame;
+use roxygen_codec::H2ErrorCode;
 use roxygen_codec::HttpCodec;
 use roxygen_codec::HttpCodecCallback;
 use roxygen_core::buf_queue::BufQueue;
 use roxygen_core::byte_event::HttpByteEventRegistration;
 use roxygen_core::error::HttpError;
 use roxygen_core::error::HttpErrorCode;
+use roxygen_core::events::HttpBodyEvent;
 use roxygen_core::events::HttpHeaderEvent;
 use roxygen_core::fixed_source::HttpFixedSource;
 use roxygen_core::handler::HandlerSessionContext;
@@ -34,11 +41,14 @@ use roxygen_core::headers::HttpHeaders;
 use roxygen_core::http::HttpMethod;
 use roxygen_core::http::TransportDirection;
 use roxygen_core::ids::StreamId;
+use roxygen_core::ingress_completion::IngressCompletion;
 use roxygen_core::message::HttpMessage;
 use roxygen_core::source::HttpSource;
 use roxygen_core::source_holder::HttpSourceHolder;
+use roxygen_core::stream_source::HttpStreamSourceOwner;
 use roxygen_http1::Http1xCodec;
 use roxygen_http2::Http2Codec;
+use roxygen_http2::frame::FrameType;
 use roxygen_runtime::cancellation::CancellationSource;
 use roxygen_runtime::cancellation::CancellationToken;
 use roxygen_runtime::wait::CancellableBaton;
@@ -57,6 +67,10 @@ use super::UniplexRead;
 use super::UniplexSession;
 use super::UniplexTransport;
 use crate::http2::Http2SessionConfig;
+use crate::owned_h2::OwnedH2Application;
+use crate::owned_h2::OwnedH2Exchange;
+use crate::owned_h2::OwnedH2Options;
+use crate::owned_h2::OwnedH2Session;
 use crate::uniplex_tests::run_on_worker;
 
 const QUEUE_LIMIT: usize = 1 << 20;
@@ -109,6 +123,27 @@ fn render(message: &HttpMessage) -> String {
 
 fn probe_address(message: &HttpMessage) -> *const u8 {
     message.headers().get_single_or_empty(PROBE).as_ptr()
+}
+
+/// Changes `message`'s headers and reports whether its probe value kept its
+/// address, which it does unless another message shares the header entries.
+fn edits_in_place(message: &mut HttpMessage) -> bool {
+    assert!(!message.headers().get_single_or_empty(PROBE).is_empty());
+    let before = probe_address(message);
+    // An uncommon name that is absent still makes the removal write the entries.
+    message.headers_mut().remove(b"x-absent");
+    probe_address(message) == before
+}
+
+/// The check fails when another message shares the header entries.
+#[test]
+fn edits_in_place_sees_shared_header_entries() {
+    let mut message = HttpMessage::new();
+    message.headers_mut().set(PROBE, b"shared");
+    assert!(edits_in_place(&mut message.clone()));
+    message.headers_mut().share_entries();
+    let _sibling = message.clone();
+    assert!(!edits_in_place(&mut message));
 }
 
 /// Collects the messages a standalone codec delivers.
@@ -250,11 +285,9 @@ struct Seen {
     /// The delivered message's rendering, or the header-read error's code and
     /// its attached message's rendering.
     delivered: String,
-    /// `None` without an `IngressMeta`; otherwise whether it holds a message.
-    meta_message: Option<bool>,
-    /// Whether the `IngressMeta` copy's probe value has the delivered
-    /// message's address.
-    shares_probe: Option<bool>,
+    /// For a delivered message, whether a change to its headers left them in
+    /// place.
+    edited_in_place: Option<bool>,
 }
 
 /// What a handler observed when a body read after its headers failed.
@@ -279,8 +312,8 @@ struct Probe {
 }
 
 /// Maps each fixture request target to its stream, records what its header
-/// read returned, drains its body, records a failed body read, and responds
-/// with 200.
+/// read returned and whether it could edit the delivered headers in place,
+/// drains its body, records a failed body read, and responds with 200.
 struct ProbeHandler {
     probe: Rc<Probe>,
     progress: Rc<tokio::sync::Notify>,
@@ -308,51 +341,40 @@ impl HttpHandler for ProbeHandler {
         let progress = Rc::clone(&self.progress);
         let streams = self.streams;
         Box::pin(async move {
-            let header = request.read_header_event().await;
-            let (stream, delivered, message) = match &header {
+            let mut header = request.read_header_event().await;
+            let (stream, seen) = match &mut header {
                 Ok(headers) => {
-                    let message = headers.headers();
+                    let message = headers.headers_mut();
+                    let delivered = render(message);
                     (
-                        stream_for(streams, Some(message)),
-                        render(message),
-                        Some(message),
+                        stream_for(streams, Some(&*message)),
+                        Seen {
+                            delivered,
+                            edited_in_place: Some(edits_in_place(message)),
+                        },
                     )
                 }
                 Err(error) => {
                     let message = error.http_message();
                     (
                         stream_for(streams, message),
-                        format!(
-                            "error {} {}",
-                            error.code().as_u16(),
-                            message.map_or_else(|| "none".to_owned(), render)
-                        ),
-                        message,
+                        Seen {
+                            delivered: format!(
+                                "error {} {}",
+                                error.code().as_u16(),
+                                message.map_or_else(|| "none".to_owned(), render)
+                            ),
+                            edited_in_place: None,
+                        },
                     )
                 }
             };
-            let session = probe.session.borrow().upgrade().expect("the session lives");
-            let (meta_message, shares_probe) = session
-                .borrow()
-                .with_ingress_message_for_test(stream, |copy| {
-                    let shares = copy
-                        .zip(message)
-                        .map(|(copy, message)| probe_address(copy) == probe_address(message));
-                    (copy.is_some(), shares)
-                })
-                .map_or((None, None), |(holds, shares)| (Some(holds), shares));
-            probe.seen.borrow_mut().push((
-                stream,
-                Seen {
-                    delivered,
-                    meta_message,
-                    shares_probe,
-                },
-            ));
+            probe.seen.borrow_mut().push((stream, seen));
             progress.notify_one();
             if let Ok(headers) = &header
                 && !headers.eom()
             {
+                let session = probe.session.borrow().upgrade().expect("the session lives");
                 loop {
                     match request.read_body_event(u32::MAX).await {
                         Ok(event) if event.eom() => break,
@@ -608,30 +630,18 @@ fn upstream_response(http2: bool) -> (Seen, String) {
                 )
             }
             .expect("an upstream session");
-            let state = Rc::clone(&session.state);
             let source =
                 HttpFixedSource::make_get_request(b"/upstream", None).expect("a fixed GET request");
-            let response = send(&handle, source).await;
-            let stream = response.stream;
-            let mut source = response.source;
+            let mut source = send(&handle, source).await.source;
             let consume = async move {
-                let headers = source
+                let mut headers = source
                     .read_header_event()
                     .await
                     .expect("the response headers");
-                let delivered = headers.headers();
-                let (meta_message, shares_probe) = state
-                    .borrow()
-                    .with_ingress_message_for_test(stream, |copy| {
-                        let shares =
-                            copy.map(|copy| probe_address(copy) == probe_address(delivered));
-                        (copy.is_some(), shares)
-                    })
-                    .map_or((None, None), |(holds, shares)| (Some(holds), shares));
+                let delivered = headers.headers_mut();
                 let seen = Seen {
                     delivered: render(delivered),
-                    meta_message,
-                    shares_probe,
+                    edited_in_place: Some(edits_in_place(delivered)),
                 };
                 headers_read.set(true);
                 progress.notify_one();
@@ -682,16 +692,14 @@ fn http1_sessions_keep_no_ingress_message_copy() {
                 StreamId::new(1),
                 Seen {
                     delivered: expected[0].clone(),
-                    meta_message: Some(false),
-                    shares_probe: None,
+                    edited_in_place: Some(true),
                 },
             ),
             (
                 StreamId::new(2),
                 Seen {
                     delivered: expected[1].clone(),
-                    meta_message: Some(false),
-                    shares_probe: None,
+                    edited_in_place: Some(true),
                 },
             ),
         ]
@@ -701,8 +709,6 @@ fn http1_sessions_keep_no_ingress_message_copy() {
         &mut Http1xCodec::new(TransportDirection::Downstream),
         FORBIDDEN,
     );
-    // The body arrives after the handler's header read, so the discarded
-    // stream's `IngressMeta` is still present when the handler reads it.
     let head = FORBIDDEN.len() - b"hello".len();
     let outcome = run_downstream(
         vec![
@@ -728,15 +734,13 @@ fn http1_sessions_keep_no_ingress_message_copy() {
         seen.delivered.starts_with("error "),
         "no handler receives the forbidden request's headers: {seen:?}"
     );
-    assert_eq!(seen.meta_message, Some(false));
 
     let (seen, expected) = upstream_response(false);
     assert_eq!(
         seen,
         Seen {
             delivered: expected,
-            meta_message: Some(false),
-            shares_probe: None,
+            edited_in_place: Some(true),
         }
     );
 }
@@ -799,7 +803,7 @@ fn http2_wire(requests: &[(HttpMethod, &[u8], &[u8], Option<&[u8]>)]) -> (Vec<u8
 const H2_STREAMS: &[(&[u8], u64)] = &[(b"/shared", 1), (b"/forbidden", 3)];
 
 #[test]
-fn http2_ingress_copy_shares_the_delivered_header_entries() {
+fn http2_sessions_keep_no_ingress_message_copy() {
     let (headers, bodies) = http2_wire(&[
         (HttpMethod::Get, b"/shared", b"shared", None),
         (
@@ -813,10 +817,9 @@ fn http2_ingress_copy_shares_the_delivered_header_entries() {
         &mut Http2Codec::new(TransportDirection::Downstream),
         &headers,
     );
-    // The forbidden request's DATA arrives after both header reads, so its
-    // discarded stream's `IngressMeta` is still present when its handler reads.
-    // Its 400 aborts the source that holds the failure's attached message as
-    // unread headers, so the header read returns that message on its error.
+    // The forbidden request's 400 aborts the source that holds the failure's
+    // attached message as unread headers, so the header read returns that
+    // message on its error.
     let outcome = run_downstream(vec![(0, headers), (2, bodies)], true, H2_STREAMS, 2);
     assert_eq!(outcome.run_error, None);
     let mut seen = outcome.seen;
@@ -828,8 +831,7 @@ fn http2_ingress_copy_shares_the_delivered_header_entries() {
                 StreamId::new(1),
                 Seen {
                     delivered: expected[0].clone(),
-                    meta_message: Some(true),
-                    shares_probe: Some(true),
+                    edited_in_place: Some(true),
                 },
             ),
             (
@@ -840,8 +842,7 @@ fn http2_ingress_copy_shares_the_delivered_header_entries() {
                         HttpErrorCode::HEADER_PARSE_ERROR.as_u16(),
                         expected[1]
                     ),
-                    meta_message: Some(true),
-                    shares_probe: Some(true),
+                    edited_in_place: None,
                 },
             ),
         ]
@@ -849,21 +850,20 @@ fn http2_ingress_copy_shares_the_delivered_header_entries() {
 }
 
 #[test]
-fn http2_upstream_ingress_copy_shares_the_delivered_header_entries() {
+fn http2_upstream_sessions_keep_no_ingress_message_copy() {
     let (seen, expected) = upstream_response(true);
     assert_eq!(
         seen,
         Seen {
             delivered: expected,
-            meta_message: Some(true),
-            shares_probe: Some(true),
+            edited_in_place: Some(true),
         }
     );
 }
 
 /// Trailers without END_STREAM, and DATA after them, arrive after the handler has read its
 /// headers. The codec fails the stream at the trailers, so its source never sees the DATA, and
-/// the failure carries the trailers the codec decoded rather than a copy of the head.
+/// the failure carries the trailers the codec decoded.
 #[test]
 fn http2_trailers_without_end_stream_fail_after_the_head() {
     let mut codec = Http2Codec::new(TransportDirection::Upstream);
@@ -944,8 +944,7 @@ fn http2_trailers_without_end_stream_fail_after_the_head() {
             StreamId::new(1),
             Seen {
                 delivered: expected[0].clone(),
-                meta_message: Some(true),
-                shares_probe: Some(true),
+                edited_in_place: Some(true),
             },
         )]
     );
@@ -966,4 +965,230 @@ fn http2_trailers_without_end_stream_fail_after_the_head() {
             },
         )]
     );
+}
+
+const LATE_STREAMS: &[(&[u8], u64)] = &[(b"/late", 1)];
+
+/// A POST of "body" on stream 1: the client preface, SETTINGS and HEADERS, then
+/// DATA with END_STREAM.
+fn late_body_wire() -> (Vec<u8>, Vec<u8>) {
+    http2_wire(&[(HttpMethod::Post, b"/late", b"late", Some(b"body"))])
+}
+
+fn frame(kind: FrameType, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let length = u32::try_from(payload.len()).expect("a short payload");
+    let mut frame = length.to_be_bytes()[1..].to_vec();
+    frame.extend_from_slice(&[kind.as_u8(), 0]);
+    frame.extend_from_slice(&stream.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// DATA on stream 1 after its END_STREAM.
+fn late_data() -> Vec<u8> {
+    frame(FrameType::DATA, 1, b"late")
+}
+
+/// RST_STREAM(STREAM_CLOSED) on stream 1.
+fn stream_closed_reset() -> Vec<u8> {
+    frame(
+        FrameType::RST_STREAM,
+        1,
+        &H2ErrorCode::STREAM_CLOSED.as_u32().to_be_bytes(),
+    )
+}
+
+/// What the owned HTTP/2 driver's exchanges observed: each request head's
+/// rendering, and each cancellation's code and attached message's rendering.
+#[derive(Default)]
+struct OwnedProbe {
+    heads: RefCell<Vec<String>>,
+    cancels: RefCell<Vec<(u16, String)>>,
+    progress: Rc<tokio::sync::Notify>,
+}
+
+/// Holds each request body unread until its exchange is cancelled, and never
+/// responds.
+struct HoldingApplication(Rc<OwnedProbe>);
+
+struct HoldingExchange {
+    probe: Rc<OwnedProbe>,
+    body: Option<HttpSourceHolder>,
+}
+
+impl OwnedH2Application for HoldingApplication {
+    type Exchange = HoldingExchange;
+
+    fn new_exchange(&self, _stream: StreamId, _ingress: IngressCompletion) -> HoldingExchange {
+        HoldingExchange {
+            probe: Rc::clone(&self.0),
+            body: None,
+        }
+    }
+}
+
+impl OwnedH2Exchange for HoldingExchange {
+    fn request(&mut self, head: Box<HttpMessage>, body: HttpStreamSourceOwner, _eom: bool) {
+        self.probe.heads.borrow_mut().push(render(&head));
+        self.body = Some(body.into_source_holder());
+        self.probe.progress.notify_one();
+    }
+
+    fn poll_headers(
+        &mut self,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        Poll::Pending
+    }
+
+    fn poll_body(
+        &mut self,
+        _context: &mut Context<'_>,
+        _maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        unreachable!("the exchange does not produce a head")
+    }
+
+    fn cancel(&mut self, error: &HttpError, _peer_reset: bool) {
+        self.probe.cancels.borrow_mut().push((
+            error.code().as_u16(),
+            error
+                .http_message()
+                .map_or_else(|| "none".to_owned(), render),
+        ));
+        drop(self.body.take());
+        self.probe.progress.notify_one();
+    }
+
+    fn response_complete(&mut self) {}
+
+    fn complete(self) {}
+}
+
+struct OwnedOutcome {
+    heads: Vec<String>,
+    cancels: Vec<(u16, String)>,
+    run_error: Option<u16>,
+    written: Vec<u8>,
+}
+
+/// Runs the owned HTTP/2 driver over `head`, then `late` once an exchange has
+/// its request head, then EOF once an exchange is cancelled.
+fn run_owned(head: Vec<u8>, late: Vec<u8>) -> OwnedOutcome {
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let probe = Rc::new(OwnedProbe::default());
+            let transport = ScriptTransport::new(&probe.progress);
+            transport.push_read(|| true, Some(head));
+            let headed = Rc::clone(&probe);
+            transport.push_read(move || !headed.heads.borrow().is_empty(), Some(late));
+            let cancelled = Rc::clone(&probe);
+            transport.push_read(move || !cancelled.cancels.borrow().is_empty(), None);
+            let erased: Rc<dyn UniplexTransport> = transport.clone();
+            let (session, _handle) = OwnedH2Session::new(
+                HoldingApplication(Rc::clone(&probe)),
+                OwnedH2Options {
+                    context,
+                    transport: erased,
+                    io: UniplexConfig {
+                        drain_request_body_on_drop: true,
+                        ..UniplexConfig::default()
+                    },
+                    http2: Http2SessionConfig::default(),
+                },
+            )
+            .expect("an owned session");
+            let result = tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .expect("the session finishes");
+            let heads = probe.heads.borrow().clone();
+            let cancels = probe.cancels.borrow().clone();
+            OwnedOutcome {
+                heads,
+                cancels,
+                run_error: result.err().map(|error| error.code().as_u16()),
+                written: transport.written(),
+            }
+        })
+    })
+}
+
+/// DATA after the request's END_STREAM, once the handler has read the request
+/// head, gets RST_STREAM(STREAM_CLOSED) on both drivers, and the stream's error
+/// does not carry a message: the handler has taken the head from the source, and
+/// the drivers do not keep a copy of it.
+#[test]
+fn http2_data_after_end_stream_fails_without_the_read_head() {
+    let (head, body) = late_body_wire();
+    let late = [body, late_data()].concat();
+    let expected = decode(&mut Http2Codec::new(TransportDirection::Downstream), &head);
+    let invalid = HttpErrorCode::INVALID_STATE_TRANSITION.as_u16();
+
+    let outcome = run_downstream(
+        vec![(0, head.clone()), (1, late.clone())],
+        true,
+        LATE_STREAMS,
+        1,
+    );
+    assert_eq!(outcome.run_error, None);
+    assert_eq!(
+        outcome.seen,
+        [(
+            StreamId::new(1),
+            Seen {
+                delivered: expected[0].clone(),
+                edited_in_place: Some(true),
+            },
+        )]
+    );
+    assert_eq!(
+        outcome.failures,
+        [(
+            StreamId::new(1),
+            Failure {
+                body_error: invalid,
+                terminal: Some((invalid, "none".to_owned())),
+                shares_probe: None,
+            },
+        )]
+    );
+    assert!(contains(&outcome.written, &stream_closed_reset()));
+
+    let owned = run_owned(head, late);
+    assert_eq!(owned.run_error, None);
+    assert_eq!(owned.heads, [expected[0].clone()]);
+    assert_eq!(owned.cancels, [(invalid, "none".to_owned())]);
+    assert!(contains(&owned.written, &stream_closed_reset()));
+}
+
+/// The same DATA, arriving with the request before the handler reads its head,
+/// fails the header read, and the source attaches the head that it still
+/// holds to that error.
+#[test]
+fn http2_data_after_end_stream_fails_with_an_unread_head() {
+    let (head, body) = late_body_wire();
+    let expected = decode(&mut Http2Codec::new(TransportDirection::Downstream), &head);
+    let outcome = run_downstream(
+        vec![(0, [head, body, late_data()].concat())],
+        true,
+        LATE_STREAMS,
+        1,
+    );
+    assert_eq!(outcome.run_error, None);
+    assert_eq!(
+        outcome.seen,
+        [(
+            StreamId::new(1),
+            Seen {
+                delivered: format!(
+                    "error {} {}",
+                    HttpErrorCode::INVALID_STATE_TRANSITION.as_u16(),
+                    expected[0]
+                ),
+                edited_in_place: None,
+            },
+        )]
+    );
+    assert_eq!(outcome.failures, []);
+    assert!(contains(&outcome.written, &stream_closed_reset()));
 }
