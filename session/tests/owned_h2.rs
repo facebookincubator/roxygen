@@ -23265,3 +23265,801 @@ fn h2_drain_expiry_with_zero_goaway_timeout_hard_closes() {
         })
     });
 }
+
+/// What a tunnel exchange saw, and the response body events it returns.
+#[derive(Default)]
+struct TunnelProbe {
+    /// The request head, and whether the request ended with it.
+    request: RefCell<Option<(Box<HttpMessage>, bool)>>,
+    /// The request body, which the test reads or stops outside the exchange, as an embedder's
+    /// task does.
+    body: RefCell<Option<HttpSourceHolder>>,
+    /// The response body events, returned in order. `poll_body` is pending while it is empty.
+    response: RefCell<VecDeque<Result<HttpBodyEvent, HttpError>>>,
+    waker: RefCell<Option<Waker>>,
+    body_polls: Cell<usize>,
+    cancelled: RefCell<Vec<(HttpErrorCode, bool)>>,
+    response_complete: Cell<usize>,
+    completed: Cell<usize>,
+    dropped: Cell<usize>,
+}
+
+impl TunnelProbe {
+    /// Queues a response body event and wakes the exchange through the waker of its last body
+    /// poll.
+    fn respond(&self, event: Result<HttpBodyEvent, HttpError>) {
+        self.response.borrow_mut().push_back(event);
+        if let Some(waker) = self.waker.borrow_mut().take() {
+            waker.wake();
+        }
+    }
+
+    fn take_body(&self) -> HttpSourceHolder {
+        self.body
+            .borrow_mut()
+            .take()
+            .expect("the request body was delivered")
+    }
+}
+
+/// Answers every stream with a 200 head that has no content-length and does not end the
+/// response, then with the body events the test queues.
+struct TunnelApplication(Rc<TunnelProbe>);
+
+struct TunnelExchange(Rc<TunnelProbe>);
+
+impl OwnedH2Application for TunnelApplication {
+    type Exchange = TunnelExchange;
+
+    fn new_exchange(&self, _stream: StreamId, _ingress: IngressCompletion) -> TunnelExchange {
+        TunnelExchange(Rc::clone(&self.0))
+    }
+}
+
+impl OwnedH2Exchange for TunnelExchange {
+    fn request(&mut self, head: Box<HttpMessage>, body: HttpStreamSourceOwner, eom: bool) {
+        *self.0.request.borrow_mut() = Some((head, eom));
+        *self.0.body.borrow_mut() = Some(body.into_source_holder());
+    }
+
+    fn poll_headers(
+        &mut self,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        let mut response = HttpMessage::new();
+        response.set_status_code(200).unwrap();
+        response.set_http_version(1, 1);
+        Poll::Ready(Ok(HttpHeaderEvent::new(response, false).unwrap()))
+    }
+
+    fn poll_body(
+        &mut self,
+        context: &mut Context<'_>,
+        _maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        self.0.body_polls.set(self.0.body_polls.get() + 1);
+        *self.0.waker.borrow_mut() = Some(context.waker().clone());
+        match self.0.response.borrow_mut().pop_front() {
+            Some(event) => Poll::Ready(event),
+            None => Poll::Pending,
+        }
+    }
+
+    fn cancel(&mut self, error: &HttpError, peer_reset: bool) {
+        self.0
+            .cancelled
+            .borrow_mut()
+            .push((error.code(), peer_reset));
+    }
+
+    fn response_complete(&mut self) {
+        self.0
+            .response_complete
+            .set(self.0.response_complete.get() + 1);
+    }
+
+    fn complete(self) {
+        self.0.completed.set(self.0.completed.get() + 1);
+    }
+}
+
+impl Drop for TunnelExchange {
+    fn drop(&mut self) {
+        self.0.dropped.set(self.0.dropped.get() + 1);
+    }
+}
+
+/// SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441), which a server sends to accept extended
+/// CONNECT.
+const ENABLE_CONNECT_PROTOCOL: CodecSetting = CodecSetting {
+    identifier: 8,
+    value: 1,
+};
+
+/// The tunnel's stream.
+const TUNNEL: StreamId = StreamId::new(1);
+
+/// An extended CONNECT request for the `websocket` protocol on `/chat`.
+fn extended_connect_request() -> HttpMessage {
+    let mut request = HttpMessage::new();
+    request.set_method(HttpMethod::Connect).unwrap();
+    request.set_url(b"/chat", false).unwrap();
+    request.set_http_version(1, 1);
+    request.set_secure(true);
+    request.set_upgrade_protocol(b"websocket");
+    request
+        .headers_mut()
+        .set(HttpHeaderCode::Host, b"example.com");
+    request
+}
+
+/// A client's preface and SETTINGS, with its stream window set to `stream_window` when given,
+/// followed by `request` on stream 1 without END_STREAM.
+fn tunnel_client(
+    stream_window: Option<u32>,
+    request: Option<&HttpMessage>,
+) -> (Http2Codec, Vec<u8>) {
+    let mut peer = Http2Codec::new(TransportDirection::Upstream);
+    if let Some(window) = stream_window {
+        peer.egress_settings_mut()
+            .set(SettingsId::InitialWindowSize, u64::from(window));
+    }
+    let mut wire = eligibility_frame(&mut peer, EgressFrame::ConnectionPreface);
+    wire.extend(transcript_settings(&mut peer));
+    if let Some(request) = request {
+        let stream = peer.create_stream();
+        assert_eq!(stream, TUNNEL);
+        wire.extend(eligibility_frame(
+            &mut peer,
+            EgressFrame::Headers {
+                stream,
+                message: request,
+                end_stream: false,
+                extra_headers: None,
+            },
+        ));
+    }
+    (peer, wire)
+}
+
+/// Serves `reads` with a `TunnelApplication` session whose options `configure` adjusts,
+/// runs `operation` against it, then cancels the session. `gates` are notified before the
+/// cancellation, so every scripted read can finish.
+async fn run_tunnel<F: Future<Output = ()>>(
+    context: WorkerContext,
+    reads: Vec<FixtureRead>,
+    gates: &[Arc<tokio::sync::Notify>],
+    configure: impl FnOnce(&mut OwnedH2Options),
+    operation: impl FnOnce(Rc<TunnelProbe>, Rc<RefCell<FixtureTransportState>>) -> F,
+) {
+    let (transport, state) = FixtureTransport::new(reads);
+    let probe = Rc::new(TunnelProbe::default());
+    let mut config = options(context, transport);
+    configure(&mut config);
+    let (session, handle) =
+        OwnedH2Session::new(TunnelApplication(Rc::clone(&probe)), config).unwrap();
+    let operation = operation(Rc::clone(&probe), state);
+    let run = async {
+        let outcome =
+            eligibility_catch_unwind(tokio::time::timeout(Duration::from_secs(5), operation)).await;
+        gates.iter().for_each(|gate| gate.notify_one());
+        handle.cancel();
+        outcome
+    };
+    let (result, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(session.run(), run)
+    })
+    .await
+    .expect("the cancelled connection joins its transport operations");
+    drop(probe.body.borrow_mut().take());
+    match outcome {
+        Ok(result) => result.expect("the tunnel test made progress"),
+        Err(payload) => resume_unwind(payload),
+    }
+    assert_eq!(
+        result.expect_err("the test ends by cancellation").code(),
+        HttpErrorCode::CORO_CANCELLED
+    );
+}
+
+/// Advertises extended CONNECT.
+fn advertise_connect(config: &mut OwnedH2Options) {
+    config.http2.settings.push(ENABLE_CONNECT_PROTOCOL);
+}
+
+/// The session's written bytes.
+fn tunnel_wire(state: &RefCell<FixtureTransportState>) -> Vec<u8> {
+    state.borrow().writes.concat()
+}
+
+/// Waits for the server's SETTINGS frame and returns the settings it carries.
+async fn advertised_settings(state: &RefCell<FixtureTransportState>) -> Vec<CodecSetting> {
+    complete_credit_wait(|| {
+        raw_frames(&tunnel_wire(state))
+            .iter()
+            .any(|frame| frame.frame_type == FrameType::SETTINGS.as_u8() && frame.flags == 0)
+    })
+    .await;
+    decode_server_frames_with_requests(&tunnel_wire(state), 0).settings
+}
+
+/// The owned driver advertises SETTINGS_ENABLE_CONNECT_PROTOCOL when its settings include it
+/// with value 1, and does not by default.
+#[test]
+fn owned_h2_advertises_enable_connect_protocol() {
+    for advertise in [true, false] {
+        run_on_worker(move |context| {
+            Box::pin(async move {
+                let (_, preface) = tunnel_client(None, None);
+                run_tunnel(
+                    context,
+                    vec![FixtureRead::Data(preface)],
+                    &[],
+                    |config| {
+                        if advertise {
+                            advertise_connect(config);
+                        }
+                    },
+                    |_, state| async move {
+                        let settings = advertised_settings(&state).await;
+                        let values: Vec<u64> = settings
+                            .iter()
+                            .filter(|setting| {
+                                setting.identifier == ENABLE_CONNECT_PROTOCOL.identifier
+                            })
+                            .map(|setting| setting.value)
+                            .collect();
+                        let expected: &[u64] = if advertise { &[1] } else { &[] };
+                        assert_eq!(values, expected, "advertised {settings:?}");
+                    },
+                )
+                .await;
+            })
+        });
+    }
+}
+
+/// An extended CONNECT request reaches the exchange as a CONNECT whose `upgrade_protocol` is
+/// the `:protocol` value, with its `:path`, `:scheme` and `:authority`, marked as an ingress
+/// WebSocket upgrade, and with its body still open.
+#[test]
+fn owned_h2_extended_connect_exposes_protocol_and_path() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (_, input) = tunnel_client(None, Some(&extended_connect_request()));
+            run_tunnel(
+                context,
+                vec![FixtureRead::Data(input)],
+                &[],
+                advertise_connect,
+                |probe, _| async move {
+                    complete_credit_wait(|| probe.request.borrow().is_some()).await;
+                    let mut request = probe.request.borrow_mut();
+                    let (head, eom) = request.as_mut().unwrap();
+                    assert!(!*eom, "the tunnel's request body stays open");
+                    assert_eq!(head.method().unwrap(), Some(HttpMethod::Connect));
+                    assert_eq!(head.upgrade_protocol(), Some(b"websocket".as_slice()));
+                    assert_eq!(head.path().unwrap(), b"/chat");
+                    assert!(head.is_secure(), ":scheme https");
+                    assert_eq!(
+                        head.headers().get_single_or_empty(HttpHeaderCode::Host),
+                        b"example.com"
+                    );
+                    assert!(head.is_ingress_websocket_upgrade());
+                },
+            )
+            .await;
+        })
+    });
+}
+
+/// Reads request body events until `length` bytes have arrived or the body ends, and returns
+/// the bytes and whether it ended.
+async fn read_tunnel_body(body: &mut HttpSourceHolder, length: usize) -> (Vec<u8>, bool) {
+    let mut bytes = Vec::new();
+    loop {
+        let event = body
+            .read_body_event(u32::MAX)
+            .await
+            .expect("the body reads");
+        if let Some(data) = event.as_body() {
+            let length = data.chain_length();
+            bytes.extend_from_slice(data.coalesce(length).unwrap().as_ref());
+        }
+        if event.eom() {
+            return (bytes, true);
+        }
+        if bytes.len() >= length {
+            return (bytes, false);
+        }
+    }
+}
+
+/// A client DATA frame on the tunnel's stream.
+fn tunnel_data(peer: &mut Http2Codec, bytes: &[u8], end_stream: bool) -> Vec<u8> {
+    eligibility_frame(
+        peer,
+        EgressFrame::Body {
+            stream: TUNNEL,
+            body: queue(bytes),
+            padding: None,
+            end_stream,
+        },
+    )
+}
+
+/// The payloads of the DATA frames written on the tunnel's stream, concatenated.
+fn tunnel_body(wire: &[u8]) -> Vec<u8> {
+    raw_frames(wire)
+        .into_iter()
+        .filter(|frame| frame.stream == 1 && frame.frame_type == FrameType::DATA.as_u8())
+        .flat_map(|frame| frame.payload)
+        .collect()
+}
+
+/// A 200 answer to an extended CONNECT with no content-length leaves the stream open in both
+/// directions: its HEADERS carry no END_STREAM, the client's later DATA reaches the request
+/// body, and the response's later DATA reaches the client, with no reset.
+#[test]
+fn owned_h2_connect_200_without_content_length_stays_open() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (mut peer, input) = tunnel_client(None, Some(&extended_connect_request()));
+            let send_data = Arc::new(tokio::sync::Notify::new());
+            let reads = vec![
+                FixtureRead::Data(input),
+                FixtureRead::WaitData(
+                    Arc::clone(&send_data),
+                    tunnel_data(&mut peer, b"ping", false),
+                ),
+            ];
+            let gates = [Arc::clone(&send_data)];
+            run_tunnel(
+                context,
+                reads,
+                &gates,
+                advertise_connect,
+                |probe, state| async move {
+                    complete_credit_wait(|| {
+                        !stream_frame_kinds(&tunnel_wire(&state), 1).is_empty()
+                    })
+                    .await;
+                    let wire = tunnel_wire(&state);
+                    assert_eq!(
+                        stream_frame_kinds(&wire, 1),
+                        [(FrameType::HEADERS.as_u8(), END_HEADERS)],
+                        "the 200 HEADERS do not end the stream"
+                    );
+                    let (_, _, _, fields) = decoded_header_blocks(&wire).remove(0);
+                    assert!(
+                        fields
+                            .iter()
+                            .any(|field| field.name.as_bytes() == b":status"
+                                && field.value.as_ref() == b"200")
+                    );
+                    assert!(
+                        !fields
+                            .iter()
+                            .any(|field| field.name.as_bytes() == b"content-length"),
+                        "the head carries no content-length"
+                    );
+
+                    send_data.notify_one();
+                    let mut body = probe.take_body();
+                    assert_eq!(
+                        read_tunnel_body(&mut body, 4).await,
+                        (b"ping".to_vec(), false)
+                    );
+                    probe.respond(Ok(HttpBodyEvent::body(queue(b"pong"), false)));
+                    complete_credit_wait(|| tunnel_body(&tunnel_wire(&state)) == b"pong").await;
+                    assert_eq!(
+                        stream_frame_kinds(&tunnel_wire(&state), 1),
+                        [
+                            (FrameType::HEADERS.as_u8(), END_HEADERS),
+                            (FrameType::DATA.as_u8(), 0),
+                        ],
+                        "no END_STREAM and no RST_STREAM"
+                    );
+                    assert!(probe.cancelled.borrow().is_empty());
+                    assert_eq!(probe.response_complete.get(), 0);
+                    assert_eq!(probe.dropped.get(), 0, "the exchange is still live");
+                    drop(body);
+                },
+            )
+            .await;
+        })
+    });
+}
+
+/// A client RST_STREAM on an established tunnel cancels its exchange as a peer reset, fails its
+/// request body, and is not echoed.
+#[test]
+fn owned_h2_connect_peer_rst_cancels_exchange() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (mut peer, input) = tunnel_client(None, Some(&extended_connect_request()));
+            let send_reset = Arc::new(tokio::sync::Notify::new());
+            let reset = eligibility_frame(
+                &mut peer,
+                EgressFrame::Reset {
+                    stream: TUNNEL,
+                    code: H2ErrorCode::CANCEL,
+                },
+            );
+            let reads = vec![
+                FixtureRead::Data(input),
+                FixtureRead::WaitData(Arc::clone(&send_reset), reset),
+            ];
+            let gates = [Arc::clone(&send_reset)];
+            run_tunnel(
+                context,
+                reads,
+                &gates,
+                advertise_connect,
+                |probe, state| async move {
+                    complete_credit_wait(|| {
+                        !stream_frame_kinds(&tunnel_wire(&state), 1).is_empty()
+                    })
+                    .await;
+                    send_reset.notify_one();
+                    complete_credit_wait(|| probe.dropped.get() == 1).await;
+                    assert_eq!(
+                        probe.cancelled.borrow().as_slice(),
+                        &[(HttpErrorCode::CANCEL, true)]
+                    );
+                    assert_eq!(probe.completed.get(), 0);
+                    assert_eq!(probe.response_complete.get(), 0);
+                    let mut body = probe.take_body();
+                    assert!(body.read_body_event(u32::MAX).await.is_err());
+                    assert_eq!(
+                        stream_frame_kinds(&tunnel_wire(&state), 1),
+                        [(FrameType::HEADERS.as_u8(), END_HEADERS)],
+                        "a peer reset is not echoed"
+                    );
+                },
+            )
+            .await;
+        })
+    });
+}
+
+/// Each side of a tunnel ends with its own END_STREAM, in either order: the request body ends
+/// at the client's END_STREAM, the response's last event writes the server's, and the
+/// exchange completes once both have happened, with no reset either way.
+#[test]
+fn owned_h2_connect_end_stream_each_direction() {
+    for client_first in [true, false] {
+        run_on_worker(move |context| {
+            Box::pin(async move {
+                let (mut peer, input) = tunnel_client(None, Some(&extended_connect_request()));
+                let send_end = Arc::new(tokio::sync::Notify::new());
+                let reads = vec![
+                    FixtureRead::Data(input),
+                    FixtureRead::WaitData(
+                        Arc::clone(&send_end),
+                        tunnel_data(&mut peer, b"up", true),
+                    ),
+                ];
+                let gates = [Arc::clone(&send_end)];
+                run_tunnel(
+                    context,
+                    reads,
+                    &gates,
+                    advertise_connect,
+                    |probe, state| async move {
+                        complete_credit_wait(|| {
+                            !stream_frame_kinds(&tunnel_wire(&state), 1).is_empty()
+                        })
+                        .await;
+                        let server_ended = || {
+                            stream_frame_kinds(&tunnel_wire(&state), 1).last()
+                                == Some(&(FrameType::DATA.as_u8(), END_STREAM))
+                        };
+                        let mut body = probe.take_body();
+                        if client_first {
+                            send_end.notify_one();
+                            assert_eq!(
+                                read_tunnel_body(&mut body, 2).await,
+                                (b"up".to_vec(), true)
+                            );
+                            assert_eq!(probe.completed.get(), 0, "the response is still open");
+                            probe.respond(Ok(HttpBodyEvent::body(queue(b"down"), true)));
+                        } else {
+                            probe.respond(Ok(HttpBodyEvent::body(queue(b"down"), true)));
+                            complete_credit_wait(|| {
+                                server_ended() && probe.response_complete.get() == 1
+                            })
+                            .await;
+                            assert_eq!(probe.completed.get(), 0, "the request is still open");
+                            send_end.notify_one();
+                            assert_eq!(
+                                read_tunnel_body(&mut body, 2).await,
+                                (b"up".to_vec(), true)
+                            );
+                        }
+                        complete_credit_wait(|| probe.completed.get() == 1).await;
+                        let wire = tunnel_wire(&state);
+                        assert!(server_ended());
+                        assert_eq!(tunnel_body(&wire), b"down");
+                        assert!(
+                            stream_frame_kinds(&wire, 1)
+                                .iter()
+                                .all(|(kind, _)| *kind != FrameType::RST_STREAM.as_u8()),
+                            "no reset: {:?}",
+                            stream_frame_kinds(&wire, 1)
+                        );
+                        assert!(probe.cancelled.borrow().is_empty());
+                        assert_eq!(probe.response_complete.get(), 1);
+                        drop(body);
+                    },
+                )
+                .await;
+            })
+        });
+    }
+}
+
+/// With the client's stream window at 0, the response's DATA is pending and the driver does
+/// not poll the exchange. Stopping the request body with CANCEL still resets the stream with
+/// RST_STREAM(CANCEL) and cancels the exchange, and the blocked DATA is never written.
+#[test]
+fn stop_reading_with_code_resets_stream_while_egress_blocked() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (_, input) = tunnel_client(Some(0), Some(&extended_connect_request()));
+            run_tunnel(
+                context,
+                vec![FixtureRead::Data(input)],
+                &[],
+                advertise_connect,
+                |probe, state| async move {
+                    complete_credit_wait(|| {
+                        !stream_frame_kinds(&tunnel_wire(&state), 1).is_empty()
+                    })
+                    .await;
+                    probe.respond(Ok(HttpBodyEvent::body(queue(b"blocked"), false)));
+                    complete_credit_wait(|| probe.response.borrow().is_empty()).await;
+                    let polls = probe.body_polls.get();
+                    settle_turns(16).await;
+                    assert_eq!(
+                        probe.body_polls.get(),
+                        polls,
+                        "the exchange is not polled while its DATA is pending"
+                    );
+                    assert!(
+                        tunnel_body(&tunnel_wire(&state)).is_empty(),
+                        "no stream credit"
+                    );
+
+                    let mut body = probe.take_body();
+                    body.stop_reading(Some(HttpErrorCode::CANCEL));
+                    complete_credit_wait(|| {
+                        !decode_server_frames(&tunnel_wire(&state)).resets.is_empty()
+                            && probe.dropped.get() == 1
+                    })
+                    .await;
+                    let wire = tunnel_wire(&state);
+                    assert_eq!(
+                        decode_server_frames(&wire).resets,
+                        [(TUNNEL, H2ErrorCode::CANCEL)]
+                    );
+                    assert_eq!(
+                        stream_frame_kinds(&wire, 1),
+                        [
+                            (FrameType::HEADERS.as_u8(), END_HEADERS),
+                            (FrameType::RST_STREAM.as_u8(), 0),
+                        ],
+                        "the reset replaces the blocked DATA"
+                    );
+                    assert_eq!(
+                        probe.cancelled.borrow().as_slice(),
+                        &[(HttpErrorCode::CANCEL, false)]
+                    );
+                    assert_eq!(probe.completed.get(), 0);
+                    drop(body);
+                },
+            )
+            .await;
+        })
+    });
+}
+
+/// A head that does not end the response, followed by a body poll that fails with NO_ERROR,
+/// writes HEADERS without END_STREAM and then RST_STREAM(NO_ERROR), with no DATA.
+#[test]
+fn headers_then_rst_no_error_sequence() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (_, input) = tunnel_client(None, Some(&extended_connect_request()));
+            run_tunnel(
+                context,
+                vec![FixtureRead::Data(input)],
+                &[],
+                advertise_connect,
+                |probe, state| async move {
+                    complete_credit_wait(|| {
+                        !stream_frame_kinds(&tunnel_wire(&state), 1).is_empty()
+                    })
+                    .await;
+                    probe.respond(Err(HttpError::with_message(
+                        HttpErrorCode::NO_ERROR,
+                        b"response ends after its head",
+                    )));
+                    complete_credit_wait(|| {
+                        !decode_server_frames(&tunnel_wire(&state)).resets.is_empty()
+                            && probe.dropped.get() == 1
+                    })
+                    .await;
+                    let wire = tunnel_wire(&state);
+                    assert_eq!(
+                        stream_frame_kinds(&wire, 1),
+                        [
+                            (FrameType::HEADERS.as_u8(), END_HEADERS),
+                            (FrameType::RST_STREAM.as_u8(), 0),
+                        ]
+                    );
+                    assert_eq!(
+                        decode_server_frames(&wire).resets,
+                        [(TUNNEL, H2ErrorCode::NO_ERROR)]
+                    );
+                    assert_eq!(
+                        probe.cancelled.borrow().as_slice(),
+                        &[(HttpErrorCode::NO_ERROR, false)]
+                    );
+                    assert_eq!(probe.completed.get(), 0);
+                },
+            )
+            .await;
+        })
+    });
+}
+
+/// An application that clears its open request body with NO_ERROR before its response's last
+/// event gets END_STREAM and then RST_STREAM(NO_ERROR), which stops the client's upload. A clear
+/// after the response's last event writes no RST_STREAM.
+#[test]
+fn final_response_before_request_end_resets_no_error() {
+    for clear_before_eom in [true, false] {
+        run_on_worker(move |context| {
+            Box::pin(async move {
+                let (mut peer, input) = tunnel_client(None, Some(&extended_connect_request()));
+                let send_ping = Arc::new(tokio::sync::Notify::new());
+                let ping = eligibility_frame(&mut peer, EgressFrame::PingRequest { data: Some(9) });
+                let reads = vec![
+                    FixtureRead::Data(input),
+                    FixtureRead::WaitData(Arc::clone(&send_ping), ping),
+                ];
+                let gates = [Arc::clone(&send_ping)];
+                run_tunnel(
+                    context,
+                    reads,
+                    &gates,
+                    advertise_connect,
+                    |probe, state| async move {
+                        complete_credit_wait(|| {
+                            !stream_frame_kinds(&tunnel_wire(&state), 1).is_empty()
+                        })
+                        .await;
+                        let mut body = probe.take_body();
+                        if clear_before_eom {
+                            body.clear(Some(HttpErrorCode::NO_ERROR));
+                            settle_turns(16).await;
+                            probe.respond(Ok(HttpBodyEvent::body(queue(b"done"), true)));
+                        } else {
+                            probe.respond(Ok(HttpBodyEvent::body(queue(b"done"), true)));
+                            complete_credit_wait(|| probe.response_complete.get() == 1).await;
+                            body.clear(Some(HttpErrorCode::NO_ERROR));
+                        }
+                        complete_credit_wait(|| probe.completed.get() == 1).await;
+                        send_ping.notify_one();
+                        complete_credit_wait(|| {
+                            decode_server_frames(&tunnel_wire(&state)).ping_replies == [9]
+                        })
+                        .await;
+                        let wire = tunnel_wire(&state);
+                        let mut expected = vec![
+                            (FrameType::HEADERS.as_u8(), END_HEADERS),
+                            (FrameType::DATA.as_u8(), END_STREAM),
+                        ];
+                        if clear_before_eom {
+                            expected.push((FrameType::RST_STREAM.as_u8(), 0));
+                            assert_eq!(
+                                decode_server_frames(&wire).resets,
+                                [(TUNNEL, H2ErrorCode::NO_ERROR)]
+                            );
+                        }
+                        assert_eq!(stream_frame_kinds(&wire, 1), expected);
+                        assert_eq!(tunnel_body(&wire), b"done");
+                        assert!(probe.cancelled.borrow().is_empty());
+                        assert_eq!(probe.response_complete.get(), 1);
+                    },
+                )
+                .await;
+            })
+        });
+    }
+}
+
+/// The driver takes a whole body event, up to its fixed allowance, whatever the peer's window.
+/// With the client's stream window at 4, a 16-byte event sends 4 bytes and leaves 12 pending.
+/// An end of message the exchange then makes ready, and wakes the driver for, is not polled
+/// until the client's WINDOW_UPDATE lets the pending DATA out. END_STREAM follows the last
+/// DATA byte.
+#[test]
+fn connect_eom_after_peer_window_closed_queues_end_stream_behind_data() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (mut peer, input) = tunnel_client(Some(4), Some(&extended_connect_request()));
+            let send_credit = Arc::new(tokio::sync::Notify::new());
+            let credit = eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: TUNNEL,
+                    amount: 12,
+                },
+            );
+            let reads = vec![
+                FixtureRead::Data(input),
+                FixtureRead::WaitData(Arc::clone(&send_credit), credit),
+            ];
+            let gates = [Arc::clone(&send_credit)];
+            run_tunnel(
+                context,
+                reads,
+                &gates,
+                advertise_connect,
+                |probe, state| async move {
+                    complete_credit_wait(|| {
+                        !stream_frame_kinds(&tunnel_wire(&state), 1).is_empty()
+                    })
+                    .await;
+                    probe.respond(Ok(HttpBodyEvent::body(queue(b"abcdefghijklmnop"), false)));
+                    complete_credit_wait(|| tunnel_body(&tunnel_wire(&state)) == b"abcd").await;
+                    settle_turns(16).await;
+                    let polls = probe.body_polls.get();
+                    probe.respond(Ok(HttpBodyEvent::body(queue(&[]), true)));
+                    settle_turns(16).await;
+                    assert_eq!(
+                        probe.body_polls.get(),
+                        polls,
+                        "no poll while DATA is pending"
+                    );
+                    assert_eq!(
+                        probe.response.borrow().len(),
+                        1,
+                        "the end of message waits in the application"
+                    );
+                    let ends = |wire: &[u8]| {
+                        stream_frame_kinds(wire, 1)
+                            .iter()
+                            .filter(|(_, flags)| flags & END_STREAM != 0)
+                            .count()
+                    };
+                    let wire = tunnel_wire(&state);
+                    assert_eq!(tunnel_body(&wire), b"abcd");
+                    assert_eq!(ends(&wire), 0, "END_STREAM waits for the client's credit");
+                    assert_eq!(probe.response_complete.get(), 0);
+
+                    send_credit.notify_one();
+                    complete_credit_wait(|| probe.response_complete.get() == 1).await;
+                    let wire = tunnel_wire(&state);
+                    let kinds = stream_frame_kinds(&wire, 1);
+                    assert_eq!(tunnel_body(&wire), b"abcdefghijklmnop");
+                    assert_eq!(ends(&wire), 1);
+                    assert_eq!(
+                        kinds.last(),
+                        Some(&(FrameType::DATA.as_u8(), END_STREAM)),
+                        "END_STREAM follows the pending DATA: {kinds:?}"
+                    );
+                    assert!(
+                        kinds
+                            .iter()
+                            .all(|(kind, _)| *kind != FrameType::RST_STREAM.as_u8())
+                    );
+                    assert!(probe.cancelled.borrow().is_empty());
+                },
+            )
+            .await;
+        })
+    });
+}

@@ -226,3 +226,7 @@ mod owned_deadlines_tests;
 #[cfg(test)]
 #[path = "../tests/owned_application.rs"]
 mod owned_application_tests;
+
+#[cfg(test)]
+#[path = "../tests/extended_connect.rs"]
+mod extended_connect_tests;
