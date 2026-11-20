@@ -10,8 +10,8 @@
 //! Every item in this module may change or be removed in any release.
 //!
 //! - [`StaticFiles`] serves the files under one directory from a per-worker cache that a `stat`
-//!   on every request keeps in step with the disk, with optional precompressed `.br` and `.gz`
-//!   siblings.
+//!   on every request keeps in step with the disk, unless a revalidation interval is set, with
+//!   optional precompressed `.br` and `.gz` siblings.
 
 mod static_files;
 

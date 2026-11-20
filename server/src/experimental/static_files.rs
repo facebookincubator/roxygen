@@ -19,6 +19,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -34,11 +35,13 @@ use roxygen_core::source_holder::HttpSourceHolder;
 /// Serves the files under one directory, keeping their contents in a cache.
 ///
 /// Each file that a request looks up is checked on disk with one `stat`, so a request that falls
-/// back past missing `.br` and `.gz` siblings costs up to three. A cached copy is served only
-/// while the file's device, inode, size, modification time and change time all still match the
-/// copy's, and a file is cached only once its change time is two seconds old, so that a rewrite
-/// within one timestamp tick cannot keep a cached copy's identity. A file that is replaced or
-/// rewritten is therefore read again by the next request.
+/// back past missing `.br` and `.gz` siblings costs up to three. A request can instead reuse the
+/// response built for an earlier one within a revalidation interval: see
+/// [`StaticFiles::with_revalidate_interval`]. A cached copy is served only while the file's
+/// device, inode, size, modification time and change time all still match the copy's, and a file
+/// is cached only once its change time is two seconds old, so that a rewrite within one timestamp
+/// tick cannot keep a cached copy's identity. A file that is replaced or rewritten is therefore
+/// read again by the next request.
 ///
 /// Files are read whole on the calling thread, so `StaticFiles` suits files on a local disk, and
 /// a file larger than the served limit is answered with an error. Only the URL path is checked:
@@ -55,7 +58,9 @@ pub struct StaticFiles {
     precompressed: bool,
     max_served_file: usize,
     settle: Duration,
+    revalidate: Duration,
     cache: RefCell<FileCache>,
+    responses: RefCell<ResponseCache>,
 }
 
 impl StaticFiles {
@@ -73,6 +78,8 @@ impl StaticFiles {
             precompressed: false,
             max_served_file: Self::DEFAULT_MAX_SERVED_FILE,
             settle: Duration::from_secs(2),
+            revalidate: Duration::ZERO,
+            responses: RefCell::new(ResponseCache::default()),
             cache: RefCell::new(FileCache {
                 entries: HashMap::new(),
                 bytes: 0,
@@ -85,6 +92,17 @@ impl StaticFiles {
     /// Serves `.br` and `.gz` siblings when the request accepts them.
     pub fn with_precompressed(mut self, enabled: bool) -> Self {
         self.precompressed = enabled;
+        self
+    }
+
+    /// Reuses a cached response for `interval` after its files were last checked on disk.
+    ///
+    /// A request for the same path whose `Accept-Encoding` allows the same precompressed
+    /// codings is then answered from the response built for the first one, without a `stat`, so a
+    /// file rewritten or removed within the interval can be served as it was. The default, zero,
+    /// checks the files for every request. Only responses whose contents are cached are reused.
+    pub fn with_revalidate_interval(mut self, interval: Duration) -> Self {
+        self.revalidate = interval;
         self
     }
 
@@ -124,28 +142,45 @@ impl StaticFiles {
         path: &[u8],
         accept_encoding: &[u8],
     ) -> Result<HttpSourceHolder, HttpError> {
+        if self.revalidate.is_zero() {
+            let found = self.lookup(path, accept_encoding)?;
+            let head = response_head(&found)?;
+            return fixed_response(head, found.body);
+        }
+        let codings = self.codings(accept_encoding);
+        let now = Instant::now();
+        let cached = self
+            .responses
+            .borrow()
+            .get(path, codings, now, self.revalidate);
+        if let Some((head, body)) = cached {
+            return fixed_response(head, body);
+        }
         let found = self.lookup(path, accept_encoding)?;
-        let mut head = HttpMessage::new();
-        head.set_status_code(found.status).map_err(internal)?;
-        head.set_status_message(HttpMessage::default_reason(found.status))
-            .map_err(internal)?;
-        head.set_http_version(1, 1);
-        let headers = head.headers_mut();
-        if let Some(content_type) = found.content_type {
-            headers.add(HttpHeaderCode::ContentType, content_type);
+        let mut head = response_head(&found)?;
+        if found.cached {
+            head.headers_mut().share_entries();
+            self.responses.borrow_mut().insert(
+                path,
+                codings,
+                CachedResponse {
+                    head: head.clone(),
+                    body: found.body.clone(),
+                    checked: now,
+                },
+            );
         }
-        if let Some(coding) = found.content_encoding {
-            headers.add(HttpHeaderCode::ContentEncoding, coding);
+        fixed_response(head, found.body)
+    }
+
+    /// The precompressed codings that `accept_encoding` allows, as an index into a path's
+    /// cached responses.
+    fn codings(&self, accept_encoding: &[u8]) -> usize {
+        if !self.precompressed {
+            return 0;
         }
-        if found.vary {
-            headers.add(HttpHeaderCode::Vary, b"Accept-Encoding");
-        }
-        let length = found.body.len();
-        let body = BufQueue::from_bytes(found.body, length).map_err(internal)?;
-        Ok(HttpSourceHolder::new(Box::new(HttpFixedSource::new(
-            head,
-            Some(body),
-        ))))
+        usize::from(accepts(accept_encoding, b"br"))
+            | usize::from(accepts(accept_encoding, b"gzip")) << 1
     }
 
     fn lookup(&self, path: &[u8], accept_encoding: &[u8]) -> Result<Found, HttpError> {
@@ -162,42 +197,46 @@ impl StaticFiles {
                 }
                 let mut sibling = file.clone().into_os_string();
                 sibling.push(suffix);
-                if let Some(body) = self.read(Path::new(&sibling))? {
+                if let Some((body, cached)) = self.read(Path::new(&sibling))? {
                     return Ok(Found {
                         status: 200,
                         content_type: Some(content_type),
                         content_encoding: Some(coding),
                         vary: true,
                         body,
+                        cached,
                     });
                 }
             }
         }
         Ok(match self.read(&file)? {
-            Some(body) => Found {
+            Some((body, cached)) => Found {
                 status: 200,
                 content_type: Some(content_type),
                 content_encoding: None,
                 vary: precompressed,
                 body,
+                cached,
             },
             None => Found::not_found(),
         })
     }
 
-    /// The contents of the regular file at `path`, or `None` when `path` does not name a regular
-    /// file.
-    fn read(&self, path: &Path) -> Result<Option<Bytes>, HttpError> {
+    /// The contents of the regular file at `path` and whether they are cached, or `None` when
+    /// `path` does not name a regular file.
+    fn read(&self, path: &Path) -> Result<Option<(Bytes, bool)>, HttpError> {
         let key = path.as_os_str().as_bytes();
         let identity = match fs::metadata(path) {
             Ok(metadata) if metadata.is_file() => FileIdentity::of(&metadata),
             _ => {
-                self.cache.borrow_mut().remove(key);
+                if self.cache.borrow_mut().remove(key) {
+                    self.responses.borrow_mut().clear();
+                }
                 return Ok(None);
             }
         };
         if let Some(body) = self.cache.borrow().get(key, identity) {
-            return Ok(Some(body));
+            return Ok(Some((body, true)));
         }
         let started = SystemTime::now();
         // Cache under the opened file's identity: the file can be replaced after the `stat` above.
@@ -219,15 +258,19 @@ impl StaticFiles {
             return Err(too_large());
         }
         let body = Bytes::from(contents);
+        // Responses built from an earlier version of this file, or from one the insertion below
+        // evicts, must not be reused.
+        self.responses.borrow_mut().clear();
         // A file that changed size while it was read is served but not cached, and so is a file
         // changed shortly before the read: a later write in the same timestamp tick would leave
         // its identity unchanged.
-        if body.len() as u64 == metadata.len() && settled(&metadata, started, self.settle) {
-            self.cache
+        let cached = body.len() as u64 == metadata.len()
+            && settled(&metadata, started, self.settle)
+            && self
+                .cache
                 .borrow_mut()
                 .insert(key, FileIdentity::of(&metadata), body.clone());
-        }
-        Ok(Some(body))
+        Ok(Some((body, cached)))
     }
 
     #[cfg(test)]
@@ -247,6 +290,7 @@ struct Found {
     content_encoding: Option<&'static [u8]>,
     vary: bool,
     body: Bytes,
+    cached: bool,
 }
 
 impl Found {
@@ -257,6 +301,7 @@ impl Found {
             content_encoding: None,
             vary: false,
             body: Bytes::new(),
+            cached: false,
         }
     }
 }
@@ -312,17 +357,21 @@ impl FileCache {
             .map(|cached| cached.body.clone())
     }
 
-    fn remove(&mut self, key: &[u8]) {
-        if let Some((key, cached)) = self.entries.remove_entry(key) {
-            self.bytes -= entry_cost(&key, cached.body.len());
-        }
+    /// Removes the entry for `key` and returns whether there was one.
+    fn remove(&mut self, key: &[u8]) -> bool {
+        let Some((key, cached)) = self.entries.remove_entry(key) else {
+            return false;
+        };
+        self.bytes -= entry_cost(&key, cached.body.len());
+        true
     }
 
-    fn insert(&mut self, key: &[u8], identity: FileIdentity, body: Bytes) {
+    /// Caches `body` under `key` and returns whether it fits the limits.
+    fn insert(&mut self, key: &[u8], identity: FileIdentity, body: Bytes) -> bool {
         self.remove(key);
         let cost = entry_cost(key, body.len());
         if body.len() > self.max_file || cost > self.limit {
-            return;
+            return false;
         }
         while self.bytes + cost > self.limit {
             let Some(evicted) = self.entries.keys().next().cloned() else {
@@ -333,7 +382,81 @@ impl FileCache {
         self.bytes += cost;
         self.entries
             .insert(key.into(), CachedFile { identity, body });
+        true
     }
+}
+
+/// A response that a request for the same path and codings can reuse.
+struct CachedResponse {
+    /// Shares its header entries with its clones.
+    head: HttpMessage,
+    body: Bytes,
+    /// When the response's files were last checked on disk.
+    checked: Instant,
+}
+
+/// The most paths with reusable responses. Inserting another path clears them all.
+const MAX_RESPONSE_PATHS: usize = 1024;
+
+/// Responses by request path, each indexed by the precompressed codings the request allows.
+/// The bodies are shared with the file cache, which is why any change to it clears this one.
+#[derive(Default)]
+struct ResponseCache {
+    entries: HashMap<Box<[u8]>, [Option<CachedResponse>; 4]>,
+}
+
+impl ResponseCache {
+    fn get(
+        &self,
+        path: &[u8],
+        codings: usize,
+        now: Instant,
+        interval: Duration,
+    ) -> Option<(HttpMessage, Bytes)> {
+        let cached = self.entries.get(path)?[codings].as_ref()?;
+        (now.saturating_duration_since(cached.checked) < interval)
+            .then(|| (cached.head.clone(), cached.body.clone()))
+    }
+
+    fn insert(&mut self, path: &[u8], codings: usize, response: CachedResponse) {
+        if self.entries.len() >= MAX_RESPONSE_PATHS && !self.entries.contains_key(path) {
+            self.entries.clear();
+        }
+        self.entries.entry(path.into()).or_default()[codings] = Some(response);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// The response head for `found`.
+fn response_head(found: &Found) -> Result<HttpMessage, HttpError> {
+    let mut head = HttpMessage::new();
+    head.set_status_code(found.status).map_err(internal)?;
+    head.set_status_message(HttpMessage::default_reason(found.status))
+        .map_err(internal)?;
+    head.set_http_version(1, 1);
+    let headers = head.headers_mut();
+    if let Some(content_type) = found.content_type {
+        headers.add(HttpHeaderCode::ContentType, content_type);
+    }
+    if let Some(coding) = found.content_encoding {
+        headers.add(HttpHeaderCode::ContentEncoding, coding);
+    }
+    if found.vary {
+        headers.add(HttpHeaderCode::Vary, b"Accept-Encoding");
+    }
+    Ok(head)
+}
+
+fn fixed_response(head: HttpMessage, body: Bytes) -> Result<HttpSourceHolder, HttpError> {
+    let length = body.len();
+    let body = BufQueue::from_bytes(body, length).map_err(internal)?;
+    Ok(HttpSourceHolder::new(Box::new(HttpFixedSource::new(
+        head,
+        Some(body),
+    ))))
 }
 
 /// Opens `path` and returns it with its `fstat`, or `None` when it no longer names a regular
@@ -725,6 +848,110 @@ mod tests {
             "a FIFO is opened without waiting for a writer and is not a regular file"
         );
         assert_eq!(get(&StaticFiles::new(&root.0), "pipe.txt", "").status, 404);
+    }
+
+    /// The `Content-Encoding` and the whole body of the response for `path`.
+    fn fetch(
+        runtime: &tokio::runtime::Runtime,
+        files: &StaticFiles,
+        path: &str,
+        accept_encoding: &str,
+    ) -> (Vec<u8>, Vec<u8>) {
+        runtime.block_on(async {
+            let mut source = files
+                .respond(path.as_bytes(), accept_encoding.as_bytes())
+                .unwrap();
+            let head = source.read_header_event().await.unwrap();
+            let coding = head
+                .headers()
+                .headers()
+                .get_single_or_empty(HttpHeaderCode::ContentEncoding)
+                .to_vec();
+            let mut body = Vec::new();
+            loop {
+                let event = source.read_body_event(u32::MAX).await.unwrap();
+                if let Some(data) = event.as_body() {
+                    body.extend_from_slice(&data.coalesce(usize::MAX).unwrap());
+                }
+                if event.eom() {
+                    break;
+                }
+            }
+            (coding, body)
+        })
+    }
+
+    fn current_thread() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn revalidate_interval_reuses_the_response_until_it_ends() {
+        let root = Root::new();
+        root.write("note.txt", b"first");
+        let runtime = current_thread();
+        let reused = StaticFiles::new(&root.0)
+            .with_settle(Duration::ZERO)
+            .with_revalidate_interval(Duration::from_secs(3600));
+        let checked = StaticFiles::new(&root.0).with_settle(Duration::ZERO);
+        let expiring = StaticFiles::new(&root.0)
+            .with_settle(Duration::ZERO)
+            .with_revalidate_interval(Duration::from_millis(20));
+        for files in [&reused, &checked, &expiring] {
+            assert_eq!(fetch(&runtime, files, "note.txt", "").1, b"first");
+        }
+
+        root.write("note.txt", b"second version");
+        assert_eq!(
+            fetch(&runtime, &reused, "note.txt", "").1,
+            b"first",
+            "within the interval the earlier response is reused without checking the file"
+        );
+        assert_eq!(
+            fetch(&runtime, &checked, "note.txt", "").1,
+            b"second version",
+            "without an interval every request checks the file"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(
+            fetch(&runtime, &expiring, "note.txt", "").1,
+            b"second version",
+            "after the interval the file is checked again"
+        );
+    }
+
+    #[test]
+    fn revalidate_interval_keeps_one_response_per_accepted_codings() {
+        let root = Root::new();
+        root.write("app.js", b"plain");
+        root.write("app.js.br", b"brotli");
+        root.write("app.js.gz", b"gzipped");
+        let runtime = current_thread();
+        let files = StaticFiles::new(&root.0)
+            .with_precompressed(true)
+            .with_settle(Duration::ZERO)
+            .with_revalidate_interval(Duration::from_secs(3600));
+        for _ in 0..2 {
+            assert_eq!(
+                fetch(&runtime, &files, "app.js", "br;q=1, gzip;q=0.8"),
+                (b"br".to_vec(), b"brotli".to_vec())
+            );
+            assert_eq!(
+                fetch(&runtime, &files, "app.js", "gzip"),
+                (b"gzip".to_vec(), b"gzipped".to_vec())
+            );
+            assert_eq!(
+                fetch(&runtime, &files, "app.js", ""),
+                (Vec::new(), b"plain".to_vec())
+            );
+        }
+        let missing = runtime.block_on(async {
+            let mut source = files.respond(b"none.js", b"br").unwrap();
+            source.read_header_event().await.unwrap()
+        });
+        assert_eq!(missing.headers().response_status(), Some(404));
     }
 
     #[test]
