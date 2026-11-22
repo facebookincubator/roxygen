@@ -15,6 +15,7 @@ members = [
   "core",
   "curl",
   "examples",
+  "qpack",
   "runtime",
   "server",
   "session",

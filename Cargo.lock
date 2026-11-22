@@ -661,6 +661,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferroxygen_qpack"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror",
+]
+
+[[package]]
 name = "ferroxygen_runtime"
 version = "0.1.0"
 dependencies = [
