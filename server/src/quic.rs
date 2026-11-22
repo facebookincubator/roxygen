@@ -27,6 +27,7 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::future::Future;
 use std::io;
+use std::io::Write;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
@@ -34,6 +35,7 @@ use std::panic::catch_unwind;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
@@ -44,6 +46,7 @@ use mvfstr_driver::Conn;
 use mvfstr_driver::ConnInfo;
 use mvfstr_driver::EndpointDriver;
 use mvfstr_driver::EndpointHandle;
+use mvfstr_driver::EndpointStats;
 use mvfstr_driver::QuicApplication;
 use mvfstr_driver::QuicSession;
 use mvfstr_driver::Refusal;
@@ -134,6 +137,9 @@ pub struct QuicListenerConfig {
     /// where it refuses the steering program (SO_ATTACH_REUSEPORT_CBPF, from Linux 4.5), since a
     /// handed-off connection would break without it; turn this off to serve there.
     pub steering: bool,
+    /// Where the workers' drivers log their counters at shutdown, in place of stderr.
+    #[cfg(test)]
+    pub(crate) shutdown_log: ShutdownLog,
 }
 
 impl QuicListenerConfig {
@@ -148,9 +154,15 @@ impl QuicListenerConfig {
             send_buffer: None,
             drain_grace: Duration::MAX,
             steering: true,
+            #[cfg(test)]
+            shutdown_log: Arc::new(Mutex::new(io::stderr())),
         }
     }
 }
+
+/// Where a worker's QUIC drivers log their counters at shutdown: stderr, since roxygen_server does
+/// not depend on a logging crate, or a test's buffer.
+pub(crate) type ShutdownLog = Arc<Mutex<dyn Write + Send>>;
 
 /// The TLS settings of a QUIC listener.
 pub enum QuicTls {
@@ -183,6 +195,8 @@ struct QuicShared {
     drain_grace: Duration,
     /// For each address with steering, the group its drivers share; empty without steering.
     steering: Vec<Arc<Steering>>,
+    /// Where the drivers log their counters at shutdown.
+    log: ShutdownLog,
     /// A duplicate of every worker's socket, which keeps each socket in its port's SO_REUSEPORT
     /// group until every worker has ended. A socket that left the group would move flows of the
     /// others to sockets whose workers drop the packets of connections they do not serve.
@@ -279,6 +293,10 @@ impl QuicBinding {
                 },
                 drain_grace: config.drain_grace,
                 steering: groups,
+                #[cfg(test)]
+                log: config.shutdown_log,
+                #[cfg(not(test))]
+                log: Arc::new(Mutex::new(io::stderr())),
                 _group: group,
             }),
         })
@@ -301,6 +319,15 @@ impl QuicBinding {
                 count,
             })
     }
+}
+
+/// Formats the line a worker's QUIC driver on `address` logs at shutdown with its counters.
+fn shutdown_report(worker: usize, address: SocketAddr, stats: &EndpointStats) -> String {
+    format!(
+        "roxygen_server: QUIC worker {worker} on {address}: {} turns, {} packets and {} \
+         datagrams sent",
+        stats.turns, stats.sent_packets, stats.sent_datagrams
+    )
 }
 
 fn quic_error(error: impl std::fmt::Display) -> HttpServerError {
@@ -349,9 +376,14 @@ pub(crate) struct WorkerQuicInputs<'a> {
     pub serial: Rc<Cell<u64>>,
 }
 
-/// A worker's QUIC drivers: one per address.
+/// A worker's QUIC drivers: one per address. Each logs its counters when the worker ends, so a
+/// benchmark can relate requests to the turns, packets and datagrams that served them.
 pub(crate) struct WorkerQuic {
     drivers: Vec<EndpointHandle<ServerQuicApp, MmsgBackend>>,
+    /// Each driver's socket address.
+    addresses: Vec<SocketAddr>,
+    /// The worker's index.
+    index: usize,
     tracker: Rc<Tracker>,
     /// The shared configs and the socket group, held until the worker ends.
     shared: Arc<QuicShared>,
@@ -383,6 +415,7 @@ impl WorkerQuic {
             serial: inputs.serial,
         });
         let mut drivers = Vec::with_capacity(config.sockets.len());
+        let mut addresses = Vec::with_capacity(config.sockets.len());
         for (address, socket) in config.sockets.into_iter().enumerate() {
             let backend = MmsgBackend::from_socket(socket, &config.shared.options)
                 .map_err(|error| error.to_string())?;
@@ -404,9 +437,12 @@ impl WorkerQuic {
                 .spawn(inputs.context)
                 .map_err(|error| error.to_string())?;
             drivers.push(handle);
+            addresses.push(local);
         }
         Ok(Self {
             drivers,
+            addresses,
+            index: inputs.index,
             tracker,
             shared: config.shared,
         })
@@ -430,6 +466,22 @@ impl WorkerQuic {
     /// Resolves once every driver has ended and dropped its sessions.
     pub(crate) fn finished(&self) -> impl Future<Output = ()> + '_ {
         std::future::poll_fn(|cx| self.tracker.poll_finished(cx))
+    }
+}
+
+impl Drop for WorkerQuic {
+    fn drop(&mut self) {
+        // The handles keep a finished driver's last counters. A line that fails to write, as to
+        // a closed stderr pipe, is lost rather than panicking a worker that may be unwinding.
+        let mut log = self
+            .shared
+            .log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (driver, &address) in self.drivers.iter().zip(&self.addresses) {
+            let line = shutdown_report(self.index, address, &driver.stats());
+            let _ = writeln!(log, "{line}");
+        }
     }
 }
 
@@ -961,6 +1013,19 @@ mod tests {
             .map(|_| receiver(&sockets, addr, &short_header(0)))
             .collect();
         assert!(receivers.len() > 1, "every datagram reached {receivers:?}");
+    }
+
+    #[test]
+    fn a_drivers_shutdown_report_names_its_worker_turns_packets_and_datagrams() {
+        let mut stats = EndpointStats::default();
+        stats.turns = 7;
+        stats.sent_packets = 40;
+        stats.sent_datagrams = 30;
+        assert_eq!(
+            shutdown_report(3, SocketAddr::from((Ipv4Addr::LOCALHOST, 8443)), &stats),
+            "roxygen_server: QUIC worker 3 on 127.0.0.1:8443: 7 turns, 40 packets and 30 \
+             datagrams sent"
+        );
     }
 
     #[test]

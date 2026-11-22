@@ -300,6 +300,142 @@ fn every_quic_address_serves_http3() {
     client.shutdown();
 }
 
+/// A driver's shutdown line: the worker, the address, then the turns, packets and datagrams.
+type ShutdownLine = (usize, SocketAddr, u64, u64, u64);
+
+fn shutdown_line(line: &str) -> Option<ShutdownLine> {
+    let rest = line.strip_prefix("roxygen_server: QUIC worker ")?;
+    let (worker, rest) = rest.split_once(" on ")?;
+    let (address, rest) = rest.split_once(": ")?;
+    let (turns, rest) = rest.split_once(" turns, ")?;
+    let (packets, rest) = rest.split_once(" packets and ")?;
+    let datagrams = rest.strip_suffix(" datagrams sent")?;
+    Some((
+        worker.parse().ok()?,
+        address.parse().ok()?,
+        turns.parse().ok()?,
+        packets.parse().ok()?,
+        datagrams.parse().ok()?,
+    ))
+}
+
+/// Returns what a shutdown log kept, as text.
+fn logged(log: &Mutex<Vec<u8>>) -> String {
+    let bytes = log.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    String::from_utf8(bytes.clone()).expect("the log is UTF-8")
+}
+
+#[test]
+fn each_worker_logs_the_counters_of_its_quic_drivers_at_shutdown() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let addresses = vec![
+        free_udp_address(),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+    ];
+    let quic = QuicListenerConfig {
+        shutdown_log: log.clone(),
+        ..quic_listener(addresses)
+    };
+    let server = start(quic, 2);
+    let bound = server.quic_addresses().to_vec();
+    let client = H3Client::new();
+    for &addr in &bound {
+        let response = client.connect(addr).fetch(Request::get("/"));
+        assert_eq!(response.status, 200, "{addr}");
+    }
+    server.force_stop().expect("the server stops");
+    client.shutdown();
+
+    let text = logged(&log);
+    let lines: Vec<ShutdownLine> = text
+        .lines()
+        .map(|line| shutdown_line(line).unwrap_or_else(|| panic!("a shutdown line: {line:?}")))
+        .collect();
+    let drivers: BTreeSet<(usize, SocketAddr)> = lines
+        .iter()
+        .map(|&(worker, address, ..)| (worker, address))
+        .collect();
+    let expected: BTreeSet<(usize, SocketAddr)> = (0..2)
+        .flat_map(|worker| bound.iter().map(move |&address| (worker, address)))
+        .collect();
+    assert_eq!(
+        (lines.len(), drivers),
+        (expected.len(), expected),
+        "one line for each worker's driver on each address: {text:?}"
+    );
+    // Each address served a request, so its drivers' last counters, summed over the workers,
+    // show turns and sends, and every datagram carries at least one packet.
+    for &addr in &bound {
+        let (turns, packets, datagrams) = lines
+            .iter()
+            .filter(|&&(_, address, ..)| address == addr)
+            .fold(
+                (0, 0, 0),
+                |(t, p, d), &(_, _, turns, packets, datagrams)| {
+                    (t + turns, p + packets, d + datagrams)
+                },
+            );
+        assert!(
+            turns > 0 && datagrams > 0 && packets >= datagrams,
+            "the counters of the drivers on {addr}: {text:?}"
+        );
+    }
+}
+
+/// A shutdown log whose first write fails, as a write to a pipe whose reader went away does; it
+/// keeps what the later writes carry.
+struct BrokenOnce {
+    failed: bool,
+    kept: Arc<Mutex<Vec<u8>>>,
+}
+
+impl io::Write for BrokenOnce {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !std::mem::replace(&mut self.failed, true) {
+            return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+        }
+        self.kept
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_shutdown_line_that_fails_to_write_is_lost_without_failing_the_worker() {
+    let kept = Arc::new(Mutex::new(Vec::new()));
+    let addresses = vec![
+        free_udp_address(),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+    ];
+    let quic = QuicListenerConfig {
+        shutdown_log: Arc::new(Mutex::new(BrokenOnce {
+            failed: false,
+            kept: Arc::clone(&kept),
+        })),
+        ..quic_listener(addresses)
+    };
+    let server = start(quic, 1);
+    let second = server.quic_addresses()[1];
+    let stopped = server.force_stop();
+
+    let text = logged(&kept);
+    assert!(
+        matches!(stopped, Ok(true)),
+        "the server stops cleanly: {stopped:?}; the log kept {text:?}"
+    );
+    let lines: Vec<ShutdownLine> = text.lines().filter_map(shutdown_line).collect();
+    assert!(
+        matches!(lines[..], [(0, address, ..)] if address == second),
+        "the first driver's line is lost and the second's still written: {text:?}"
+    );
+}
+
 #[test]
 fn a_post_over_http3_delivers_its_body_to_the_handler() {
     let addr = free_udp_address();
