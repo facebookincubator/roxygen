@@ -464,7 +464,8 @@ fn response_head(found: &Found) -> Result<HttpMessage, HttpError> {
         headers.add(HttpHeaderCode::ContentEncoding, coding);
     }
     if found.vary {
-        headers.add(HttpHeaderCode::Vary, b"Accept-Encoding");
+        // Lowercase as in the QPACK static table, where it is a full match.
+        headers.add(HttpHeaderCode::Vary, b"accept-encoding");
     }
     Ok(head)
 }
@@ -1069,7 +1070,7 @@ mod tests {
             [
                 (b"Content-Type".to_vec(), b"application/javascript".to_vec()),
                 (b"Content-Encoding".to_vec(), b"gzip".to_vec()),
-                (b"Vary".to_vec(), b"Accept-Encoding".to_vec()),
+                (b"Vary".to_vec(), b"accept-encoding".to_vec()),
                 (b"Content-Length".to_vec(), b"7".to_vec()),
             ]
         );
@@ -1130,7 +1131,7 @@ mod tests {
             );
             assert_eq!(
                 headers.get_single_or_empty(HttpHeaderCode::Vary),
-                b"Accept-Encoding"
+                b"accept-encoding"
             );
 
             let mut missing = files.respond(b"none.html", b"").unwrap();

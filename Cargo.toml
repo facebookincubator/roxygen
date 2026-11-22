@@ -11,6 +11,7 @@ members = [
   "codec",
   "codec/http1",
   "codec/http2",
+  "codec/huffman",
   "connect",
   "core",
   "curl",

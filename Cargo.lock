@@ -640,6 +640,7 @@ dependencies = [
  "bytes",
  "ferroxygen_codec",
  "ferroxygen_core",
+ "ferroxygen_huffman",
  "foldhash",
  "thiserror",
 ]
@@ -656,6 +657,10 @@ dependencies = [
  "http",
  "thiserror",
 ]
+
+[[package]]
+name = "ferroxygen_huffman"
+version = "0.1.0"
 
 [[package]]
 name = "ferroxygen_hyper_adapter"
@@ -677,6 +682,7 @@ name = "ferroxygen_qpack"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "ferroxygen_huffman",
  "thiserror",
 ]
 

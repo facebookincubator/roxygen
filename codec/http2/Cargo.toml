@@ -27,6 +27,7 @@ name = "roxygen_http2"
 bytes = "1.12.1"
 ferroxygen_codec = { version = "0.1.0", path = ".." }
 ferroxygen_core = { version = "0.1.0", path = "../../core" }
+ferroxygen_huffman = { version = "0.1.0", path = "../huffman" }
 foldhash = "0.2.0"
 thiserror = "2.0.21"
 

@@ -301,7 +301,7 @@ fn static_files_answer_through_respond_now_with_the_precompressed_sibling() {
         field(&brotli, "content-type").as_deref(),
         Some("application/javascript")
     );
-    assert_eq!(field(&brotli, "vary").as_deref(), Some("Accept-Encoding"));
+    assert_eq!(field(&brotli, "vary").as_deref(), Some("accept-encoding"));
     assert_eq!(field(&brotli, "content-length").as_deref(), Some("6"));
 
     let plain = conn.fetch(Request::get("/app.js"));
