@@ -613,6 +613,11 @@ name = "ferroxygen_h3"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "ferroxygen_core",
+ "ferroxygen_qpack",
+ "ferroxygen_runtime",
+ "ferroxygen_session",
+ "thiserror",
 ]
 
 [[package]]
