@@ -12,7 +12,9 @@
 //! worker starts. Each worker runs an mvfstr endpoint driver on its sockets and serves every
 //! connection with a `roxygen_h3` session that hosts the worker's application: the worker's
 //! `HttpHandler`, or an owned application's connection through
-//! [`OwnedConnectionFactory::attach_http3`](crate::OwnedConnectionFactory::attach_http3).
+//! [`OwnedConnectionFactory::attach_http3`](crate::OwnedConnectionFactory::attach_http3). With
+//! steering, the kernel delivers each datagram to the worker its connection ID names and the
+//! drivers of an address hand new connections round the workers in turn.
 //!
 //! QUIC connections go through the connection filter and both connection observers as TCP ones do,
 //! but these TCP features do not apply to them: [`AcceptStats`](crate::AcceptStats),
@@ -46,6 +48,7 @@ use mvfstr_driver::QuicApplication;
 use mvfstr_driver::QuicSession;
 use mvfstr_driver::Refusal;
 use mvfstr_driver::SendSink;
+use mvfstr_driver::Steering;
 use mvfstr_io::MmsgBackend;
 use mvfstr_io::MmsgOptions;
 use mvfstr_io::SocketOptions;
@@ -123,6 +126,14 @@ pub struct QuicListenerConfig {
     /// How long a drain lets QUIC connections finish their exchanges before closing them with
     /// NO_ERROR. Default unbounded, as for TCP connections.
     pub drain_grace: Duration,
+    /// Whether new connections spread evenly over the workers, when there is more than one. The
+    /// kernel then delivers each datagram to the worker its connection ID names, and the worker
+    /// that receives a client's first Initial hands it to the next worker in turn. Without it the
+    /// kernel picks a worker by a hash of the client's address, which can leave some workers idle
+    /// while others serve several connections. Default on. Binding fails with the kernel's error
+    /// where it refuses the steering program (SO_ATTACH_REUSEPORT_CBPF, from Linux 4.5), since a
+    /// handed-off connection would break without it; turn this off to serve there.
+    pub steering: bool,
 }
 
 impl QuicListenerConfig {
@@ -136,6 +147,7 @@ impl QuicListenerConfig {
             recv_buffer: None,
             send_buffer: None,
             drain_grace: Duration::MAX,
+            steering: true,
         }
     }
 }
@@ -169,6 +181,8 @@ struct QuicShared {
     h3: H3ApplicationBuilder,
     options: MmsgOptions,
     drain_grace: Duration,
+    /// For each address with steering, the group its drivers share; empty without steering.
+    steering: Vec<Arc<Steering>>,
     /// A duplicate of every worker's socket, which keeps each socket in its port's SO_REUSEPORT
     /// group until every worker has ended. A socket that left the group would move flows of the
     /// others to sockets whose workers drop the packets of connections they do not serve.
@@ -216,9 +230,12 @@ impl QuicBinding {
         } else {
             &config.bind_addresses
         };
+        let count = u16::try_from(workers).map_err(quic_error)?;
+        let steering = config.steering && workers > 1;
         let mut sockets: Vec<Vec<Socket>> = (0..workers).map(|_| Vec::new()).collect();
         let mut group = Vec::with_capacity(workers * requested.len());
         let mut addresses = Vec::with_capacity(requested.len());
+        let mut groups = Vec::new();
         for &address in requested {
             // The first socket settles a port the system picks; the others share it.
             let first = mvfstr_io::socket::open(address, None, &socket)?;
@@ -237,6 +254,16 @@ impl QuicBinding {
                 group.push(socket.try_clone()?);
                 worker.push(socket);
             }
+            // The kernel numbers a group's sockets in the order they bound, and these bound one
+            // after another on this thread before any worker started, worker 0's first, so the
+            // socket at index `i` is worker `i`'s, as the steering program needs, unless another
+            // socket already held the port with SO_REUSEPORT, as one of an overlapping process can
+            // on an explicit port. A failed bind fails the whole listener, so a group is never
+            // short of a socket, and `_group` keeps each in the group until every worker has ended.
+            if steering && let Some(first) = sockets.first().and_then(|worker| worker.last()) {
+                mvfstr_io::socket::steer_by_connection_id(first, count)?;
+                groups.push(Steering::new(count));
+            }
             addresses.push(bound);
         }
         Ok(Self {
@@ -251,6 +278,7 @@ impl QuicBinding {
                     ..MmsgOptions::default()
                 },
                 drain_grace: config.drain_grace,
+                steering: groups,
                 _group: group,
             }),
         })
@@ -355,7 +383,7 @@ impl WorkerQuic {
             serial: inputs.serial,
         });
         let mut drivers = Vec::with_capacity(config.sockets.len());
-        for socket in config.sockets {
+        for (address, socket) in config.sockets.into_iter().enumerate() {
             let backend = MmsgBackend::from_socket(socket, &config.shared.options)
                 .map_err(|error| error.to_string())?;
             let local = backend.local_addr().map_err(|error| error.to_string())?;
@@ -364,13 +392,17 @@ impl WorkerQuic {
                 local,
                 _driver: tracker.driver(),
             };
-            let handle =
+            let mut builder =
                 EndpointDriver::<_, MmsgBackend>::builder(Arc::clone(&config.shared.endpoint), app)
                     .serve(backend, Arc::clone(&config.shared.server))
                     .worker(index, count)
-                    .backend_options(config.shared.options.clone())
-                    .spawn(inputs.context)
-                    .map_err(|error| error.to_string())?;
+                    .backend_options(config.shared.options.clone());
+            if let Some(group) = config.shared.steering.get(address) {
+                builder = builder.steering(Arc::clone(group));
+            }
+            let handle = builder
+                .spawn(inputs.context)
+                .map_err(|error| error.to_string())?;
             drivers.push(handle);
         }
         Ok(Self {
@@ -799,8 +831,12 @@ pub struct Http3Attached {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::mem::MaybeUninit;
     use std::net::Ipv4Addr;
     use std::net::Ipv6Addr;
+    use std::net::UdpSocket;
+    use std::os::fd::AsRawFd;
 
     use bytes::Bytes;
     use socket2::Domain;
@@ -855,6 +891,76 @@ mod tests {
         for socket in binding.sockets.iter().flatten() {
             assert_eq!(sizes(socket), sizes(&reference), "SO_RCVBUF and SO_SNDBUF");
         }
+    }
+
+    /// Sends `datagram` to `addr` from a socket of its own, so each call is a new flow for the
+    /// kernel's hash, and returns the index of the socket in `sockets` that received it.
+    fn receiver(sockets: &[&Socket], addr: SocketAddr, datagram: &[u8]) -> usize {
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a socket");
+        sender
+            .send_to(datagram, addr)
+            .expect("the datagram goes out");
+        let mut ready: Vec<libc::pollfd> = sockets
+            .iter()
+            .map(|socket| libc::pollfd {
+                fd: socket.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        // SAFETY: `ready` is a live array of `pollfd`s of the length passed; the timeout only
+        // guards against a hang.
+        let n = unsafe { libc::poll(ready.as_mut_ptr(), ready.len() as libc::nfds_t, 20_000) };
+        assert_eq!(n, 1, "exactly one socket receives the datagram");
+        let index = ready
+            .iter()
+            .position(|fd| fd.revents & libc::POLLIN != 0)
+            .expect("a readable socket");
+        let mut buf = [MaybeUninit::uninit(); 2048];
+        sockets[index].recv(&mut buf).expect("the datagram reads");
+        index
+    }
+
+    /// Builds a short header whose destination connection ID starts with `first`.
+    fn short_header(first: u8) -> Vec<u8> {
+        let mut datagram = vec![0x40, first];
+        datagram.resize(30, 0xee);
+        datagram
+    }
+
+    #[test]
+    fn each_workers_socket_joins_its_group_in_worker_order_and_gets_its_connection_ids() {
+        const WORKERS: usize = 4;
+        let config = listener(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+        let binding = QuicBinding::bind(config, &[], WORKERS).expect("the listener binds");
+        let addr = binding.addresses()[0];
+        let sockets: Vec<&Socket> = binding.sockets.iter().map(|worker| &worker[0]).collect();
+        // Each from a socket of its own, so the kernel's hash alone would scatter them.
+        for first in 0..32 {
+            assert_eq!(
+                receiver(&sockets, addr, &short_header(first)),
+                usize::from(first) % WORKERS,
+                "a connection ID that starts with {first}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listener_without_steering_leaves_the_choice_of_worker_to_the_kernels_hash() {
+        const WORKERS: usize = 4;
+        let config = QuicListenerConfig {
+            steering: false,
+            ..listener(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        };
+        let binding = QuicBinding::bind(config, &[], WORKERS).expect("the listener binds");
+        let addr = binding.addresses()[0];
+        let sockets: Vec<&Socket> = binding.sockets.iter().map(|worker| &worker[0]).collect();
+        // Steered, all would reach worker 0; hashed, 16 flows all landing on one socket of 4 has
+        // odds of about 1 in 10^9.
+        let receivers: BTreeSet<usize> = (0..16)
+            .map(|_| receiver(&sockets, addr, &short_header(0)))
+            .collect();
+        assert!(receivers.len() > 1, "every datagram reached {receivers:?}");
     }
 
     #[test]

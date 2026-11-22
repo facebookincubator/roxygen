@@ -475,6 +475,42 @@ fn many_concurrent_requests_on_several_connections_spread_over_the_workers() {
     client.shutdown();
 }
 
+#[test]
+fn new_connections_spread_exactly_evenly_over_the_workers() {
+    const WORKERS: usize = 4;
+    const CONNECTIONS: usize = 16;
+    let addr = free_udp_address();
+    let config = ServerConfig {
+        num_io_threads: WORKERS,
+        shutdown_on_signals: Vec::new(),
+        quic: Some(quic_listener(vec![addr])),
+        ..ServerConfig::default()
+    };
+    let handlers: crate::server::HandlerFactory =
+        Arc::new(|index| Rc::new(WorkerIndex(index)) as HttpHandlerRef);
+    let server = HttpServer::start(config, handlers, None).expect("the server starts");
+    let client = H3Client::new();
+    // Each connection has a UDP socket of its own, which the kernel's hash alone would spread
+    // unevenly.
+    let conns: Vec<_> = (0..CONNECTIONS).map(|_| client.connect(addr)).collect();
+    let mut served = [0; WORKERS];
+    for conn in &conns {
+        let response = conn.fetch(Request::get("/"));
+        let worker: usize = String::from_utf8(response.body)
+            .ok()
+            .and_then(|body| body.parse().ok())
+            .expect("a worker index");
+        served[worker] += 1;
+    }
+    assert_eq!(
+        served,
+        [CONNECTIONS / WORKERS; WORKERS],
+        "connections served per worker"
+    );
+    server.force_stop().expect("the server stops");
+    client.shutdown();
+}
+
 /// A handler that counts the requests whose heads arrived and answers each only once released.
 struct Held {
     started: Arc<AtomicUsize>,
