@@ -80,7 +80,7 @@
 //! ```
 
 pub mod body_event_queue;
-pub mod buf_queue;
+pub use roxygen_bufqueue as buf_queue;
 pub mod byte_event;
 pub mod connection;
 pub mod egress_state;
@@ -172,10 +172,6 @@ mod http_priority_tests;
 #[cfg(test)]
 #[path = "../tests/rfc2616.rs"]
 mod rfc2616_tests;
-
-#[cfg(test)]
-#[path = "../tests/segmented_buffer.rs"]
-mod segmented_buffer_tests;
 
 #[cfg(test)]
 #[path = "../tests/source_events.rs"]

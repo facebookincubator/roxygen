@@ -455,6 +455,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferroxygen_bufqueue"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror",
+]
+
+[[package]]
 name = "ferroxygen_client"
 version = "0.1.0"
 dependencies = [
@@ -536,6 +544,7 @@ name = "ferroxygen_core"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "ferroxygen_bufqueue",
  "ferroxygen_runtime",
  "thiserror",
  "tokio",

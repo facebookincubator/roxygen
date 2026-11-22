@@ -6,6 +6,7 @@ members = [
   "adapters/hyper",
   "adapters/tower",
   "adapters/tower/axum_fixture",
+  "bufqueue",
   "client",
   "codec",
   "codec/http1",
