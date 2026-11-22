@@ -137,6 +137,8 @@ pub mod connection;
 pub mod expect_continue;
 pub mod experimental;
 pub mod owned_application;
+#[cfg(all(target_os = "linux", feature = "http3"))]
+pub mod quic;
 pub mod scoped_server;
 pub mod server;
 pub mod shutdown;
@@ -151,6 +153,14 @@ pub use owned_application::OwnedConnectionControl;
 pub use owned_application::OwnedConnectionFactory;
 pub use owned_application::StopAbandon;
 pub use owned_application::WorkerView;
+#[cfg(all(target_os = "linux", feature = "http3"))]
+pub use quic::Http3Attached;
+#[cfg(all(target_os = "linux", feature = "http3"))]
+pub use quic::Http3ConnectionAttach;
+#[cfg(all(target_os = "linux", feature = "http3"))]
+pub use quic::QuicListenerConfig;
+#[cfg(all(target_os = "linux", feature = "http3"))]
+pub use quic::QuicTls;
 pub use server::AcceptDistribution;
 pub use server::AcceptStats;
 pub use server::StopAccepting;
@@ -238,3 +248,11 @@ mod tls_alpn_fallback_tests;
 #[cfg(test)]
 #[path = "../tests/respond_now.rs"]
 mod respond_now_tests;
+
+#[cfg(all(test, target_os = "linux", feature = "http3"))]
+#[path = "../tests/h3_client.rs"]
+mod h3_client;
+
+#[cfg(all(test, target_os = "linux", feature = "http3"))]
+#[path = "../tests/http3.rs"]
+mod http3_tests;

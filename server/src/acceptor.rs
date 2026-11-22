@@ -69,7 +69,7 @@ mod handler_application;
 mod owned_http1;
 mod owned_http2;
 
-use handler_application::HandlerApplication;
+pub(crate) use handler_application::HandlerApplication;
 use owned_http1::OwnedHttp1Session;
 use owned_http2::OwnedHttp2Session;
 #[cfg(test)]
@@ -226,7 +226,7 @@ impl ConnectionLifecycle {
     }
 
     /// Reports the established protocol, once.
-    fn established(&mut self, protocol: CodecProtocol) {
+    pub(crate) fn established(&mut self, protocol: CodecProtocol) {
         if !self.established {
             self.established = true;
             self.invoke(|observer| observer.on_protocol_established(self.id, protocol));

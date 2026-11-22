@@ -701,6 +701,7 @@ dependencies = [
  "ferroxygen_client",
  "ferroxygen_codec",
  "ferroxygen_core",
+ "ferroxygen_h3",
  "ferroxygen_runtime",
  "ferroxygen_session",
  "ferroxygen_transport",

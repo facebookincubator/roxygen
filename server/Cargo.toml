@@ -48,5 +48,13 @@ rustls = { version = "0.23.46", features = ["ring", "std", "tls12"], default-fea
 tokio = { version = "1.54.1", features = ["full", "test-util"] }
 tokio-rustls = { version = "0.26.6", features = ["ring", "tls12"], default-features = false }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+ferroxygen_h3 = { version = "0.1.0", path = "../h3", optional = true }
+rustls = { version = "0.23.46", features = ["ring", "std", "tls12"], optional = true, default-features = false }
+
+[features]
+default = []
+http3 = ["dep:ferroxygen_h3", "dep:rustls"]
+
 [lints]
 workspace = true

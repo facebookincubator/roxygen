@@ -7,6 +7,7 @@
 
 //! Fixed-worker TCP/TLS HTTP server lifecycle.
 
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -650,6 +651,10 @@ pub struct ServerConfig {
     /// Limits on each worker's blocking pool. The default keeps Tokio's,
     /// 512 threads with a 10 s keep-alive per worker.
     pub worker_blocking_pool: BlockingPoolLimits,
+    /// The QUIC listener, which serves HTTP/3 beside the TCP listeners, on Linux with the `http3`
+    /// feature. The server does not serve HTTP/3 with `None`, the default.
+    #[cfg(all(target_os = "linux", feature = "http3"))]
+    pub quic: Option<crate::quic::QuicListenerConfig>,
     #[cfg(test)]
     pub(crate) session_retirement_probe: Option<Arc<SessionRetirementProbe>>,
     #[cfg(test)]
@@ -678,6 +683,8 @@ impl Default for ServerConfig {
             lifecycle_observer: None,
             zero_copy_enable_threshold: 0,
             worker_blocking_pool: BlockingPoolLimits::default(),
+            #[cfg(all(target_os = "linux", feature = "http3"))]
+            quic: None,
             #[cfg(test)]
             session_retirement_probe: None,
             #[cfg(test)]
@@ -726,6 +733,8 @@ pub enum HttpServerError {
     WorkerStartup(String),
     #[error("server TLS credential reload failed: {0}")]
     TlsReload(HttpError),
+    #[error("server QUIC listener setup failed: {0}")]
+    Quic(String),
     #[error("server {stage:?} callback panicked on worker {worker_index}")]
     CallbackPanic {
         worker_index: usize,
@@ -834,6 +843,9 @@ struct WorkerConfig {
     accept_distribution: AcceptDistribution,
     accept_counters: Arc<[Arc<AcceptCounters>]>,
     lifecycle_observer: Option<Arc<dyn ConnectionLifecycleObserver>>,
+    /// This worker's part of the QUIC listener, until the worker starts it.
+    #[cfg(all(target_os = "linux", feature = "http3"))]
+    quic: Option<crate::quic::WorkerQuicConfig>,
     #[cfg(test)]
     session_retirement_probe: Option<Arc<SessionRetirementProbe>>,
     #[cfg(test)]
@@ -1097,6 +1109,8 @@ pub struct HttpServer {
     state: Arc<AtomicU8>,
     draining: Arc<AtomicBool>,
     addresses: Vec<SocketAddr>,
+    #[cfg(all(target_os = "linux", feature = "http3"))]
+    quic_addresses: Vec<SocketAddr>,
     tcp_max_segments: Vec<Option<u32>>,
     num_io_threads: usize,
     workers: RefCell<Vec<ManagedWorker>>,
@@ -1219,6 +1233,20 @@ impl HttpServer {
             .map(TcpListener::local_addr)
             .collect::<Result<Vec<_>, _>>()?;
         let tcp_max_segments = listeners.iter().map(read_tcp_max_segment).collect();
+        #[cfg(all(target_os = "linux", feature = "http3"))]
+        let quic = config
+            .quic
+            .take()
+            .map(|quic| crate::quic::QuicBinding::bind(quic, &addresses, num_io_threads))
+            .transpose()?;
+        #[cfg(all(target_os = "linux", feature = "http3"))]
+        let quic_addresses = quic
+            .as_ref()
+            .map_or_else(Vec::new, |quic| quic.addresses().to_vec());
+        #[cfg(all(target_os = "linux", feature = "http3"))]
+        let mut worker_quic = quic
+            .into_iter()
+            .flat_map(crate::quic::QuicBinding::into_workers);
         let tls = match config.tls_credentials.as_ref() {
             Some(provider) => Some(Arc::new(ArcSwap::from_pointee(
                 provider.load().map_err(HttpServerError::TlsReload)?,
@@ -1322,6 +1350,8 @@ impl HttpServer {
                 accept_distribution: config.socket.accept_distribution,
                 accept_counters: Arc::clone(&accept_counters),
                 lifecycle_observer: config.lifecycle_observer.clone(),
+                #[cfg(all(target_os = "linux", feature = "http3"))]
+                quic: worker_quic.next(),
                 #[cfg(test)]
                 session_retirement_probe: config.session_retirement_probe.clone(),
                 #[cfg(test)]
@@ -1371,6 +1401,8 @@ impl HttpServer {
             state,
             draining,
             addresses,
+            #[cfg(all(target_os = "linux", feature = "http3"))]
+            quic_addresses,
             tcp_max_segments,
             num_io_threads,
             workers: RefCell::new(workers),
@@ -1415,6 +1447,14 @@ impl HttpServer {
 
     pub fn addresses(&self) -> &[SocketAddr] {
         &self.addresses
+    }
+
+    /// Returns the UDP addresses the QUIC listener bound, in the order of its configured
+    /// addresses or of the TCP listeners, or an empty slice without a QUIC listener. Available on
+    /// Linux with the `http3` feature only.
+    #[cfg(all(target_os = "linux", feature = "http3"))]
+    pub fn quic_addresses(&self) -> &[SocketAddr] {
+        &self.quic_addresses
     }
 
     pub fn tcp_max_segment(&self, listener_index: usize) -> Option<u32> {
@@ -1537,7 +1577,11 @@ async fn worker_loop(
     accepted_senders: Vec<mpsc::Sender<PendingSocket>>,
     round_robin: Arc<AtomicUsize>,
     listeners: Vec<TcpListener>,
-    config: WorkerConfig,
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "http3")),
+        expect(unused_mut, reason = "only the QUIC listener is taken from the config")
+    )]
+    mut config: WorkerConfig,
     started: SyncSender<Result<(), String>>,
 ) {
     let app = match &config.app_factory {
@@ -1609,6 +1653,35 @@ async fn worker_loop(
     }
     config.lifecycle_started.store(true, Ordering::Release);
     let acceptor = Rc::new(config.acceptor.clone());
+    // Connection serial numbers, shared by the worker's TCP and QUIC connections.
+    let next_session = Rc::new(Cell::new(1_u64));
+    #[cfg(all(target_os = "linux", feature = "http3"))]
+    let quic = match config.quic.take() {
+        Some(quic) => match crate::quic::WorkerQuic::start(
+            quic,
+            crate::quic::WorkerQuicInputs {
+                context: &context,
+                index: config.index,
+                app: &app,
+                acceptor: &acceptor,
+                lifecycle_observer: config.lifecycle_observer.clone(),
+                callback_failure: Arc::clone(&config.callback_failure),
+                serial: Rc::clone(&next_session),
+            },
+        ) {
+            Ok(quic) => Some(quic),
+            Err(error) => {
+                let _ = started.send(Err(error));
+                context.handle().begin_shutdown();
+                return;
+            }
+        },
+        None => None,
+    };
+    #[cfg(not(all(target_os = "linux", feature = "http3")))]
+    let quic: Option<no_quic::WorkerQuic> = None;
+    // True until every QUIC driver has ended.
+    let mut quic_running = quic.is_some();
     #[cfg(test)]
     let mut admission_gate = config
         .admission_probe
@@ -1680,7 +1753,6 @@ async fn worker_loop(
     }
     let _ = started.send(Ok(()));
 
-    let mut next_session = 1_u64;
     let worker_id = u32::try_from(config.index).unwrap_or(u32::MAX);
     let mut controls: BTreeMap<u64, Rc<RefCell<Option<SessionControl>>>> = BTreeMap::new();
     let mut task_sessions = HashMap::new();
@@ -1697,6 +1769,9 @@ async fn worker_loop(
                 match command {
                     Some(WorkerCommand::Drain) => {
                         drain_requested = true;
+                        if let Some(quic) = &quic {
+                            quic.drain();
+                        }
                         if per_worker_accept {
                             // Each listener task drops its listener, queues the socket it holds and
                             // exits; the queue is closed once they all have, and every socket in
@@ -1805,8 +1880,8 @@ async fn worker_loop(
                 accepted_receiver.recv().await
             }, if receiving && (per_worker_accept || !drain_requested) => {
                 if let Some(socket) = accepted {
-                    let id = next_session;
-                    next_session = next_session.wrapping_add(1);
+                    let id = next_session.get();
+                    next_session.set(id.wrapping_add(1));
                     let slot = Rc::new(RefCell::new(None));
                     #[cfg(test)]
                     if let Some(probe) = &config.session_retirement_probe {
@@ -1963,6 +2038,14 @@ async fn worker_loop(
                     receiving = false;
                 }
             }
+            () = async {
+                match &quic {
+                    Some(quic) => quic.finished().await,
+                    None => std::future::pending().await,
+                }
+            }, if quic_running => {
+                quic_running = false;
+            }
             completed = sessions.join_next_with_id(), if !sessions.is_empty() => {
                 #[cfg(test)]
                 let observed = config.session_retirement_probe.as_ref().and_then(|probe| {
@@ -2032,6 +2115,7 @@ async fn worker_loop(
         }
         if drain_requested
             && sessions.is_empty()
+            && !quic_running
             && (!per_worker_accept || (listener_tasks.is_empty() && !receiving))
         {
             break;
@@ -2058,10 +2142,34 @@ async fn worker_loop(
     }
     sessions.abort_all();
     while sessions.join_next().await.is_some() {}
+    if let Some(quic) = &quic {
+        quic.abort();
+        quic.finished().await;
+    }
     if let WorkerApp::Owned(factory) = &app {
         await_worker_stopping(factory.as_ref(), &config).await;
     }
     context.handle().begin_shutdown();
+}
+
+#[cfg(not(all(target_os = "linux", feature = "http3")))]
+mod no_quic {
+    /// A worker's QUIC drivers in a build without HTTP/3: an empty type that cannot be constructed.
+    pub(super) enum WorkerQuic {}
+
+    impl WorkerQuic {
+        pub(super) fn drain(&self) {
+            match *self {}
+        }
+
+        pub(super) fn abort(&self) {
+            match *self {}
+        }
+
+        pub(super) async fn finished(&self) {
+            match *self {}
+        }
+    }
 }
 
 /// Runs the owned application's `worker_stopping` and waits for its future, or for the owner to

@@ -66,6 +66,23 @@ pub trait OwnedConnectionFactory: 'static {
     /// server's stop then returns. The worker keeps serving other connections in either case.
     fn attach(&self, connection: OwnedConnectionAttach<'_>) -> Result<OwnedAttached, HttpError>;
 
+    /// Serves one accepted HTTP/3 connection on this worker, after its admission: the factory
+    /// calls [`Http3ConnectionAttach::serve`](crate::quic::Http3ConnectionAttach::serve) and
+    /// returns its result. An error refuses the connection with CONNECTION_REFUSED; so does a
+    /// panic, which is recorded as for `attach`. By default every HTTP/3 connection is refused.
+    /// Available on Linux with the `http3` feature only.
+    #[cfg(all(target_os = "linux", feature = "http3"))]
+    fn attach_http3(
+        &self,
+        connection: crate::quic::Http3ConnectionAttach<'_>,
+    ) -> Result<crate::quic::Http3Attached, HttpError> {
+        let _ = connection;
+        Err(HttpError::with_message(
+            HttpErrorCode::INVALID_STATE_TRANSITION,
+            b"the application serves no HTTP/3",
+        ))
+    }
+
     /// Called on the worker as soon as its session set is empty (after a graceful drain, or
     /// after a forced stop has aborted and joined every session), before any further shutdown
     /// work. The worker thread exits after the returned future resolves, or after `abandon`
