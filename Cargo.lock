@@ -609,6 +609,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferroxygen_h3"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+]
+
+[[package]]
 name = "ferroxygen_http1"
 version = "0.1.0"
 dependencies = [
