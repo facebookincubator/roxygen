@@ -104,6 +104,8 @@ pub(crate) struct Request {
     pub(crate) method: &'static str,
     pub(crate) path: String,
     pub(crate) body: Bytes,
+    /// Fields after the pseudo-header fields.
+    fields: Vec<(String, String)>,
     /// Where the rest of the body comes from, if the request waits for it before its FIN.
     tail: Option<BodyTail>,
 }
@@ -118,6 +120,7 @@ impl Request {
             method: "GET",
             path: path.to_owned(),
             body: Bytes::new(),
+            fields: Vec::new(),
             tail: None,
         }
     }
@@ -127,8 +130,15 @@ impl Request {
             method: "POST",
             path: path.to_owned(),
             body: body.into(),
+            fields: Vec::new(),
             tail: None,
         }
+    }
+
+    /// Returns the request with the field `name: value` added.
+    pub(crate) fn with_field(mut self, name: &str, value: &str) -> Self {
+        self.fields.push((name.to_owned(), value.to_owned()));
+        self
     }
 
     /// Creates a POST whose body starts with `first` and whose rest, with the FIN, waits for the
@@ -156,6 +166,12 @@ impl Request {
         roxygen_qpack::Encoder::new().encode_field_section(
             fields
                 .iter()
+                .map(|(name, value)| (*name, value.as_str()))
+                .chain(
+                    self.fields
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.as_str())),
+                )
                 .map(|(name, value)| FieldLine::new(name.as_bytes(), value.as_bytes())),
             &mut block,
         );
@@ -176,6 +192,8 @@ impl Request {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Response {
     pub(crate) status: u16,
+    /// The final head's fields other than `:status`, in order.
+    pub(crate) headers: Vec<(String, String)>,
     pub(crate) body: Vec<u8>,
 }
 
@@ -566,12 +584,18 @@ impl ClientSession {
                 match exchange.decoder.decode(&mut segment) {
                     Ok(Some(Frame::Headers(block))) => {
                         let mut status = None;
+                        let mut headers = Vec::new();
                         let decoded =
                             roxygen_qpack::Decoder::new().decode_field_section(&block, |line| {
                                 if line.name == b":status" {
                                     status = std::str::from_utf8(line.value)
                                         .ok()
                                         .and_then(|value| value.parse().ok());
+                                } else {
+                                    headers.push((
+                                        String::from_utf8_lossy(line.name).into_owned(),
+                                        String::from_utf8_lossy(line.value).into_owned(),
+                                    ));
                                 }
                             });
                         if decoded.is_err() {
@@ -582,6 +606,7 @@ impl ClientSession {
                         if exchange.response.is_none() {
                             exchange.response = Some(Response {
                                 status: status.unwrap_or(0),
+                                headers,
                                 body: Vec::new(),
                             });
                         }

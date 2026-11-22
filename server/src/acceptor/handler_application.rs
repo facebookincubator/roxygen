@@ -11,7 +11,7 @@
 //! handler future and the response source inline from the driver's poll, with no
 //! task per request. A request without a body is first offered to
 //! `HttpHandler::respond_now`, whose whole response the exchange holds inline. The
-//! owned HTTP/1.1 and HTTP/2 session wrappers share it.
+//! owned HTTP/1.1 and HTTP/2 session wrappers and the HTTP/3 listener share it.
 //!
 //! The exchanges of one connection share its handler and base context, and an
 //! exchange clones the context only for a request it passes to `handle_request`.

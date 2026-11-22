@@ -143,7 +143,7 @@ fn echo_handlers() -> crate::server::HandlerFactory {
 }
 
 /// Returns the config of a QUIC listener on `bind_addresses` with a fresh `localhost` certificate.
-fn quic_listener(bind_addresses: Vec<SocketAddr>) -> QuicListenerConfig {
+pub(crate) fn quic_listener(bind_addresses: Vec<SocketAddr>) -> QuicListenerConfig {
     let (chain, key) = localhost_certificate();
     QuicListenerConfig {
         bind_addresses,
@@ -162,7 +162,7 @@ fn start(quic: QuicListenerConfig, workers: usize) -> HttpServer {
 }
 
 /// Returns a loopback UDP address whose port was free a moment ago.
-fn free_udp_address() -> SocketAddr {
+pub(crate) fn free_udp_address() -> SocketAddr {
     UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
         .and_then(|socket| socket.local_addr())
         .expect("a free UDP port")
@@ -521,7 +521,7 @@ fn wait_until(what: &str, done: impl Fn() -> bool) {
     }
 }
 
-fn closed_without_error(seen: &Seen) -> bool {
+pub(crate) fn closed_without_error(seen: &Seen) -> bool {
     matches!(
         seen,
         Seen::Closed(CloseReason::Application { code, .. }) if *code == AppCode::from_u32(H3_NO_ERROR)

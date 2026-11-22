@@ -398,14 +398,15 @@ pub trait HttpHandler: 'static {
     /// Answers a request synchronously with a whole response, or returns `None`
     /// to leave the request to [`Self::handle_request`].
     ///
-    /// Only the experimental owned HTTP/1.1 and HTTP/2 drivers call this, with
-    /// the head of each request without a body, and they send the response it
-    /// returns without a request source, a handler future or a response source.
-    /// An error or a panic is answered as the same failure of `handle_request`
-    /// is. Other sessions call only `handle_request`, so it must still answer
-    /// every request, and answer it as this method would.
-    /// [`FixedResponse::new`] sets `Content-Length` as `HttpFixedSource::new`
-    /// does, and [`FixedResponse::from_parts`] sends the head as it is.
+    /// Only the experimental owned HTTP/1.1 and HTTP/2 drivers and the server's
+    /// HTTP/3 listener call this, with the head of each request without a body,
+    /// and they send the response it returns without a request source, a
+    /// handler future or a response source. An error or a panic is answered as
+    /// the same failure of `handle_request` is. Other sessions call only
+    /// `handle_request`, so it must still answer every request, and answer it as
+    /// this method would. [`FixedResponse::new`] sets `Content-Length` as
+    /// `HttpFixedSource::new` does, and [`FixedResponse::from_parts`] sends the
+    /// head as it is.
     fn respond_now(&self, _request: &HttpMessage) -> Option<Result<FixedResponse, HttpError>> {
         None
     }

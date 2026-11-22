@@ -256,3 +256,7 @@ mod h3_client;
 #[cfg(all(test, target_os = "linux", feature = "http3"))]
 #[path = "../tests/http3.rs"]
 mod http3_tests;
+
+#[cfg(all(test, target_os = "linux", feature = "http3"))]
+#[path = "../tests/http3_respond_now.rs"]
+mod http3_respond_now_tests;
