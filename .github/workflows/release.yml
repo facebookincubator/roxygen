@@ -6,6 +6,11 @@ name: Release
 # order. A run that stops part way can be run again. All crates share one
 # version, and a release bumps it in every manifest first.
 #
+# Crates named in the RELEASE_HOLD repository variable or in the hold input of a
+# run by hand are left out of the dry run and the upload, for example while their
+# dependencies are not on crates.io. Names are separated by spaces or commas, and
+# a name that is not a publishable crate fails the run.
+#
 # Uploads use crates.io trusted publishing when the CRATES_IO_TRUSTED_PUBLISHING
 # repository variable is "true", and the CARGO_REGISTRY_TOKEN secret of the
 # crates-io environment otherwise. Trusted publishing cannot create a crate, so
@@ -23,6 +28,10 @@ on:
         description: Upload to crates.io (unchecked runs a dry run)
         type: boolean
         default: false
+      hold:
+        description: Crates to leave out, separated by spaces or commas
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -42,6 +51,7 @@ jobs:
     outputs:
       packages: ${{ steps.plan.outputs.packages }}
       new: ${{ steps.plan.outputs.new }}
+      held: ${{ steps.plan.outputs.held }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -51,6 +61,9 @@ jobs:
           toolchain: "1.98.1"
       - name: Find versions not on crates.io
         id: plan
+        env:
+          HOLD: ${{ inputs.hold }}
+          RELEASE_HOLD: ${{ vars.RELEASE_HOLD }}
         run: |
           set -euo pipefail
           status=$(bash .github/scripts/crates_io_status.sh)
@@ -59,23 +72,36 @@ jobs:
             echo "::error::The publishable crates do not share one version"
             exit 1
           fi
+          held=$(tr ',' ' ' <<<"$HOLD $RELEASE_HOLD" | awk '{ for (i = 1; i <= NF; i++) print $i }' | sort -u | paste -sd' ')
+          unknown=$(awk -v held="$held" '{ known[$1] } END { n = split(held, names, " "); for (i = 1; i <= n; i++) if (!(names[i] in known)) print names[i] }' <<<"$status" | paste -sd' ')
+          if [[ -n "$unknown" ]]; then
+            echo "::error::These held names are not publishable crates of the workspace: $unknown"
+            exit 1
+          fi
+          if [[ -n "$held" ]]; then
+            echo "::notice::Holding back $held"
+          fi
+          status=$(awk -v held="$held" 'BEGIN { split(held, names, " "); for (i in names) skip[names[i]] } !($1 in skip)' <<<"$status")
           packages=$(awk '$3 != "published" { print $1 }' <<<"$status" | paste -sd' ')
           new=$(awk '$3 == "new" { print $1 }' <<<"$status" | paste -sd' ')
           {
             echo "packages=$packages"
             echo "new=$new"
+            echo "held=$held"
           } >> "$GITHUB_OUTPUT"
       - name: Dry run
         env:
           PACKAGES: ${{ steps.plan.outputs.packages }}
+          HELD: ${{ steps.plan.outputs.held }}
         run: |
           set -euo pipefail
           if [[ -n "$PACKAGES" ]]; then
             read -ra crates <<<"$PACKAGES"
             cargo publish --dry-run "${crates[@]/#/--package=}"
           else
-            echo "Every version is on crates.io"
-            cargo publish --dry-run --workspace
+            echo "Every version that is not held back is on crates.io"
+            read -ra excluded <<<"$HELD"
+            cargo publish --dry-run --workspace "${excluded[@]/#/--exclude=}"
           fi
 
   publish:
@@ -116,6 +142,7 @@ jobs:
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+          HELD: ${{ needs.package.outputs.held }}
         run: |
           set -euo pipefail
           if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
@@ -124,9 +151,10 @@ jobs:
           fi
           log=$RUNNER_TEMP/publish.log
           while :; do
-            packages=$(bash .github/scripts/crates_io_status.sh | awk '$3 != "published" { print $1 }')
+            packages=$(bash .github/scripts/crates_io_status.sh \
+              | awk -v held="$HELD" 'BEGIN { split(held, names, " "); for (i in names) skip[names[i]] } $3 != "published" && !($1 in skip) { print $1 }')
             if [[ -z "$packages" ]]; then
-              echo "Every version is on crates.io"
+              echo "Every version that is not held back is on crates.io"
               exit 0
             fi
             mapfile -t crates <<<"$packages"
