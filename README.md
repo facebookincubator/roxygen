@@ -3,11 +3,12 @@
 [![CI](https://github.com/facebookincubator/roxygen/actions/workflows/ci.yml/badge.svg)](https://github.com/facebookincubator/roxygen/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)][license]
 
-Roxygen is an HTTP/1.1 and HTTP/2 client and server library for Rust. It
-brings the design of [Proxygen](https://github.com/facebook/proxygen), Meta's
-C++ HTTP library, to Rust: every connection belongs to one worker thread, and
-a request or response is a stream of header and body events that the
-connection pulls when it is ready for more.
+Roxygen is an HTTP/1.1 and HTTP/2 client and server library for Rust, and its
+server can also serve [HTTP/3](#http3) on Linux. It brings the design of
+[Proxygen](https://github.com/facebook/proxygen), Meta's C++ HTTP library, to
+Rust: every connection belongs to one worker thread, and a request or response
+is a stream of header and body events that the connection pulls when it is
+ready for more.
 
 Roxygen is under active development, and its APIs will change before 1.0.
 
@@ -221,12 +222,16 @@ library: depend on `ferroxygen_server` and write `use roxygen_server::...`.
 | Package | Contents |
 | --- | --- |
 | `ferroxygen_core` | Messages, headers, URLs, body buffers, and the source, filter and handler traits |
+| `ferroxygen_bufqueue` | `BufQueue`, the queue of shared byte segments that holds bodies, which `ferroxygen_core` re-exports |
 | `ferroxygen_runtime` | Worker threads and their handles, timers, cancellation and task groups |
 | `ferroxygen_codec`, `ferroxygen_http1`, `ferroxygen_http2` | The codec interface and the HTTP/1.x and HTTP/2 codecs |
+| `ferroxygen_huffman` | The Huffman code of HPACK and QPACK, shared by the HTTP/2 and HTTP/3 codecs |
+| `ferroxygen_qpack` | QPACK field compression for HTTP/3, with the static table and literals only |
 | `ferroxygen_transport` | TCP and TLS byte streams, byte events, and adoption of connections you established |
 | `ferroxygen_session` | HTTP/1.1 and HTTP/2 connection state machines, including the experimental owned drivers |
+| `ferroxygen_h3` | HTTP/3 framing, and on Linux an HTTP/3 server session over mvfstr that hosts Roxygen's owned applications |
 | `ferroxygen_client` | Connector, connection pool, a simple request API, and an experimental owned client |
-| `ferroxygen_server` | A multi-worker server with TLS, graceful drain and `100-continue` |
+| `ferroxygen_server` | A multi-worker server with TLS, graceful drain and `100-continue`, and HTTP/3 on Linux with the `http3` feature |
 | `ferroxygen_connect` | HTTP CONNECT tunnels over a client session |
 | `ferroxygen_http_adapter` | Conversions to and from the `http` crate's types |
 | `ferroxygen_hyper_adapter` | `http_body::Body` implementations over Roxygen bodies, and the reverse |
@@ -254,7 +259,46 @@ cargo test --workspace --features ferroxygen_runtime/observability
 `Cargo.lock` tracks the versions used by Meta's internal build, so Cargo may
 refresh registry checksums on the first build.
 
-HTTP/3, QUIC and WebTransport are out of scope for now.
+## HTTP/3
+
+`HttpServer` can serve HTTP/3 on Linux, over [mvfstr][mvfstr], a QUIC
+implementation in Rust that runs on Roxygen's runtime. Turn on the `http3`
+feature of `ferroxygen_server`, which is off by default, and give the server a
+QUIC listener:
+
+```rust
+use roxygen_server::{QuicListenerConfig, QuicTls};
+
+// `chain` is a `Vec<CertificateDer<'static>>` and `key` a `PrivateKeyDer<'static>`.
+config.quic = Some(QuicListenerConfig::new(QuicTls::Certificate { chain, key }));
+```
+
+Unless it is given addresses of its own, the listener binds UDP on the
+addresses of the TCP listeners, so HTTP/3 answers on the same port numbers.
+Each worker serves the QUIC connections of its own sockets with the
+`HttpHandler` that serves its TCP connections, or with an owned application's
+`attach_http3`. The server does not add an `Alt-Svc` header that advertises
+HTTP/3, but a handler can add one to its responses.
+
+Current limits of HTTP/3:
+
+- Roxygen does not have an HTTP/3 client.
+- QPACK does not use a dynamic table in either direction.
+- The server does not push, and it does not support extended CONNECT, HTTP
+  datagrams or WebTransport.
+- Some server features apply to TCP connections only, such as `AcceptStats`,
+  TLS credential reloads and the session timeouts. The documentation of the
+  server's `quic` module lists them.
+- QUIC has the [limits of mvfstr][mvfstr-limits]. For example, 0-RTT is not
+  supported.
+
+On Linux, `ferroxygen_h3` and the `http3` feature build mvfstr's crates, which
+Cargo takes from mvfst's GitHub repository. The server's HTTP/3 tests run only
+with that feature on:
+
+```sh
+cargo test --workspace --features ferroxygen_server/http3
+```
 
 ## TLS crypto provider
 
@@ -274,11 +318,10 @@ exchange, X25519MLKEM768, is offered first with aws-lc-rs and is not available
 with ring. TLS options that are given a provider, or a process-default provider
 installed with rustls, use that provider instead.
 
-To build and test the workspace with ring, except `ferroxygen_h3`, whose mvfstr
-dependencies are not in the workspace:
+To build and test the workspace with ring, HTTP/3 included:
 
 ```sh
-cargo test --workspace --exclude ferroxygen_h3 --no-default-features --features ring
+cargo test --workspace --no-default-features --features ring,ferroxygen_server/http3
 ```
 
 ## Contributing
@@ -302,6 +345,8 @@ derived from llhttp, which is also MIT licensed.
 [examples-dir]: https://github.com/facebookincubator/roxygen/tree/main/examples
 [hello-server]: https://github.com/facebookincubator/roxygen/blob/main/examples/hello_server.rs
 [license]: https://github.com/facebookincubator/roxygen/blob/main/LICENSE
+[mvfstr]: https://github.com/meta/mvfst/tree/main/mvfstr
+[mvfstr-limits]: https://github.com/meta/mvfst/tree/main/mvfstr#current-limits
 [owned-client]: https://github.com/facebookincubator/roxygen/blob/main/examples/owned_client.rs
 [owned-server]: https://github.com/facebookincubator/roxygen/blob/main/examples/owned_server.rs
 [security]: https://github.com/facebookincubator/roxygen/blob/main/SECURITY.md

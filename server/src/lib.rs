@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! A multi-worker HTTP/1.1 and HTTP/2 server with TLS and graceful drain.
+//! A multi-worker HTTP/1.1, HTTP/2 and HTTP/3 server with TLS and graceful drain.
 //!
 //! [`HttpServer`] binds its listeners and starts a fixed set of worker threads, one by
 //! default. The first worker accepts connections and hands them to the workers in turn, and
@@ -13,6 +13,11 @@
 //! [`HttpHandler`] that each worker builds for itself, so a handler does not need to be
 //! `Send`. Most server applications use this crate, and `roxygen_tower_adapter` builds on it
 //! to serve Tower services.
+//!
+//! HTTP/3 is available only on Linux with the `http3` feature, which is off by default. A QUIC
+//! listener then serves it beside the TCP listeners: each worker runs mvfstr, a QUIC stack in
+//! Rust, on its own UDP sockets, and serves their connections with its handler or owned
+//! application.
 //!
 //! The main entry points:
 //!
@@ -40,6 +45,13 @@
 //!   serve TLS. A connection that negotiates `h2` through ALPN runs HTTP/2, and any other TLS
 //!   connection runs HTTP/1.1. [`HttpServer::update_tls_credentials`] reloads the credentials
 //!   for new connections.
+#![cfg_attr(
+    all(target_os = "linux", feature = "http3"),
+    doc = "- Set [`ServerConfig::quic`](server::ServerConfig::quic) to a [`QuicListenerConfig`] \
+           to serve HTTP/3. By default the listener binds UDP on the addresses that the TCP \
+           listeners bound. The [`quic`] module lists the TCP features that do not apply to QUIC \
+           connections."
+)]
 //! - Sessions do not send `100 Continue` on their own. [`ExpectContinueWrapperHandler`] wraps
 //!   a handler. For `Expect: 100-continue` it returns a `100 Continue` head before it calls the
 //!   wrapped handler, and it rejects other expectations with 417.
