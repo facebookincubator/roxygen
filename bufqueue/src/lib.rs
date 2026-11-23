@@ -37,10 +37,14 @@ const COMPACT_EXACT_GROWTH: usize = 128;
 /// `COMPACT_EXACT_GROWTH`.
 const COMPACT_GROWTH_MINIMUM: usize = 512;
 
+/// The error a [`BufQueue`] operation returns. A failed operation leaves its
+/// queues unchanged.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum BufQueueError {
+    /// A length past `usize::MAX`: `current` bytes plus `incoming` bytes.
     #[error("buffer length overflow: {current} existing bytes plus {incoming} incoming bytes")]
     LengthOverflow { current: usize, incoming: usize },
+    /// A length over the `limit`: `current` queued bytes plus `incoming` bytes.
     #[error(
         "buffer limit {limit} exceeded: {current} existing bytes plus {incoming} incoming bytes"
     )]
@@ -49,8 +53,10 @@ pub enum BufQueueError {
         current: usize,
         incoming: usize,
     },
+    /// A trim of `requested` bytes from a queue of only `available` bytes.
     #[error("cannot trim {requested} bytes from a buffer containing {available} bytes")]
     TrimUnderflow { requested: usize, available: usize },
+    /// A [`BufQueue::coalesce`] of `length` bytes, over the maximum `limit`.
     #[error("cannot coalesce {length} bytes with an explicit maximum of {limit}")]
     CoalesceLimitExceeded { limit: usize, length: usize },
 }
@@ -522,6 +528,9 @@ impl ExactSizeIterator for IntoSegments {
 }
 
 impl BufQueue {
+    /// Creates an empty queue without allocating. Adding bytes that would take
+    /// its length past `limit` fails with [`BufQueueError::LimitExceeded`], or
+    /// with [`BufQueueError::LengthOverflow`] if that length overflows `usize`.
     pub fn new(limit: usize) -> Self {
         Self {
             segments: Segments::Inline(Bytes::new(), 0),
@@ -594,22 +603,27 @@ impl BufQueue {
         Ok(queue)
     }
 
+    /// Returns the number of bytes in the queue, summed over its segments.
     pub fn chain_length(&self) -> usize {
         self.length
     }
 
+    /// Returns the length limit the queue was created with.
     pub fn limit(&self) -> usize {
         self.limit
     }
 
+    /// Returns how many more bytes fit before the queue reaches its limit.
     pub fn remaining_capacity(&self) -> usize {
         self.limit - self.length
     }
 
+    /// Returns `true` if the queue does not hold any bytes.
     pub fn is_empty(&self) -> bool {
         self.length == 0
     }
 
+    /// Returns the number of segments in the queue, 0 when it is empty.
     pub fn segment_count(&self) -> usize {
         match &self.segments {
             Segments::Inline(segment, _) => usize::from(!segment.is_empty()),
@@ -617,6 +631,7 @@ impl BufQueue {
         }
     }
 
+    /// Returns the first segment, or `None` if the queue is empty.
     pub fn front(&self) -> Option<&Bytes> {
         match &self.segments {
             Segments::Inline(segment, _) => (!segment.is_empty()).then_some(segment),
@@ -636,6 +651,7 @@ impl BufQueue {
         }
     }
 
+    /// Borrows each segment as an `IoSlice` in queue order, for vectored I/O.
     pub fn iovecs(&self) -> impl ExactSizeIterator<Item = IoSlice<'_>> {
         self.segments()
             .map(|segment| IoSlice::new(segment.as_ref()))
@@ -930,6 +946,8 @@ impl BufQueue {
         taken
     }
 
+    /// Returns a queue with the same bytes and limit whose segments share this
+    /// queue's storage, so the payload is not copied.
     pub fn clone_shared(&self) -> Self {
         Self {
             segments: self.segments.clone(),
@@ -939,6 +957,8 @@ impl BufQueue {
         }
     }
 
+    /// Splits off the first `amount` bytes, or every byte if fewer are queued,
+    /// into a queue with the same limit. A cut segment is shared, not copied.
     pub fn split_at_most(&mut self, amount: usize) -> Self {
         if amount == 0 || self.is_empty() {
             return Self::new(self.limit);
@@ -1024,6 +1044,8 @@ impl BufQueue {
         }
     }
 
+    /// Removes the first `amount` bytes. Fails with
+    /// [`BufQueueError::TrimUnderflow`] when the queue holds fewer.
     #[inline]
     pub fn trim_start(&mut self, amount: usize) -> Result<(), BufQueueError> {
         if amount > self.length {
@@ -1037,6 +1059,9 @@ impl BufQueue {
         Ok(())
     }
 
+    /// Returns the queued bytes as one `Bytes`, copying them unless the queue
+    /// holds one segment. Fails with [`BufQueueError::CoalesceLimitExceeded`]
+    /// when it holds more than `maximum` bytes.
     pub fn coalesce(&self, maximum: usize) -> Result<Bytes, BufQueueError> {
         if self.length > maximum {
             return Err(BufQueueError::CoalesceLimitExceeded {
@@ -1074,6 +1099,7 @@ impl BufQueue {
         Ok(())
     }
 
+    /// Consumes the queue and returns its segments in queue order.
     pub fn into_bytes_segments(self) -> VecDeque<Bytes> {
         match self.segments {
             Segments::Inline(segment, _) => (!segment.is_empty())
