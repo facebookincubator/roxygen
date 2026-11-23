@@ -61,6 +61,7 @@ use roxygen_session::owned::OwnedExchange;
 use roxygen_session::owned_h1::Http1DriverConfig;
 use roxygen_transport::tcp::TcpTransport;
 use roxygen_transport::tls::TlsServerOptions;
+use roxygen_transport::tls::builtin_crypto_provider;
 use rustls::ClientConfig;
 use rustls::ClientConnection;
 use rustls::RootCertStore;
@@ -1094,7 +1095,9 @@ impl TlsServer {
         roots
             .add(CertificateDer::from(self.certificate.clone()))
             .expect("root certificate");
-        let mut config = ClientConfig::builder()
+        let mut config = ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("TLS versions")
             .with_root_certificates(roots)
             .with_no_client_auth();
         config.alpn_protocols = vec![protocol.to_vec()];

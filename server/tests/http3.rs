@@ -56,6 +56,7 @@ use roxygen_session::owned::OwnedExchange;
 use roxygen_transport::tls::TlsAlpnMismatch;
 use roxygen_transport::tls::TlsServerOptions;
 use roxygen_transport::tls::TlsServerSettings;
+use roxygen_transport::tls::builtin_crypto_provider;
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::PrivatePkcs8KeyDer;
@@ -231,7 +232,7 @@ fn a_supplied_tls_config_serves_only_h3_whatever_alpn_it_lists() {
     let addr = free_udp_address();
     let (chain, key) = localhost_certificate();
     let tls = mvfstr_tls::server_config(
-        rustls::crypto::ring::default_provider(),
+        builtin_crypto_provider(),
         Arc::new(DefaultTimeProvider),
         chain,
         key,
@@ -491,13 +492,12 @@ fn tls_and_quic() -> (ServerConfig, RootCertStore) {
 /// Sends a GET for `path` to `addr` over TLS with ALPN `h2`, and returns the response's status
 /// and body.
 fn h2_get(addr: SocketAddr, roots: RootCertStore, path: &str) -> (u16, Vec<u8>) {
-    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .expect("TLS versions")
-    .with_root_certificates(roots)
-    .with_no_client_auth();
+    let mut config =
+        rustls::ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("TLS versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
     config.alpn_protocols = vec![b"h2".to_vec()];
     let uri = format!("https://localhost{path}");
     tokio::runtime::Builder::new_current_thread()

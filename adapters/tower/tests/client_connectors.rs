@@ -26,6 +26,7 @@ use roxygen_core::connection::TransportEndpoint;
 use roxygen_core::connection::TransportSecurity;
 use roxygen_core::http::CodecProtocol;
 use roxygen_transport::established::EstablishedIo;
+use roxygen_transport::tls::builtin_crypto_provider;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
@@ -162,7 +163,7 @@ fn hyper_tls_timeout_stack_adopts_with_real_h1_h2_alpn() {
     }
     case(|fixture| {
         Box::pin(async move {
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            let provider = Arc::new(builtin_crypto_provider());
             for protocol in [CodecProtocol::Http11, CodecProtocol::Http2] {
                 let generated =
                     rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
@@ -171,7 +172,9 @@ fn hyper_tls_timeout_stack_adopts_with_real_h1_h2_alpn() {
                     generated.signing_key.serialized_der().to_vec(),
                 )
                 .unwrap();
-                let mut server = rustls::ServerConfig::builder()
+                let mut server = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
                     .with_no_client_auth()
                     .with_single_cert(vec![certificate.clone()], key)
                     .unwrap();
@@ -183,7 +186,9 @@ fn hyper_tls_timeout_stack_adopts_with_real_h1_h2_alpn() {
                 server.alpn_protocols = vec![alpn.clone()];
                 let mut roots = rustls::RootCertStore::empty();
                 roots.add(certificate).unwrap();
-                let config = rustls::ClientConfig::builder()
+                let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
                     .with_root_certificates(roots)
                     .with_no_client_auth();
                 let connector = hyper_rustls::HttpsConnectorBuilder::new()
@@ -742,7 +747,7 @@ impl<Io> Drop for PostConnectIo<Io> {
 fn tls_failure_case(kind: u8) {
     case(|fixture| {
         Box::pin(async move {
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            let provider = Arc::new(builtin_crypto_provider());
             let generated =
                 rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
             let certificate = generated.cert.der().clone();
@@ -750,7 +755,9 @@ fn tls_failure_case(kind: u8) {
                 generated.signing_key.serialized_der().to_vec(),
             )
             .unwrap();
-            let mut server = rustls::ServerConfig::builder()
+            let mut server = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+                .with_safe_default_protocol_versions()
+                .unwrap()
                 .with_no_client_auth()
                 .with_single_cert(vec![certificate.clone()], key)
                 .unwrap();
@@ -759,7 +766,9 @@ fn tls_failure_case(kind: u8) {
             if kind != 0 {
                 roots.add(certificate).unwrap();
             }
-            let config = rustls::ClientConfig::builder()
+            let config = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
                 .with_root_certificates(roots)
                 .with_no_client_auth();
             let https = hyper_rustls::HttpsConnectorBuilder::new()

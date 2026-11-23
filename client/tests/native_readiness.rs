@@ -75,6 +75,7 @@ use roxygen_runtime::worker::WorkerHandle;
 use roxygen_runtime::worker::WorkerState;
 use roxygen_transport::byte_stream::TransportRetirement;
 use roxygen_transport::tls::TlsClientOptions;
+use roxygen_transport::tls::builtin_crypto_provider;
 use rustls::ServerConfig;
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use tokio::io::AsyncRead;
@@ -1094,13 +1095,12 @@ fn tls_fixture(case: Case) -> io::Result<(Option<Vec<u8>>, Option<Arc<ServerConf
         rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).map_err(failure)?;
     let certificate = generated.cert.der().to_vec();
     let key = PrivatePkcs8KeyDer::from(generated.signing_key.serialized_der().to_vec());
-    let mut config =
-        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .map_err(failure)?
-            .with_no_client_auth()
-            .with_single_cert(vec![generated.cert.der().clone()], key.into())
-            .map_err(failure)?;
+    let mut config = ServerConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(failure)?
+        .with_no_client_auth()
+        .with_single_cert(vec![generated.cert.der().clone()], key.into())
+        .map_err(failure)?;
     config.alpn_protocols = vec![case.protocol.alpn().to_vec()];
     Ok((Some(certificate), Some(Arc::new(config))))
 }

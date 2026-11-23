@@ -38,6 +38,7 @@ use roxygen_transport::established::EstablishedIo;
 use roxygen_transport::established::adopt_local;
 use roxygen_transport::tls::TlsServerOptions;
 use roxygen_transport::tls::TlsTransport;
+use roxygen_transport::tls::builtin_crypto_provider;
 use rustls::ClientConfig;
 use rustls::ClientConnection;
 use rustls::RootCertStore;
@@ -658,12 +659,11 @@ fn tls_identity() -> (TlsServerOptions, Arc<ClientConfig>) {
     .unwrap();
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(certificate)).unwrap();
-    let config =
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+    let config = ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
     (options, Arc::new(config))
 }
 

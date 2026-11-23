@@ -85,8 +85,9 @@
 //! Clients offer TLS 1.2 and 1.3 and the ALPN protocols `h2` and `http/1.1` by
 //! default. Client options without a provider set, and server options not
 //! built from a rustls `ServerConfig` or given a provider with
-//! [`TlsServerSettings::with_crypto_provider`], use the process-wide rustls
-//! `CryptoProvider` if one is installed, and ring otherwise.
+//! [`TlsServerSettings::with_crypto_provider`], use
+//! [`tls::fallback_crypto_provider`]: the process-wide rustls `CryptoProvider`
+//! if one is installed, else [`tls::builtin_crypto_provider`], which is ring's.
 //!
 //! # TLS client certificates
 //!

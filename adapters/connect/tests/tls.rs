@@ -15,6 +15,7 @@ use roxygen_connect_client::SocketAddress;
 use roxygen_connect_client::TransportEndpoint;
 use roxygen_connect_client::TransportSecurity;
 use roxygen_connect_client::connect_tls;
+use roxygen_transport::tls::builtin_crypto_provider;
 use rustls::ClientConfig;
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
@@ -114,7 +115,9 @@ async fn certificate_or_name_failures_are_not_h2_negotiation_failures() {
     timeout(TEST_TIMEOUT, async {
         let (server_config, trusted) = tls_identity(&[b"h2"]);
         let untrusted = Arc::new(
-            ClientConfig::builder()
+            ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("TLS versions")
                 .with_root_certificates(RootCertStore::empty())
                 .with_no_client_auth(),
         );

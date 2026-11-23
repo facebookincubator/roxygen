@@ -94,6 +94,7 @@ pub(crate) mod fixture {
     use roxygen_runtime::worker::WorkerHandle;
     use roxygen_transport::byte_stream::PeerIdentity;
     use roxygen_transport::established::EstablishedIo;
+    use roxygen_transport::tls::builtin_crypto_provider;
     use tokio::io::AsyncRead;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWrite;
@@ -1055,7 +1056,7 @@ pub(crate) mod fixture {
             peer_identity,
         } = established;
         let (server, peer) = if tls {
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            let provider = Arc::new(builtin_crypto_provider());
             let generated =
                 rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
             let certificate = generated.cert.der().clone();
@@ -1063,14 +1064,18 @@ pub(crate) mod fixture {
                 generated.signing_key.serialized_der().to_vec(),
             )
             .unwrap();
-            let mut server = rustls::ServerConfig::builder()
+            let mut server = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+                .with_safe_default_protocol_versions()
+                .unwrap()
                 .with_no_client_auth()
                 .with_single_cert(vec![certificate.clone()], key)
                 .unwrap();
             server.alpn_protocols = vec![b"http/1.1".to_vec()];
             let mut roots = rustls::RootCertStore::empty();
             roots.add(certificate).unwrap();
-            let mut client = rustls::ClientConfig::builder()
+            let mut client = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
                 .with_root_certificates(roots)
                 .with_no_client_auth();
             client.alpn_protocols = vec![b"http/1.1".to_vec()];

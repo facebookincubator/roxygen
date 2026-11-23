@@ -61,6 +61,7 @@ use roxygen_transport::byte_stream::WriteInfo;
 use roxygen_transport::tcp::TcpTransport;
 use roxygen_transport::tls::TlsClientOptions;
 use roxygen_transport::tls::TlsTransport;
+use roxygen_transport::tls::builtin_crypto_provider;
 use rustls::ServerConfig;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::PrivateKeyDer;
@@ -2521,13 +2522,14 @@ fn h1_abandoned_upgraded_stream_paused_at_ingress_limit_resumes_reading() {
 }
 
 fn tls_fixture() -> (Vec<u8>, Arc<ServerConfig>) {
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let generated =
         rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("certificate");
     let certificate = generated.cert.der().to_vec();
     let private_key = PrivateKeyDer::try_from(generated.signing_key.serialized_der().to_vec())
         .expect("private key");
-    let config = ServerConfig::builder()
+    let config = ServerConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
         .with_no_client_auth()
         .with_single_cert(vec![CertificateDer::from(certificate.clone())], private_key)
         .expect("server configuration");

@@ -2268,7 +2268,7 @@ impl TlsServerOptions {
     pub fn from_settings(settings: TlsServerSettings) -> Result<Self, HttpError> {
         let provider = settings
             .crypto_provider
-            .unwrap_or_else(default_crypto_provider);
+            .unwrap_or_else(fallback_crypto_provider);
         let certificate_chain_key =
             certificates_sha256(settings.certificate_chain_der.iter().map(AsRef::as_ref));
         let certificates = settings
@@ -2362,7 +2362,7 @@ impl TlsServerOptions {
             .collect();
         let private_key = PrivateKeyDer::try_from(private_key_der.into_vec())
             .map_err(|error| tls_message_error(b"invalid TLS private key: ", error))?;
-        let mut config = ServerConfig::builder_with_provider(default_crypto_provider())
+        let mut config = ServerConfig::builder_with_provider(fallback_crypto_provider())
             .with_safe_default_protocol_versions()
             .map_err(|error| tls_message_error(b"invalid TLS server provider: ", error))?
             .with_no_client_auth()
@@ -2386,7 +2386,7 @@ impl TlsServerOptions {
         alpn_protocols: Vec<Box<[u8]>>,
         client_ca_certificates_der: Vec<Box<[u8]>>,
     ) -> Result<Self, HttpError> {
-        let provider = default_crypto_provider();
+        let provider = fallback_crypto_provider();
         let certificates = certificate_chain_der
             .into_iter()
             .map(|certificate| CertificateDer::from(certificate.into_vec()))
@@ -3060,7 +3060,7 @@ fn build_client_config(
     } else {
         let provider = options
             .crypto_provider
-            .unwrap_or_else(default_crypto_provider);
+            .unwrap_or_else(fallback_crypto_provider);
         let signature_algorithms = provider.signature_verification_algorithms;
         let verifier = if options.certificate_verifier.is_none() {
             let mut roots = RootCertStore::empty();
@@ -3162,11 +3162,20 @@ fn build_client_config(
     Ok((config, server_name, options.identity_verifier))
 }
 
-/// Resolves the process-default provider, else ring's defaults, without installing either.
-fn default_crypto_provider() -> Arc<CryptoProvider> {
+/// Returns ring's default crypto provider, which TLS options use when they
+/// have no provider of their own and none is installed for the process.
+pub fn builtin_crypto_provider() -> CryptoProvider {
+    rustls::crypto::ring::default_provider()
+}
+
+/// Returns the crypto provider that TLS options use when they have none of
+/// their own: the process-default provider if one is installed, else
+/// [`builtin_crypto_provider`]. It does not install either as the process
+/// default.
+pub fn fallback_crypto_provider() -> Arc<CryptoProvider> {
     CryptoProvider::get_default()
         .map(Arc::clone)
-        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()))
+        .unwrap_or_else(|| Arc::new(builtin_crypto_provider()))
 }
 
 fn session_store_name(identity: &str) -> ServerName<'static> {
@@ -3381,12 +3390,13 @@ mod tests {
     use rustls::CipherSuite;
     use rustls::NamedGroup;
     use rustls::crypto::CryptoProvider;
-    use rustls::crypto::ring;
 
     use super::TlsClientOptions;
     use super::TlsServerOptions;
     use super::TlsServerSettings;
     use super::build_client_config;
+    use super::builtin_crypto_provider;
+    use super::fallback_crypto_provider;
     use super::select_default_ca_path;
 
     const PROVIDER_CHILD_MARKER: &str = "ROXYGEN_TLS_PROVIDER_CHILD";
@@ -3408,12 +3418,16 @@ mod tests {
         )
     }
 
-    fn ring_with_only(suite: CipherSuite) -> CryptoProvider {
-        let mut provider = ring::default_provider();
+    fn builtin_with_only(suite: CipherSuite) -> CryptoProvider {
+        let mut provider = builtin_crypto_provider();
         provider
             .cipher_suites
             .retain(|candidate| candidate.suite() == suite);
-        assert_eq!(provider.cipher_suites.len(), 1, "ring provides {suite:?}");
+        assert_eq!(
+            provider.cipher_suites.len(),
+            1,
+            "the built-in provider includes {suite:?}",
+        );
         provider
     }
 
@@ -3523,25 +3537,32 @@ mod tests {
     }
 
     #[test]
-    fn fallback_configs_use_ring_defaults_without_installing_a_process_provider() {
+    fn fallback_configs_use_the_builtin_provider_without_installing_it() {
         run_in_child_process(
-            "fallback_configs_use_ring_defaults_without_installing_a_process_provider",
+            "fallback_configs_use_the_builtin_provider_without_installing_it",
             || {
                 assert!(
                     CryptoProvider::get_default().is_none(),
                     "a fresh test process starts without a process-default provider",
                 );
+                let fallback = fallback_crypto_provider();
                 let providers = fallback_config_providers();
                 assert!(
                     CryptoProvider::get_default().is_none(),
-                    "fallback TLS configs must not install a process-default provider",
+                    "the fallback provider and fallback TLS configs must not install a \
+                     process-default provider",
                 );
-                let expected = provider_algorithms(&ring::default_provider());
+                let expected = provider_algorithms(&builtin_crypto_provider());
+                assert_eq!(
+                    provider_algorithms(&fallback),
+                    expected,
+                    "the fallback provider is the built-in provider",
+                );
                 for provider in providers {
                     assert_eq!(
                         provider_algorithms(&provider),
                         expected,
-                        "the fallback provider keeps ring's default suites and groups",
+                        "fallback configs keep the built-in provider's suites and groups",
                     );
                 }
             },
@@ -3553,14 +3574,18 @@ mod tests {
         run_in_child_process(
             "fallback_configs_use_the_installed_process_provider",
             || {
-                ring_with_only(CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)
+                builtin_with_only(CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)
                     .install_default()
                     .expect("a fresh test process accepts a process-default provider");
                 let installed = CryptoProvider::get_default().expect("installed process default");
+                assert!(
+                    Arc::ptr_eq(&fallback_crypto_provider(), installed),
+                    "the fallback provider is the installed process default",
+                );
                 for provider in fallback_config_providers() {
                     assert!(
                         Arc::ptr_eq(&provider, installed),
-                        "the fallback provider is the installed process default",
+                        "fallback configs use the installed process default",
                     );
                     assert_eq!(
                         provider_algorithms(&provider).0,
@@ -3577,10 +3602,10 @@ mod tests {
         run_in_child_process(
             "explicit_client_provider_overrides_the_installed_process_provider",
             || {
-                ring_with_only(CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)
+                builtin_with_only(CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)
                     .install_default()
                     .expect("a fresh test process accepts a process-default provider");
-                let explicit = Arc::new(ring_with_only(CipherSuite::TLS13_AES_128_GCM_SHA256));
+                let explicit = Arc::new(builtin_with_only(CipherSuite::TLS13_AES_128_GCM_SHA256));
                 let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
                     .expect("test certificate");
                 let mut options = TlsClientOptions::new("localhost");
@@ -3612,7 +3637,7 @@ mod tests {
             &build_client_config(retained.clone()).unwrap().0,
         ));
 
-        let mut provider = ring::default_provider();
+        let mut provider = builtin_crypto_provider();
         provider
             .cipher_suites
             .sort_by_key(|suite| suite.suite() != CipherSuite::TLS13_AES_128_GCM_SHA256);

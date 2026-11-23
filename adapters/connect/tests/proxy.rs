@@ -47,6 +47,7 @@ use roxygen_connect_client::runtime::DialError;
 use roxygen_connect_client::tunnel::Tunnel;
 use roxygen_http2::hpack::HpackDecoder;
 use roxygen_http2::hpack::HpackHeader;
+use roxygen_transport::tls::builtin_crypto_provider;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::ServerName;
@@ -233,31 +234,32 @@ fn endpoint(address: SocketAddr) -> TransportEndpoint {
     TransportEndpoint::Socket(SocketAddress::new(address.ip().to_string(), address.port()))
 }
 
-pub(crate) fn install_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
 /// A self-signed proxy identity: a server config selecting from `server_alpn` and a client
 /// config that trusts it and offers h2 and http/1.1.
 pub(crate) fn tls_identity(
     server_alpn: &[&[u8]],
 ) -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
-    install_crypto_provider();
     let generated = rcgen::generate_simple_self_signed(vec!["proxy.example".to_owned()])
         .expect("self-signed certificate");
     let certificate: CertificateDer<'static> = generated.cert.der().clone();
     let key = PrivateKeyDer::try_from(generated.signing_key.serialized_der().to_vec())
         .expect("private key");
-    let mut server = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![certificate.clone()], key)
-        .expect("server identity");
+    let mut server =
+        rustls::ServerConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("TLS versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.clone()], key)
+            .expect("server identity");
     server.alpn_protocols = server_alpn.iter().map(|alpn| alpn.to_vec()).collect();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(certificate).expect("trusted root");
-    let mut client = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let mut client =
+        rustls::ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("TLS versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
     client.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     (Arc::new(server), Arc::new(client))
 }

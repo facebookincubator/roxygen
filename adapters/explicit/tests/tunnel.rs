@@ -35,6 +35,7 @@ mod tunnel {
     use roxygen_transport::byte_stream::ByteStreamLimits;
     use roxygen_transport::established::EstablishedIo;
     use roxygen_transport::established::adopt_local_with_completion;
+    use roxygen_transport::tls::builtin_crypto_provider;
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::PrivateKeyDer;
     use tokio::io::AsyncReadExt;
@@ -61,7 +62,6 @@ mod tunnel {
     use crate::exchange_tests::support::block_on;
     use crate::exchange_tests::support::endpoint;
     use crate::exchange_tests::support::eventually;
-    use crate::exchange_tests::support::install_crypto_provider;
     use crate::exchange_tests::support::refusing_address;
     use crate::exchange_tests::support::request;
     use crate::exchange_tests::support::run_on_tokio_driver;
@@ -781,7 +781,6 @@ mod tunnel {
     /// A self-signed origin identity for `names`, which the client trusts. With `alpn`, the
     /// client offers http/1.1, which the origin selects.
     fn identity(names: &[&str], alpn: bool) -> Identity {
-        install_crypto_provider();
         let generated = rcgen::generate_simple_self_signed(
             names
                 .iter()
@@ -792,16 +791,22 @@ mod tunnel {
         let certificate: CertificateDer<'static> = generated.cert.der().clone();
         let key = PrivateKeyDer::try_from(generated.signing_key.serialized_der().to_vec())
             .expect("private key");
-        let mut server = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![certificate.clone()], key)
-            .expect("server identity");
+        let mut server =
+            rustls::ServerConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("TLS versions")
+                .with_no_client_auth()
+                .with_single_cert(vec![certificate.clone()], key)
+                .expect("server identity");
         server.alpn_protocols = vec![b"http/1.1".to_vec()];
         let mut roots = rustls::RootCertStore::empty();
         roots.add(certificate).expect("trusted root");
-        let mut client = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let mut client =
+            rustls::ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("TLS versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth();
         if alpn {
             client.alpn_protocols = vec![b"http/1.1".to_vec()];
         }
@@ -1867,7 +1872,6 @@ mod tunnel {
     fn classified_connect(answer: &'static [u8], observed: Observed) -> ExplicitError {
         let proxy = Proxy::start(Script::Answer(answer.to_vec()));
         let address = proxy.address;
-        install_crypto_provider();
         let tunnel = Arc::new(
             try_tunnel("10.0.0.1:443", &[], &untrusting_client(), "localhost").expect("tunnel"),
         );

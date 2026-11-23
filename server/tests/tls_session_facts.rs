@@ -25,6 +25,7 @@ use roxygen_core::handler::LocalHandlerFuture;
 use roxygen_core::source::HttpSource;
 use roxygen_core::source_holder::HttpSourceHolder;
 use roxygen_transport::tls::TlsServerOptions;
+use roxygen_transport::tls::builtin_crypto_provider;
 use rustls::ClientConfig;
 use rustls::ClientConnection;
 use rustls::HandshakeKind;
@@ -136,12 +137,11 @@ fn tls_session_facts_report_resumption() {
     .unwrap();
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(certificate)).unwrap();
-    let mut config =
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+    let mut config = ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     // The client's default in-memory session store keeps the ticket that the
     // first connection receives, and the second connection offers it.

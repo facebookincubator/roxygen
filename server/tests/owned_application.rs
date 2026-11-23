@@ -53,6 +53,7 @@ use roxygen_session::owned::OwnedExchange;
 use roxygen_session::owned_h1::Http1DriverConfig;
 use roxygen_session::session::LifecycleObserver;
 use roxygen_transport::tls::TlsServerOptions;
+use roxygen_transport::tls::builtin_crypto_provider;
 use rustls::ClientConfig;
 use rustls::ClientConnection;
 use rustls::RootCertStore;
@@ -802,13 +803,16 @@ fn owned_app_sees_context_and_peer_der() {
     roots
         .add(CertificateDer::from(tls.server_certificate))
         .unwrap();
-    let mut client_config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_client_auth_cert(
-            vec![CertificateDer::from(tls.client_certificate.clone())],
-            PrivateKeyDer::try_from(tls.client_key).unwrap(),
-        )
-        .unwrap();
+    let mut client_config =
+        ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(
+                vec![CertificateDer::from(tls.client_certificate.clone())],
+                PrivateKeyDer::try_from(tls.client_key).unwrap(),
+            )
+            .unwrap();
     client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let connection = ClientConnection::new(
         Arc::new(client_config),

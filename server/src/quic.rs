@@ -81,8 +81,8 @@ use roxygen_runtime::worker::WorkerCleanupTaskRegistration;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_session::owned::OwnedApplication;
 use roxygen_session::uniplex::UniplexRunSummary;
+use roxygen_transport::tls::fallback_crypto_provider;
 use rustls::NamedGroup;
-use rustls::crypto::CryptoProvider;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::time_provider::DefaultTimeProvider;
@@ -334,15 +334,13 @@ fn quic_error(error: impl std::fmt::Display) -> HttpServerError {
     HttpServerError::Quic(error.to_string())
 }
 
-/// Builds the TLS config for a certificate: TLS 1.3, ALPN `h3`, and the process-default crypto
-/// provider, else ring's, with X25519 first among its key exchange groups.
+/// Builds the TLS config for a certificate: TLS 1.3, ALPN `h3`, and the provider from
+/// [`fallback_crypto_provider`], with X25519 first among its key exchange groups.
 fn certificate_config(
     chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<rustls::ServerConfig, HttpServerError> {
-    let mut provider = CryptoProvider::get_default()
-        .map(|provider| CryptoProvider::clone(provider))
-        .unwrap_or_else(rustls::crypto::ring::default_provider);
+    let mut provider = Arc::unwrap_or_clone(fallback_crypto_provider());
     provider
         .kx_groups
         .sort_by_key(|group| group.name() != NamedGroup::X25519);

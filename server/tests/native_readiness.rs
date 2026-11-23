@@ -62,6 +62,7 @@ use roxygen_core::source::HttpSource;
 use roxygen_core::source::LocalSourceFuture;
 use roxygen_core::source_holder::HttpSourceHolder;
 use roxygen_transport::tls::TlsServerOptions;
+use roxygen_transport::tls::builtin_crypto_provider;
 use rustls::ClientConfig;
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
@@ -804,7 +805,8 @@ fn tls_fixture(protocol: Protocol) -> TestResult<(TlsServerOptions, Arc<ClientCo
     )?;
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(certificate))?;
-    let mut client = ClientConfig::builder()
+    let mut client = ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+        .with_safe_default_protocol_versions()?
         .with_root_certificates(roots)
         .with_no_client_auth();
     client.alpn_protocols = vec![protocol.alpn().to_vec()];

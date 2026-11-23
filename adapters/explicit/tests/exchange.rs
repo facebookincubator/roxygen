@@ -53,6 +53,7 @@ pub(crate) mod support {
     use roxygen_runtime::worker::WorkerContext;
     use roxygen_runtime::worker::WorkerHandle;
     use roxygen_transport::established::EstablishedIo;
+    use roxygen_transport::tls::builtin_crypto_provider;
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::PrivateKeyDer;
     use rustls::server::ClientHello;
@@ -392,12 +393,8 @@ pub(crate) mod support {
         pub(crate) alpn_offers: Arc<Mutex<Vec<Option<Vec<Vec<u8>>>>>>,
     }
 
-    pub(crate) fn install_crypto_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    }
-
     pub(crate) fn tls_fixture() -> TlsFixture {
-        install_crypto_provider();
+        let provider = Arc::new(builtin_crypto_provider());
         let generated = rcgen::generate_simple_self_signed(vec![
             "localhost".to_owned(),
             "127.0.0.1".to_owned(),
@@ -407,10 +404,14 @@ pub(crate) mod support {
         let certificate: CertificateDer<'static> = generated.cert.der().clone();
         let key = PrivateKeyDer::try_from(generated.signing_key.serialized_der().to_vec())
             .expect("private key");
-        let signing_key =
-            rustls::crypto::ring::sign::any_supported_type(&key).expect("signing key");
+        let signing_key = provider
+            .key_provider
+            .load_private_key(key)
+            .expect("signing key");
         let alpn_offers = Arc::new(Mutex::new(Vec::new()));
-        let server = rustls::ServerConfig::builder()
+        let server = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .expect("TLS versions")
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(RecordingResolver {
                 key: Arc::new(CertifiedKey::new(vec![certificate.clone()], signing_key)),
@@ -418,7 +419,9 @@ pub(crate) mod support {
             }));
         let mut roots = rustls::RootCertStore::empty();
         roots.add(certificate).expect("trusted root");
-        let client = rustls::ClientConfig::builder()
+        let client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("TLS versions")
             .with_root_certificates(roots)
             .with_no_client_auth();
         TlsFixture {
@@ -429,9 +432,10 @@ pub(crate) mod support {
     }
 
     pub(crate) fn untrusting_client() -> Arc<rustls::ClientConfig> {
-        install_crypto_provider();
         Arc::new(
-            rustls::ClientConfig::builder()
+            rustls::ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("TLS versions")
                 .with_root_certificates(rustls::RootCertStore::empty())
                 .with_no_client_auth(),
         )

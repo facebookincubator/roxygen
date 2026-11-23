@@ -25,6 +25,7 @@ use roxygen_core::source_holder::HttpSourceHolder;
 use roxygen_transport::tls::TlsAlpnMismatch;
 use roxygen_transport::tls::TlsServerOptions;
 use roxygen_transport::tls::TlsServerSettings;
+use roxygen_transport::tls::builtin_crypto_provider;
 use rustls::ClientConfig;
 use rustls::ClientConnection;
 use rustls::RootCertStore;
@@ -123,12 +124,11 @@ fn no_alpn_offered_dispatches_h1() {
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(certificate)).unwrap();
     let client = |protocols: Vec<Vec<u8>>| {
-        let mut config =
-            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_root_certificates(roots.clone())
-                .with_no_client_auth();
+        let mut config = ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots.clone())
+            .with_no_client_auth();
         config.alpn_protocols = protocols;
         Arc::new(config)
     };

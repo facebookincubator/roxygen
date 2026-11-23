@@ -78,6 +78,7 @@ use roxygen_session::uniplex::UniplexResponse;
 use roxygen_transport::byte_stream::ByteStreamLimits;
 use roxygen_transport::established::EstablishedIo;
 use roxygen_transport::established::adopt_local;
+use roxygen_transport::tls::builtin_crypto_provider;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::ServerName;
@@ -3388,20 +3389,24 @@ fn dropped_unique_tunnel_with_stalled_egress_is_released_by_write_timeout_or_ses
 const ORIGIN_BODY_LENGTH: usize = 70_000;
 
 fn tls_configs() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let provider = Arc::new(builtin_crypto_provider());
     let generated =
         rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("certificate");
     let certificate = CertificateDer::from(generated.cert.der().to_vec());
     let private_key = PrivateKeyDer::try_from(generated.signing_key.serialized_der().to_vec())
         .expect("private key");
-    let mut server = rustls::ServerConfig::builder()
+    let mut server = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
         .with_no_client_auth()
         .with_single_cert(vec![certificate.clone()], private_key)
         .expect("server configuration");
     server.alpn_protocols = vec![b"http/1.1".to_vec()];
     let mut roots = rustls::RootCertStore::empty();
     roots.add(certificate).expect("test root");
-    let mut client = rustls::ClientConfig::builder()
+    let mut client = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
         .with_root_certificates(roots)
         .with_no_client_auth();
     client.alpn_protocols = vec![b"http/1.1".to_vec()];

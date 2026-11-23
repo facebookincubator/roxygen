@@ -39,6 +39,7 @@ use roxygen_core::source_holder::HttpSourceHolder;
 use roxygen_runtime::worker::WorkerContext;
 use roxygen_runtime::worker::WorkerHandle;
 use roxygen_transport::tls::TlsServerOptions;
+use roxygen_transport::tls::builtin_crypto_provider;
 use rustls::ClientConfig;
 use rustls::ClientConnection;
 use rustls::RootCertStore;
@@ -308,7 +309,9 @@ fn tls_connect(
     roots
         .add(CertificateDer::from(certificate.to_vec()))
         .unwrap();
-    let mut client = ClientConfig::builder()
+    let mut client = ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
     client.alpn_protocols = vec![protocol.to_vec()];

@@ -76,6 +76,7 @@ use roxygen_transport::tcp::TcpTransport;
 use roxygen_transport::tls::TlsClientOptions;
 use roxygen_transport::tls::TlsServerOptions;
 use roxygen_transport::tls::TlsTransport;
+use roxygen_transport::tls::builtin_crypto_provider;
 use rustls::ClientConfig;
 use rustls::ClientConnection;
 use rustls::RootCertStore;
@@ -509,7 +510,9 @@ fn tls_client(certificate: &[u8]) -> ClientConnection {
     roots
         .add(CertificateDer::from(certificate.to_vec()))
         .unwrap();
-    let mut config = ClientConfig::builder()
+    let mut config = ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -963,9 +966,12 @@ fn registration_panic_or_worker_close_joins_without_serving() {
                 let mut client: Box<dyn Write> = if secure {
                     let mut roots = RootCertStore::empty();
                     roots.add(CertificateDer::from(certificate)).unwrap();
-                    let mut config = ClientConfig::builder()
-                        .with_root_certificates(roots)
-                        .with_no_client_auth();
+                    let mut config =
+                        ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+                            .with_safe_default_protocol_versions()
+                            .unwrap()
+                            .with_root_certificates(roots)
+                            .with_no_client_auth();
                     config.alpn_protocols = vec![b"http/1.1".to_vec()];
                     let connection = ClientConnection::new(
                         Arc::new(config),
@@ -2347,9 +2353,12 @@ fn tls_zero_copy_force_stop_is_bounded() {
     roots
         .add(CertificateDer::from(certificate))
         .expect("generated certificate is trusted");
-    let mut client_config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let mut client_config =
+        ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("the built-in provider supports the default TLS versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
     client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let connection = ClientConnection::new(
         Arc::new(client_config),

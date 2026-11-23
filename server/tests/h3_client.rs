@@ -59,7 +59,8 @@ use roxygen_h3::codec::UniStreamHeaderDecoder;
 use roxygen_h3::codec::encode_frame_header;
 use roxygen_qpack::FieldLine;
 use roxygen_runtime::tokio_host::ManagedWorker;
-use rustls::crypto::ring;
+use roxygen_transport::tls::builtin_crypto_provider;
+use rustls::NamedGroup;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::PrivatePkcs8KeyDer;
@@ -254,8 +255,10 @@ impl H3Client {
             })
             .expect("the client worker takes commands");
         rx.recv_timeout(WAIT).expect("the client driver starts");
-        let mut provider = ring::default_provider();
-        provider.kx_groups = vec![ring::kx_group::X25519];
+        let mut provider = builtin_crypto_provider();
+        provider
+            .kx_groups
+            .retain(|group| group.name() == NamedGroup::X25519);
         let tls = mvfstr_tls::client_config(
             provider,
             Arc::new(ManualTimeProvider::new(UnixTime::now())),

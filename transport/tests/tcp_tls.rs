@@ -67,8 +67,10 @@ mod tcp_tls {
     use roxygen_runtime::worker::WorkerHandle;
     use roxygen_runtime::worker::WorkerState;
     use rustls::ClientConfig;
+    use rustls::NamedGroup;
     use rustls::RootCertStore;
     use rustls::ServerConfig;
+    use rustls::crypto::CryptoProvider;
     use rustls::crypto::cipher::OutboundChunks;
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::PrivateKeyDer;
@@ -156,6 +158,7 @@ mod tcp_tls {
     use crate::tls::TlsStreamAccess;
     use crate::tls::TlsTransport;
     use crate::tls::await_handshake_with_deadline;
+    use crate::tls::builtin_crypto_provider;
     use crate::tls::tls_error;
     use crate::tls_handshake_failure_kind;
     use crate::tls_handshake_rustls_error;
@@ -5798,15 +5801,24 @@ mod tcp_tls {
         let certificate_der = CertificateDer::from(certificate.clone());
         let private_key =
             PrivateKeyDer::try_from(generated.signing_key.serialized_der().to_vec()).unwrap();
-        let mut config =
-            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_no_client_auth()
-                .with_single_cert(vec![certificate_der], private_key)
-                .unwrap();
+        let mut config = ServerConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate_der], private_key)
+            .unwrap();
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         (certificate, Arc::new(config))
+    }
+
+    /// The built-in provider with X25519 as its only key exchange group, for
+    /// tests that check the negotiated group.
+    fn builtin_x25519_only() -> CryptoProvider {
+        let mut provider = builtin_crypto_provider();
+        provider
+            .kx_groups
+            .retain(|group| group.name() == NamedGroup::X25519);
+        provider
     }
 
     fn tls_owned_read_payload() -> Vec<u8> {
@@ -5925,7 +5937,7 @@ mod tcp_tls {
         let mut roots = RootCertStore::empty();
         roots.add(CertificateDer::from(certificate)).unwrap();
         let client_config =
-            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
                 .with_safe_default_protocol_versions()
                 .unwrap()
                 .with_root_certificates(roots)
@@ -6038,6 +6050,7 @@ mod tcp_tls {
                             trusted.add_root_certificate(&certificate);
                             trusted.set_alpn_protocols([b"http/1.1".as_slice()]);
                             trusted.set_identity_verifier(Rc::new(BadActorIdentity));
+                            trusted.set_crypto_provider(Arc::new(builtin_x25519_only()));
                             let transport = TlsTransport::connect(
                                 &context,
                                 address(destination),
@@ -6262,13 +6275,12 @@ mod tcp_tls {
                 roots
                     .add(CertificateDer::from(certificate))
                     .expect("generated certificate is a valid root");
-                let mut client_config = ClientConfig::builder_with_provider(Arc::new(
-                    rustls::crypto::ring::default_provider(),
-                ))
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
+                let mut client_config =
+                    ClientConfig::builder_with_provider(Arc::new(builtin_x25519_only()))
+                        .with_safe_default_protocol_versions()
+                        .unwrap()
+                        .with_root_certificates(roots)
+                        .with_no_client_auth();
                 client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -11949,13 +11961,12 @@ mod tcp_tls {
                     let stream = socket.connect(destination).await.unwrap();
                     let mut roots = RootCertStore::empty();
                     roots.add(CertificateDer::from(certificate)).unwrap();
-                    let config = ClientConfig::builder_with_provider(Arc::new(
-                        rustls::crypto::ring::default_provider(),
-                    ))
-                    .with_safe_default_protocol_versions()
-                    .unwrap()
-                    .with_root_certificates(roots)
-                    .with_no_client_auth();
+                    let config =
+                        ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+                            .with_safe_default_protocol_versions()
+                            .unwrap()
+                            .with_root_certificates(roots)
+                            .with_no_client_auth();
                     TlsConnector::from(Arc::new(config))
                         .connect(ServerName::try_from("localhost").unwrap(), stream)
                         .await
@@ -12230,7 +12241,7 @@ mod tcp_tls {
             .add(CertificateDer::from(server.cert.der().to_vec()))
             .unwrap();
         let client_config =
-            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
                 .with_safe_default_protocol_versions()
                 .unwrap()
                 .with_root_certificates(roots)
@@ -12310,12 +12321,11 @@ mod tcp_tls {
 
     /// A ClientHello that offers the ALPN `protocols`.
     fn client_hello_offering(protocols: Vec<Vec<u8>>) -> Vec<u8> {
-        let mut config =
-            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_root_certificates(RootCertStore::empty())
-                .with_no_client_auth();
+        let mut config = ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
         config.alpn_protocols = protocols;
         let mut client_hello = Vec::new();
         rustls::ClientConnection::new(Arc::new(config), ServerName::try_from("localhost").unwrap())
@@ -12608,7 +12618,7 @@ mod tcp_tls {
             roots
                 .add(CertificateDer::from(self.certificate.to_vec()))
                 .unwrap();
-            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
                 .with_protocol_versions(versions)
                 .unwrap()
                 .with_root_certificates(roots)
@@ -13264,14 +13274,14 @@ mod tcp_tls {
 
     type SignatureAlgorithm = &'static dyn rustls::pki_types::SignatureVerificationAlgorithm;
 
-    /// ring's default provider without Ed25519 signature verification.
-    fn ring_without_ed25519_verification() -> Arc<rustls::crypto::CryptoProvider> {
+    /// The built-in provider without Ed25519 signature verification.
+    fn builtin_without_ed25519_verification() -> Arc<CryptoProvider> {
         // The provider needs `'static` lists; a static keeps them reachable.
         static ALGORITHMS: OnceLock<(
             Vec<SignatureAlgorithm>,
             Vec<(rustls::SignatureScheme, &'static [SignatureAlgorithm])>,
         )> = OnceLock::new();
-        let mut provider = rustls::crypto::ring::default_provider();
+        let mut provider = builtin_crypto_provider();
         let defaults = provider.signature_verification_algorithms;
         let (all, mapping) = ALGORITHMS.get_or_init(|| {
             (
@@ -13330,7 +13340,7 @@ mod tcp_tls {
         let restricted = accept(
             server
                 .settings()
-                .with_crypto_provider(ring_without_ed25519_verification()),
+                .with_crypto_provider(builtin_without_ed25519_verification()),
         );
         assert!(
             matches!(
@@ -13679,7 +13689,7 @@ mod tcp_tls {
 
     impl SwitchedClientCertificate {
         fn new(leaf: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> Self {
-            let key = rustls::crypto::ring::default_provider()
+            let key = builtin_crypto_provider()
                 .key_provider
                 .load_private_key(key)
                 .unwrap();
@@ -13854,12 +13864,11 @@ mod tcp_tls {
         };
         let mut roots = RootCertStore::empty();
         roots.add(server_ca.certificate()).unwrap();
-        let client =
-            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .unwrap()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
+        let client = ClientConfig::builder_with_provider(Arc::new(builtin_crypto_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
 
         let first = accept_with_client_auth(load(server_ca.issue_server()), client.clone());
         assert!(!first.server_resumed);
