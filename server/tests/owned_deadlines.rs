@@ -486,8 +486,11 @@ fn tls_idle_is_refreshed_by_staged_plaintext_write() {
         std::thread::sleep(TLS_IDLE / 2);
     }
     let after = (readable(client_fd), unsent(server_fd));
+    // The kernel can still move bytes from the server's send queue into the client's receive
+    // queue, so the check is on their total, which a staged write reaching either kernel raises.
     assert_eq!(
-        after, queues,
+        after.0 + after.1,
+        queues.0 + queues.1,
         "the staged writes reached neither kernel: last fill chunk {fill_chunks}, \
          (client FIONREAD, server SIOCOUTQ) before {queues:?}, after {after:?}"
     );

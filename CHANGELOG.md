@@ -15,3 +15,11 @@ The first public version of Roxygen:
   Linux.
 - Adapters for the `http`, `http-body` and Tower crates.
 - HTTP CONNECT tunnels, and a curl-like command-line client.
+
+### Changed
+
+- TLS uses the aws-lc-rs crypto provider by default instead of ring, and offers
+  the post-quantum X25519MLKEM768 key exchange first. Every crate that reaches
+  Roxygen's TLS has `aws-lc-rs` and `ring` features. With
+  `default-features = false` and `ring`, Roxygen uses ring and does not build
+  aws-lc-rs.

@@ -51,6 +51,31 @@ jobs:
       - run: cargo test --workspace --no-fail-fast --features ferroxygen_runtime/observability
       - run: cargo clippy --workspace --all-targets --all-features
 
+  # ferroxygen_h3 is left out because its mvfstr dependencies are not in the
+  # workspace.
+  ring:
+    name: Linux (ring)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.98.1"
+          components: clippy
+      - run: cargo test --workspace --exclude ferroxygen_h3 --no-fail-fast --no-default-features --features ring
+      - run: cargo clippy --workspace --exclude ferroxygen_h3 --all-targets --no-default-features --features ring
+      - name: Check that aws-lc-rs is not built
+        run: |
+          if cargo tree --workspace --exclude ferroxygen_h3 --no-default-features --features ring -e all --prefix none | grep -E '^aws-lc-(rs|sys) '; then
+            echo "the ring build depends on aws-lc-rs" >&2
+            exit 1
+          fi
+
   macos:
     name: macOS
     runs-on: macos-latest

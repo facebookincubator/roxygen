@@ -87,7 +87,16 @@
 //! built from a rustls `ServerConfig` or given a provider with
 //! [`TlsServerSettings::with_crypto_provider`], use
 //! [`tls::fallback_crypto_provider`]: the process-wide rustls `CryptoProvider`
-//! if one is installed, else [`tls::builtin_crypto_provider`], which is ring's.
+//! if one is installed, else [`tls::builtin_crypto_provider`].
+//!
+//! # Crypto backend
+//!
+//! The built-in provider and the servers' session ticketers come from
+//! aws-lc-rs or ring, chosen by Cargo feature. The `aws-lc-rs` feature is on
+//! by default, and aws-lc-rs is used whenever it is on, even with `ring` on
+//! too. With only `ring` on, ring is used. At least one of the two must be on.
+//! The aws-lc-rs provider offers the post-quantum X25519MLKEM768 key exchange
+//! first, and ring's provider does not have it.
 //!
 //! # TLS client certificates
 //!
@@ -103,11 +112,10 @@
 //! # TLS session resumption
 //!
 //! By default each set of server options from `from_settings` issues tickets
-//! from its own ring ticketer, so clients cannot resume a session made before
-//! the server reloads its credentials. Settings given a [`TlsServerResumption`]
+//! from its own ticketer, so clients cannot resume a session made before the
+//! server reloads its credentials. Settings given a [`TlsServerResumption`]
 //! share its ticketer and session cache with the other options built from it,
-//! as long as the client verification and the certificate chain stay the
-//! same.
+//! as long as the client verification and the certificate chain stay the same.
 
 pub mod byte_event;
 pub mod byte_stream;

@@ -110,6 +110,8 @@ use crate::tcp::prepare_accepted_stream;
 use crate::tcp::set_congestion_flavor_best_effort;
 use crate::tcp::setup_future;
 
+pub(crate) mod backend;
+
 /// Owner-local policy applied to the peer's end-entity certificate after chain
 /// verification.
 pub trait TlsPeerIdentityVerifier {
@@ -1997,9 +1999,9 @@ pub enum TlsAlpnMismatch {
 ///
 /// By default the server offers no ALPN protocols, requests no client
 /// certificate, and uses the installed process-default crypto provider, else
-/// ring. Each set of options issues tickets from its own ring ticketer, as
-/// `TlsServerOptions::new` does, unless the settings carry a
-/// [`TlsServerResumption`].
+/// [`builtin_crypto_provider`]. Each set of options issues tickets from its own
+/// ticketer on the built-in backend, as `TlsServerOptions::new` does, unless
+/// the settings carry a [`TlsServerResumption`].
 #[non_exhaustive]
 pub struct TlsServerSettings {
     certificate_chain_der: Vec<Box<[u8]>>,
@@ -2043,7 +2045,8 @@ impl TlsServerSettings {
     }
 
     /// Sets the provider for the handshake and for verifying client
-    /// certificates, instead of the installed process default, else ring.
+    /// certificates, instead of the installed process default, else
+    /// [`builtin_crypto_provider`].
     pub fn with_crypto_provider(mut self, provider: Arc<CryptoProvider>) -> Self {
         self.crypto_provider = Some(provider);
         self
@@ -2060,7 +2063,7 @@ impl TlsServerSettings {
     /// fresh state.
     ///
     /// Without this, each [`TlsServerOptions::from_settings`] call makes its
-    /// own ring ticketer and a cache of 256 sessions.
+    /// own ticketer on the built-in backend and a cache of 256 sessions.
     pub fn with_resumption(mut self, resumption: TlsServerResumption) -> Self {
         self.resumption = Some(resumption);
         self
@@ -2081,18 +2084,19 @@ pub struct TlsServerResumption {
 }
 
 impl TlsServerResumption {
-    /// Issues tickets with ring's ticketer, and caches up to
-    /// `session_cache_capacity` sessions for TLS 1.2 clients that resume by
-    /// session ID. Fails if ring cannot make the ticketer.
+    /// Issues tickets with the built-in backend's ticketer (see
+    /// [`builtin_crypto_provider`]), and caches up to `session_cache_capacity`
+    /// sessions for TLS 1.2 clients that resume by session ID. Fails if the
+    /// backend cannot make the ticketer.
     pub fn new(session_cache_capacity: usize) -> Result<Self, HttpError> {
-        Self::with_ring_ticketer(Some(session_cache_capacity))
+        Self::with_builtin_ticketer(Some(session_cache_capacity))
     }
 
-    /// Issues tickets with ring's ticketer and keeps no session cache, so
-    /// TLS 1.2 clients cannot resume by session ID. Fails if ring cannot make
-    /// the ticketer.
+    /// Issues tickets with the built-in backend's ticketer and keeps no
+    /// session cache, so TLS 1.2 clients cannot resume by session ID. Fails if
+    /// the backend cannot make the ticketer.
     pub fn tickets_only() -> Result<Self, HttpError> {
-        Self::with_ring_ticketer(None)
+        Self::with_builtin_ticketer(None)
     }
 
     /// Issues no tickets and keeps no session cache, so sessions do not
@@ -2101,9 +2105,9 @@ impl TlsServerResumption {
         Self::unbound(None, None, Ok(None))
     }
 
-    /// Issues tickets from `make_ticketer` instead of ring's ticketer, for
-    /// example to keep them on the provider that runs the handshake. It is
-    /// called once before this returns, and again by each
+    /// Issues tickets from `make_ticketer` instead of the built-in backend's
+    /// ticketer, for example to keep them on the provider that runs the
+    /// handshake. It is called once before this returns, and again by each
     /// [`TlsServerOptions::from_settings`] call that replaces the state
     /// because the settings changed. Each call must return a ticketer with new
     /// keys: returning the same ticketer again would let tickets resume across
@@ -2128,8 +2132,8 @@ impl TlsServerResumption {
         Self::unbound(Some(make_ticketer), self.session_cache_capacity, first)
     }
 
-    fn with_ring_ticketer(session_cache_capacity: Option<usize>) -> Result<Self, HttpError> {
-        let make_ticketer: TicketerFactory = Arc::new(rustls::crypto::ring::Ticketer::new);
+    fn with_builtin_ticketer(session_cache_capacity: Option<usize>) -> Result<Self, HttpError> {
+        let make_ticketer: TicketerFactory = Arc::new(backend::Ticketer::new);
         let first = make_ticketer().map_err(ticket_error)?;
         Ok(Self::unbound(
             Some(make_ticketer),
@@ -2227,7 +2231,7 @@ struct TrustDigest {
 /// SHA-256 over `certificates`, each preceded by its length as eight
 /// big-endian octets.
 fn certificates_sha256<'a>(certificates: impl IntoIterator<Item = &'a [u8]>) -> [u8; 32] {
-    let mut context = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+    let mut context = backend::cipher_suite::TLS13_AES_128_GCM_SHA256
         .tls13()
         .expect("should be a TLS 1.3 cipher suite")
         .common
@@ -2317,7 +2321,7 @@ impl TlsServerOptions {
                 config.session_storage = bound.sessions;
             }
             None => {
-                config.ticketer = rustls::crypto::ring::Ticketer::new().map_err(ticket_error)?;
+                config.ticketer = backend::Ticketer::new().map_err(ticket_error)?;
             }
         }
         let continue_without_alpn = settings.alpn_mismatch == TlsAlpnMismatch::ContinueWithoutAlpn
@@ -2368,7 +2372,7 @@ impl TlsServerOptions {
             .with_no_client_auth()
             .with_single_cert(certificates, private_key)
             .map_err(|error| tls_message_error(b"invalid TLS server certificate: ", error))?;
-        config.ticketer = rustls::crypto::ring::Ticketer::new()
+        config.ticketer = backend::Ticketer::new()
             .map_err(|error| tls_message_error(b"failed to initialize TLS tickets: ", error))?;
         config.alpn_protocols = alpn_protocols
             .into_iter()
@@ -2411,7 +2415,7 @@ impl TlsServerOptions {
             .with_client_cert_verifier(verifier)
             .with_single_cert(certificates, private_key)
             .map_err(|error| tls_message_error(b"invalid TLS server certificate: ", error))?;
-        config.ticketer = rustls::crypto::ring::Ticketer::new()
+        config.ticketer = backend::Ticketer::new()
             .map_err(|error| tls_message_error(b"failed to initialize TLS tickets: ", error))?;
         config.alpn_protocols = alpn_protocols
             .into_iter()
@@ -3162,10 +3166,15 @@ fn build_client_config(
     Ok((config, server_name, options.identity_verifier))
 }
 
-/// Returns ring's default crypto provider, which TLS options use when they
-/// have no provider of their own and none is installed for the process.
+/// Returns the default crypto provider of the built-in backend, which TLS
+/// options use when they have no provider of their own and none is installed
+/// for the process. The backend, which also makes the servers' session
+/// ticketers, is aws-lc-rs when the `aws-lc-rs` feature is on, as it is by
+/// default, even if `ring` is on too, and ring when only `ring` is on. The
+/// aws-lc-rs provider offers the post-quantum X25519MLKEM768 key exchange
+/// first; ring's does not have it.
 pub fn builtin_crypto_provider() -> CryptoProvider {
-    rustls::crypto::ring::default_provider()
+    backend::default_provider()
 }
 
 /// Returns the crypto provider that TLS options use when they have none of
@@ -3595,6 +3604,67 @@ mod tests {
                 }
             },
         );
+    }
+
+    #[cfg(feature = "aws-lc-rs")]
+    #[test]
+    fn builtin_provider_prefers_post_quantum_key_exchange() {
+        assert_eq!(
+            provider_algorithms(&builtin_crypto_provider()).1.first(),
+            Some(&NamedGroup::X25519MLKEM768),
+            "with aws-lc-rs, the built-in provider offers X25519MLKEM768 first",
+        );
+    }
+
+    #[cfg(all(feature = "aws-lc-rs", feature = "ring"))]
+    #[test]
+    fn fallback_configs_use_aws_lc_rs_when_both_backends_are_built() {
+        run_in_child_process(
+            "fallback_configs_use_aws_lc_rs_when_both_backends_are_built",
+            || {
+                assert!(
+                    CryptoProvider::get_default().is_none(),
+                    "a fresh test process starts without a process-default provider",
+                );
+                let expected = provider_algorithms(&rustls::crypto::aws_lc_rs::default_provider());
+                assert_eq!(
+                    provider_algorithms(&builtin_crypto_provider()),
+                    expected,
+                    "the built-in provider is aws-lc-rs's when ring is built too",
+                );
+                for provider in fallback_config_providers() {
+                    assert_eq!(
+                        provider_algorithms(&provider),
+                        expected,
+                        "fallback configs use aws-lc-rs's suites and groups",
+                    );
+                }
+            },
+        );
+    }
+
+    #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
+    #[test]
+    fn fallback_configs_use_ring_without_aws_lc_rs() {
+        run_in_child_process("fallback_configs_use_ring_without_aws_lc_rs", || {
+            assert!(
+                CryptoProvider::get_default().is_none(),
+                "a fresh test process starts without a process-default provider",
+            );
+            let expected = provider_algorithms(&rustls::crypto::ring::default_provider());
+            assert_eq!(
+                provider_algorithms(&builtin_crypto_provider()),
+                expected,
+                "the built-in provider is ring's without aws-lc-rs",
+            );
+            for provider in fallback_config_providers() {
+                assert_eq!(
+                    provider_algorithms(&provider),
+                    expected,
+                    "fallback configs use ring's suites and groups",
+                );
+            }
+        });
     }
 
     #[test]

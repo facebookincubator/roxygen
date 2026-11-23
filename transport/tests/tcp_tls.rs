@@ -13552,8 +13552,8 @@ mod tcp_tls {
         }
     }
 
-    /// A factory of counting ring ticketers whose call number `fail_on`, if
-    /// any, fails.
+    /// A factory of counting ticketers on the built-in backend whose call
+    /// number `fail_on`, if any, fails.
     fn counting_ticketer(fail_on: Option<usize>) -> (Arc<TicketerCounts>, TicketerFactory) {
         let counts = Arc::new(TicketerCounts::default());
         let factory_counts = Arc::clone(&counts);
@@ -13563,7 +13563,7 @@ mod tcp_tls {
                 return Err(rustls::Error::General("ticketer unavailable".to_owned()));
             }
             Ok(Arc::new(CountingTicketer {
-                inner: rustls::crypto::ring::Ticketer::new()?,
+                inner: crate::tls::backend::Ticketer::new()?,
                 counts: Arc::clone(&factory_counts),
             }))
         });

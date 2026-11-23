@@ -171,7 +171,7 @@ pub enum QuicTls {
     /// the config lists.
     Config(Arc<rustls::ServerConfig>),
     /// A certificate chain and its key. The server builds the config: TLS 1.3, ALPN `h3`, and
-    /// the process-default crypto provider, else ring's, with X25519 preferred.
+    /// the provider from [`fallback_crypto_provider`], with X25519 preferred.
     Certificate {
         chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,

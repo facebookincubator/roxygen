@@ -256,6 +256,31 @@ refresh registry checksums on the first build.
 
 HTTP/3, QUIC and WebTransport are out of scope for now.
 
+## TLS crypto provider
+
+Roxygen's TLS runs on rustls with the
+[aws-lc-rs](https://github.com/aws/aws-lc-rs) crypto provider by default. To
+use [ring](https://github.com/briansmith/ring) instead, turn off the default
+features of every Roxygen crate you depend on and turn on `ring`:
+
+```toml
+[dependencies]
+ferroxygen_server = { version = "0.1", default-features = false, features = ["ring"] }
+```
+
+Roxygen uses aws-lc-rs whenever its feature is on, even if `ring` is on too,
+and a build with only `ring` on does not compile aws-lc-rs. Post-quantum key
+exchange, X25519MLKEM768, is offered first with aws-lc-rs and is not available
+with ring. TLS options that are given a provider, or a process-default provider
+installed with rustls, use that provider instead.
+
+To build and test the workspace with ring, except `ferroxygen_h3`, whose mvfstr
+dependencies are not in the workspace:
+
+```sh
+cargo test --workspace --exclude ferroxygen_h3 --no-default-features --features ring
+```
+
 ## Contributing
 
 See [CONTRIBUTING.md][contributing]. Roxygen is developed in Meta's internal
