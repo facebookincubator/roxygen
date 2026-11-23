@@ -657,6 +657,8 @@ dependencies = [
  "ferroxygen_qpack",
  "ferroxygen_runtime",
  "ferroxygen_session",
+ "mvfstr_driver",
+ "mvfstr_proto",
  "thiserror",
 ]
 
@@ -748,6 +750,7 @@ dependencies = [
  "ferroxygen_codec",
  "ferroxygen_core",
  "ferroxygen_h3",
+ "ferroxygen_qpack",
  "ferroxygen_runtime",
  "ferroxygen_session",
  "ferroxygen_transport",
@@ -757,6 +760,10 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "mvfstr_driver",
+ "mvfstr_io",
+ "mvfstr_proto",
+ "mvfstr_tls",
  "rcgen",
  "rustls",
  "socket2",
@@ -1594,6 +1601,65 @@ dependencies = [
  "smallvec",
  "tagptr",
  "uuid",
+]
+
+[[package]]
+name = "mvfstr_crypto"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "mvfstr_wire",
+ "ring",
+ "rustls",
+]
+
+[[package]]
+name = "mvfstr_driver"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "ferroxygen_runtime",
+ "mvfstr_io",
+ "mvfstr_proto",
+ "rustls",
+]
+
+[[package]]
+name = "mvfstr_io"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "mvfstr_proto",
+ "socket2",
+ "tokio",
+]
+
+[[package]]
+name = "mvfstr_proto"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "ferroxygen_bufqueue",
+ "mvfstr_crypto",
+ "mvfstr_tls",
+ "mvfstr_wire",
+ "rustls",
+]
+
+[[package]]
+name = "mvfstr_tls"
+version = "0.1.0"
+dependencies = [
+ "mvfstr_crypto",
+ "mvfstr_wire",
+ "rustls",
+]
+
+[[package]]
+name = "mvfstr_wire"
+version = "0.1.0"
+dependencies = [
+ "bytes",
 ]
 
 [[package]]

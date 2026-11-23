@@ -38,6 +38,7 @@ tokio = { version = "1.54.1", features = ["macros", "net", "rt", "signal", "sync
 
 [dev-dependencies]
 ferroxygen_client = { path = "../client", default-features = false }
+ferroxygen_qpack = { version = "0.1.0", path = "../qpack" }
 h2 = "0.4.20"
 http = "1.5.0"
 http-body = "1.1.0"
@@ -50,13 +51,17 @@ tokio-rustls = { version = "0.26.6", features = ["tls12"], default-features = fa
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ferroxygen_h3 = { version = "0.1.0", path = "../h3", optional = true, default-features = false }
+mvfstr_driver = { version = "0.1.0", git = "https://github.com/meta/mvfst.git", branch = "main", optional = true, default-features = false }
+mvfstr_io = { version = "0.1.0", git = "https://github.com/meta/mvfst.git", branch = "main", optional = true, default-features = false }
+mvfstr_proto = { version = "0.1.0", git = "https://github.com/meta/mvfst.git", branch = "main", optional = true, default-features = false }
+mvfstr_tls = { version = "0.1.0", git = "https://github.com/meta/mvfst.git", branch = "main", optional = true, default-features = false }
 rustls = { version = "0.23.46", features = ["std", "tls12"], optional = true, default-features = false }
 
 [features]
-aws-lc-rs = ["ferroxygen_h3?/aws-lc-rs", "ferroxygen_session/aws-lc-rs", "ferroxygen_transport/aws-lc-rs"]
+aws-lc-rs = ["ferroxygen_h3?/aws-lc-rs", "ferroxygen_session/aws-lc-rs", "ferroxygen_transport/aws-lc-rs", "mvfstr_driver?/aws-lc-rs", "mvfstr_io?/aws-lc-rs", "mvfstr_proto?/aws-lc-rs", "mvfstr_tls?/aws-lc-rs"]
 default = ["aws-lc-rs"]
-http3 = ["dep:ferroxygen_h3", "dep:rustls"]
-ring = ["ferroxygen_h3?/ring", "ferroxygen_session/ring", "ferroxygen_transport/ring"]
+http3 = ["dep:ferroxygen_h3", "dep:mvfstr_driver", "dep:mvfstr_io", "dep:mvfstr_proto", "dep:mvfstr_tls", "dep:rustls"]
+ring = ["ferroxygen_h3?/ring", "ferroxygen_session/ring", "ferroxygen_transport/ring", "mvfstr_driver?/ring", "mvfstr_io?/ring", "mvfstr_proto?/ring", "mvfstr_tls?/ring"]
 
 [lints]
 workspace = true

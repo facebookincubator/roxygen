@@ -31,10 +31,14 @@ ferroxygen_runtime = { version = "0.1.0", path = "../runtime" }
 ferroxygen_session = { version = "0.1.0", path = "../session", default-features = false }
 thiserror = "2.0.21"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+mvfstr_driver = { version = "0.1.0", git = "https://github.com/meta/mvfst.git", branch = "main", default-features = false }
+mvfstr_proto = { version = "0.1.0", git = "https://github.com/meta/mvfst.git", branch = "main", default-features = false }
+
 [features]
-aws-lc-rs = ["ferroxygen_session/aws-lc-rs"]
+aws-lc-rs = ["ferroxygen_session/aws-lc-rs", "mvfstr_driver/aws-lc-rs", "mvfstr_proto/aws-lc-rs"]
 default = ["aws-lc-rs"]
-ring = ["ferroxygen_session/ring"]
+ring = ["ferroxygen_session/ring", "mvfstr_driver/ring", "mvfstr_proto/ring"]
 
 [lints]
 workspace = true

@@ -1,3 +1,7 @@
+[patch."https://github.com/facebookincubator/roxygen.git"]
+ferroxygen_bufqueue = { path = "bufqueue" }
+ferroxygen_runtime = { path = "runtime" }
+
 [workspace]
 members = [
   "adapters/connect",
