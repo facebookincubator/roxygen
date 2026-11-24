@@ -795,7 +795,7 @@ impl<A: OwnedApplication> Core<A> {
             StreamReady::Reset { code, .. } => self.peer_reset(t, id, code),
             StreamReady::Stopped { code } => self.peer_stopped(t, id, code),
             StreamReady::Closed => self.stream_closed(id),
-            StreamReady::Writable => {}
+            StreamReady::Writable | StreamReady::Progress => {}
         }
     }
 
@@ -1103,7 +1103,7 @@ impl<A: OwnedApplication> Core<A> {
                     self.uni_ended(t, index);
                 }
             }
-            StreamReady::Writable | StreamReady::Stopped { .. } => {}
+            StreamReady::Writable | StreamReady::Progress | StreamReady::Stopped { .. } => {}
         }
     }
 
