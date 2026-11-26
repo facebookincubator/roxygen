@@ -1,0 +1,2953 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! The HTTP/3 session driven through the in-memory transport: a test client writes the peer's
+//! streams and parses what the session sends, and a scripted application records the session's
+//! calls into it.
+
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Wake;
+use std::task::Waker;
+use std::time::Duration;
+
+use bytes::Bytes;
+use bytes::BytesMut;
+use mvfstr_driver::ConnInfo;
+use mvfstr_driver::QuicApplication;
+use mvfstr_driver::QuicSession;
+use mvfstr_proto::BufQueue;
+use mvfstr_proto::ConnEvent;
+use mvfstr_proto::ConnOptions;
+use mvfstr_proto::Dir;
+use mvfstr_proto::Side;
+use mvfstr_proto::StreamId;
+use mvfstr_proto::StreamReady;
+use mvfstr_proto::Version;
+use roxygen_core::error::HttpError;
+use roxygen_core::error::HttpErrorCode;
+use roxygen_core::events::HttpBodyEvent;
+use roxygen_core::events::HttpBodyEventKind;
+use roxygen_core::events::HttpHeaderEvent;
+use roxygen_core::events::ResumeFuture;
+use roxygen_core::events::ResumeStatus;
+use roxygen_core::headers::HttpHeaders;
+use roxygen_core::ids::StreamId as HttpStreamId;
+use roxygen_core::ingress_completion::IngressCompletion;
+use roxygen_core::message::HttpMessage;
+use roxygen_core::stream_source::HttpStreamBodyRead;
+use roxygen_core::stream_source::HttpStreamSourceOwner;
+use roxygen_qpack::FieldLine;
+use roxygen_runtime::cancellation::CancellationToken;
+use roxygen_runtime::host::Host;
+use roxygen_session::owned::OwnedApplication;
+use roxygen_session::owned::OwnedExchange;
+
+use crate::H3ApplicationBuilder;
+use crate::H3Session;
+use crate::codec::Frame;
+use crate::codec::FrameDecoder;
+use crate::codec::FrameLimits;
+use crate::codec::FrameType;
+use crate::codec::H3ErrorCode;
+use crate::codec::Role;
+use crate::codec::SettingId;
+use crate::codec::Settings;
+use crate::codec::StreamKind;
+use crate::codec::StreamType;
+use crate::codec::UniStreamHeader;
+use crate::codec::UniStreamHeaderDecoder;
+use crate::codec::encode_frame_header;
+use crate::fake::FakeConn;
+use crate::fake::FakeSink;
+
+// ---------------------------------------------------------------------------------------------
+// The scripted application.
+
+/// What the application did, in order.
+#[derive(Clone, Debug, PartialEq)]
+enum Ev {
+    New(u64),
+    Request {
+        id: u64,
+        eom: bool,
+    },
+    Cancel {
+        id: u64,
+        code: HttpErrorCode,
+        peer: bool,
+    },
+    ResponseComplete(u64),
+    Complete(u64),
+}
+
+/// A flag a test opens to let the application continue.
+#[derive(Clone, Default)]
+struct Gate(Rc<GateInner>);
+
+#[derive(Default)]
+struct GateInner {
+    open: Cell<bool>,
+    waker: RefCell<Option<Waker>>,
+}
+
+impl Gate {
+    fn open(&self) {
+        self.0.open.set(true);
+        if let Some(waker) = self.0.waker.borrow_mut().take() {
+            waker.wake();
+        }
+    }
+
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0.open.get() {
+            Poll::Ready(())
+        } else {
+            *self.0.waker.borrow_mut() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    fn resume(&self) -> ResumeFuture {
+        let gate = self.clone();
+        Box::pin(std::future::poll_fn(move |cx| {
+            gate.poll(cx).map(|()| ResumeStatus::Signalled)
+        }))
+    }
+}
+
+/// The response an exchange produces.
+#[derive(Clone)]
+struct Plan {
+    informational: bool,
+    status: u16,
+    headers: Vec<(&'static str, &'static str)>,
+    body: Bytes,
+    trailers: Option<Vec<(&'static str, &'static str)>>,
+    /// A gate the head waits for.
+    head_gate: Option<Gate>,
+    /// A gate the first body poll suspends on.
+    suspend: Option<Gate>,
+    /// Whether the head fails instead.
+    fail: bool,
+    /// The code the body fails with instead.
+    body_failure: Option<HttpErrorCode>,
+    /// Empty body events produced before the body.
+    empty_events: usize,
+}
+
+impl Default for Plan {
+    fn default() -> Self {
+        Self {
+            informational: false,
+            status: 200,
+            headers: vec![("content-type", "text/plain")],
+            body: Bytes::from_static(b"hello"),
+            trailers: None,
+            head_gate: None,
+            suspend: None,
+            fail: false,
+            body_failure: None,
+            empty_events: 0,
+        }
+    }
+}
+
+/// A request as the application received it.
+struct Received {
+    head: Box<HttpMessage>,
+    body: Option<HttpStreamSourceOwner>,
+    read: Option<HttpStreamBodyRead>,
+}
+
+#[derive(Default)]
+struct AppState {
+    log: Vec<Ev>,
+    plan: Plan,
+    requests: HashMap<u64, Received>,
+    /// The `maximum` of each `poll_body` call.
+    maxima: Vec<u32>,
+}
+
+#[derive(Clone, Default)]
+struct TestApp(Rc<RefCell<AppState>>);
+
+impl OwnedApplication for TestApp {
+    type Exchange = TestExchange;
+
+    fn new_exchange(&self, stream: HttpStreamId, _ingress: IngressCompletion) -> TestExchange {
+        let plan = {
+            let mut state = self.0.borrow_mut();
+            state.log.push(Ev::New(stream.get()));
+            state.plan.clone()
+        };
+        TestExchange {
+            id: stream.get(),
+            state: Rc::clone(&self.0),
+            plan,
+            sent_informational: false,
+            offset: 0,
+            suspended: false,
+            empty_events: 0,
+        }
+    }
+}
+
+struct TestExchange {
+    id: u64,
+    state: Rc<RefCell<AppState>>,
+    plan: Plan,
+    sent_informational: bool,
+    offset: usize,
+    suspended: bool,
+    empty_events: usize,
+}
+
+impl TestExchange {
+    fn fields(fields: &[(&str, &str)]) -> HttpHeaders {
+        let mut headers = HttpHeaders::new();
+        for (name, value) in fields {
+            headers.add(*name, value);
+        }
+        headers
+    }
+}
+
+impl OwnedExchange for TestExchange {
+    fn request(&mut self, head: Box<HttpMessage>, body: HttpStreamSourceOwner, eom: bool) {
+        let mut state = self.state.borrow_mut();
+        state.log.push(Ev::Request { id: self.id, eom });
+        state.requests.insert(
+            self.id,
+            Received {
+                head,
+                body: Some(body),
+                read: None,
+            },
+        );
+    }
+
+    fn poll_headers(&mut self, cx: &mut Context<'_>) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        if let Some(gate) = &self.plan.head_gate {
+            std::task::ready!(gate.poll(cx));
+        }
+        if self.plan.fail {
+            return Poll::Ready(Err(HttpError::with_message(
+                HttpErrorCode::INTERNAL_ERROR,
+                b"the handler failed",
+            )));
+        }
+        let mut message = HttpMessage::new();
+        if self.plan.informational && !self.sent_informational {
+            self.sent_informational = true;
+            message.set_status_code(103).unwrap();
+            message.headers_mut().add("link", "</style.css>");
+            return Poll::Ready(Ok(HttpHeaderEvent::new(message, false).unwrap()));
+        }
+        message.set_status_code(self.plan.status).unwrap();
+        for (name, value) in &self.plan.headers {
+            message.headers_mut().add(*name, value);
+        }
+        let eom = self.plan.body.is_empty() && self.plan.trailers.is_none();
+        Poll::Ready(Ok(HttpHeaderEvent::new(message, eom).unwrap()))
+    }
+
+    fn poll_body(
+        &mut self,
+        _cx: &mut Context<'_>,
+        maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        self.state.borrow_mut().maxima.push(maximum);
+        if let Some(code) = self.plan.body_failure {
+            return Poll::Ready(Err(HttpError::with_message(code, b"the body failed")));
+        }
+        if let Some(gate) = &self.plan.suspend
+            && !self.suspended
+        {
+            self.suspended = true;
+            return Poll::Ready(Ok(HttpBodyEvent::suspend(gate.resume())));
+        }
+        if self.empty_events < self.plan.empty_events {
+            self.empty_events += 1;
+            return Poll::Ready(Ok(HttpBodyEvent::body(BufQueue::new(0), false)));
+        }
+        let left = self.plan.body.len() - self.offset;
+        if left > 0 {
+            let take = left.min(maximum as usize);
+            let chunk = self.plan.body.slice(self.offset..self.offset + take);
+            self.offset += take;
+            let eom = self.offset == self.plan.body.len() && self.plan.trailers.is_none();
+            let body = BufQueue::from_bytes(chunk, take).unwrap();
+            return Poll::Ready(Ok(HttpBodyEvent::body(body, eom)));
+        }
+        let trailers = self.plan.trailers.as_ref().expect("the body ended");
+        Poll::Ready(Ok(HttpBodyEvent::trailers(Self::fields(trailers))))
+    }
+
+    fn cancel(&mut self, error: &HttpError, peer_reset: bool) {
+        self.state.borrow_mut().log.push(Ev::Cancel {
+            id: self.id,
+            code: error.code(),
+            peer: peer_reset,
+        });
+    }
+
+    fn response_complete(&mut self) {
+        self.state
+            .borrow_mut()
+            .log
+            .push(Ev::ResponseComplete(self.id));
+    }
+
+    fn complete(self) {
+        self.state.borrow_mut().log.push(Ev::Complete(self.id));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The test client.
+
+fn client_bidi(index: u64) -> StreamId {
+    StreamId::new(Side::Client, Dir::Bi, index).unwrap()
+}
+
+fn client_uni(index: u64) -> StreamId {
+    StreamId::new(Side::Client, Dir::Uni, index).unwrap()
+}
+
+fn server_uni(index: u64) -> StreamId {
+    StreamId::new(Side::Server, Dir::Uni, index).unwrap()
+}
+
+/// Returns the Roxygen stream ID of a request stream.
+fn http_id(id: StreamId) -> u64 {
+    id.into_inner() + 1
+}
+
+fn field_section(fields: &[(&str, &str)]) -> Vec<u8> {
+    let mut block = BytesMut::new();
+    roxygen_qpack::Encoder::new().encode_field_section(
+        fields
+            .iter()
+            .map(|(name, value)| FieldLine::new(name.as_bytes(), value.as_bytes())),
+        &mut block,
+    );
+    block.to_vec()
+}
+
+fn headers_frame(fields: &[(&str, &str)]) -> Vec<u8> {
+    frame(FrameType::HEADERS, &field_section(fields))
+}
+
+fn data_frame(payload: &[u8]) -> Vec<u8> {
+    frame(FrameType::DATA, payload)
+}
+
+fn frame(frame_type: FrameType, payload: &[u8]) -> Vec<u8> {
+    let mut out = BytesMut::new();
+    encode_frame_header(&mut out, frame_type, payload.len() as u64).unwrap();
+    out.extend_from_slice(payload);
+    out.to_vec()
+}
+
+const GET: &[(&str, &str)] = &[
+    (":method", "GET"),
+    (":scheme", "https"),
+    (":authority", "example.com"),
+    (":path", "/index.html"),
+];
+
+const POST: &[(&str, &str)] = &[
+    (":method", "POST"),
+    (":scheme", "https"),
+    (":authority", "example.com"),
+    (":path", "/upload"),
+];
+
+fn control_stream(settings: &Settings) -> Vec<u8> {
+    let mut out = BytesMut::new();
+    UniStreamHeader::Control.encode(&mut out).unwrap();
+    Frame::Settings(settings.clone()).encode(&mut out).unwrap();
+    out.to_vec()
+}
+
+/// A part of a response as the client decodes it.
+#[derive(Clone, Debug, PartialEq)]
+enum Part {
+    Headers(Vec<(String, String)>),
+    Data(Vec<u8>),
+}
+
+fn parse_request_stream(bytes: &[u8]) -> Vec<Part> {
+    let mut decoder = FrameDecoder::new(StreamKind::Request, Role::Client, FrameLimits::default());
+    let mut input = Bytes::copy_from_slice(bytes);
+    let mut parts = Vec::new();
+    while let Some(frame) = decoder.decode(&mut input).unwrap() {
+        match frame {
+            Frame::Data(data) => parts.push(Part::Data(data.to_vec())),
+            Frame::Headers(block) => {
+                let mut fields = Vec::new();
+                roxygen_qpack::Decoder::new()
+                    .decode_field_section(&block, |line| {
+                        fields.push((
+                            String::from_utf8(line.name.to_vec()).unwrap(),
+                            String::from_utf8(line.value.to_vec()).unwrap(),
+                        ));
+                    })
+                    .unwrap();
+                parts.push(Part::Headers(fields));
+            }
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+    assert!(input.is_empty());
+    parts
+}
+
+fn body_of(parts: &[Part]) -> Vec<u8> {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::Data(data) => Some(data.as_slice()),
+            Part::Headers(_) => None,
+        })
+        .flatten()
+        .copied()
+        .collect()
+}
+
+fn field<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    fields
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, value)| value.as_str())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The harness: one session on a fake connection.
+
+struct Harness {
+    conn: FakeConn,
+    session: H3Session<TestApp>,
+    app: TestApp,
+    options: ConnOptions,
+    /// Wakes of the waker `poll_session` is given.
+    session_waker: Arc<CountWake>,
+}
+
+#[derive(Default)]
+struct CountWake(AtomicUsize);
+
+impl Wake for CountWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl Harness {
+    fn new() -> Self {
+        Self::with(H3ApplicationBuilder::new())
+    }
+
+    fn with(builder: H3ApplicationBuilder) -> Self {
+        Self::with_plan(builder, Plan::default())
+    }
+
+    fn with_plan(builder: H3ApplicationBuilder, plan: Plan) -> Self {
+        let app = TestApp::default();
+        app.0.borrow_mut().plan = plan;
+        let made = app.clone();
+        let mut application = builder
+            .build(Host::tokio(), move |_| Ok(made.clone()))
+            .unwrap();
+        let info = ConnInfo {
+            remote: "[::1]:4433".parse().unwrap(),
+            local_ip: None,
+            version: Version::V1,
+        };
+        let mut options = ConnOptions::default();
+        let session = application.accept(&info, &mut options).unwrap();
+        Self {
+            conn: FakeConn::new(),
+            session,
+            app,
+            options,
+            session_waker: Arc::default(),
+        }
+    }
+
+    /// Builds a harness whose peer has opened its control stream with SETTINGS.
+    fn ready() -> Self {
+        Self::ready_with(H3ApplicationBuilder::new(), Plan::default())
+    }
+
+    fn ready_with(builder: H3ApplicationBuilder, plan: Plan) -> Self {
+        let mut harness = Self::with_plan(builder, plan);
+        harness.event(ConnEvent::Connected);
+        harness.receive(client_uni(0), &control_stream(&Settings::new()), false);
+        harness
+    }
+
+    fn event(&mut self, event: ConnEvent) {
+        self.session.core.on_event(&mut self.conn, event);
+    }
+
+    fn ready_edge(&mut self, id: StreamId, ready: StreamReady) {
+        self.session.core.on_stream(&mut self.conn, id, ready);
+    }
+
+    /// Delivers peer bytes on `id`, opening it first if new, and the FIN if `fin`. As in the
+    /// transport, the stream reports a FIN that came with the bytes before any of their edges.
+    fn receive(&mut self, id: StreamId, bytes: &[u8], fin: bool) {
+        let new = !self.conn.streams.contains_key(&id);
+        self.conn.receive(id, bytes);
+        self.conn.get(id).peer_finished |= fin;
+        if new {
+            self.ready_edge(id, StreamReady::Opened);
+        }
+        if !bytes.is_empty() {
+            self.ready_edge(id, StreamReady::Readable);
+        }
+        if fin {
+            self.ready_edge(id, StreamReady::Finished);
+        }
+    }
+
+    fn poll_session(&mut self) {
+        let waker = Waker::from(Arc::clone(&self.session_waker));
+        let mut cx = Context::from_waker(&waker);
+        let _ = self.session.core.poll_session(&mut cx, &mut self.conn);
+    }
+
+    /// Counts the wakes of the waker `poll_session` was given.
+    fn waker_wakes(&self) -> usize {
+        self.session_waker.0.load(Ordering::SeqCst)
+    }
+
+    /// Counts the session wakes by either path.
+    fn wakes(&self) -> usize {
+        self.conn.session_wakes() + self.waker_wakes()
+    }
+
+    /// Calls `poll_send` once on `id` with `allowance`, and records what it pushed as sent.
+    fn pull(&mut self, id: StreamId, allowance: usize) -> (Poll<()>, FakeSink) {
+        let waker = self.conn.stream_waker_for(id);
+        let mut cx = Context::from_waker(&waker);
+        let mut sink = FakeSink::new(allowance);
+        let poll = self.session.core.poll_send(&mut cx, id, &mut sink);
+        if let Some(stream) = self.conn.streams.get_mut(&id) {
+            stream.sent.extend_from_slice(&sink.pushed);
+            stream.finished |= sink.finished;
+        }
+        (poll, sink)
+    }
+
+    /// Calls `poll_send` until it returns `Pending`, and returns the number of `Ready` calls.
+    fn pull_all(&mut self, id: StreamId, allowance: usize) -> usize {
+        let mut ready = 0;
+        while self.pull(id, allowance).0.is_ready() {
+            ready += 1;
+            assert!(ready < 10_000, "poll_send never returned Pending");
+        }
+        ready
+    }
+
+    fn response(&mut self, id: StreamId) -> Vec<Part> {
+        parse_request_stream(&self.conn.get(id).sent)
+    }
+
+    fn log(&self) -> Vec<Ev> {
+        self.app.0.borrow().log.clone()
+    }
+
+    /// Parses the server's control stream into its header and frames.
+    fn control(&mut self) -> (UniStreamHeader, Vec<Frame>) {
+        let sent = Bytes::copy_from_slice(&self.conn.get(server_uni(0)).sent);
+        let mut input = sent;
+        let header = UniStreamHeaderDecoder::new(Role::Client)
+            .decode(&mut input)
+            .unwrap()
+            .expect("the stream header is complete");
+        let mut decoder =
+            FrameDecoder::new(StreamKind::Control, Role::Client, FrameLimits::default());
+        let mut frames = Vec::new();
+        while let Some(frame) = decoder.decode(&mut input).unwrap() {
+            frames.push(frame);
+        }
+        (header, frames)
+    }
+
+    fn closed(&self) -> Option<u64> {
+        self.conn.closed
+    }
+
+    /// Polls the application's request body once for at most `maximum` bytes.
+    fn read_body(&mut self, id: StreamId, maximum: u32) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        let mut state = self.app.0.borrow_mut();
+        let received = state
+            .requests
+            .get_mut(&http_id(id))
+            .expect("the request was delivered");
+        let mut read = match received.read.take() {
+            Some(read) => read,
+            None => received
+                .body
+                .as_ref()
+                .and_then(HttpStreamSourceOwner::source)
+                .expect("the body has a source")
+                .read_body_event_unboxed(maximum, CancellationToken::never()),
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        let poll = Pin::new(&mut read).poll(&mut cx);
+        if poll.is_pending() {
+            received.read = Some(read);
+        }
+        poll
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Connection streams.
+
+#[test]
+fn settings_exchange() {
+    let mut h = Harness::with(H3ApplicationBuilder::new().max_field_section_size(16 << 10));
+    let transport = h
+        .options
+        .transport
+        .clone()
+        .expect("accept sets the transport");
+    assert!(transport.max_streams_bidi() >= 100);
+    assert!(transport.max_streams_uni() >= 3);
+    assert_eq!(transport.max_stream_data_bidi_remote(), 64 << 10);
+
+    h.event(ConnEvent::Connected);
+    let (header, frames) = h.control();
+    assert_eq!(header, UniStreamHeader::Control);
+    let Some(Frame::Settings(settings)) = frames.first() else {
+        panic!("the control stream starts with SETTINGS: {frames:?}");
+    };
+    assert_eq!(settings.get(SettingId::QPACK_MAX_TABLE_CAPACITY), Some(0));
+    assert_eq!(settings.get(SettingId::QPACK_BLOCKED_STREAMS), Some(0));
+    assert_eq!(
+        settings.get(SettingId::MAX_FIELD_SECTION_SIZE),
+        Some(16 << 10)
+    );
+    assert_eq!(settings.iter().filter(|(id, _)| id.is_grease()).count(), 1);
+    assert_eq!(settings.len(), 4);
+    let order = h.conn.get(server_uni(0)).order.unwrap();
+    assert_eq!((order.class, order.urgency), (0, 0));
+
+    // The peer's control stream and QPACK streams are accepted, and capacity 0 is valid.
+    let mut peer = Settings::new();
+    peer.set(SettingId::MAX_FIELD_SECTION_SIZE, 1000).unwrap();
+    h.receive(client_uni(0), &control_stream(&peer), false);
+    h.receive(
+        client_uni(1),
+        &[StreamType::QPACK_ENCODER.as_u64() as u8, 0x20],
+        false,
+    );
+    h.receive(
+        client_uni(2),
+        &[StreamType::QPACK_DECODER.as_u64() as u8],
+        false,
+    );
+    assert_eq!(h.closed(), None);
+    for index in 0..3 {
+        assert!(h.conn.get(client_uni(index)).readable.is_empty());
+    }
+    // MAX_PUSH_ID is accepted and ignored.
+    let mut max_push = BytesMut::new();
+    Frame::MaxPushId(10).encode(&mut max_push).unwrap();
+    h.receive(client_uni(0), &max_push, false);
+    assert_eq!(h.closed(), None);
+}
+
+#[test]
+fn critical_stream_errors() {
+    fn encoded(frame: Frame) -> Vec<u8> {
+        let mut out = BytesMut::new();
+        frame.encode(&mut out).unwrap();
+        out.to_vec()
+    }
+    let settings = control_stream(&Settings::new());
+    let encoder = [StreamType::QPACK_ENCODER.as_u64() as u8];
+    let decoder = [StreamType::QPACK_DECODER.as_u64() as u8];
+    let control_then = {
+        let settings = settings.clone();
+        move |frame: Frame| {
+            let mut bytes = settings.clone();
+            bytes.extend_from_slice(&encoded(frame));
+            bytes
+        }
+    };
+    type Step = Box<dyn Fn(&mut Harness)>;
+    let cases: Vec<(&str, Step, u64)> = vec![
+        (
+            "control stream FIN",
+            Box::new({
+                let settings = settings.clone();
+                move |h| h.receive(client_uni(0), &settings, true)
+            }),
+            H3ErrorCode::CLOSED_CRITICAL_STREAM.as_u64(),
+        ),
+        (
+            "control stream reset",
+            Box::new({
+                let settings = settings.clone();
+                move |h| {
+                    h.receive(client_uni(0), &settings, false);
+                    h.ready_edge(
+                        client_uni(0),
+                        StreamReady::Reset {
+                            code: app(H3ErrorCode::NO_ERROR.as_u64()),
+                            final_size: settings.len() as u64,
+                        },
+                    );
+                }
+            }),
+            H3ErrorCode::CLOSED_CRITICAL_STREAM.as_u64(),
+        ),
+        (
+            "encoder stream FIN",
+            Box::new(move |h| h.receive(client_uni(1), &encoder, true)),
+            H3ErrorCode::CLOSED_CRITICAL_STREAM.as_u64(),
+        ),
+        (
+            "decoder stream reset",
+            Box::new(move |h| {
+                h.receive(client_uni(1), &decoder, false);
+                h.ready_edge(
+                    client_uni(1),
+                    StreamReady::Reset {
+                        code: app(0),
+                        final_size: 1,
+                    },
+                );
+            }),
+            H3ErrorCode::CLOSED_CRITICAL_STREAM.as_u64(),
+        ),
+        (
+            "STOP_SENDING on our control stream",
+            Box::new(|h| {
+                h.ready_edge(
+                    server_uni(0),
+                    StreamReady::Stopped {
+                        code: app(H3ErrorCode::NO_ERROR.as_u64()),
+                    },
+                )
+            }),
+            H3ErrorCode::CLOSED_CRITICAL_STREAM.as_u64(),
+        ),
+        (
+            "second control stream",
+            Box::new({
+                let settings = settings.clone();
+                move |h| {
+                    h.receive(client_uni(0), &settings, false);
+                    h.receive(client_uni(1), &settings, false);
+                }
+            }),
+            H3ErrorCode::STREAM_CREATION_ERROR.as_u64(),
+        ),
+        (
+            "second encoder stream",
+            Box::new(move |h| {
+                h.receive(client_uni(1), &encoder, false);
+                h.receive(client_uni(2), &encoder, false);
+            }),
+            H3ErrorCode::STREAM_CREATION_ERROR.as_u64(),
+        ),
+        (
+            "second decoder stream",
+            Box::new(move |h| {
+                h.receive(client_uni(1), &decoder, false);
+                h.receive(client_uni(2), &decoder, false);
+            }),
+            H3ErrorCode::STREAM_CREATION_ERROR.as_u64(),
+        ),
+        (
+            "client push stream",
+            Box::new(|h| h.receive(client_uni(1), &[StreamType::PUSH.as_u64() as u8, 0], false)),
+            H3ErrorCode::STREAM_CREATION_ERROR.as_u64(),
+        ),
+        (
+            "control stream without SETTINGS first",
+            Box::new(|h| {
+                let mut bytes = vec![StreamType::CONTROL.as_u64() as u8];
+                bytes.extend_from_slice(&encoded(Frame::MaxPushId(1)));
+                h.receive(client_uni(0), &bytes, false);
+            }),
+            H3ErrorCode::MISSING_SETTINGS.as_u64(),
+        ),
+        (
+            "second SETTINGS",
+            Box::new({
+                let control_then = control_then.clone();
+                move |h| {
+                    h.receive(
+                        client_uni(0),
+                        &control_then(Frame::Settings(Settings::new())),
+                        false,
+                    )
+                }
+            }),
+            H3ErrorCode::FRAME_UNEXPECTED.as_u64(),
+        ),
+        (
+            "DATA on the control stream",
+            Box::new({
+                let control_then = control_then.clone();
+                move |h| {
+                    h.receive(
+                        client_uni(0),
+                        &control_then(Frame::Data(Bytes::from_static(b"x"))),
+                        false,
+                    )
+                }
+            }),
+            H3ErrorCode::FRAME_UNEXPECTED.as_u64(),
+        ),
+        (
+            "GOAWAY declaring a 2^30-byte payload",
+            Box::new({
+                let settings = settings.clone();
+                move |h| {
+                    let mut bytes = settings.clone();
+                    bytes.extend_from_slice(&[0x07, 0xc0, 0, 0, 0, 0x40, 0, 0, 0]);
+                    h.receive(client_uni(0), &bytes, false)
+                }
+            }),
+            H3ErrorCode::EXCESSIVE_LOAD.as_u64(),
+        ),
+        (
+            "CANCEL_PUSH for a push never promised",
+            Box::new({
+                let control_then = control_then.clone();
+                move |h| h.receive(client_uni(0), &control_then(Frame::CancelPush(0)), false)
+            }),
+            H3ErrorCode::ID_ERROR.as_u64(),
+        ),
+        (
+            "encoder stream insert",
+            Box::new(move |h| h.receive(client_uni(1), &[encoder[0], 0xc0 | 17], false)),
+            roxygen_qpack::QPACK_ENCODER_STREAM_ERROR,
+        ),
+        (
+            "encoder stream capacity above 0",
+            Box::new(move |h| h.receive(client_uni(1), &[encoder[0], 0x21], false)),
+            roxygen_qpack::QPACK_ENCODER_STREAM_ERROR,
+        ),
+        (
+            "decoder stream insert count increment",
+            Box::new(move |h| h.receive(client_uni(1), &[decoder[0], 0x00], false)),
+            roxygen_qpack::QPACK_DECODER_STREAM_ERROR,
+        ),
+    ];
+    for (name, step, code) in cases {
+        let mut h = Harness::new();
+        h.event(ConnEvent::Connected);
+        step(&mut h);
+        assert_eq!(h.closed(), Some(code), "{name}");
+    }
+}
+
+#[test]
+fn settings_precede_a_goaway_queued_before_the_control_stream_opened() {
+    let plan = Plan {
+        head_gate: Some(Gate::default()),
+        ..Plan::default()
+    };
+    let mut h = Harness::with_plan(H3ApplicationBuilder::new(), plan);
+    h.conn.uni_limit = 0;
+    h.event(ConnEvent::Connected);
+    assert!(
+        h.conn.streams.is_empty(),
+        "no unidirectional stream credit yet"
+    );
+    h.receive(client_bidi(0), &headers_frame(GET), true);
+    h.session.core.on_quiesce(&mut h.conn);
+    // A transport that has shut down cannot open a stream, so the control stream opens first.
+    assert!(
+        !h.conn.shutdown,
+        "shutdown waits for the control stream to open"
+    );
+
+    h.conn.uni_limit = 3;
+    h.event(ConnEvent::StreamsAvailable { dir: Dir::Uni });
+    let (header, frames) = h.control();
+    assert_eq!(header, UniStreamHeader::Control);
+    assert!(
+        matches!(frames.as_slice(), [Frame::Settings(_), Frame::Goaway(4)]),
+        "{frames:?}"
+    );
+    assert!(h.conn.shutdown, "the transport shuts down after the GOAWAY");
+}
+
+#[test]
+fn a_quiesce_waiting_for_the_control_stream_closes_only_after_its_goaway_can_leave() {
+    let mut h = Harness::new();
+    h.conn.uni_limit = 0;
+    h.event(ConnEvent::Connected);
+    h.session.core.on_quiesce(&mut h.conn);
+    assert_eq!(
+        h.session.deadline(),
+        None,
+        "no close is due while the GOAWAY cannot be sent"
+    );
+    h.conn.now += Duration::from_secs(60);
+    h.poll_session();
+    assert_eq!(
+        h.closed(),
+        None,
+        "the connection waits for its control stream"
+    );
+
+    h.conn.uni_limit = 3;
+    h.event(ConnEvent::StreamsAvailable { dir: Dir::Uni });
+    let (_, frames) = h.control();
+    assert!(
+        matches!(frames.as_slice(), [Frame::Settings(_), Frame::Goaway(0)]),
+        "{frames:?}"
+    );
+    assert_eq!(h.closed(), None, "the GOAWAY is staged, not sent");
+    let deadline = h
+        .session
+        .deadline()
+        .expect("the close waits for the GOAWAY");
+    h.poll_session();
+    assert_eq!(h.closed(), None, "before the deadline");
+    h.conn.now = deadline;
+    h.poll_session();
+    assert_eq!(h.closed(), Some(H3ErrorCode::NO_ERROR.as_u64()));
+}
+
+#[test]
+fn handshake_completes_with_the_peer_settings() {
+    let mut h = Harness::new();
+    h.event(ConnEvent::Connected);
+    assert!(
+        !h.session.handshake_complete(),
+        "no peer control stream yet"
+    );
+    let control = control_stream(&Settings::new());
+    h.receive(client_uni(0), &control[..1], false);
+    assert!(
+        !h.session.handshake_complete(),
+        "the control stream has no SETTINGS yet"
+    );
+    h.receive(client_uni(0), &control[1..], false);
+    assert!(
+        h.session.handshake_complete(),
+        "the peer's SETTINGS arrived"
+    );
+}
+
+#[test]
+fn qpack_stream_fin_inside_an_instruction_closes_a_critical_stream() {
+    let mut h = Harness::ready();
+    // Set Dynamic Table Capacity with a continued integer, cut off by the FIN.
+    h.receive(
+        client_uni(1),
+        &[StreamType::QPACK_ENCODER.as_u64() as u8, 0x3f],
+        true,
+    );
+    assert_eq!(
+        h.closed(),
+        Some(H3ErrorCode::CLOSED_CRITICAL_STREAM.as_u64())
+    );
+}
+
+#[test]
+fn closed_edge_on_a_critical_stream_closes_the_connection() {
+    let mut h = Harness::ready();
+    h.receive(
+        client_uni(1),
+        &[StreamType::QPACK_DECODER.as_u64() as u8],
+        false,
+    );
+    h.ready_edge(client_uni(1), StreamReady::Closed);
+    assert_eq!(
+        h.closed(),
+        Some(H3ErrorCode::CLOSED_CRITICAL_STREAM.as_u64())
+    );
+}
+
+#[test]
+fn control_stream_bytes_go_out_across_partial_sends_and_pulls() {
+    let mut h = Harness::new();
+    h.conn.uni_send_window = 4;
+    h.event(ConnEvent::Connected);
+    let control = server_uni(0);
+    assert_eq!(
+        h.conn.get(control).sent.len(),
+        4,
+        "the stream took its window"
+    );
+    h.ready_edge(control, StreamReady::Writable);
+    assert_eq!(h.conn.get(control).sent.len(), 8);
+    assert!(
+        h.pull(control, 1 << 20).0.is_ready(),
+        "the pull path drains the rest"
+    );
+    let (header, frames) = h.control();
+    assert_eq!(header, UniStreamHeader::Control);
+    assert!(
+        matches!(frames.as_slice(), [Frame::Settings(_)]),
+        "{frames:?}"
+    );
+    assert!(h.pull(control, 1 << 20).0.is_pending(), "nothing is left");
+}
+
+fn app(code: u64) -> mvfstr_proto::AppCode {
+    mvfstr_proto::AppCode(mvfstr_proto::VarInt::from_u64(code).unwrap())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Requests and responses.
+
+/// Returns the request head the application received, as (method, url, fields).
+fn received_head(h: &Harness, id: StreamId) -> (String, String, Vec<(String, String)>) {
+    let state = h.app.0.borrow();
+    let head = &state.requests[&http_id(id)].head;
+    let mut fields = Vec::new();
+    head.headers().for_each(|name, value| {
+        fields.push((
+            String::from_utf8(name.to_vec()).unwrap(),
+            String::from_utf8(value.to_vec()).unwrap(),
+        ));
+    });
+    (
+        head.request_method().unwrap().to_owned(),
+        String::from_utf8(head.request_url().unwrap().to_vec()).unwrap(),
+        fields,
+    )
+}
+
+#[test]
+fn get_produces_headers_data_fin() {
+    let mut h = Harness::ready();
+    let id = client_bidi(0);
+    let request = headers_frame(GET);
+    // A head whose FIN comes later is delivered at once, and the FIN's Finished edge then ends
+    // the body.
+    h.receive(id, &request, false);
+    assert_eq!(h.log(), vec![Ev::New(1), Ev::Request { id: 1, eom: false }]);
+    h.receive(id, &[], true);
+    let Poll::Ready(Ok(event)) = h.read_body(id, 100) else {
+        panic!("the FIN ends the request body");
+    };
+    assert!(event.eom() && event.as_body().is_some_and(BufQueue::is_empty));
+    let (method, url, fields) = received_head(&h, id);
+    assert_eq!((method.as_str(), url.as_str()), ("GET", "/index.html"));
+    assert_eq!(
+        field(&fields, "Host").or(field(&fields, "host")),
+        Some("example.com")
+    );
+    assert!(h.conn.take_stream_wakes().contains(&id));
+
+    let (poll, sink) = h.pull(id, 1 << 20);
+    assert!(poll.is_ready());
+    assert_eq!(
+        sink.parts.last(),
+        Some(&5),
+        "the body goes out as a shared payload"
+    );
+    assert!(sink.finished);
+    let parts = h.response(id);
+    let [Part::Headers(head), Part::Data(body)] = parts.as_slice() else {
+        panic!("expected HEADERS and DATA: {parts:?}");
+    };
+    assert_eq!(field(head, ":status"), Some("200"));
+    assert_eq!(field(head, "content-type"), Some("text/plain"));
+    assert_eq!(body, b"hello");
+    assert!(h.conn.get(id).finished);
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1), Ev::Complete(1)]);
+    h.poll_session();
+    assert_eq!(h.conn.get(id).consumed, request.len() as u64);
+    assert!(h.pull(id, 1 << 20).0.is_pending());
+
+    // A head that arrives with its FIN, reported by one Finished edge, is delivered complete.
+    let second = client_bidi(1);
+    h.receive(second, &[], false);
+    h.conn.receive(second, &request);
+    h.conn.get(second).peer_finished = true;
+    h.ready_edge(second, StreamReady::Finished);
+    assert_eq!(h.log()[4..], [Ev::New(5), Ev::Request { id: 5, eom: true }]);
+    h.pull_all(second, 1 << 20);
+    assert_eq!(body_of(&h.response(second)), b"hello");
+    assert_eq!(h.log()[6..], [Ev::ResponseComplete(5), Ev::Complete(5)]);
+}
+
+/// A request head whose FIN came in the same packet is delivered complete at the stream's first
+/// edge, and the Readable and Finished edges that follow do not add events.
+#[test]
+fn a_head_whose_fin_arrived_with_it_is_delivered_complete_at_the_first_edge() {
+    let mut h = Harness::ready();
+    let id = client_bidi(0);
+    let request = headers_frame(GET);
+    h.conn.receive(id, &request);
+    h.conn.get(id).peer_finished = true;
+    h.ready_edge(id, StreamReady::Opened);
+    assert_eq!(h.log(), [Ev::New(1), Ev::Request { id: 1, eom: true }]);
+    h.ready_edge(id, StreamReady::Readable);
+    h.ready_edge(id, StreamReady::Finished);
+    assert_eq!(h.log().len(), 2, "the later edges deliver nothing more");
+    assert_eq!(h.conn.get(id).consumed, request.len() as u64);
+    h.pull_all(id, 1 << 20);
+    assert_eq!(body_of(&h.response(id)), b"hello");
+    assert!(h.conn.get(id).finished);
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1), Ev::Complete(1)]);
+}
+
+/// A request body whose FIN arrived with it ends at the stream's first edge: the request is
+/// delivered with a body, and the first read returns the body's bytes with its end.
+#[test]
+fn a_body_whose_fin_arrived_with_it_ends_at_the_first_edge() {
+    let mut h = Harness::ready();
+    let id = client_bidi(0);
+    h.conn
+        .receive(id, &[headers_frame(POST), data_frame(b"hello")].concat());
+    h.conn.get(id).peer_finished = true;
+    h.ready_edge(id, StreamReady::Opened);
+    assert_eq!(h.log(), [Ev::New(1), Ev::Request { id: 1, eom: false }]);
+    assert_eq!(read_chunk(&mut h, id), (b"hello".to_vec(), true));
+}
+
+#[test]
+fn finished_exchange_needs_no_session_wake() {
+    let mut h = Harness::ready();
+    let id = client_bidi(0);
+    h.receive(id, &headers_frame(GET), true);
+    let wakes = h.wakes();
+    h.pull_all(id, 1 << 20);
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1), Ev::Complete(1)]);
+    h.ready_edge(id, StreamReady::Closed);
+    assert_eq!(
+        h.wakes(),
+        wakes,
+        "a request that ends normally costs no session wake"
+    );
+    assert_eq!(h.conn.get(id).consumed, headers_frame(GET).len() as u64);
+}
+
+#[test]
+fn head_response_carries_no_content() {
+    // The application answers HEAD as it answers GET, and the session does not send the content,
+    // as RFC 9110 requires. RFC 9114 lets the head keep the content-length of the GET.
+    let plan = Plan {
+        headers: vec![("content-type", "text/plain"), ("content-length", "5")],
+        ..Plan::default()
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let id = client_bidi(0);
+    let head = [
+        (":method", "HEAD"),
+        (":scheme", "https"),
+        (":authority", "example.com"),
+        (":path", "/index.html"),
+    ];
+    h.receive(id, &headers_frame(&head), true);
+    h.pull_all(id, 1 << 20);
+    let parts = h.response(id);
+    let [Part::Headers(fields)] = parts.as_slice() else {
+        panic!("expected HEADERS only: {parts:?}");
+    };
+    assert_eq!(field(fields, ":status"), Some("200"));
+    assert_eq!(field(fields, "content-length"), Some("5"));
+    assert!(h.conn.get(id).finished);
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1), Ev::Complete(1)]);
+}
+
+#[test]
+fn large_response_spans_several_polls() {
+    let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let plan = Plan {
+        body: Bytes::from(body.clone()),
+        ..Plan::default()
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let id = client_bidi(0);
+    h.receive(id, &headers_frame(GET), true);
+
+    // Each call stays within its allowance; the sink refuses anything larger.
+    let mut calls = 0;
+    while h.pull(id, 30_000).0.is_ready() {
+        calls += 1;
+    }
+    assert!(calls >= 7, "{calls} calls");
+    let parts = h.response(id);
+    assert_eq!(body_of(&parts), body);
+    assert!(h.conn.get(id).finished);
+    let maxima = h.app.0.borrow().maxima.clone();
+    // min(allowance, 64 KiB) less the DATA frame header.
+    assert!(maxima.iter().all(|&maximum| maximum <= 30_000 - 5));
+    assert_eq!(maxima[1], 30_000 - 5);
+
+    // With a larger allowance the cap is 64 KiB less the frame header.
+    let mut h = Harness::ready_with(
+        H3ApplicationBuilder::new(),
+        Plan {
+            body: Bytes::from(body.clone()),
+            ..Plan::default()
+        },
+    );
+    h.receive(id, &headers_frame(GET), true);
+    h.pull_all(id, 1 << 20);
+    assert_eq!(body_of(&h.response(id)), body);
+    let maxima = h.app.0.borrow().maxima.clone();
+    assert_eq!(maxima[0], (64 << 10) - 5);
+}
+
+/// Returns the bytes of the next body event the application reads, and whether it ends the body.
+fn read_chunk(h: &mut Harness, id: StreamId) -> (Vec<u8>, bool) {
+    let Poll::Ready(Ok(event)) = h.read_body(id, 1 << 20) else {
+        panic!("a body event is ready");
+    };
+    let eom = event.eom();
+    match event.into_kind() {
+        HttpBodyEventKind::Body(body) => (
+            body.segments()
+                .flat_map(|segment| segment.to_vec())
+                .collect(),
+            eom,
+        ),
+        _ => panic!("expected a body event"),
+    }
+}
+
+#[test]
+fn post_credit_returned_only_on_consume() {
+    let mut h = Harness::ready_with(
+        H3ApplicationBuilder::new().request_body_buffer(1000),
+        Plan::default(),
+    );
+    let id = client_bidi(0);
+    let head = headers_frame(POST);
+    h.receive(id, &head, false);
+    assert_eq!(h.log(), vec![Ev::New(1), Ev::Request { id: 1, eom: false }]);
+    let mut credited = head.len() as u64;
+    assert_eq!(h.conn.get(id).consumed, credited);
+
+    // The DATA frame header's credit is returned at once, the payload's only when consumed.
+    h.receive(id, &data_frame(&[1; 600]), false);
+    credited += 3;
+    assert_eq!(h.conn.get(id).consumed, credited);
+    h.poll_session();
+    assert_eq!(h.conn.get(id).consumed, credited);
+
+    let wakes = h.wakes();
+    assert_eq!(read_chunk(&mut h, id), (vec![1; 600], false));
+    assert!(h.wakes() > wakes, "consuming wakes the session");
+    assert_eq!(h.conn.get(id).consumed, credited);
+    h.poll_session();
+    credited += 600;
+    assert_eq!(h.conn.get(id).consumed, credited);
+
+    // At most the request body buffer is handed to the body before the application reads it.
+    h.receive(id, &data_frame(&[2; 700]), false);
+    h.receive(id, &data_frame(&[3; 700]), true);
+    credited += 3 + 3;
+    assert_eq!(h.conn.get(id).consumed, credited);
+    assert_eq!(
+        read_chunk(&mut h, id),
+        ([vec![2; 700], vec![3; 300]].concat(), false)
+    );
+    h.poll_session();
+    credited += 1000;
+    assert_eq!(h.conn.get(id).consumed, credited);
+    assert_eq!(read_chunk(&mut h, id), (vec![3; 400], true));
+    h.poll_session();
+    credited += 400;
+    assert_eq!(h.conn.get(id).consumed, credited);
+    assert!(h.conn.get(id).readable.is_empty());
+
+    h.pull_all(id, 1 << 20);
+    assert_eq!(body_of(&h.response(id)), b"hello");
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1), Ev::Complete(1)]);
+}
+
+#[test]
+fn retired_exchange_returns_body_credit_only_as_consumed() {
+    let mut h = Harness::ready();
+    let id = client_bidi(0);
+    let head = headers_frame(POST);
+    let request = [head.clone(), data_frame(&[7; 500])].concat();
+    h.receive(id, &request, true);
+    h.pull_all(id, 1 << 20);
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1), Ev::Complete(1)]);
+
+    // The application still holds the unread body, so its credit stays out.
+    h.poll_session();
+    let overhead = head.len() as u64 + 3;
+    assert_eq!(h.conn.get(id).consumed, overhead);
+    assert_eq!(read_all(&mut h, id), (vec![7; 500], None));
+    h.poll_session();
+    assert_eq!(h.conn.get(id).consumed, request.len() as u64);
+}
+
+#[test]
+fn credit_cell_wakes_the_session_from_another_thread() {
+    use crate::credit::CreditCell;
+    use crate::credit::WorkQueue;
+    use crate::fake::FakeHandle;
+
+    let queue = Arc::new(WorkQueue::default());
+    let handle = FakeHandle::default();
+    let count = Arc::clone(&handle.wakes);
+    queue.set_handle(Box::new(handle));
+    let cell = Arc::new(CreditCell::new(client_bidi(0), Arc::clone(&queue)));
+    let consumer = Arc::clone(&cell);
+    std::thread::spawn(move || {
+        consumer.add(10);
+        consumer.add(5);
+    })
+    .join()
+    .unwrap();
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "one wake until the session drains"
+    );
+    let mut streams = Vec::new();
+    queue.take(&mut streams);
+    assert_eq!(streams, vec![client_bidi(0)]);
+    assert_eq!(cell.take(), 15);
+
+    let consumer = Arc::clone(&cell);
+    std::thread::spawn(move || consumer.add(1)).join().unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+    assert_eq!(cell.take(), 1);
+}
+
+#[test]
+fn dropped_session_wake_is_retried_by_later_credit() {
+    use crate::credit::CreditCell;
+    use crate::credit::WorkQueue;
+    use crate::fake::FakeHandle;
+
+    let queue = Arc::new(WorkQueue::default());
+    let handle = FakeHandle::default();
+    let delivered = Arc::clone(&handle.wakes);
+    handle.drop_wakes.store(1, Ordering::SeqCst);
+    queue.set_handle(Box::new(handle));
+    let cell = CreditCell::new(client_bidi(0), Arc::clone(&queue));
+    cell.add(10);
+    assert_eq!(
+        delivered.load(Ordering::SeqCst),
+        0,
+        "the first wake is dropped"
+    );
+    cell.add(5);
+    assert_eq!(
+        delivered.load(Ordering::SeqCst),
+        1,
+        "later credit retries the dropped wake"
+    );
+    cell.add(1);
+    assert_eq!(delivered.load(Ordering::SeqCst), 1, "one wake per drain");
+}
+
+#[test]
+fn wakes_use_the_session_waker_once_polled() {
+    let mut h = Harness::ready();
+    let id = client_bidi(0);
+    let request = [headers_frame(POST), data_frame(&[1; 600])].concat();
+    h.receive(id, &request, false);
+    h.poll_session();
+    let handle_wakes = h.conn.session_wakes();
+    let waker_wakes = h.waker_wakes();
+    assert_eq!(read_chunk(&mut h, id), (vec![1; 600], false));
+    assert_eq!(
+        h.waker_wakes(),
+        waker_wakes + 1,
+        "consumption wakes the waker poll_session was given"
+    );
+    assert_eq!(h.conn.session_wakes(), handle_wakes, "no handle command");
+    h.poll_session();
+    assert_eq!(h.conn.get(id).consumed, request.len() as u64);
+}
+
+#[test]
+fn malformed_requests_are_reset_before_delivery() {
+    const BASE: &[(&str, &str)] = &[(":scheme", "https"), (":authority", "a.example")];
+    let request = |method: &str, path: &str, extra: &[(&str, &str)]| {
+        let mut fields = vec![(":method", method), (":path", path)];
+        fields.extend_from_slice(BASE);
+        fields.extend_from_slice(extra);
+        headers_frame(&fields)
+    };
+    let get = |extra: &[(&str, &str)]| request("GET", "/", extra);
+    let with_body = |extra: &[(&str, &str)], body: &[u8]| {
+        let mut bytes = request("POST", "/", extra);
+        bytes.extend_from_slice(&data_frame(body));
+        bytes
+    };
+    let many_static_lines: Vec<(&str, &str)> = (0..10).map(|_| ("accept", "*/*")).collect();
+    // (class, request stream bytes, whether the FIN arrives with them)
+    let cases: Vec<(&str, Vec<u8>, bool)> = vec![
+        (
+            "missing :method",
+            headers_frame(&[(":scheme", "https"), (":authority", "a"), (":path", "/")]),
+            false,
+        ),
+        (
+            "missing :scheme",
+            headers_frame(&[(":method", "GET"), (":authority", "a"), (":path", "/")]),
+            false,
+        ),
+        (
+            "missing :path",
+            headers_frame(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":authority", "a"),
+            ]),
+            false,
+        ),
+        ("empty :path", request("GET", "", &[]), false),
+        (
+            "missing :authority and host",
+            headers_frame(&[(":method", "GET"), (":scheme", "https"), (":path", "/")]),
+            false,
+        ),
+        (
+            "empty :authority",
+            headers_frame(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":authority", ""),
+                (":path", "/"),
+            ]),
+            false,
+        ),
+        (
+            "host differs from :authority",
+            get(&[("host", "b.example")]),
+            false,
+        ),
+        (
+            "duplicate pseudo-header",
+            headers_frame(&[
+                (":method", "GET"),
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":authority", "a"),
+                (":path", "/"),
+            ]),
+            false,
+        ),
+        (
+            "pseudo-header after a regular field",
+            headers_frame(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                ("accept", "*/*"),
+                (":authority", "a"),
+                (":path", "/"),
+            ]),
+            false,
+        ),
+        (
+            "undefined pseudo-header",
+            headers_frame(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":authority", "a"),
+                (":path", "/"),
+                (":foo", "bar"),
+            ]),
+            false,
+        ),
+        (
+            "response pseudo-header",
+            headers_frame(&[
+                (":status", "200"),
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":authority", "a"),
+                (":path", "/"),
+            ]),
+            false,
+        ),
+        (
+            "extended CONNECT not offered",
+            headers_frame(&[
+                (":method", "CONNECT"),
+                (":protocol", "websocket"),
+                (":scheme", "https"),
+                (":authority", "a"),
+                (":path", "/"),
+            ]),
+            false,
+        ),
+        (
+            "CONNECT with a path",
+            headers_frame(&[
+                (":method", "CONNECT"),
+                (":authority", "a:443"),
+                (":path", "/"),
+            ]),
+            false,
+        ),
+        ("uppercase field name", get(&[("Accept", "*/*")]), false),
+        ("connection", get(&[("connection", "keep-alive")]), false),
+        ("keep-alive", get(&[("keep-alive", "timeout=5")]), false),
+        (
+            "proxy-connection",
+            get(&[("proxy-connection", "keep-alive")]),
+            false,
+        ),
+        (
+            "transfer-encoding",
+            get(&[("transfer-encoding", "chunked")]),
+            false,
+        ),
+        ("upgrade", get(&[("upgrade", "h2c")]), false),
+        ("te other than trailers", get(&[("te", "gzip")]), false),
+        (
+            "value with a line feed",
+            get(&[("x-a", "1\nx-b: 2")]),
+            false,
+        ),
+        (
+            "invalid content-length",
+            get(&[("content-length", "1x")]),
+            false,
+        ),
+        (
+            "conflicting content-length",
+            get(&[("content-length", "1"), ("content-length", "2")]),
+            false,
+        ),
+        (
+            "DATA beyond content-length",
+            with_body(&[("content-length", "3")], b"hello"),
+            false,
+        ),
+        (
+            "DATA short of content-length",
+            with_body(&[("content-length", "10")], b"hello"),
+            true,
+        ),
+        (
+            "field section over the limit",
+            get(&many_static_lines),
+            false,
+        ),
+    ];
+    let message_error = H3ErrorCode::MESSAGE_ERROR.as_u64();
+    for (class, bytes, fin) in cases {
+        let mut h = Harness::ready_with(
+            H3ApplicationBuilder::new().max_field_section_size(300),
+            Plan::default(),
+        );
+        let id = client_bidi(0);
+        h.receive(id, &[], false);
+        h.conn.receive(id, &bytes);
+        h.conn.get(id).peer_finished = fin;
+        h.ready_edge(
+            id,
+            if fin {
+                StreamReady::Finished
+            } else {
+                StreamReady::Readable
+            },
+        );
+        let stream = h.conn.get(id);
+        assert_eq!(stream.reset, Some(message_error), "{class}");
+        assert_eq!(stream.stop_sending, Some(message_error), "{class}");
+        assert_eq!(
+            h.log(),
+            vec![
+                Ev::New(1),
+                Ev::Cancel {
+                    id: 1,
+                    code: HttpErrorCode::MESSAGE_ERROR,
+                    peer: false
+                }
+            ],
+            "{class}"
+        );
+        assert_eq!(h.closed(), None, "{class}");
+
+        // The connection carries on.
+        let next = client_bidi(1);
+        h.receive(next, &headers_frame(GET), true);
+        h.pull_all(next, 1 << 20);
+        assert_eq!(body_of(&h.response(next)), b"hello", "{class}");
+    }
+}
+
+#[test]
+fn field_values_with_surrounding_whitespace_are_malformed() {
+    // RFC 9114 requires values to follow the field-content rule, which does not allow a leading
+    // or trailing SP or HTAB.
+    let message_error = Some(H3ErrorCode::MESSAGE_ERROR.as_u64());
+    for value in [" a", "a ", "\ta", "a\t", " "] {
+        let mut h = Harness::ready();
+        let id = client_bidi(0);
+        h.receive(
+            id,
+            &headers_frame(&[GET, &[("x-a", value)]].concat()),
+            false,
+        );
+        assert_eq!(h.conn.get(id).reset, message_error, "{value:?}");
+        assert_eq!(
+            h.log(),
+            vec![
+                Ev::New(1),
+                Ev::Cancel {
+                    id: 1,
+                    code: HttpErrorCode::MESSAGE_ERROR,
+                    peer: false
+                }
+            ],
+            "{value:?}"
+        );
+
+        let next = client_bidi(1);
+        let request = [headers_frame(POST), headers_frame(&[("x-t", value)])].concat();
+        h.receive(next, &request, false);
+        assert_eq!(h.conn.get(next).reset, message_error, "trailer {value:?}");
+    }
+
+    // Inner whitespace and empty values are valid.
+    let mut h = Harness::ready();
+    let id = client_bidi(0);
+    h.receive(
+        id,
+        &headers_frame(&[GET, &[("x-a", "a \t b"), ("x-b", "")]].concat()),
+        true,
+    );
+    assert_eq!(h.conn.get(id).reset, None);
+    assert_eq!(h.log(), vec![Ev::New(1), Ev::Request { id: 1, eom: true }]);
+}
+
+/// Returns whether a request head with `fields` is reset as malformed before delivery.
+fn rejected(fields: &[(&str, &str)]) -> bool {
+    let mut h = Harness::ready();
+    let id = client_bidi(0);
+    h.receive(id, &headers_frame(fields), true);
+    let reset = h.conn.get(id).reset == Some(H3ErrorCode::MESSAGE_ERROR.as_u64());
+    assert_eq!(
+        h.log().contains(&Ev::Request { id: 1, eom: true }),
+        !reset,
+        "{fields:?}"
+    );
+    reset
+}
+
+#[test]
+fn method_is_case_sensitive() {
+    // RFC 9110 makes methods case-sensitive, so `connect` is not CONNECT and gets the checks of
+    // an ordinary request, and the application receives each method as it was sent.
+    let ordinary = |method| {
+        [
+            (":method", method),
+            (":scheme", "https"),
+            (":authority", "a.example:443"),
+            (":path", "/"),
+        ]
+    };
+    for method in ["get", "Post", "connect"] {
+        let mut h = Harness::ready();
+        let id = client_bidi(0);
+        h.receive(id, &headers_frame(&ordinary(method)), true);
+        assert_eq!(h.conn.get(id).reset, None, "{method}");
+        assert_eq!(received_head(&h, id).0, method);
+    }
+    // The CONNECT form is open only to `CONNECT`, and the asterisk form only to `OPTIONS`.
+    assert!(rejected(&[
+        (":method", "connect"),
+        (":authority", "a.example:443")
+    ]));
+    assert!(rejected(&[
+        (":method", "options"),
+        (":scheme", "https"),
+        (":authority", "a.example"),
+        (":path", "*"),
+    ]));
+}
+
+#[test]
+fn te_trailers_is_case_insensitive() {
+    // "trailers" is a literal of RFC 9110's TE grammar, and RFC 5234 makes ABNF string literals
+    // case-insensitive.
+    for value in ["trailers", "Trailers", "TRAILERS"] {
+        assert!(!rejected(&[GET, &[("te", value)]].concat()), "{value}");
+    }
+    assert!(rejected(&[GET, &[("te", "trailers, gzip")]].concat()));
+}
+
+#[test]
+fn path_must_be_origin_form() {
+    // RFC 9114 requires `:path` to be path-absolute and an optional query, or `*` for OPTIONS.
+    let request = |method, path| {
+        [
+            (":method", method),
+            (":scheme", "https"),
+            (":authority", "a.example"),
+            (":path", path),
+        ]
+    };
+    for (method, path) in [
+        ("GET", "https://a.example/"),
+        ("GET", "index.html"),
+        ("GET", "/a#fragment"),
+        ("GET", "*"),
+        ("GET", "/a b"),
+    ] {
+        assert!(rejected(&request(method, path)), "{method} {path}");
+    }
+    for (method, path) in [("GET", "/a/b?c=d&e"), ("OPTIONS", "*"), ("GET", "/%7Euser")] {
+        assert!(!rejected(&request(method, path)), "{method} {path}");
+    }
+}
+
+#[test]
+fn http_authority_has_no_userinfo() {
+    // RFC 9114 does not allow userinfo in the authority of an http or https URI, whether it comes
+    // from `:authority` or `host`, and whichever order the pseudo-header fields come in.
+    let cases: [&[(&str, &str)]; 4] = [
+        &[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", "user@a.example"),
+            (":path", "/"),
+        ],
+        &[
+            (":method", "GET"),
+            (":authority", "user:pw@a.example"),
+            (":scheme", "http"),
+            (":path", "/"),
+        ],
+        &[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            ("host", "user@a.example"),
+        ],
+        &[(":method", "CONNECT"), (":authority", "user@a.example:443")],
+    ];
+    for fields in cases {
+        assert!(rejected(fields), "{fields:?}");
+    }
+    assert!(!rejected(&[
+        (":method", "CONNECT"),
+        (":authority", "a.example:443")
+    ]));
+    assert!(!rejected(&[
+        (":method", "GET"),
+        (":scheme", "https"),
+        (":authority", "[2001:db8::1]:8443"),
+        (":path", "/"),
+    ]));
+}
+
+#[test]
+fn authority_follows_the_uri_syntax() {
+    // In RFC 9114, `:authority`, or `host` in its place, is the authority of the target URI in
+    // RFC 3986's syntax, and RFC 9110 requires a host in an http or https URI.
+    let with_authority = |authority| {
+        [
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", authority),
+            (":path", "/"),
+        ]
+    };
+    let with_host = |host| {
+        [
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            ("host", host),
+        ]
+    };
+    for authority in [
+        "a b",
+        "a/b",
+        "a?b",
+        "a#b",
+        "a\\b",
+        "a.example:80x",
+        "a:1:2",
+        "[2001:db8::1",
+        "[2001:db8::1]x",
+        "a%zz.example",
+        ":443",
+        // In RFC 3986, an IP literal is an IPv6 address or an IPvFuture.
+        "[foo]:443",
+        "[192.0.2.1]",
+        "[2001:db8::1::2]",
+        "[v1]",
+        "[v.a]",
+        "[vg.a]:443",
+        "[v1.a%20]",
+    ] {
+        assert!(rejected(&with_authority(authority)), "{authority}");
+        assert!(rejected(&with_host(authority)), "host {authority}");
+    }
+    for authority in [
+        "a.example",
+        "a.example:8443",
+        "a.example:",
+        "[2001:db8::1]:8443",
+        "[::1]",
+        "[::ffff:192.0.2.1]:443",
+        "[v1.a:b]:443",
+        "[V1F.x~y]",
+        "xn--bcher-kva.example",
+        "a_b~c.example",
+        "a%2Db.example",
+    ] {
+        assert!(!rejected(&with_authority(authority)), "{authority}");
+        assert!(!rejected(&with_host(authority)), "host {authority}");
+    }
+}
+
+#[test]
+fn connect_authority_names_host_and_port() {
+    // RFC 9114 requires the `:authority` of CONNECT to carry the host and port to connect to.
+    let connect = |authority| [(":method", "CONNECT"), (":authority", authority)];
+    for authority in ["a.example", "a.example:", "[2001:db8::1]", ":443"] {
+        assert!(rejected(&connect(authority)), "{authority}");
+    }
+    for authority in ["a.example:443", "[2001:db8::1]:443", "192.0.2.1:8080"] {
+        assert!(!rejected(&connect(authority)), "{authority}");
+    }
+}
+
+const CONNECT: &[(&str, &str)] = &[(":method", "CONNECT"), (":authority", "a.example:443")];
+
+#[test]
+fn connect_stream_carries_only_data_after_the_head() {
+    // RFC 9114 permits only DATA frames after the CONNECT head, and receipt of any other known
+    // frame type is a connection error.
+    let mut h = Harness::ready();
+    let id = client_bidi(0);
+    let request = [headers_frame(CONNECT), data_frame(b"tunnel")].concat();
+    h.receive(id, &request, false);
+    assert_eq!(h.log(), vec![Ev::New(1), Ev::Request { id: 1, eom: false }]);
+    assert_eq!(read_chunk(&mut h, id), (b"tunnel".to_vec(), false));
+    h.receive(id, &headers_frame(&[("x-trailer", "1")]), false);
+    assert_eq!(
+        h.closed(),
+        Some(H3ErrorCode::FRAME_UNEXPECTED.as_u64()),
+        "HEADERS after the CONNECT head"
+    );
+}
+
+#[test]
+fn connect_response_carries_no_trailers() {
+    // RFC 9114 allows only DATA frames on the stream once CONNECT has completed.
+    let plan = Plan {
+        trailers: Some(vec![("x-checksum", "abc")]),
+        ..Plan::default()
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let id = client_bidi(0);
+    h.receive(id, &headers_frame(CONNECT), false);
+    h.pull_all(id, 1 << 20);
+    let parts = h.response(id);
+    let [Part::Headers(head), Part::Data(body)] = parts.as_slice() else {
+        panic!("expected HEADERS and DATA only: {parts:?}");
+    };
+    assert_eq!(field(head, ":status"), Some("200"));
+    assert_eq!(body, b"hello");
+    assert!(h.conn.get(id).finished);
+}
+
+#[test]
+fn connect_tunnel_stays_open_to_the_client_after_the_response_ends() {
+    // In RFC 9114, the proxy closes its send stream when the target closes, and the client may
+    // go on sending, so the end of a tunnel's response does not stop the request stream.
+    let mut h = Harness::ready();
+    let id = client_bidi(0);
+    let request = [headers_frame(CONNECT), data_frame(b"up")].concat();
+    h.receive(id, &request, false);
+    h.pull_all(id, 1 << 20);
+    assert!(h.conn.get(id).finished);
+    h.poll_session();
+    assert_eq!(h.conn.get(id).stop_sending, None);
+    h.receive(id, &data_frame(b"stream"), true);
+    let mut upload = Vec::new();
+    loop {
+        let (chunk, eom) = read_chunk(&mut h, id);
+        upload.extend(chunk);
+        if eom {
+            break;
+        }
+    }
+    assert_eq!(upload, b"upstream");
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1), Ev::Complete(1)]);
+}
+
+#[test]
+fn peer_reset_of_a_tunnel_after_its_response_ends_cancels() {
+    // In RFC 9114, a client that resets a tunnel aborts its TCP connection, also after the
+    // target closed its side, so the exchange is cancelled, not completed.
+    let mut h = Harness::ready();
+    let id = client_bidi(0);
+    h.receive(id, &headers_frame(CONNECT), false);
+    h.pull_all(id, 1 << 20);
+    assert!(h.conn.get(id).finished);
+    h.poll_session();
+    h.ready_edge(
+        id,
+        StreamReady::Reset {
+            code: app(H3ErrorCode::CONNECT_ERROR.as_u64()),
+            final_size: 100,
+        },
+    );
+    assert_eq!(
+        h.log()[2..],
+        [
+            Ev::ResponseComplete(1),
+            Ev::Cancel {
+                id: 1,
+                code: HttpErrorCode::CONNECT_ERROR,
+                peer: true
+            }
+        ]
+    );
+    assert!(matches!(h.read_body(id, 100), Poll::Ready(Err(_))));
+    h.ready_edge(id, StreamReady::Closed);
+    assert_eq!(h.log().len(), 4, "no completion after the cancel");
+    assert_eq!(h.closed(), None);
+}
+
+#[test]
+fn scheme_follows_the_uri_syntax() {
+    // RFC 3986 defines a scheme as a letter, then letters, digits, `+`, `-` and `.`.
+    let request = |scheme| {
+        [
+            (":method", "GET"),
+            (":scheme", scheme),
+            (":authority", "a.example"),
+            (":path", "/"),
+        ]
+    };
+    for scheme in ["ht_tp", "1http", "web!", "-x"] {
+        assert!(rejected(&request(scheme)), "{scheme}");
+    }
+    for scheme in ["https", "web+app", "coap.tcp", "x-1"] {
+        assert!(!rejected(&request(scheme)), "{scheme}");
+    }
+}
+
+#[test]
+fn http_schemes_are_case_insensitive() {
+    // RFC 3986 makes schemes case-insensitive, so `HTTPS` has the rules of `https`.
+    assert!(
+        rejected(&[(":method", "GET"), (":scheme", "HTTPS"), (":path", "/")]),
+        "no authority"
+    );
+    assert!(
+        rejected(&[
+            (":method", "GET"),
+            (":scheme", "Http"),
+            (":authority", "user@a.example"),
+            (":path", "/"),
+        ]),
+        "userinfo"
+    );
+    let mut h = Harness::ready();
+    let id = client_bidi(0);
+    let request = [
+        (":method", "GET"),
+        (":scheme", "HTTPS"),
+        (":authority", "a.example"),
+        (":path", "/"),
+    ];
+    h.receive(id, &headers_frame(&request), true);
+    assert!(h.app.0.borrow().requests[&http_id(id)].head.is_secure());
+}
+
+#[test]
+fn trailers_both_ways() {
+    let plan = Plan {
+        trailers: Some(vec![("x-checksum", "abc")]),
+        ..Plan::default()
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let id = client_bidi(0);
+    let mut request = headers_frame(POST);
+    request.extend_from_slice(&data_frame(b"body"));
+    request.extend_from_slice(&headers_frame(&[("x-request-trailer", "1")]));
+    h.receive(id, &request, true);
+
+    // The request trailers end the body.
+    assert_eq!(read_chunk(&mut h, id), (b"body".to_vec(), false));
+    let Poll::Ready(Ok(event)) = h.read_body(id, 100) else {
+        panic!("the trailers are ready");
+    };
+    assert!(event.eom());
+    let HttpBodyEventKind::Trailers(trailers) = event.into_kind() else {
+        panic!("expected trailers");
+    };
+    assert_eq!(trailers.get_single_or_empty("x-request-trailer"), b"1");
+
+    // The response trailers are a final HEADERS frame before the FIN.
+    h.pull_all(id, 1 << 20);
+    let parts = h.response(id);
+    let [
+        Part::Headers(head),
+        Part::Data(body),
+        Part::Headers(trailers),
+    ] = parts.as_slice()
+    else {
+        panic!("expected HEADERS, DATA and trailers: {parts:?}");
+    };
+    assert_eq!(field(head, ":status"), Some("200"));
+    assert_eq!(body, b"hello");
+    assert_eq!(trailers, &[("x-checksum".to_owned(), "abc".to_owned())]);
+    assert!(h.conn.get(id).finished);
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1), Ev::Complete(1)]);
+
+    // Request trailers with a pseudo-header are malformed.
+    let next = client_bidi(1);
+    let mut request = headers_frame(POST);
+    request.extend_from_slice(&headers_frame(&[(":path", "/")]));
+    h.receive(next, &request, false);
+    assert_eq!(
+        h.conn.get(next).reset,
+        Some(H3ErrorCode::MESSAGE_ERROR.as_u64())
+    );
+}
+
+#[test]
+fn responses_and_their_trailers_carry_no_te() {
+    // RFC 9114 allows TE only in the header section of a request.
+    let plan = Plan {
+        headers: vec![("te", "trailers"), ("content-type", "text/plain")],
+        trailers: Some(vec![("te", "trailers"), ("x-checksum", "abc")]),
+        ..Plan::default()
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let id = client_bidi(0);
+    h.receive(id, &headers_frame(GET), true);
+    h.pull_all(id, 1 << 20);
+    let parts = h.response(id);
+    let [Part::Headers(head), Part::Data(_), Part::Headers(trailers)] = parts.as_slice() else {
+        panic!("expected HEADERS, DATA and trailers: {parts:?}");
+    };
+    assert_eq!(field(head, "te"), None, "response head");
+    assert_eq!(field(head, "content-type"), Some("text/plain"));
+    assert_eq!(field(trailers, "te"), None, "response trailers");
+    assert_eq!(field(trailers, "x-checksum"), Some("abc"));
+}
+
+#[test]
+fn request_trailers_with_te_are_malformed() {
+    // RFC 9114 allows TE only in the header section of a request.
+    let mut h = Harness::ready();
+    let id = client_bidi(0);
+    let request = [headers_frame(POST), headers_frame(&[("te", "trailers")])].concat();
+    h.receive(id, &request, false);
+    assert_eq!(
+        h.conn.get(id).reset,
+        Some(H3ErrorCode::MESSAGE_ERROR.as_u64())
+    );
+}
+
+#[test]
+fn early_response_stops_the_request_body() {
+    let mut h = Harness::ready();
+    let id = client_bidi(0);
+    let mut request = headers_frame(POST);
+    request.extend_from_slice(&data_frame(&[1; 100]));
+    h.receive(id, &request, false);
+
+    h.pull_all(id, 1 << 20);
+    assert_eq!(body_of(&h.response(id)), b"hello");
+    assert!(h.conn.get(id).finished);
+    assert_eq!(h.conn.get(id).stop_sending, None);
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1)]);
+
+    // STOP_SENDING needs the stream, so the session sends it at its next callback.
+    let wakes = h.conn.session_wakes();
+    h.poll_session();
+    assert!(wakes > 0);
+    assert_eq!(
+        h.conn.get(id).stop_sending,
+        Some(H3ErrorCode::NO_ERROR.as_u64())
+    );
+    assert_eq!(h.conn.get(id).reset, None);
+    // The application's body read ends with the cancellation rather than waiting for more.
+    let mut reads = Vec::new();
+    loop {
+        match h.read_body(id, 1 << 20) {
+            Poll::Ready(Ok(event)) => reads.push(format!("body eom={}", event.eom())),
+            Poll::Ready(Err(error)) => {
+                reads.push(format!("error {:?}", error.code()));
+                break;
+            }
+            Poll::Pending => panic!("the body read waits after the early response: {reads:?}"),
+        }
+        assert!(reads.len() < 3, "{reads:?}");
+    }
+    assert!(reads.last().unwrap().starts_with("error"), "{reads:?}");
+
+    // The peer's reset of its upload does not cancel the finished exchange, which retires
+    // once both halves end.
+    h.ready_edge(
+        id,
+        StreamReady::Reset {
+            code: app(H3ErrorCode::NO_ERROR.as_u64()),
+            final_size: 1000,
+        },
+    );
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1)]);
+    h.ready_edge(id, StreamReady::Closed);
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1), Ev::Complete(1)]);
+}
+
+#[test]
+fn peer_reset_before_the_early_response_cleanup_ends_the_body() {
+    let mut h = Harness::ready();
+    let id = client_bidi(0);
+    let request = [headers_frame(POST), data_frame(&[1; 100])].concat();
+    h.receive(id, &request, false);
+    h.pull_all(id, 1 << 20);
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1)]);
+
+    // The peer abandons its upload before the session's next callback.
+    h.ready_edge(
+        id,
+        StreamReady::Reset {
+            code: app(H3ErrorCode::REQUEST_CANCELLED.as_u64()),
+            final_size: 1000,
+        },
+    );
+    h.poll_session();
+    let mut reads = Vec::new();
+    loop {
+        match h.read_body(id, 1 << 20) {
+            Poll::Ready(Ok(event)) => reads.push(format!("body eom={}", event.eom())),
+            Poll::Ready(Err(error)) => {
+                reads.push(format!("error {:?}", error.code()));
+                break;
+            }
+            Poll::Pending => panic!("the body read waits after the peer's reset: {reads:?}"),
+        }
+        assert!(reads.len() < 3, "{reads:?}");
+    }
+    assert_eq!(
+        h.conn.get(id).stop_sending,
+        None,
+        "the peer ended the upload"
+    );
+    h.ready_edge(id, StreamReady::Closed);
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1), Ev::Complete(1)]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Lifecycle.
+
+fn large_plan() -> Plan {
+    Plan {
+        body: Bytes::from(vec![0; 100_000]),
+        ..Plan::default()
+    }
+}
+
+#[test]
+fn peer_reset_mid_response_cancels() {
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), large_plan());
+    let id = client_bidi(0);
+    h.receive(id, &headers_frame(POST), false);
+    assert!(h.pull(id, 10_000).0.is_ready());
+    h.ready_edge(
+        id,
+        StreamReady::Reset {
+            code: app(H3ErrorCode::REQUEST_CANCELLED.as_u64()),
+            final_size: 50,
+        },
+    );
+    assert_eq!(
+        h.log()[2..],
+        [Ev::Cancel {
+            id: 1,
+            code: HttpErrorCode::CANCEL,
+            peer: true
+        }]
+    );
+    assert_eq!(
+        h.conn.get(id).reset,
+        Some(H3ErrorCode::REQUEST_CANCELLED.as_u64())
+    );
+    assert!(h.pull(id, 10_000).0.is_pending());
+    assert!(matches!(h.read_body(id, 100), Poll::Ready(Err(_))));
+
+    // The peer's code selects the cancellation cause.
+    let next = client_bidi(1);
+    h.receive(next, &headers_frame(POST), false);
+    h.ready_edge(
+        next,
+        StreamReady::Reset {
+            code: app(H3ErrorCode::INTERNAL_ERROR.as_u64()),
+            final_size: 0,
+        },
+    );
+    assert_eq!(
+        h.log().last(),
+        Some(&Ev::Cancel {
+            id: 5,
+            code: HttpErrorCode::INTERNAL_ERROR,
+            peer: true
+        })
+    );
+}
+
+#[test]
+fn peer_stop_sending_mid_response_cancels() {
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), large_plan());
+    let id = client_bidi(0);
+    h.receive(id, &headers_frame(GET), true);
+    assert!(h.pull(id, 10_000).0.is_ready());
+    h.ready_edge(
+        id,
+        StreamReady::Stopped {
+            code: app(H3ErrorCode::REQUEST_CANCELLED.as_u64()),
+        },
+    );
+    assert_eq!(
+        h.log()[2..],
+        [Ev::Cancel {
+            id: 1,
+            code: HttpErrorCode::CANCEL,
+            peer: true
+        }]
+    );
+    // The transport has reset the send half itself; the request had already ended.
+    assert_eq!(h.conn.get(id).reset, None);
+    assert_eq!(h.conn.get(id).stop_sending, None);
+    assert!(h.pull(id, 10_000).0.is_pending());
+
+    // A request still uploading is stopped too.
+    let next = client_bidi(1);
+    h.receive(next, &headers_frame(POST), false);
+    assert!(h.pull(next, 10_000).0.is_ready());
+    h.ready_edge(next, StreamReady::Stopped { code: app(0x99) });
+    assert_eq!(
+        h.log().last(),
+        Some(&Ev::Cancel {
+            id: 5,
+            code: HttpErrorCode::CANCEL,
+            peer: true
+        })
+    );
+    assert_eq!(
+        h.conn.get(next).stop_sending,
+        Some(H3ErrorCode::REQUEST_CANCELLED.as_u64())
+    );
+}
+
+#[test]
+fn peer_stop_sending_after_the_upload_returns_its_credit() {
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), large_plan());
+    let id = client_bidi(0);
+    let request = [headers_frame(POST), data_frame(&[1; 300])].concat();
+    h.receive(id, &request, true);
+    assert!(h.pull(id, 10_000).0.is_ready());
+    h.ready_edge(
+        id,
+        StreamReady::Stopped {
+            code: app(H3ErrorCode::REQUEST_CANCELLED.as_u64()),
+        },
+    );
+    assert_eq!(
+        h.log()[2..],
+        [Ev::Cancel {
+            id: 1,
+            code: HttpErrorCode::CANCEL,
+            peer: true
+        }]
+    );
+    // The cancelled body is not read, so its bytes are released and the stream can end.
+    assert_eq!(h.conn.get(id).consumed, request.len() as u64);
+    assert_eq!(h.conn.get(id).stop_sending, None, "the upload had ended");
+}
+
+#[test]
+fn quiesce_sends_goaway_and_closes_after_the_last_exchange() {
+    let gate = Gate::default();
+    let plan = Plan {
+        head_gate: Some(gate.clone()),
+        ..Plan::default()
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    h.receive(client_bidi(0), &headers_frame(GET), true);
+    h.receive(client_bidi(1), &headers_frame(GET), true);
+    h.session.core.on_quiesce(&mut h.conn);
+    let (_, frames) = h.control();
+    assert_eq!(
+        frames.last(),
+        Some(&Frame::Goaway(8)),
+        "the first stream not accepted"
+    );
+    assert!(h.conn.shutdown);
+    assert_eq!(h.closed(), None);
+
+    // Later request streams are rejected.
+    let late = client_bidi(2);
+    h.receive(late, &headers_frame(GET), true);
+    let rejected = Some(H3ErrorCode::REQUEST_REJECTED.as_u64());
+    assert_eq!(h.conn.get(late).reset, rejected);
+    assert_eq!(h.conn.get(late).stop_sending, rejected);
+    assert!(!h.log().contains(&Ev::New(9)));
+
+    // The connection closes with H3_NO_ERROR once the last request stream is done: a staged
+    // response may still be unsent or unacknowledged, and CONNECTION_CLOSE would cut it off.
+    gate.open();
+    h.pull_all(client_bidi(0), 1 << 20);
+    h.poll_session();
+    h.pull_all(client_bidi(1), 1 << 20);
+    h.poll_session();
+    assert_eq!(h.closed(), None, "the responses are staged, not delivered");
+    h.ready_edge(client_bidi(0), StreamReady::Closed);
+    assert_eq!(h.closed(), None);
+    assert_eq!(h.session.deadline(), None, "an exchange is left");
+    h.ready_edge(client_bidi(1), StreamReady::Closed);
+    assert_eq!(
+        h.log()
+            .iter()
+            .filter(|ev| matches!(ev, Ev::Complete(_)))
+            .count(),
+        2
+    );
+    assert_eq!(h.closed(), None, "the GOAWAY has not had its time");
+    h.conn.now = h
+        .session
+        .deadline()
+        .expect("the close waits for the GOAWAY");
+    h.poll_session();
+    assert_eq!(h.closed(), Some(H3ErrorCode::NO_ERROR.as_u64()));
+
+    // Once the GOAWAY has had its time, the end of the last request stream closes at once.
+    let mut h = Harness::ready();
+    h.receive(client_bidi(0), &headers_frame(GET), true);
+    h.session.core.on_quiesce(&mut h.conn);
+    h.pull_all(client_bidi(0), 1 << 20);
+    h.conn.now += Duration::from_secs(60);
+    h.poll_session();
+    assert_eq!(h.closed(), None);
+    h.ready_edge(client_bidi(0), StreamReady::Closed);
+    assert_eq!(h.closed(), Some(H3ErrorCode::NO_ERROR.as_u64()));
+}
+
+#[test]
+fn idle_quiesce_closes_after_the_goaway_can_leave() {
+    // `close` enters the closing period at once, in which RFC 9000 lets only CONNECTION_CLOSE go
+    // out, so closing in the callback that staged GOAWAY would drop the GOAWAY.
+    let mut h = Harness::ready();
+    h.session.core.on_quiesce(&mut h.conn);
+    assert_eq!(h.control().1.last(), Some(&Frame::Goaway(0)));
+    assert_eq!(h.closed(), None, "the GOAWAY is staged, not sent");
+    let deadline = h.session.deadline().expect("the session asks to be polled");
+    h.poll_session();
+    assert_eq!(h.closed(), None, "before the deadline");
+    h.conn.now = deadline;
+    h.poll_session();
+    assert_eq!(h.closed(), Some(H3ErrorCode::NO_ERROR.as_u64()));
+    assert_eq!(h.session.deadline(), None);
+}
+
+#[test]
+fn connection_close_cancels_exchanges() {
+    let plan = Plan {
+        head_gate: Some(Gate::default()),
+        ..Plan::default()
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan.clone());
+    h.receive(client_bidi(0), &headers_frame(GET), true);
+    h.receive(client_bidi(1), &headers_frame(POST), false);
+    h.event(ConnEvent::Closed {
+        reason: mvfstr_proto::CloseReason::Silent,
+        initiator: mvfstr_proto::Initiator::Peer,
+    });
+    let cancels: Vec<_> = h
+        .log()
+        .into_iter()
+        .filter(|ev| matches!(ev, Ev::Cancel { .. }))
+        .collect();
+    assert_eq!(
+        cancels,
+        [1, 5].map(|id| Ev::Cancel {
+            id,
+            code: HttpErrorCode::TRANSPORT_EOF,
+            peer: true
+        })
+    );
+
+    // A connection error cancels the exchanges as a local cause.
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    h.receive(client_bidi(0), &headers_frame(GET), true);
+    h.receive(client_uni(0), &[], true);
+    assert_eq!(
+        h.closed(),
+        Some(H3ErrorCode::CLOSED_CRITICAL_STREAM.as_u64())
+    );
+    assert_eq!(
+        h.log().last(),
+        Some(&Ev::Cancel {
+            id: 1,
+            code: HttpErrorCode::PROTOCOL_ERROR,
+            peer: false
+        })
+    );
+}
+
+#[test]
+fn connection_close_cause_follows_its_initiator() {
+    use mvfstr_proto::Initiator;
+    let cases = [
+        (Initiator::Local, HttpErrorCode::CANCEL, false),
+        (Initiator::Internal, HttpErrorCode::INTERNAL_ERROR, false),
+        (Initiator::IdleTimeout, HttpErrorCode::TRANSPORT_EOF, true),
+        (
+            Initiator::StatelessReset,
+            HttpErrorCode::TRANSPORT_EOF,
+            true,
+        ),
+    ];
+    for (initiator, code, peer) in cases {
+        let plan = Plan {
+            head_gate: Some(Gate::default()),
+            ..Plan::default()
+        };
+        let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+        h.receive(client_bidi(0), &headers_frame(GET), true);
+        h.event(ConnEvent::Closed {
+            reason: mvfstr_proto::CloseReason::Silent,
+            initiator,
+        });
+        assert_eq!(
+            h.log().last(),
+            Some(&Ev::Cancel { id: 1, code, peer }),
+            "{initiator:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// QPACK, unknown types and framing.
+
+#[test]
+fn dynamic_table_reference_is_decompression_failure() {
+    // A Required Insert Count above 0, and an indexed line in the dynamic table.
+    for block in [vec![0x01, 0x00, 0xd1], vec![0x00, 0x00, 0x80]] {
+        let mut h = Harness::ready();
+        let id = client_bidi(0);
+        h.receive(id, &frame(FrameType::HEADERS, &block), false);
+        assert_eq!(h.closed(), Some(roxygen_qpack::QPACK_DECOMPRESSION_FAILED));
+        assert_eq!(
+            h.log(),
+            vec![
+                Ev::New(1),
+                Ev::Cancel {
+                    id: 1,
+                    code: HttpErrorCode::COMPRESSION_ERROR,
+                    peer: false
+                }
+            ]
+        );
+    }
+}
+
+#[test]
+fn unknown_frames_and_stream_types_are_ignored() {
+    let mut h = Harness::ready();
+    // PRIORITY_UPDATE (RFC 9218) is skipped as an unknown frame on the control stream.
+    h.receive(
+        client_uni(0),
+        &frame(FrameType::new(0xf0700).unwrap(), b"\x00u=1"),
+        false,
+    );
+    // A reserved and an unknown stream type are stopped and drained.
+    for (index, stream_type) in [(1, StreamType::grease(3).as_u64()), (2, 0x54)] {
+        let id = client_uni(index);
+        let mut bytes = BytesMut::new();
+        UniStreamHeader::Unknown(StreamType::new(stream_type).unwrap())
+            .encode(&mut bytes)
+            .unwrap();
+        bytes.extend_from_slice(b"ignored");
+        h.receive(id, &bytes, false);
+        assert_eq!(
+            h.conn.get(id).stop_sending,
+            Some(H3ErrorCode::STREAM_CREATION_ERROR.as_u64())
+        );
+        assert!(h.conn.get(id).readable.is_empty());
+        h.receive(id, b"more", true);
+        assert!(h.conn.get(id).readable.is_empty());
+    }
+    // Reserved frame types around a request's frames are skipped.
+    let id = client_bidi(0);
+    let grease = |n| frame(FrameType::grease(n), b"grease");
+    let request = [
+        grease(1),
+        headers_frame(POST),
+        grease(2),
+        data_frame(b"abc"),
+        frame(FrameType::new(0x2a).unwrap(), b""),
+        data_frame(b"def"),
+        grease(3),
+    ]
+    .concat();
+    h.receive(id, &request, true);
+    assert_eq!(h.closed(), None);
+    assert_eq!(read_all(&mut h, id), (b"abcdef".to_vec(), None));
+    h.poll_session();
+    assert_eq!(h.conn.get(id).consumed, request.len() as u64);
+    h.pull_all(id, 1 << 20);
+    assert_eq!(body_of(&h.response(id)), b"hello");
+}
+
+#[test]
+fn frame_legality_follows_the_codec() {
+    let settings = {
+        let mut out = BytesMut::new();
+        Frame::Settings(Settings::new()).encode(&mut out).unwrap();
+        out.to_vec()
+    };
+    let cases: Vec<(&str, Vec<u8>, bool, u64)> = vec![
+        (
+            "DATA before HEADERS",
+            data_frame(b"x"),
+            false,
+            H3ErrorCode::FRAME_UNEXPECTED.as_u64(),
+        ),
+        (
+            "SETTINGS on a request stream",
+            settings,
+            false,
+            H3ErrorCode::FRAME_UNEXPECTED.as_u64(),
+        ),
+        (
+            "HTTP/2 frame type",
+            // PRIORITY (0x02), with an empty payload.
+            vec![0x02, 0x00],
+            false,
+            H3ErrorCode::FRAME_UNEXPECTED.as_u64(),
+        ),
+        (
+            "HEADERS after trailers",
+            [
+                headers_frame(POST),
+                headers_frame(&[("x", "1")]),
+                headers_frame(&[("y", "2")]),
+            ]
+            .concat(),
+            false,
+            H3ErrorCode::FRAME_UNEXPECTED.as_u64(),
+        ),
+        (
+            "DATA after trailers",
+            [
+                headers_frame(POST),
+                headers_frame(&[("x", "1")]),
+                data_frame(b"z"),
+            ]
+            .concat(),
+            false,
+            H3ErrorCode::FRAME_UNEXPECTED.as_u64(),
+        ),
+        (
+            "FIN inside a frame",
+            [headers_frame(POST), data_frame(b"abc")[..3].to_vec()].concat(),
+            true,
+            H3ErrorCode::FRAME_ERROR.as_u64(),
+        ),
+    ];
+    for (name, bytes, fin, code) in cases {
+        let mut h = Harness::ready();
+        h.receive(client_bidi(0), &bytes, fin);
+        assert_eq!(h.closed(), Some(code), "{name}");
+    }
+
+    // A FIN before the request head is a stream error.
+    let mut h = Harness::ready();
+    let id = client_bidi(0);
+    h.receive(id, &[], true);
+    assert_eq!(
+        h.conn.get(id).reset,
+        Some(H3ErrorCode::REQUEST_INCOMPLETE.as_u64())
+    );
+    assert_eq!(h.closed(), None);
+}
+
+/// Reads the application's request body to its end: the data and any trailers.
+fn read_all(h: &mut Harness, id: StreamId) -> (Vec<u8>, Option<Vec<(String, String)>>) {
+    let mut data = Vec::new();
+    loop {
+        let Poll::Ready(Ok(event)) = h.read_body(id, 1 << 20) else {
+            panic!("the body is readable to its end");
+        };
+        let eom = event.eom();
+        match event.into_kind() {
+            HttpBodyEventKind::Body(body) => {
+                data.extend(body.segments().flat_map(|segment| segment.to_vec()));
+            }
+            HttpBodyEventKind::Trailers(trailers) => {
+                let mut fields = Vec::new();
+                trailers.for_each(|name, value| {
+                    fields.push((
+                        String::from_utf8(name.to_vec()).unwrap(),
+                        String::from_utf8(value.to_vec()).unwrap(),
+                    ));
+                });
+                return (data, Some(fields));
+            }
+            _ => panic!("unexpected body event"),
+        }
+        if eom {
+            return (data, None);
+        }
+        h.poll_session();
+    }
+}
+
+#[test]
+fn request_split_at_every_byte_boundary() {
+    let request = [
+        headers_frame(
+            &[
+                POST,
+                &[
+                    ("content-length", "11"),
+                    ("cookie", "a=1"),
+                    ("cookie", "b=2"),
+                ],
+            ]
+            .concat(),
+        ),
+        frame(FrameType::grease(7), b"pad"),
+        data_frame(b"hello "),
+        data_frame(b"world"),
+        headers_frame(&[("x-trailer", "t")]),
+    ]
+    .concat();
+    let check = |h: &mut Harness, id: StreamId, split: &str| {
+        assert_eq!(h.closed(), None, "{split}");
+        assert_eq!(
+            h.log()[..2],
+            [Ev::New(1), Ev::Request { id: 1, eom: false }],
+            "{split}"
+        );
+        let (method, url, fields) = received_head(h, id);
+        assert_eq!(
+            (method.as_str(), url.as_str()),
+            ("POST", "/upload"),
+            "{split}"
+        );
+        assert_eq!(field(&fields, "Cookie"), Some("a=1; b=2"), "{split}");
+        assert_eq!(
+            read_all(h, id),
+            (
+                b"hello world".to_vec(),
+                Some(vec![("x-trailer".to_owned(), "t".to_owned())])
+            ),
+            "{split}"
+        );
+        h.poll_session();
+        assert_eq!(h.conn.get(id).consumed, request.len() as u64, "{split}");
+    };
+    let id = client_bidi(0);
+    for at in 1..request.len() {
+        let mut h = Harness::ready();
+        h.receive(id, &request[..at], false);
+        h.receive(id, &request[at..], true);
+        check(&mut h, id, &format!("split at {at}"));
+    }
+    // One byte at a time.
+    let mut h = Harness::ready();
+    for byte in &request {
+        h.receive(id, std::slice::from_ref(byte), false);
+    }
+    h.receive(id, &[], true);
+    check(&mut h, id, "byte by byte");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Response scheduling and limits.
+
+#[test]
+fn suspend_parks_the_stream_until_resumed() {
+    let gate = Gate::default();
+    let plan = Plan {
+        suspend: Some(gate.clone()),
+        ..Plan::default()
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let id = client_bidi(0);
+    h.receive(id, &headers_frame(GET), true);
+    assert!(h.pull(id, 1 << 20).0.is_ready(), "the head goes out");
+    assert!(h.pull(id, 1 << 20).0.is_pending(), "the body is suspended");
+    assert!(!h.conn.get(id).finished);
+    h.conn.take_stream_wakes();
+
+    gate.open();
+    assert_eq!(
+        h.conn.take_stream_wakes(),
+        vec![id],
+        "resuming wakes the stream"
+    );
+    assert!(h.pull(id, 1 << 20).0.is_ready());
+    assert_eq!(body_of(&h.response(id)), b"hello");
+    assert!(h.conn.get(id).finished);
+}
+
+#[test]
+fn poll_without_progress_wakes_its_stream_again() {
+    let plan = Plan {
+        empty_events: 40,
+        ..Plan::default()
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let id = client_bidi(0);
+    h.receive(id, &headers_frame(GET), true);
+    assert!(h.pull(id, 1 << 20).0.is_ready(), "the head goes out");
+    h.conn.take_stream_wakes();
+
+    // A call that meets only empty events returns without progress and wakes its stream again,
+    // since the stream would otherwise wait for a wake that was never registered.
+    assert!(h.pull(id, 1 << 20).0.is_pending());
+    assert_eq!(h.conn.take_stream_wakes(), vec![id]);
+    for _ in 0..4 {
+        let _ = h.pull(id, 1 << 20);
+    }
+    assert!(h.conn.get(id).finished);
+    assert_eq!(body_of(&h.response(id)), b"hello");
+}
+
+#[test]
+fn priority_header_sets_the_stream_order() {
+    let mut h = Harness::ready();
+    let urgent = client_bidi(0);
+    h.receive(
+        urgent,
+        &headers_frame(&[GET, &[("priority", "u=1, i")]].concat()),
+        true,
+    );
+    let order = h
+        .conn
+        .get(urgent)
+        .order
+        .expect("the order is set at delivery");
+    assert_eq!(
+        (order.class, order.urgency, order.incremental),
+        (1, 1, true)
+    );
+
+    let plain = client_bidi(1);
+    h.receive(plain, &headers_frame(GET), true);
+    let order = h.conn.get(plain).order.unwrap();
+    assert_eq!(
+        (order.class, order.urgency, order.incremental),
+        (1, 3, false)
+    );
+}
+
+#[test]
+fn priority_header_follows_rfc9218() {
+    // (field lines, urgency, incremental)
+    let cases: [(&[&str], u8, bool); 10] = [
+        (&["i=?1, u=1"], 1, true),
+        (&["i, u=2"], 2, true),
+        // Out-of-range values and values of another type are ignored, not the whole field.
+        (&["u=9, i"], 3, true),
+        (&["u=1, i=1"], 1, false),
+        (&["u=a, i=?1"], 3, true),
+        // Parameters and unknown members, including inner lists, are ignored.
+        (&["u=1;x=2, i;y, z=(a \"b\" 3), w=:AAEC:"], 1, true),
+        // The last of duplicate members counts, across field lines too.
+        (&["u=1, u=6"], 6, false),
+        (&["u=1", "u=5, i"], 5, true),
+        // A value that does not parse leaves the defaults.
+        (&["u=1, i,"], 3, false),
+        (&["u=1 i"], 3, false),
+    ];
+    for (lines, urgency, incremental) in cases {
+        let mut h = Harness::ready();
+        let id = client_bidi(0);
+        let fields: Vec<(&str, &str)> = GET
+            .iter()
+            .copied()
+            .chain(lines.iter().map(|line| ("priority", *line)))
+            .collect();
+        h.receive(id, &headers_frame(&fields), true);
+        let order = h.conn.get(id).order.expect("the order is set at delivery");
+        assert_eq!(
+            (order.class, order.urgency, order.incremental),
+            (1, urgency, incremental),
+            "{lines:?}"
+        );
+    }
+}
+
+#[test]
+fn informational_response_precedes_the_final_head() {
+    let plan = Plan {
+        informational: true,
+        ..Plan::default()
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let id = client_bidi(0);
+    h.receive(id, &headers_frame(GET), true);
+    h.pull_all(id, 1 << 20);
+    let parts = h.response(id);
+    let [Part::Headers(early), Part::Headers(head), Part::Data(_)] = parts.as_slice() else {
+        panic!("expected 103, 200 and the body: {parts:?}");
+    };
+    assert_eq!(field(early, ":status"), Some("103"));
+    assert_eq!(field(head, ":status"), Some("200"));
+}
+
+#[test]
+fn concurrent_exchange_limit_rejects_streams() {
+    let gate = Gate::default();
+    let plan = Plan {
+        head_gate: Some(gate.clone()),
+        ..Plan::default()
+    };
+    let mut h = Harness::ready_with(
+        H3ApplicationBuilder::new().max_concurrent_exchanges(1),
+        plan,
+    );
+    h.receive(client_bidi(0), &headers_frame(GET), true);
+    h.receive(client_bidi(1), &headers_frame(GET), true);
+    let rejected = Some(H3ErrorCode::REQUEST_REJECTED.as_u64());
+    assert_eq!(h.conn.get(client_bidi(1)).reset, rejected);
+    assert_eq!(h.conn.get(client_bidi(1)).stop_sending, rejected);
+    assert!(!h.log().contains(&Ev::New(5)));
+
+    gate.open();
+    h.pull_all(client_bidi(0), 1 << 20);
+    h.poll_session();
+    h.receive(client_bidi(2), &headers_frame(GET), true);
+    assert!(h.log().contains(&Ev::New(9)));
+    assert_eq!(h.conn.get(client_bidi(2)).reset, None);
+}
+
+#[test]
+fn builder_rejects_unusable_limits() {
+    let build = |builder: H3ApplicationBuilder| {
+        builder
+            .build(Host::tokio(), |_| Ok(TestApp::default()))
+            .err()
+    };
+    assert!(build(H3ApplicationBuilder::new().max_concurrent_exchanges(0)).is_some());
+    assert!(build(H3ApplicationBuilder::new().request_body_buffer(0)).is_some());
+    assert!(build(H3ApplicationBuilder::new().max_field_section_size(0)).is_some());
+    let too_few_uni = mvfstr_proto::TransportConfig::builder()
+        .max_streams_uni(2)
+        .build()
+        .unwrap();
+    assert!(build(H3ApplicationBuilder::new().transport(too_few_uni)).is_some());
+    assert!(build(H3ApplicationBuilder::new()).is_none());
+}
+
+#[test]
+fn response_failure_resets_the_stream() {
+    let plan = Plan {
+        fail: true,
+        ..Plan::default()
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let id = client_bidi(0);
+    h.receive(id, &headers_frame(POST), false);
+    assert!(h.pull(id, 1 << 20).0.is_pending());
+    h.poll_session();
+    // RFC 9114 uses H3_REQUEST_CANCELLED for a response abandoned after partial processing.
+    let cancelled = Some(H3ErrorCode::REQUEST_CANCELLED.as_u64());
+    assert_eq!(h.conn.get(id).reset, cancelled);
+    assert_eq!(h.conn.get(id).stop_sending, cancelled);
+    assert_eq!(
+        h.log()[2..],
+        [Ev::Cancel {
+            id: 1,
+            code: HttpErrorCode::INTERNAL_ERROR,
+            peer: false
+        }]
+    );
+    assert!(h.pull(id, 1 << 20).0.is_pending());
+}
+
+#[test]
+fn tunnel_failure_resets_with_connect_error() {
+    // In RFC 9114, an error in a tunnel's TCP connection is a stream error of type
+    // H3_CONNECT_ERROR.
+    let plan = Plan {
+        body_failure: Some(HttpErrorCode::CONNECT_ERROR),
+        ..Plan::default()
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let reset_with = |h: &mut Harness, index: u64, request: &[(&str, &str)]| {
+        let id = client_bidi(index);
+        h.receive(id, &headers_frame(request), false);
+        assert!(h.pull(id, 1 << 20).0.is_pending());
+        h.poll_session();
+        let stream = h.conn.get(id);
+        assert_eq!(stream.reset, stream.stop_sending);
+        stream.reset
+    };
+    let connect_error = Some(H3ErrorCode::CONNECT_ERROR.as_u64());
+    let cancelled = Some(H3ErrorCode::REQUEST_CANCELLED.as_u64());
+    assert_eq!(reset_with(&mut h, 0, CONNECT), connect_error);
+    assert_eq!(
+        h.log()[2..],
+        [Ev::Cancel {
+            id: 1,
+            code: HttpErrorCode::CONNECT_ERROR,
+            peer: false
+        }]
+    );
+
+    // Only a tunnel has a TCP connection to report: other failures keep H3_REQUEST_CANCELLED.
+    assert_eq!(reset_with(&mut h, 1, POST), cancelled);
+    h.app.0.borrow_mut().plan.body_failure = Some(HttpErrorCode::INTERNAL_ERROR);
+    assert_eq!(reset_with(&mut h, 2, CONNECT), cancelled);
+}
+
+#[test]
+fn tiny_allowance_splits_frames_across_polls() {
+    let plan = Plan {
+        body: Bytes::from_static(b"a body longer than the allowance"),
+        trailers: Some(vec![("x-done", "1")]),
+        ..Plan::default()
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let id = client_bidi(0);
+    h.receive(id, &headers_frame(GET), true);
+    let mut calls = 0;
+    while h.pull(id, [1, 2, 3][calls % 3]).0.is_ready() {
+        calls += 1;
+        assert!(calls < 1000);
+    }
+    assert!(h.conn.get(id).finished);
+    let parts = h.response(id);
+    assert_eq!(body_of(&parts), b"a body longer than the allowance");
+    assert_eq!(
+        parts.last(),
+        Some(&Part::Headers(vec![("x-done".to_owned(), "1".to_owned())]))
+    );
+}
