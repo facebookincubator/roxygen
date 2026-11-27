@@ -609,6 +609,42 @@ fn retire_empty_body_completes_a_header_only_source() {
     );
 }
 
+/// A header-only body is the body that `retire_empty_body` leaves: it holds no source, reports no
+/// completion, converts to an empty holder, and its drop calls back nothing.
+#[test]
+fn a_header_only_ingress_body_holds_no_source() {
+    let log = Rc::new(RefCell::new(CallbackLog::default()));
+    let retired = HttpIngressBody::new(
+        StreamId::new(7),
+        RecordingCallback(Rc::clone(&log)),
+        8,
+        Host::tokio(),
+    )
+    .unwrap();
+    assert!(retired.initialize_body_only(&mut request(None), false));
+    assert!(retired.producer().eom());
+    let retired = retired
+        .retire_empty_body(&mut Context::from_waker(Waker::noop()))
+        .expect("the terminal empty read");
+    assert_eq!(log.borrow().completions, vec![None]);
+
+    for (name, body) in [
+        ("header-only", HttpIngressBody::header_only()),
+        ("retired", retired),
+    ] {
+        assert!(!body.readable(), "{name}");
+        assert!(body.ingress_completion().is_none(), "{name}");
+        let owner = body.into_source_owner();
+        assert!(owner.source().is_none(), "{name}");
+        assert!(!owner.into_source_holder().readable(), "{name}");
+    }
+    assert_eq!(
+        log.borrow().completions,
+        vec![None],
+        "dropping the retired body calls back nothing"
+    );
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("owned source failure")]
 struct SourceCause;

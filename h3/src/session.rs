@@ -12,11 +12,13 @@
 //! each. The session opens its control stream with SETTINGS, accepts the peer's control and QPACK
 //! streams, and turns each request stream into one exchange of the application: it decodes the
 //! request head through QPACK, feeds DATA to the exchange's ingress body, and returns stream
-//! credit only as the application consumes the body. Responses go out through the pull path:
-//! `poll_send` polls the exchange's head and body with an allowance and pushes frames whose
-//! payloads are never copied. A small response that the exchange holds whole when its request is
-//! delivered is staged at once, the same way, without waiting for the pull step. The logic is
-//! written against the transport seam in [`crate::transport`].
+//! credit only as the application consumes the body. The body is built when the application
+//! takes its completion, or else when the head is decoded, except that a request whose FIN
+//! directly follows its HEADERS frame, other than a CONNECT, gets a body that holds no source.
+//! Responses go out through the pull path: `poll_send` polls the exchange's head and body with an
+//! allowance and pushes frames whose payloads are never copied. A small response that the exchange
+//! holds whole when its request is delivered is staged at once, the same way, without waiting for
+//! the pull step. The logic is written against the transport seam in [`crate::transport`].
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
@@ -489,13 +491,12 @@ enum Egress {
 struct Exchange<E> {
     application: Option<E>,
     decoder: FrameDecoder,
-    cell: Arc<CreditCell>,
-    producer: HttpStreamSourceProducer,
-    /// The ingress body until the request is delivered.
+    /// The ingress body, once built, until the request is delivered. It is declared before `feed`
+    /// so that a dropped exchange drops it before the drain owner, which then stops the draining
+    /// body as dropped rather than abandoned.
     body: Option<HttpIngressBody>,
-    /// The owner that keeps a body the application dropped draining, with its credit, until the
-    /// request ends.
-    _drain: HttpStreamSourceDrain,
+    /// The session's side of the ingress body, once the body is built.
+    feed: Option<IngressFeed>,
     /// The decoded request head until it is delivered.
     head: Option<Box<HttpMessage>>,
     delivered: bool,
@@ -539,6 +540,49 @@ impl<E> Exchange<E> {
         let outstanding = self.handed - self.app_consumed;
         u64::from(buffer).saturating_sub(outstanding) as usize
     }
+
+    /// Returns the producer of the ingress body, once the body is built.
+    fn producer(&self) -> Option<&HttpStreamSourceProducer> {
+        self.feed.as_ref().map(|feed| &feed.producer)
+    }
+}
+
+/// The session's side of a request's ingress body, built with the body and kept until the exchange
+/// goes.
+struct IngressFeed {
+    /// The cell the body's consumer returns credit through.
+    cell: Arc<CreditCell>,
+    producer: HttpStreamSourceProducer,
+    /// The owner that keeps a body the application dropped draining, with its credit, until the
+    /// request ends.
+    _drain: HttpStreamSourceDrain,
+}
+
+/// Builds the ingress body of request stream `id` and the session's side of it.
+fn ingress_body(state: &State, id: StreamId) -> (HttpIngressBody, IngressFeed) {
+    let cell = Arc::new(CreditCell::new(id, Arc::clone(&state.work)));
+    let signals = Rc::new(IngressSignals {
+        cell: Arc::clone(&cell),
+    });
+    let body = HttpIngressBody::new_shared(
+        http_stream_id(id),
+        signals,
+        state.config.request_body_buffer,
+        state.host.clone(),
+    )
+    .expect("the builder bounds the request body buffer to the body's window range");
+    let feed = IngressFeed {
+        cell,
+        producer: body.producer(),
+        _drain: body.drain_on_drop(),
+    };
+    (body, feed)
+}
+
+/// Returns the Roxygen stream ID of request stream `id`. QUIC's first request stream is 0, which
+/// Roxygen reserves for "unspecified".
+fn http_stream_id(id: StreamId) -> HttpStreamId {
+    HttpStreamId::new(id.into_inner() + 1)
 }
 
 /// The outcome of a step of ingress processing.
@@ -820,40 +864,27 @@ impl<A: OwnedApplication> Core<A> {
             abort_stream(t, id, H3ErrorCode::REQUEST_REJECTED);
             return;
         }
-        let config = &self.state.config;
-        let cell = Arc::new(CreditCell::new(id, Arc::clone(&self.state.work)));
-        let signals = Rc::new(IngressSignals {
-            cell: Arc::clone(&cell),
+        // An application that takes the completion gets the body built at admission.
+        let mut built = None;
+        let application = self.application.new_exchange_with(http_stream_id(id), || {
+            let (body, feed) = ingress_body(&self.state, id);
+            let completion = body
+                .ingress_completion()
+                .expect("a fresh ingress body reports its completion");
+            built = Some((body, feed));
+            completion
         });
-        // QUIC's first request stream is 0, which Roxygen reserves for "unspecified".
-        let http_id = HttpStreamId::new(id.into_inner() + 1);
-        let Ok(body) = HttpIngressBody::new_shared(
-            http_id,
-            signals,
-            config.request_body_buffer,
-            self.state.host.clone(),
-        ) else {
-            abort_stream(t, id, H3ErrorCode::INTERNAL_ERROR);
-            return;
-        };
-        let producer = body.producer();
-        let drain = body.drain_on_drop();
-        let application = self.application.new_exchange_with(http_id, || {
-            body.ingress_completion()
-                .expect("a fresh ingress body reports its completion")
-        });
+        let (body, feed) = built.unzip();
         let limits = FrameLimits {
-            max_field_section_payload: usize::try_from(config.max_field_section_size)
+            max_field_section_payload: usize::try_from(self.state.config.max_field_section_size)
                 .unwrap_or(usize::MAX),
             ..FrameLimits::default()
         };
         let exchange = Box::new(Exchange {
             application: Some(application),
             decoder: FrameDecoder::new(StreamKind::Request, Role::Server, limits),
-            cell,
-            producer,
-            body: Some(body),
-            _drain: drain,
+            body,
+            feed,
             head: None,
             delivered: false,
             ingress: Ingress::Head,
@@ -940,10 +971,12 @@ impl<A: OwnedApplication> Core<A> {
             // The response is out; the peer only stopped its upload, which ends the body.
             if exchange.ingress.open() {
                 exchange.ingress = Ingress::Abandoned;
-                exchange.producer.abort(
-                    fields::peer_error_code(code.0.into_inner()),
-                    b"peer reset the request stream",
-                );
+                if let Some(producer) = exchange.producer() {
+                    producer.abort(
+                        fields::peer_error_code(code.0.into_inner()),
+                        b"peer reset the request stream",
+                    );
+                }
             }
             return;
         }
@@ -1046,9 +1079,9 @@ impl<A: OwnedApplication> Core<A> {
                     if let Ok(mut stream) = t.stream(id) {
                         let _ = stream.stop_sending(app_code(H3ErrorCode::NO_ERROR));
                     }
-                    exchange
-                        .producer
-                        .abort(HttpErrorCode::CANCEL, b"response completed early");
+                    if let Some(producer) = exchange.producer() {
+                        producer.abort(HttpErrorCode::CANCEL, b"response completed early");
+                    }
                     exchange.ingress = Ingress::Abandoned;
                     continue;
                 }
@@ -1344,7 +1377,9 @@ fn read_frames<T: Transport, E: OwnedExchange>(
     id: StreamId,
     exchange: &mut Exchange<E>,
 ) -> Verdict {
-    exchange.app_consumed = (exchange.app_consumed + exchange.cell.take()).min(exchange.handed);
+    if let Some(feed) = &exchange.feed {
+        exchange.app_consumed = (exchange.app_consumed + feed.cell.take()).min(exchange.handed);
+    }
     if !exchange.ingress.open() {
         settle_credit(t, id, exchange);
         return Verdict::Continue;
@@ -1370,9 +1405,10 @@ fn read_frames<T: Transport, E: OwnedExchange>(
     drop(stream);
 
     let buffer = state.config.request_body_buffer;
-    let max_size = state.config.max_field_section_size;
+    // Moved out of the state while the loop runs, since `on_headers` takes the whole state.
+    let segments = mem::take(&mut state.segments);
     let mut verdict = Verdict::Continue;
-    'segments: for segment in &state.segments {
+    'segments: for segment in &segments {
         let mut position = 0;
         while position < segment.len() {
             let room = exchange.room(buffer);
@@ -1392,7 +1428,8 @@ fn read_frames<T: Transport, E: OwnedExchange>(
                 }
                 Ok(Some(Frame::Headers(block))) => {
                     exchange.overhead += used as u64;
-                    on_headers(&mut state.qpack_decoder, max_size, exchange, &block)
+                    let complete = fin && exchange.parsed == end;
+                    on_headers(state, id, exchange, &block, complete)
                 }
                 Ok(_) => {
                     exchange.overhead += used as u64;
@@ -1405,6 +1442,7 @@ fn read_frames<T: Transport, E: OwnedExchange>(
             }
         }
     }
+    state.segments = segments;
     if verdict != Verdict::Continue {
         return verdict;
     }
@@ -1439,28 +1477,41 @@ fn on_data<E>(exchange: &mut Exchange<E>, data: Bytes) -> Verdict {
     exchange.body_events = true;
     let body = BufQueue::from_bytes(data, len as usize)
         .expect("a queue sized for its one segment accepts it");
-    if exchange.producer.body(body, 0, false) == FlowControlState::Error {
-        // The body is not read any more: its bytes count as consumed.
+    let taken = exchange
+        .producer()
+        .is_some_and(|producer| producer.body(body, 0, false) != FlowControlState::Error);
+    if !taken {
+        // The body is not read any more, or does not exist: its bytes count as consumed.
         exchange.app_consumed += len;
     }
     Verdict::Continue
 }
 
+/// Decodes a HEADERS frame: the request head, or the trailers. `complete` is whether the peer's
+/// FIN directly follows the frame.
 fn on_headers<E>(
-    decoder: &mut roxygen_qpack::Decoder,
-    max_size: u64,
+    state: &mut State,
+    id: StreamId,
     exchange: &mut Exchange<E>,
     block: &[u8],
+    complete: bool,
 ) -> Verdict {
+    let max_size = state.config.max_field_section_size;
     match exchange.ingress {
-        Ingress::Head => match fields::decode_request(decoder, block, max_size) {
+        Ingress::Head => match fields::decode_request(&mut state.qpack_decoder, block, max_size) {
             Ok(head) => {
                 let mut message = head.message;
-                let body = exchange
-                    .body
-                    .as_ref()
-                    .expect("an undelivered request keeps its body");
-                if !body.initialize_body_only(&mut message, false) {
+                // A request that is complete at its head carries no body event, so its body is
+                // built only for an application that took the completion. A CONNECT's body is the
+                // upload half of its tunnel and is always built.
+                if exchange.feed.is_none() && (!complete || head.connect) {
+                    let (body, feed) = ingress_body(state, id);
+                    exchange.body = Some(body);
+                    exchange.feed = Some(feed);
+                }
+                if let Some(body) = &exchange.body
+                    && !body.initialize_body_only(&mut message, false)
+                {
                     return Verdict::Stream(H3ErrorCode::MESSAGE_ERROR);
                 }
                 exchange.content_length = head.content_length;
@@ -1474,7 +1525,7 @@ fn on_headers<E>(
         },
         // RFC 9114: a CONNECT stream carries only DATA after the head.
         Ingress::Body if exchange.connect => Verdict::Connection(H3ErrorCode::FRAME_UNEXPECTED),
-        Ingress::Body => match fields::decode_trailers(decoder, block, max_size) {
+        Ingress::Body => match fields::decode_trailers(&mut state.qpack_decoder, block, max_size) {
             Ok(trailers) => {
                 if exchange
                     .content_length
@@ -1485,7 +1536,9 @@ fn on_headers<E>(
                 exchange.body_events = true;
                 exchange.ingress = Ingress::Trailers;
                 // The source leaves the body open after trailers; the trailers end the message.
-                let _ = exchange.producer.trailers(trailers) && exchange.producer.eom();
+                if let Some(producer) = exchange.producer() {
+                    let _ = producer.trailers(trailers) && producer.eom();
+                }
                 Verdict::Continue
             }
             Err(error) => field_verdict(error),
@@ -1522,10 +1575,12 @@ fn end_ingress<E>(now: Instant, exchange: &mut Exchange<E>) -> Verdict {
                 return Verdict::Stream(H3ErrorCode::MESSAGE_ERROR);
             }
             exchange.ingress = Ingress::Complete;
-            if exchange.body_events {
-                exchange.producer.eom();
-            } else {
-                exchange.producer.eom_at(now);
+            if let Some(producer) = exchange.producer() {
+                if exchange.body_events {
+                    producer.eom();
+                } else {
+                    producer.eom_at(now);
+                }
             }
             Verdict::Continue
         }
@@ -1567,14 +1622,15 @@ fn deliver<T: Transport, E: OwnedExchange>(
     else {
         return Ok(());
     };
-    let mut body = exchange
-        .body
-        .take()
-        .expect("an undelivered request keeps its body");
     let eom = exchange.ingress == Ingress::Complete && !exchange.body_events;
-    if eom {
-        body = body.retire_empty_body(&mut Context::from_waker(Waker::noop()))?;
-    }
+    let body = match exchange.body.take() {
+        Some(body) if eom => body.retire_empty_body(&mut Context::from_waker(Waker::noop()))?,
+        Some(body) => body,
+        None => {
+            debug_assert!(eom, "only a request complete at its head has no body");
+            HttpIngressBody::header_only()
+        }
+    };
     if let Ok(mut stream) = t.stream(id) {
         stream.set_order(fields::request_order(&head));
     }
@@ -1935,9 +1991,9 @@ fn retire<E: OwnedExchange>(exchange: &mut Exchange<E>) {
 
 /// Cancels an exchange and its ingress body. A cancelled exchange is dropped, not completed.
 fn cancel<E: OwnedExchange>(exchange: &mut Exchange<E>, error: &HttpError, peer_reset: bool) {
-    exchange
-        .producer
-        .abort_with_error(error.clone(), b"HTTP/3 exchange cancelled");
+    if let Some(producer) = exchange.producer() {
+        producer.abort_with_error(error.clone(), b"HTTP/3 exchange cancelled");
+    }
     if let Some(mut application) = exchange.application.take() {
         application.cancel(error, peer_reset);
     }

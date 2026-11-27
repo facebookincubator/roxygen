@@ -1146,6 +1146,19 @@ impl HttpIngressBody {
         })
     }
 
+    /// Creates a body that holds no source, for a request that is complete at its head. It is the
+    /// value that [`retire_empty_body`] returns: [`ingress_completion`] is `None`, the methods
+    /// that need a source panic, and [`into_source_owner`] gives an empty owner.
+    ///
+    /// [`retire_empty_body`]: Self::retire_empty_body
+    /// [`ingress_completion`]: Self::ingress_completion
+    /// [`into_source_owner`]: Self::into_source_owner
+    pub fn header_only() -> Self {
+        Self {
+            owner: HttpStreamSourceOwner { source: None },
+        }
+    }
+
     /// Returns the non-owning producer for this fresh body.
     pub fn producer(&self) -> HttpStreamSourceProducer {
         self.owner

@@ -178,6 +178,8 @@ struct Received {
     head: Box<HttpMessage>,
     body: Option<HttpStreamSourceOwner>,
     read: Option<HttpStreamBodyRead>,
+    /// The ingress completion of an exchange that took it.
+    completion: Option<IngressCompletion>,
 }
 
 #[derive(Default)]
@@ -185,17 +187,25 @@ struct AppState {
     log: Vec<Ev>,
     plan: Plan,
     requests: HashMap<u64, Received>,
+    /// The ingress completions of cancelled exchanges that took them.
+    cancelled: HashMap<u64, IngressCompletion>,
+    /// The ingress completions that a `KeepApp` keeps beyond their exchanges.
+    kept: HashMap<u64, IngressCompletion>,
     /// The `maximum` of each `poll_body` call.
     maxima: Vec<u32>,
 }
 
+/// The scripted application. It creates its exchanges through the default `new_exchange_with`,
+/// which takes the ingress completion.
 #[derive(Clone, Default)]
 struct TestApp(Rc<RefCell<AppState>>);
 
-impl OwnedApplication for TestApp {
-    type Exchange = TestExchange;
-
-    fn new_exchange(&self, stream: HttpStreamId, _ingress: IngressCompletion) -> TestExchange {
+impl TestApp {
+    fn exchange(
+        &self,
+        stream: HttpStreamId,
+        completion: Option<IngressCompletion>,
+    ) -> TestExchange {
         let plan = {
             let mut state = self.0.borrow_mut();
             state.log.push(Ev::New(stream.get()));
@@ -205,6 +215,7 @@ impl OwnedApplication for TestApp {
             id: stream.get(),
             state: Rc::clone(&self.0),
             plan,
+            completion,
             sent_informational: false,
             offset: 0,
             suspended: false,
@@ -214,10 +225,58 @@ impl OwnedApplication for TestApp {
     }
 }
 
+impl OwnedApplication for TestApp {
+    type Exchange = TestExchange;
+
+    fn new_exchange(&self, stream: HttpStreamId, ingress: IngressCompletion) -> TestExchange {
+        self.exchange(stream, Some(ingress))
+    }
+}
+
+/// The scripted application creating its exchanges without the ingress completion, as the
+/// server's handler application does.
+#[derive(Clone, Default)]
+struct SkipApp(TestApp);
+
+impl OwnedApplication for SkipApp {
+    type Exchange = TestExchange;
+
+    fn new_exchange(&self, stream: HttpStreamId, ingress: IngressCompletion) -> TestExchange {
+        self.0.new_exchange(stream, ingress)
+    }
+
+    fn new_exchange_with(
+        &self,
+        stream: HttpStreamId,
+        _ingress: impl FnOnce() -> IngressCompletion,
+    ) -> TestExchange {
+        self.0.exchange(stream, None)
+    }
+}
+
+/// The scripted application keeping a handle to each ingress completion it takes beyond the
+/// completion's exchange, as an accounting task would.
+#[derive(Clone, Default)]
+struct KeepApp(TestApp);
+
+impl OwnedApplication for KeepApp {
+    type Exchange = TestExchange;
+
+    fn new_exchange(&self, stream: HttpStreamId, ingress: IngressCompletion) -> TestExchange {
+        let app = &self.0;
+        app.0
+            .borrow_mut()
+            .kept
+            .insert(stream.get(), ingress.clone());
+        app.new_exchange(stream, ingress)
+    }
+}
+
 struct TestExchange {
     id: u64,
     state: Rc<RefCell<AppState>>,
     plan: Plan,
+    completion: Option<IngressCompletion>,
     sent_informational: bool,
     offset: usize,
     suspended: bool,
@@ -245,6 +304,7 @@ impl OwnedExchange for TestExchange {
                 head,
                 body: Some(body),
                 read: None,
+                completion: self.completion.take(),
             },
         );
     }
@@ -312,11 +372,15 @@ impl OwnedExchange for TestExchange {
     }
 
     fn cancel(&mut self, error: &HttpError, peer_reset: bool) {
-        self.state.borrow_mut().log.push(Ev::Cancel {
+        let mut state = self.state.borrow_mut();
+        state.log.push(Ev::Cancel {
             id: self.id,
             code: error.code(),
             peer: peer_reset,
         });
+        if let Some(completion) = self.completion.take() {
+            state.cancelled.insert(self.id, completion);
+        }
     }
 
     fn response_complete(&mut self) {
@@ -453,9 +517,10 @@ fn field<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str> {
 // ---------------------------------------------------------------------------------------------
 // The harness: one session on a fake connection.
 
-struct Harness {
+struct Harness<A: OwnedApplication = TestApp> {
     conn: FakeConn,
-    session: H3Session<TestApp>,
+    session: H3Session<A>,
+    /// The state of the scripted application, which `session` hosts directly or wrapped.
     app: TestApp,
     options: ConnOptions,
     /// Wakes of the waker `poll_session` is given.
@@ -485,9 +550,39 @@ impl Harness {
     }
 
     fn with_plan(builder: H3ApplicationBuilder, plan: Plan) -> Self {
+        Self::hosting(builder, plan, |app| app)
+    }
+
+    /// Builds a harness whose peer has opened its control stream with SETTINGS.
+    fn ready() -> Self {
+        Self::ready_with(H3ApplicationBuilder::new(), Plan::default())
+    }
+
+    fn ready_with(builder: H3ApplicationBuilder, plan: Plan) -> Self {
+        let mut harness = Self::with_plan(builder, plan);
+        harness.make_ready();
+        harness
+    }
+}
+
+impl Harness<SkipApp> {
+    /// Builds a ready harness whose application skips the ingress completion.
+    fn skipping(plan: Plan) -> Self {
+        let mut harness = Self::hosting(H3ApplicationBuilder::new(), plan, SkipApp);
+        harness.make_ready();
+        harness
+    }
+}
+
+impl<A: OwnedApplication> Harness<A> {
+    /// Builds a harness whose session hosts `wrap` of the scripted application.
+    fn hosting(builder: H3ApplicationBuilder, plan: Plan, wrap: impl FnOnce(TestApp) -> A) -> Self
+    where
+        A: Clone,
+    {
         let app = TestApp::default();
         app.0.borrow_mut().plan = plan;
-        let made = app.clone();
+        let made = wrap(app.clone());
         let mut application = builder
             .build(Host::tokio(), move |_| Ok(made.clone()))
             .unwrap();
@@ -507,16 +602,10 @@ impl Harness {
         }
     }
 
-    /// Builds a harness whose peer has opened its control stream with SETTINGS.
-    fn ready() -> Self {
-        Self::ready_with(H3ApplicationBuilder::new(), Plan::default())
-    }
-
-    fn ready_with(builder: H3ApplicationBuilder, plan: Plan) -> Self {
-        let mut harness = Self::with_plan(builder, plan);
-        harness.event(ConnEvent::Connected);
-        harness.receive(client_uni(0), &control_stream(&Settings::new()), false);
-        harness
+    /// Opens the peer's control stream with SETTINGS.
+    fn make_ready(&mut self) {
+        self.event(ConnEvent::Connected);
+        self.receive(client_uni(0), &control_stream(&Settings::new()), false);
     }
 
     fn event(&mut self, event: ConnEvent) {
@@ -1038,7 +1127,10 @@ fn app(code: u64) -> mvfstr_proto::AppCode {
 // Requests and responses.
 
 /// Returns the request head the application received, as (method, url, fields).
-fn received_head(h: &Harness, id: StreamId) -> (String, String, Vec<(String, String)>) {
+fn received_head<A: OwnedApplication>(
+    h: &Harness<A>,
+    id: StreamId,
+) -> (String, String, Vec<(String, String)>) {
     let state = h.app.0.borrow();
     let head = &state.requests[&http_id(id)].head;
     let mut fields = Vec::new();
@@ -1231,7 +1323,7 @@ fn large_response_spans_several_polls() {
 }
 
 /// Returns the bytes of the next body event the application reads, and whether it ends the body.
-fn read_chunk(h: &mut Harness, id: StreamId) -> (Vec<u8>, bool) {
+fn read_chunk<A: OwnedApplication>(h: &mut Harness<A>, id: StreamId) -> (Vec<u8>, bool) {
     let Poll::Ready(Ok(event)) = h.read_body(id, 1 << 20) else {
         panic!("a body event is ready");
     };
@@ -2085,7 +2177,11 @@ fn request_trailers_with_te_are_malformed() {
 
 #[test]
 fn early_response_stops_the_request_body() {
-    let mut h = Harness::ready();
+    stop_the_request_body_after_an_early_response(Harness::ready());
+    stop_the_request_body_after_an_early_response(Harness::skipping(Plan::default()));
+}
+
+fn stop_the_request_body_after_an_early_response<A: OwnedApplication>(mut h: Harness<A>) {
     let id = client_bidi(0);
     let mut request = headers_frame(POST);
     request.extend_from_slice(&data_frame(&[1; 100]));
@@ -2137,7 +2233,13 @@ fn early_response_stops_the_request_body() {
 
 #[test]
 fn peer_reset_before_the_early_response_cleanup_ends_the_body() {
-    let mut h = Harness::ready();
+    end_the_body_at_a_reset_before_the_early_response_cleanup(Harness::ready());
+    end_the_body_at_a_reset_before_the_early_response_cleanup(Harness::skipping(Plan::default()));
+}
+
+fn end_the_body_at_a_reset_before_the_early_response_cleanup<A: OwnedApplication>(
+    mut h: Harness<A>,
+) {
     let id = client_bidi(0);
     let request = [headers_frame(POST), data_frame(&[1; 100])].concat();
     h.receive(id, &request, false);
@@ -2610,7 +2712,10 @@ fn frame_legality_follows_the_codec() {
 }
 
 /// Reads the application's request body to its end: the data and any trailers.
-fn read_all(h: &mut Harness, id: StreamId) -> (Vec<u8>, Option<Vec<(String, String)>>) {
+fn read_all<A: OwnedApplication>(
+    h: &mut Harness<A>,
+    id: StreamId,
+) -> (Vec<u8>, Option<Vec<(String, String)>>) {
     let mut data = Vec::new();
     loop {
         let Poll::Ready(Ok(event)) = h.read_body(id, 1 << 20) else {
@@ -2982,7 +3087,7 @@ fn fixed(body: Bytes) -> Plan {
 
 /// Delivers `request` and its FIN to a new stream at the stream's Opened edge, as when they arrive
 /// together.
-fn open_with_fin(h: &mut Harness, id: StreamId, request: &[u8]) {
+fn open_with_fin<A: OwnedApplication>(h: &mut Harness<A>, id: StreamId, request: &[u8]) {
     h.conn.receive(id, request);
     h.conn.get(id).peer_finished = true;
     h.ready_edge(id, StreamReady::Opened);
@@ -3334,4 +3439,350 @@ fn an_inline_response_error_resets_as_a_polled_one_does() {
         }]
     );
     assert!(h.pull(id, 1 << 20).0.is_pending());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ingress bodies built only when something can use them.
+
+/// Counts the allocations of the Opened edge of a stream whose `request` and FIN arrived together:
+/// the exchange's admission, the read of its head and its delivery, which wakes the stream. The
+/// fake's buffers are reserved beforehand, so only the session, the application and the stream
+/// waker allocate.
+fn allocations_at_open<A: OwnedApplication>(
+    h: &mut Harness<A>,
+    id: StreamId,
+    request: &[u8],
+) -> Option<usize> {
+    h.conn.receive(id, request);
+    h.conn.get(id).peer_finished = true;
+    h.conn.stream_wakes.lock().unwrap().reserve(4);
+    count_allocations(|| h.ready_edge(id, StreamReady::Opened))
+}
+
+/// Checks a census against its pinned count, where the count is observable.
+fn assert_allocations(allocations: Option<usize>, expected: usize, what: &str) {
+    match allocations {
+        Some(allocations) => {
+            eprintln!("{what}: {allocations} allocations");
+            assert_eq!(allocations, expected, "{what}");
+        }
+        None => eprintln!("{what}: the allocation count needs a statically linked std"),
+    }
+}
+
+#[test]
+fn a_request_complete_at_its_headers_builds_no_ingress_body() {
+    let mut h = Harness::skipping(Plan::default());
+    let id = client_bidi(0);
+    let allocations = allocations_at_open(&mut h, id, &headers_frame(GET));
+    assert_eq!(h.log(), [Ev::New(1), Ev::Request { id: 1, eom: true }]);
+    {
+        let state = h.app.0.borrow();
+        let body = state.requests[&http_id(id)].body.as_ref().unwrap();
+        assert!(body.source().is_none(), "the body holds no source");
+    }
+    // An ingress body would add 3: its credit cell, its signals and its source state.
+    assert_allocations(allocations, 13, "a GET with its FIN");
+
+    h.pull_all(id, 1 << 20);
+    assert_eq!(body_of(&h.response(id)), b"hello");
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1), Ev::Complete(1)]);
+}
+
+#[test]
+fn an_application_that_takes_the_completion_keeps_the_eager_body() {
+    let mut h = Harness::ready();
+    let id = client_bidi(0);
+    let allocations = allocations_at_open(&mut h, id, &headers_frame(GET));
+    assert_eq!(h.log(), [Ev::New(1), Ev::Request { id: 1, eom: true }]);
+    {
+        let state = h.app.0.borrow();
+        let received = &state.requests[&http_id(id)];
+        assert!(received.body.as_ref().unwrap().source().is_none());
+        let completion = received.completion.as_ref().expect("the exchange took it");
+        assert_eq!(
+            completion.snapshot().map(Result::ok),
+            Some(Some(h.conn.now)),
+            "the completion resolves with the phase reading of the FIN"
+        );
+    }
+    // The ingress body's credit cell, signals and source state, and the completion's handle, are
+    // among these.
+    assert_allocations(allocations, 17, "a GET with its FIN, completion taken");
+
+    h.pull_all(id, 1 << 20);
+    assert_eq!(body_of(&h.response(id)), b"hello");
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1), Ev::Complete(1)]);
+
+    // The head of a request whose body follows it is validated through the body built at
+    // admission, which then carries the body: its completion stays pending until the FIN.
+    let post = client_bidi(1);
+    h.receive(post, &headers_frame(POST), false);
+    h.receive(post, &data_frame(&[7; 10]), false);
+    assert_eq!(
+        h.log()[4..],
+        [Ev::New(5), Ev::Request { id: 5, eom: false }]
+    );
+    let completion = h.app.0.borrow().requests[&http_id(post)]
+        .completion
+        .clone()
+        .expect("the exchange took it");
+    assert!(completion.snapshot().is_none(), "the body is open");
+    h.receive(post, &data_frame(&[7; 10]), true);
+    assert!(completion.snapshot().is_some_and(|outcome| outcome.is_ok()));
+    assert_eq!(completion.body_bytes_received(), 20);
+    assert_eq!(read_all(&mut h, post), (vec![7; 20], None));
+
+    // A head followed by a bare FIN: the completion resolves at the FIN with its phase reading.
+    let bare = client_bidi(2);
+    h.receive(bare, &headers_frame(GET), false);
+    let completion = h.app.0.borrow().requests[&http_id(bare)]
+        .completion
+        .clone()
+        .expect("the exchange took it");
+    assert!(completion.snapshot().is_none(), "the body is open");
+    h.receive(bare, &[], true);
+    assert_eq!(
+        completion.snapshot().map(Result::ok),
+        Some(Some(h.conn.now))
+    );
+}
+
+#[test]
+fn a_connect_builds_its_body_eagerly_at_the_head() {
+    let mut h = Harness::skipping(Plan::default());
+    let id = client_bidi(0);
+    let request = [headers_frame(CONNECT), data_frame(b"tunnel")].concat();
+    h.receive(id, &request, false);
+    assert_eq!(h.log(), [Ev::New(1), Ev::Request { id: 1, eom: false }]);
+    assert_eq!(read_chunk(&mut h, id), (b"tunnel".to_vec(), false));
+    h.receive(id, &data_frame(b"!"), true);
+    assert_eq!(read_chunk(&mut h, id), (b"!".to_vec(), true));
+
+    // A CONNECT whose FIN came with its head builds its body all the same: the body's credit
+    // cell, signals and source state are among these.
+    let mut h = Harness::skipping(Plan::default());
+    let allocations = allocations_at_open(&mut h, id, &headers_frame(CONNECT));
+    assert_eq!(h.log(), [Ev::New(1), Ev::Request { id: 1, eom: true }]);
+    assert_allocations(allocations, 14, "a CONNECT with its FIN");
+}
+
+#[test]
+fn a_head_without_fin_builds_the_body_at_the_head() {
+    let mut h = Harness::skipping(Plan::default());
+    let id = client_bidi(0);
+    let head = headers_frame(POST);
+    h.receive(id, &head, false);
+    assert_eq!(h.log(), [Ev::New(1), Ev::Request { id: 1, eom: false }]);
+    assert_eq!(h.conn.get(id).consumed, head.len() as u64);
+
+    // The payload's credit returns through the body's credit cell as the consumer reads it.
+    h.receive(id, &data_frame(&[7; 500]), true);
+    h.poll_session();
+    let overhead = head.len() as u64 + 3;
+    assert_eq!(h.conn.get(id).consumed, overhead, "the payload is unread");
+    let wakes = h.wakes();
+    assert_eq!(read_chunk(&mut h, id), (vec![7; 500], true));
+    assert!(h.wakes() > wakes, "consuming wakes the session");
+    h.poll_session();
+    assert_eq!(h.conn.get(id).consumed, overhead + 500);
+    h.pull_all(id, 1 << 20);
+    assert_eq!(body_of(&h.response(id)), b"hello");
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1), Ev::Complete(1)]);
+
+    // A head followed by a bare FIN is delivered open, and the FIN ends its body.
+    let bare = client_bidi(1);
+    h.receive(bare, &headers_frame(GET), false);
+    assert_eq!(
+        h.log()[4..],
+        [Ev::New(5), Ev::Request { id: 5, eom: false }]
+    );
+    h.receive(bare, &[], true);
+    let Poll::Ready(Ok(event)) = h.read_body(bare, 100) else {
+        panic!("the FIN ends the request body");
+    };
+    assert!(event.eom() && event.as_body().is_some_and(BufQueue::is_empty));
+
+    // A body whose FIN arrived with its head is delivered with the body.
+    let together = client_bidi(2);
+    let request = [headers_frame(POST), data_frame(b"hello")].concat();
+    open_with_fin(&mut h, together, &request);
+    assert_eq!(
+        h.log()[6..],
+        [Ev::New(9), Ev::Request { id: 9, eom: false }]
+    );
+    assert_eq!(read_chunk(&mut h, together), (b"hello".to_vec(), true));
+}
+
+/// Resets a malformed head, with and without its FIN, and a stream that the peer resets before
+/// its head, then serves a GET on the same connection.
+fn cancel_before_the_head<A: OwnedApplication>(mut h: Harness<A>) -> Harness<A> {
+    let malformed = headers_frame(&[(":method", "GET"), (":path", "/")]);
+    let message_error = Some(H3ErrorCode::MESSAGE_ERROR.as_u64());
+    for (index, fin) in [(0, false), (1, true)] {
+        let id = client_bidi(index);
+        h.receive(id, &malformed, fin);
+        let stream = h.conn.get(id);
+        assert_eq!(stream.reset, message_error, "FIN {fin}");
+        assert_eq!(stream.stop_sending, message_error, "FIN {fin}");
+    }
+    let reset = client_bidi(2);
+    h.receive(reset, &[], false);
+    h.ready_edge(
+        reset,
+        StreamReady::Reset {
+            code: app(H3ErrorCode::REQUEST_CANCELLED.as_u64()),
+            final_size: 0,
+        },
+    );
+    assert_eq!(
+        h.conn.get(reset).reset,
+        Some(H3ErrorCode::REQUEST_CANCELLED.as_u64())
+    );
+    let cancel = |id, code, peer| Ev::Cancel { id, code, peer };
+    assert_eq!(
+        h.log(),
+        [
+            Ev::New(1),
+            cancel(1, HttpErrorCode::MESSAGE_ERROR, false),
+            Ev::New(5),
+            cancel(5, HttpErrorCode::MESSAGE_ERROR, false),
+            Ev::New(9),
+            cancel(9, HttpErrorCode::CANCEL, true),
+        ]
+    );
+
+    let next = client_bidi(3);
+    h.receive(next, &headers_frame(GET), true);
+    h.pull_all(next, 1 << 20);
+    assert_eq!(body_of(&h.response(next)), b"hello");
+    assert_eq!(h.closed(), None);
+    h
+}
+
+#[test]
+fn malformed_heads_and_resets_before_the_head_cancel_without_a_body() {
+    let h = cancel_before_the_head(Harness::skipping(Plan::default()));
+    assert!(h.app.0.borrow().cancelled.is_empty());
+
+    // An exchange that took its completion sees it resolve with the cancellation's error.
+    let h = cancel_before_the_head(Harness::ready());
+    let state = h.app.0.borrow();
+    for (id, code) in [
+        (1, HttpErrorCode::MESSAGE_ERROR),
+        (5, HttpErrorCode::MESSAGE_ERROR),
+        (9, HttpErrorCode::CANCEL),
+    ] {
+        let outcome = state.cancelled[&id].snapshot().expect("it resolves");
+        assert_eq!(
+            outcome.err().map(|error| error.code()),
+            Some(code),
+            "stream {id}"
+        );
+    }
+}
+
+/// Serves a request whose FIN came with its head `fields`, and returns how its stream was reset,
+/// if it was, and the application's events.
+fn complete_at_its_head<A: OwnedApplication>(
+    mut h: Harness<A>,
+    fields: &[(&str, &str)],
+) -> (Option<u64>, Vec<Ev>) {
+    let id = client_bidi(0);
+    open_with_fin(&mut h, id, &headers_frame(fields));
+    h.pull_all(id, 1 << 20);
+    (h.conn.get(id).reset, h.log())
+}
+
+#[test]
+fn content_length_cases_are_judged_alike_with_and_without_a_body() {
+    let post = |extra: &[(&'static str, &'static str)]| [POST, extra].concat();
+    let length = |value| ("content-length", value);
+    let message_error = Some(H3ErrorCode::MESSAGE_ERROR.as_u64());
+    let cases = [
+        ("zero", post(&[length("0")]), None),
+        ("five", post(&[length("5")]), message_error),
+        ("two equal", post(&[length("0"), length("0")]), None),
+        (
+            "two different",
+            post(&[length("0"), length("5")]),
+            message_error,
+        ),
+    ];
+    for (name, fields, reset) in cases {
+        let skipping = complete_at_its_head(Harness::skipping(Plan::default()), &fields);
+        let taking = complete_at_its_head(Harness::ready(), &fields);
+        assert_eq!(skipping, taking, "{name}");
+        assert_eq!(skipping.0, reset, "{name}");
+    }
+}
+
+#[test]
+fn peer_reset_of_a_retired_exchange_cancels_nothing() {
+    reset_retired_exchanges(Harness::ready());
+    reset_retired_exchanges(Harness::skipping(Plan::default()));
+}
+
+/// Retires a GET complete at its head and a POST whose body is unread, then resets both streams
+/// from the peer before their `Closed` edges.
+fn reset_retired_exchanges<A: OwnedApplication>(mut h: Harness<A>) {
+    let get = client_bidi(0);
+    open_with_fin(&mut h, get, &headers_frame(GET));
+    let post = client_bidi(1);
+    let request = [headers_frame(POST), data_frame(&[7; 10])].concat();
+    open_with_fin(&mut h, post, &request);
+    h.pull_all(get, 1 << 20);
+    h.pull_all(post, 1 << 20);
+    let retired = [
+        Ev::New(1),
+        Ev::Request { id: 1, eom: true },
+        Ev::New(5),
+        Ev::Request { id: 5, eom: false },
+        Ev::ResponseComplete(1),
+        Ev::Complete(1),
+        Ev::ResponseComplete(5),
+        Ev::Complete(5),
+    ];
+    assert_eq!(h.log(), retired);
+
+    for id in [get, post] {
+        h.ready_edge(
+            id,
+            StreamReady::Reset {
+                code: app(H3ErrorCode::REQUEST_CANCELLED.as_u64()),
+                final_size: 100,
+            },
+        );
+    }
+    assert_eq!(h.log(), retired, "the resets cancel nothing");
+    assert_eq!(read_chunk(&mut h, post), (vec![7; 10], true));
+    for id in [get, post] {
+        h.ready_edge(id, StreamReady::Closed);
+    }
+    assert_eq!(h.log(), retired);
+    assert_eq!(h.closed(), None);
+}
+
+#[test]
+fn a_session_dropped_before_the_head_ends_a_taken_completion_as_dropped() {
+    let mut h = Harness::hosting(H3ApplicationBuilder::new(), Plan::default(), KeepApp);
+    h.make_ready();
+    let id = client_bidi(0);
+    let head = headers_frame(POST);
+    h.receive(id, &head[..head.len() - 1], false);
+    assert_eq!(h.log(), [Ev::New(1)], "the head is incomplete");
+    let app = h.app.clone();
+    assert!(
+        app.0.borrow().kept[&1].snapshot().is_none(),
+        "it is pending"
+    );
+
+    // The session goes without a `Closed` edge, as when its connection is torn down. The body's
+    // owner goes before its drain owner, which then stops the draining body as dropped.
+    drop(h);
+    let outcome = app.0.borrow().kept[&1].snapshot().expect("it resolves");
+    assert_eq!(
+        outcome.err().map(|error| error.code()),
+        Some(HttpErrorCode::DROPPED)
+    );
 }
