@@ -51,6 +51,7 @@ use roxygen_core::headers::HttpCommonHeaderTable;
 use roxygen_core::headers::HttpCommonHeaders;
 use roxygen_core::headers::HttpHeaderCode;
 use roxygen_core::headers::HttpHeaders;
+use roxygen_core::http::HttpHeaderSize;
 use roxygen_core::ids::StreamId as HttpStreamId;
 use roxygen_core::ingress_completion::IngressCompletion;
 use roxygen_core::message::HttpMessage;
@@ -161,6 +162,12 @@ struct Plan {
     empty_events: usize,
     /// Whether the exchange reports that it holds its whole response until its head is polled.
     fixed: bool,
+    /// A response head whose clone is sent in place of one built from `status` and `headers`.
+    head: Option<HttpMessage>,
+    /// An informational head whose clone is sent in place of the built 103.
+    interim: Option<HttpMessage>,
+    /// Whether each head event records the size the session reports for it in `sizes`.
+    record_sizes: bool,
 }
 
 impl Default for Plan {
@@ -177,6 +184,9 @@ impl Default for Plan {
             body_failure: None,
             empty_events: 0,
             fixed: false,
+            head: None,
+            interim: None,
+            record_sizes: false,
         }
     }
 }
@@ -201,6 +211,8 @@ struct AppState {
     kept: HashMap<u64, IngressCompletion>,
     /// The `maximum` of each `poll_body` call.
     maxima: Vec<u32>,
+    /// The encoded size reported for each head event that records it, with its exchange's ID.
+    sizes: Vec<(u64, HttpHeaderSize)>,
 }
 
 /// The scripted application. It creates its exchanges through the default `new_exchange_with`,
@@ -300,6 +312,18 @@ impl TestExchange {
         }
         headers
     }
+
+    /// Returns the event of a response head, which records its encoded size if the plan says so.
+    fn head_event(&self, message: HttpMessage, eom: bool) -> HttpHeaderEvent {
+        let mut event = HttpHeaderEvent::new(message, eom).unwrap();
+        if self.plan.record_sizes {
+            let state = Rc::clone(&self.state);
+            let id = self.id;
+            event
+                .set_egress_headers_callback(move |size| state.borrow_mut().sizes.push((id, size)));
+        }
+        event
+    }
 }
 
 impl OwnedExchange for TestExchange {
@@ -328,19 +352,26 @@ impl OwnedExchange for TestExchange {
                 b"the handler failed",
             )));
         }
-        let mut message = HttpMessage::new();
         if self.plan.informational && !self.sent_informational {
             self.sent_informational = true;
-            message.set_status_code(103).unwrap();
-            message.headers_mut().add("link", "</style.css>");
-            return Poll::Ready(Ok(HttpHeaderEvent::new(message, false).unwrap()));
+            let message = self.plan.interim.clone().unwrap_or_else(|| {
+                let mut message = HttpMessage::new();
+                message.set_status_code(103).unwrap();
+                message.headers_mut().add("link", "</style.css>");
+                message
+            });
+            return Poll::Ready(Ok(self.head_event(message, false)));
         }
-        message.set_status_code(self.plan.status).unwrap();
-        for (name, value) in &self.plan.headers {
-            message.headers_mut().add(*name, value);
-        }
+        let message = self.plan.head.clone().unwrap_or_else(|| {
+            let mut message = HttpMessage::new();
+            message.set_status_code(self.plan.status).unwrap();
+            for (name, value) in &self.plan.headers {
+                message.headers_mut().add(*name, value);
+            }
+            message
+        });
         let eom = self.plan.body.is_empty() && self.plan.trailers.is_none();
-        Poll::Ready(Ok(HttpHeaderEvent::new(message, eom).unwrap()))
+        Poll::Ready(Ok(self.head_event(message, eom)))
     }
 
     fn poll_body(
@@ -5039,4 +5070,420 @@ fn the_live_count_matches_a_walk_after_every_edge() {
             Ev::Complete(5),
         ]
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Response heads encoded once per connection.
+
+/// The header fields of a response head that a server sends unchanged.
+const SHARED_FIELDS: &[(&str, &str)] = &[
+    ("content-type", "text/plain"),
+    ("server", "roxygen"),
+    ("x-request-cost", "low"),
+];
+
+/// Returns a response head whose header entries are shared, so that its clones share them.
+fn shared_head(status: u16, fields: &[(&str, &str)]) -> HttpMessage {
+    let mut head = HttpMessage::new();
+    head.set_status_code(status).unwrap();
+    for (name, value) in fields {
+        head.headers_mut().add(*name, value);
+    }
+    head.headers_mut().share_entries();
+    head
+}
+
+/// Returns the fields a client decodes from a head with `status` and `fields`.
+fn decoded_head(status: u16, fields: &[(&str, &str)]) -> Vec<(String, String)> {
+    let status = (":status".to_owned(), status.to_string());
+    let fields = fields
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()));
+    std::iter::once(status).chain(fields).collect()
+}
+
+/// Returns the first frame of a response stream's bytes, which is its HEADERS frame, as sent.
+fn sent_headers_frame(sent: &[u8]) -> Vec<u8> {
+    let mut decoder = FrameDecoder::new(StreamKind::Request, Role::Client, FrameLimits::default());
+    let mut input = Bytes::copy_from_slice(sent);
+    let frame = decoder.decode(&mut input).unwrap();
+    assert!(matches!(frame, Some(Frame::Headers(_))), "{frame:?}");
+    sent[..sent.len() - input.len()].to_vec()
+}
+
+/// Returns the fields of the HEADERS frame that starts a response stream.
+fn response_head(h: &mut Harness, id: StreamId) -> Vec<(String, String)> {
+    match h.response(id).first() {
+        Some(Part::Headers(fields)) => fields.clone(),
+        other => panic!("expected HEADERS first: {other:?}"),
+    }
+}
+
+/// Serves a fixed GET with each head in turn, on request streams from the first, and returns the
+/// head encode count after each response.
+fn serve_heads(h: &mut Harness, heads: &[&HttpMessage]) -> Vec<usize> {
+    heads
+        .iter()
+        .zip(0..)
+        .map(|(head, index)| {
+            h.app.0.borrow_mut().plan.head = Some((*head).clone());
+            let id = client_bidi(index);
+            open_with_fin(h, id, &headers_frame(GET));
+            assert!(h.conn.get(id).finished, "stream {index} is staged");
+            h.session.core.head_encodes()
+        })
+        .collect()
+}
+
+#[test]
+fn a_shared_response_head_is_encoded_once_per_connection() {
+    let head = shared_head(200, SHARED_FIELDS);
+    // Fixed responses, staged while their requests are delivered.
+    let plan = Plan {
+        head: Some(head.clone()),
+        ..fixed(Bytes::from_static(FIXED_BODY))
+    };
+    let mut inline = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let inline_encodes: Vec<usize> = (0..8)
+        .map(|index| {
+            let id = client_bidi(index);
+            open_with_fin(&mut inline, id, &headers_frame(GET));
+            assert!(inline.conn.get(id).finished, "stream {index} is staged");
+            inline.session.core.head_encodes()
+        })
+        .collect();
+    // Responses pulled through each stream's wake and `poll_send`.
+    let plan = Plan {
+        head: Some(head),
+        ..Plan::default()
+    };
+    let mut pulled = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let pulled_encodes: Vec<usize> = (0..8)
+        .map(|index| {
+            let id = client_bidi(index);
+            open_with_fin(&mut pulled, id, &headers_frame(GET));
+            assert_eq!(pulled.conn.take_stream_wakes(), [id]);
+            assert!(pulled.pull(id, 1 << 20).0.is_ready());
+            assert!(pulled.conn.get(id).finished, "stream {index} ends");
+            pulled.session.core.head_encodes()
+        })
+        .collect();
+    assert_eq!(
+        [inline_encodes, pulled_encodes],
+        [[1; 8], [1; 8]],
+        "head encodes after each response, staged inline and pulled"
+    );
+
+    let mut first = Vec::new();
+    for h in [&mut inline, &mut pulled] {
+        let parts = h.response(client_bidi(0));
+        let [Part::Headers(fields), Part::Data(body)] = parts.as_slice() else {
+            panic!("expected HEADERS and DATA: {parts:?}");
+        };
+        assert_eq!(*fields, decoded_head(200, SHARED_FIELDS));
+        assert_eq!(body, &h.app.0.borrow().plan.body[..]);
+        let frames: Vec<Vec<u8>> = (0..8)
+            .map(|index| sent_headers_frame(&h.conn.get(client_bidi(index)).sent))
+            .collect();
+        first.push(frames[0].clone());
+        for (index, frame) in frames.iter().enumerate() {
+            assert_eq!(frame, &frames[0], "the HEADERS frame of stream {index}");
+        }
+    }
+    assert_eq!(first[0], first[1], "inline and pulled heads are alike");
+}
+
+#[test]
+fn a_changed_clone_is_encoded_and_does_not_replace_the_cache() {
+    let head = shared_head(200, SHARED_FIELDS);
+    let mut changed = head.clone();
+    changed.headers_mut().add("x-changed", "1");
+    assert!(
+        !changed.headers().shares_entries_with(head.headers()),
+        "the added header copies the entries"
+    );
+    let plan = fixed(Bytes::from_static(FIXED_BODY));
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    assert_eq!(
+        serve_heads(&mut h, &[&head, &changed, &head]),
+        [1, 2, 2],
+        "head encodes after the shared head, the changed clone and the shared head"
+    );
+
+    let mut with_change = SHARED_FIELDS.to_vec();
+    with_change.push(("x-changed", "1"));
+    assert_eq!(
+        response_head(&mut h, client_bidi(1)),
+        decoded_head(200, &with_change)
+    );
+    for index in [0, 2] {
+        assert_eq!(
+            response_head(&mut h, client_bidi(index)),
+            decoded_head(200, SHARED_FIELDS),
+            "stream {index}"
+        );
+    }
+    let frame = |h: &mut Harness, index| sent_headers_frame(&h.conn.get(client_bidi(index)).sent);
+    assert_eq!(frame(&mut h, 2), frame(&mut h, 0));
+}
+
+/// Counts the allocations of each of eight fixed responses on one connection, whose heads are
+/// clones of one head with shared entries, from the stream's Opened edge, which stages the
+/// response, until the edge returns. Each stream closes after its response, outside the count, so
+/// the exchange window keeps one slot. The fake's buffers and the application's records are
+/// reserved beforehand. In tests, each encode also copies every line it encodes for the field
+/// tests' recorder: two allocations per line, and the growth of the recorder's list.
+#[test]
+fn a_cached_head_allocates_nothing_on_a_hit() {
+    let plan = Plan {
+        head: Some(shared_head(200, SHARED_FIELDS)),
+        ..fixed(Bytes::from_static(FIXED_BODY))
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    {
+        let mut state = h.app.0.borrow_mut();
+        state.log.reserve(64);
+        state.requests.reserve(16);
+        state.maxima.reserve(16);
+    }
+    let counts: Option<Vec<usize>> = (0..8)
+        .map(|index| {
+            let id = client_bidi(index);
+            h.conn.receive(id, &headers_frame(GET));
+            let stream = h.conn.get(id);
+            stream.peer_finished = true;
+            stream.sent.reserve(256);
+            let allocations = count_allocations(|| h.ready_edge(id, StreamReady::Opened));
+            assert!(h.conn.get(id).finished, "stream {index} is staged");
+            assert_eq!(body_of(&h.response(id)), FIXED_BODY, "stream {index}");
+            h.ready_edge(id, StreamReady::Closed);
+            allocations
+        })
+        .collect();
+    assert_eq!(h.session.core.head_encodes(), 1);
+    match counts {
+        Some(counts) => {
+            eprintln!("allocations of each response: {counts:?}");
+            // The first response also makes the connection's first exchange and frame buffer, and
+            // the cache's copy of the encoded section. The first hit promotes that copy's handle to
+            // a shared one, and later hits allocate nothing for the head.
+            assert_eq!(counts, [107, 14, 13, 13, 13, 13, 13, 13]);
+        }
+        None => eprintln!("the allocation count needs a statically linked std"),
+    }
+}
+
+#[test]
+fn a_new_status_or_new_entries_replace_the_cached_head() {
+    let ok = shared_head(200, SHARED_FIELDS);
+    let mut not_found = ok.clone();
+    not_found.set_status_code(404).unwrap();
+    assert!(not_found.headers().shares_entries_with(ok.headers()));
+    let plan = fixed(Bytes::from_static(FIXED_BODY));
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan.clone());
+    assert_eq!(
+        serve_heads(&mut h, &[&ok, &not_found, &ok]),
+        [1, 2, 3],
+        "head encodes after the shared headers at 200, at 404 and at 200"
+    );
+    for (index, status) in [(0, 200), (1, 404), (2, 200)] {
+        assert_eq!(
+            response_head(&mut h, client_bidi(index)),
+            decoded_head(status, SHARED_FIELDS),
+            "stream {index}"
+        );
+    }
+
+    let b_fields: &[(&str, &str)] = &[("content-type", "text/html")];
+    let a = shared_head(200, SHARED_FIELDS);
+    let b = shared_head(200, b_fields);
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    assert_eq!(
+        serve_heads(&mut h, &[&a, &b, &a, &b]),
+        [1, 2, 3, 4],
+        "head encodes after heads A, B, A and B"
+    );
+    for (index, fields) in (0..).zip([SHARED_FIELDS, b_fields, SHARED_FIELDS, b_fields]) {
+        assert_eq!(
+            response_head(&mut h, client_bidi(index)),
+            decoded_head(200, fields),
+            "stream {index}"
+        );
+    }
+}
+
+#[test]
+fn a_head_http3_cannot_carry_fails_although_its_entries_are_cached() {
+    // HTTP/3 cannot carry 101, so a 101 head fails as it does without a cache, and leaves the
+    // cached head in place.
+    let ok = shared_head(200, SHARED_FIELDS);
+    let mut switching = ok.clone();
+    switching.set_status_code(101).unwrap();
+    let plan = fixed(Bytes::from_static(FIXED_BODY));
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    assert_eq!(serve_heads(&mut h, &[&ok]), [1]);
+
+    h.app.0.borrow_mut().plan.head = Some(switching);
+    let id = client_bidi(1);
+    open_with_fin(&mut h, id, &headers_frame(GET));
+    let cancelled = Some(H3ErrorCode::REQUEST_CANCELLED.as_u64());
+    let stream = h.conn.get(id);
+    assert_eq!((stream.reset, stream.stop_sending), (cancelled, cancelled));
+    assert!(stream.sent.is_empty());
+    assert_eq!(
+        h.log().last(),
+        Some(&Ev::Cancel {
+            id: http_id(id),
+            code: HttpErrorCode::INTERNAL_ERROR,
+            peer: false
+        })
+    );
+    assert_eq!(h.session.core.head_encodes(), 2, "the 101 head is encoded");
+
+    h.app.0.borrow_mut().plan.head = Some(ok);
+    let id = client_bidi(2);
+    open_with_fin(&mut h, id, &headers_frame(GET));
+    assert!(h.conn.get(id).finished);
+    assert_eq!(response_head(&mut h, id), decoded_head(200, SHARED_FIELDS));
+    assert_eq!(
+        h.session.core.head_encodes(),
+        2,
+        "the 200 head is still cached"
+    );
+}
+
+#[test]
+fn a_head_with_owned_entries_is_encoded_every_time() {
+    let plan = Plan {
+        headers: SHARED_FIELDS.to_vec(),
+        ..fixed(Bytes::from_static(FIXED_BODY))
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let encodes: Vec<usize> = (0..8)
+        .map(|index| {
+            let id = client_bidi(index);
+            open_with_fin(&mut h, id, &headers_frame(GET));
+            assert!(h.conn.get(id).finished, "stream {index} is staged");
+            assert_eq!(
+                response_head(&mut h, id),
+                decoded_head(200, SHARED_FIELDS),
+                "stream {index}"
+            );
+            h.session.core.head_encodes()
+        })
+        .collect();
+    assert_eq!(
+        encodes,
+        [1, 2, 3, 4, 5, 6, 7, 8],
+        "head encodes after each response built with `add`"
+    );
+}
+
+#[test]
+fn cached_and_encoded_heads_stage_the_same_bytes() {
+    let a = shared_head(200, SHARED_FIELDS);
+    let with_status = |status| {
+        let mut head = a.clone();
+        head.set_status_code(status).unwrap();
+        head
+    };
+    let b = shared_head(200, &[("content-type", "text/html"), ("x-b", "1")]);
+    let early_hints = shared_head(103, &[("link", "</style.css>")]);
+    let head_request = [
+        (":method", "HEAD"),
+        (":scheme", "https"),
+        (":authority", "example.com"),
+        (":path", "/index.html"),
+    ];
+    let shared = |head: &HttpMessage, fixed: bool| Plan {
+        head: Some(head.clone()),
+        fixed,
+        record_sizes: true,
+        ..Plan::default()
+    };
+    let owned = Plan {
+        headers: SHARED_FIELDS.to_vec(),
+        record_sizes: true,
+        ..Plan::default()
+    };
+    // Each response's plan and request: shared and owned heads, staged inline and pulled, at 200,
+    // 404 and 500, with 103 interim heads, shared and owned, and a HEAD request.
+    let sequence: Vec<(Plan, &[(&str, &str)])> = vec![
+        (shared(&a, true), GET),
+        (shared(&a, false), GET),
+        (owned.clone(), GET),
+        (shared(&a, true), GET),
+        (shared(&with_status(404), true), GET),
+        (shared(&with_status(404), false), GET),
+        (shared(&a, false), &head_request),
+        (
+            Plan {
+                informational: true,
+                interim: Some(early_hints.clone()),
+                ..shared(&a, false)
+            },
+            GET,
+        ),
+        (
+            Plan {
+                informational: true,
+                ..shared(&a, false)
+            },
+            GET,
+        ),
+        (shared(&with_status(500), true), GET),
+        (shared(&b, true), GET),
+        (shared(&a, true), GET),
+        (owned, GET),
+        (shared(&a, false), GET),
+    ];
+    let run = |cache: bool| {
+        let mut h = Harness::ready();
+        h.session.core.set_head_cache(cache);
+        let streams: Vec<(Vec<u8>, bool)> = sequence
+            .iter()
+            .zip(0..)
+            .map(|((plan, request), index)| {
+                h.app.0.borrow_mut().plan = plan.clone();
+                let id = client_bidi(index);
+                open_with_fin(&mut h, id, &headers_frame(request));
+                if !plan.fixed {
+                    assert_eq!(h.conn.take_stream_wakes(), [id], "stream {index}");
+                    h.pull_all(id, 1 << 20);
+                }
+                let stream = h.conn.get(id);
+                assert!(stream.finished, "stream {index} ends");
+                (stream.sent.clone(), stream.finished)
+            })
+            .collect();
+        let sizes = h.app.0.borrow().sizes.clone();
+        (streams, sizes, h.session.core.head_encodes())
+    };
+    let (cached, cached_sizes, cached_encodes) = run(true);
+    let (encoded, encoded_sizes, encoded_encodes) = run(false);
+    assert_eq!(
+        encoded_encodes, 16,
+        "every head is encoded with the cache off"
+    );
+    assert_eq!(cached_encodes, 11, "head encodes with the cache on");
+    for (index, (cached, encoded)) in cached.iter().zip(&encoded).enumerate() {
+        assert_eq!(cached, encoded, "stream {index}");
+    }
+    assert_eq!(cached_sizes.len(), 16, "one size for each head");
+    assert_eq!(cached_sizes, encoded_sizes);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "the QPACK encoder must not change while a response head is cached")]
+fn a_hit_after_the_encoder_changed_fails_the_debug_check() {
+    let plan = Plan {
+        head: Some(shared_head(200, SHARED_FIELDS)),
+        ..fixed(Bytes::from_static(FIXED_BODY))
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    open_with_fin(&mut h, client_bidi(0), &headers_frame(GET));
+    // Without Huffman coding the encoder writes the head's literals longer.
+    h.session.core.qpack_encoder_mut().set_huffman(false);
+    open_with_fin(&mut h, client_bidi(1), &headers_frame(GET));
 }

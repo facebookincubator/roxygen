@@ -22,7 +22,9 @@
 //! Responses go out through the pull path: `poll_send` polls the exchange's head and body with an
 //! allowance and pushes frames whose payloads are never copied. A small response that the exchange
 //! holds whole when its request is delivered is staged at once, the same way, without waiting for
-//! the pull step. The logic is written against the transport seam in [`crate::transport`].
+//! the pull step. The session keeps the field section of the last response head with shared header
+//! entries that it encoded, and stages it again for a head with the same status and the same
+//! shared entries. The logic is written against the transport seam in [`crate::transport`].
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
@@ -64,6 +66,8 @@ use roxygen_core::error::HttpErrorCode;
 use roxygen_core::events::HttpBodyEventKind;
 use roxygen_core::events::ResumeFuture;
 use roxygen_core::events::ResumeStatus;
+use roxygen_core::headers::HttpHeaders;
+use roxygen_core::http::HttpHeaderSize;
 use roxygen_core::ids::StreamId as HttpStreamId;
 use roxygen_core::message::HttpMessage;
 use roxygen_core::stream_source::FlowControlState;
@@ -451,6 +455,10 @@ struct State {
     /// Whether opening the decoder stream waits for the peer's stream limit to rise.
     decoder_waiting: bool,
     qpack_encoder: roxygen_qpack::Encoder,
+    /// The last response head with shared header entries that was encoded. It is valid only while
+    /// the encoder has no dynamic table and keeps its settings, so a change that reconfigures the
+    /// encoder mid-session must clear it.
+    head_cache: Option<EncodedHead>,
     work: Arc<WorkQueue>,
     work_scratch: Vec<StreamId>,
     segments: Vec<Bytes>,
@@ -467,6 +475,23 @@ struct State {
     /// such responses at that reading.
     inline_at: Option<Instant>,
     inline_work: usize,
+    /// The response heads encoded, counted for the tests.
+    #[cfg(test)]
+    head_encodes: usize,
+    /// Whether the head cache is off, so that every head is encoded, for the tests.
+    #[cfg(test)]
+    head_cache_off: bool,
+}
+
+/// A response head encoded on this connection.
+struct EncodedHead {
+    /// A clone of the head's headers. It keeps their shared entries alive, so that other entries
+    /// cannot reuse their address while they are cached.
+    headers: HttpHeaders,
+    status: u16,
+    /// The session's own copy of the encoded field section.
+    block: Bytes,
+    size: HttpHeaderSize,
 }
 
 /// Our QPACK decoder stream, a pull producer.
@@ -667,6 +692,7 @@ impl<A: OwnedApplication> Core<A> {
                 decoder_stream: None,
                 decoder_waiting: false,
                 qpack_encoder: roxygen_qpack::Encoder::new(),
+                head_cache: None,
                 work: Arc::new(WorkQueue::default()),
                 work_scratch: Vec::new(),
                 segments: Vec::new(),
@@ -678,6 +704,10 @@ impl<A: OwnedApplication> Core<A> {
                 close_at: None,
                 inline_at: None,
                 inline_work: 0,
+                #[cfg(test)]
+                head_encodes: 0,
+                #[cfg(test)]
+                head_cache_off: false,
             },
             exchanges: ExchangeTable::new(),
         }
@@ -1335,6 +1365,21 @@ impl<A: OwnedApplication> Core<A> {
     pub(crate) fn set_exchange_window(&mut self, slots: usize) {
         self.exchanges.set_bound(slots);
     }
+
+    /// Returns the response heads encoded.
+    pub(crate) fn head_encodes(&self) -> usize {
+        self.state.head_encodes
+    }
+
+    /// Turns the head cache on or off. It is on by default.
+    pub(crate) fn set_head_cache(&mut self, on: bool) {
+        self.state.head_cache_off = !on;
+    }
+
+    /// Returns the QPACK encoder, for tests that change it without clearing the head cache.
+    pub(crate) fn qpack_encoder_mut(&mut self) -> &mut roxygen_qpack::Encoder {
+        &mut self.state.qpack_encoder
+    }
 }
 
 impl State {
@@ -1409,6 +1454,48 @@ impl State {
         }
         stream.woken = false;
         Poll::Pending
+    }
+
+    /// Returns the cached field section of a response head with `status` and its size, if the
+    /// cached head has that status and shares the head's header entries.
+    fn cached_head(&self, head: &HttpMessage, status: u16) -> Option<(Bytes, HttpHeaderSize)> {
+        #[cfg(test)]
+        if self.head_cache_off {
+            return None;
+        }
+        let cached = self.head_cache.as_ref()?;
+        if cached.status != status || !head.headers().shares_entries_with(&cached.headers) {
+            return None;
+        }
+        #[cfg(debug_assertions)]
+        {
+            let mut block = BytesMut::with_capacity(cached.block.len());
+            let size =
+                fields::encode_response(&self.qpack_encoder, head, &mut Vec::new(), &mut block);
+            assert!(
+                size == Some(cached.size) && block == cached.block,
+                "the QPACK encoder must not change while a response head is cached"
+            );
+        }
+        Some((cached.block.clone(), cached.size))
+    }
+
+    /// Caches the field section encoded for a response head, in place of the cached head, if the
+    /// head's header entries are shared.
+    fn cache_head(&mut self, head: &HttpMessage, status: u16, block: &[u8], size: HttpHeaderSize) {
+        #[cfg(test)]
+        if self.head_cache_off {
+            return;
+        }
+        if !head.headers().has_shared_entries() {
+            return;
+        }
+        self.head_cache = Some(EncodedHead {
+            headers: head.headers().clone(),
+            status,
+            block: Bytes::copy_from_slice(block),
+            size,
+        });
     }
 
     /// Returns a frame header carved from the shared header buffer.
@@ -1938,20 +2025,33 @@ fn produce<E: OwnedExchange, S: PullSink>(
                     return Ok(());
                 };
                 let mut event = event?;
-                let status = event.headers().response_status().unwrap_or(0);
-                let Some(size) = fields::encode_response(
-                    &state.qpack_encoder,
-                    event.headers(),
-                    &mut state.names,
-                    &mut state.out,
-                ) else {
-                    return Err(HttpError::with_message(
-                        HttpErrorCode::INTERNAL_ERROR,
-                        b"response head has no status HTTP/3 can carry",
-                    ));
+                let head = event.headers();
+                let status = head.response_status().unwrap_or(0);
+                let (block, size) = match state.cached_head(head, status) {
+                    Some(cached) => cached,
+                    None => {
+                        #[cfg(test)]
+                        {
+                            state.head_encodes += 1;
+                        }
+                        let Some(size) = fields::encode_response(
+                            &state.qpack_encoder,
+                            head,
+                            &mut state.names,
+                            &mut state.out,
+                        ) else {
+                            return Err(HttpError::with_message(
+                                HttpErrorCode::INTERNAL_ERROR,
+                                b"response head has no status HTTP/3 can carry",
+                            ));
+                        };
+                        let block = state.out.split().freeze();
+                        state.cache_head(head, status, &block, size);
+                        (block, size)
+                    }
                 };
                 event.on_headers_encoded(size);
-                if !stage_headers(state, sink, &mut exchange.pending, progress) {
+                if !stage_headers(state, sink, &mut exchange.pending, block, progress) {
                     return Ok(());
                 }
                 if status >= 200 {
@@ -2013,7 +2113,8 @@ fn produce<E: OwnedExchange, S: PullSink>(
                             &mut state.names,
                             &mut state.out,
                         );
-                        if !stage_headers(state, sink, &mut exchange.pending, progress) {
+                        let block = state.out.split().freeze();
+                        if !stage_headers(state, sink, &mut exchange.pending, block, progress) {
                             return Ok(());
                         }
                     }
@@ -2065,18 +2166,19 @@ fn settle_response<E: OwnedExchange>(
     true
 }
 
-/// Frames the field section encoded at the start of the state's buffer as HEADERS and stages
-/// it. Returns false if the stream's send half ended.
+/// Frames a field section as HEADERS and stages it. Returns false if the stream's send half
+/// ended.
 fn stage_headers<S: PullSink>(
     state: &mut State,
     sink: &mut S,
     pending: &mut BufQueue,
+    block: Bytes,
     progress: &mut bool,
 ) -> bool {
-    let block = state.out.split().freeze();
-    let header = state.frame_header(FrameType::HEADERS, block.len());
-    let block = BufQueue::from_bytes(block.clone(), block.len())
-        .expect("a queue sized for its one segment accepts it");
+    let len = block.len();
+    let header = state.frame_header(FrameType::HEADERS, len);
+    let block =
+        BufQueue::from_bytes(block, len).expect("a queue sized for its one segment accepts it");
     match stage(sink, pending, header, block) {
         Ok(pushed) => {
             *progress |= pushed;

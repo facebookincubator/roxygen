@@ -1580,3 +1580,41 @@ fn add_uncommon_matches_add() {
     assert_eq!(uncommon.number_of_values("x-repeated"), 6);
     assert_eq!(uncommon.get_single_or_empty("x-uncommon-0"), b"value-0");
 }
+
+#[test]
+fn shares_entries_with_is_true_only_for_one_shared_block() {
+    let mut shared = HttpHeaders::new();
+    fill_headers(&mut shared, 3, b'a');
+    assert!(
+        !shared.has_shared_entries(),
+        "headers start with owned entries"
+    );
+    let owned = shared.clone();
+    shared.share_entries();
+    assert!(shared.has_shared_entries());
+    let clone = shared.clone();
+    assert!(clone.has_shared_entries(), "a clone shares the entries");
+    assert!(shared.shares_entries_with(&clone));
+    assert!(clone.shares_entries_with(&shared));
+    assert!(shared.shares_entries_with(&shared));
+
+    assert!(!owned.has_shared_entries());
+    assert!(!owned.shares_entries_with(&shared));
+    assert!(!shared.shares_entries_with(&owned));
+    assert!(!owned.shares_entries_with(&owned.clone()));
+    assert!(!owned.shares_entries_with(&owned));
+
+    let mut changed = shared.clone();
+    changed.add("x-changed", "1");
+    assert!(!changed.has_shared_entries(), "a change copies the entries");
+    assert!(!changed.shares_entries_with(&shared));
+    assert!(!shared.shares_entries_with(&changed));
+    assert!(shared.shares_entries_with(&clone));
+
+    let mut separate = owned.clone();
+    separate.share_entries();
+    assert_eq!(separate, shared);
+    assert!(separate.has_shared_entries());
+    assert!(!separate.shares_entries_with(&shared));
+    assert!(!shared.shares_entries_with(&separate));
+}

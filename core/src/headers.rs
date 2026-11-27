@@ -857,6 +857,33 @@ impl HttpHeaders {
         }
     }
 
+    /// Returns whether these headers and `other` hold one block of shared
+    /// entries.
+    ///
+    /// Entries are shared by [`Self::share_entries`] and by cloning headers
+    /// whose entries are shared, until a change copies them, so headers that
+    /// hold one shared block have equal entries. It is false when either holds
+    /// owned entries, and for equal entries that were shared separately. It
+    /// does not read or change the entries.
+    #[doc(hidden)]
+    pub fn shares_entries_with(&self, other: &HttpHeaders) -> bool {
+        match (&self.entries, &other.entries) {
+            (HeaderEntries::Shared(entries), HeaderEntries::Shared(others)) => {
+                Arc::ptr_eq(entries, others)
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns whether these headers hold shared entries: entries shared by
+    /// [`Self::share_entries`] or by cloning headers whose entries are shared,
+    /// which no change has copied since. It does not read or change the
+    /// entries.
+    #[doc(hidden)]
+    pub fn has_shared_entries(&self) -> bool {
+        matches!(self.entries, HeaderEntries::Shared(_))
+    }
+
     /// Adds a header after trimming surrounding space, LF, HT, and CR from its value.
     ///
     /// Existing values with the same name remain in their insertion positions.
