@@ -98,6 +98,14 @@ use crate::transport::StreamSink;
 use crate::transport::Transport;
 use crate::transport::TransportStream;
 
+mod exchanges;
+
+#[cfg(test)]
+pub(crate) use exchanges::Census;
+use exchanges::ExchangeTable;
+#[cfg(test)]
+pub(crate) use exchanges::Shape;
+
 /// The largest body a single `poll_body` may return, the same limit as Roxygen's owned HTTP/2
 /// driver.
 const MAX_BODY_POLL: usize = 64 << 10;
@@ -380,14 +388,8 @@ impl<A: OwnedApplication> QuicSession for H3Session<A> {
 pub(crate) struct Core<A: OwnedApplication> {
     application: A,
     state: State,
-    /// The live exchanges, sorted by stream ID.
-    exchanges: Vec<Entry<A::Exchange>>,
-}
-
-/// One request stream's exchange.
-struct Entry<E> {
-    id: StreamId,
-    exchange: Box<Exchange<E>>,
+    /// The exchanges of the request streams, until their streams close.
+    exchanges: ExchangeTable<A::Exchange>,
 }
 
 /// The connection-level state.
@@ -627,7 +629,7 @@ impl<A: OwnedApplication> Core<A> {
                 inline_at: None,
                 inline_work: 0,
             },
-            exchanges: Vec::new(),
+            exchanges: ExchangeTable::new(),
         }
     }
 
@@ -719,11 +721,11 @@ impl<A: OwnedApplication> Core<A> {
         if self.state.control == Some(id) {
             return self.state.push_control(sink);
         }
-        let Some(index) = self.find(id) else {
+        let Some(mut entry) = self.exchanges.find_mut(id) else {
             return Poll::Pending;
         };
         let state = &mut self.state;
-        let exchange = &mut *self.exchanges[index].exchange;
+        let exchange = &mut *entry;
         if exchange.retired || exchange.application.is_none() {
             return Poll::Pending;
         }
@@ -818,16 +820,10 @@ impl<A: OwnedApplication> Core<A> {
         }
     }
 
-    fn find(&self, id: StreamId) -> Option<usize> {
-        self.exchanges
-            .binary_search_by_key(&id, |entry| entry.id)
-            .ok()
-    }
-
     fn request_ready<T: Transport>(&mut self, t: &mut T, id: StreamId, ready: StreamReady) {
         match ready {
             StreamReady::Opened => {
-                if self.find(id).is_none() {
+                if self.exchanges.find(id).is_none() {
                     self.accept_request(t, id);
                 }
                 self.read_request(t, id);
@@ -836,7 +832,7 @@ impl<A: OwnedApplication> Core<A> {
             // Opened edge, and a FIN its own Finished edge. A data edge for an unknown stream
             // below `next_request` therefore belongs to one already ended.
             StreamReady::Readable | StreamReady::Finished => {
-                if self.find(id).is_none() && id.index() >= self.state.next_request {
+                if self.exchanges.find(id).is_none() && id.index() >= self.state.next_request {
                     self.accept_request(t, id);
                 }
                 self.read_request(t, id);
@@ -851,11 +847,7 @@ impl<A: OwnedApplication> Core<A> {
     /// Creates the exchange for a new request stream, or rejects the stream.
     fn accept_request<T: Transport>(&mut self, t: &mut T, id: StreamId) {
         self.state.next_request = self.state.next_request.max(id.index() + 1);
-        let live = self
-            .exchanges
-            .iter()
-            .filter(|entry| !entry.exchange.retired)
-            .count();
+        let live = self.exchanges.live();
         let going_away = self
             .state
             .goaway
@@ -908,37 +900,38 @@ impl<A: OwnedApplication> Core<A> {
             reset_owed: None,
             retired: false,
         });
-        let position = self
-            .exchanges
-            .binary_search_by_key(&id, |entry| entry.id)
-            .unwrap_err();
-        self.exchanges.insert(position, Entry { id, exchange });
+        self.exchanges.insert(id, exchange);
     }
 
     /// Parses what the request stream has received, applies the credit its application
     /// returned, ends ingress at the FIN, and delivers the request once its head is complete.
     fn read_request<T: Transport>(&mut self, t: &mut T, id: StreamId) {
-        let Some(index) = self.find(id) else {
+        let Some(mut entry) = self.exchanges.find_mut(id) else {
             return;
         };
-        let verdict = {
-            let state = &mut self.state;
-            let exchange = &mut *self.exchanges[index].exchange;
-            read_frames(t, state, id, exchange)
-        };
-        match verdict {
-            Verdict::Continue => {}
-            Verdict::Stream(code) => return self.fail_stream(t, id, code),
-            Verdict::Connection(code) => return self.connection_error(t, code),
-        }
         let state = &mut self.state;
-        let exchange = &mut *self.exchanges[index].exchange;
+        let exchange = &mut *entry;
+        match read_frames(t, state, id, exchange) {
+            Verdict::Continue => {}
+            Verdict::Stream(code) => {
+                drop(entry);
+                return self.fail_stream(t, id, code);
+            }
+            Verdict::Connection(code) => {
+                drop(entry);
+                return self.connection_error(t, code);
+            }
+        }
         if exchange.head.is_some()
             && let Err(error) = deliver(t, state, id, exchange)
         {
+            drop(entry);
             abort_stream(t, id, H3ErrorCode::INTERNAL_ERROR);
-            let mut entry = self.exchanges.remove(index);
-            cancel(&mut entry.exchange, &error, false);
+            let mut exchange = self
+                .exchanges
+                .remove(id)
+                .expect("the exchange was found above");
+            cancel(&mut exchange, &error, false);
             return self.check_quiesced(t);
         }
         if exchange.ingress == Ingress::Complete
@@ -952,19 +945,17 @@ impl<A: OwnedApplication> Core<A> {
     /// Resets the request stream with a stream error and cancels its exchange.
     fn fail_stream<T: Transport>(&mut self, t: &mut T, id: StreamId, code: H3ErrorCode) {
         abort_stream(t, id, code);
-        if let Some(index) = self.find(id) {
-            let mut entry = self.exchanges.remove(index);
+        if let Some(mut exchange) = self.exchanges.remove(id) {
             let error = HttpError::with_message(error_code(code), b"HTTP/3 stream error");
-            cancel(&mut entry.exchange, &error, false);
+            cancel(&mut exchange, &error, false);
         }
         self.check_quiesced(t);
     }
 
     fn peer_reset<T: Transport>(&mut self, t: &mut T, id: StreamId, code: AppCode) {
-        let Some(index) = self.find(id) else {
+        let Some(mut exchange) = self.exchanges.find_mut(id) else {
             return;
         };
-        let exchange = &mut *self.exchanges[index].exchange;
         // The upload is half of a tunnel, so a reset aborts it also after the target closed its
         // side (RFC 9114).
         if exchange.retired || (exchange.response_complete && !exchange.tunnel) {
@@ -980,27 +971,35 @@ impl<A: OwnedApplication> Core<A> {
             }
             return;
         }
+        drop(exchange);
         if let Ok(mut stream) = t.stream(id) {
             let _ = stream.reset(app_code(H3ErrorCode::REQUEST_CANCELLED));
         }
-        let mut entry = self.exchanges.remove(index);
+        let mut exchange = self
+            .exchanges
+            .remove(id)
+            .expect("the exchange was found above");
         let error = HttpError::with_message(
             fields::peer_error_code(code.0.into_inner()),
             b"peer reset the request stream",
         );
-        cancel(&mut entry.exchange, &error, true);
+        cancel(&mut exchange, &error, true);
         self.check_quiesced(t);
     }
 
     fn peer_stopped<T: Transport>(&mut self, t: &mut T, id: StreamId, code: AppCode) {
-        let Some(index) = self.find(id) else {
-            return;
-        };
-        if self.exchanges[index].exchange.retired {
+        if self
+            .exchanges
+            .find(id)
+            .is_none_or(|exchange| exchange.retired)
+        {
             return;
         }
-        let mut entry = self.exchanges.remove(index);
-        if entry.exchange.ingress.open() {
+        let mut exchange = self
+            .exchanges
+            .remove(id)
+            .expect("the exchange was found above");
+        if exchange.ingress.open() {
             if let Ok(mut stream) = t.stream(id) {
                 let _ = stream.stop_sending(app_code(H3ErrorCode::REQUEST_CANCELLED));
             }
@@ -1012,25 +1011,23 @@ impl<A: OwnedApplication> Core<A> {
             fields::peer_error_code(code.0.into_inner()),
             b"peer stopped the response",
         );
-        cancel(&mut entry.exchange, &error, true);
+        cancel(&mut exchange, &error, true);
         self.check_quiesced(t);
     }
 
     /// Removes the exchange of a stream whose two halves have ended, completing it if its response
     /// is complete and cancelling it otherwise.
     fn stream_closed(&mut self, id: StreamId) {
-        let Some(index) = self.find(id) else {
+        let Some(mut exchange) = self.exchanges.remove(id) else {
             return;
         };
-        let mut entry = self.exchanges.remove(index);
-        let exchange = &mut *entry.exchange;
         if exchange.response_complete {
             if let Some(application) = exchange.application.take() {
                 application.complete();
             }
         } else {
             let error = HttpError::with_message(HttpErrorCode::STREAM_CLOSED, b"stream closed");
-            cancel(exchange, &error, true);
+            cancel(&mut exchange, &error, true);
         }
     }
 
@@ -1046,11 +1043,10 @@ impl<A: OwnedApplication> Core<A> {
     }
 
     fn cancel_all(&mut self, error: &HttpError, peer_reset: bool) {
-        for mut entry in mem::take(&mut self.exchanges) {
-            if entry.exchange.retired {
-                continue;
+        for mut exchange in self.exchanges.drain() {
+            if !exchange.retired {
+                cancel(&mut exchange, error, peer_reset);
             }
-            cancel(&mut entry.exchange, error, peer_reset);
         }
     }
 
@@ -1064,11 +1060,12 @@ impl<A: OwnedApplication> Core<A> {
             if self.state.closed {
                 break;
             }
-            let Some(index) = self.find(id) else {
+            let Some(mut entry) = self.exchanges.find_mut(id) else {
                 continue;
             };
-            let exchange = &mut *self.exchanges[index].exchange;
+            let exchange = &mut *entry;
             if let Some(code) = exchange.reset_owed.take() {
+                drop(entry);
                 self.fail_stream(t, id, code);
                 continue;
             }
@@ -1090,6 +1087,7 @@ impl<A: OwnedApplication> Core<A> {
                     continue;
                 }
             }
+            drop(entry);
             self.read_request(t, id);
         }
         self.state.work_scratch = queued;
@@ -1188,6 +1186,29 @@ impl<A: OwnedApplication> Core<A> {
         if drained {
             self.state.uni.remove(index);
         }
+    }
+}
+
+#[cfg(test)]
+impl<A: OwnedApplication> Core<A> {
+    /// Returns the work the exchange lookups have done.
+    pub(crate) fn census(&self) -> Census {
+        self.exchanges.census()
+    }
+
+    /// Returns the layout of the exchange table.
+    pub(crate) fn exchange_shape(&self) -> Shape {
+        self.exchanges.shape()
+    }
+
+    /// Checks the exchange table's counts against a walk of its exchanges.
+    pub(crate) fn check_exchanges(&self) {
+        self.exchanges.check();
+    }
+
+    /// Sets the most slots the exchange window holds.
+    pub(crate) fn set_exchange_window(&mut self, slots: usize) {
+        self.exchanges.set_bound(slots);
     }
 }
 

@@ -13,6 +13,7 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
+use std::ops::Range;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -77,6 +78,7 @@ use crate::codec::UniStreamHeaderDecoder;
 use crate::codec::encode_frame_header;
 use crate::fake::FakeConn;
 use crate::fake::FakeSink;
+use crate::session::Census;
 
 // ---------------------------------------------------------------------------------------------
 // The scripted application.
@@ -610,10 +612,12 @@ impl<A: OwnedApplication> Harness<A> {
 
     fn event(&mut self, event: ConnEvent) {
         self.session.core.on_event(&mut self.conn, event);
+        self.session.core.check_exchanges();
     }
 
     fn ready_edge(&mut self, id: StreamId, ready: StreamReady) {
         self.session.core.on_stream(&mut self.conn, id, ready);
+        self.session.core.check_exchanges();
     }
 
     /// Delivers peer bytes on `id`, opening it first if new, and the FIN if `fin`. As in the
@@ -637,6 +641,7 @@ impl<A: OwnedApplication> Harness<A> {
         let waker = Waker::from(Arc::clone(&self.session_waker));
         let mut cx = Context::from_waker(&waker);
         let _ = self.session.core.poll_session(&mut cx, &mut self.conn);
+        self.session.core.check_exchanges();
     }
 
     /// Counts the wakes of the waker `poll_session` was given.
@@ -655,6 +660,7 @@ impl<A: OwnedApplication> Harness<A> {
         let mut cx = Context::from_waker(&waker);
         let mut sink = FakeSink::new(allowance);
         let poll = self.session.core.poll_send(&mut cx, id, &mut sink);
+        self.session.core.check_exchanges();
         if let Some(stream) = self.conn.streams.get_mut(&id) {
             stream.sent.extend_from_slice(&sink.pushed);
             stream.finished |= sink.finished;
@@ -3784,5 +3790,637 @@ fn a_session_dropped_before_the_head_ends_a_taken_completion_as_dropped() {
     assert_eq!(
         outcome.err().map(|error| error.code()),
         Some(HttpErrorCode::DROPPED)
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Exchanges by stream.
+
+/// Returns the lookup work that `step` does.
+fn census_of<A: OwnedApplication>(
+    h: &mut Harness<A>,
+    step: impl FnOnce(&mut Harness<A>),
+) -> Census {
+    let before = h.session.core.census();
+    step(h);
+    let after = h.session.core.census();
+    Census {
+        visited: after.visited - before.visited,
+        moved: after.moved - before.moved,
+        finds: after.finds - before.finds,
+        probes: after.probes - before.probes,
+    }
+}
+
+/// Opens a GET stream with its FIN at each index, delivered and waiting for its response.
+fn open_gets<A: OwnedApplication>(h: &mut Harness<A>, indexes: Range<u64>) {
+    for index in indexes {
+        h.receive(client_bidi(index), &headers_frame(GET), true);
+    }
+}
+
+fn admitted<A: OwnedApplication>(h: &Harness<A>, index: u64) -> bool {
+    h.log().contains(&Ev::New(http_id(client_bidi(index))))
+}
+
+#[test]
+fn admission_reads_a_live_count_instead_of_walking_the_exchanges() {
+    let builder = H3ApplicationBuilder::new().max_concurrent_exchanges(512);
+    let mut h = Harness::ready_with(builder, Plan::default());
+    open_gets(&mut h, 0..256);
+    let census = census_of(&mut h, |h| open_gets(h, 256..257));
+    assert!(admitted(&h, 256));
+    assert_eq!(
+        census.visited, 0,
+        "exchanges visited to admit one next to 256"
+    );
+
+    // The default limit rejects a stream past 100 live exchanges. An exchange that retired and
+    // waits for its stream's `Closed` edge does not count, and that edge does not make room for
+    // another stream.
+    let mut h = Harness::ready();
+    open_gets(&mut h, 0..100);
+    let rejected = Some(H3ErrorCode::REQUEST_REJECTED.as_u64());
+    open_gets(&mut h, 100..101);
+    assert_eq!(h.conn.get(client_bidi(100)).reset, rejected);
+    assert!(!admitted(&h, 100));
+    h.pull_all(client_bidi(0), 1 << 20);
+    assert_eq!(h.log().last(), Some(&Ev::Complete(1)), "stream 0 retired");
+    open_gets(&mut h, 101..102);
+    assert!(admitted(&h, 101), "a retired exchange does not count");
+    assert_eq!(h.conn.get(client_bidi(101)).reset, None);
+    open_gets(&mut h, 102..103);
+    assert_eq!(h.conn.get(client_bidi(102)).reset, rejected);
+    h.ready_edge(client_bidi(0), StreamReady::Closed);
+    open_gets(&mut h, 103..104);
+    assert_eq!(h.conn.get(client_bidi(103)).reset, rejected);
+    assert!(!admitted(&h, 102) && !admitted(&h, 103));
+}
+
+#[test]
+fn closing_the_oldest_exchange_moves_no_other() {
+    let builder = H3ApplicationBuilder::new().max_concurrent_exchanges(512);
+    let mut h = Harness::ready_with(builder, Plan::default());
+    open_gets(&mut h, 0..256);
+    for index in 0..256 {
+        h.pull_all(client_bidi(index), 1 << 20);
+    }
+    let moved: Vec<usize> = (0..256)
+        .map(|index| {
+            census_of(&mut h, |h| {
+                h.ready_edge(client_bidi(index), StreamReady::Closed)
+            })
+            .moved
+        })
+        .collect();
+    assert_eq!(
+        moved, [0; 256],
+        "exchanges moved by each Closed edge, oldest first"
+    );
+    assert_eq!(
+        h.log()
+            .iter()
+            .filter(|ev| matches!(ev, Ev::Complete(_)))
+            .count(),
+        256
+    );
+}
+
+#[test]
+fn a_find_inside_the_window_probes_one_slot() {
+    let builder = H3ApplicationBuilder::new().max_concurrent_exchanges(512);
+    let mut h = Harness::ready_with(builder, Plan::default());
+    for index in 0..256 {
+        h.receive(client_bidi(index), &headers_frame(POST), false);
+    }
+    // Each edge to a present stream, and each pull, finds the stream's exchange one or more
+    // times. Every find probes one slot.
+    let mut steps = Vec::new();
+    for index in 0..256 {
+        let id = client_bidi(index);
+        let mut step = |name: &'static str, step: &dyn Fn(&mut Harness)| {
+            steps.push((name, index, census_of(&mut h, step)));
+        };
+        step("DATA", &|h| h.receive(id, &data_frame(b"x"), false));
+        step("FIN", &|h| h.receive(id, &[], true));
+        step("pull", &|h| assert!(h.pull(id, 1 << 20).0.is_ready()));
+        let code = H3ErrorCode::REQUEST_CANCELLED.as_u64();
+        match index % 3 {
+            0 => step("reset", &|h| {
+                h.ready_edge(
+                    id,
+                    StreamReady::Reset {
+                        code: app(code),
+                        final_size: 0,
+                    },
+                )
+            }),
+            1 => step("stop", &|h| {
+                h.ready_edge(id, StreamReady::Stopped { code: app(code) })
+            }),
+            _ => {}
+        }
+        step("Closed", &|h| h.ready_edge(id, StreamReady::Closed));
+    }
+    for (name, index, census) in steps {
+        assert!(
+            census.finds > 0,
+            "{name} on stream {index} finds its exchange"
+        );
+        assert_eq!(
+            census.probes, census.finds,
+            "{name} on stream {index}: one probe per find, {census:?}"
+        );
+    }
+    assert_eq!(
+        h.log()
+            .iter()
+            .filter(|ev| matches!(ev, Ev::Complete(_)))
+            .count(),
+        256
+    );
+}
+
+#[test]
+fn a_stream_of_another_kind_does_not_find_a_request_exchange() {
+    let mut h = Harness::ready();
+    // Request stream 4 has index 1, as do these streams of the three other kinds.
+    open_gets(&mut h, 1..2);
+    let others = [
+        client_uni(1),
+        server_uni(1),
+        StreamId::new(Side::Server, Dir::Bi, 1).unwrap(),
+    ];
+    for id in others {
+        let (poll, sink) = h.pull(id, 1 << 20);
+        assert!(
+            poll.is_pending() && sink.pushed.is_empty(),
+            "a pull of {id:?} does not find an exchange"
+        );
+    }
+    let id = client_bidi(1);
+    assert!(h.pull(id, 1 << 20).0.is_ready());
+    assert!(
+        h.conn.get(id).finished,
+        "stream 4 is answered on its own stream"
+    );
+}
+
+/// Returns the exchange window's base and slots, and the exchanges present.
+fn window<A: OwnedApplication>(h: &Harness<A>) -> (u64, usize, usize) {
+    let shape = h.session.core.exchange_shape();
+    (shape.base, shape.slots, shape.occupied)
+}
+
+#[test]
+fn exchanges_closed_out_of_order_are_found_and_reaped() {
+    let mut h = Harness::ready();
+    // Streams 0, 4, 8, 12 and 16, at indexes 0 to 4.
+    open_gets(&mut h, 0..5);
+    for index in [2, 1, 3] {
+        h.ready_edge(client_bidi(index), StreamReady::Closed);
+        assert_eq!(window(&h).0, 0, "the window starts at stream 0");
+    }
+    assert_eq!(window(&h), (0, 5, 2));
+    for index in [0, 4] {
+        let id = client_bidi(index);
+        assert!(h.pull(id, 1 << 20).0.is_ready());
+        assert!(
+            h.conn.get(id).finished,
+            "stream {id:?} is found and answered"
+        );
+    }
+    h.ready_edge(client_bidi(0), StreamReady::Closed);
+    assert_eq!(
+        window(&h),
+        (4, 1, 1),
+        "the front passes the empty slots of streams 4, 8 and 12"
+    );
+    h.ready_edge(client_bidi(4), StreamReady::Closed);
+    assert_eq!(window(&h), (5, 0, 0));
+    let cancel = |id| Ev::Cancel {
+        id,
+        code: HttpErrorCode::STREAM_CLOSED,
+        peer: true,
+    };
+    assert_eq!(
+        h.log()[10..],
+        [
+            cancel(9),
+            cancel(5),
+            cancel(13),
+            Ev::ResponseComplete(1),
+            Ev::Complete(1),
+            Ev::ResponseComplete(17),
+            Ev::Complete(17),
+        ]
+    );
+}
+
+#[test]
+fn streams_opened_out_of_order_are_admitted_in_place() {
+    let mut h = Harness::ready();
+    // Stream 8's Opened edge comes before stream 4's, then stream 0's.
+    for index in [2, 1, 0] {
+        open_gets(&mut h, index..index + 1);
+        assert!(admitted(&h, index));
+    }
+    let shape = h.session.core.exchange_shape();
+    assert_eq!(
+        (shape.base, shape.slots, shape.side),
+        (0, 3, 0),
+        "streams 4 and 0 take slots in front of stream 8"
+    );
+    for index in [1, 2, 0] {
+        let id = client_bidi(index);
+        assert!(h.pull(id, 1 << 20).0.is_ready());
+        assert!(
+            h.conn.get(id).finished,
+            "stream {id:?} is found and answered"
+        );
+    }
+
+    // With a window of 4 slots at streams 5 to 7 by index, streams 0 and 3 do not fit in front
+    // of it and go to the side map. Stream 4 then takes the window's fourth slot.
+    let mut h = Harness::ready();
+    h.session.core.set_exchange_window(4);
+    open_gets(&mut h, 5..8);
+    let mut shapes = Vec::new();
+    for index in [0, 3, 4] {
+        open_gets(&mut h, index..index + 1);
+        assert!(admitted(&h, index));
+        let shape = h.session.core.exchange_shape();
+        shapes.push((index, shape.base, shape.slots, shape.side));
+    }
+    assert_eq!(shapes, [(0, 5, 3, 1), (3, 5, 3, 2), (4, 4, 4, 2)]);
+    for index in [0, 3, 4, 5, 6, 7] {
+        let id = client_bidi(index);
+        assert!(h.pull(id, 1 << 20).0.is_ready());
+        assert!(
+            h.conn.get(id).finished,
+            "stream {id:?} is found and answered"
+        );
+    }
+}
+
+#[test]
+fn late_streams_take_the_empty_slots_left_for_them_in_the_window() {
+    // Stream 12 opens after stream 0, so the window appends empty slots up to it, or before stream
+    // 0, so the window grows at the front by the slots down to it. Either way streams 4 and 8 open
+    // last and take the empty slots between them.
+    for order in [[0, 3, 1, 2], [3, 0, 1, 2]] {
+        let mut h = Harness::ready();
+        let mut shapes = Vec::new();
+        for index in order {
+            open_gets(&mut h, index..index + 1);
+            assert!(
+                admitted(&h, index),
+                "stream {:?} is admitted, opened in index order {order:?}",
+                client_bidi(index)
+            );
+            let shape = h.session.core.exchange_shape();
+            shapes.push((shape.base, shape.slots, shape.side));
+        }
+        assert_eq!(
+            shapes,
+            [(order[0], 1, 0), (0, 4, 0), (0, 4, 0), (0, 4, 0)],
+            "opened in index order {order:?}"
+        );
+        for index in 0..4 {
+            let id = client_bidi(index);
+            assert!(h.pull(id, 1 << 20).0.is_ready());
+            assert!(
+                h.conn.get(id).finished,
+                "stream {id:?} is found and answered on its own stream, order {order:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_long_lived_exchange_moves_out_of_the_window() {
+    let mut h = Harness::ready();
+    h.session.core.set_exchange_window(8);
+    // Two CONNECT streams stay open while 20 later requests open, are answered and close.
+    for index in [0, 1] {
+        h.receive(client_bidi(index), &headers_frame(CONNECT), false);
+    }
+    let mut slots = Vec::new();
+    for index in 2..22 {
+        let id = client_bidi(index);
+        open_gets(&mut h, index..index + 1);
+        slots.push(h.session.core.exchange_shape().slots);
+        h.pull_all(id, 1 << 20);
+        h.ready_edge(id, StreamReady::Closed);
+        let shape = h.session.core.exchange_shape();
+        assert_eq!((shape.occupied, shape.live), (2, 2), "after stream {index}");
+    }
+    // The ninth slot would hold stream 8 by index: the oldest CONNECT moves to the side map, and
+    // stream 9 moves the other, after which the window holds each request alone.
+    let expected: Vec<usize> = [3, 4, 5, 6, 7, 8, 8].into_iter().chain([1; 13]).collect();
+    assert_eq!(slots, expected, "window slots after each request opens");
+    let shape = h.session.core.exchange_shape();
+    assert_eq!((shape.slots, shape.side), (0, 2));
+
+    // The tunnels' DATA still reaches their exchanges.
+    for index in [0, 1] {
+        let id = client_bidi(index);
+        h.receive(id, &data_frame(b"tunnel"), false);
+        assert_eq!(read_chunk(&mut h, id), (b"tunnel".to_vec(), false));
+    }
+    // A reset and a Closed edge each remove one from the side map.
+    h.ready_edge(
+        client_bidi(0),
+        StreamReady::Reset {
+            code: app(H3ErrorCode::REQUEST_CANCELLED.as_u64()),
+            final_size: 100,
+        },
+    );
+    let shape = h.session.core.exchange_shape();
+    assert_eq!((shape.side, shape.occupied, shape.live), (1, 1, 1));
+    h.ready_edge(client_bidi(1), StreamReady::Closed);
+    let shape = h.session.core.exchange_shape();
+    assert_eq!((shape.side, shape.occupied, shape.live), (0, 0, 0));
+    let log = h.log();
+    assert_eq!(
+        log[log.len() - 2..],
+        [
+            Ev::Cancel {
+                id: 1,
+                code: HttpErrorCode::CANCEL,
+                peer: true
+            },
+            Ev::Cancel {
+                id: 5,
+                code: HttpErrorCode::STREAM_CLOSED,
+                peer: true
+            },
+        ]
+    );
+}
+
+#[test]
+fn the_window_holds_1024_slots_by_default() {
+    let builder = H3ApplicationBuilder::new().max_concurrent_exchanges(2048);
+    let mut h = Harness::ready_with(builder, Plan::default());
+    let shape = |h: &Harness| {
+        let shape = h.session.core.exchange_shape();
+        (shape.base, shape.slots, shape.side)
+    };
+    // A CONNECT at index 0 holds the window's front while requests open up to index 1,023.
+    h.receive(client_bidi(0), &headers_frame(CONNECT), false);
+    open_gets(&mut h, 1..1024);
+    assert_eq!(shape(&h), (0, 1024, 0));
+    open_gets(&mut h, 1024..1025);
+    assert_eq!(shape(&h), (1, 1024, 1), "the CONNECT moves to the side map");
+}
+
+#[test]
+fn a_stream_past_the_bound_restarts_an_emptied_window() {
+    let mut h = Harness::ready();
+    h.session.core.set_exchange_window(4);
+    // A request at index 8, twice the bound past a CONNECT at index 0, moves the CONNECT to the
+    // side map. The emptied window starts again at the request, not at the lowest index the bound
+    // allows.
+    h.receive(client_bidi(0), &headers_frame(CONNECT), false);
+    open_gets(&mut h, 8..9);
+    let shape = h.session.core.exchange_shape();
+    assert_eq!((shape.base, shape.slots, shape.side), (8, 1, 1));
+    let id = client_bidi(8);
+    assert!(h.pull(id, 1 << 20).0.is_ready());
+    assert!(h.conn.get(id).finished, "stream 32 is found and answered");
+    let tunnel = client_bidi(0);
+    h.receive(tunnel, &data_frame(b"tunnel"), false);
+    assert_eq!(read_chunk(&mut h, tunnel), (b"tunnel".to_vec(), false));
+}
+
+#[test]
+fn a_late_stream_below_a_side_map_exchange_joins_the_side_map() {
+    let mut h = Harness::ready();
+    h.session.core.set_exchange_window(4);
+    // CONNECTs at indexes 0 and 3 fill the window, and a request at index 7 moves both to the
+    // side map. Late Opened edges then come for indexes 2 and 1, below CONNECT 3. Index 2 would
+    // fit in front of the window at index 5, and index 1 could start the emptied window again, but
+    // either would put the window below CONNECT 3, so both join the side map.
+    for index in [0, 3] {
+        h.receive(client_bidi(index), &headers_frame(CONNECT), false);
+    }
+    let shape = |h: &Harness| {
+        let shape = h.session.core.exchange_shape();
+        (shape.base, shape.slots, shape.side)
+    };
+    let answer_and_close = |h: &mut Harness, index| {
+        let id = client_bidi(index);
+        h.pull_all(id, 1 << 20);
+        h.ready_edge(id, StreamReady::Closed);
+    };
+    open_gets(&mut h, 7..8);
+    assert_eq!(shape(&h), (7, 1, 2), "index 7 moves both CONNECTs");
+    answer_and_close(&mut h, 7);
+    open_gets(&mut h, 5..6);
+    assert_eq!(shape(&h), (5, 1, 2));
+    open_gets(&mut h, 2..3);
+    assert_eq!(shape(&h), (5, 1, 3), "index 2 joins the side map");
+    answer_and_close(&mut h, 5);
+    assert_eq!(shape(&h), (6, 0, 3));
+    open_gets(&mut h, 1..2);
+    assert_eq!(shape(&h), (6, 0, 4), "index 1 joins the side map");
+
+    for index in [0, 3] {
+        let id = client_bidi(index);
+        h.receive(id, &data_frame(b"tunnel"), false);
+        assert_eq!(read_chunk(&mut h, id), (b"tunnel".to_vec(), false));
+    }
+    for index in [1, 2] {
+        let id = client_bidi(index);
+        assert!(h.pull(id, 1 << 20).0.is_ready());
+        assert!(
+            h.conn.get(id).finished,
+            "stream {id:?} is found and answered"
+        );
+    }
+    for index in [2, 1, 0, 3] {
+        h.ready_edge(client_bidi(index), StreamReady::Closed);
+    }
+    assert_eq!(h.session.core.exchange_shape().occupied, 0);
+}
+
+#[test]
+fn a_quiesced_connection_waits_for_and_stops_exchanges_in_the_side_map() {
+    let mut h = Harness::ready();
+    h.session.core.set_exchange_window(4);
+    // CONNECTs at indexes 0 and 1 stay open, and a request at index 5 moves both to the side map.
+    // Once the request closes, only the side map holds exchanges.
+    for index in [0, 1] {
+        h.receive(client_bidi(index), &headers_frame(CONNECT), false);
+    }
+    open_gets(&mut h, 5..6);
+    let shape = |h: &Harness| {
+        let shape = h.session.core.exchange_shape();
+        (shape.slots, shape.side, shape.occupied)
+    };
+    assert_eq!(shape(&h), (1, 2, 3));
+    let request = client_bidi(5);
+    h.pull_all(request, 1 << 20);
+    h.ready_edge(request, StreamReady::Closed);
+    assert_eq!(shape(&h), (0, 2, 2));
+
+    // After GOAWAY, the tunnels keep the connection open past the close delay.
+    h.session.core.on_quiesce(&mut h.conn);
+    assert_eq!(h.session.deadline(), None, "the tunnels are open");
+    h.conn.now += Duration::from_secs(60);
+    h.poll_session();
+    assert_eq!(h.closed(), None, "the tunnels are open");
+
+    // A peer STOP_SENDING on CONNECT 0 cancels its exchange and stops its upload.
+    let stopped = client_bidi(0);
+    h.ready_edge(
+        stopped,
+        StreamReady::Stopped {
+            code: app(H3ErrorCode::REQUEST_CANCELLED.as_u64()),
+        },
+    );
+    assert_eq!(
+        h.log().last(),
+        Some(&Ev::Cancel {
+            id: 1,
+            code: HttpErrorCode::CANCEL,
+            peer: true
+        })
+    );
+    assert_eq!(
+        h.conn.get(stopped).stop_sending,
+        Some(H3ErrorCode::REQUEST_CANCELLED.as_u64())
+    );
+    assert_eq!(shape(&h), (0, 1, 1));
+    assert_eq!(h.closed(), None, "CONNECT 1 is open");
+
+    // The end of the last tunnel closes the connection.
+    h.ready_edge(client_bidi(1), StreamReady::Closed);
+    assert_eq!(h.closed(), Some(H3ErrorCode::NO_ERROR.as_u64()));
+}
+
+#[test]
+fn cancel_all_cancels_in_ascending_stream_order() {
+    let mut h = Harness::ready();
+    h.session.core.set_exchange_window(4);
+    // Streams 2 to 5 by index fill the window. Stream 0 does not fit in front of it, stream 6
+    // moves stream 2 to the side map, and stream 1 goes there between streams 0 and 2.
+    for index in [2, 3, 4, 5, 0, 6, 1] {
+        open_gets(&mut h, index..index + 1);
+    }
+    let shape = h.session.core.exchange_shape();
+    assert_eq!((shape.base, shape.slots, shape.side), (3, 4, 3));
+    // A retired exchange is not cancelled.
+    h.pull_all(client_bidi(4), 1 << 20);
+    h.event(ConnEvent::Closed {
+        reason: mvfstr_proto::CloseReason::Silent,
+        initiator: mvfstr_proto::Initiator::Peer,
+    });
+    let cancelled: Vec<u64> = h
+        .log()
+        .into_iter()
+        .filter_map(|ev| match ev {
+            Ev::Cancel { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        cancelled,
+        [0, 1, 2, 3, 5, 6].map(|index| http_id(client_bidi(index)))
+    );
+    assert_eq!(h.session.core.exchange_shape().occupied, 0);
+}
+
+#[test]
+fn the_live_count_matches_a_walk_after_every_edge() {
+    // The harness checks the table's counts against a walk after every edge, pull and session
+    // poll. This sequence reaches each way an exchange retires or goes.
+    let plan = fixed(Bytes::from_static(FIXED_BODY));
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let counts = |h: &Harness| {
+        let shape = h.session.core.exchange_shape();
+        (shape.occupied, shape.live)
+    };
+    // A fixed response staged at delivery retires its exchange inside the Opened edge.
+    open_with_fin(&mut h, client_bidi(0), &headers_frame(GET));
+    assert_eq!(counts(&h), (1, 0));
+
+    // After an early response, STOP_SENDING ends the upload. The exchange does not retire and
+    // stays until its stream's `Closed` edge.
+    h.app.0.borrow_mut().plan = Plan::default();
+    let early = client_bidi(1);
+    h.receive(early, &headers_frame(POST), false);
+    h.pull_all(early, 1 << 20);
+    h.poll_session();
+    assert_eq!(
+        h.conn.get(early).stop_sending,
+        Some(H3ErrorCode::NO_ERROR.as_u64())
+    );
+    assert_eq!(counts(&h), (2, 1));
+
+    // A peer reset, a peer STOP_SENDING and a malformed head each remove their exchange.
+    let code = app(H3ErrorCode::REQUEST_CANCELLED.as_u64());
+    h.receive(client_bidi(2), &headers_frame(POST), false);
+    h.ready_edge(
+        client_bidi(2),
+        StreamReady::Reset {
+            code,
+            final_size: 0,
+        },
+    );
+    h.receive(client_bidi(3), &headers_frame(GET), true);
+    h.ready_edge(client_bidi(3), StreamReady::Stopped { code });
+    h.receive(
+        client_bidi(4),
+        &headers_frame(&[(":method", "GET"), (":path", "/")]),
+        true,
+    );
+    assert_eq!(
+        h.conn.get(client_bidi(4)).reset,
+        Some(H3ErrorCode::MESSAGE_ERROR.as_u64())
+    );
+    assert_eq!(counts(&h), (2, 1));
+
+    // A stream past the GOAWAY is rejected without an exchange.
+    h.session.core.on_quiesce(&mut h.conn);
+    h.session.core.check_exchanges();
+    h.receive(client_bidi(5), &headers_frame(GET), true);
+    assert_eq!(
+        h.conn.get(client_bidi(5)).reset,
+        Some(H3ErrorCode::REQUEST_REJECTED.as_u64())
+    );
+    assert_eq!(counts(&h), (2, 1));
+
+    // `Closed` removes the retired exchange and the early response's.
+    h.ready_edge(client_bidi(0), StreamReady::Closed);
+    assert_eq!(counts(&h), (1, 1));
+    h.ready_edge(early, StreamReady::Closed);
+    assert_eq!(counts(&h), (0, 0));
+    let cancel = |id, code| Ev::Cancel {
+        id,
+        code,
+        peer: true,
+    };
+    assert_eq!(
+        h.log()[4..],
+        [
+            Ev::New(5),
+            Ev::Request { id: 5, eom: false },
+            Ev::ResponseComplete(5),
+            Ev::New(9),
+            Ev::Request { id: 9, eom: false },
+            cancel(9, HttpErrorCode::CANCEL),
+            Ev::New(13),
+            Ev::Request { id: 13, eom: true },
+            cancel(13, HttpErrorCode::CANCEL),
+            Ev::New(17),
+            Ev::Cancel {
+                id: 17,
+                code: HttpErrorCode::MESSAGE_ERROR,
+                peer: false
+            },
+            Ev::Complete(5),
+        ]
     );
 }
