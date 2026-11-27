@@ -8,8 +8,9 @@
 //! The transport seam: exactly the connection, stream and pull-sink operations the session uses.
 //!
 //! The session is written against these traits; the driver's [`Conn`], [`StreamMut`] and
-//! [`SendSink`] implement them, and the tests implement them in memory. Dispatch is static, except
-//! for the session handle, which other threads hold as a trait object as they would a `Waker`.
+//! [`SendSink`] implement them, and the tests implement them in memory. [`StreamSink`] stages a
+//! response through a stream outside the driver's pull step. Dispatch is static, except for the
+//! session handle, which other threads hold as a trait object as they would a `Waker`.
 
 use std::fmt::Debug;
 use std::task::Waker;
@@ -83,6 +84,16 @@ pub(crate) trait TransportStream {
     /// Stages the longest prefix of `data` the allowance accepts.
     fn send(&mut self, data: &mut Bytes) -> Result<usize, SendError>;
 
+    /// Returns how many bytes the stream accepts now.
+    fn send_capacity(&self) -> usize;
+
+    /// Stages a frame header and a shared payload without copying the payload. It stages both or
+    /// fails without staging either.
+    fn send_parts(&mut self, header: Bytes, shared: Bytes) -> Result<(), SendError>;
+
+    /// Ends the send half after the staged bytes.
+    fn finish(&mut self) -> Result<(), SendError>;
+
     /// Abandons the send half with RESET_STREAM.
     fn reset(&mut self, code: AppCode) -> Result<(), SendError>;
 
@@ -93,7 +104,7 @@ pub(crate) trait TransportStream {
     fn set_order(&mut self, order: SendOrder);
 }
 
-/// The pull sink `poll_send` writes a stream's data to.
+/// The pull sink a response's frames are staged through.
 pub(crate) trait PullSink {
     /// Returns how many bytes the stream accepts now.
     fn allowance(&self) -> usize;
@@ -107,6 +118,47 @@ pub(crate) trait PullSink {
 
     /// Ends the stream after the staged bytes.
     fn finish(&mut self) -> Result<(), SinkError>;
+}
+
+/// A pull sink over a stream, for a response produced outside the driver's pull step. It counts
+/// the bytes it staged.
+pub(crate) struct StreamSink<S> {
+    stream: S,
+    staged: usize,
+}
+
+impl<S> StreamSink<S> {
+    pub(crate) fn new(stream: S) -> Self {
+        Self { stream, staged: 0 }
+    }
+
+    /// Returns the bytes staged through this sink.
+    pub(crate) fn staged(&self) -> usize {
+        self.staged
+    }
+}
+
+impl<S: TransportStream> PullSink for StreamSink<S> {
+    fn allowance(&self) -> usize {
+        self.stream.send_capacity()
+    }
+
+    fn push(&mut self, data: Bytes) -> Result<(), SinkError> {
+        self.push_parts(data, Bytes::new())
+    }
+
+    fn push_parts(&mut self, header: Bytes, shared: Bytes) -> Result<(), SinkError> {
+        let len = header.len() + shared.len();
+        self.stream
+            .send_parts(header, shared)
+            .map_err(SinkError::from)?;
+        self.staged += len;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), SinkError> {
+        self.stream.finish().map_err(SinkError::from)
+    }
 }
 
 impl Transport for Conn<'_> {
@@ -167,6 +219,18 @@ impl TransportStream for StreamMut<'_> {
 
     fn send(&mut self, data: &mut Bytes) -> Result<usize, SendError> {
         StreamMut::send(self, data)
+    }
+
+    fn send_capacity(&self) -> usize {
+        StreamMut::send_capacity(self)
+    }
+
+    fn send_parts(&mut self, header: Bytes, shared: Bytes) -> Result<(), SendError> {
+        StreamMut::send_parts(self, header, shared)
+    }
+
+    fn finish(&mut self) -> Result<(), SendError> {
+        StreamMut::finish(self)
     }
 
     fn reset(&mut self, code: AppCode) -> Result<(), SendError> {

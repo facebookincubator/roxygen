@@ -14,8 +14,9 @@
 //! request head through QPACK, feeds DATA to the exchange's ingress body, and returns stream
 //! credit only as the application consumes the body. Responses go out through the pull path:
 //! `poll_send` polls the exchange's head and body with an allowance and pushes frames whose
-//! payloads are never copied. The logic is written against the transport seam in
-//! [`crate::transport`].
+//! payloads are never copied. A small response that the exchange holds whole when its request is
+//! delivered is staged at once, the same way, without waiting for the pull step. The logic is
+//! written against the transport seam in [`crate::transport`].
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
@@ -91,6 +92,7 @@ use crate::credit::WorkQueue;
 use crate::fields;
 use crate::fields::FieldError;
 use crate::transport::PullSink;
+use crate::transport::StreamSink;
 use crate::transport::Transport;
 use crate::transport::TransportStream;
 
@@ -112,6 +114,18 @@ const CONTROL_ORDER: SendOrder = SendOrder {
 
 /// Room kept free in the frame-header buffer, so that headers carve from a shared allocation.
 const FRAME_BUFFER: usize = 4096;
+
+/// The largest fixed response body staged when its request is delivered: 16 KiB, the driver's
+/// low-water mark, the allowance a stream must reach before the driver polls it.
+const INLINE_BODY_MAX: usize = 16 << 10;
+
+/// The work that fixed responses staged at delivery may charge a connection in one phase: 1 MiB,
+/// the driver's bound on the bytes one connection's pull steps stage in a turn.
+const INLINE_STAGING: usize = 1 << 20;
+
+/// The least a fixed response staged at delivery is charged: 16 KiB, the driver's least charge
+/// for a poll. A connection so stages at most 64 responses at delivery in one phase.
+const INLINE_CHARGE: usize = 16 << 10;
 
 /// The shortest time a quiescing connection stays open after its GOAWAY. CONNECTION_CLOSE stops
 /// all stream data at once (RFC 9000) and the transport does not report when the control
@@ -410,6 +424,10 @@ struct State {
     goaway: Option<u64>,
     /// The earliest time the quiesced connection closes.
     close_at: Option<Instant>,
+    /// The phase reading of the last fixed response staged at delivery, and the work charged to
+    /// such responses at that reading.
+    inline_at: Option<Instant>,
+    inline_work: usize,
 }
 
 /// A peer unidirectional stream.
@@ -562,6 +580,8 @@ impl<A: OwnedApplication> Core<A> {
                 next_request: 0,
                 goaway: None,
                 close_at: None,
+                inline_at: None,
+                inline_work: 0,
             },
             exchanges: Vec::new(),
         }
@@ -668,23 +688,8 @@ impl<A: OwnedApplication> Core<A> {
             return Poll::Pending;
         }
         let mut progress = false;
-        if let Err(failure) = produce(state, exchange, cx, sink, &mut progress) {
-            cancel(exchange, &failure, false);
-            // RFC 9114: an error in a tunnel's TCP connection is H3_CONNECT_ERROR, and any other
-            // response abandoned after partial processing is H3_REQUEST_CANCELLED.
-            let code = if exchange.tunnel && failure.code() == HttpErrorCode::CONNECT_ERROR {
-                H3ErrorCode::CONNECT_ERROR
-            } else {
-                H3ErrorCode::REQUEST_CANCELLED
-            };
-            exchange.reset_owed = Some(code);
-            state.work.push(id);
-            return Poll::Pending;
-        }
-        if exchange.egress == Egress::Done && !exchange.response_complete {
-            on_fin_staged(state, id, exchange);
-        }
-        if progress {
+        let produced = produce(state, exchange, cx, sink, &mut progress);
+        if settle_response(state, id, exchange, produced) && progress {
             Poll::Ready(())
         } else {
             Poll::Pending
@@ -895,9 +900,10 @@ impl<A: OwnedApplication> Core<A> {
             Verdict::Stream(code) => return self.fail_stream(t, id, code),
             Verdict::Connection(code) => return self.connection_error(t, code),
         }
+        let state = &mut self.state;
         let exchange = &mut *self.exchanges[index].exchange;
         if exchange.head.is_some()
-            && let Err(error) = deliver(t, id, exchange)
+            && let Err(error) = deliver(t, state, id, exchange)
         {
             abort_stream(t, id, H3ErrorCode::INTERNAL_ERROR);
             let mut entry = self.exchanges.remove(index);
@@ -1549,9 +1555,11 @@ fn settle_credit<T: Transport, E>(t: &mut T, id: StreamId, exchange: &mut Exchan
     }
 }
 
-/// Hands the request to the application and wakes its stream for the response.
+/// Hands the request to the application, then stages a fixed response at once or wakes the
+/// stream for the response.
 fn deliver<T: Transport, E: OwnedExchange>(
     t: &mut T,
+    state: &mut State,
     id: StreamId,
     exchange: &mut Exchange<E>,
 ) -> Result<(), HttpError> {
@@ -1572,11 +1580,93 @@ fn deliver<T: Transport, E: OwnedExchange>(
     }
     exchange.delivered = true;
     application.request_body(head, body, eom);
-    match exchange.waker.take() {
-        Some(waker) => waker.wake(),
-        None => t.stream_waker(id).wake(),
+    if let Some(waker) = exchange.waker.take() {
+        waker.wake();
+    } else if !stage_fixed(t, state, id, exchange) {
+        t.stream_waker(id).wake();
     }
     Ok(())
+}
+
+/// Stages the response of a just-delivered request whose exchange holds it whole, with a body of
+/// at most `INLINE_BODY_MAX` bytes, within the connection's bound for the phase. A CONNECT keeps
+/// the pull path. The body is staged only whole, in one DATA frame (see [`WholeBody`]). Returns
+/// false if the stream needs its wake, for the whole response or the rest of it.
+fn stage_fixed<T: Transport, E: OwnedExchange>(
+    t: &mut T,
+    state: &mut State,
+    id: StreamId,
+    exchange: &mut Exchange<E>,
+) -> bool {
+    let Some(body) = exchange
+        .application
+        .as_ref()
+        .and_then(OwnedExchange::fixed_response_len)
+        .filter(|&len| len <= INLINE_BODY_MAX)
+    else {
+        return false;
+    };
+    if exchange.connect {
+        return false;
+    }
+    let now = t.now();
+    let work = if state.inline_at == Some(now) {
+        state.inline_work
+    } else {
+        0
+    };
+    if work >= INLINE_STAGING {
+        return false;
+    }
+    let Ok(stream) = t.stream(id) else {
+        return false;
+    };
+    let mut sink = WholeBody {
+        sink: StreamSink::new(stream),
+        body,
+    };
+    let mut progress = false;
+    // A fixed response's polls do not register a waker, so the context's waker is never used.
+    let mut cx = Context::from_waker(Waker::noop());
+    let produced = produce(state, exchange, &mut cx, &mut sink, &mut progress);
+    state.inline_at = Some(now);
+    state.inline_work = work + sink.sink.staged().max(INLINE_CHARGE);
+    // A failed response is cancelled and its stream reset through the work queue, so a poll would
+    // find nothing to do.
+    !settle_response(state, id, exchange, produced) || exchange.egress == Egress::Done
+}
+
+/// The sink a fixed response is staged through at delivery. It offers the stream's allowance only
+/// while that allowance lets one body poll take the whole body, so the body goes out in the one
+/// DATA frame that a pull with room for it stages, or waits for the pull step, which sizes the
+/// frame by its own allowance. Bytes that do not fit wait in the exchange's pending bytes.
+struct WholeBody<S> {
+    sink: S,
+    /// The fixed body's length.
+    body: usize,
+}
+
+impl<S: PullSink> PullSink for WholeBody<S> {
+    fn allowance(&self) -> usize {
+        let allowance = self.sink.allowance();
+        if body_maximum(allowance) >= self.body {
+            allowance
+        } else {
+            0
+        }
+    }
+
+    fn push(&mut self, data: Bytes) -> Result<(), SinkError> {
+        self.sink.push(data)
+    }
+
+    fn push_parts(&mut self, header: Bytes, shared: Bytes) -> Result<(), SinkError> {
+        self.sink.push_parts(header, shared)
+    }
+
+    fn finish(&mut self) -> Result<(), SinkError> {
+        self.sink.finish()
+    }
 }
 
 /// Produces response frames into the sink until the application or the allowance runs out.
@@ -1713,6 +1803,33 @@ fn produce<E: OwnedExchange, S: PullSink>(
     // waker: put the stream back on the pull-ready list.
     cx.waker().wake_by_ref();
     Ok(())
+}
+
+/// Applies the outcome of `produce`: a failed response cancels the exchange and queues its stream's
+/// reset, and a response whose FIN is staged completes. Returns false if the response failed.
+fn settle_response<E: OwnedExchange>(
+    state: &State,
+    id: StreamId,
+    exchange: &mut Exchange<E>,
+    produced: Result<(), HttpError>,
+) -> bool {
+    if let Err(failure) = produced {
+        cancel(exchange, &failure, false);
+        // RFC 9114: an error in a tunnel's TCP connection is H3_CONNECT_ERROR, and any other
+        // response abandoned after partial processing is H3_REQUEST_CANCELLED.
+        let code = if exchange.tunnel && failure.code() == HttpErrorCode::CONNECT_ERROR {
+            H3ErrorCode::CONNECT_ERROR
+        } else {
+            H3ErrorCode::REQUEST_CANCELLED
+        };
+        exchange.reset_owed = Some(code);
+        state.work.push(id);
+        return false;
+    }
+    if exchange.egress == Egress::Done && !exchange.response_complete {
+        on_fin_staged(state, id, exchange);
+    }
+    true
 }
 
 /// Frames the field section encoded at the start of the state's buffer as HEADERS and stages

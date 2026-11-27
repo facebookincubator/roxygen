@@ -63,6 +63,10 @@ mod settings_contract;
 mod stream_types_contract;
 
 #[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/allocations.rs"]
+mod allocations;
+
+#[cfg(all(test, target_os = "linux"))]
 #[path = "../tests/fake.rs"]
 mod fake;
 

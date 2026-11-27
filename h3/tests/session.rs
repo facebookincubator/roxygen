@@ -44,6 +44,9 @@ use roxygen_core::events::HttpBodyEventKind;
 use roxygen_core::events::HttpHeaderEvent;
 use roxygen_core::events::ResumeFuture;
 use roxygen_core::events::ResumeStatus;
+use roxygen_core::headers::HttpCommonHeaderTable;
+use roxygen_core::headers::HttpCommonHeaders;
+use roxygen_core::headers::HttpHeaderCode;
 use roxygen_core::headers::HttpHeaders;
 use roxygen_core::ids::StreamId as HttpStreamId;
 use roxygen_core::ingress_completion::IngressCompletion;
@@ -58,6 +61,7 @@ use roxygen_session::owned::OwnedExchange;
 
 use crate::H3ApplicationBuilder;
 use crate::H3Session;
+use crate::allocations::count_allocations;
 use crate::codec::Frame;
 use crate::codec::FrameDecoder;
 use crate::codec::FrameLimits;
@@ -147,6 +151,8 @@ struct Plan {
     body_failure: Option<HttpErrorCode>,
     /// Empty body events produced before the body.
     empty_events: usize,
+    /// Whether the exchange reports that it holds its whole response until its head is polled.
+    fixed: bool,
 }
 
 impl Default for Plan {
@@ -162,6 +168,7 @@ impl Default for Plan {
             fail: false,
             body_failure: None,
             empty_events: 0,
+            fixed: false,
         }
     }
 }
@@ -202,6 +209,7 @@ impl OwnedApplication for TestApp {
             offset: 0,
             suspended: false,
             empty_events: 0,
+            head_polled: false,
         }
     }
 }
@@ -214,6 +222,7 @@ struct TestExchange {
     offset: usize,
     suspended: bool,
     empty_events: usize,
+    head_polled: bool,
 }
 
 impl TestExchange {
@@ -244,6 +253,7 @@ impl OwnedExchange for TestExchange {
         if let Some(gate) = &self.plan.head_gate {
             std::task::ready!(gate.poll(cx));
         }
+        self.head_polled = true;
         if self.plan.fail {
             return Poll::Ready(Err(HttpError::with_message(
                 HttpErrorCode::INTERNAL_ERROR,
@@ -295,6 +305,10 @@ impl OwnedExchange for TestExchange {
         }
         let trailers = self.plan.trailers.as_ref().expect("the body ended");
         Poll::Ready(Ok(HttpBodyEvent::trailers(Self::fields(trailers))))
+    }
+
+    fn fixed_response_len(&self) -> Option<usize> {
+        (self.plan.fixed && !self.head_polled).then_some(self.plan.body.len())
     }
 
     fn cancel(&mut self, error: &HttpError, peer_reset: bool) {
@@ -2950,4 +2964,374 @@ fn tiny_allowance_splits_frames_across_polls() {
         parts.last(),
         Some(&Part::Headers(vec![("x-done".to_owned(), "1".to_owned())]))
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fixed responses staged at delivery.
+
+const FIXED_BODY: &[u8] = b"fixed response!";
+
+/// A plan whose exchanges report that they hold their whole response, with `body`.
+fn fixed(body: Bytes) -> Plan {
+    Plan {
+        fixed: true,
+        body,
+        ..Plan::default()
+    }
+}
+
+/// Delivers `request` and its FIN to a new stream at the stream's Opened edge, as when they arrive
+/// together.
+fn open_with_fin(h: &mut Harness, id: StreamId, request: &[u8]) {
+    h.conn.receive(id, request);
+    h.conn.get(id).peer_finished = true;
+    h.ready_edge(id, StreamReady::Opened);
+}
+
+/// Serves a GET with its FIN to an application that does not report a fixed response, through
+/// the stream's wake and one `poll_send`, and returns what the stream staged and whether its FIN
+/// is staged.
+fn pulled(body: Bytes) -> (Vec<u8>, bool) {
+    let plan = Plan {
+        body,
+        ..Plan::default()
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let id = client_bidi(0);
+    open_with_fin(&mut h, id, &headers_frame(GET));
+    assert_eq!(h.conn.take_stream_wakes(), [id]);
+    assert!(h.pull(id, 1 << 20).0.is_ready());
+    let stream = h.conn.get(id);
+    (stream.sent.clone(), stream.finished)
+}
+
+#[test]
+fn a_fixed_response_is_staged_while_its_request_is_delivered() {
+    let plan = fixed(Bytes::from_static(FIXED_BODY));
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let id = client_bidi(0);
+    open_with_fin(&mut h, id, &headers_frame(GET));
+    let parts = h.response(id);
+    let [Part::Headers(head), Part::Data(body)] = parts.as_slice() else {
+        panic!("expected HEADERS and DATA when the Opened callback returns: {parts:?}");
+    };
+    assert_eq!(field(head, ":status"), Some("200"));
+    assert_eq!(body, FIXED_BODY);
+    assert!(h.conn.get(id).finished, "the FIN is staged");
+    assert_eq!(h.conn.stream_wakers.get(), 0, "no stream waker is made");
+    assert!(h.conn.take_stream_wakes().is_empty(), "no wake fires");
+    assert_eq!(
+        h.log(),
+        [
+            Ev::New(1),
+            Ev::Request { id: 1, eom: true },
+            Ev::ResponseComplete(1),
+            Ev::Complete(1)
+        ]
+    );
+}
+
+#[test]
+fn inline_and_pulled_responses_stage_the_same_bytes() {
+    let body = Bytes::from_static(FIXED_BODY);
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), fixed(body.clone()));
+    let id = client_bidi(0);
+    open_with_fin(&mut h, id, &headers_frame(GET));
+    let stream = h.conn.get(id);
+    let inline = (stream.sent.clone(), stream.finished);
+    let pulled = pulled(body);
+    assert!(pulled.1, "the pulled response ends");
+    assert_eq!(inline, pulled);
+}
+
+/// Counts the allocations of a fixed-response GET from its stream's Opened edge until its
+/// exchange retires. A stream wake it fires is polled as the driver polls it, with a waker the
+/// driver makes for the stream. The fake's buffers are reserved beforehand, so only the session,
+/// the application and the wakers allocate.
+#[test]
+fn allocations_of_a_fixed_response_from_accept_to_retire() {
+    // The shared header-name table is initialized outside the per-request count.
+    let _ = HttpCommonHeaders::name(
+        HttpHeaderCode::ContentType,
+        HttpCommonHeaderTable::Lowercase,
+    );
+    let plan = fixed(Bytes::from_static(FIXED_BODY));
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let id = client_bidi(0);
+    h.conn.receive(id, &headers_frame(GET));
+    let stream = h.conn.get(id);
+    stream.peer_finished = true;
+    stream.sent.reserve(256);
+    h.conn.stream_wakes.lock().unwrap().reserve(4);
+    let mut sink = FakeSink::new(1 << 20);
+    sink.pushed.reserve(256);
+    sink.parts.reserve(4);
+    let allocations = count_allocations(|| {
+        h.ready_edge(id, StreamReady::Opened);
+        for woken in h.conn.take_stream_wakes() {
+            let waker = h.conn.stream_waker_for(woken);
+            let mut cx = Context::from_waker(&waker);
+            let _ = h.session.core.poll_send(&mut cx, woken, &mut sink);
+        }
+    });
+    let stream = h.conn.get(id);
+    stream.sent.extend_from_slice(&sink.pushed);
+    stream.finished |= sink.finished;
+    assert!(stream.finished);
+    assert_eq!(body_of(&h.response(id)), FIXED_BODY);
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1), Ev::Complete(1)]);
+    match allocations {
+        Some(allocations) => {
+            eprintln!("{allocations} allocations from accept to retire");
+            // The wake path also makes the stream waker it fires and the waker the driver polls
+            // with: 30 allocations.
+            assert_eq!(allocations, 28);
+        }
+        None => eprintln!("the allocation count needs a statically linked std"),
+    }
+}
+
+#[test]
+fn a_fixed_body_over_sixteen_kib_is_woken() {
+    let mut h = Harness::ready_with(
+        H3ApplicationBuilder::new(),
+        fixed(Bytes::from(vec![b'a'; 16_384])),
+    );
+    let at_cap = client_bidi(0);
+    open_with_fin(&mut h, at_cap, &headers_frame(GET));
+    assert!(h.conn.get(at_cap).finished, "a 16,384 B body is staged");
+    assert_eq!(body_of(&h.response(at_cap)).len(), 16_384);
+    assert!(h.conn.take_stream_wakes().is_empty());
+
+    h.app.0.borrow_mut().plan.body = Bytes::from(vec![b'b'; 16_385]);
+    let over = client_bidi(1);
+    open_with_fin(&mut h, over, &headers_frame(GET));
+    assert!(
+        h.conn.get(over).sent.is_empty(),
+        "nothing is staged at delivery"
+    );
+    assert_eq!(h.conn.take_stream_wakes(), [over]);
+    assert_eq!(h.conn.stream_wakers.get(), 1);
+    assert!(h.pull(over, 1 << 20).0.is_ready());
+    assert!(h.conn.get(over).finished);
+    assert_eq!(body_of(&h.response(over)), vec![b'b'; 16_385]);
+}
+
+#[test]
+fn connect_and_handled_responses_keep_the_wake() {
+    // A CONNECT whose exchange reports a fixed response, and an exchange that reports none.
+    let cases: [(&str, bool, &[(&str, &str)], bool); 2] = [
+        ("CONNECT", true, CONNECT, false),
+        ("handled", false, GET, true),
+    ];
+    for (name, reports, request, fin) in cases {
+        let plan = Plan {
+            fixed: reports,
+            ..Plan::default()
+        };
+        let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+        let id = client_bidi(0);
+        h.receive(id, &headers_frame(request), fin);
+        assert!(h.conn.get(id).sent.is_empty(), "{name}: nothing staged");
+        assert_eq!(h.conn.take_stream_wakes(), [id], "{name}: one wake");
+        assert_eq!(h.conn.stream_wakers.get(), 1, "{name}");
+        assert!(h.pull(id, 1 << 20).0.is_ready(), "{name}");
+        assert!(
+            h.conn.get(id).finished,
+            "{name}: one poll ends the response"
+        );
+        let parts = h.response(id);
+        let [Part::Headers(head), Part::Data(body)] = parts.as_slice() else {
+            panic!("{name}: expected HEADERS and DATA: {parts:?}");
+        };
+        assert_eq!(field(head, ":status"), Some("200"), "{name}");
+        assert_eq!(body, b"hello", "{name}");
+        assert!(h.conn.take_stream_wakes().is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn a_stream_polled_before_delivery_is_woken_not_staged() {
+    let plan = fixed(Bytes::from_static(FIXED_BODY));
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let id = client_bidi(0);
+    h.receive(id, &[], false);
+    assert!(h.pull(id, 1 << 20).0.is_pending(), "no request yet");
+    h.receive(id, &headers_frame(GET), true);
+    assert!(
+        h.conn.get(id).sent.is_empty(),
+        "nothing is staged at delivery"
+    );
+    assert_eq!(
+        h.conn.take_stream_wakes(),
+        [id],
+        "the registered waker fires"
+    );
+    assert_eq!(h.conn.stream_wakers.get(), 0);
+    assert!(h.pull(id, 1 << 20).0.is_ready());
+    assert!(h.conn.get(id).finished);
+    assert_eq!(body_of(&h.response(id)), FIXED_BODY);
+}
+
+#[test]
+fn fixed_responses_past_the_phase_bound_are_woken() {
+    // Each response staged at delivery is charged at least 16 KiB against 1 MiB per phase.
+    let plan = fixed(Bytes::from_static(FIXED_BODY));
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    for index in 0..64 {
+        let id = client_bidi(index);
+        open_with_fin(&mut h, id, &headers_frame(GET));
+        assert!(
+            h.conn.get(id).finished,
+            "stream {index} is staged at delivery"
+        );
+    }
+    assert!(h.conn.take_stream_wakes().is_empty());
+    assert_eq!(h.conn.stream_wakers.get(), 0);
+
+    let woken = client_bidi(64);
+    open_with_fin(&mut h, woken, &headers_frame(GET));
+    assert!(h.conn.get(woken).sent.is_empty(), "the 65th is not staged");
+    assert_eq!(h.conn.take_stream_wakes(), [woken]);
+    assert_eq!(h.conn.stream_wakers.get(), 1);
+    assert!(h.pull(woken, 1 << 20).0.is_ready());
+    assert!(h.conn.get(woken).finished);
+    assert_eq!(body_of(&h.response(woken)), FIXED_BODY);
+
+    h.conn.now += Duration::from_millis(1);
+    let next = client_bidi(65);
+    open_with_fin(&mut h, next, &headers_frame(GET));
+    assert!(
+        h.conn.get(next).finished,
+        "a new phase stages at delivery again"
+    );
+    assert!(h.conn.take_stream_wakes().is_empty());
+}
+
+#[test]
+fn fixed_responses_are_charged_the_bytes_they_stage() {
+    // A response staged at delivery is charged the bytes it staged when they pass 16 KiB, so
+    // responses with large heads reach the phase's 1 MiB bound in fewer than 64 stagings.
+    static PAD: [u8; 16 << 10] = [b'z'; 16 << 10];
+    let pad = std::str::from_utf8(&PAD).unwrap();
+    let plan = Plan {
+        headers: vec![("x-pad", pad)],
+        ..fixed(Bytes::from(vec![b'a'; 16 << 10]))
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    open_with_fin(&mut h, client_bidi(0), &headers_frame(GET));
+    let size = h.conn.get(client_bidi(0)).sent.len();
+    // Each staging that starts below 1 MiB goes ahead.
+    let staged = (1usize << 20).div_ceil(size) as u64;
+    assert!(staged < 64, "{size} B per response");
+    for index in 1..staged {
+        let id = client_bidi(index);
+        open_with_fin(&mut h, id, &headers_frame(GET));
+        assert!(
+            h.conn.get(id).finished,
+            "stream {index} is staged at delivery"
+        );
+    }
+    assert!(h.conn.take_stream_wakes().is_empty());
+    let woken = client_bidi(staged);
+    open_with_fin(&mut h, woken, &headers_frame(GET));
+    assert!(
+        h.conn.get(woken).sent.is_empty(),
+        "stream {staged} is not staged"
+    );
+    assert_eq!(h.conn.take_stream_wakes(), [woken]);
+}
+
+#[test]
+fn a_fixed_response_cut_short_finishes_after_its_wake() {
+    let body = Bytes::from_static(FIXED_BODY);
+    let (expected, _) = pulled(body.clone());
+    // The DATA frame's type and length take a byte each.
+    let data = 2 + FIXED_BODY.len();
+    let head = expected.len() - data;
+    // A stream that cannot take the body's DATA frame whole stages nothing at delivery, and one
+    // that takes the DATA frame but not the whole response stages the HEADERS alone, so the body
+    // is polled with the pulled path's allowance and its DATA frame is not cut shorter. Each case
+    // is a stream capacity and the bytes it stages at delivery.
+    let cases = [
+        (head + 4, 0, "ends inside the DATA frame"),
+        (3, 0, "ends inside the HEADERS frame"),
+        (data - 1, 0, "a byte short of the DATA frame"),
+        (data, head, "takes the DATA frame alone"),
+        (head + data - 1, head, "a byte short of the response"),
+    ];
+    for (capacity, at_delivery, name) in cases {
+        let mut h = Harness::ready_with(H3ApplicationBuilder::new(), fixed(body.clone()));
+        let id = client_bidi(0);
+        h.conn.receive(id, &headers_frame(GET));
+        let stream = h.conn.get(id);
+        stream.peer_finished = true;
+        stream.capacity = capacity;
+        h.ready_edge(id, StreamReady::Opened);
+        let staged = h.conn.get(id).sent.clone();
+        assert!(!h.conn.get(id).finished, "{name}");
+        assert_eq!(h.conn.take_stream_wakes(), [id], "{name}: one wake");
+        assert_eq!(h.conn.stream_wakers.get(), 1, "{name}");
+
+        assert!(h.pull(id, 1 << 20).0.is_ready(), "{name}");
+        let stream = h.conn.get(id);
+        assert_eq!(
+            stream.sent, expected,
+            "{name}: the pulled bytes, none twice"
+        );
+        assert!(stream.finished, "{name}");
+        assert_eq!(
+            staged,
+            expected[..at_delivery],
+            "{name}: staged at delivery"
+        );
+        assert_eq!(
+            h.log()[2..],
+            [Ev::ResponseComplete(1), Ev::Complete(1)],
+            "{name}"
+        );
+    }
+
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), fixed(body));
+    let id = client_bidi(0);
+    h.conn.receive(id, &headers_frame(GET));
+    let stream = h.conn.get(id);
+    stream.peer_finished = true;
+    stream.capacity = expected.len();
+    h.ready_edge(id, StreamReady::Opened);
+    let stream = h.conn.get(id);
+    assert_eq!(stream.sent, expected, "a capacity of the whole response");
+    assert!(stream.finished);
+    assert!(h.conn.take_stream_wakes().is_empty());
+}
+
+#[test]
+fn an_inline_response_error_resets_as_a_polled_one_does() {
+    // HTTP/3 cannot carry 101, so encoding the fixed head fails.
+    let plan = Plan {
+        status: 101,
+        ..fixed(Bytes::from_static(FIXED_BODY))
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    let id = client_bidi(0);
+    let wakes = h.conn.session_wakes();
+    open_with_fin(&mut h, id, &headers_frame(GET));
+    // The reset is queued as `poll_send` queues it, which wakes the session, and the callback
+    // runs the queue before it returns.
+    assert_eq!(h.conn.session_wakes(), wakes + 1);
+    let cancelled = Some(H3ErrorCode::REQUEST_CANCELLED.as_u64());
+    let stream = h.conn.get(id);
+    assert_eq!((stream.reset, stream.stop_sending), (cancelled, cancelled));
+    assert!(stream.sent.is_empty());
+    assert!(h.conn.take_stream_wakes().is_empty(), "no wake fires");
+    assert_eq!(h.conn.stream_wakers.get(), 0);
+    assert_eq!(
+        h.log()[2..],
+        [Ev::Cancel {
+            id: 1,
+            code: HttpErrorCode::INTERNAL_ERROR,
+            peer: false
+        }]
+    );
+    assert!(h.pull(id, 1 << 20).0.is_pending());
 }

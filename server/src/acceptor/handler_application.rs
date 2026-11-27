@@ -371,6 +371,16 @@ impl OwnedExchange for HandlerExchange {
         matches!(self.state, ExchangeState::Handling(_))
     }
 
+    fn fixed_response_len(&self) -> Option<usize> {
+        match &self.state {
+            ExchangeState::Fixed {
+                head: Some(_),
+                body,
+            } => Some(body.as_ref().map_or(0, BufQueue::chain_length)),
+            _ => None,
+        }
+    }
+
     fn cancel(&mut self, error: &HttpError, _peer_reset: bool) {
         self.retire(Some(error.code()));
     }
@@ -639,12 +649,71 @@ mod tests {
     }
 
     fn request_without_body(exchange: &mut HandlerExchange) {
+        request(exchange, true);
+    }
+
+    fn request(exchange: &mut HandlerExchange, eom: bool) {
         let mut head = HttpMessage::new();
         head.set_method(roxygen_core::http::HttpMethod::Get)
             .expect("a request head");
         let body =
             HttpStreamSource::new_async(Some(StreamId::new(1)), None, 8).expect("a body source");
-        exchange.request(Box::new(head), HttpStreamSourceOwner::new(body), true);
+        exchange.request(Box::new(head), HttpStreamSourceOwner::new(body), eom);
+    }
+
+    /// Answers from `respond_now` with a 200 that carries `AVAILABLE`.
+    struct AnswerAvailable;
+
+    impl HttpHandler for AnswerAvailable {
+        fn respond_now(&self, _request: &HttpMessage) -> Option<Result<FixedResponse, HttpError>> {
+            let mut head = HttpMessage::new();
+            head.set_status_code(200).expect("a response head");
+            let body = BufQueue::from_bytes(Bytes::from_static(AVAILABLE), AVAILABLE.len())
+                .expect("the body fits its queue");
+            Some(Ok(FixedResponse::new(head, body)))
+        }
+
+        fn handle_request(
+            &self,
+            _context: HandlerSessionContext,
+            _request: HttpSourceHolder,
+        ) -> LocalHandlerFuture {
+            failed_handler(failure(b"handled"))
+        }
+    }
+
+    /// Only a `respond_now` response whose head is unread reports its body's length. A request
+    /// with a body goes to `handle_request` and reports nothing, as does an exchange before its
+    /// request.
+    #[test]
+    fn fixed_response_len_reports_only_an_unread_respond_now_response() {
+        let owner = KeepAliveOwner::new(());
+        let base = HandlerSessionContext::acquire(&owner).expect("the owner accepts work");
+        let application = HandlerApplication::new(Rc::new(AnswerAvailable), base);
+        let mut context = Context::from_waker(std::task::Waker::noop());
+
+        let mut answered = application.exchange();
+        assert_eq!(answered.fixed_response_len(), None, "before the request");
+        request_without_body(&mut answered);
+        assert_eq!(answered.fixed_response_len(), Some(AVAILABLE.len()));
+        let Poll::Ready(Ok(head)) = answered.poll_headers(&mut context) else {
+            panic!("the answer's head is ready");
+        };
+        assert!(!head.eom());
+        assert_eq!(
+            answered.fixed_response_len(),
+            None,
+            "after the head is read"
+        );
+        answered.complete();
+
+        let mut handled = application.exchange();
+        request(&mut handled, false);
+        assert!(handled.handler_active());
+        assert_eq!(handled.fixed_response_len(), None, "a handled request");
+        handled.complete();
+        drop(application);
+        finalize(owner);
     }
 
     /// A request answered by `respond_now` takes no keep-alive reference, and

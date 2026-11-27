@@ -85,6 +85,13 @@ pub trait OwnedExchange: 'static {
     fn handler_active(&self) -> bool {
         false
     }
+    /// Returns `Some(n)` when the exchange holds its complete response, head and body, with a
+    /// body of `n` bytes. Its next `poll_headers` and every `poll_body` up to the end of message
+    /// then return `Ready` without registering a waker, so a driver may produce the whole
+    /// response at once with a context whose waker does nothing. The default returns `None`.
+    fn fixed_response_len(&self) -> Option<usize> {
+        None
+    }
     /// Cancels the owned policy/body operation with its selected cause. `peer_reset` is true
     /// when the peer reset the stream (HTTP/2 RST_STREAM) or closed the connection before the
     /// exchange finished (HTTP/1.1). All synchronous callback/destructor work runs outside

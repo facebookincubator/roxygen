@@ -8,6 +8,7 @@
 //! An in-memory transport for the session tests: a connection whose streams record what the
 //! session sent and did to them, and a pull sink with a set allowance.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -54,6 +55,8 @@ pub(crate) struct FakeStream {
     pub(crate) peer_stopped: Option<u64>,
     /// The bytes `send` takes at most, per call.
     pub(crate) send_window: usize,
+    /// The bytes `send_parts` takes before the stream's allowance runs out.
+    pub(crate) capacity: usize,
 }
 
 impl FakeStream {
@@ -69,7 +72,20 @@ impl FakeStream {
             order: None,
             peer_stopped: None,
             send_window: usize::MAX,
+            capacity: usize::MAX,
         }
+    }
+
+    fn check_send(&self) -> Result<(), SendError> {
+        if let Some(code) = self.peer_stopped {
+            return Err(SendError::Stopped {
+                code: AppCode::from_u64(code),
+            });
+        }
+        if self.finished || self.reset.is_some() {
+            return Err(SendError::Ended);
+        }
+        Ok(())
     }
 }
 
@@ -89,6 +105,8 @@ pub(crate) struct FakeConn {
     /// How many of the next handle wakes are dropped, as by a full command queue.
     pub(crate) drop_wakes: Arc<AtomicUsize>,
     pub(crate) stream_wakes: Arc<Mutex<Vec<StreamId>>>,
+    /// The wakers `stream_waker` created.
+    pub(crate) stream_wakers: Cell<usize>,
 }
 
 impl FakeConn {
@@ -104,6 +122,7 @@ impl FakeConn {
             session_wakes: Arc::new(AtomicUsize::new(0)),
             drop_wakes: Arc::new(AtomicUsize::new(0)),
             stream_wakes: Arc::new(Mutex::new(Vec::new())),
+            stream_wakers: Cell::new(0),
         }
     }
 
@@ -202,6 +221,7 @@ impl Transport for FakeConn {
     }
 
     fn stream_waker(&self, id: StreamId) -> Waker {
+        self.stream_wakers.set(self.stream_wakers.get() + 1);
         self.stream_waker_for(id)
     }
 
@@ -242,17 +262,36 @@ impl TransportStream for &mut FakeStream {
     }
 
     fn send(&mut self, data: &mut Bytes) -> Result<usize, SendError> {
-        if let Some(code) = self.peer_stopped {
-            return Err(SendError::Stopped {
-                code: AppCode::from_u64(code),
-            });
-        }
-        if self.finished || self.reset.is_some() {
-            return Err(SendError::Ended);
-        }
+        self.check_send()?;
         let take = data.len().min(self.send_window);
         self.sent.extend_from_slice(&data.split_to(take));
         Ok(take)
+    }
+
+    fn send_capacity(&self) -> usize {
+        if self.check_send().is_err() {
+            0
+        } else {
+            self.capacity
+        }
+    }
+
+    fn send_parts(&mut self, header: Bytes, shared: Bytes) -> Result<(), SendError> {
+        self.check_send()?;
+        let len = header.len() + shared.len();
+        if len > self.capacity {
+            return Err(SendError::OverAllowance);
+        }
+        self.capacity -= len;
+        self.sent.extend_from_slice(&header);
+        self.sent.extend_from_slice(&shared);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), SendError> {
+        self.check_send()?;
+        self.finished = true;
+        Ok(())
     }
 
     fn reset(&mut self, code: AppCode) -> Result<(), SendError> {
