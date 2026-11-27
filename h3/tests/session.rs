@@ -31,6 +31,7 @@ use bytes::BytesMut;
 use mvfstr_driver::ConnInfo;
 use mvfstr_driver::QuicApplication;
 use mvfstr_driver::QuicSession;
+use mvfstr_driver::SinkError;
 use mvfstr_proto::BufQueue;
 use mvfstr_proto::ConnEvent;
 use mvfstr_proto::ConnOptions;
@@ -82,6 +83,8 @@ use crate::codec::encode_frame_header;
 use crate::fake::FakeConn;
 use crate::fake::FakeSink;
 use crate::session::Census;
+use crate::transport::PullSink;
+use crate::transport::StreamSink;
 
 // ---------------------------------------------------------------------------------------------
 // The scripted application.
@@ -3966,6 +3969,67 @@ fn a_fixed_response_cut_short_finishes_after_its_wake() {
     assert_eq!(stream.sent, expected, "a capacity of the whole response");
     assert!(stream.finished);
     assert!(h.conn.take_stream_wakes().is_empty());
+}
+
+#[test]
+fn an_inline_response_computes_the_allowance_once() {
+    let body = Bytes::from_static(FIXED_BODY);
+    let expected = pulled(body.clone());
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), fixed(body.clone()));
+    let id = client_bidi(0);
+    open_with_fin(&mut h, id, &headers_frame(GET));
+    let inline = h.conn.get(id);
+    assert_eq!(
+        (inline.sent.clone(), inline.finished),
+        expected,
+        "at delivery"
+    );
+
+    // A response that the session's poll stages through a stream sink over the stream.
+    let plan = Plan {
+        body,
+        ..Plan::default()
+    };
+    let mut p = Harness::ready_with(H3ApplicationBuilder::new(), plan);
+    open_with_fin(&mut p, id, &headers_frame(GET));
+    assert_eq!(p.conn.take_stream_wakes(), [id]);
+    let waker = p.conn.stream_waker_for(id);
+    let mut cx = Context::from_waker(&waker);
+    let mut sink = StreamSink::new(p.conn.get(id));
+    assert!(p.session.core.poll_send(&mut cx, id, &mut sink).is_ready());
+    p.session.core.check_exchanges();
+    let polled = p.conn.get(id);
+    assert_eq!((polled.sent.clone(), polled.finished), expected, "polled");
+    assert_eq!(
+        [h.conn.get(id).computations.get(), polled.computations.get()],
+        [1, 1],
+        "allowance computations of a response staged at delivery and of one polled through a \
+         stream sink"
+    );
+}
+
+#[test]
+fn a_stream_sink_reads_the_allowance_once_and_offers_none_after_its_finish() {
+    let mut conn = FakeConn::new();
+    let id = client_bidi(0);
+    conn.receive(id, b"");
+    conn.get(id).capacity = 100;
+    let mut sink = StreamSink::new(conn.get(id));
+    assert_eq!(sink.allowance(), 100);
+    sink.push(Bytes::from_static(b"0123456789"))
+        .expect("within the allowance");
+    assert_eq!(sink.allowance(), 90);
+    sink.finish().expect("the stream is open");
+    assert_eq!(sink.allowance(), 0, "a finished stream takes no bytes");
+    assert_eq!(
+        sink.push(Bytes::from_static(b"x")),
+        Err(SinkError::Closed),
+        "a push after the finish"
+    );
+    let stream = conn.get(id);
+    assert_eq!(stream.computations.get(), 1, "allowance computations");
+    assert_eq!(stream.sent, b"0123456789");
+    assert!(stream.finished);
 }
 
 #[test]

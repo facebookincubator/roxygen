@@ -12,6 +12,7 @@
 //! response through a stream outside the driver's pull step. Dispatch is static, except for the
 //! session handle, which other threads hold as a trait object as they would a `Waker`.
 
+use std::cell::Cell;
 use std::fmt::Debug;
 use std::task::Waker;
 use std::time::Instant;
@@ -87,9 +88,16 @@ pub(crate) trait TransportStream {
     /// Returns how many bytes the stream accepts now.
     fn send_capacity(&self) -> usize;
 
-    /// Stages a frame header and a shared payload without copying the payload. It stages both or
-    /// fails without staging either.
-    fn send_parts(&mut self, header: Bytes, shared: Bytes) -> Result<(), SendError>;
+    /// Stages a frame header and a shared payload without copying the payload, against
+    /// `allowance`, the stream's allowance as read earlier in the same poll, and takes the staged
+    /// bytes off it. It stages both or fails without staging either, leaving `allowance`
+    /// unchanged. Only this stream may stage between the read and the call.
+    fn send_parts_within(
+        &mut self,
+        allowance: &mut usize,
+        header: Bytes,
+        shared: Bytes,
+    ) -> Result<(), SendError>;
 
     /// Ends the send half after the staged bytes.
     fn finish(&mut self) -> Result<(), SendError>;
@@ -125,11 +133,18 @@ pub(crate) trait PullSink {
 pub(crate) struct StreamSink<S> {
     stream: S,
     staged: usize,
+    /// The stream's allowance once read, less the bytes staged since, so that a response reads it
+    /// once.
+    allowance: Cell<Option<usize>>,
 }
 
 impl<S> StreamSink<S> {
     pub(crate) fn new(stream: S) -> Self {
-        Self { stream, staged: 0 }
+        Self {
+            stream,
+            staged: 0,
+            allowance: Cell::new(None),
+        }
     }
 
     /// Returns the bytes staged through this sink.
@@ -140,7 +155,12 @@ impl<S> StreamSink<S> {
 
 impl<S: TransportStream> PullSink for StreamSink<S> {
     fn allowance(&self) -> usize {
-        self.stream.send_capacity()
+        if let Some(allowance) = self.allowance.get() {
+            return allowance;
+        }
+        let allowance = self.stream.send_capacity();
+        self.allowance.set(Some(allowance));
+        allowance
     }
 
     fn push(&mut self, data: Bytes) -> Result<(), SinkError> {
@@ -149,15 +169,20 @@ impl<S: TransportStream> PullSink for StreamSink<S> {
 
     fn push_parts(&mut self, header: Bytes, shared: Bytes) -> Result<(), SinkError> {
         let len = header.len() + shared.len();
-        self.stream
-            .send_parts(header, shared)
-            .map_err(SinkError::from)?;
+        let mut allowance = self.allowance();
+        let pushed = self
+            .stream
+            .send_parts_within(&mut allowance, header, shared);
+        self.allowance.set(Some(allowance));
+        pushed.map_err(SinkError::from)?;
         self.staged += len;
         Ok(())
     }
 
     fn finish(&mut self) -> Result<(), SinkError> {
-        self.stream.finish().map_err(SinkError::from)
+        self.stream.finish().map_err(SinkError::from)?;
+        self.allowance.set(Some(0));
+        Ok(())
     }
 }
 
@@ -225,8 +250,13 @@ impl TransportStream for StreamMut<'_> {
         StreamMut::send_capacity(self)
     }
 
-    fn send_parts(&mut self, header: Bytes, shared: Bytes) -> Result<(), SendError> {
-        StreamMut::send_parts(self, header, shared)
+    fn send_parts_within(
+        &mut self,
+        allowance: &mut usize,
+        header: Bytes,
+        shared: Bytes,
+    ) -> Result<(), SendError> {
+        StreamMut::send_parts_within(self, allowance, header, shared)
     }
 
     fn finish(&mut self) -> Result<(), SendError> {

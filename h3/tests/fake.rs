@@ -55,8 +55,11 @@ pub(crate) struct FakeStream {
     pub(crate) peer_stopped: Option<u64>,
     /// The bytes `send` takes at most, per call.
     pub(crate) send_window: usize,
-    /// The bytes `send_parts` takes before the stream's allowance runs out.
+    /// The bytes `send_parts_within` takes before the stream's allowance runs out.
     pub(crate) capacity: usize,
+    /// The allowance computations the session requested: `send_capacity` calls. A
+    /// `send_parts_within` call carries an allowance and computes none.
+    pub(crate) computations: Cell<usize>,
 }
 
 impl FakeStream {
@@ -73,6 +76,7 @@ impl FakeStream {
             peer_stopped: None,
             send_window: usize::MAX,
             capacity: usize::MAX,
+            computations: Cell::new(0),
         }
     }
 
@@ -273,6 +277,7 @@ impl TransportStream for &mut FakeStream {
     }
 
     fn send_capacity(&self) -> usize {
+        self.computations.set(self.computations.get() + 1);
         if self.check_send().is_err() {
             0
         } else {
@@ -280,13 +285,25 @@ impl TransportStream for &mut FakeStream {
         }
     }
 
-    fn send_parts(&mut self, header: Bytes, shared: Bytes) -> Result<(), SendError> {
+    fn send_parts_within(
+        &mut self,
+        allowance: &mut usize,
+        header: Bytes,
+        shared: Bytes,
+    ) -> Result<(), SendError> {
+        let fresh = if self.check_send().is_err() {
+            0
+        } else {
+            self.capacity
+        };
+        assert_eq!(*allowance, fresh, "the carried allowance went stale");
         self.check_send()?;
         let len = header.len() + shared.len();
-        if len > self.capacity {
+        if len > *allowance {
             return Err(SendError::OverAllowance);
         }
         self.capacity -= len;
+        *allowance -= len;
         self.sent.extend_from_slice(&header);
         self.sent.extend_from_slice(&shared);
         Ok(())
