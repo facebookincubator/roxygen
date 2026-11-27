@@ -41,16 +41,28 @@ pub enum DecodeError {
     /// A field line references a static table index past the end of the table.
     #[error("static table index {0} is out of range")]
     InvalidStaticIndex(u64),
-    /// A field line references the dynamic table, whose capacity is 0.
-    #[error("reference to the dynamic table, whose capacity is 0")]
+    /// A field line references a dynamic table entry that the section cannot use: one at or past
+    /// its Required Insert Count, or one evicted. Under a maximum capacity of 0 that is every
+    /// reference.
+    #[error("reference to a dynamic table entry that the section cannot use")]
     DynamicTableReference,
-    /// The prefix encodes a non-zero Required Insert Count, which a conformant encoder does not
-    /// send while the dynamic table capacity is 0. The value is as encoded.
-    #[error("encoded Required Insert Count {0} with a dynamic table capacity of 0")]
+    /// The prefix encodes a Required Insert Count that no count encodes to, or a non-zero one
+    /// where the dynamic table cannot be used: under a maximum capacity of 0, or in a method that
+    /// does not acknowledge sections. The value is as encoded.
+    #[error("invalid encoded Required Insert Count {0}")]
     RequiredInsertCount(u64),
     /// The prefix's sign bit makes the Base negative.
     #[error("negative Base")]
     NegativeBase,
+    /// The Required Insert Count is larger than the number of entries received, so the section
+    /// would block, and the decoder allows no blocked streams.
+    #[error("Required Insert Count {required} exceeds the {inserted} entries received")]
+    Blocked {
+        /// The section's Required Insert Count.
+        required: u64,
+        /// The number of entries the decoder has received.
+        inserted: u64,
+    },
 }
 
 /// An encoder stream instruction that the decoder rejects. Each is a QPACK_ENCODER_STREAM_ERROR
@@ -60,15 +72,33 @@ pub enum EncoderStreamError {
     /// An integer larger than 2^62 - 1, or with more continuation bytes than such a value needs.
     #[error("integer exceeds 62 bits")]
     IntegerTooLarge,
-    /// Set Dynamic Table Capacity above the advertised maximum of 0.
-    #[error("dynamic table capacity {0} exceeds the maximum of 0")]
+    /// Set Dynamic Table Capacity above the advertised maximum.
+    #[error("dynamic table capacity {0} exceeds the advertised maximum")]
     CapacityExceeded(u64),
-    /// An Insert instruction, which cannot fit a table of capacity 0.
-    #[error("insert into a dynamic table of capacity 0")]
+    /// An Insert instruction while the capacity is below 32 bytes, the size of the smallest entry.
+    #[error("insert into a dynamic table smaller than any entry")]
     Insert,
     /// A Duplicate instruction, which references an entry of the empty dynamic table.
     #[error("duplicate of an entry of the empty dynamic table")]
     Duplicate,
+    /// An insert whose entry is larger than the dynamic table capacity.
+    #[error("entry of at least {size} bytes exceeds the dynamic table capacity of {capacity}")]
+    EntryTooLarge {
+        /// The entry's size, or the least size its length prefixes allow.
+        size: u64,
+        /// The dynamic table capacity.
+        capacity: u64,
+    },
+    /// An insert with a name reference past the end of the static table.
+    #[error("static table index {0} is out of range")]
+    InvalidStaticIndex(u64),
+    /// An insert with a name reference, or a Duplicate, of a relative index that names no entry
+    /// of the dynamic table.
+    #[error("relative index {0} names no dynamic table entry")]
+    InvalidRelativeIndex(u64),
+    /// An insert with an invalid Huffman-coded string.
+    #[error("invalid Huffman-coded string")]
+    InvalidHuffman,
 }
 
 /// A decoder stream instruction that the encoder rejects. Each is a QPACK_DECODER_STREAM_ERROR

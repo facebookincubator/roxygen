@@ -56,6 +56,8 @@ use roxygen_core::message::HttpMessage;
 use roxygen_core::stream_source::HttpStreamBodyRead;
 use roxygen_core::stream_source::HttpStreamSourceOwner;
 use roxygen_qpack::FieldLine;
+use roxygen_qpack::StringLiteral;
+use roxygen_qpack::instructions::EncoderInstruction;
 use roxygen_runtime::cancellation::CancellationToken;
 use roxygen_runtime::host::Host;
 use roxygen_session::owned::OwnedApplication;
@@ -754,7 +756,10 @@ fn settings_exchange() {
     let Some(Frame::Settings(settings)) = frames.first() else {
         panic!("the control stream starts with SETTINGS: {frames:?}");
     };
-    assert_eq!(settings.get(SettingId::QPACK_MAX_TABLE_CAPACITY), Some(0));
+    assert_eq!(
+        settings.get(SettingId::QPACK_MAX_TABLE_CAPACITY),
+        Some(4096)
+    );
     assert_eq!(settings.get(SettingId::QPACK_BLOCKED_STREAMS), Some(0));
     assert_eq!(
         settings.get(SettingId::MAX_FIELD_SECTION_SIZE),
@@ -788,6 +793,68 @@ fn settings_exchange() {
     Frame::MaxPushId(10).encode(&mut max_push).unwrap();
     h.receive(client_uni(0), &max_push, false);
     assert_eq!(h.closed(), None);
+}
+
+/// Returns the bytes of the server's control stream and its SETTINGS, for a session built with
+/// `builder`.
+fn sent_settings(builder: H3ApplicationBuilder) -> (Vec<u8>, Settings) {
+    let mut h = Harness::with(builder);
+    h.event(ConnEvent::Connected);
+    let (_, frames) = h.control();
+    let Some(Frame::Settings(settings)) = frames.first() else {
+        panic!("the control stream starts with SETTINGS: {frames:?}");
+    };
+    (h.conn.get(server_uni(0)).sent.clone(), settings.clone())
+}
+
+#[test]
+fn settings_advertise_a_4096_byte_table_and_no_blocked_streams() {
+    for (builder, capacity) in [
+        (H3ApplicationBuilder::new(), 4096),
+        (
+            H3ApplicationBuilder::new().qpack_max_table_capacity(65_536),
+            65_536,
+        ),
+    ] {
+        let (_, settings) = sent_settings(builder);
+        assert_eq!(
+            settings.get(SettingId::QPACK_MAX_TABLE_CAPACITY),
+            Some(capacity)
+        );
+        assert_eq!(settings.get(SettingId::QPACK_BLOCKED_STREAMS), Some(0));
+    }
+
+    // At 0, the control stream is the one sent before the table: the two QPACK settings at 0,
+    // the field section size and one reserved setting.
+    let (sent, settings) = sent_settings(H3ApplicationBuilder::new().qpack_max_table_capacity(0));
+    let (grease, value) = settings
+        .iter()
+        .find(|(id, _)| id.is_grease())
+        .expect("a reserved setting");
+    let mut expected_settings = Settings::new();
+    for (id, value) in [
+        (SettingId::QPACK_MAX_TABLE_CAPACITY, 0),
+        (SettingId::QPACK_BLOCKED_STREAMS, 0),
+        (SettingId::MAX_FIELD_SECTION_SIZE, 64 << 10),
+        (grease, value),
+    ] {
+        expected_settings.set(id, value).unwrap();
+    }
+    assert_eq!(sent, control_stream(&expected_settings));
+
+    let built = |bytes| {
+        H3ApplicationBuilder::new()
+            .qpack_max_table_capacity(bytes)
+            .build(Host::tokio(), |_| Ok(TestApp::default()))
+            .err()
+    };
+    assert_eq!(built(65_536), None);
+    assert_eq!(
+        built(65_537),
+        Some(crate::H3ConfigError::OutOfRange {
+            field: "qpack_max_table_capacity"
+        })
+    );
 }
 
 #[test]
@@ -961,8 +1028,8 @@ fn critical_stream_errors() {
             roxygen_qpack::QPACK_ENCODER_STREAM_ERROR,
         ),
         (
-            "encoder stream capacity above 0",
-            Box::new(move |h| h.receive(client_uni(1), &[encoder[0], 0x21], false)),
+            "encoder stream capacity above the maximum",
+            Box::new(move |h| h.receive(client_uni(1), &[encoder[0], 0x3f, 0xe2, 0x1f], false)),
             roxygen_qpack::QPACK_ENCODER_STREAM_ERROR,
         ),
         (
@@ -2629,6 +2696,456 @@ fn dynamic_table_reference_is_decompression_failure() {
             ]
         );
     }
+}
+
+/// Returns the client's encoder stream type and `instructions`.
+fn encoder_stream(instructions: &[EncoderInstruction<'_>]) -> Vec<u8> {
+    let mut out = vec![StreamType::QPACK_ENCODER.as_u64() as u8];
+    for instruction in instructions {
+        instruction.encode(&mut out);
+    }
+    out
+}
+
+/// An insert of `value` under the name of static entry `index`.
+fn static_name_insert(index: u64, value: &[u8]) -> EncoderInstruction<'_> {
+    EncoderInstruction::InsertWithNameReference {
+        static_table: true,
+        name_index: index,
+        value: StringLiteral {
+            huffman: false,
+            data: value,
+        },
+    }
+}
+
+#[test]
+fn a_section_that_would_block_closes_the_connection() {
+    let mut h = Harness::ready();
+    h.receive(
+        client_uni(1),
+        &encoder_stream(&[
+            EncoderInstruction::SetDynamicTableCapacity(4096),
+            static_name_insert(0, b"example.com"),
+        ]),
+        false,
+    );
+    assert_eq!(h.closed(), None);
+    // Required Insert Count 1 and Base 1: `:method GET`, `:scheme https`, the entry by relative
+    // index 0 and `:path /`. The entry is received but not yet acknowledged.
+    h.receive(
+        client_bidi(0),
+        &frame(FrameType::HEADERS, &[0x02, 0x00, 0xd1, 0xd7, 0x80, 0xc1]),
+        true,
+    );
+    assert_eq!(h.closed(), None);
+    let mut literal = Harness::ready();
+    literal.receive(
+        client_bidi(0),
+        &headers_frame(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", "example.com"),
+            (":path", "/"),
+        ]),
+        true,
+    );
+    assert_eq!(
+        received_head(&h, client_bidi(0)),
+        received_head(&literal, client_bidi(0))
+    );
+
+    // Required Insert Count 2 needs an entry that has not arrived.
+    h.receive(
+        client_bidi(1),
+        &frame(FrameType::HEADERS, &[0x03, 0x00, 0xd1, 0xd7, 0x81, 0xc1]),
+        true,
+    );
+    assert_eq!(h.closed(), Some(roxygen_qpack::QPACK_DECOMPRESSION_FAILED));
+}
+
+/// h2load's request as nghttp3 sends it once both of its entries are acknowledged: Required
+/// Insert Count 2 and Base 2, `:path` as a literal under its static name, `:scheme https`,
+/// `:authority` by relative index 1, `:method GET` and `user-agent` by relative index 0.
+fn h2load_dynamic_request() -> Vec<u8> {
+    let mut section = vec![0x03, 0x00, 0x51, 18];
+    section.extend_from_slice(b"/baseline2?a=1&b=1");
+    section.extend_from_slice(&[0xd7, 0x81, 0xd1, 0x80]);
+    frame(FrameType::HEADERS, &section)
+}
+
+const H2LOAD_REQUEST: &[(&str, &str)] = &[
+    (":path", "/baseline2?a=1&b=1"),
+    (":scheme", "https"),
+    (":authority", "localhost:8443"),
+    (":method", "GET"),
+    ("user-agent", "h2load nghttp2/1.69.0"),
+];
+
+/// Pulls the decoder stream until it is idle, and returns the pushes it made.
+fn pull_decoder<A: OwnedApplication>(h: &mut Harness<A>) -> (Vec<Poll<()>>, usize) {
+    let mut polls = Vec::new();
+    let mut pushes = 0;
+    loop {
+        let (poll, sink) = h.pull(server_uni(1), 16 << 10);
+        polls.push(poll);
+        pushes += sink.pushes;
+        if poll.is_pending() || polls.len() > 8 {
+            return (polls, pushes);
+        }
+    }
+}
+
+#[test]
+fn an_nghttp3_shaped_connection_gets_one_decoder_write_per_phase() {
+    let fixed = Plan {
+        fixed: true,
+        ..Plan::default()
+    };
+    let mut h = Harness::ready_with(H3ApplicationBuilder::new(), fixed.clone());
+    let decoder = server_uni(1);
+    h.conn.take_stream_wakes();
+    h.receive(
+        client_uni(1),
+        &encoder_stream(&[
+            EncoderInstruction::SetDynamicTableCapacity(4096),
+            static_name_insert(0, b"localhost:8443"),
+            static_name_insert(95, b"h2load nghttp2/1.69.0"),
+        ]),
+        false,
+    );
+    assert_eq!(h.conn.take_stream_wakes(), vec![decoder]);
+    let control_order = h.conn.get(server_uni(0)).order;
+    assert_eq!(h.conn.get(decoder).order, control_order);
+    // A push that sends every due byte returns Pending, so the stream waits for its waker.
+    assert_eq!(pull_decoder(&mut h), (vec![Poll::Pending], 1));
+    // The stream type, then an Insert Count Increment of 2.
+    assert_eq!(h.conn.get(decoder).sent, [0x03, 0x02]);
+
+    let mut literal = Harness::ready_with(H3ApplicationBuilder::new(), fixed);
+    for index in 0..64 {
+        h.receive(client_bidi(index), &h2load_dynamic_request(), true);
+        literal.receive(client_bidi(index), &headers_frame(H2LOAD_REQUEST), true);
+    }
+    assert_eq!(h.closed(), None);
+    assert_eq!(h.conn.take_stream_wakes(), vec![decoder]);
+    assert_eq!(pull_decoder(&mut h), (vec![Poll::Pending], 1));
+    // A Section Acknowledgment per request, in stream order: stream IDs 0 to 124 fit the 7-bit
+    // prefix, and 128 to 252 continue in one more byte.
+    let mut acks: Vec<u8> = (0..32).map(|index| 0x80 | (index * 4)).collect();
+    for index in 32..64u8 {
+        acks.extend([0xff, index * 4 - 127]);
+    }
+    assert_eq!(acks[..3], [0x80, 0x84, 0x88]);
+    assert_eq!(acks[acks.len() - 2..], [0xff, 0x7d]);
+    assert_eq!(h.conn.get(decoder).sent[2..], acks);
+    assert_eq!(h.conn.stream_wakers.get(), 1);
+    for index in 0..64 {
+        assert_eq!(
+            received_head(&h, client_bidi(index)),
+            received_head(&literal, client_bidi(index))
+        );
+    }
+}
+
+#[test]
+fn the_decoder_stream_is_a_critical_stream() {
+    let inserts = encoder_stream(&[
+        EncoderInstruction::SetDynamicTableCapacity(4096),
+        static_name_insert(0, b"localhost:8443"),
+        static_name_insert(95, b"h2load nghttp2/1.69.0"),
+    ]);
+    let decoder = server_uni(1);
+    let edges = [
+        StreamReady::Stopped {
+            code: app(H3ErrorCode::NO_ERROR.as_u64()),
+        },
+        StreamReady::Reset {
+            code: app(H3ErrorCode::NO_ERROR.as_u64()),
+            final_size: 0,
+        },
+        StreamReady::Closed,
+    ];
+    for edge in edges {
+        let mut h = Harness::ready();
+        h.receive(client_uni(1), &inserts, false);
+        assert!(h.conn.streams.contains_key(&decoder));
+        h.ready_edge(decoder, edge);
+        assert_eq!(
+            h.closed(),
+            Some(H3ErrorCode::CLOSED_CRITICAL_STREAM.as_u64()),
+            "{edge:?}"
+        );
+    }
+
+    // At the peer's stream limit, opening waits for more streams.
+    let mut h = Harness::ready();
+    h.conn.uni_limit = 1;
+    h.receive(client_uni(1), &inserts, false);
+    h.poll_session();
+    h.poll_session();
+    assert!(!h.conn.streams.contains_key(&decoder));
+    assert_eq!(h.conn.open_refusals, 1);
+    h.conn.uni_limit = 2;
+    h.event(ConnEvent::StreamsAvailable { dir: Dir::Uni });
+    assert_eq!(h.conn.take_stream_wakes(), vec![decoder]);
+    assert_eq!(pull_decoder(&mut h), (vec![Poll::Pending], 1));
+    assert_eq!(h.conn.get(decoder).sent, [0x03, 0x02]);
+
+    // A request reset before its head is cancelled on the decoder stream, only under a nonzero
+    // maximum.
+    for (builder, sent) in [
+        (H3ApplicationBuilder::new(), Some(vec![0x03, 0x48])),
+        (
+            H3ApplicationBuilder::new().qpack_max_table_capacity(0),
+            None,
+        ),
+    ] {
+        let mut h = Harness::ready_with(builder, Plan::default());
+        let id = client_bidi(2);
+        h.receive(id, &[FrameType::HEADERS.as_u64() as u8], false);
+        h.ready_edge(
+            id,
+            StreamReady::Reset {
+                code: app(H3ErrorCode::REQUEST_CANCELLED.as_u64()),
+                final_size: 1,
+            },
+        );
+        pull_decoder(&mut h);
+        assert_eq!(
+            h.conn
+                .streams
+                .get(&decoder)
+                .map(|stream| stream.sent.clone()),
+            sent
+        );
+    }
+
+    // A peer that withholds the decoder stream's credit while it keeps sending sections. From
+    // stream ID 16,512 on, each Section Acknowledgment takes 4 bytes, so with the unsent stream
+    // type and Insert Count Increment, the 16,384th acknowledgment passes 64 KiB.
+    let mut h = Harness::ready_with(
+        H3ApplicationBuilder::new(),
+        Plan {
+            fixed: true,
+            ..Plan::default()
+        },
+    );
+    h.receive(client_uni(1), &inserts, false);
+    let first = 4128;
+    let mut index = first;
+    while h.closed().is_none() {
+        assert!(index < first + 20_000, "the connection stays open");
+        let id = client_bidi(index);
+        h.conn.now += Duration::from_micros(1);
+        h.receive(id, &h2load_dynamic_request(), true);
+        h.ready_edge(id, StreamReady::Closed);
+        h.conn.streams.remove(&id);
+        index += 1;
+    }
+    assert_eq!(h.closed(), Some(H3ErrorCode::EXCESSIVE_LOAD.as_u64()));
+    assert_eq!(index - first, 16_384);
+    assert!(h.conn.get(decoder).sent.is_empty());
+}
+
+#[test]
+fn decoder_stream_bytes_an_allowance_cuts_short_lead_the_next_push() {
+    let mut h = Harness::ready();
+    let decoder = server_uni(1);
+    h.receive(
+        client_uni(1),
+        &encoder_stream(&[
+            EncoderInstruction::SetDynamicTableCapacity(4096),
+            static_name_insert(0, b"localhost:8443"),
+            static_name_insert(95, b"h2load nghttp2/1.69.0"),
+        ]),
+        false,
+    );
+    // A 1-byte allowance takes the stream type, and the Insert Count Increment of 2 waits.
+    let (poll, sink) = h.pull(decoder, 1);
+    assert_eq!(
+        (poll, sink.pushes, &sink.pushed[..]),
+        (Poll::Ready(()), 1, &[0x03][..])
+    );
+
+    // Two requests add Section Acknowledgments while the stream is still ready, so its waker
+    // does not fire. A 2-byte allowance takes the increment and the first acknowledgment.
+    h.conn.take_stream_wakes();
+    for index in 0..2 {
+        h.receive(client_bidi(index), &h2load_dynamic_request(), true);
+    }
+    assert!(!h.conn.take_stream_wakes().contains(&decoder));
+    let (poll, sink) = h.pull(decoder, 2);
+    assert_eq!(
+        (poll, sink.pushes, &sink.pushed[..]),
+        (Poll::Ready(()), 1, &[0x02, 0x80][..])
+    );
+
+    // A third request: one push carries the rest of the earlier bytes and then its own
+    // acknowledgment.
+    h.receive(client_bidi(2), &h2load_dynamic_request(), true);
+    let (poll, sink) = h.pull(decoder, 16 << 10);
+    assert_eq!(
+        (poll, sink.pushes, &sink.pushed[..]),
+        (Poll::Pending, 1, &[0x84, 0x88][..])
+    );
+    assert_eq!(h.conn.get(decoder).sent, [0x03, 0x02, 0x80, 0x84, 0x88]);
+}
+
+#[test]
+fn request_trailers_that_reference_the_dynamic_table_are_acknowledged() {
+    let mut h = Harness::ready();
+    let decoder = server_uni(1);
+    let raw = |data| StringLiteral {
+        huffman: false,
+        data,
+    };
+    h.receive(
+        client_uni(1),
+        &encoder_stream(&[
+            EncoderInstruction::SetDynamicTableCapacity(4096),
+            EncoderInstruction::InsertWithLiteralName {
+                name: raw(b"x-request-trailer"),
+                value: raw(b"1"),
+            },
+        ]),
+        false,
+    );
+    pull_decoder(&mut h);
+    assert_eq!(h.conn.get(decoder).sent, [0x03, 0x01]);
+
+    // Trailers with Required Insert Count 1 (encoded 2) and Base 1: the entry by relative
+    // index 0.
+    let id = client_bidi(3);
+    let mut request = headers_frame(POST);
+    request.extend_from_slice(&data_frame(b"body"));
+    request.extend_from_slice(&frame(FrameType::HEADERS, &[0x02, 0x00, 0x80]));
+    h.receive(id, &request, true);
+    assert_eq!(h.closed(), None);
+    assert_eq!(read_chunk(&mut h, id), (b"body".to_vec(), false));
+    let Poll::Ready(Ok(event)) = h.read_body(id, 100) else {
+        panic!("the trailers are ready");
+    };
+    assert!(event.eom());
+    let HttpBodyEventKind::Trailers(trailers) = event.into_kind() else {
+        panic!("expected trailers");
+    };
+    assert_eq!(trailers.get_single_or_empty("x-request-trailer"), b"1");
+
+    // The trailer section is acknowledged for its request stream, ID 12.
+    pull_decoder(&mut h);
+    assert_eq!(h.conn.get(decoder).sent, [0x03, 0x01, 0x8c]);
+}
+
+#[test]
+fn request_streams_abandoned_while_ingress_is_open_are_cancelled_on_the_decoder_stream() {
+    /// Returns the instructions on the decoder stream after `abandon`, if the stream opened.
+    fn cancellations(
+        builder: H3ApplicationBuilder,
+        abandon: impl FnOnce(&mut Harness),
+    ) -> Option<Vec<u8>> {
+        let mut h = Harness::ready_with(builder, Plan::default());
+        abandon(&mut h);
+        h.poll_session();
+        pull_decoder(&mut h);
+        let sent = &h.conn.streams.get(&server_uni(1))?.sent;
+        assert_eq!(sent[0], 0x03);
+        Some(sent[1..].to_vec())
+    }
+    let id = client_bidi(0);
+    let upload = |h: &mut Harness| h.receive(id, &headers_frame(POST), false);
+    let whole = |h: &mut Harness| h.receive(id, &headers_frame(GET), true);
+    let reset = |h: &mut Harness| {
+        h.ready_edge(
+            id,
+            StreamReady::Reset {
+                code: app(H3ErrorCode::REQUEST_CANCELLED.as_u64()),
+                final_size: 100,
+            },
+        );
+    };
+    let stopped = |h: &mut Harness| {
+        h.ready_edge(
+            id,
+            StreamReady::Stopped {
+                code: app(H3ErrorCode::REQUEST_CANCELLED.as_u64()),
+            },
+        );
+    };
+    let new = H3ApplicationBuilder::new;
+    let actual = vec![
+        (
+            "peer reset after the response",
+            cancellations(new(), |h| {
+                upload(h);
+                h.pull_all(id, 1 << 20);
+                reset(h);
+            }),
+        ),
+        (
+            "early response",
+            cancellations(new(), |h| {
+                upload(h);
+                h.pull_all(id, 1 << 20);
+            }),
+        ),
+        (
+            "malformed head",
+            cancellations(new(), |h| {
+                h.receive(
+                    id,
+                    &headers_frame(&[(":scheme", "https"), (":authority", "a"), (":path", "/")]),
+                    false,
+                );
+            }),
+        ),
+        (
+            "peer stopped the response",
+            cancellations(new(), |h| {
+                upload(h);
+                stopped(h);
+            }),
+        ),
+        (
+            "rejected",
+            cancellations(new().max_concurrent_exchanges(1), |h| {
+                upload(h);
+                h.receive(client_bidi(1), &headers_frame(GET), true);
+            }),
+        ),
+        (
+            "peer reset after the whole request",
+            cancellations(new(), |h| {
+                whole(h);
+                reset(h);
+            }),
+        ),
+        (
+            "peer stopped after the whole request",
+            cancellations(new(), |h| {
+                whole(h);
+                stopped(h);
+            }),
+        ),
+        (
+            "early response under a zero maximum",
+            cancellations(new().qpack_max_table_capacity(0), |h| {
+                upload(h);
+                h.pull_all(id, 1 << 20);
+            }),
+        ),
+    ];
+    let expected = vec![
+        ("peer reset after the response", Some(vec![0x40])),
+        ("early response", Some(vec![0x40])),
+        ("malformed head", Some(vec![0x40])),
+        ("peer stopped the response", Some(vec![0x40])),
+        ("rejected", Some(vec![0x44])),
+        ("peer reset after the whole request", None),
+        ("peer stopped after the whole request", None),
+        ("early response under a zero maximum", None),
+    ];
+    assert_eq!(actual, expected);
 }
 
 #[test]

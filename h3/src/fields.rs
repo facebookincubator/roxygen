@@ -195,23 +195,29 @@ pub(crate) struct RequestHead {
     pub(crate) head_request: bool,
 }
 
-/// Decodes and validates the request head in `block`. The head starts at `start_time`.
+/// Decodes and validates the request head in `block`, sent on the request stream with QUIC stream
+/// ID `stream_id`. The head starts at `start_time`.
 pub(crate) fn decode_request(
     decoder: &mut Decoder,
+    stream_id: u64,
     block: &[u8],
     max_size: u64,
     start_time: Instant,
 ) -> Result<RequestHead, FieldError> {
     let mut builder = RequestBuilder::new(max_size, start_time);
     decoder
-        .decode_resolved_section(block, |line, static_ref| builder.field(line, static_ref))
+        .decode_section(stream_id, block, |line, static_ref| {
+            builder.field(line, static_ref)
+        })
         .map_err(FieldError::Qpack)?;
     builder.finish(block.len())
 }
 
-/// Decodes and validates a trailer section, which must not hold pseudo-header fields.
+/// Decodes and validates a trailer section, sent on the request stream with QUIC stream ID
+/// `stream_id`, which must not hold pseudo-header fields.
 pub(crate) fn decode_trailers(
     decoder: &mut Decoder,
+    stream_id: u64,
     block: &[u8],
     max_size: u64,
 ) -> Result<HttpHeaders, FieldError> {
@@ -219,7 +225,7 @@ pub(crate) fn decode_trailers(
     let mut size = 0u64;
     let mut malformed = false;
     decoder
-        .decode_field_section(block, |line| {
+        .decode_section(stream_id, block, |line, _| {
             size = size.saturating_add(line_size(&line));
             malformed |= size > max_size
                 || line.name.starts_with(b":")

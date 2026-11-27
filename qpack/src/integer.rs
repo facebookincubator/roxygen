@@ -31,6 +31,16 @@ pub fn encode(dst: &mut impl BufMut, first: u8, prefix_bits: u8, value: u64) {
     dst.put_u8(rest as u8);
 }
 
+/// Returns the length of `value` encoded with a `prefix_bits`-bit prefix.
+pub fn encoded_len(prefix_bits: u8, value: u64) -> usize {
+    let max_prefix = u64::from(prefix_max(prefix_bits));
+    if value < max_prefix {
+        return 1;
+    }
+    let rest = value - max_prefix;
+    2 + (u64::BITS - rest.leading_zeros()).saturating_sub(1) as usize / 7
+}
+
 /// Reads an integer with a `prefix_bits`-bit prefix from the start of `buf`, ignoring the bits of
 /// the first byte above the prefix. Returns the value and the number of bytes read.
 pub fn decode(buf: &[u8], prefix_bits: u8) -> Result<(u64, usize), WireError> {

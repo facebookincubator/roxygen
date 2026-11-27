@@ -5,18 +5,22 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! QPACK field compression for HTTP/3, using the static table and literals only.
+//! QPACK field compression for HTTP/3: the static table, Huffman coding, and the decoder's dynamic
+//! table.
 //!
 //! [`Encoder`] encodes a field section with static table references and literals, Huffman-coding
 //! each string when that makes it shorter. It never uses the dynamic table, so its field sections
 //! never block the peer's decoder, and it does not send encoder stream instructions.
 //!
-//! [`Decoder`] decodes every field line representation of RFC 9204 for an endpoint that advertises
-//! a maximum dynamic table capacity of 0, the default of SETTINGS_QPACK_MAX_TABLE_CAPACITY. Any
-//! reference to the dynamic table is then a decompression error.
+//! [`Decoder`] decodes every field line representation of RFC 9204. [`Decoder::new`] is for an
+//! endpoint that advertises a maximum dynamic table capacity of 0, the default of
+//! SETTINGS_QPACK_MAX_TABLE_CAPACITY: any reference to the dynamic table is then a decompression
+//! error, and [`Decoder::feed_encoder_stream`] accepts only Set Dynamic Table Capacity with a
+//! capacity of 0. [`Decoder::with_max_capacity`] is for an endpoint that advertises a larger
+//! maximum and 0 for SETTINGS_QPACK_BLOCKED_STREAMS. It builds the dynamic table from the peer's
+//! encoder stream, resolves references to it in [`Decoder::decode_section`], refuses a section
+//! that would block, and writes the decoder stream's instructions with [`Decoder::write_owed`].
 //!
-//! The peer may still open an encoder and a decoder stream. [`Decoder::feed_encoder_stream`]
-//! accepts only Set Dynamic Table Capacity with a capacity of 0, and
 //! [`Encoder::feed_decoder_stream`] accepts only Stream Cancellation. The [`instructions`] module
 //! parses and encodes every instruction of both streams.
 //!
@@ -82,12 +86,14 @@ impl<'a> FieldLine<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StaticRef {
     /// The table was not consulted. [`Decoder::decode_resolved_section`] passes this for a line
-    /// with a literal name, and [`Encoder::encode_resolved_section`] looks such a line up.
+    /// with a literal name, [`Decoder::decode_section`] also for a line from the dynamic table
+    /// whose name was a literal, and [`Encoder::encode_resolved_section`] looks such a line up.
     Unresolved,
     /// The table does not have the line's name, so the encoder writes the name as a literal.
     Unlisted,
     /// The entry at this index has the line's name. The decoder passes this for a line whose name
-    /// references the entry and whose value is a literal.
+    /// references the entry and whose value is a literal, and for a line from the dynamic table
+    /// whose entry took its name from this entry.
     Name(u8),
     /// The entry at this index has the line's name and value.
     Entry(u8),

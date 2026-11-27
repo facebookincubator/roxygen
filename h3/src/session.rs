@@ -12,9 +12,13 @@
 //! each. The session opens its control stream with SETTINGS, accepts the peer's control and QPACK
 //! streams, and turns each request stream into one exchange of the application: it decodes the
 //! request head through QPACK, feeds DATA to the exchange's ingress body, and returns stream
-//! credit only as the application consumes the body. The body is built when the application
-//! takes its completion, or else when the head is decoded, except that a request whose FIN
-//! directly follows its HEADERS frame, other than a CONNECT, gets a body that holds no source.
+//! credit only as the application consumes the body. Field sections may reference the QPACK
+//! dynamic table that the peer builds on its encoder stream, but never wait for it: the session
+//! advertises no blocked streams. Once the decoder has instructions due, the session opens its
+//! QPACK decoder stream, whose pull path writes the instructions of a phase in one push. The body
+//! is built when the application takes its completion, or else when the head is decoded, except
+//! that a request whose FIN directly follows its HEADERS frame, other than a CONNECT, gets a body
+//! that holds no source.
 //! Responses go out through the pull path: `poll_send` polls the exchange's head and body with an
 //! allowance and pushes frames whose payloads are never copied. A small response that the exchange
 //! holds whole when its request is delivered is staged at once, the same way, without waiting for
@@ -137,6 +141,15 @@ const INLINE_STAGING: usize = 1 << 20;
 /// for a poll. A connection so stages at most 64 responses at delivery in one phase.
 const INLINE_CHARGE: usize = 16 << 10;
 
+/// The largest QPACK dynamic table a session lets the peer build, which bounds the decoder's
+/// memory per connection.
+const MAX_QPACK_TABLE_CAPACITY: u64 = 64 << 10;
+
+/// The most QPACK decoder stream bytes, due and unsent, that a session holds before it closes the
+/// connection. Only a peer that withholds the stream's credit while it sends sections gets there,
+/// so this bounds what such a peer makes the session hold.
+const MAX_UNSENT_DECODER_BYTES: usize = 64 << 10;
+
 /// The shortest time a quiescing connection stays open after its GOAWAY. CONNECTION_CLOSE stops
 /// all stream data at once (RFC 9000) and the transport does not report when the control
 /// stream's bytes are acknowledged, so the GOAWAY gets time to arrive, and to be sent again if
@@ -161,6 +174,7 @@ pub enum H3ConfigError {
 #[derive(Clone, Debug)]
 struct Config {
     max_field_section_size: u64,
+    qpack_max_table_capacity: u64,
     max_concurrent_exchanges: usize,
     request_body_buffer: u32,
     transport: Arc<TransportConfig>,
@@ -170,6 +184,7 @@ struct Config {
 #[derive(Clone, Debug)]
 pub struct H3ApplicationBuilder {
     max_field_section_size: u64,
+    qpack_max_table_capacity: u64,
     max_concurrent_exchanges: usize,
     request_body_buffer: u32,
     transport: Option<Arc<TransportConfig>>,
@@ -179,6 +194,7 @@ impl Default for H3ApplicationBuilder {
     fn default() -> Self {
         Self {
             max_field_section_size: 64 << 10,
+            qpack_max_table_capacity: 4096,
             max_concurrent_exchanges: 100,
             request_body_buffer: 64 << 10,
             transport: None,
@@ -197,6 +213,16 @@ impl H3ApplicationBuilder {
     /// 64 KiB by default.
     pub fn max_field_section_size(mut self, bytes: u64) -> Self {
         self.max_field_section_size = bytes;
+        self
+    }
+
+    /// Sets the largest QPACK dynamic table the peer's encoder may build for the session's
+    /// decoder, advertised as SETTINGS_QPACK_MAX_TABLE_CAPACITY, from 0 to 65,536 bytes. The
+    /// session advertises 0 blocked streams, so the peer references only entries that the
+    /// session has acknowledged. At 0, the peer cannot use the dynamic table. 4,096 bytes by
+    /// default, as in Proxygen.
+    pub fn qpack_max_table_capacity(mut self, bytes: u64) -> Self {
+        self.qpack_max_table_capacity = bytes;
         self
     }
 
@@ -263,6 +289,10 @@ impl H3ApplicationBuilder {
             "max_field_section_size",
         )?;
         check(
+            self.qpack_max_table_capacity <= MAX_QPACK_TABLE_CAPACITY,
+            "qpack_max_table_capacity",
+        )?;
+        check(
             self.max_concurrent_exchanges > 0,
             "max_concurrent_exchanges",
         )?;
@@ -291,6 +321,7 @@ impl H3ApplicationBuilder {
         )?;
         Ok(Config {
             max_field_section_size: self.max_field_section_size,
+            qpack_max_table_capacity: self.qpack_max_table_capacity,
             max_concurrent_exchanges: self.max_concurrent_exchanges,
             request_body_buffer: self.request_body_buffer,
             transport,
@@ -415,6 +446,10 @@ struct State {
     /// The peer's unidirectional streams still being read.
     uni: Vec<UniStream>,
     qpack_decoder: roxygen_qpack::Decoder,
+    /// Our QPACK decoder stream, once the decoder has had instructions due.
+    decoder_stream: Option<DecoderStream>,
+    /// Whether opening the decoder stream waits for the peer's stream limit to rise.
+    decoder_waiting: bool,
     qpack_encoder: roxygen_qpack::Encoder,
     work: Arc<WorkQueue>,
     work_scratch: Vec<StreamId>,
@@ -432,6 +467,17 @@ struct State {
     /// such responses at that reading.
     inline_at: Option<Instant>,
     inline_work: usize,
+}
+
+/// Our QPACK decoder stream, a pull producer.
+struct DecoderStream {
+    id: StreamId,
+    /// The stream's waker, made once when the stream opens.
+    waker: Waker,
+    /// The stream type until it is pushed, then the bytes an allowance cut short.
+    unsent: Bytes,
+    /// Whether the stream was woken and has not since returned `Pending` from a poll.
+    woken: bool,
 }
 
 /// A peer unidirectional stream.
@@ -599,6 +645,8 @@ enum Verdict {
 
 impl<A: OwnedApplication> Core<A> {
     fn new(application: A, config: Rc<Config>, host: Host) -> Self {
+        let qpack_decoder =
+            roxygen_qpack::Decoder::with_max_capacity(config.qpack_max_table_capacity);
         Self {
             application,
             state: State {
@@ -615,7 +663,9 @@ impl<A: OwnedApplication> Core<A> {
                 peer_encoder: false,
                 peer_decoder: false,
                 uni: Vec::new(),
-                qpack_decoder: roxygen_qpack::Decoder::new(),
+                qpack_decoder,
+                decoder_stream: None,
+                decoder_waiting: false,
                 qpack_encoder: roxygen_qpack::Encoder::new(),
                 work: Arc::new(WorkQueue::default()),
                 work_scratch: Vec::new(),
@@ -636,8 +686,11 @@ impl<A: OwnedApplication> Core<A> {
     pub(crate) fn on_event<T: Transport>(&mut self, t: &mut T, event: ConnEvent) {
         self.start(t);
         match event {
-            ConnEvent::StreamsAvailable { dir: Dir::Uni } if self.state.control_waiting => {
-                self.open_control(t);
+            ConnEvent::StreamsAvailable { dir: Dir::Uni } => {
+                self.state.decoder_waiting = false;
+                if self.state.control_waiting {
+                    self.open_control(t);
+                }
             }
             ConnEvent::Closed { initiator, .. } => {
                 self.state.closed = true;
@@ -720,6 +773,14 @@ impl<A: OwnedApplication> Core<A> {
     ) -> Poll<()> {
         if self.state.control == Some(id) {
             return self.state.push_control(sink);
+        }
+        if self
+            .state
+            .decoder_stream
+            .as_ref()
+            .is_some_and(|stream| stream.id == id)
+        {
+            return self.state.push_decoder(sink);
         }
         let Some(mut entry) = self.exchanges.find_mut(id) else {
             return Poll::Pending;
@@ -807,12 +868,20 @@ impl<A: OwnedApplication> Core<A> {
     }
 
     fn own_stream_ready<T: Transport>(&mut self, t: &mut T, id: StreamId, ready: StreamReady) {
-        if self.state.control != Some(id) {
+        let control = self.state.control == Some(id);
+        if !control
+            && self
+                .state
+                .decoder_stream
+                .as_ref()
+                .is_none_or(|stream| stream.id != id)
+        {
             return;
         }
         match ready {
-            StreamReady::Writable => self.flush_control(t),
-            // RFC 9114: the peer must not ask the server to close the server's control stream.
+            StreamReady::Writable if control => self.flush_control(t),
+            // RFC 9114 and RFC 9204: the server's control and QPACK decoder streams stay open for
+            // the connection's life, so the peer must not stop or reset them.
             StreamReady::Stopped { .. } | StreamReady::Reset { .. } | StreamReady::Closed => {
                 self.connection_error(t, H3ErrorCode::CLOSED_CRITICAL_STREAM);
             }
@@ -854,6 +923,7 @@ impl<A: OwnedApplication> Core<A> {
             .is_some_and(|goaway| id.into_inner() >= goaway);
         if going_away || live >= self.state.config.max_concurrent_exchanges {
             abort_stream(t, id, H3ErrorCode::REQUEST_REJECTED);
+            self.state.qpack_decoder.cancel_stream(id.into_inner());
             return;
         }
         // An application that takes the completion gets the body built at admission.
@@ -946,6 +1016,9 @@ impl<A: OwnedApplication> Core<A> {
     fn fail_stream<T: Transport>(&mut self, t: &mut T, id: StreamId, code: H3ErrorCode) {
         abort_stream(t, id, code);
         if let Some(mut exchange) = self.exchanges.remove(id) {
+            if exchange.ingress.open() {
+                self.state.qpack_decoder.cancel_stream(id.into_inner());
+            }
             let error = HttpError::with_message(error_code(code), b"HTTP/3 stream error");
             cancel(&mut exchange, &error, false);
         }
@@ -962,6 +1035,7 @@ impl<A: OwnedApplication> Core<A> {
             // The response is out; the peer only stopped its upload, which ends the body.
             if exchange.ingress.open() {
                 exchange.ingress = Ingress::Abandoned;
+                self.state.qpack_decoder.cancel_stream(id.into_inner());
                 if let Some(producer) = exchange.producer() {
                     producer.abort(
                         fields::peer_error_code(code.0.into_inner()),
@@ -979,6 +1053,9 @@ impl<A: OwnedApplication> Core<A> {
             .exchanges
             .remove(id)
             .expect("the exchange was found above");
+        if exchange.ingress.open() {
+            self.state.qpack_decoder.cancel_stream(id.into_inner());
+        }
         let error = HttpError::with_message(
             fields::peer_error_code(code.0.into_inner()),
             b"peer reset the request stream",
@@ -1003,6 +1080,7 @@ impl<A: OwnedApplication> Core<A> {
             if let Ok(mut stream) = t.stream(id) {
                 let _ = stream.stop_sending(app_code(H3ErrorCode::REQUEST_CANCELLED));
             }
+            self.state.qpack_decoder.cancel_stream(id.into_inner());
         } else {
             // The cancelled body is not read; its bytes must go for the receive half to end.
             release(t, id);
@@ -1080,6 +1158,7 @@ impl<A: OwnedApplication> Core<A> {
                         producer.abort(HttpErrorCode::CANCEL, b"response completed early");
                     }
                     exchange.ingress = Ingress::Abandoned;
+                    self.state.qpack_decoder.cancel_stream(id.into_inner());
                     continue;
                 }
                 if exchange.ingress == Ingress::Complete {
@@ -1092,6 +1171,52 @@ impl<A: OwnedApplication> Core<A> {
         }
         self.state.work_scratch = queued;
         self.check_quiesced(t);
+        self.wake_decoder_stream(t);
+    }
+
+    /// Opens the QPACK decoder stream when the decoder first has instructions due, and wakes it
+    /// when instructions become due, so that the instructions of a phase leave in one push.
+    fn wake_decoder_stream<T: Transport>(&mut self, t: &mut T) {
+        if self.state.closed {
+            return;
+        }
+        let unsent = self
+            .state
+            .decoder_stream
+            .as_ref()
+            .map_or(0, |stream| stream.unsent.len());
+        if self.state.qpack_decoder.owed_len() + unsent > MAX_UNSENT_DECODER_BYTES {
+            return self.connection_error(t, H3ErrorCode::EXCESSIVE_LOAD);
+        }
+        let state = &mut self.state;
+        let due = state.qpack_decoder.has_owed();
+        match &mut state.decoder_stream {
+            Some(stream) => {
+                if !stream.woken && (due || !stream.unsent.is_empty()) {
+                    stream.woken = true;
+                    stream.waker.wake_by_ref();
+                }
+            }
+            None if due && !state.decoder_waiting => match t.open_uni(CONTROL_ORDER) {
+                Ok(id) => {
+                    let mut unsent = BytesMut::new();
+                    UniStreamHeader::QpackDecoder
+                        .encode(&mut unsent)
+                        .expect("the decoder stream header encodes");
+                    let waker = t.stream_waker(id);
+                    waker.wake_by_ref();
+                    state.decoder_stream = Some(DecoderStream {
+                        id,
+                        waker,
+                        unsent: unsent.freeze(),
+                        woken: true,
+                    });
+                }
+                Err(OpenError::StreamLimit) => state.decoder_waiting = true,
+                Err(OpenError::Closed) => {}
+            },
+            None => {}
+        }
     }
 
     /// After GOAWAY, closes the connection with H3_NO_ERROR once every exchange is gone and the
@@ -1218,7 +1343,10 @@ impl State {
         let random = RandomState::new().hash_one(0u8);
         let mut settings = Settings::new();
         let entries = [
-            (SettingId::QPACK_MAX_TABLE_CAPACITY, 0),
+            (
+                SettingId::QPACK_MAX_TABLE_CAPACITY,
+                self.config.qpack_max_table_capacity,
+            ),
             (SettingId::QPACK_BLOCKED_STREAMS, 0),
             (
                 SettingId::MAX_FIELD_SECTION_SIZE,
@@ -1258,6 +1386,29 @@ impl State {
                 Poll::Pending
             }
         }
+    }
+
+    /// Pushes the decoder stream's unsent bytes and every instruction due, in one push. Only
+    /// bytes that the allowance cut short keep the stream ready; otherwise it waits for its
+    /// waker, which fires when instructions are next due.
+    fn push_decoder<S: PullSink>(&mut self, sink: &mut S) -> Poll<()> {
+        let Some(stream) = &mut self.decoder_stream else {
+            return Poll::Pending;
+        };
+        if self.qpack_decoder.has_owed() {
+            self.out.extend_from_slice(&stream.unsent);
+            self.qpack_decoder.write_owed(&mut self.out);
+            stream.unsent = self.out.split().freeze();
+        }
+        let take = stream.unsent.len().min(sink.allowance());
+        if take > 0 && sink.push(stream.unsent.slice(..take)).is_ok() {
+            stream.unsent = stream.unsent.slice(take..);
+            if !stream.unsent.is_empty() {
+                return Poll::Ready(());
+            }
+        }
+        stream.woken = false;
+        Poll::Pending
     }
 
     /// Returns a frame header carved from the shared header buffer.
@@ -1522,34 +1673,36 @@ fn on_headers<E>(
     let max_size = state.config.max_field_section_size;
     let decoder = &mut state.qpack_decoder;
     match exchange.ingress {
-        Ingress::Head => match fields::decode_request(decoder, block, max_size, now) {
-            Ok(head) => {
-                let mut message = head.message;
-                // A request that is complete at its head carries no body event, so its body is
-                // built only for an application that took the completion. A CONNECT's body is the
-                // upload half of its tunnel and is always built.
-                if exchange.feed.is_none() && (!complete || head.connect) {
-                    let (body, feed) = ingress_body(state, id);
-                    exchange.body = Some(body);
-                    exchange.feed = Some(feed);
+        Ingress::Head => {
+            match fields::decode_request(decoder, id.into_inner(), block, max_size, now) {
+                Ok(head) => {
+                    let mut message = head.message;
+                    // A request that is complete at its head carries no body event, so its body is
+                    // built only for an application that took the completion. A CONNECT's body is the
+                    // upload half of its tunnel and is always built.
+                    if exchange.feed.is_none() && (!complete || head.connect) {
+                        let (body, feed) = ingress_body(state, id);
+                        exchange.body = Some(body);
+                        exchange.feed = Some(feed);
+                    }
+                    if let Some(body) = &exchange.body
+                        && !body.initialize_body_only(&mut message, false)
+                    {
+                        return Verdict::Stream(H3ErrorCode::MESSAGE_ERROR);
+                    }
+                    exchange.content_length = head.content_length;
+                    exchange.connect = head.connect;
+                    exchange.head_request = head.head_request;
+                    exchange.head = Some(message);
+                    exchange.ingress = Ingress::Body;
+                    Verdict::Continue
                 }
-                if let Some(body) = &exchange.body
-                    && !body.initialize_body_only(&mut message, false)
-                {
-                    return Verdict::Stream(H3ErrorCode::MESSAGE_ERROR);
-                }
-                exchange.content_length = head.content_length;
-                exchange.connect = head.connect;
-                exchange.head_request = head.head_request;
-                exchange.head = Some(message);
-                exchange.ingress = Ingress::Body;
-                Verdict::Continue
+                Err(error) => field_verdict(error),
             }
-            Err(error) => field_verdict(error),
-        },
+        }
         // RFC 9114: a CONNECT stream carries only DATA after the head.
         Ingress::Body if exchange.connect => Verdict::Connection(H3ErrorCode::FRAME_UNEXPECTED),
-        Ingress::Body => match fields::decode_trailers(decoder, block, max_size) {
+        Ingress::Body => match fields::decode_trailers(decoder, id.into_inner(), block, max_size) {
             Ok(trailers) => {
                 if exchange
                     .content_length

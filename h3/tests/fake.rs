@@ -96,6 +96,8 @@ pub(crate) struct FakeConn {
     pub(crate) next_uni: u64,
     /// The server unidirectional streams the peer permits.
     pub(crate) uni_limit: u64,
+    /// The opens that the peer's stream limit refused.
+    pub(crate) open_refusals: usize,
     /// The send window of the unidirectional streams the session opens.
     pub(crate) uni_send_window: usize,
     pub(crate) closed: Option<u64>,
@@ -116,6 +118,7 @@ impl FakeConn {
             streams: BTreeMap::new(),
             next_uni: 0,
             uni_limit: 100,
+            open_refusals: 0,
             uni_send_window: usize::MAX,
             closed: None,
             shutdown: false,
@@ -205,6 +208,7 @@ impl Transport for FakeConn {
             return Err(OpenError::Closed);
         }
         if self.next_uni >= self.uni_limit {
+            self.open_refusals += 1;
             return Err(OpenError::StreamLimit);
         }
         let id = StreamId::new(Side::Server, Dir::Uni, self.next_uni).unwrap();
@@ -322,6 +326,8 @@ impl TransportStream for &mut FakeStream {
 pub(crate) struct FakeSink {
     pub(crate) allowance: usize,
     pub(crate) pushed: Vec<u8>,
+    /// The `push` calls that staged their bytes.
+    pub(crate) pushes: usize,
     /// The `push_parts` calls, with the length of each shared payload.
     pub(crate) parts: Vec<usize>,
     pub(crate) finished: bool,
@@ -333,6 +339,7 @@ impl FakeSink {
         Self {
             allowance,
             pushed: Vec::new(),
+            pushes: 0,
             parts: Vec::new(),
             finished: false,
             closed: false,
@@ -363,6 +370,7 @@ impl PullSink for FakeSink {
         self.check(data.len())?;
         self.allowance -= data.len();
         self.pushed.extend_from_slice(&data);
+        self.pushes += 1;
         Ok(())
     }
 
