@@ -320,8 +320,24 @@ impl Clone for HttpMessage {
 
 impl Default for HttpMessage {
     fn default() -> Self {
+        Self::with_start_time(Instant::now())
+    }
+}
+
+impl HttpMessage {
+    pub const HTTP_VERSION_09: (u8, u8) = (0, 9);
+    pub const HTTP_VERSION_10: (u8, u8) = (1, 0);
+    pub const HTTP_VERSION_11: (u8, u8) = (1, 1);
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns a message equal to [`HttpMessage::new`] except that its start time is `start_time`.
+    /// Unlike `new`, it does not read the clock.
+    pub fn with_start_time(start_time: Instant) -> Self {
         Self {
-            start_time: Instant::now(),
+            start_time,
             destination_address: SocketAddress::default(),
             destination_ip: Box::default(),
             destination_port: Box::default(),
@@ -347,16 +363,6 @@ impl Default for HttpMessage {
             trailers_allowed: false,
             scheme: Scheme::Http,
         }
-    }
-}
-
-impl HttpMessage {
-    pub const HTTP_VERSION_09: (u8, u8) = (0, 9);
-    pub const HTTP_VERSION_10: (u8, u8) = (1, 0);
-    pub const HTTP_VERSION_11: (u8, u8) = (1, 1);
-
-    pub fn new() -> Self {
-        Self::default()
     }
 
     pub fn take(&mut self) -> Self {

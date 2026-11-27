@@ -11,6 +11,7 @@
 //! field lines of responses and trailers are encoded through QPACK.
 
 use std::net::Ipv6Addr;
+use std::time::Instant;
 
 use bytes::BytesMut;
 use mvfstr_proto::SendOrder;
@@ -194,13 +195,14 @@ pub(crate) struct RequestHead {
     pub(crate) head_request: bool,
 }
 
-/// Decodes and validates the request head in `block`.
+/// Decodes and validates the request head in `block`. The head starts at `start_time`.
 pub(crate) fn decode_request(
     decoder: &mut Decoder,
     block: &[u8],
     max_size: u64,
+    start_time: Instant,
 ) -> Result<RequestHead, FieldError> {
-    let mut builder = RequestBuilder::new(max_size);
+    let mut builder = RequestBuilder::new(max_size, start_time);
     decoder
         .decode_resolved_section(block, |line, static_ref| builder.field(line, static_ref))
         .map_err(FieldError::Qpack)?;
@@ -741,9 +743,9 @@ struct RequestBuilder {
 }
 
 impl RequestBuilder {
-    fn new(max_size: u64) -> Self {
+    fn new(max_size: u64, start_time: Instant) -> Self {
         Self {
-            message: Box::new(HttpMessage::new()),
+            message: Box::new(HttpMessage::with_start_time(start_time)),
             max_size,
             size: 0,
             method: None,

@@ -24,6 +24,7 @@ use std::task::Poll;
 use std::task::Wake;
 use std::task::Waker;
 use std::time::Duration;
+use std::time::Instant;
 
 use bytes::Bytes;
 use bytes::BytesMut;
@@ -1227,6 +1228,40 @@ fn a_head_whose_fin_arrived_with_it_is_delivered_complete_at_the_first_edge() {
     assert_eq!(body_of(&h.response(id)), b"hello");
     assert!(h.conn.get(id).finished);
     assert_eq!(h.log()[2..], [Ev::ResponseComplete(1), Ev::Complete(1)]);
+}
+
+/// A request head starts at the transport's reading for the phase in which it is decoded, whether
+/// its FIN came with it or not, and a head whose bytes span two phases starts at the second.
+#[test]
+fn a_request_head_starts_at_the_phase_reading() {
+    let mut h = Harness::ready();
+    // Ahead of the wall clock, so that a clock read while decoding cannot match it.
+    h.conn.now = Instant::now() + Duration::from_secs(3600);
+    let first = h.conn.now;
+    let (get, post, split) = (client_bidi(0), client_bidi(1), client_bidi(2));
+    h.receive(get, &headers_frame(GET), true);
+    h.receive(post, &headers_frame(POST), false);
+    let request = headers_frame(GET);
+    h.receive(split, &request[..request.len() - 1], false);
+    h.conn.now += Duration::from_millis(5);
+    let second = h.conn.now;
+    h.receive(split, &request[request.len() - 1..], true);
+    assert_eq!(
+        h.log(),
+        [
+            Ev::New(1),
+            Ev::Request { id: 1, eom: true },
+            Ev::New(5),
+            Ev::Request { id: 5, eom: false },
+            Ev::New(9),
+            Ev::Request { id: 9, eom: true },
+        ]
+    );
+    let state = h.app.0.borrow();
+    let start = |id| state.requests[&http_id(id)].head.start_time();
+    assert_eq!(start(get), first);
+    assert_eq!(start(post), first);
+    assert_eq!(start(split), second);
 }
 
 /// A request body whose FIN arrived with it ends at the stream's first edge: the request is

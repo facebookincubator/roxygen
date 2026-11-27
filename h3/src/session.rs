@@ -1424,6 +1424,7 @@ fn read_frames<T: Transport, E: OwnedExchange>(
         skip = 0;
     }
     drop(stream);
+    let now = t.now();
 
     let buffer = state.config.request_body_buffer;
     // Moved out of the state while the loop runs, since `on_headers` takes the whole state.
@@ -1450,7 +1451,7 @@ fn read_frames<T: Transport, E: OwnedExchange>(
                 Ok(Some(Frame::Headers(block))) => {
                     exchange.overhead += used as u64;
                     let complete = fin && exchange.parsed == end;
-                    on_headers(state, id, exchange, &block, complete)
+                    on_headers(state, id, exchange, &block, complete, now)
                 }
                 Ok(_) => {
                     exchange.overhead += used as u64;
@@ -1469,7 +1470,7 @@ fn read_frames<T: Transport, E: OwnedExchange>(
     }
     settle_credit(t, id, exchange);
     if fin && exchange.parsed == end {
-        return end_ingress(t.now(), exchange);
+        return end_ingress(now, exchange);
     }
     Verdict::Continue
 }
@@ -1509,17 +1510,19 @@ fn on_data<E>(exchange: &mut Exchange<E>, data: Bytes) -> Verdict {
 }
 
 /// Decodes a HEADERS frame: the request head, or the trailers. `complete` is whether the peer's
-/// FIN directly follows the frame.
+/// FIN directly follows the frame. A request head starts at `now`, the phase's reading.
 fn on_headers<E>(
     state: &mut State,
     id: StreamId,
     exchange: &mut Exchange<E>,
     block: &[u8],
     complete: bool,
+    now: Instant,
 ) -> Verdict {
     let max_size = state.config.max_field_section_size;
+    let decoder = &mut state.qpack_decoder;
     match exchange.ingress {
-        Ingress::Head => match fields::decode_request(&mut state.qpack_decoder, block, max_size) {
+        Ingress::Head => match fields::decode_request(decoder, block, max_size, now) {
             Ok(head) => {
                 let mut message = head.message;
                 // A request that is complete at its head carries no body event, so its body is
@@ -1546,7 +1549,7 @@ fn on_headers<E>(
         },
         // RFC 9114: a CONNECT stream carries only DATA after the head.
         Ingress::Body if exchange.connect => Verdict::Connection(H3ErrorCode::FRAME_UNEXPECTED),
-        Ingress::Body => match fields::decode_trailers(&mut state.qpack_decoder, block, max_size) {
+        Ingress::Body => match fields::decode_trailers(decoder, block, max_size) {
             Ok(trailers) => {
                 if exchange
                     .content_length

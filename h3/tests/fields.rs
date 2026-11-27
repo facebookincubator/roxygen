@@ -8,6 +8,8 @@
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::thread::LocalKey;
+use std::time::Duration;
+use std::time::Instant;
 
 use super::*;
 
@@ -447,7 +449,12 @@ fn compare(block: &[u8], max_size: u64) -> bool {
         block,
         max_size,
     ));
-    let actual = outcome(decode_request(&mut Decoder::new(), block, max_size));
+    let actual = outcome(decode_request(
+        &mut Decoder::new(),
+        block,
+        max_size,
+        Instant::now(),
+    ));
     assert_eq!(actual, expected, "{block:02x?} under {max_size}");
     matches!(actual, Outcome::Accepted { .. })
 }
@@ -619,7 +626,7 @@ fn a_static_name_is_not_checked_again_nor_a_static_value() {
         for (block, checks) in [(entry, (0, 0)), (static_name, (0, 1)), (literal, (1, 1))] {
             NAME_CHECKS.set(0);
             VALUE_CHECKS.set(0);
-            let _ = decode_request(&mut Decoder::new(), &block.0, u64::MAX);
+            let _ = decode_request(&mut Decoder::new(), &block.0, u64::MAX, Instant::now());
             assert_eq!(
                 (NAME_CHECKS.get(), VALUE_CHECKS.get()),
                 checks,
@@ -628,6 +635,21 @@ fn a_static_name_is_not_checked_again_nor_a_static_value() {
             );
         }
     }
+}
+
+#[test]
+fn decode_request_stamps_the_reading_it_is_given() {
+    // Ahead of the clock, so that a clock read cannot produce it.
+    let reading = Instant::now() + Duration::from_secs(3600);
+    let mut block = Block::new();
+    block.indexed(17);
+    block.indexed(23);
+    block.name_ref(0, b"example.com");
+    block.name_ref(1, b"/index.html");
+    let Ok(head) = decode_request(&mut Decoder::new(), &block.0, u64::MAX, reading) else {
+        panic!("a GET with its four pseudo-header fields is valid");
+    };
+    assert_eq!(head.message.start_time(), reading);
 }
 
 /// The reference response and trailer encoding, which leaves every static table lookup to QPACK.

@@ -5,6 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::time::Duration;
+use std::time::Instant;
+
 use crate::headers::HttpHeaderCode;
 use crate::headers::HttpHeaders;
 use crate::http::HttpHeaderSize;
@@ -1566,6 +1569,18 @@ fn clone_of_default_message_matches_the_original() {
     assert!(cloned.is_response());
     assert_eq!(cloned.status_message().unwrap(), b"");
     assert_eq!(format!("{cloned:?}"), format!("{response:?}"));
+}
+
+#[test]
+fn with_start_time_differs_from_new_only_in_its_start_time() {
+    // Ahead of the clock, so that a clock read cannot produce it.
+    let start = Instant::now() + Duration::from_secs(3600);
+    let given = HttpMessage::with_start_time(start);
+    let mut stamped = HttpMessage::new();
+    stamped.set_start_time(start);
+    assert_eq!(format!("{given:?}"), format!("{stamped:?}"));
+    assert_eq!(given.start_time(), stamped.start_time());
+    assert_eq!(given.start_time(), start);
 }
 
 #[test]
