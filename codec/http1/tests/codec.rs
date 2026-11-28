@@ -9255,6 +9255,11 @@ fn a_bodiless_post_with_caller_chunked_framing_closes_the_connection_when_enable
 /// The head of a 200 that a downstream codec generates for a GET, with `add_date` passed to
 /// `set_add_date_header_to_response` and `date` as the response's own `Date`.
 fn generate_ok_head(add_date: bool, date: Option<&[u8]>) -> String {
+    generate_counted_ok_head(add_date, date).0
+}
+
+/// [`generate_ok_head`]'s head and the allocations made by generating it.
+fn generate_counted_ok_head(add_date: bool, date: Option<&[u8]>) -> (String, usize) {
     let mut codec = Http1xCodec::new(TransportDirection::Downstream);
     codec.set_add_date_header_to_response(add_date);
     let request = b"GET / HTTP/1.1\r\nHost: h\r\n\r\n";
@@ -9269,34 +9274,60 @@ fn generate_ok_head(add_date: bool, date: Option<&[u8]>) -> String {
     if let Some(date) = date {
         message.headers_mut().set(HttpHeaderCode::Date, date);
     }
-    let head = generate(
-        &mut codec,
-        EgressFrame::Headers {
-            stream: StreamId::new(1),
-            message: &message,
-            end_stream: true,
-            extra_headers: None,
-        },
-    );
-    String::from_utf8(head).expect("an ASCII head")
+    let mut callback = Recorder::default();
+    let mut output = BufQueue::new(QUEUE_LIMIT);
+    let (generated, allocations) = count_allocations(|| {
+        codec.generate(
+            &mut output,
+            EgressFrame::Headers {
+                stream: StreamId::new(1),
+                message: &message,
+                end_stream: true,
+                extra_headers: None,
+            },
+            &mut callback,
+        )
+    });
+    generated.expect("a generated head");
+    let head = String::from_utf8(queue_bytes(&output)).expect("an ASCII head");
+    (head, allocations)
 }
 
 #[test]
 fn the_implicit_date_is_added_by_default_and_omitted_when_disabled() {
-    let head = generate_ok_head(true, None);
-    let date = head
-        .split("\r\n")
-        .find_map(|line| line.strip_prefix("Date: "))
-        .expect("an implicit Date");
-    assert!(date.len() == 29 && date.ends_with(" GMT"), "{head}");
+    // Retries when the second changes while the head is generated.
+    let (head, date) = loop {
+        let date = HttpMessage::date_header();
+        let head = generate_ok_head(true, None);
+        if HttpMessage::date_header() == date {
+            break (head, date);
+        }
+    };
+    let date = std::str::from_utf8(date.as_bytes()).expect("an ASCII date");
+    assert!(date.len() == 29 && date.ends_with(" GMT"), "{date}");
     assert_eq!(
-        head.replace(date, "<date>"),
-        "HTTP/1.1 200 OK\r\nDate: <date>\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n"
+        head,
+        format!(
+            "HTTP/1.1 200 OK\r\nDate: {date}\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n"
+        )
     );
     assert_eq!(
         generate_ok_head(false, None),
         "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n"
     );
+}
+
+#[test]
+fn the_implicit_date_adds_no_allocation() {
+    let (head, with_date) = generate_counted_ok_head(true, None);
+    assert!(head.contains("\r\nDate: "), "{head}");
+    let (head, without_date) = generate_counted_ok_head(false, None);
+    assert!(!head.contains("\r\nDate: "), "{head}");
+    if std_allocations_observable() {
+        assert_eq!(with_date, without_date);
+    } else {
+        eprintln!("allocation counts need a static std, as in optimized builds");
+    }
 }
 
 #[test]

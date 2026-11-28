@@ -1076,7 +1076,7 @@ impl Http1xCodec {
         }
         if !upstream && !has_date && self.add_date_to_response {
             output.extend_from_slice(b"Date: ");
-            output.extend_from_slice(HttpMessage::format_date_header().as_bytes());
+            output.extend_from_slice(HttpMessage::date_header().as_bytes());
             output.extend_from_slice(b"\r\n");
         }
         if egress_websocket && !has_upgrade {
