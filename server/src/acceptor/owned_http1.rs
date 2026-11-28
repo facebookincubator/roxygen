@@ -24,10 +24,10 @@ use roxygen_session::owned_h1::OwnedH1Session;
 use roxygen_session::uniplex::UniplexConfig;
 use roxygen_session::uniplex::UniplexTransport;
 
-use super::RunFuture;
 use super::handler_application::HandlerApplication;
 use super::handler_application::failure;
 use super::owned_run::OwnedDriver;
+use super::owned_run::OwnedRun;
 use super::owned_run::OwnedSession;
 use super::owned_run::RunFinished;
 
@@ -43,8 +43,8 @@ impl<A: OwnedApplication> OwnedDriver for OwnedH1Session<A> {
         handle.cancel();
     }
 
-    fn run(self) -> RunFuture {
-        Box::pin(OwnedH1Session::run(self))
+    fn run(self) -> impl OwnedRun {
+        OwnedH1Session::run(self)
     }
 }
 

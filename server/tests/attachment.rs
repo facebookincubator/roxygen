@@ -69,6 +69,8 @@ use tokio::sync::oneshot;
 
 use crate::acceptor::AcceptedConnectionObserver;
 use crate::acceptor::ConnectionInfo;
+use crate::allocation_count::start_counting;
+use crate::allocation_count::stop_counting;
 use crate::connection::CompletionPauseForTest;
 use crate::connection::ServeTransportOptions;
 use crate::connection::ServerConnection;
@@ -1379,6 +1381,28 @@ impl HttpHandler for PendingHandler {
     }
 }
 
+/// Polls `run` until `PendingHandler` sets `invoked`, then drops it as the server's force stop
+/// aborts its session task.
+async fn abandon_once_invoked<Run: Future + Unpin>(mut run: Run, invoked: &std::cell::Cell<bool>) {
+    std::future::poll_fn(|poll_context| {
+        assert!(
+            Pin::new(&mut run).poll(poll_context).is_pending(),
+            "the run waits for its handler"
+        );
+        if invoked.get() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(run)));
+    assert!(
+        dropped.is_ok(),
+        "an abandoned owned run drops without a panic"
+    );
+}
+
 #[test]
 fn owned_http1_abandoned_run_finishes_on_the_worker() {
     let mut owner = RuntimeOwner::start(RuntimeConfig {
@@ -1410,28 +1434,11 @@ fn owned_http1_abandoned_run_finishes_on_the_worker() {
                     Rc::new(PendingHandler(Rc::clone(&invoked))),
                 );
                 let control = accepted.control;
-                let mut run = accepted.session.run();
+                let run = accepted.session.run();
                 peer.write_all(b"GET /pending HTTP/1.1\r\nHost: localhost\r\n\r\n")
                     .await
                     .expect("request written");
-                std::future::poll_fn(|poll_context| {
-                    assert!(
-                        run.as_mut().poll(poll_context).is_pending(),
-                        "the run waits for its handler"
-                    );
-                    if invoked.get() {
-                        Poll::Ready(())
-                    } else {
-                        Poll::Pending
-                    }
-                })
-                .await;
-                // As the server's force stop aborts its session task.
-                let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(run)));
-                assert!(
-                    dropped.is_ok(),
-                    "an abandoned owned run drops without a panic"
-                );
+                abandon_once_invoked(run, &invoked).await;
                 let mut rest = Vec::new();
                 let _ = peer.read_to_end(&mut rest).await;
                 assert!(rest.is_empty(), "the cancelled request gets no response");
@@ -1823,6 +1830,110 @@ fn untimed_owned(owned_http1: bool, owned_http2: bool) -> crate::acceptor::Serve
         owned_http1,
         owned_http2,
         ..crate::acceptor::ServerSessionConfig::default()
+    }
+}
+
+/// An abandoned owned HTTP/2 run finishes in the worker cleanup task: its pending request gets
+/// no response, its transport closes, and its session finishes.
+#[test]
+fn owned_http2_abandoned_run_finishes_on_the_worker() {
+    on_worker(|context, _runtime| async move {
+        let (io, peer) = tokio::io::duplex(64 * 1024);
+        let invoked = Rc::new(std::cell::Cell::new(false));
+        let accepted = attach_for_test(
+            &context,
+            CodecProtocol::Http2,
+            untimed_owned(false, true),
+            io,
+            Rc::new(PendingHandler(Rc::clone(&invoked))),
+        );
+        let control = accepted.control;
+        let run = accepted.session.run();
+        let (client, connection) = h2::client::handshake(peer).await.expect("H2 handshake");
+        let connection = tokio::task::spawn_local(connection);
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/pending")
+            .body(())
+            .expect("request builds");
+        let mut client = client.ready().await.expect("H2 client ready");
+        let (response, _stream) = client.send_request(request, true).expect("request sent");
+        abandon_once_invoked(run, &invoked).await;
+        assert!(
+            response.await.is_err(),
+            "the cancelled request gets no response"
+        );
+        let _ = connection.await.expect("the client connection joins");
+        while !control.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    });
+}
+
+/// Starting an owned run of either protocol allocates one box, which holds the driver's run.
+/// This crate's own code makes that allocation, so every build counts it.
+#[test]
+fn an_owned_run_allocates_one_box() {
+    use crate::acceptor::ServerSessionKind;
+    for (protocol, session, kind) in [
+        (
+            CodecProtocol::Http11,
+            untimed_owned(true, false),
+            ServerSessionKind::OwnedHttp1,
+        ),
+        (
+            CodecProtocol::Http2,
+            untimed_owned(false, true),
+            ServerSessionKind::OwnedHttp2,
+        ),
+    ] {
+        on_worker(move |context, _runtime| async move {
+            let (io, _peer) = tokio::io::duplex(64);
+            let accepted = attach_for_test(&context, protocol, session, io, Rc::new(FixedHandler));
+            assert_eq!(accepted.session.kind(), kind);
+            start_counting();
+            let run = accepted.session.run();
+            let allocations = stop_counting();
+            drop(run);
+            while !accepted.control.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(allocations, 1, "{kind:?}");
+        });
+    }
+}
+
+/// An owned run of either protocol that unwinds out of a poll fails only its connection: the run
+/// returns an error, the worker counts one contained connection panic, and the peer sees the
+/// connection close.
+#[test]
+fn a_faulted_owned_run_reports_a_contained_panic() {
+    for (protocol, session) in [
+        (CodecProtocol::Http11, untimed_owned(true, false)),
+        (CodecProtocol::Http2, untimed_owned(false, true)),
+    ] {
+        on_worker(move |context, _runtime| async move {
+            use tokio::io::AsyncReadExt;
+            let (io, mut peer) = tokio::io::duplex(4096);
+            let accepted = attach_for_test(&context, protocol, session, io, Rc::new(FixedHandler));
+            let panics = context.handle().poll_stats().contained_connection_panics;
+            crate::acceptor::fault_next_owned_run();
+            let error = accepted
+                .session
+                .run()
+                .await
+                .expect_err("the faulted run fails");
+            assert_eq!(error.message(), b"owned connection panicked".as_slice());
+            assert_eq!(
+                context.handle().poll_stats().contained_connection_panics - panics,
+                1,
+                "{protocol:?}"
+            );
+            assert!(accepted.control.is_finished());
+            let mut rest = Vec::new();
+            let _ = peer.read_to_end(&mut rest).await;
+            assert!(rest.is_empty(), "{}", String::from_utf8_lossy(&rest));
+        });
     }
 }
 

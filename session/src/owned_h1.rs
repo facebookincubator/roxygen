@@ -947,7 +947,7 @@ impl<A: OwnedApplication> OwnedH1Session<A> {
     /// worker teardown, because its native I/O has not joined. To stop early, call the handle's
     /// `cancel` and poll the run to completion. Dropping the session or its run before the first
     /// poll does not panic.
-    pub fn run(self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> {
+    pub fn run(self) -> impl Future<Output = Result<UniplexRunSummary, HttpError>> + Unpin {
         DriverRun(Some(self.0))
     }
 }

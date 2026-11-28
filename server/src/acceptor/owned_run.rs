@@ -37,8 +37,16 @@ pub(crate) trait OwnedDriver: 'static {
 
     fn cancel(handle: &Self::Handle);
 
-    fn run(self) -> RunFuture;
+    fn run(self) -> impl OwnedRun;
 }
+
+/// An owned driver's run, which `OwnedSessionRun` holds inline.
+pub(crate) trait OwnedRun:
+    Future<Output = Result<UniplexRunSummary, HttpError>> + Unpin + 'static
+{
+}
+
+impl<R: Future<Output = Result<UniplexRunSummary, HttpError>> + Unpin + 'static> OwnedRun for R {}
 
 /// One owned connection and the worker cleanup that retires it.
 pub(crate) struct OwnedSession<D: OwnedDriver> {
@@ -146,13 +154,12 @@ impl<D: OwnedDriver> OwnedSession<D> {
     /// Runs the connection, then waits for its cleanup's finalization. Dropping the returned
     /// future before it completes cancels the connection, whose run then finishes in the
     /// worker cleanup task.
-    pub(crate) fn run(self) -> OwnedSessionRun<D> {
+    pub(crate) fn run(self) -> OwnedSessionRun<D, impl OwnedRun> {
         let run = self.session.run();
         #[cfg(test)]
-        let run = if RUN_FAULT.take() {
-            faulted_run(run)
-        } else {
-            run
+        let run = FaultableRun {
+            run,
+            faulted: RUN_FAULT.take(),
         };
         OwnedSessionRun {
             run: Some(run),
@@ -176,30 +183,41 @@ pub(crate) fn fault_next_owned_run() {
     RUN_FAULT.set(true);
 }
 
+/// A run that, while `faulted`, unwinds out of every poll without polling its driver.
 #[cfg(test)]
-fn faulted_run(unstarted: RunFuture) -> RunFuture {
-    Box::pin(std::future::poll_fn(
-        move |_: &mut Context<'_>| -> Poll<Result<UniplexRunSummary, HttpError>> {
-            let _unstarted = &unstarted;
-            panic!("owned run fault")
-        },
-    ))
+struct FaultableRun<R> {
+    run: R,
+    faulted: bool,
 }
 
-pub(crate) struct OwnedSessionRun<D: OwnedDriver> {
-    run: Option<RunFuture>,
+#[cfg(test)]
+impl<R: Future + Unpin> Future for FaultableRun<R> {
+    type Output = R::Output;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<R::Output> {
+        if self.faulted {
+            panic!("owned run fault");
+        }
+        Pin::new(&mut self.run).poll(context)
+    }
+}
+
+/// A running owned session. Its driver's run is boxed only when it is abandoned to the cleanup
+/// task.
+pub(crate) struct OwnedSessionRun<D: OwnedDriver, R: OwnedRun> {
+    run: Option<R>,
     cleanup: Option<Cleanup<D>>,
     finalizing: Option<WorkerCleanupTask>,
     result: Option<Result<UniplexRunSummary, HttpError>>,
 }
 
-impl<D: OwnedDriver> Future for OwnedSessionRun<D> {
+impl<D: OwnedDriver, R: OwnedRun> Future for OwnedSessionRun<D, R> {
     type Output = Result<UniplexRunSummary, HttpError>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
         if let Some(run) = this.run.as_mut() {
-            let result = match catch_unwind(AssertUnwindSafe(|| run.as_mut().poll(context))) {
+            let result = match catch_unwind(AssertUnwindSafe(|| Pin::new(run).poll(context))) {
                 Ok(Poll::Pending) => return Poll::Pending,
                 Ok(Poll::Ready(result)) => result,
                 Err(panic) => {
@@ -242,10 +260,10 @@ impl<D: OwnedDriver> Future for OwnedSessionRun<D> {
     }
 }
 
-impl<D: OwnedDriver> Drop for OwnedSessionRun<D> {
+impl<D: OwnedDriver, R: OwnedRun> Drop for OwnedSessionRun<D, R> {
     fn drop(&mut self) {
         if let (Some(run), Some(cleanup)) = (self.run.take(), self.cleanup.as_ref()) {
-            cleanup.shared.abandoned.set(Some(run));
+            cleanup.shared.abandoned.set(Some(Box::pin(run)));
             D::cancel(&cleanup.handle);
             if cleanup.shared.cleanup_dropped.get() {
                 drop(cleanup.shared.abandoned.take());
@@ -299,8 +317,8 @@ mod tests {
             handle.0.set(true);
         }
 
-        fn run(self) -> RunFuture {
-            Box::pin(self.0)
+        fn run(self) -> impl OwnedRun {
+            self.0
         }
     }
 

@@ -26,10 +26,10 @@ use roxygen_session::session::LifecycleObserverId;
 use roxygen_session::uniplex::UniplexConfig;
 use roxygen_session::uniplex::UniplexTransport;
 
-use super::RunFuture;
 use super::handler_application::HandlerApplication;
 use super::handler_application::failure;
 use super::owned_run::OwnedDriver;
+use super::owned_run::OwnedRun;
 use super::owned_run::OwnedSession;
 use super::owned_run::RunFinished;
 
@@ -45,8 +45,8 @@ impl<A: OwnedApplication> OwnedDriver for OwnedH2Session<A> {
         handle.cancel();
     }
 
-    fn run(self) -> RunFuture {
-        Box::pin(OwnedH2Session::run(self))
+    fn run(self) -> impl OwnedRun {
+        OwnedH2Session::run(self)
     }
 }
 
