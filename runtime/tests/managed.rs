@@ -846,6 +846,93 @@ fn notification_panic_does_not_skip_driver_or_supervisor_wake() {
     }
 }
 
+fn is_accepting_on_another_thread(handle: &WorkerHandle) -> bool {
+    let handle = handle.clone();
+    std::thread::spawn(move || handle.is_accepting())
+        .join()
+        .expect("reader thread joins")
+}
+
+#[test]
+fn is_accepting_follows_every_admission_close_on_every_thread() {
+    let (quiesced, quiesced_driver) = WorkerDriver::new(1).expect("worker driver starts");
+    assert!(quiesced.is_accepting());
+    assert!(is_accepting_on_another_thread(&quiesced));
+    quiesced.begin_quiesce(QuiesceDeadline::new(Duration::from_secs(60)));
+    assert!(!quiesced.is_accepting());
+    assert!(!is_accepting_on_another_thread(&quiesced));
+    assert_eq!(quiesced.state(), WorkerState::Open);
+    assert_eq!(quiesced.submit(|_| {}), Err(SubmitError::Closed));
+    drop(quiesced_driver);
+
+    let (shut_down, mut shut_down_driver) = WorkerDriver::new(1).expect("worker driver starts");
+    assert!(shut_down.begin_shutdown());
+    assert!(!shut_down.is_accepting());
+    assert!(!is_accepting_on_another_thread(&shut_down));
+    let waker = futures::task::noop_waker();
+    assert!(
+        Pin::new(&mut shut_down_driver)
+            .poll(&mut Context::from_waker(&waker))
+            .is_ready()
+    );
+    assert_eq!(shut_down.state(), WorkerState::Closed);
+    assert!(!shut_down.is_accepting());
+    assert!(!is_accepting_on_another_thread(&shut_down));
+
+    let (closed, closed_driver) = WorkerDriver::new(1).expect("worker driver starts");
+    assert!(closed.shared.mark_closed().is_none());
+    assert!(!closed.is_accepting());
+    assert!(!is_accepting_on_another_thread(&closed));
+    assert_eq!(closed.submit(|_| {}), Err(SubmitError::Closed));
+    drop(closed_driver);
+}
+
+/// Readers on other threads spin until they observe shutdown, one through
+/// cancellation and one through admission. Both must then find admission
+/// closed, and `submit` must refuse their command.
+#[test]
+fn racing_readers_that_observe_shutdown_find_admission_closed() {
+    let (handle, driver) = WorkerDriver::new(1).expect("worker driver starts");
+    let spin_until = |handle: &WorkerHandle, observed: fn(&WorkerHandle) -> bool| {
+        let handle = handle.clone();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + TEST_TIMEOUT;
+            while !observed(&handle) {
+                assert!(Instant::now() < deadline, "shutdown becomes visible");
+                std::hint::spin_loop();
+            }
+            (handle.is_accepting(), handle.submit(|_| {}))
+        })
+    };
+    let through_cancellation = spin_until(&handle, WorkerHandle::is_cancelled);
+    let through_admission = spin_until(&handle, |handle| !handle.is_accepting());
+    assert!(handle.begin_shutdown());
+    for reader in [through_cancellation, through_admission] {
+        let (accepting, submitted) = reader.join().expect("reader thread joins");
+        assert!(!accepting);
+        assert_eq!(submitted, Err(SubmitError::Closed));
+    }
+    drop(driver);
+}
+
+#[test]
+fn is_accepting_does_not_lock_the_command_queue() {
+    let (handle, driver) = WorkerDriver::new(1).expect("worker driver starts");
+    let locks = handle.queue_locks();
+    assert_eq!(handle.queued_commands(), 0);
+    assert_eq!(handle.queue_locks(), locks + 1, "one queue lock");
+
+    let locks = handle.queue_locks();
+    assert!(handle.is_accepting());
+    assert_eq!(handle.queue_locks(), locks, "an open worker");
+
+    assert!(handle.begin_shutdown());
+    let locks = handle.queue_locks();
+    assert!(!handle.is_accepting());
+    assert_eq!(handle.queue_locks(), locks, "a closing worker");
+    drop(driver);
+}
+
 struct ParkedWorker {
     handle: WorkerHandle,
     completion: watch::Receiver<Option<Result<(), ManagedWorkerError>>>,

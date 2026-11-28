@@ -389,7 +389,6 @@ impl Drop for WorkerCommand {
 
 struct QueueState {
     lifecycle: WorkerState,
-    accepting: bool,
     capacity: usize,
     commands: VecDeque<WorkerCommand>,
     outstanding_work: usize,
@@ -407,14 +406,21 @@ pub(crate) struct WorkerShared {
     id: WorkerId,
     owner_thread: ThreadId,
     queue: Mutex<QueueState>,
+    /// Stored only under the `queue` lock, so `enqueue` does not queue a
+    /// command after admission closes.
+    accepting: AtomicBool,
     cancelled: AtomicBool,
     quiescing: CancellationSource,
     poll_counters: PollCounters,
     shutdown_span: Mutex<Option<OperationSpan>>,
+    #[cfg(test)]
+    queue_locks: AtomicUsize,
 }
 
 impl WorkerShared {
     fn queue(&self) -> std::sync::MutexGuard<'_, QueueState> {
+        #[cfg(test)]
+        self.queue_locks.fetch_add(1, Ordering::Relaxed);
         self.queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -487,7 +493,7 @@ impl WorkerShared {
         let (closed_wakers, driver_waker, supervisor_waker) = {
             let mut queue = self.queue();
             queue.lifecycle = WorkerState::Closed;
-            queue.accepting = false;
+            self.accepting.store(false, Ordering::Release);
             queue.ready = Vec::new();
             (
                 std::mem::take(&mut queue.closed_wakers),
@@ -584,7 +590,6 @@ impl WorkerHandle {
                 owner_thread,
                 queue: Mutex::new(QueueState {
                     lifecycle: WorkerState::Open,
-                    accepting: true,
                     capacity,
                     commands: VecDeque::with_capacity(capacity),
                     outstanding_work: 0,
@@ -595,10 +600,13 @@ impl WorkerHandle {
                     closed_wakers: Vec::new(),
                     ready: Vec::new(),
                 }),
+                accepting: AtomicBool::new(true),
                 cancelled: AtomicBool::new(false),
                 quiescing: CancellationSource::new(),
                 poll_counters: PollCounters::default(),
                 shutdown_span: Mutex::new(None),
+                #[cfg(test)]
+                queue_locks: AtomicUsize::new(0),
             }),
         })
     }
@@ -622,8 +630,9 @@ impl WorkerHandle {
 
     /// Whether new commands may be admitted, independently of driver state.
     /// A draining managed worker remains `Open` while admitted work finishes.
+    #[inline]
     pub fn is_accepting(&self) -> bool {
-        self.shared.queue().accepting
+        self.shared.accepting.load(Ordering::Acquire)
     }
 
     /// Observes the close of admission without requesting cancellation.
@@ -641,7 +650,7 @@ impl WorkerHandle {
             if queue.lifecycle != WorkerState::Open {
                 return;
             }
-            queue.accepting = false;
+            self.shared.accepting.store(false, Ordering::Release);
             let now = Instant::now();
             if queue
                 .quiesce_deadline
@@ -748,7 +757,9 @@ impl WorkerHandle {
                 return false;
             }
             queue.lifecycle = WorkerState::Closing;
-            queue.accepting = false;
+            // Admission closes before cancellation is published, so a thread that
+            // sees cancellation sees admission closed.
+            self.shared.accepting.store(false, Ordering::Release);
             self.shared.cancelled.store(true, Ordering::Release);
             queue.driver_waker.take()
         };
@@ -781,7 +792,7 @@ impl WorkerHandle {
         let mut command = Some(command);
         let (driver_waker, rejection) = {
             let mut queue = self.shared.queue();
-            if !queue.accepting {
+            if !self.shared.accepting.load(Ordering::Relaxed) {
                 (None, Some(SubmitError::Closed))
             } else if queue.commands.len() == queue.capacity {
                 (None, Some(SubmitError::Overloaded))
@@ -841,6 +852,12 @@ impl WorkerHandle {
     #[cfg(test)]
     pub(crate) fn outstanding_work(&self) -> usize {
         self.shared.queue().outstanding_work
+    }
+
+    /// How many times the command queue lock has been taken.
+    #[cfg(test)]
+    pub(crate) fn queue_locks(&self) -> usize {
+        self.shared.queue_locks.load(Ordering::Relaxed)
     }
 }
 

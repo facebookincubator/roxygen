@@ -787,8 +787,7 @@ pub(crate) fn worker_admission_checks_for_test() -> u64 {
     WORKER_ADMISSION_CHECKS.with(Cell::get)
 }
 
-/// Whether `worker` still accepts new work: an uncontended lock of its
-/// command queue.
+/// Whether `worker` still accepts new work: one atomic load.
 pub(crate) fn worker_admits(worker: &WorkerHandle) -> bool {
     #[cfg(test)]
     WORKER_ADMISSION_CHECKS.with(|checks| checks.set(checks.get() + 1));
