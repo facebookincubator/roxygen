@@ -141,7 +141,7 @@ impl HttpRequestVerifier {
         self.has_path = true;
         let strict = strict && !(allow_empty && path.is_empty());
         message
-            .set_url(path, strict)
+            .set_url_components(path, strict)
             .is_ok_and(|parsed| !strict || parsed.valid())
     }
 

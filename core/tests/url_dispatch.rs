@@ -8,8 +8,8 @@
 use std::ops::Range;
 
 use super::ABSOLUTE_URL_SCANS;
-use super::Components;
 use super::ParseUrl;
+use super::UrlComponents;
 use super::find_bytes;
 use super::parse_components;
 use super::parse_fully_formed;
@@ -23,12 +23,12 @@ const ALPHABET: &[u8] = b"/:ah1?#@[].%\x20\x7f\x80";
 
 /// A `parse_components` that searches for `://` even in leading-slash targets,
 /// for comparison with the dispatch that skips that search.
-fn scheme_scanning_parse(url: &[u8], strict: bool) -> Components {
+fn scheme_scanning_parse(url: &[u8], strict: bool) -> UrlComponents {
     if url == b"/" {
-        return Components {
+        return UrlComponents {
             path: 0..1,
             valid: true,
-            ..Components::default()
+            ..UrlComponents::default()
         };
     }
 
@@ -56,7 +56,7 @@ type Fields<'a> = (
     bool,
 );
 
-fn fields(components: &Components) -> Fields<'_> {
+fn fields(components: &UrlComponents) -> Fields<'_> {
     (
         &components.scheme,
         &components.authority,

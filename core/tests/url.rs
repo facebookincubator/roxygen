@@ -5,6 +5,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use crate::alloc_count::count_allocations;
+use crate::alloc_count::std_allocations_observable;
+use crate::message::HttpMessage;
+use crate::message::MessageTypeError;
 use crate::url::ParseUrl;
 use crate::url::Url;
 use crate::url::UrlMode;
@@ -708,4 +712,114 @@ fn redirect_destination_matches_absolute_relative_and_fallback_paths() {
         ParseUrl::get_redirect_destination(b"/original", b"http", b"/next", b"/missing-host",),
         None,
     );
+}
+
+#[test]
+fn set_url_components_agrees_with_set_url() {
+    for target in [
+        b"/".as_slice(),
+        b"/path/to/resource?a=1&b=2#frag",
+        b"*",
+        b"/caf\xc3\xa9?q",
+        b"/bad target",
+        b"http://example.com:8080/path?query#fragment",
+        b"https://[::1]:443/",
+        b"http://user:pass@example.com/path",
+        b"user@example.com/path",
+        b"example.com:443",
+        b"localhost:80abc",
+        b"http://host#fragment",
+        b"",
+    ] {
+        for strict in [false, true] {
+            let context = format!("target={} strict={strict}", target.escape_ascii());
+            let expected = ParseUrl::parse_url_maybe_invalid(target, strict);
+            let mut by_url = HttpMessage::new();
+            let parsed = by_url
+                .set_url(target, strict)
+                .expect("a request accepts a URL");
+            let mut by_components = HttpMessage::new();
+            let components = by_components
+                .set_url_components(target, strict)
+                .expect("a request accepts a URL");
+
+            for message in [&mut by_url, &mut by_components] {
+                assert_eq!(message.url(), Ok(target), "{context}");
+                assert_eq!(message.path(), Ok(expected.request_path()), "{context}");
+                assert_eq!(
+                    message.query_string(),
+                    Ok(expected.request_query()),
+                    "{context}"
+                );
+            }
+
+            assert_eq!(parsed.url(), expected.url(), "{context}");
+            assert_eq!(parsed.scheme(), expected.scheme(), "{context}");
+            assert_eq!(parsed.host(), expected.host(), "{context}");
+            assert_eq!(parsed.port(), expected.port(), "{context}");
+            assert_eq!(parsed.path(), expected.path(), "{context}");
+            assert_eq!(parsed.query(), expected.query(), "{context}");
+            assert_eq!(parsed.fragment(), expected.fragment(), "{context}");
+            assert_eq!(parsed.valid(), expected.valid(), "{context}");
+            assert_eq!(parsed.authority(), expected.authority(), "{context}");
+            assert_eq!(parsed.has_host(), expected.has_host(), "{context}");
+            assert_eq!(
+                parsed.host_and_port(),
+                expected.host_and_port(),
+                "{context}"
+            );
+
+            assert_eq!(components.valid(), expected.valid(), "{context}");
+            assert_eq!(components.authority(), expected.authority(), "{context}");
+            assert_eq!(components.has_host(), expected.has_host(), "{context}");
+            assert_eq!(
+                components.host_and_port(),
+                expected.host_and_port(),
+                "{context}"
+            );
+        }
+    }
+
+    let mut response = HttpMessage::new();
+    response
+        .set_status_code(200)
+        .expect("a new message accepts a status");
+    assert_eq!(
+        response.set_url_components(b"/", false).err(),
+        Some(MessageTypeError::RequestApiOnResponse),
+    );
+    assert_eq!(
+        response.set_url(b"/", false).err(),
+        Some(MessageTypeError::RequestApiOnResponse),
+    );
+}
+
+#[test]
+fn set_url_components_copies_the_url_once() {
+    let target: &[u8; 40] = b"/api/v1/items/0123456789abcdef?limit=100";
+    let observable = std_allocations_observable();
+    let mut message = HttpMessage::new();
+    message
+        .set_url(b"/", false)
+        .expect("a request accepts a URL");
+
+    let (components, components_allocations) =
+        count_allocations(|| message.set_url_components(target, true));
+    assert!(components.expect("a request accepts a URL").valid());
+    assert_eq!(message.url(), Ok(target.as_slice()));
+    let (parsed, url_allocations) = count_allocations(|| message.set_url(target, true));
+    assert!(parsed.expect("a request accepts a URL").valid());
+
+    if observable {
+        assert_eq!(
+            components_allocations, 1,
+            "only the message's copy of the URL"
+        );
+        assert_eq!(
+            url_allocations, 2,
+            "the message's copy and the returned ParseUrl's copy"
+        );
+    } else {
+        eprintln!("allocation counts need a statically linked std");
+    }
 }

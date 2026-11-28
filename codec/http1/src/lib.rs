@@ -103,7 +103,7 @@ use roxygen_core::http::TransportDirection;
 use roxygen_core::ids::StreamId;
 use roxygen_core::message::HttpMessage;
 use roxygen_core::rfc2616;
-use roxygen_core::url::ParseUrl;
+use roxygen_core::url::UrlComponents;
 use sha1::Digest as _;
 use sha1::Sha1;
 
@@ -249,7 +249,7 @@ pub struct Http1xCodec {
     header_value: Vec<u8>,
     target: Vec<u8>,
     target_complete: bool,
-    parsed_target: Option<ParseUrl>,
+    parsed_target: Option<UrlComponents>,
     reason: Vec<u8>,
     trailers: Option<HttpHeaders>,
     header_bytes: usize,

@@ -17,8 +17,10 @@ pub enum UrlMode {
     Strict,
 }
 
+/// The parsed components of a URL, without a copy of the URL itself.
+#[doc(hidden)]
 #[derive(Debug, Default)]
-struct Components {
+pub struct UrlComponents {
     scheme: Box<[u8]>,
     authority: Box<[u8]>,
     host: Box<[u8]>,
@@ -29,11 +31,37 @@ struct Components {
     valid: bool,
 }
 
+impl UrlComponents {
+    pub fn valid(&self) -> bool {
+        self.valid
+    }
+
+    pub fn authority(&self) -> &[u8] {
+        &self.authority
+    }
+
+    pub fn has_host(&self) -> bool {
+        self.valid && !self.host.is_empty()
+    }
+
+    pub fn host_and_port(&self) -> Box<[u8]> {
+        join_host_and_port(&self.host, self.port)
+    }
+
+    pub(crate) fn path_range(&self) -> Range<usize> {
+        self.path.clone()
+    }
+
+    pub(crate) fn query_range(&self) -> Range<usize> {
+        self.query.clone()
+    }
+}
+
 /// An owned parse of an absolute URL or URI reference.
 #[derive(Debug)]
 pub struct ParseUrl {
     url: OwnedBytes,
-    components: Components,
+    components: UrlComponents,
 }
 
 impl ParseUrl {
@@ -50,6 +78,13 @@ impl ParseUrl {
         let url = OwnedBytes::new(url.as_ref());
         let components = parse_components(url.bytes(), strict);
         Self { url, components }
+    }
+
+    pub(crate) fn from_components(url: &[u8], components: UrlComponents) -> Self {
+        Self {
+            url: OwnedBytes::new(url),
+            components,
+        }
     }
 
     pub fn is_supported_scheme(location: impl AsRef<[u8]>) -> bool {
@@ -125,7 +160,7 @@ impl ParseUrl {
     }
 
     pub fn has_host(&self) -> bool {
-        self.valid() && !self.components.host.is_empty()
+        self.components.has_host()
     }
 
     pub fn host(&self) -> &[u8] {
@@ -151,23 +186,15 @@ impl ParseUrl {
     }
 
     pub fn host_and_port(&self) -> Box<[u8]> {
-        join_host_and_port(self.host(), self.port())
+        self.components.host_and_port()
     }
 
     pub fn path(&self) -> &[u8] {
         &self.url.bytes()[self.components.path.clone()]
     }
 
-    pub(crate) fn path_range(&self) -> Range<usize> {
-        self.components.path.clone()
-    }
-
     pub fn query(&self) -> &[u8] {
         &self.url.bytes()[self.components.query.clone()]
-    }
-
-    pub(crate) fn query_range(&self) -> Range<usize> {
-        self.components.query.clone()
     }
 
     pub fn fragment(&self) -> &[u8] {
@@ -369,12 +396,12 @@ thread_local! {
     static ABSOLUTE_URL_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn parse_components(url: &[u8], strict: bool) -> Components {
+pub(crate) fn parse_components(url: &[u8], strict: bool) -> UrlComponents {
     if url == b"/" {
-        return Components {
+        return UrlComponents {
             path: 0..1,
             valid: true,
-            ..Components::default()
+            ..UrlComponents::default()
         };
     }
 
@@ -397,29 +424,29 @@ fn parse_components(url: &[u8], strict: bool) -> Components {
     }
 }
 
-fn parse_fully_formed(url: &[u8], scheme_end: usize, strict: bool) -> Components {
+fn parse_fully_formed(url: &[u8], scheme_end: usize, strict: bool) -> UrlComponents {
     if !validate_url(url, strict) {
-        return Components::default();
+        return UrlComponents::default();
     }
 
     let authority_start = scheme_end + 3;
     let authority_end = find_any_from(url, authority_start, b"/?#").unwrap_or(url.len());
     if authority_start == authority_end {
-        return Components::default();
+        return UrlComponents::default();
     }
 
     let raw_authority = &url[authority_start..authority_end];
     if url.get(authority_end) == Some(&b'#') {
-        return Components::default();
+        return UrlComponents::default();
     }
     let Some((host, port)) = parse_full_authority(raw_authority) else {
-        return Components::default();
+        return UrlComponents::default();
     };
-    let mut components = Components {
+    let mut components = UrlComponents {
         scheme: url[..scheme_end].to_vec().into_boxed_slice(),
         host: host.to_vec().into_boxed_slice(),
         port,
-        ..Components::default()
+        ..UrlComponents::default()
     };
 
     let query_start = find_byte_from(url, b'?', authority_end);
@@ -431,7 +458,7 @@ fn parse_fully_formed(url: &[u8], scheme_end: usize, strict: bool) -> Components
             .iter()
             .all(|byte| is_full_url_char(*byte))
         {
-            return Components::default();
+            return UrlComponents::default();
         }
     }
     if let Some(query_start) = query_start {
@@ -442,7 +469,7 @@ fn parse_fully_formed(url: &[u8], scheme_end: usize, strict: bool) -> Components
                 .iter()
                 .all(|byte| *byte == b'?' || is_full_url_char(*byte))
             {
-                return Components::default();
+                return UrlComponents::default();
             }
         }
     }
@@ -456,7 +483,7 @@ fn parse_fully_formed(url: &[u8], scheme_end: usize, strict: bool) -> Components
             .iter()
             .all(|byte| matches!(*byte, b'?' | b'#') || is_full_url_char(*byte))
         {
-            return Components::default();
+            return UrlComponents::default();
         }
     }
     components.authority = join_host_and_port(&components.host, components.port);
@@ -464,9 +491,9 @@ fn parse_fully_formed(url: &[u8], scheme_end: usize, strict: bool) -> Components
     components
 }
 
-fn parse_non_fully_formed(url: &[u8], strict: bool) -> Components {
+fn parse_non_fully_formed(url: &[u8], strict: bool) -> UrlComponents {
     if url.is_empty() {
-        return Components::default();
+        return UrlComponents::default();
     }
     let Some(Delimiters {
         path_start,
@@ -474,13 +501,13 @@ fn parse_non_fully_formed(url: &[u8], strict: bool) -> Components {
         fragment_start,
     }) = scan_delimiters(url, strict)
     else {
-        return Components::default();
+        return UrlComponents::default();
     };
     let path_end = earliest(query_start, fragment_start).unwrap_or(url.len());
     let authority_end = path_start.map_or(path_end, |path_start| path_start.min(path_end));
-    let mut components = Components {
+    let mut components = UrlComponents {
         authority: url[..authority_end].to_vec().into_boxed_slice(),
-        ..Components::default()
+        ..UrlComponents::default()
     };
 
     if let Some(path_start) = path_start
@@ -575,7 +602,7 @@ fn scan_delimiters(url: &[u8], strict: bool) -> Option<Delimiters> {
     (classes & rejected_url_bytes(strict) == 0).then_some(delimiters)
 }
 
-fn parse_authority(components: &mut Components) -> bool {
+fn parse_authority(components: &mut UrlComponents) -> bool {
     let authority = components.authority.as_ref();
     let left_bracket = find_byte(authority, b'[');
     let right_bracket = find_byte(authority, b']');
@@ -851,12 +878,12 @@ mod tests {
     mod oracle {
         use super::super::*;
 
-        pub(super) fn parse_components(url: &[u8], strict: bool) -> Components {
+        pub(super) fn parse_components(url: &[u8], strict: bool) -> UrlComponents {
             if url == b"/" {
-                return Components {
+                return UrlComponents {
                     path: 0..1,
                     valid: true,
-                    ..Components::default()
+                    ..UrlComponents::default()
                 };
             }
 
@@ -873,29 +900,29 @@ mod tests {
             }
         }
 
-        fn parse_fully_formed(url: &[u8], scheme_end: usize, strict: bool) -> Components {
+        fn parse_fully_formed(url: &[u8], scheme_end: usize, strict: bool) -> UrlComponents {
             if !validate_url(url, strict) {
-                return Components::default();
+                return UrlComponents::default();
             }
 
             let authority_start = scheme_end + 3;
             let authority_end = find_any_from(url, authority_start, b"/?#").unwrap_or(url.len());
             if authority_start == authority_end {
-                return Components::default();
+                return UrlComponents::default();
             }
 
             let raw_authority = &url[authority_start..authority_end];
             if url.get(authority_end) == Some(&b'#') {
-                return Components::default();
+                return UrlComponents::default();
             }
             let Some((host, port)) = parse_full_authority(raw_authority) else {
-                return Components::default();
+                return UrlComponents::default();
             };
-            let mut components = Components {
+            let mut components = UrlComponents {
                 scheme: url[..scheme_end].to_vec().into_boxed_slice(),
                 host: host.to_vec().into_boxed_slice(),
                 port,
-                ..Components::default()
+                ..UrlComponents::default()
             };
 
             let query_start = find_byte_from(url, b'?', authority_end);
@@ -907,7 +934,7 @@ mod tests {
                     .iter()
                     .all(|byte| is_full_url_char(*byte))
                 {
-                    return Components::default();
+                    return UrlComponents::default();
                 }
             }
             if let Some(query_start) = query_start {
@@ -918,7 +945,7 @@ mod tests {
                         .iter()
                         .all(|byte| *byte == b'?' || is_full_url_char(*byte))
                     {
-                        return Components::default();
+                        return UrlComponents::default();
                     }
                 }
             }
@@ -932,7 +959,7 @@ mod tests {
                     .iter()
                     .all(|byte| matches!(*byte, b'?' | b'#') || is_full_url_char(*byte))
                 {
-                    return Components::default();
+                    return UrlComponents::default();
                 }
             }
             components.authority = join_host_and_port(&components.host, components.port);
@@ -940,9 +967,9 @@ mod tests {
             components
         }
 
-        fn parse_non_fully_formed(url: &[u8], strict: bool) -> Components {
+        fn parse_non_fully_formed(url: &[u8], strict: bool) -> UrlComponents {
             if url.is_empty() || !validate_url(url, strict) {
-                return Components::default();
+                return UrlComponents::default();
             }
 
             let path_start = find_byte(url, b'/');
@@ -950,9 +977,9 @@ mod tests {
             let fragment_start = find_byte(url, b'#');
             let path_end = earliest(query_start, fragment_start).unwrap_or(url.len());
             let authority_end = path_start.map_or(path_end, |path_start| path_start.min(path_end));
-            let mut components = Components {
+            let mut components = UrlComponents {
                 authority: url[..authority_end].to_vec().into_boxed_slice(),
-                ..Components::default()
+                ..UrlComponents::default()
             };
 
             if let Some(path_start) = path_start
@@ -998,7 +1025,7 @@ mod tests {
         bool,
     );
 
-    fn fields(components: &Components) -> Fields<'_> {
+    fn fields(components: &UrlComponents) -> Fields<'_> {
         (
             &components.scheme,
             &components.authority,

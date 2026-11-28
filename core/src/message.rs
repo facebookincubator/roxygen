@@ -27,6 +27,8 @@ use crate::owned_bytes::OwnedBytes;
 use crate::priority::HttpPriority;
 use crate::priority::HttpPriorityHeaderAccess;
 use crate::url::ParseUrl;
+use crate::url::UrlComponents;
+use crate::url::parse_components;
 
 pub type QueryParamMap = BTreeMap<Vec<u8>, Vec<u8>>;
 
@@ -558,6 +560,19 @@ impl HttpMessage {
         url: impl AsRef<[u8]>,
         strict: bool,
     ) -> Result<ParseUrl, MessageTypeError> {
+        let url = url.as_ref();
+        let components = self.set_url_internal(url, true, strict)?;
+        Ok(ParseUrl::from_components(url, components))
+    }
+
+    /// Like [`set_url`](Self::set_url), but returns only the parsed components, so that the URL
+    /// is copied once, into the message.
+    #[doc(hidden)]
+    pub fn set_url_components(
+        &mut self,
+        url: impl AsRef<[u8]>,
+        strict: bool,
+    ) -> Result<UrlComponents, MessageTypeError> {
         self.set_url_internal(url.as_ref(), true, strict)
     }
 
@@ -1211,8 +1226,8 @@ impl HttpMessage {
         url: &[u8],
         unparse: bool,
         strict: bool,
-    ) -> Result<ParseUrl, MessageTypeError> {
-        let parsed = ParseUrl::parse_url_maybe_invalid(url, strict);
+    ) -> Result<UrlComponents, MessageTypeError> {
+        let parsed = parse_components(url, strict);
         let request = self.request_mut()?;
         request.url = OwnedBytes::new(url);
         if parsed.valid() {

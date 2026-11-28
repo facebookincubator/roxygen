@@ -258,7 +258,8 @@ impl<C: IngressDelivery + ?Sized> Execution<'_, C> {
                 ParserEvent::UrlComplete => {
                     self.codec.target_complete = true;
                     if let Some(message) = self.codec.current_message.as_mut() {
-                        self.codec.parsed_target = message.set_url(&self.codec.target, true).ok();
+                        self.codec.parsed_target =
+                            message.set_url_components(&self.codec.target, true).ok();
                         message.set_http_version(parser.http_major, parser.http_minor);
                     }
                     self.codec.http09_request = parser.http_major == 0 && parser.http_minor == 9;
@@ -542,7 +543,7 @@ impl Http1xCodec {
             let parsed = match self.parsed_target.take() {
                 Some(parsed) => parsed,
                 None => message
-                    .set_url(&self.target, true)
+                    .set_url_components(&self.target, true)
                     .map_err(|_| header_error(b"invalid HTTP request URL"))?,
             };
             if !parsed.valid() || parsed.authority().contains(&b'@') {
