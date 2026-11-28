@@ -759,6 +759,7 @@ fn panicking_cancellation_waker_cannot_skip_group_drop_retirement() {
 mod external_host {
     use super::*;
     use crate::task_group::TaskId;
+    use crate::task_group::TaskKind;
 
     /// Records its index in a shared order when dropped.
     struct OrderProbe {
@@ -1365,5 +1366,46 @@ mod external_host {
             );
         }
         assert!(offsets.body <= 32, "body starts at {}", offsets.body);
+    }
+
+    /// The size of the state allocation that spawning a plain task makes.
+    fn plain_task_state_size() -> usize {
+        let (mut pool, _, host) = TestHost::create();
+        let mut tasks = TaskGroup::with_host(host);
+        tasks.spawn_local(|_| async {}).unwrap();
+        let size = crate::task_group::task_state_size(TaskKind::Task);
+        pool.run_until(tasks.join()).unwrap();
+        size
+    }
+
+    /// A plain task's state holds only a plain task's body, so it fits the
+    /// 224-byte allocation class.
+    #[cfg(not(feature = "observability"))]
+    #[test]
+    fn plain_task_state_fits_the_224_class() {
+        let size = plain_task_state_size();
+        assert!(
+            size <= 224,
+            "a plain task's state allocation is {size} bytes"
+        );
+    }
+
+    /// Under `observability`, each of the two contexts that a plain task's
+    /// body holds also carries a span, so the bound grows by two spans.
+    #[cfg(feature = "observability")]
+    #[test]
+    fn plain_task_state_fits_the_224_class_plus_two_spans() {
+        let bound = 224 + 2 * size_of::<tracing::Span>();
+        let size = plain_task_state_size();
+        assert!(
+            size <= bound,
+            "a plain task's state allocation is {size} bytes, over {bound}"
+        );
+    }
+
+    /// A task table slot stays 16 bytes, whatever the kind of task it holds.
+    #[test]
+    fn task_table_slot_keeps_its_size() {
+        assert_eq!(crate::task_group::task_table_slot_size(), 16);
     }
 }

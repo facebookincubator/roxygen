@@ -98,23 +98,63 @@ impl fmt::Debug for TaskId {
 /// A slot index that never holds an entry, so lookups and removals there miss.
 pub(crate) const NO_SLOT: usize = usize::MAX;
 
-/// Owner-local entries addressed by slot, each stored with the identifier it
-/// was inserted under. Lookup and removal check both, so a stale key never
+/// How a slab slot holds a live value together with the identifier it was
+/// inserted under.
+pub(crate) trait SlabEntry {
+    type Value;
+
+    fn new(id: u64, value: Self::Value) -> Self;
+
+    fn id(&self) -> u64;
+
+    fn value(&self) -> &Self::Value;
+
+    fn into_value(self) -> Self::Value;
+}
+
+/// A value stored beside the identifier it was inserted under.
+pub(crate) struct Keyed<T>(u64, T);
+
+impl<T> SlabEntry for Keyed<T> {
+    type Value = T;
+
+    fn new(id: u64, value: T) -> Self {
+        Self(id, value)
+    }
+
+    fn id(&self) -> u64 {
+        self.0
+    }
+
+    fn value(&self) -> &T {
+        &self.1
+    }
+
+    fn into_value(self) -> T {
+        self.1
+    }
+}
+
+/// Owner-local entries addressed by slot, each holding the identifier it was
+/// inserted under. Lookup and removal check both, so a stale key never
 /// reaches the entry that reused its slot. Freed slots are reused last-freed
 /// first, so storage stays at the peak live count. Paths that need insertion
 /// order sort the live entries by identifier.
-pub(crate) struct IdSlab<T> {
-    slots: Vec<Slot<T>>,
+pub(crate) struct Slab<E: SlabEntry> {
+    slots: Vec<Slot<E>>,
     free: usize,
     live: usize,
 }
 
-enum Slot<T> {
-    Occupied(u64, T),
+/// A slab that stores each value beside its identifier.
+pub(crate) type IdSlab<T> = Slab<Keyed<T>>;
+
+enum Slot<E> {
+    Occupied(E),
     Vacant(usize),
 }
 
-impl<T> IdSlab<T> {
+impl<E: SlabEntry> Slab<E> {
     pub(crate) const fn new() -> Self {
         Self {
             slots: Vec::new(),
@@ -146,8 +186,8 @@ impl<T> IdSlab<T> {
         }
     }
 
-    pub(crate) fn insert(&mut self, id: u64, value: T) -> usize {
-        let entry = Slot::Occupied(id, value);
+    pub(crate) fn insert(&mut self, id: u64, value: E::Value) -> usize {
+        let entry = Slot::Occupied(E::new(id, value));
         let slot = match self.slots.get_mut(self.free) {
             Some(vacant) => {
                 let Slot::Vacant(next) = *vacant else {
@@ -165,26 +205,26 @@ impl<T> IdSlab<T> {
         slot
     }
 
-    pub(crate) fn get(&self, slot: usize, id: u64) -> Option<&T> {
+    pub(crate) fn get(&self, slot: usize, id: u64) -> Option<&E::Value> {
         match self.slots.get(slot)? {
-            Slot::Occupied(stored, value) if *stored == id => Some(value),
+            Slot::Occupied(entry) if entry.id() == id => Some(entry.value()),
             _ => None,
         }
     }
 
     /// Vacates the slot only if it holds `id`; the freed value returns to
     /// the caller to drop.
-    pub(crate) fn remove(&mut self, slot: usize, id: u64) -> Option<T> {
+    pub(crate) fn remove(&mut self, slot: usize, id: u64) -> Option<E::Value> {
         let entry = self.slots.get_mut(slot)?;
-        if !matches!(entry, Slot::Occupied(stored, _) if *stored == id) {
+        if !matches!(entry, Slot::Occupied(stored) if stored.id() == id) {
             return None;
         }
-        let Slot::Occupied(_, value) = mem::replace(entry, Slot::Vacant(self.free)) else {
+        let Slot::Occupied(stored) = mem::replace(entry, Slot::Vacant(self.free)) else {
             unreachable!("the slot was checked to be occupied");
         };
         self.free = slot;
         self.live -= 1;
-        Some(value)
+        Some(stored.into_value())
     }
 
     /// The live entries' identifiers and slots, in ascending identifier order.
@@ -194,7 +234,7 @@ impl<T> IdSlab<T> {
             .iter()
             .enumerate()
             .filter_map(|(slot, entry)| match entry {
-                Slot::Occupied(id, _) => Some((*id, slot)),
+                Slot::Occupied(entry) => Some((entry.id(), slot)),
                 Slot::Vacant(_) => None,
             })
             .collect();
@@ -203,12 +243,12 @@ impl<T> IdSlab<T> {
     }
 
     /// Takes every live entry, in ascending identifier order.
-    pub(crate) fn into_sorted(mut self) -> Vec<(u64, T)> {
+    pub(crate) fn into_sorted(mut self) -> Vec<(u64, E::Value)> {
         self.live = 0;
         let mut entries: Vec<_> = mem::take(&mut self.slots)
             .into_iter()
             .filter_map(|entry| match entry {
-                Slot::Occupied(id, value) => Some((id, value)),
+                Slot::Occupied(entry) => Some((entry.id(), entry.into_value())),
                 Slot::Vacant(_) => None,
             })
             .collect();
@@ -217,7 +257,7 @@ impl<T> IdSlab<T> {
     }
 }
 
-impl<T> Default for IdSlab<T> {
+impl<E: SlabEntry> Default for Slab<E> {
     fn default() -> Self {
         Self::new()
     }
@@ -225,7 +265,7 @@ impl<T> Default for IdSlab<T> {
 
 /// Drops the live entries in ascending identifier order, as `BTreeMap` does,
 /// continuing past one whose drop panics.
-impl<T> Drop for IdSlab<T> {
+impl<E: SlabEntry> Drop for Slab<E> {
     fn drop(&mut self) {
         if self.live != 0 {
             drop(mem::take(self).into_sorted());
@@ -273,35 +313,153 @@ struct Completions {
     waker: RefCell<Option<Waker>>,
 }
 
-/// What a task's group span observes: a user future, a hosted worker command
-/// with its own command span, or an activated hosted worker cleanup.
-enum TaskBody {
-    Task(ObservedTask<LocalFuture>),
-    Command(ObservedTask<CommandTask>),
-    Cleanup(ObservedTask<HostedCleanup>),
+/// What a task's group span observes, kept inline in the task's state, which
+/// is sized to this kind of body alone.
+trait TaskBody: Sized + 'static {
+    /// The task table's handle on a state of this kind.
+    fn handle(state: Rc<TaskState<Self>>) -> TaskHandle;
+
+    /// One poll of the body under its own `catch_unwind`.
+    fn poll_body(&mut self, context: &mut Context<'_>) -> Result<Poll<()>, Payload>;
 }
 
-// The command variant stays the largest, so the cleanup variant does not grow
-// `TaskState`.
-const _: () = assert!(size_of::<ObservedTask<HostedCleanup>>() <= size_of::<CommandTask>());
+/// A user future.
+type FutureBody = ObservedTask<LocalFuture>;
+
+/// A hosted worker command with its own command span.
+type CommandBody = ObservedTask<CommandTask>;
+
+/// An activated hosted worker cleanup.
+type CleanupBody = ObservedTask<HostedCleanup>;
+
+impl TaskBody for FutureBody {
+    fn handle(state: Rc<TaskState<Self>>) -> TaskHandle {
+        TaskHandle::Task(state)
+    }
+
+    #[inline(always)]
+    fn poll_body(&mut self, context: &mut Context<'_>) -> Result<Poll<()>, Payload> {
+        poll_observed(self, context)
+    }
+}
+
+impl TaskBody for CommandBody {
+    fn handle(state: Rc<TaskState<Self>>) -> TaskHandle {
+        TaskHandle::Command(state)
+    }
+
+    #[cfg(feature = "observability")]
+    #[inline(always)]
+    fn poll_body(&mut self, context: &mut Context<'_>) -> Result<Poll<()>, Payload> {
+        poll_observed(self, context)
+    }
+
+    #[cfg(not(feature = "observability"))]
+    #[inline(always)]
+    fn poll_body(&mut self, context: &mut Context<'_>) -> Result<Poll<()>, Payload> {
+        poll_command(self, context)
+    }
+}
+
+impl TaskBody for CleanupBody {
+    fn handle(state: Rc<TaskState<Self>>) -> TaskHandle {
+        TaskHandle::Cleanup(state)
+    }
+
+    #[inline(always)]
+    fn poll_body(&mut self, context: &mut Context<'_>) -> Result<Poll<()>, Payload> {
+        poll_observed(self, context)
+    }
+}
 
 type Payload = Box<dyn Any + Send>;
 
 /// The fields that every poll reads lead the struct, ahead of the body.
 #[repr(C)]
-struct TaskState {
+struct TaskState<B> {
     completed: Cell<bool>,
     polling: Cell<bool>,
     abort_requested: Cell<bool>,
     tracked: bool,
     host_waker: Cell<Option<Waker>>,
-    body: RefCell<Option<TaskBody>>,
+    body: RefCell<Option<B>>,
     id: TaskId,
     panic: RefCell<Option<Box<dyn Any + Send>>>,
     completions: Weak<Completions>,
 }
 
-impl TaskState {
+/// A task table entry: the task's state, typed by its body kind. It is its own
+/// slab entry, because the state holds the task's identifier.
+enum TaskHandle {
+    Task(Rc<TaskState<FutureBody>>),
+    Command(Rc<TaskState<CommandBody>>),
+    Cleanup(Rc<TaskState<CleanupBody>>),
+}
+
+/// Runs `$action` with `$state` bound to the handle's state, whatever its kind.
+macro_rules! with_state {
+    ($handle:expr, $state:ident => $action:expr) => {
+        match $handle {
+            TaskHandle::Task($state) => $action,
+            TaskHandle::Command($state) => $action,
+            TaskHandle::Cleanup($state) => $action,
+        }
+    };
+}
+
+impl TaskHandle {
+    fn task_id(&self) -> TaskId {
+        with_state!(self, state => state.id)
+    }
+
+    fn is_completed(&self) -> bool {
+        with_state!(self, state => state.completed.get())
+    }
+
+    fn finish(&self, result: Result<(), TaskGroupError>) {
+        with_state!(self, state => state.finish(result))
+    }
+
+    fn take_panic(&self) -> Option<Payload> {
+        with_state!(self, state => state.panic.borrow_mut().take())
+    }
+
+    fn discard_panic(&self) {
+        with_state!(self, state => state.discard_panic())
+    }
+
+    #[cfg(test)]
+    fn kind(&self) -> TaskKind {
+        match self {
+            Self::Task(_) => TaskKind::Task,
+            Self::Command(_) => TaskKind::Command,
+            Self::Cleanup(_) => TaskKind::Cleanup,
+        }
+    }
+}
+
+impl SlabEntry for TaskHandle {
+    type Value = Self;
+
+    fn new(id: u64, handle: Self) -> Self {
+        debug_assert_eq!(handle.task_id().seq, id);
+        handle
+    }
+
+    fn id(&self) -> u64 {
+        self.task_id().seq
+    }
+
+    fn value(&self) -> &Self {
+        self
+    }
+
+    fn into_value(self) -> Self {
+        self
+    }
+}
+
+impl<B> TaskState<B> {
     fn finish(&self, mut result: Result<(), TaskGroupError>) {
         if self.polling.get() {
             self.abort_requested.set(true);
@@ -375,7 +533,7 @@ impl TaskState {
     fn poll_hosted(
         &self,
         context: &mut Context<'_>,
-        poll_body: impl FnOnce(&mut TaskBody, &mut Context<'_>) -> Result<Poll<()>, Payload>,
+        poll_body: impl FnOnce(&mut B, &mut Context<'_>) -> Result<Poll<()>, Payload>,
     ) -> Poll<()> {
         if self.completed.get() {
             return Poll::Ready(());
@@ -420,29 +578,20 @@ impl TaskState {
     }
 }
 
-impl Drop for TaskState {
+impl<B> Drop for TaskState<B> {
     fn drop(&mut self) {
         self.discard_panic();
     }
 }
 
-struct HostedTask(Rc<TaskState>);
-
-/// The wrapper that a task group spawns for an activated hosted cleanup. Its
-/// poll reaches the cleanup body without choosing among the body kinds.
-struct HostedCleanupTask(Rc<TaskState>);
+/// The wrapper that a task group spawns on its host. It holds one kind of
+/// state, so its poll reaches the body without choosing among the body kinds.
+struct HostedTask<B>(Rc<TaskState<B>>);
 
 #[cfg(test)]
 thread_local! {
     static GROUP_STATE_ALLOCATIONS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
     static BOXED_TASK_FUTURES: Cell<usize> = const { Cell::new(0) };
-    static TASK_BODY_DISPATCHES: Cell<usize> = const { Cell::new(0) };
-}
-
-/// How many host polls on this thread have chosen among the task body kinds.
-#[cfg(test)]
-pub(crate) fn task_body_dispatches() -> usize {
-    TASK_BODY_DISPATCHES.get()
 }
 
 /// How many `Completions` and group `CancellationSource`s this thread's task
@@ -458,14 +607,52 @@ pub(crate) fn boxed_task_futures() -> usize {
     BOXED_TASK_FUTURES.get()
 }
 
-/// The size of the wrapper that a task group spawns on its host.
+/// The size of the wrapper that a task group spawns on its host for a user
+/// future.
 #[cfg(all(test, feature = "observability"))]
 pub(crate) fn hosted_task_size() -> usize {
-    size_of::<HostedTask>()
+    size_of::<HostedTask<FutureBody>>()
 }
 
-/// `TaskState` field offsets: the body's, and those of the fields that every
-/// poll reads.
+/// A task body kind, as the state size records name it.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum TaskKind {
+    Task,
+    Command,
+    Cleanup,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TASK_STATE_SIZES: Cell<[usize; 3]> = const { Cell::new([0; 3]) };
+}
+
+/// The size of the state allocation that this thread's task groups last made
+/// for a task of `kind`, or zero before the first.
+#[cfg(test)]
+pub(crate) fn task_state_size(kind: TaskKind) -> usize {
+    TASK_STATE_SIZES.get()[kind as usize]
+}
+
+/// Records the size of `state`'s allocation, which holds the `Rc`'s two
+/// counts ahead of the state.
+#[cfg(test)]
+fn record_task_state_size<S>(kind: TaskKind, state: &Rc<S>) {
+    let mut sizes = TASK_STATE_SIZES.get();
+    sizes[kind as usize] = 2 * size_of::<usize>() + size_of_val(&**state);
+    TASK_STATE_SIZES.set(sizes);
+}
+
+/// The size of one slot of a task group's task table.
+#[cfg(test)]
+pub(crate) fn task_table_slot_size() -> usize {
+    size_of::<Slot<TaskHandle>>()
+}
+
+/// `TaskState` field offsets: the body's, the latest among the body kinds,
+/// and those of the fields that every poll reads, which do not depend on the
+/// body kind.
 #[cfg(test)]
 pub(crate) struct TaskStateOffsets {
     pub(crate) body: usize,
@@ -474,16 +661,16 @@ pub(crate) struct TaskStateOffsets {
 
 #[cfg(test)]
 pub(crate) fn task_state_offsets() -> TaskStateOffsets {
+    type State = TaskState<FutureBody>;
     TaskStateOffsets {
-        body: mem::offset_of!(TaskState, body),
+        body: mem::offset_of!(State, body)
+            .max(mem::offset_of!(TaskState<CommandBody>, body))
+            .max(mem::offset_of!(TaskState<CleanupBody>, body)),
         per_poll: [
-            ("completed", mem::offset_of!(TaskState, completed)),
-            ("polling", mem::offset_of!(TaskState, polling)),
-            (
-                "abort_requested",
-                mem::offset_of!(TaskState, abort_requested),
-            ),
-            ("host_waker", mem::offset_of!(TaskState, host_waker)),
+            ("completed", mem::offset_of!(State, completed)),
+            ("polling", mem::offset_of!(State, polling)),
+            ("abort_requested", mem::offset_of!(State, abort_requested)),
+            ("host_waker", mem::offset_of!(State, host_waker)),
         ],
     }
 }
@@ -506,39 +693,12 @@ fn new_cancellation_source() -> CancellationSource {
     CancellationSource::new()
 }
 
-impl Future for HostedTask {
+impl<B: TaskBody> Future for HostedTask<B> {
     type Output = ();
 
     #[inline(never)]
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
-        self.0.poll_hosted(context, |body, context| {
-            #[cfg(test)]
-            TASK_BODY_DISPATCHES.set(TASK_BODY_DISPATCHES.get() + 1);
-            match body {
-                TaskBody::Task(task) => poll_observed(task, context),
-                #[cfg(feature = "observability")]
-                TaskBody::Command(command) => poll_observed(command, context),
-                #[cfg(not(feature = "observability"))]
-                TaskBody::Command(command) => poll_command(command, context),
-                TaskBody::Cleanup(_) => {
-                    unreachable!("a hosted cleanup is spawned as a `HostedCleanupTask`")
-                }
-            }
-        })
-    }
-}
-
-impl Future for HostedCleanupTask {
-    type Output = ();
-
-    #[inline(never)]
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
-        self.0.poll_hosted(context, |body, context| {
-            let TaskBody::Cleanup(cleanup) = body else {
-                unreachable!("a `HostedCleanupTask` holds a cleanup body")
-            };
-            poll_observed(cleanup, context)
-        })
+        self.0.poll_hosted(context, B::poll_body)
     }
 }
 
@@ -582,7 +742,7 @@ enum CommandPhase {
 ///
 /// The group context would wrap only the command install, so it is installed
 /// only on the terminal paths that run code under it. Under `observability`,
-/// `HostedTask::poll` uses `poll_observed` instead, which keeps the group
+/// a command body polls with `poll_observed` instead, which keeps the group
 /// install and a `catch_unwind` around the poll so that the subscriber receives
 /// the command span's enter and exit under the group context.
 #[cfg(not(feature = "observability"))]
@@ -665,13 +825,7 @@ fn clean_up_panic_under(
     }
 }
 
-impl Drop for HostedTask {
-    fn drop(&mut self) {
-        self.0.finish(Err(TaskGroupError::TaskCancelled));
-    }
-}
-
-impl Drop for HostedCleanupTask {
+impl<B> Drop for HostedTask<B> {
     fn drop(&mut self) {
         self.0.finish(Err(TaskGroupError::TaskCancelled));
     }
@@ -688,7 +842,7 @@ impl Drop for HostedCleanupTask {
 /// first spawn, and its task table keeps the slots of its peak live count.
 pub struct TaskGroup {
     host: Host,
-    tasks: IdSlab<Rc<TaskState>>,
+    tasks: Slab<TaskHandle>,
     completions: Option<Rc<Completions>>,
     next_id: u64,
     cancellation: Option<CancellationSource>,
@@ -704,7 +858,7 @@ impl TaskGroup {
     pub fn with_host(host: Host) -> Self {
         Self {
             host,
-            tasks: IdSlab::new(),
+            tasks: Slab::new(),
             completions: None,
             next_id: 0,
             cancellation: None,
@@ -770,27 +924,17 @@ impl TaskGroup {
         F: FnOnce(CancellationToken) -> Fut,
         Fut: Future<Output = ()> + 'static,
     {
-        self.spawn_body(
-            factory,
-            tracked,
-            |task, future| {
-                #[cfg(test)]
-                BOXED_TASK_FUTURES.set(BOXED_TASK_FUTURES.get() + 1);
-                TaskBody::Task(ObservedTask::new(task, Box::pin(future)))
-            },
-            HostedTask,
-        )
+        self.spawn_body(factory, tracked, |task, future| {
+            #[cfg(test)]
+            BOXED_TASK_FUTURES.set(BOXED_TASK_FUTURES.get() + 1);
+            FutureBody::new(task, Box::pin(future))
+        })
     }
 
     /// Admits a worker command, tracked, as `spawn_local_tracked` does with
     /// a factory that returns it, and keeps it inline beneath the group span.
     pub(crate) fn spawn_command(&mut self, command: CommandTask) -> Result<TaskId, TaskGroupError> {
-        self.spawn_body(
-            move |_| command,
-            true,
-            |task, command| TaskBody::Command(ObservedTask::new(task, command)),
-            HostedTask,
-        )
+        self.spawn_body(move |_| command, true, CommandBody::new)
     }
 
     /// Admits an activated hosted worker cleanup, tracked, as `spawn_command`
@@ -799,27 +943,21 @@ impl TaskGroup {
         &mut self,
         cleanup: HostedCleanup,
     ) -> Result<TaskId, TaskGroupError> {
-        self.spawn_body(
-            move |_| cleanup,
-            true,
-            |task, cleanup| TaskBody::Cleanup(ObservedTask::new(task, cleanup)),
-            HostedCleanupTask,
-        )
+        self.spawn_body(move |_| cleanup, true, CleanupBody::new)
     }
 
-    /// Admits the body that `body` builds and spawns `wrapper` around its
-    /// state on the host.
+    /// Admits the body that `body` builds, in a state of its own kind, and
+    /// spawns that kind's wrapper around the state on the host.
     #[inline(always)]
-    fn spawn_body<F, T, W>(
+    fn spawn_body<F, T, B>(
         &mut self,
         factory: F,
         tracked: bool,
-        body: impl FnOnce(OperationSpan, T) -> TaskBody,
-        wrapper: impl FnOnce(Rc<TaskState>) -> W,
+        body: impl FnOnce(OperationSpan, T) -> B,
     ) -> Result<TaskId, TaskGroupError>
     where
         F: FnOnce(CancellationToken) -> T,
-        W: Future<Output = ()> + 'static,
+        B: TaskBody,
     {
         self.assert_owner_thread();
         let context = ContextEnvelope::capture();
@@ -864,9 +1002,12 @@ impl TaskGroup {
             panic: RefCell::new(None),
             completions: Rc::downgrade(completions),
         });
-        let slot = self.tasks.insert(seq, Rc::clone(&state));
+        let handle = B::handle(Rc::clone(&state));
+        #[cfg(test)]
+        record_task_state_size(handle.kind(), &state);
+        let slot = self.tasks.insert(seq, handle);
         debug_assert_eq!(slot, id.slot);
-        self.host.spawn_unboxed(wrapper(state));
+        self.host.spawn_unboxed(HostedTask(state));
         Ok(id)
     }
 
@@ -905,7 +1046,7 @@ impl TaskGroup {
             .pop_front()
             .or_else(|| completions.untracked.borrow_mut().pop_front())?;
         if let Some(state) = self.tasks.remove(completion.id.slot, completion.id.seq) {
-            completion.panic = state.panic.borrow_mut().take();
+            completion.panic = state.take_panic();
         }
         self.finish_shutdown();
         Some(completion)
@@ -974,7 +1115,7 @@ impl TaskGroup {
         let Some(state) = self.tasks.get(id.slot, id.seq) else {
             return false;
         };
-        if state.completed.get() {
+        if state.is_completed() {
             return false;
         }
         state.finish(Err(TaskGroupError::TaskCancelled));
@@ -995,10 +1136,10 @@ impl TaskGroup {
             let Some(state) = self.tasks.get(slot, seq) else {
                 continue;
             };
-            let destroyed = !state.completed.get();
+            let destroyed = !state.is_completed();
             state.finish(Err(TaskGroupError::TaskCancelled));
             if take_panic && destroyed && raised.is_none() {
-                raised = state.panic.borrow_mut().take();
+                raised = state.take_panic();
             }
         }
         raised

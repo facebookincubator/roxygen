@@ -2921,24 +2921,22 @@ mod task_wrapping {
         }
     }
 
-    /// The context installs, task-wrapper `catch_unwind` calls, and task
-    /// body dispatches of one pending poll of a `TaskGroup` task, of a
-    /// command on `WorkerDriver::new`, of a command on
-    /// `WorkerDriver::with_host`, and of an activated cleanup on
-    /// `WorkerDriver::with_host`.
-    fn pending_poll_work() -> [(usize, usize, usize); 4] {
+    /// The context installs and task-wrapper `catch_unwind` calls of one
+    /// pending poll of a `TaskGroup` task, of a command on
+    /// `WorkerDriver::new`, of a command on `WorkerDriver::with_host`, and of
+    /// an activated cleanup on `WorkerDriver::with_host`.
+    fn pending_poll_work() -> [(usize, usize); 4] {
         let counts = || {
             (
                 crate::context::context_installs(),
                 crate::observability::task_catch_unwinds(),
-                crate::task_group::task_body_dispatches(),
             )
         };
         let measure = |poll: &dyn Fn()| {
             let before = counts();
             poll();
             let after = counts();
-            (after.0 - before.0, after.1 - before.1, after.2 - before.2)
+            (after.0 - before.0, after.1 - before.1)
         };
 
         let host = ManualHost::default();
@@ -3016,7 +3014,7 @@ mod task_wrapping {
 
     #[test]
     fn each_pending_poll_counts_its_catch_unwind_calls() {
-        let catches = pending_poll_work().map(|(_, catches, _)| catches);
+        let catches = pending_poll_work().map(|(_, catches)| catches);
         assert_eq!(
             catches,
             [1, 1, HOSTED_POLL_WORK, 1],
@@ -3076,20 +3074,6 @@ mod task_wrapping {
         );
         drop(cleanup);
         rig.finish();
-    }
-
-    /// A hosted cleanup's wrapper polls its cleanup body without dispatching
-    /// on the body kind. A `TaskGroup` task's wrapper and a hosted command's
-    /// wrapper dispatch once per poll, and an owner-polled command has no
-    /// wrapper.
-    #[test]
-    fn each_pending_poll_counts_its_task_body_dispatches() {
-        let dispatches = pending_poll_work().map(|(.., dispatches)| dispatches);
-        assert_eq!(
-            dispatches,
-            [1, 0, 1, 0],
-            "a TaskGroup task, a WorkerDriver::new command, a with_host command, and a with_host cleanup"
-        );
     }
 
     /// A task whose poll starts a span on a new observer from the installed
