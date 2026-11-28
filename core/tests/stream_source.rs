@@ -9,9 +9,11 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::error::Error;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::task::Context;
@@ -31,6 +33,8 @@ use roxygen_runtime::host::TokioHost;
 use tokio::runtime::Builder;
 use tokio::time;
 
+use crate::alloc_count::count_allocations;
+use crate::alloc_count::std_allocations_observable;
 use crate::buf_queue::BufQueue;
 use crate::error::HttpError;
 use crate::error::HttpErrorCode;
@@ -54,6 +58,7 @@ use crate::source_filter::MutateFilter;
 use crate::source_holder::HttpSourceHolder;
 use crate::stream_source::DeferredReadTimeout;
 use crate::stream_source::FlowControlState;
+use crate::stream_source::HttpBodyReader;
 use crate::stream_source::HttpIngressBody;
 use crate::stream_source::HttpResponseReader;
 use crate::stream_source::HttpResponseSource;
@@ -3973,6 +3978,801 @@ mod stream_source {
             assert!(event.eom());
             assert!(!reader.is_active());
             assert_eq!(log.borrow().completions, [None]);
+        });
+    }
+
+    /// A request body source after its head, as an owned server hands it to
+    /// its application.
+    fn request_owner() -> (
+        HttpStreamSourceOwner,
+        HttpStreamSourceProducer,
+        Rc<RefCell<CallbackLog>>,
+    ) {
+        let log = Rc::new(RefCell::new(CallbackLog::default()));
+        let ingress = HttpIngressBody::new(
+            StreamId::new(1),
+            RecordingCallback(Rc::clone(&log)),
+            65_535,
+            Host::tokio(),
+        )
+        .unwrap();
+        assert!(ingress.initialize_body_only(&mut request(None), false));
+        let producer = ingress.producer();
+        (ingress.into_source_owner(), producer, log)
+    }
+
+    /// Reads `bodies` paced bodies of a request source through the general
+    /// API, producing each only after a poll returned `Pending`, and returns
+    /// every event's type. With `await_resume` the consumer awaits each
+    /// suspend's resume before it reads again; otherwise it drops the suspend.
+    fn paced_general_reads(await_resume: bool, bodies: usize) -> Vec<HttpBodyEventType> {
+        let (owner, producer, _log) = request_owner();
+        let source = owner.source().unwrap();
+        let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut context = Context::from_waker(&waker);
+        let mut produced = 0;
+        let mut produce = || {
+            assert!(
+                produced < bodies,
+                "a pending wait outlived the paced bodies"
+            );
+            produced += 1;
+            let woken = wakes.0.load(Ordering::SeqCst);
+            assert_eq!(
+                producer.body(body(b"token"), 0, produced == bodies),
+                FlowControlState::Open
+            );
+            assert_eq!(
+                wakes.0.load(Ordering::SeqCst),
+                woken + 1,
+                "each body must wake the pending wait once"
+            );
+        };
+        let mut events = Vec::new();
+        loop {
+            let mut read = source.read_body_event_unboxed(u32::MAX, CancellationToken::never());
+            let event = loop {
+                match Pin::new(&mut read).poll(&mut context) {
+                    Poll::Ready(result) => break result.unwrap(),
+                    Poll::Pending => produce(),
+                }
+            };
+            events.push(event.event_type());
+            if event.eom() {
+                return events;
+            }
+            if await_resume && event.event_type() == HttpBodyEventType::Suspend {
+                let mut resume = take_resume(event);
+                while resume.as_mut().poll(&mut context).is_pending() {
+                    produce();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn general_request_reads_suspend_before_paced_bodies() {
+        run_paused(async {
+            use HttpBodyEventType::Body;
+            use HttpBodyEventType::Suspend;
+            // A consumer that drops each suspend sees one before every body.
+            assert_eq!(
+                paced_general_reads(false, 3),
+                [Suspend, Body, Suspend, Body, Suspend, Body]
+            );
+            // One that awaits each resume reads the next body, then waits in
+            // a read for the body after it.
+            assert_eq!(
+                paced_general_reads(true, 3),
+                [Suspend, Body, Body, Suspend, Body]
+            );
+        });
+    }
+
+    /// Where a [`LoggedCallback`] panics.
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum CallbackPanic {
+        None,
+        SourceComplete,
+        Drop,
+    }
+
+    type OrderLog = Arc<Mutex<Vec<String>>>;
+
+    fn entries(log: &OrderLog) -> Vec<String> {
+        log.lock().unwrap().clone()
+    }
+
+    /// The entries a [`LoggedCallback`] wrote, without the waker's.
+    fn callback_entries(log: &OrderLog) -> Vec<String> {
+        entries(log)
+            .into_iter()
+            .filter(|entry| !entry.starts_with("waker"))
+            .collect()
+    }
+
+    /// A callback that logs its completion and its own drop.
+    struct LoggedCallback {
+        log: OrderLog,
+        panic: CallbackPanic,
+    }
+
+    impl HttpStreamSourceCallback for LoggedCallback {
+        fn source_complete(&mut self, _id: StreamId, error: Option<HttpError>) {
+            let code = error.map(|error| error.code());
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("callback complete {code:?}"));
+            if self.panic == CallbackPanic::SourceComplete {
+                panic!("callback completion");
+            }
+        }
+    }
+
+    impl Drop for LoggedCallback {
+        fn drop(&mut self) {
+            self.log.lock().unwrap().push("callback dropped".to_owned());
+            if self.panic == CallbackPanic::Drop {
+                panic!("callback drop");
+            }
+        }
+    }
+
+    /// A request source like [`request_owner`]'s whose callback logs into
+    /// `log` and panics where `panic` says.
+    fn logged_request_owner(
+        log: &OrderLog,
+        panic: CallbackPanic,
+    ) -> (HttpStreamSourceOwner, HttpStreamSourceProducer) {
+        let ingress = HttpIngressBody::new(
+            StreamId::new(1),
+            LoggedCallback {
+                log: Arc::clone(log),
+                panic,
+            },
+            65_535,
+            Host::tokio(),
+        )
+        .unwrap();
+        assert!(ingress.initialize_body_only(&mut request(None), false));
+        let producer = ingress.producer();
+        (ingress.into_source_owner(), producer)
+    }
+
+    fn panic_text(payload: &(dyn std::any::Any + Send)) -> &'static str {
+        payload
+            .downcast_ref::<&'static str>()
+            .copied()
+            .unwrap_or("<not a static str>")
+    }
+
+    /// How an owner or reader releases its source.
+    #[derive(Clone, Copy, Debug)]
+    enum Release {
+        Clear,
+        RetireTerminal,
+        Drop,
+    }
+
+    /// The callback panic that `release` delivers: the completion of a stop,
+    /// or for `retire_terminal`, the callback's drop with the source.
+    fn delivered_panic(release: Release) -> CallbackPanic {
+        match release {
+            Release::Clear | Release::Drop => CallbackPanic::SourceComplete,
+            Release::RetireTerminal => CallbackPanic::Drop,
+        }
+    }
+
+    #[test]
+    fn owner_retirement_propagates_a_callback_panic_once() {
+        for release in [Release::Clear, Release::RetireTerminal, Release::Drop] {
+            let log = OrderLog::default();
+            let (mut owner, producer) = logged_request_owner(&log, delivered_panic(release));
+            // A clear or retire_terminal that unwinds leaves the owner alive,
+            // so the call itself destroyed the source.
+            let unwound = match release {
+                Release::Clear => std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    owner.clear(Some(HttpErrorCode::CANCEL));
+                })),
+                Release::RetireTerminal => {
+                    std::panic::catch_unwind(AssertUnwindSafe(|| owner.retire_terminal()))
+                }
+                Release::Drop => std::panic::catch_unwind(AssertUnwindSafe(|| drop(owner))),
+            };
+            let payload = unwound.expect_err("the callback panic propagates");
+            let expected = match release {
+                Release::RetireTerminal => "callback drop",
+                Release::Clear | Release::Drop => "callback completion",
+            };
+            assert_eq!(panic_text(&*payload), expected, "{release:?}");
+            assert!(!producer.is_live(), "{release:?}");
+            let code = match release {
+                Release::Clear => HttpErrorCode::CANCEL,
+                Release::RetireTerminal | Release::Drop => HttpErrorCode::NO_ERROR,
+            };
+            assert_eq!(
+                entries(&log),
+                [
+                    format!("callback complete {:?}", Some(code)),
+                    "callback dropped".to_owned()
+                ],
+                "{release:?}"
+            );
+        }
+
+        // A drop while already unwinding drops the callback's payload.
+        let log = OrderLog::default();
+        let (owner, producer) = logged_request_owner(&log, CallbackPanic::SourceComplete);
+        let unwound = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _owner = owner;
+            panic!("outer");
+        }));
+        assert_eq!(panic_text(&*unwound.unwrap_err()), "outer");
+        assert!(!producer.is_live());
+        assert_eq!(callback_entries(&log).len(), 2);
+    }
+
+    #[test]
+    fn producer_stop_completes_a_source_whose_consumer_holds_only_a_resume() {
+        let (owner, producer, log) = request_owner();
+        let source = owner.source().unwrap();
+        let resume = take_resume(read_body(source, u32::MAX).unwrap());
+        assert!(producer.stop_reading(Some(HttpErrorCode::CANCEL)));
+        assert_eq!(log.borrow().completions, [Some(HttpErrorCode::CANCEL)]);
+        drop(resume);
+        assert_eq!(
+            error_code(read_body(source, u32::MAX)),
+            HttpErrorCode::CANCEL
+        );
+        assert_eq!(log.borrow().completions, [Some(HttpErrorCode::CANCEL)]);
+    }
+
+    #[test]
+    fn body_reader_is_small() {
+        assert!(size_of::<HttpBodyReader>() <= 32, "the timed wait is boxed");
+    }
+
+    #[test]
+    fn body_reader_waits_without_a_timed_baton_or_resume_future() {
+        run_paused(async {
+            let (owner, producer, _log) = request_owner();
+            let mut reader = owner.into_body_reader();
+            let (_twin, twin_producer, _twin_log) = request_owner();
+            let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut context = Context::from_waker(&waker);
+            let observable = std_allocations_observable();
+
+            let (pending, allocations) =
+                count_allocations(|| reader.poll_body(&mut context, u32::MAX).is_pending());
+            assert!(pending);
+            // The body that wakes the read allocates what the same body
+            // allocates on a source with no read pending.
+            let (bodies, twin_bodies) = (body(b"token"), body(b"token"));
+            let (state, push) = count_allocations(|| producer.body(bodies, 0, false));
+            let (twin_state, twin_push) =
+                count_allocations(|| twin_producer.body(twin_bodies, 0, false));
+            assert_eq!(
+                (state, twin_state),
+                (FlowControlState::Open, FlowControlState::Open)
+            );
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+            if observable {
+                assert_eq!(allocations, 0, "a pending read allocates nothing");
+                assert_eq!(push, twin_push, "the wake adds nothing to the push");
+            } else {
+                eprintln!("allocation counts need a statically linked std");
+            }
+            let Poll::Ready(Ok(event)) = reader.poll_body(&mut context, u32::MAX) else {
+                panic!("the body must complete the pending read");
+            };
+            assert_eq!(body_text(&event), b"token");
+            assert!(!producer.event_baton_created_for_test());
+
+            // Control: the general API's first empty read creates the baton and
+            // boxes the suspend's resume.
+            let (control, control_producer, _control_log) = request_owner();
+            let mut read = control
+                .source()
+                .unwrap()
+                .read_body_event_unboxed(u32::MAX, CancellationToken::never());
+            let (event, allocations) =
+                count_allocations(|| match Pin::new(&mut read).poll(&mut context) {
+                    Poll::Ready(Ok(event)) => event,
+                    _ => panic!("the first empty general read must suspend"),
+                });
+            assert_eq!(event.event_type(), HttpBodyEventType::Suspend);
+            assert!(control_producer.event_baton_created_for_test());
+            if observable {
+                assert_eq!(allocations, 2, "the event baton and the boxed resume");
+            }
+        });
+    }
+
+    /// One producer step of a paced body script.
+    #[derive(Clone, Copy)]
+    enum Step {
+        Body(&'static [&'static [u8]]),
+        Padding(u16),
+        Trailers,
+        Eom,
+        Abort,
+    }
+
+    fn apply(producer: &HttpStreamSourceProducer, step: Step) {
+        match step {
+            Step::Body(segments) => {
+                let mut queue = BufQueue::new(usize::MAX);
+                for segment in segments {
+                    queue.push_bytes(Bytes::from_static(segment)).unwrap();
+                }
+                assert_eq!(producer.body(queue, 0, false), FlowControlState::Open);
+            }
+            Step::Padding(bytes) => assert!(producer.padding(bytes)),
+            Step::Trailers => {
+                let mut trailers = HttpHeaders::new();
+                trailers.add(b"trailer", b"value");
+                assert!(producer.trailers(trailers));
+            }
+            Step::Eom => assert!(producer.eom()),
+            Step::Abort => assert!(producer.abort(HttpErrorCode::TRANSPORT_READ_ERROR, b"gone")),
+        }
+    }
+
+    /// What a consumer saw of one body read.
+    #[derive(Debug, Eq, PartialEq)]
+    enum Seen {
+        Body(Vec<u8>, bool),
+        Padding(u16, bool),
+        Trailers(Vec<u8>),
+        Error(HttpErrorCode, Vec<u8>),
+    }
+
+    fn seen(result: Result<HttpBodyEvent, HttpError>) -> Seen {
+        let event = match result {
+            Ok(event) => event,
+            Err(error) => return Seen::Error(error.code(), error.message().to_vec()),
+        };
+        let eom = event.eom();
+        match event.into_kind() {
+            HttpBodyEventKind::Body(body) => {
+                Seen::Body(body.coalesce(body.chain_length()).unwrap().to_vec(), eom)
+            }
+            HttpBodyEventKind::Padding(bytes) => Seen::Padding(bytes, eom),
+            HttpBodyEventKind::Trailers(trailers) => {
+                assert!(eom);
+                Seen::Trailers(trailers.get_single_or_empty(b"trailer").to_vec())
+            }
+            _ => panic!("unexpected body event"),
+        }
+    }
+
+    type ReadTranscript = (Vec<Seen>, Vec<(StreamId, usize, usize)>);
+
+    /// Reads a request source through the general API, three bytes at most per
+    /// event, applying the next step of `script` whenever a read or a resume is
+    /// pending. Suspends are awaited and left out of the transcript.
+    fn general_transcript(script: &[Step]) -> ReadTranscript {
+        let (owner, producer, log) = request_owner();
+        let source = owner.source().unwrap();
+        let mut steps = script.iter();
+        let mut next = || apply(&producer, *steps.next().expect("a step for each wait"));
+        let mut context = Context::from_waker(Waker::noop());
+        let mut transcript = Vec::new();
+        loop {
+            let mut read = source.read_body_event_unboxed(3, CancellationToken::never());
+            let result = loop {
+                match Pin::new(&mut read).poll(&mut context) {
+                    Poll::Ready(result) => break result,
+                    Poll::Pending => next(),
+                }
+            };
+            if let Ok(event) = &result
+                && event.event_type() == HttpBodyEventType::Suspend
+            {
+                let mut resume = take_resume(result.unwrap());
+                while resume.as_mut().poll(&mut context).is_pending() {
+                    next();
+                }
+                continue;
+            }
+            let last = result.as_ref().map_or(true, HttpBodyEvent::eom);
+            transcript.push(seen(result));
+            if last {
+                return (transcript, log.borrow().processed.clone());
+            }
+        }
+    }
+
+    /// Reads as [`general_transcript`] does, through a body reader.
+    fn reader_transcript(script: &[Step]) -> ReadTranscript {
+        let (owner, producer, log) = request_owner();
+        let mut reader = owner.into_body_reader();
+        let mut steps = script.iter();
+        let mut context = Context::from_waker(Waker::noop());
+        let mut transcript = Vec::new();
+        loop {
+            let result = loop {
+                match reader.poll_body(&mut context, 3) {
+                    Poll::Ready(result) => break result,
+                    Poll::Pending => apply(&producer, *steps.next().expect("a step for each wait")),
+                }
+            };
+            let last = result.as_ref().map_or(true, HttpBodyEvent::eom);
+            transcript.push(seen(result));
+            if last {
+                return (transcript, log.borrow().processed.clone());
+            }
+        }
+    }
+
+    #[test]
+    fn body_reader_events_match_the_general_read_without_suspends() {
+        run_paused(async {
+            let start: [Step; 3] = [
+                Step::Body(&[b"ab", b"cde", b"f"]),
+                Step::Padding(4),
+                Step::Body(&[b"ghij", b"k"]),
+            ];
+            for end in [Step::Trailers, Step::Eom, Step::Abort] {
+                let script = [start[0], start[1], start[2], end];
+                let general = general_transcript(&script);
+                let reader = reader_transcript(&script);
+                assert_eq!(reader, general);
+                assert!(general.0.len() >= 6, "the bodies split at the maximum");
+            }
+        });
+    }
+
+    #[test]
+    fn body_reader_pending_read_fails_with_the_producer_abort() {
+        run_paused(async {
+            let (owner, producer, log) = request_owner();
+            let mut reader = owner.into_body_reader();
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(reader.poll_body(&mut context, u32::MAX).is_pending());
+
+            assert!(producer.abort(HttpErrorCode::TRANSPORT_READ_ERROR, b""));
+            let Poll::Ready(Err(error)) = reader.poll_body(&mut context, u32::MAX) else {
+                panic!("the abort must fail the pending read");
+            };
+            assert_eq!(error.code(), HttpErrorCode::TRANSPORT_READ_ERROR);
+            assert_eq!(log.borrow().completions, [None]);
+        });
+    }
+
+    #[test]
+    fn body_reader_pending_read_times_out_with_the_source_timeout() {
+        run_paused(async {
+            let (owner, producer, _log) = request_owner();
+            assert!(producer.set_read_timeout(Duration::from_secs(2)));
+            let mut reader = owner.into_body_reader();
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(reader.poll_body(&mut context, u32::MAX).is_pending());
+            let started = time::Instant::now();
+
+            time::advance(Duration::from_secs(2)).await;
+            let error =
+                match std::future::poll_fn(|context| reader.poll_body(context, u32::MAX)).await {
+                    Err(error) => error,
+                    Ok(event) => panic!("expected a read timeout, got {:?}", event.event_type()),
+                };
+            assert_eq!(error.code(), HttpErrorCode::READ_TIMEOUT);
+            assert_eq!(error.message(), b"Read timeout after 2000");
+            // One timeout fails the read; the timer rounds up to a millisecond.
+            let elapsed = time::Instant::now() - started;
+            assert!(
+                (Duration::from_secs(2)..Duration::from_secs(4)).contains(&elapsed),
+                "{elapsed:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn body_reader_read_timeout_set_while_waiting_counts_from_the_update() {
+        run_paused(async {
+            let (owner, producer, _log) = request_owner();
+            let mut reader = owner.into_body_reader();
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(reader.poll_body(&mut context, u32::MAX).is_pending());
+
+            time::advance(Duration::from_secs(1)).await;
+            let updated = time::Instant::now();
+            assert!(producer.set_read_timeout(Duration::from_secs(2)));
+            // The read is next polled after its deadline has passed.
+            time::advance(Duration::from_secs(3)).await;
+            let error =
+                match std::future::poll_fn(|context| reader.poll_body(context, u32::MAX)).await {
+                    Err(error) => error,
+                    Ok(event) => panic!("expected a read timeout, got {:?}", event.event_type()),
+                };
+            assert_eq!(error.code(), HttpErrorCode::READ_TIMEOUT);
+            assert_eq!(error.message(), b"Read timeout after 2000");
+            assert_eq!(time::Instant::now() - updated, Duration::from_secs(3));
+        });
+    }
+
+    #[test]
+    fn body_reader_on_an_empty_owner_is_not_readable() {
+        let mut context = Context::from_waker(Waker::noop());
+        let (mut owner, _producer, _log) = request_owner();
+        owner.clear(None);
+        let mut reader = owner.into_body_reader();
+        assert!(!reader.readable());
+        let Poll::Ready(Err(error)) = reader.poll_body(&mut context, u32::MAX) else {
+            panic!("a read of an empty owner must fail");
+        };
+        assert_eq!(error.code(), HttpErrorCode::DROPPED);
+        assert_eq!(error.message(), b"HTTP source is no longer readable");
+
+        // So is a read after the reader released its source.
+        let (owner, _producer, _log) = request_owner();
+        let mut reader = owner.into_body_reader();
+        assert!(reader.readable());
+        reader.clear(Some(HttpErrorCode::CANCEL));
+        assert!(!reader.readable());
+        assert!(matches!(
+            reader.poll_body(&mut context, u32::MAX),
+            Poll::Ready(Err(error)) if error.code() == HttpErrorCode::DROPPED
+        ));
+    }
+
+    #[test]
+    fn body_reader_refuses_a_read_while_another_is_active() {
+        run_paused(async {
+            let mut context = Context::from_waker(Waker::noop());
+            let refused = |reader: &mut HttpBodyReader, context: &mut Context<'_>| {
+                let Poll::Ready(Err(error)) = reader.poll_body(context, u32::MAX) else {
+                    panic!("an overlapping read must fail");
+                };
+                assert_eq!(error.code(), HttpErrorCode::INVALID_STATE_TRANSITION);
+                assert_eq!(
+                    error.message(),
+                    b"HTTP stream source already has an active read or resume wait"
+                );
+            };
+
+            // A suspend's resume wait.
+            let (owner, _producer, _log) = request_owner();
+            let resume = take_resume(read_body(owner.source().unwrap(), u32::MAX).unwrap());
+            let mut reader = owner.into_body_reader();
+            refused(&mut reader, &mut context);
+            drop(resume);
+            assert!(reader.poll_body(&mut context, u32::MAX).is_pending());
+
+            // A general read waiting after its suspend.
+            let (owner, _producer, _log) = request_owner();
+            drop(read_body(owner.source().unwrap(), u32::MAX).unwrap());
+            let mut read = owner
+                .source()
+                .unwrap()
+                .read_body_event_unboxed(u32::MAX, CancellationToken::never());
+            assert!(Pin::new(&mut read).poll(&mut context).is_pending());
+            let mut reader = owner.into_body_reader();
+            refused(&mut reader, &mut context);
+            drop(read);
+            assert!(reader.poll_body(&mut context, u32::MAX).is_pending());
+        });
+    }
+
+    /// A waker that logs its drop, and panics in it if `panics`.
+    struct LoggedWaker {
+        log: OrderLog,
+        panics: bool,
+    }
+
+    #[expect(
+        clippy::manual_noop_waker,
+        reason = "the waker must log its drop, which `Waker::noop()` cannot"
+    )]
+    impl Wake for LoggedWaker {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    impl Drop for LoggedWaker {
+        fn drop(&mut self) {
+            self.log.lock().unwrap().push("waker dropped".to_owned());
+            if self.panics {
+                panic!("waker drop");
+            }
+        }
+    }
+
+    /// The wait of a pending body reader read.
+    #[derive(Clone, Copy, Debug)]
+    enum PendingWait {
+        /// The source has no read timeout.
+        Direct,
+        /// A read timeout set during the wait, then one poll.
+        Retimed,
+    }
+
+    /// A body reader of a [`logged_request_owner`] source, with a read pending
+    /// in `wait`. The reader holds the only reference to the poll's waker.
+    fn reader_with_pending_read(
+        log: &OrderLog,
+        panic: CallbackPanic,
+        wait: PendingWait,
+        waker_panics: bool,
+    ) -> (HttpBodyReader, HttpStreamSourceProducer) {
+        let (owner, producer) = logged_request_owner(log, panic);
+        let mut reader = owner.into_body_reader();
+        let waker = Waker::from(Arc::new(LoggedWaker {
+            log: Arc::clone(log),
+            panics: waker_panics,
+        }));
+        let mut context = Context::from_waker(&waker);
+        assert!(reader.poll_body(&mut context, u32::MAX).is_pending());
+        if let PendingWait::Retimed = wait {
+            assert!(producer.set_read_timeout(Duration::from_secs(2)));
+            assert!(reader.poll_body(&mut context, u32::MAX).is_pending());
+        }
+        (reader, producer)
+    }
+
+    /// The callback transcript of `release` on a [`logged_request_owner`]
+    /// source with no read pending.
+    fn twin_transcript(release: Release) -> Vec<String> {
+        let log = OrderLog::default();
+        let (mut owner, _producer) = logged_request_owner(&log, CallbackPanic::None);
+        match release {
+            Release::Clear => owner.clear(Some(HttpErrorCode::CANCEL)),
+            Release::RetireTerminal => owner.retire_terminal(),
+            Release::Drop => drop(owner),
+        }
+        entries(&log)
+    }
+
+    /// Releases a reader with each kind of pending wait, and checks that the
+    /// callback saw what the owner's `release` gives with no read pending, and
+    /// that the read was retired, dropping its waker, before the source was
+    /// destroyed.
+    fn check_release_of_a_pending_read(release: Release) {
+        run_paused(async {
+            for wait in [PendingWait::Direct, PendingWait::Retimed] {
+                let log = OrderLog::default();
+                let (mut reader, producer) =
+                    reader_with_pending_read(&log, CallbackPanic::None, wait, false);
+                assert!(entries(&log).is_empty(), "{wait:?}");
+                match release {
+                    Release::Clear => reader.clear(Some(HttpErrorCode::CANCEL)),
+                    Release::RetireTerminal => reader.retire_terminal(),
+                    Release::Drop => drop(reader),
+                }
+                assert!(!producer.is_live(), "{wait:?}");
+                assert_eq!(callback_entries(&log), twin_transcript(release), "{wait:?}");
+                let log = entries(&log);
+                let position = |entry: &str| log.iter().position(|logged| logged == entry);
+                let waker = position("waker dropped").expect("the waker is dropped");
+                let callback = position("callback dropped").expect("the callback is dropped");
+                assert!(waker < callback, "{wait:?}: {log:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn body_reader_clear_stops_the_source_with_its_code() {
+        check_release_of_a_pending_read(Release::Clear);
+    }
+
+    #[test]
+    fn body_reader_retire_terminal_releases_the_wait_without_a_stop() {
+        check_release_of_a_pending_read(Release::RetireTerminal);
+    }
+
+    #[test]
+    fn body_reader_drop_releases_a_pending_wait() {
+        check_release_of_a_pending_read(Release::Drop);
+    }
+
+    #[test]
+    fn body_reader_retirement_propagates_a_callback_panic() {
+        run_paused(async {
+            for release in [Release::Clear, Release::RetireTerminal, Release::Drop] {
+                for waker_panics in [false, true] {
+                    let label = format!("{release:?}, waker panics: {waker_panics}");
+                    let log = OrderLog::default();
+                    let (mut reader, producer) = reader_with_pending_read(
+                        &log,
+                        delivered_panic(release),
+                        PendingWait::Direct,
+                        waker_panics,
+                    );
+                    // A clear or retire_terminal that unwinds leaves the
+                    // reader alive, so the call itself destroyed the source.
+                    let unwound = match release {
+                        Release::Clear => std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            reader.clear(Some(HttpErrorCode::CANCEL));
+                        })),
+                        Release::RetireTerminal => {
+                            std::panic::catch_unwind(AssertUnwindSafe(|| reader.retire_terminal()))
+                        }
+                        Release::Drop => {
+                            std::panic::catch_unwind(AssertUnwindSafe(|| drop(reader)))
+                        }
+                    };
+                    let payload = unwound.expect_err("a retirement panic propagates");
+                    let expected = match (waker_panics, release) {
+                        (true, _) => "waker drop",
+                        (false, Release::RetireTerminal) => "callback drop",
+                        (false, Release::Clear | Release::Drop) => "callback completion",
+                    };
+                    assert_eq!(panic_text(&*payload), expected, "{label}");
+                    assert!(!producer.is_live(), "{label}");
+                    assert_eq!(
+                        entries(&log),
+                        [
+                            "waker dropped".to_owned(),
+                            twin_transcript(release)[0].clone(),
+                            "callback dropped".to_owned()
+                        ],
+                        "{label}"
+                    );
+                }
+            }
+
+            // A drop while already unwinding drops both payloads.
+            let log = OrderLog::default();
+            let (reader, producer) = reader_with_pending_read(
+                &log,
+                CallbackPanic::SourceComplete,
+                PendingWait::Direct,
+                true,
+            );
+            let unwound = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let _reader = reader;
+                panic!("outer");
+            }));
+            assert_eq!(panic_text(&*unwound.unwrap_err()), "outer");
+            assert!(!producer.is_live());
+            assert_eq!(entries(&log).len(), 3, "the waker and the callback");
+        });
+    }
+
+    #[test]
+    fn body_reader_producer_stop_completes_the_source_at_the_next_poll() {
+        run_paused(async {
+            let (owner, producer, log) = request_owner();
+            let mut reader = owner.into_body_reader();
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(reader.poll_body(&mut context, u32::MAX).is_pending());
+
+            assert!(producer.stop_reading(Some(HttpErrorCode::CANCEL)));
+            assert!(
+                log.borrow().completions.is_empty(),
+                "the pending read defers the completion"
+            );
+            let Poll::Ready(Err(error)) = reader.poll_body(&mut context, u32::MAX) else {
+                panic!("the stop must fail the pending read");
+            };
+            assert_eq!(error.code(), HttpErrorCode::CANCEL);
+            assert_eq!(log.borrow().completions, [Some(HttpErrorCode::CANCEL)]);
+        });
+    }
+
+    #[test]
+    fn body_reader_keeps_the_armed_maximum() {
+        run_paused(async {
+            let (owner, producer, _log) = request_owner();
+            let mut reader = owner.into_body_reader();
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(reader.poll_body(&mut context, 4).is_pending());
+            assert!(reader.poll_body(&mut context, u32::MAX).is_pending());
+
+            assert_eq!(
+                producer.body(body(b"0123456789"), 0, false),
+                FlowControlState::Open
+            );
+            let Poll::Ready(Ok(event)) = reader.poll_body(&mut context, u32::MAX) else {
+                panic!("the body must complete the pending read");
+            };
+            assert_eq!(body_text(&event), b"0123");
+            let Poll::Ready(Ok(event)) = reader.poll_body(&mut context, u32::MAX) else {
+                panic!("the next read takes the rest of the body");
+            };
+            assert_eq!(body_text(&event), b"456789");
         });
     }
 }

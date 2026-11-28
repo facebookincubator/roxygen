@@ -5,12 +5,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::borrow::BorrowMut;
 use std::cell::Cell;
 use std::cell::OnceCell;
 use std::cell::RefCell;
 use std::cell::RefMut;
 use std::collections::VecDeque;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
 use std::pin::Pin;
@@ -536,19 +538,41 @@ impl HttpStreamSourceOwner {
     /// propagated unless the caller is already unwinding.
     pub fn clear(&mut self, error: Option<HttpErrorCode>) {
         let unwinding = std::thread::panicking();
-        let failure = self
-            .source
-            .take()
-            .and_then(|source| retire_source(source, |source| source.stop_reading(error)));
+        let failure = self.stop_source(error);
         finish_retirement_panic(failure, unwinding);
     }
 
     /// Destroys the source after a terminal read without an additional explicit stop.
     pub fn retire_terminal(&mut self) {
         let unwinding = std::thread::panicking();
-        let source = self.source.take();
-        let failure = catch_unwind(AssertUnwindSafe(|| drop(source))).err();
+        let failure = self.destroy_source();
         finish_retirement_panic(failure, unwinding);
+    }
+
+    /// Converts into the source's body reader, whose empty reads wait instead
+    /// of suspending. An empty owner gives a reader that is not readable.
+    pub fn into_body_reader(self) -> HttpBodyReader {
+        HttpBodyReader {
+            owner: self,
+            wait: ExclusiveWait::Idle,
+            maximum: u32::MAX,
+            completed: true,
+        }
+    }
+
+    /// Empties the owner, then stops and destroys its source, and returns the
+    /// first cleanup panic.
+    fn stop_source(&mut self, error: Option<HttpErrorCode>) -> Option<RetirementPanic> {
+        self.source
+            .take()
+            .and_then(|source| retire_source(source, |source| source.stop_reading(error)))
+    }
+
+    /// Empties the owner and destroys its source, and returns the panic of
+    /// that destruction.
+    fn destroy_source(&mut self) -> Option<RetirementPanic> {
+        let source = self.source.take();
+        catch_unwind(AssertUnwindSafe(|| drop(source))).err()
     }
 
     /// Transfers the same source into the generic holder without reading or stopping it.
@@ -566,6 +590,162 @@ impl HttpStreamSourceOwner {
 impl Drop for HttpStreamSourceOwner {
     fn drop(&mut self) {
         self.clear(None);
+    }
+}
+
+/// The single reader of an owned stream source's body, made by
+/// [`HttpStreamSourceOwner::into_body_reader`]. An empty read waits in place
+/// for the next event instead of returning [`HttpBodyEvent::suspend`].
+///
+/// Each read is admitted and completed as an exclusive read, so the source
+/// completes as it would for the general source API. A read ends with the next
+/// body, padding, trailers or terminal event, a source error, or the source's
+/// read timeout, which fails it with `READ_TIMEOUT`. While the source has no
+/// read timeout, a pending read does not allocate or create a timer.
+///
+/// The reader owns its source. [`Self::clear`], [`Self::retire_terminal`] and
+/// Drop first retire a pending read, then stop or destroy the source as the
+/// owner's methods of the same names do.
+pub struct HttpBodyReader {
+    owner: HttpStreamSourceOwner,
+    wait: BodyReadWait,
+    maximum: u32,
+    /// The reader does not hold an admitted read.
+    completed: bool,
+}
+
+/// A body reader's wait. Its timed state is boxed, so that a reader of a
+/// source without a read timeout stays at 32 bytes.
+type BodyReadWait = ExclusiveWait<Box<TimedWait>>;
+
+impl HttpBodyReader {
+    /// Whether the reader still owns its source.
+    pub fn readable(&self) -> bool {
+        self.owner.source.is_some()
+    }
+
+    /// Polls for the next body event of at most `maximum` body bytes. It never
+    /// returns [`HttpBodyEvent::suspend`].
+    ///
+    /// The poll that starts a read fixes its maximum. Later polls of the same
+    /// pending read ignore theirs, and the next read takes the maximum of the
+    /// poll that starts it.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `DROPPED` if the reader no longer owns its source, and with
+    /// `INVALID_STATE_TRANSITION` if a read or a suspend's resume wait that
+    /// started on the source before the conversion is still active. Otherwise
+    /// it fails as a body read of the source does.
+    pub fn poll_body(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        let mut guard = BodyReadPollGuard {
+            reader: self,
+            armed: true,
+        };
+        let result = guard.reader.poll_read(context, maximum);
+        guard.armed = false;
+        result
+    }
+
+    fn poll_read(
+        &mut self,
+        context: &mut Context<'_>,
+        maximum: u32,
+    ) -> Poll<Result<HttpBodyEvent, HttpError>> {
+        let Some(source) = &self.owner.source else {
+            return Poll::Ready(Err(source_not_readable()));
+        };
+        let shared = &source.shared;
+        shared.assert_owner();
+        if self.completed {
+            validate_read(shared, ReadKind::Body, maximum)?;
+            let mut state = shared.state.borrow_mut();
+            if state.active_read.is_some() || state.suspend_wait_active {
+                return Poll::Ready(Err(read_already_active()));
+            }
+            state.active_read = Some(ReadActivity::Exclusive);
+            self.maximum = maximum;
+            self.completed = false;
+        }
+        self.operation().poll(context).map(|result| {
+            result.map(|event| match event {
+                StreamReadOutput::Body(event) => event,
+                StreamReadOutput::Header(_) => unreachable!("a body read returns body events"),
+            })
+        })
+    }
+
+    /// Retires a pending read, then stops and destroys the source, as
+    /// [`HttpStreamSourceOwner::clear`] does. The source is destroyed even if
+    /// the read's retirement panics. The first cleanup panic is propagated
+    /// unless the caller is already unwinding.
+    pub fn clear(&mut self, error: Option<HttpErrorCode>) {
+        let unwinding = std::thread::panicking();
+        let mut first = self.retire_read();
+        retain_retirement_panic(&mut first, self.owner.stop_source(error));
+        finish_retirement_panic(first, unwinding);
+    }
+
+    /// Retires a pending read, then destroys the source without an explicit
+    /// stop, as [`HttpStreamSourceOwner::retire_terminal`] does.
+    pub fn retire_terminal(&mut self) {
+        let unwinding = std::thread::panicking();
+        let mut first = self.retire_read();
+        retain_retirement_panic(&mut first, self.owner.destroy_source());
+        finish_retirement_panic(first, unwinding);
+    }
+
+    /// Releases a pending read's wait and admission, and returns the first
+    /// panic of that retirement.
+    fn retire_read(&mut self) -> Option<RetirementPanic> {
+        if self.completed {
+            return None;
+        }
+        self.operation().retire_inner()
+    }
+
+    fn operation(&mut self) -> ReadOperation<'_, ExclusiveRead<BodyReadWait>> {
+        let source = self
+            .owner
+            .source
+            .as_ref()
+            .expect("the source of a pending read stays owned until the read retires");
+        ReadOperation {
+            shared: &source.shared,
+            role: ExclusiveRead {
+                suspend_free: true,
+                wait: PhantomData,
+            },
+            kind: ReadKind::Body,
+            maximum: self.maximum,
+            wait: &mut self.wait,
+            completed: &mut self.completed,
+        }
+    }
+}
+
+impl Drop for HttpBodyReader {
+    fn drop(&mut self) {
+        self.clear(None);
+    }
+}
+
+struct BodyReadPollGuard<'a> {
+    reader: &'a mut HttpBodyReader,
+    armed: bool,
+}
+
+impl Drop for BodyReadPollGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let unwinding = std::thread::panicking();
+            let failure = self.reader.retire_read();
+            finish_retirement_panic(failure, unwinding);
+        }
     }
 }
 
@@ -927,6 +1107,7 @@ impl HttpResponseReader {
             shared,
             role: ExclusiveRead {
                 suspend_free: self.suspend_free,
+                wait: PhantomData,
             },
             kind,
             maximum: self.maximum,
@@ -949,6 +1130,7 @@ impl HttpResponseReader {
                 shared: &shared,
                 role: ExclusiveRead {
                     suspend_free: self.suspend_free,
+                    wait: PhantomData,
                 },
                 kind: self.kind,
                 maximum: self.maximum,
@@ -2069,6 +2251,16 @@ impl HttpStreamSourceProducer {
     }
 }
 
+#[cfg(test)]
+impl HttpStreamSourceProducer {
+    /// Whether the live source has created its event baton.
+    pub(crate) fn event_baton_created_for_test(&self) -> bool {
+        self.shared
+            .upgrade()
+            .is_some_and(|shared| shared.event.get().is_some())
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ReadKind {
     Header,
@@ -2271,12 +2463,14 @@ impl ReadRole for GeneralRead<'_> {
     }
 }
 
-struct ExclusiveRead {
+/// An exclusive read whose wait has type `W`.
+struct ExclusiveRead<W = ExclusiveWait> {
     suspend_free: bool,
+    wait: PhantomData<W>,
 }
 
-impl ReadRole for ExclusiveRead {
-    type Wait = ExclusiveWait;
+impl<W: OperationWait> ReadRole for ExclusiveRead<W> {
+    type Wait = W;
 
     fn finish(&self, shared: &Rc<StreamShared>, eom: bool) {
         finish_exclusive_read(shared, eom);
@@ -2337,14 +2531,18 @@ impl OperationWait for Option<TimedWait> {
 }
 
 /// An exclusive read's wait. It takes no cancellation, so while the source has
-/// no read timeout it is a `DirectWait` instead of a `TimedWait`.
-enum ExclusiveWait {
+/// no read timeout it is a `DirectWait` instead of a `TimedWait`, which `T`
+/// holds inline or boxed.
+enum ExclusiveWait<T = TimedWait> {
     Idle,
     Direct,
-    Timed(TimedWait),
+    Timed(T),
 }
 
-impl OperationWait for ExclusiveWait {
+impl<T> OperationWait for ExclusiveWait<T>
+where
+    T: From<TimedWait> + BorrowMut<TimedWait>,
+{
     #[inline]
     fn is_waiting(&self) -> bool {
         !matches!(self, Self::Idle)
@@ -2353,7 +2551,7 @@ impl OperationWait for ExclusiveWait {
     fn start(&mut self, shared: &StreamShared, cancellation: CancellationToken) {
         debug_assert!(!cancellation.can_be_cancelled());
         *self = if shared.has_read_timeout() {
-            Self::Timed(shared.wait_event(cancellation))
+            Self::Timed(T::from(shared.wait_event(cancellation)))
         } else {
             Self::Direct
         };
@@ -2387,6 +2585,7 @@ impl OperationWait for ExclusiveWait {
                 WaitStatus::Signalled
             }
             Self::Timed(wait) => {
+                let wait: &mut TimedWait = wait.borrow_mut();
                 let Poll::Ready(status) = Pin::new(wait).poll(context) else {
                     return Poll::Pending;
                 };
@@ -2405,7 +2604,7 @@ impl OperationWait for ExclusiveWait {
     }
 }
 
-impl ExclusiveWait {
+impl<T: From<TimedWait>> ExclusiveWait<T> {
     fn release_waiting(&mut self, shared: &StreamShared) {
         if matches!(std::mem::replace(self, Self::Idle), Self::Direct) {
             let direct = shared.direct_wait.take();
@@ -2418,7 +2617,7 @@ impl ExclusiveWait {
     #[inline(never)]
     fn adopt_retimed_wait(&mut self, shared: &StreamShared) {
         if let Some(wait) = shared.retimed_wait.take() {
-            *self = Self::Timed(wait);
+            *self = Self::Timed(T::from(wait));
         }
     }
 }
