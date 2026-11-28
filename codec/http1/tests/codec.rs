@@ -9338,6 +9338,183 @@ fn a_response_date_is_kept_whether_or_not_the_implicit_date_is_added() {
     assert_eq!(generate_ok_head(false, Some(b"fixed")), expected);
 }
 
+/// A 200 head costs one allocation, its buffer, which the output queue takes
+/// without allocating again.
+#[test]
+fn a_generated_head_allocates_only_its_buffer() {
+    if !std_allocations_observable() {
+        eprintln!("allocation counts need a static std, as in optimized builds");
+        return;
+    }
+    for add_date in [false, true] {
+        let (head, allocations) = generate_counted_ok_head(add_date, None);
+        assert_eq!(allocations, 1, "{head}");
+    }
+}
+
+/// The framing headers of [`generated_head_matrix`], by label.
+const MATRIX_FRAMINGS: [(&str, Option<(HttpHeaderCode, &[u8])>); 3] = [
+    ("none", None),
+    ("length", Some((HttpHeaderCode::ContentLength, b"5"))),
+    (
+        "chunked",
+        Some((HttpHeaderCode::TransferEncoding, b"chunked")),
+    ),
+];
+
+/// Generates `message` as a head and returns the output queue it went to.
+fn generate_head(
+    codec: &mut Http1xCodec,
+    stream: StreamId,
+    message: &HttpMessage,
+    end_stream: bool,
+) -> BufQueue {
+    let mut output = BufQueue::new(QUEUE_LIMIT);
+    codec
+        .generate(
+            &mut output,
+            EgressFrame::Headers {
+                stream,
+                message,
+                end_stream,
+                extra_headers: None,
+            },
+            &mut Recorder::default(),
+        )
+        .expect("a generated head");
+    output
+}
+
+/// Labeled heads of GET and POST requests and of 200 responses, on HTTP/1.0 and HTTP/1.1, with
+/// and without `end_stream`. Each has no Connection header or one with close, keep-alive or
+/// two custom tokens, and no framing header, a length or chunking. Each response is generated
+/// with the implicit Date on and off. A websocket upgrade request and its 101 come last.
+fn generated_head_matrix() -> Vec<(String, BufQueue)> {
+    let connections: [Option<&[u8]>; 4] = [
+        None,
+        Some(b"close"),
+        Some(b"keep-alive"),
+        Some(b"X-Hop, x-other"),
+    ];
+    let mut heads = Vec::new();
+    for version in [(1, 0), (1, 1)] {
+        for connection in connections {
+            for (framing_label, framing) in MATRIX_FRAMINGS {
+                for end_stream in [false, true] {
+                    let case = format!(
+                        "HTTP/{}.{} connection={} framing={framing_label} end_stream={end_stream}",
+                        version.0,
+                        version.1,
+                        connection.unwrap_or(b"-").escape_ascii(),
+                    );
+                    let add_headers = |message: &mut HttpMessage| {
+                        if let Some(connection) = connection {
+                            message
+                                .headers_mut()
+                                .add(HttpHeaderCode::Connection, connection);
+                        }
+                        if let Some((code, value)) = framing {
+                            message.headers_mut().add(code, value);
+                            message.set_chunked(code == HttpHeaderCode::TransferEncoding);
+                        }
+                    };
+                    for method in [HttpMethod::Get, HttpMethod::Post] {
+                        let mut codec = Http1xCodec::new(TransportDirection::Upstream);
+                        let stream = codec.create_stream();
+                        let mut message = request(method, b"/matrix", version);
+                        add_headers(&mut message);
+                        let output = generate_head(&mut codec, stream, &message, end_stream);
+                        heads.push((format!("{method:?} {case}"), output));
+                    }
+                    for add_date in [false, true] {
+                        let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+                        codec.set_add_date_header_to_response(add_date);
+                        let wire: &[u8] = if version == (1, 0) {
+                            b"GET / HTTP/1.0\r\nHost: h\r\nConnection: keep-alive\r\n\r\n"
+                        } else {
+                            b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"
+                        };
+                        assert_eq!(
+                            parse(&mut codec, &mut Recorder::default(), wire),
+                            wire.len()
+                        );
+                        let mut message = response(200, version);
+                        add_headers(&mut message);
+                        let output =
+                            generate_head(&mut codec, StreamId::new(1), &message, end_stream);
+                        heads.push((format!("200 date={add_date} {case}"), output));
+                    }
+                }
+            }
+        }
+    }
+    let mut codec = Http1xCodec::new(TransportDirection::Upstream);
+    let stream = codec.create_stream();
+    let mut message = request(HttpMethod::Get, b"/chat", (1, 1));
+    message.set_egress_websocket_upgrade();
+    let output = generate_head(&mut codec, stream, &message, false);
+    heads.push(("websocket request".to_owned(), output));
+    let mut codec = Http1xCodec::new(TransportDirection::Downstream);
+    let wire = b"GET /chat HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+        Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    assert_eq!(
+        parse(&mut codec, &mut Recorder::default(), wire),
+        wire.len()
+    );
+    let mut message = response(101, (1, 1));
+    message.set_egress_websocket_upgrade();
+    let output = generate_head(&mut codec, StreamId::new(1), &message, false);
+    heads.push(("websocket response".to_owned(), output));
+    heads
+}
+
+/// `head` escaped, with the values of its Date and Sec-WebSocket-Key lines, which change from
+/// run to run, replaced.
+fn stable_head(head: &[u8]) -> String {
+    head.split_inclusive(|byte| *byte == b'\n')
+        .map(|line| {
+            match ["Date: ", "Sec-WebSocket-Key: "]
+                .into_iter()
+                .find(|name| line.starts_with(name.as_bytes()))
+            {
+                Some(name) => format!("{name}<varies>\\r\\n"),
+                None => line.escape_ascii().to_string(),
+            }
+        })
+        .collect()
+}
+
+/// The recorded FNV-1a digest of the stable heads of [`generated_head_matrix`]. Update it only
+/// when the generated bytes are meant to change.
+const GENERATED_HEAD_MATRIX_DIGEST: u64 = 0x68e3_c81a_7189_8770;
+
+#[test]
+fn generated_heads_are_backed_by_exactly_their_bytes() {
+    let mut heads = String::new();
+    let mut inexact = Vec::new();
+    for (label, output) in generated_head_matrix() {
+        let length = output.chain_length();
+        let backing = output.backing_capacity_upper_bound();
+        if backing != Some(length) {
+            inexact.push(format!("{label}: {length} bytes, backing {backing:?}"));
+        }
+        writeln!(heads, "{label}: {}", stable_head(&queue_bytes(&output))).unwrap();
+    }
+    let digest = heads.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    });
+    assert!(
+        digest == GENERATED_HEAD_MATRIX_DIGEST,
+        "the generated heads differ from the recorded baseline: {digest:#018x}\n{heads}"
+    );
+    assert!(
+        inexact.is_empty(),
+        "{} heads are not backed by exactly their bytes:\n{}",
+        inexact.len(),
+        inexact.join("\n")
+    );
+}
+
 #[test]
 fn llhttp_rejections_have_fragmentation_independent_error_offsets() {
     for wire in [

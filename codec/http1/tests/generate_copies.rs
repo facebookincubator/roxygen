@@ -12,8 +12,9 @@
 //! lifecycle: a closed connection rejects another request, and an accepted
 //! upgrade delivers subsequent bytes as tunnel data. Readable traces check each
 //! base message's header block and the error, message-kind, CR/LF and websocket
-//! cases. FNV-1a digests check every header variant. A request and a response
-//! with many Connection tokens also check that generation sizes its output once.
+//! cases. FNV-1a digests check every header variant. Every generated head's
+//! buffer is exactly as long as the head, including the heads of a request and
+//! a response with many Connection tokens.
 //!
 //! The framing frames (body, chunk header and terminator, trailers, and EOM)
 //! keep the recorded traces and the chunk-size prefixes of a `format!`
@@ -42,8 +43,6 @@ use roxygen_core::ids::StreamId;
 use roxygen_core::message::HttpMessage;
 
 use super::Http1xCodec;
-use super::MAX_REQUEST_LINE_SUFFIX;
-use super::MAX_STATUS_LINE_SUFFIX;
 use super::formatted_strings;
 use super::websocket_accept;
 
@@ -239,6 +238,14 @@ impl Trace {
         let result = self
             .codec
             .generate(&mut output, frame, &mut Events::default());
+        if message.is_some() {
+            assert_eq!(
+                output.backing_capacity_upper_bound(),
+                Some(output.chain_length()),
+                "the buffer of this head is exactly its length: \"{}\"",
+                queue_bytes(&output).escape_ascii()
+            );
+        }
         self.last_output = queue_bytes(&output);
         let (bytes, key) = normalize_key(&self.last_output, message, extra_headers);
         if key.is_some() {
@@ -672,20 +679,18 @@ fn many_tokens() -> Vec<u8> {
 }
 
 /// Generates `message` through `generate_headers` and checks that the output
-/// buffer still has the capacity it was created with, which `Vec::with_capacity`
-/// makes exactly the requested one, so the buffer never regrew.
+/// buffer's capacity equals its length, as when the buffer is created with the
+/// head's exact length and never regrows.
 fn generate_sized_once(
     codec: &mut Http1xCodec,
     stream: StreamId,
     message: &HttpMessage,
     extra_headers: Option<&HttpHeaders>,
-    start_line: usize,
 ) -> String {
-    let capacity = start_line + codec.header_capacity(message, extra_headers, true);
     let (output, _) = codec
         .generate_headers(message, stream, true, extra_headers)
         .expect("generated headers");
-    assert_eq!(output.capacity(), capacity, "{}", output.escape_ascii());
+    assert_eq!(output.capacity(), output.len(), "{}", output.escape_ascii());
     output.escape_ascii().to_string()
 }
 
@@ -697,14 +702,9 @@ fn connection_token_heads(direction: TransportDirection) -> Vec<String> {
         .into_iter()
         .map(|in_extra| {
             let mut codec = Http1xCodec::new(direction);
-            let (stream, mut message, start_line) = if direction.is_upstream() {
+            let (stream, mut message) = if direction.is_upstream() {
                 let stream = codec.create_stream();
-                let message = request(HttpMethod::Get, Some(b"/tokens"), (1, 1));
-                (
-                    stream,
-                    message,
-                    b"GET".len() + b"/tokens".len() + MAX_REQUEST_LINE_SUFFIX,
-                )
+                (stream, request(HttpMethod::Get, Some(b"/tokens"), (1, 1)))
             } else {
                 let mut events = Events::default();
                 let input =
@@ -714,11 +714,7 @@ fn connection_token_heads(direction: TransportDirection) -> Vec<String> {
                 message
                     .headers_mut()
                     .add(HttpHeaderCode::ContentLength, b"0");
-                (
-                    StreamId::new(1),
-                    message,
-                    b"OK".len() + MAX_STATUS_LINE_SUFFIX,
-                )
+                (StreamId::new(1), message)
             };
             let mut extra = HttpHeaders::new();
             if in_extra {
@@ -728,13 +724,7 @@ fn connection_token_heads(direction: TransportDirection) -> Vec<String> {
                     .headers_mut()
                     .add(HttpHeaderCode::Connection, many_tokens());
             }
-            generate_sized_once(
-                &mut codec,
-                stream,
-                &message,
-                in_extra.then_some(&extra),
-                start_line,
-            )
+            generate_sized_once(&mut codec, stream, &message, in_extra.then_some(&extra))
         })
         .collect()
 }

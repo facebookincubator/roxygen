@@ -109,22 +109,6 @@ use sha1::Sha1;
 
 const MAX_HEADER_BYTES: usize = 80 * 1024;
 const WEBSOCKET_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-/// The longest request line, not counting its method and target.
-const MAX_REQUEST_LINE_SUFFIX: usize = b"  HTTP/255.255\r\n".len();
-/// The longest status line, not counting its reason.
-const MAX_STATUS_LINE_SUFFIX: usize = b"HTTP/255.255 65535 \r\n".len();
-/// The lines `generate_headers` may add after the message's headers: chunked
-/// framing, Date, Connection with its keep-alive token, and the final CRLF.
-const GENERATED_LINES: usize = b"Transfer-Encoding: chunked\r\n".len()
-    + b"Date: Tue, 06 Oct 2026 00:00:00 GMT\r\n".len()
-    + b"Connection: , keep-alive\r\n".len()
-    + b"\r\n".len();
-/// The generated websocket lines and Upgrade token, not counting the stored
-/// accept key.
-const MAX_WEBSOCKET_LINES: usize = b"Upgrade: websocket\r\n".len()
-    + b"Sec-WebSocket-Accept: \r\n".len()
-    + b"Sec-WebSocket-Key: 0123456789012345678901==\r\n".len()
-    + b", Upgrade".len();
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum KeepaliveRequested {
     #[default]
@@ -225,6 +209,59 @@ impl MessageEnd {
             Self::Crlf => b"\r\n\r\n",
             Self::LastChunk => b"\r\n0\r\n\r\n",
         }
+    }
+}
+
+/// The first line of a head that `generate_headers` writes.
+enum StartLine<'a> {
+    Request { method: &'a [u8], target: &'a [u8] },
+    Status { status: u16, reason: &'a [u8] },
+}
+
+impl StartLine<'_> {
+    /// The line's length, CRLF included, at `version`. An HTTP/0.9 request line
+    /// does not carry its version.
+    fn len(&self, version: (u8, u8)) -> usize {
+        let version_len =
+            b"HTTP/.".len() + decimal_len(u16::from(version.0)) + decimal_len(u16::from(version.1));
+        match *self {
+            Self::Request { method, target } if version == (0, 9) => {
+                method.len() + b" \r\n".len() + target.len()
+            }
+            Self::Request { method, target } => {
+                method.len() + b"  \r\n".len() + target.len() + version_len
+            }
+            Self::Status { status, reason } => {
+                version_len + b"  \r\n".len() + decimal_len(status) + reason.len()
+            }
+        }
+    }
+
+    fn write(&self, output: &mut Vec<u8>, version: (u8, u8)) {
+        match *self {
+            Self::Request { method, target } => {
+                output.extend_from_slice(method);
+                output.push(b' ');
+                output.extend_from_slice(target);
+                if version != (0, 9) {
+                    output.extend_from_slice(b" HTTP/");
+                    push_decimal(output, u16::from(version.0));
+                    output.push(b'.');
+                    push_decimal(output, u16::from(version.1));
+                }
+            }
+            Self::Status { status, reason } => {
+                output.extend_from_slice(b"HTTP/");
+                push_decimal(output, u16::from(version.0));
+                output.push(b'.');
+                push_decimal(output, u16::from(version.1));
+                output.push(b' ');
+                push_decimal(output, status);
+                output.push(b' ');
+                output.extend_from_slice(reason);
+            }
+        }
+        output.extend_from_slice(b"\r\n");
     }
 }
 
@@ -906,8 +943,7 @@ impl Http1xCodec {
 
         self.egress_chunked = message.is_chunked() && !self.egress_upgrade;
         self.last_chunk_written = false;
-        let mut output;
-        if upstream {
+        let start_line = if upstream {
             let method_name = if egress_websocket {
                 "GET"
             } else {
@@ -926,23 +962,13 @@ impl Http1xCodec {
             } else {
                 url
             };
-            let start_line = method_name.len() + target.len() + MAX_REQUEST_LINE_SUFFIX;
-            output = Vec::with_capacity(
-                start_line + self.header_capacity(message, extra_headers, end_stream),
-            );
-            output.extend_from_slice(method_name.as_bytes());
-            output.push(b' ');
-            output.extend_from_slice(target);
-            if version != (0, 9) {
-                output.extend_from_slice(b" HTTP/");
-                push_decimal(&mut output, u16::from(version.0));
-                output.push(b'.');
-                push_decimal(&mut output, u16::from(version.1));
-            }
-            output.extend_from_slice(b"\r\n");
             self.may_chunk_egress = version.0 == 1 && version.1 >= 1;
             if !self.upgrade_header.is_empty() {
                 self.upgrade_header.clear();
+            }
+            StartLine::Request {
+                method: method_name.as_bytes(),
+                target,
             }
         } else {
             if status == 0 {
@@ -959,20 +985,8 @@ impl Http1xCodec {
             } else {
                 response.1
             };
-            let start_line = reason.len() + MAX_STATUS_LINE_SUFFIX;
-            output = Vec::with_capacity(
-                start_line + self.header_capacity(message, extra_headers, end_stream),
-            );
-            output.extend_from_slice(b"HTTP/");
-            push_decimal(&mut output, u16::from(version.0));
-            output.push(b'.');
-            push_decimal(&mut output, u16::from(version.1));
-            output.push(b' ');
-            push_decimal(&mut output, status);
-            output.push(b' ');
-            output.extend_from_slice(reason);
-            output.extend_from_slice(b"\r\n");
-        }
+            StartLine::Status { status, reason }
+        };
         if self.keepalive
             && (!message.wants_keepalive()
                 || version.0 < 1
@@ -988,10 +1002,15 @@ impl Http1xCodec {
             if end_stream {
                 self.finish_egress_message();
             }
+            let mut output = Vec::with_capacity(start_line.len(version));
+            start_line.write(&mut output, version);
             let size = header_size(output.len());
             return Ok((output, size));
         }
 
+        // The head is measured before it is written: a buffer with spare capacity costs
+        // another allocation when the output converts it to `Bytes`.
+        let mut length = start_line.len(version);
         let mut deferred_content_length = None;
         let mut transfer_encoding_written = false;
         let mut has_date = false;
@@ -1000,61 +1019,52 @@ impl Http1xCodec {
         let mut explicit_keepalive = false;
         let mut connection_tokens = Vec::<&[u8]>::new();
         let mut has_upgrade_connection_token = false;
-        let extra = extra_headers.into_iter().flat_map(HttpHeaders::iter);
-        for (code, name, value) in message.headers().iter().chain(extra) {
-            if code == HttpHeaderCode::ContentLength {
-                deferred_content_length = Some(value);
-                continue;
-            }
-            if code == HttpHeaderCode::Connection
-                && (!self.informational_response || egress_websocket)
-            {
-                connection_header_seen = true;
-                for token in value.split(|byte| *byte == b',') {
-                    let token = trim_http_whitespace(token);
-                    if token.eq_ignore_ascii_case(b"upgrade") {
-                        has_upgrade_connection_token = true;
+        let mut drops_line = false;
+        let header_sets = [Some(message.headers()), extra_headers];
+        for headers in header_sets.into_iter().flatten() {
+            for (code, name, value) in headers.iter() {
+                match code {
+                    HttpHeaderCode::ContentLength => deferred_content_length = Some(value),
+                    HttpHeaderCode::Connection
+                        if !self.informational_response || egress_websocket =>
+                    {
+                        connection_header_seen = true;
+                        for token in value.split(|byte| *byte == b',') {
+                            let token = trim_http_whitespace(token);
+                            if token.eq_ignore_ascii_case(b"upgrade") {
+                                has_upgrade_connection_token = true;
+                            }
+                            if token.eq_ignore_ascii_case(b"close") {
+                                self.keepalive = false;
+                            } else if token.eq_ignore_ascii_case(b"keep-alive") {
+                                explicit_keepalive = true;
+                            } else if !token.is_empty() {
+                                connection_tokens.push(token);
+                            }
+                        }
                     }
-                    if token.eq_ignore_ascii_case(b"close") {
-                        self.keepalive = false;
-                    } else if token.eq_ignore_ascii_case(b"keep-alive") {
-                        explicit_keepalive = true;
-                    } else if !token.is_empty() {
-                        connection_tokens.push(token);
+                    HttpHeaderCode::Upgrade => {
+                        has_upgrade = true;
+                        if upstream {
+                            self.upgrade_header = value.to_vec();
+                        }
                     }
+                    HttpHeaderCode::Date => has_date = true,
+                    _ => {}
                 }
-                continue;
-            }
-            if code == HttpHeaderCode::Upgrade {
-                has_upgrade = true;
-                if upstream {
-                    self.upgrade_header = value.to_vec();
-                }
-            } else if code == HttpHeaderCode::TransferEncoding && !transfer_encoding_written {
-                if !value.eq_ignore_ascii_case(b"chunked") {
-                    continue;
-                }
-                transfer_encoding_written = true;
-                if !self.may_chunk_egress {
-                    continue;
-                }
-            } else if code == HttpHeaderCode::Date {
-                has_date = true;
-            } else if egress_websocket
-                && matches!(
+                if self.writes_header_line(
                     code,
-                    HttpHeaderCode::SecWebSocketKey | HttpHeaderCode::SecWebSocketAccept
-                )
-            {
-                continue;
+                    value,
+                    egress_websocket,
+                    &mut transfer_encoding_written,
+                ) {
+                    if holds_cr_or_lf(value) {
+                        drops_line = true;
+                    } else {
+                        length += name.len() + b": ".len() + value.len() + b"\r\n".len();
+                    }
+                }
             }
-            if holds_cr_or_lf(value) {
-                continue;
-            }
-            output.extend_from_slice(name);
-            output.extend_from_slice(b": ");
-            output.extend_from_slice(value);
-            output.extend_from_slice(b"\r\n");
         }
 
         // Only a head that ends its message and has none of the caller's framing
@@ -1066,32 +1076,25 @@ impl Http1xCodec {
         let body_check = (!upstream && !self.expect_no_response_body && !self.egress_upgrade)
             || (upstream && !unframed && (method == Some(HttpMethod::Post) || self.egress_chunked));
         self.egress_chunked &= transfer_encoding_written;
+        let mut chunked_line = false;
         if body_check && !self.egress_chunked && deferred_content_length.is_none() {
             if !transfer_encoding_written && self.may_chunk_egress {
-                output.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+                chunked_line = true;
                 self.egress_chunked = true;
             } else {
                 self.keepalive = false;
             }
         }
-        if !upstream && !has_date && self.add_date_to_response {
-            output.extend_from_slice(b"Date: ");
-            output.extend_from_slice(HttpMessage::date_header().as_bytes());
-            output.extend_from_slice(b"\r\n");
-        }
-        if egress_websocket && !has_upgrade {
-            output.extend_from_slice(b"Upgrade: websocket\r\n");
+        let date =
+            (!upstream && !has_date && self.add_date_to_response).then(HttpMessage::date_header);
+        let websocket_lines = egress_websocket && !has_upgrade;
+        let mut generated_key = None;
+        if websocket_lines {
             if upstream {
                 self.upgrade_header = b"websocket".to_vec();
                 let key = websocket_key(stream);
-                output.extend_from_slice(b"Sec-WebSocket-Key: ");
-                output.extend_from_slice(&key);
-                output.extend_from_slice(b"\r\n");
                 self.websocket_accept_key = websocket_accept(&key);
-            } else {
-                output.extend_from_slice(b"Sec-WebSocket-Accept: ");
-                output.extend_from_slice(&self.websocket_accept_key);
-                output.extend_from_slice(b"\r\n");
+                generated_key = Some(key);
             }
             if !has_upgrade_connection_token {
                 connection_tokens.push(b"Upgrade");
@@ -1103,25 +1106,85 @@ impl Http1xCodec {
             && connection_header_seen
             && !explicit_keepalive
             && connection_tokens.is_empty();
-        if (!self.informational_response || upstream || !connection_tokens.is_empty())
-            && !omit_implicit_http11_keepalive
-        {
+        let connection_line =
+            (!self.informational_response || upstream || !connection_tokens.is_empty())
+                && !omit_implicit_http11_keepalive;
+        let keepalive_token: Option<&[u8]> = if self.informational_response {
+            None
+        } else if self.keepalive {
+            Some(b"keep-alive")
+        } else {
+            Some(b"close")
+        };
+        let message_end = if end_stream {
+            self.message_end()
+        } else {
+            MessageEnd::Nothing
+        };
+        let websocket_line = websocket_lines.then(|| match &generated_key {
+            Some(key) => (b"Sec-WebSocket-Key: ".as_slice(), key.as_slice()),
+            None => (
+                b"Sec-WebSocket-Accept: ".as_slice(),
+                self.websocket_accept_key.as_slice(),
+            ),
+        });
+
+        if chunked_line {
+            length += b"Transfer-Encoding: chunked\r\n".len();
+        }
+        if let Some(date) = &date {
+            length += b"Date: \r\n".len() + date.as_bytes().len();
+        }
+        if let Some((name, value)) = websocket_line {
+            length += b"Upgrade: websocket\r\n".len() + name.len() + value.len() + b"\r\n".len();
+        }
+        if connection_line {
+            let values = connection_tokens.iter().chain(&keepalive_token);
+            let separated = values.map(|value| b", ".len() + value.len()).sum::<usize>();
+            length += b"Connection: \r\n".len() + separated.saturating_sub(b", ".len());
+        }
+        if let Some(content_length) = deferred_content_length {
+            length += b"Content-Length: \r\n".len() + content_length.len();
+        }
+        length += b"\r\n".len() + message_end.bytes().len();
+
+        let mut output = Vec::with_capacity(length);
+        start_line.write(&mut output, version);
+        let mut chunked_seen = false;
+        for headers in header_sets.into_iter().flatten() {
+            for (code, name, value) in headers.iter() {
+                if self.writes_header_line(code, value, egress_websocket, &mut chunked_seen)
+                    && !(drops_line && holds_cr_or_lf(value))
+                {
+                    output.extend_from_slice(name);
+                    output.extend_from_slice(b": ");
+                    output.extend_from_slice(value);
+                    output.extend_from_slice(b"\r\n");
+                }
+            }
+        }
+        if chunked_line {
+            output.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+        }
+        if let Some(date) = &date {
+            output.extend_from_slice(b"Date: ");
+            output.extend_from_slice(date.as_bytes());
+            output.extend_from_slice(b"\r\n");
+        }
+        if let Some((name, value)) = websocket_line {
+            output.extend_from_slice(b"Upgrade: websocket\r\n");
+            output.extend_from_slice(name);
+            output.extend_from_slice(value);
+            output.extend_from_slice(b"\r\n");
+        }
+        if connection_line {
             output.extend_from_slice(b"Connection: ");
-            for (index, token) in connection_tokens.iter().enumerate() {
+            let values = connection_tokens.iter().chain(&keepalive_token);
+            for (index, value) in values.enumerate() {
                 if index != 0 {
                     output.extend_from_slice(b", ");
                 }
-                output.extend_from_slice(token);
-            }
-            if !self.informational_response {
-                if !connection_tokens.is_empty() {
-                    output.extend_from_slice(b", ");
-                }
-                output.extend_from_slice(if self.keepalive {
-                    b"keep-alive"
-                } else {
-                    b"close"
-                });
+                output.extend_from_slice(value);
             }
             output.extend_from_slice(b"\r\n");
         }
@@ -1132,7 +1195,7 @@ impl Http1xCodec {
         }
         output.extend_from_slice(b"\r\n");
         if end_stream {
-            self.append_eom(&mut output);
+            output.extend_from_slice(message_end.bytes());
             self.finish_egress_message();
         }
         let size = header_size(output.len());
@@ -1245,35 +1308,28 @@ impl Http1xCodec {
         }
     }
 
-    /// Bytes for every header line and generated line that can follow a start
-    /// line. Connection tokens are rejoined with `", "`, so each comma in a
-    /// Connection value counts one more byte.
-    fn header_capacity(
+    /// Whether `generate_headers` writes a header of the message or of `extra_headers` as its
+    /// own line when the value holds no CR or LF. `chunked_seen` holds whether an earlier
+    /// header was the first chunked `Transfer-Encoding`, and is updated for this one.
+    fn writes_header_line(
         &self,
-        message: &HttpMessage,
-        extra_headers: Option<&HttpHeaders>,
-        end_stream: bool,
-    ) -> usize {
-        let extra = extra_headers.into_iter().flat_map(HttpHeaders::iter);
-        let headers: usize = message
-            .headers()
-            .iter()
-            .chain(extra)
-            .map(|(code, name, value)| {
-                let separators = if code == HttpHeaderCode::Connection {
-                    value.iter().filter(|byte| **byte == b',').count()
-                } else {
-                    0
-                };
-                name.len() + value.len() + b": \r\n".len() + separators
-            })
-            .sum();
-        let websocket = if message.is_egress_websocket_upgrade() {
-            MAX_WEBSOCKET_LINES + self.websocket_accept_key.len()
-        } else {
-            0
-        };
-        headers + GENERATED_LINES + websocket + if end_stream { b"0\r\n\r\n".len() } else { 0 }
+        code: HttpHeaderCode,
+        value: &[u8],
+        egress_websocket: bool,
+        chunked_seen: &mut bool,
+    ) -> bool {
+        match code {
+            HttpHeaderCode::ContentLength => false,
+            HttpHeaderCode::Connection => self.informational_response && !egress_websocket,
+            HttpHeaderCode::TransferEncoding if !*chunked_seen => {
+                *chunked_seen = value.eq_ignore_ascii_case(b"chunked");
+                *chunked_seen && self.may_chunk_egress
+            }
+            HttpHeaderCode::SecWebSocketKey | HttpHeaderCode::SecWebSocketAccept => {
+                !egress_websocket
+            }
+            _ => true,
+        }
     }
 
     fn append_eom(&mut self, output: &mut Vec<u8>) {
@@ -1891,6 +1947,10 @@ fn push_decimal(output: &mut Vec<u8>, mut value: u16) {
         }
     }
     output.extend_from_slice(&digits[start..]);
+}
+
+fn decimal_len(value: u16) -> usize {
+    value.checked_ilog10().map_or(1, |log| log as usize + 1)
 }
 
 fn header_size(length: usize) -> HttpHeaderSize {
