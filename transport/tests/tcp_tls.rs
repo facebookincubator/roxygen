@@ -967,14 +967,14 @@ mod tcp_tls {
         fn prepare_reset(&self) {}
 
         fn enable_zero_copy(
-            &self,
+            &mut self,
             _context: &roxygen_runtime::worker::WorkerContext,
             threshold: usize,
         ) -> io::Result<bool> {
             Ok(self.controller.borrow_mut().enable_for_test(threshold))
         }
 
-        fn set_zero_copy_reenable_threshold(&self, threshold: usize) {
+        fn set_zero_copy_reenable_threshold(&mut self, threshold: usize) {
             self.controller
                 .borrow_mut()
                 .set_reenable_threshold(threshold);
@@ -6061,14 +6061,13 @@ mod tcp_tls {
                             )
                             .await
                             .unwrap();
-                            let owner = transport
-                                .zero_copy_owner_for_test(&context)
-                                .unwrap()
-                                .expect("TLS delegates to one TCP completion owner");
-                            let _ = transport.enable_zero_copy(&context, 32_768).unwrap();
+                            assert_eq!(transport.zero_copy_owner_for_test(&context).unwrap(), None);
+                            let enabled = transport.enable_zero_copy(&context, 32_768).unwrap();
+                            let owner = transport.zero_copy_owner_for_test(&context).unwrap();
                             assert_eq!(
-                                transport.zero_copy_owner_for_test(&context).unwrap(),
-                                Some(owner),
+                                owner.is_some(),
+                                enabled,
+                                "TLS delegates to one TCP completion owner",
                             );
                             let peer_identity = transport.peer_identity(&context).unwrap().unwrap();
                             assert_eq!(peer_identity.as_bytes(), b"bad_actor");
@@ -6314,19 +6313,15 @@ mod tcp_tls {
                         )
                         .await
                         .unwrap();
-                        let owner = transport
-                            .zero_copy_owner_for_test(&context)
-                            .unwrap()
-                            .expect("accepted TLS has one TCP completion owner");
+                        assert_eq!(transport.zero_copy_owner_for_test(&context).unwrap(), None);
                         let enabled = transport.enable_zero_copy(&context, 32 * 1024).unwrap();
+                        let owner = transport.zero_copy_owner_for_test(&context).unwrap();
+                        assert_eq!(owner.is_some(), enabled);
                         assert_eq!(
                             transport.enable_zero_copy(&context, 64 * 1024).unwrap(),
                             enabled,
                         );
-                        assert_eq!(
-                            transport.zero_copy_owner_for_test(&context).unwrap(),
-                            Some(owner),
-                        );
+                        assert_eq!(transport.zero_copy_owner_for_test(&context).unwrap(), owner);
                         assert_eq!(
                             transport.connection_info().key_exchange_group(),
                             Some("X25519"),
@@ -6668,18 +6663,14 @@ mod tcp_tls {
                         )
                         .await
                         .unwrap();
-                        let owner = transport
-                            .zero_copy_owner_for_test(&context)
-                            .unwrap()
-                            .expect("plaintext TCP has a completion owner");
+                        assert_eq!(transport.zero_copy_owner_for_test(&context).unwrap(), None);
                         let enabled = transport.enable_zero_copy(&context, 32_768).unwrap();
+                        let owner = transport.zero_copy_owner_for_test(&context).unwrap();
+                        assert_eq!(owner.is_some(), enabled);
                         let enabled_again =
                             transport.enable_zero_copy(&context, 64 * 1024).unwrap();
                         assert_eq!(enabled_again, enabled);
-                        assert_eq!(
-                            transport.zero_copy_owner_for_test(&context).unwrap(),
-                            Some(owner),
-                        );
+                        assert_eq!(transport.zero_copy_owner_for_test(&context).unwrap(), owner);
                         let payload = vec![b'z'; 128 * 1024];
                         transport
                             .write(
@@ -6727,16 +6718,12 @@ mod tcp_tls {
                     .call_local(move |context| async move {
                         let transport = TcpTransport::from_accepted(&context, accepted, limits())
                             .expect("accepted stream is adopted");
-                        let owner = transport
-                            .zero_copy_owner_for_test(&context)
-                            .unwrap()
-                            .expect("accepted TCP has a completion owner");
-                        transport.enable_zero_copy(&context, 32_768).unwrap();
+                        assert_eq!(transport.zero_copy_owner_for_test(&context).unwrap(), None);
+                        let enabled = transport.enable_zero_copy(&context, 32_768).unwrap();
+                        let owner = transport.zero_copy_owner_for_test(&context).unwrap();
+                        assert_eq!(owner.is_some(), enabled);
                         transport.enable_zero_copy(&context, 64 * 1024).unwrap();
-                        assert_eq!(
-                            transport.zero_copy_owner_for_test(&context).unwrap(),
-                            Some(owner),
-                        );
+                        assert_eq!(transport.zero_copy_owner_for_test(&context).unwrap(), owner);
                         transport.close(&context).unwrap();
                     })
                     .unwrap();
@@ -6746,6 +6733,87 @@ mod tcp_tls {
                 driver_task.await.unwrap();
                 let mut byte = [0; 1];
                 assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+            }));
+    }
+
+    /// A TCP stream creates zero-copy state only at a successful enable or to
+    /// hold a re-enable threshold; ordinary writes and a zero threshold do not.
+    #[test]
+    fn zero_copy_state_is_created_only_when_configured() {
+        assert!(
+            size_of::<AcceptedTcpStream>() <= size_of::<TcpStream>() + 2 * size_of::<usize>(),
+            "zero-copy state costs a TCP stream one pointer",
+        );
+        Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(LocalSet::new().run_until(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let destination = listener.local_addr().unwrap();
+                let mut accepted = Vec::new();
+                let mut clients = Vec::new();
+                for _ in 0..2 {
+                    let client = tokio::task::spawn_local(TcpStream::connect(destination));
+                    let (stream, _) = listener.accept().await.unwrap();
+                    accepted.push(stream.into_std().unwrap());
+                    clients.push(client.await.unwrap().unwrap());
+                }
+                let mut reader = clients.remove(0);
+                let peer = tokio::task::spawn_local(async move {
+                    let mut payload = vec![0; 128 * 1024];
+                    reader.read_exact(&mut payload).await.unwrap();
+                    assert!(payload.iter().all(|byte| *byte == b'p'));
+                });
+                let (worker, driver) = WorkerDriver::new(4).unwrap();
+                let call = worker
+                    .call_local(move |context| async move {
+                        let limits = ByteStreamLimits::new(64, 256 * 1024, 8).unwrap();
+                        let reconfigured = accepted.pop().unwrap();
+                        let transport =
+                            TcpTransport::from_accepted(&context, accepted.pop().unwrap(), limits)
+                                .expect("accepted stream is adopted");
+                        assert_eq!(transport.zero_copy_owner_for_test(&context).unwrap(), None);
+                        assert!(!transport.enable_zero_copy(&context, 0).unwrap());
+                        transport
+                            .write(
+                                &context,
+                                BufQueue::from_vec(vec![b'p'; 128 * 1024], 128 * 1024)
+                                    .expect("payload fits transport write bound"),
+                                Duration::from_secs(1),
+                                CancellationToken::never(),
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(transport.zero_copy_owner_for_test(&context).unwrap(), None);
+                        let enabled = transport.enable_zero_copy(&context, 32_768).unwrap();
+                        let owner = transport.zero_copy_owner_for_test(&context).unwrap();
+                        assert_eq!(owner.is_some(), enabled);
+                        assert!(!transport.enable_zero_copy(&context, 0).unwrap());
+                        assert_eq!(transport.zero_copy_owner_for_test(&context).unwrap(), owner);
+                        transport.close(&context).unwrap();
+
+                        let transport = TcpTransport::from_accepted(&context, reconfigured, limits)
+                            .expect("accepted stream is adopted");
+                        transport
+                            .set_zero_copy_reenable_threshold(&context, 0)
+                            .unwrap();
+                        assert_eq!(transport.zero_copy_owner_for_test(&context).unwrap(), None);
+                        transport
+                            .set_zero_copy_reenable_threshold(&context, 2)
+                            .unwrap();
+                        let owner = transport.zero_copy_owner_for_test(&context).unwrap();
+                        assert!(owner.is_some(), "the stream keeps its re-enable threshold");
+                        transport.enable_zero_copy(&context, 32_768).unwrap();
+                        assert_eq!(transport.zero_copy_owner_for_test(&context).unwrap(), owner);
+                        transport.close(&context).unwrap();
+                    })
+                    .unwrap();
+                let driver_task = tokio::task::spawn_local(driver);
+                call.await.unwrap();
+                worker.begin_shutdown();
+                driver_task.await.unwrap();
+                peer.await.unwrap();
             }));
     }
 

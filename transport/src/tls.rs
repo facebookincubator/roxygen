@@ -969,8 +969,8 @@ where
     }
 
     fn enable_zero_copy(&self, context: &WorkerContext, threshold: usize) -> io::Result<bool> {
-        let state = self.state.borrow();
-        let Some(stream) = state.stream.as_ref() else {
+        let mut state = self.state.borrow_mut();
+        let Some(stream) = state.stream.as_mut() else {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "TLS ciphertext transport is closed",
@@ -980,7 +980,7 @@ where
     }
 
     fn set_zero_copy_reenable_threshold(&self, threshold: usize) {
-        if let Some(stream) = self.state.borrow().stream.as_ref() {
+        if let Some(stream) = self.state.borrow_mut().stream.as_mut() {
             stream.set_zero_copy_reenable_threshold(threshold);
         }
     }
@@ -1618,14 +1618,14 @@ where
         }
     }
 
-    fn enable_zero_copy(&self, context: &WorkerContext, threshold: usize) -> io::Result<bool> {
+    fn enable_zero_copy(&mut self, context: &WorkerContext, threshold: usize) -> io::Result<bool> {
         let Some(tls) = &self.tls else {
             return Err(Self::closed_error());
         };
         tls.transport().enable_zero_copy(context, threshold)
     }
 
-    fn set_zero_copy_reenable_threshold(&self, threshold: usize) {
+    fn set_zero_copy_reenable_threshold(&mut self, threshold: usize) {
         if let Some(tls) = &self.tls {
             tls.transport().set_zero_copy_reenable_threshold(threshold);
         }

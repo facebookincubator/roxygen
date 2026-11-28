@@ -79,6 +79,7 @@ use crate::established::AdoptedIoCompletion;
 use crate::established::AdoptedIoState;
 use crate::established::IoDropPublisher;
 use crate::tcp_zero_copy::TcpZeroCopy;
+use crate::tcp_zero_copy::poll_write_ordinary;
 use crate::tls::CiphertextWriteTimeout;
 
 /// TCP transport constructors. Their signatures do not expose Tokio types.
@@ -751,11 +752,15 @@ pub(crate) trait TokioByteStream: AsyncRead + AsyncWrite + Unpin + 'static {
         false
     }
 
-    fn enable_zero_copy(&self, _context: &WorkerContext, _threshold: usize) -> io::Result<bool> {
+    fn enable_zero_copy(
+        &mut self,
+        _context: &WorkerContext,
+        _threshold: usize,
+    ) -> io::Result<bool> {
         Ok(false)
     }
 
-    fn set_zero_copy_reenable_threshold(&self, _threshold: usize) {}
+    fn set_zero_copy_reenable_threshold(&mut self, _threshold: usize) {}
 
     fn begin_owned_write(&mut self, _length: usize) -> bool {
         false
@@ -924,7 +929,7 @@ fn tcp_peer_closed(_stream: &TcpStream) -> bool {
 pub(crate) struct AcceptedTcpStream {
     stream: TcpStream,
     write_shutdown_complete: bool,
-    zero_copy: RefCell<TcpZeroCopy>,
+    zero_copy: Option<Box<TcpZeroCopy>>,
 }
 
 impl AcceptedTcpStream {
@@ -932,7 +937,7 @@ impl AcceptedTcpStream {
         Self {
             stream,
             write_shutdown_complete: false,
-            zero_copy: RefCell::new(TcpZeroCopy::new()),
+            zero_copy: None,
         }
     }
 }
@@ -967,10 +972,10 @@ impl AsyncWrite for AcceptedTcpStream {
                 result => return result,
             }
         }
-        self.zero_copy
-            .get_mut()
-            .poll_drain(context)
-            .map(|()| Ok(()))
+        let Some(zero_copy) = self.zero_copy.as_deref_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        zero_copy.poll_drain(context).map(|()| Ok(()))
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -1033,25 +1038,41 @@ impl TokioByteStream for AcceptedTcpStream {
         tcp_peer_closed(&self.stream)
     }
 
-    fn enable_zero_copy(&self, _context: &WorkerContext, threshold: usize) -> io::Result<bool> {
+    fn enable_zero_copy(&mut self, context: &WorkerContext, threshold: usize) -> io::Result<bool> {
         #[cfg(target_os = "linux")]
-        return self
-            .zero_copy
-            .borrow_mut()
-            .enable(_context, self.stream.as_raw_fd(), threshold);
-
+        let descriptor = self.stream.as_raw_fd();
         #[cfg(not(target_os = "linux"))]
-        self.zero_copy.borrow_mut().enable(_context, 0, threshold)
+        let descriptor = 0;
+
+        if let Some(zero_copy) = self.zero_copy.as_deref_mut() {
+            return zero_copy.enable(context, descriptor, threshold);
+        }
+        if threshold == 0 {
+            return Ok(false);
+        }
+        let mut zero_copy = Box::new(TcpZeroCopy::new());
+        let enabled = zero_copy.enable(context, descriptor, threshold)?;
+        if enabled {
+            self.zero_copy = Some(zero_copy);
+        }
+        Ok(enabled)
     }
 
-    fn set_zero_copy_reenable_threshold(&self, threshold: usize) {
-        self.zero_copy
-            .borrow_mut()
-            .set_reenable_threshold(threshold);
+    fn set_zero_copy_reenable_threshold(&mut self, threshold: usize) {
+        match self.zero_copy.as_deref_mut() {
+            Some(zero_copy) => zero_copy.set_reenable_threshold(threshold),
+            None if threshold != 0 => self
+                .zero_copy
+                .insert(Box::new(TcpZeroCopy::new()))
+                .set_reenable_threshold(threshold),
+            None => {}
+        }
     }
 
     fn begin_owned_write(&mut self, length: usize) -> bool {
-        self.zero_copy.get_mut().begin_write(length)
+        self.zero_copy
+            .as_deref_mut()
+            .is_some_and(|zero_copy| zero_copy.begin_write(length))
     }
 
     fn try_write_borrowed(
@@ -1059,7 +1080,11 @@ impl TokioByteStream for AcceptedTcpStream {
         context: &mut Context<'_>,
         buffers: &[IoSlice<'_>],
     ) -> io::Result<usize> {
-        if !self.zero_copy.get_mut().allows_borrowed_write() {
+        if !self
+            .zero_copy
+            .as_deref()
+            .is_none_or(TcpZeroCopy::allows_borrowed_write)
+        {
             return Err(io::ErrorKind::WouldBlock.into());
         }
         let Poll::Ready(budget) = coop::poll_proceed(context) else {
@@ -1078,23 +1103,30 @@ impl TokioByteStream for AcceptedTcpStream {
         data: &BufQueue,
         zero_copy: bool,
     ) -> Poll<io::Result<usize>> {
-        self.zero_copy
-            .get_mut()
-            .poll_write(&self.stream, context, data, zero_copy)
+        match self.zero_copy.as_deref_mut() {
+            Some(state) => state.poll_write(&self.stream, context, data, zero_copy),
+            None => poll_write_ordinary(&self.stream, context, data),
+        }
     }
 
     fn abandon_zero_copy(&mut self) {
-        self.zero_copy.get_mut().force_teardown();
+        if let Some(zero_copy) = self.zero_copy.as_deref_mut() {
+            zero_copy.force_teardown();
+        }
     }
 
     #[cfg(test)]
     fn zero_copy_owner_for_test(&self) -> Option<usize> {
-        Some(self.zero_copy.borrow().completion_owner_for_test())
+        self.zero_copy
+            .as_deref()
+            .map(TcpZeroCopy::completion_owner_for_test)
     }
 
     #[cfg(test)]
     fn zero_copy_pending_for_test(&self) -> usize {
-        self.zero_copy.borrow().pending_count_for_test()
+        self.zero_copy
+            .as_deref()
+            .map_or(0, TcpZeroCopy::pending_count_for_test)
     }
 }
 
@@ -1212,12 +1244,13 @@ impl<S: TokioByteStream> TokioByteStream for ObservedStream<S> {
         self.stream().peer_closed()
     }
 
-    fn enable_zero_copy(&self, context: &WorkerContext, threshold: usize) -> io::Result<bool> {
-        self.stream().enable_zero_copy(context, threshold)
+    fn enable_zero_copy(&mut self, context: &WorkerContext, threshold: usize) -> io::Result<bool> {
+        self.stream_mut().enable_zero_copy(context, threshold)
     }
 
-    fn set_zero_copy_reenable_threshold(&self, threshold: usize) {
-        self.stream().set_zero_copy_reenable_threshold(threshold);
+    fn set_zero_copy_reenable_threshold(&mut self, threshold: usize) {
+        self.stream_mut()
+            .set_zero_copy_reenable_threshold(threshold);
     }
 
     fn begin_owned_write(&mut self, length: usize) -> bool {

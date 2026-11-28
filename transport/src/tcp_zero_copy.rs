@@ -47,7 +47,7 @@ const COMPLETION_BATCH: usize = 64;
 const LOAN_BUDGET: usize = 64 * 1024 * 1024;
 
 static QUARANTINED_LOANS: OnceLock<Mutex<Vec<RetainedLoan>>> = OnceLock::new();
-static SHARED_LOAN_BUDGET: OnceLock<Arc<LoanBudget>> = OnceLock::new();
+static SHARED_LOAN_BUDGET: LoanBudget = LoanBudget::new(LOAN_BUDGET);
 
 #[derive(Debug)]
 struct LoanBudget {
@@ -56,14 +56,14 @@ struct LoanBudget {
 }
 
 impl LoanBudget {
-    fn new(limit: usize) -> Self {
+    const fn new(limit: usize) -> Self {
         Self {
             limit,
             used: AtomicUsize::new(0),
         }
     }
 
-    fn reserve(self: &Arc<Self>, data: &BufQueue) -> Option<Arc<LoanReservation>> {
+    fn reserve(&'static self, data: &BufQueue) -> Option<Arc<LoanReservation>> {
         // Charge the full backing allocation, not the visible slices. The fixed
         // and per-segment charges also bound loan and metadata counts, including
         // both copies retained by the unwind guard and the pending-cookie map.
@@ -85,7 +85,7 @@ impl LoanBudget {
             }
         }
         Some(Arc::new(LoanReservation {
-            budget: Arc::clone(self),
+            budget: self,
             charge,
         }))
     }
@@ -93,7 +93,7 @@ impl LoanBudget {
 
 #[derive(Debug)]
 struct LoanReservation {
-    budget: Arc<LoanBudget>,
+    budget: &'static LoanBudget,
     charge: usize,
 }
 
@@ -166,7 +166,7 @@ struct ZeroCopyState {
     next_cookie: u32,
     pending: BTreeMap<u32, RetainedLoan>,
     preparing: BTreeSet<u32>,
-    budget: Arc<LoanBudget>,
+    budget: &'static LoanBudget,
 }
 
 impl ZeroCopyState {
@@ -178,9 +178,7 @@ impl ZeroCopyState {
             next_cookie: 0,
             pending: BTreeMap::new(),
             preparing: BTreeSet::new(),
-            budget: Arc::clone(
-                SHARED_LOAN_BUDGET.get_or_init(|| Arc::new(LoanBudget::new(LOAN_BUDGET))),
-            ),
+            budget: &SHARED_LOAN_BUDGET,
         }
     }
 
@@ -586,23 +584,8 @@ impl TcpZeroCopy {
         self.poll_write_with(
             data,
             zero_copy,
-            || {
-                stream
-                    .poll_write_ready(context)
-                    .map(|result| result.map(|_| ()))
-            },
-            |use_zero_copy| {
-                #[cfg(target_os = "linux")]
-                return stream.try_io(tokio::io::Interest::WRITABLE, || {
-                    send_queue(stream, data, use_zero_copy)
-                });
-
-                #[cfg(not(target_os = "linux"))]
-                {
-                    debug_assert!(!use_zero_copy);
-                    stream.try_write_vectored(&data.iovecs().take(IOV_MAX).collect::<Vec<_>>())
-                }
-            },
+            || stream.poll_write_ready(context),
+            |use_zero_copy| try_send(stream, data, use_zero_copy),
         )
     }
 
@@ -610,25 +593,10 @@ impl TcpZeroCopy {
         &mut self,
         data: &BufQueue,
         zero_copy: bool,
-        mut ready: impl FnMut() -> Poll<io::Result<()>>,
+        ready: impl FnMut() -> Poll<io::Result<()>>,
         mut send: impl FnMut(bool) -> io::Result<usize>,
     ) -> Poll<io::Result<usize>> {
-        loop {
-            match ready() {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => return Poll::Pending,
-            }
-            match self.write_after_ready(data, zero_copy, &mut send) {
-                SendOutcome::Written(written) => return Poll::Ready(Ok(written)),
-                // try_io cleared readiness: poll again to register the waker.
-                SendOutcome::Wait => continue,
-                SendOutcome::Error(error) => return Poll::Ready(Err(error)),
-                SendOutcome::RetryOrdinary => {
-                    unreachable!("the write decision consumes its ordinary retry")
-                }
-            }
-        }
+        poll_send(ready, || self.write_after_ready(data, zero_copy, &mut send))
     }
 
     pub(crate) fn poll_drain(&mut self, context: &mut Context<'_>) -> Poll<()> {
@@ -735,15 +703,7 @@ impl TcpZeroCopy {
             Some(SendOutcome::Error(error)) => return SendOutcome::Error(error),
             Some(SendOutcome::RetryOrdinary) | None => {}
         }
-        match send(false) {
-            Ok(0) => SendOutcome::Error(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "TCP write made no progress",
-            )),
-            Ok(written) => SendOutcome::Written(written),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => SendOutcome::Wait,
-            Err(error) => SendOutcome::Error(error),
-        }
+        ordinary_outcome(send(false))
     }
 
     #[cfg(test)]
@@ -927,6 +887,66 @@ impl TcpZeroCopy {
 impl Drop for TcpZeroCopy {
     fn drop(&mut self) {
         self.force_teardown();
+    }
+}
+
+/// Writes `data` as `TcpZeroCopy::poll_write` does without zero copy, for a
+/// stream that holds no zero-copy state.
+pub(crate) fn poll_write_ordinary(
+    stream: &tokio::net::TcpStream,
+    context: &mut Context<'_>,
+    data: &BufQueue,
+) -> Poll<io::Result<usize>> {
+    poll_send(
+        || stream.poll_write_ready(context),
+        || ordinary_outcome(try_send(stream, data, false)),
+    )
+}
+
+fn poll_send(
+    mut ready: impl FnMut() -> Poll<io::Result<()>>,
+    mut write: impl FnMut() -> SendOutcome,
+) -> Poll<io::Result<usize>> {
+    loop {
+        match ready() {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
+        match write() {
+            SendOutcome::Written(written) => return Poll::Ready(Ok(written)),
+            // try_io cleared readiness: poll again to register the waker.
+            SendOutcome::Wait => continue,
+            SendOutcome::Error(error) => return Poll::Ready(Err(error)),
+            SendOutcome::RetryOrdinary => {
+                unreachable!("the write decision consumes its ordinary retry")
+            }
+        }
+    }
+}
+
+fn ordinary_outcome(result: io::Result<usize>) -> SendOutcome {
+    match result {
+        Ok(0) => SendOutcome::Error(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "TCP write made no progress",
+        )),
+        Ok(written) => SendOutcome::Written(written),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => SendOutcome::Wait,
+        Err(error) => SendOutcome::Error(error),
+    }
+}
+
+fn try_send(stream: &tokio::net::TcpStream, data: &BufQueue, zero_copy: bool) -> io::Result<usize> {
+    #[cfg(target_os = "linux")]
+    return stream.try_io(tokio::io::Interest::WRITABLE, || {
+        send_queue(stream, data, zero_copy)
+    });
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        debug_assert!(!zero_copy);
+        stream.try_write_vectored(&data.iovecs().take(IOV_MAX).collect::<Vec<_>>())
     }
 }
 
@@ -1319,10 +1339,22 @@ mod tests {
 
     use super::*;
 
-    fn controller(limit: usize) -> (TcpZeroCopy, Arc<LoanBudget>) {
-        let budget = Arc::new(LoanBudget::new(limit));
+    /// A budget that lives for the rest of the process, as the shared one
+    /// does. `BUDGETS` keeps it reachable so that leak checkers accept it.
+    fn private_budget(limit: usize) -> &'static LoanBudget {
+        static BUDGETS: Mutex<Vec<&'static LoanBudget>> = Mutex::new(Vec::new());
+        let budget = Box::leak(Box::new(LoanBudget::new(limit)));
+        BUDGETS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(budget);
+        budget
+    }
+
+    fn controller(limit: usize) -> (TcpZeroCopy, &'static LoanBudget) {
+        let budget = private_budget(limit);
         let mut controller = TcpZeroCopy::new();
-        controller.control.borrow_mut().state.budget = Arc::clone(&budget);
+        controller.control.borrow_mut().state.budget = budget;
         assert!(controller.enable_for_test(1));
         (controller, budget)
     }
@@ -1442,7 +1474,7 @@ mod tests {
             SendOutcome::RetryOrdinary
         ));
         assert_eq!(budget.used.load(Ordering::Acquire), 0);
-        let budget = Arc::new(LoanBudget::new(usize::MAX));
+        let budget = private_budget(usize::MAX);
         budget.used.store(usize::MAX, Ordering::Release);
         assert!(budget.reserve(&data).is_none());
         assert_eq!(budget.used.load(Ordering::Acquire), usize::MAX);
@@ -1521,12 +1553,11 @@ mod tests {
             data
         }
 
-        /// Writes `data` with one `poll_write` of a plain controller, as an owned TCP write does,
-        /// and returns the bytes that one `sendmsg` accepted.
+        /// Writes `data` with one `poll_write_ordinary`, as an owned TCP write without zero copy
+        /// does, and returns the bytes that one `sendmsg` accepted.
         fn send_once(stream: &tokio::net::TcpStream, data: &BufQueue) -> usize {
-            let mut controller = TcpZeroCopy::new();
             let mut context = Context::from_waker(Waker::noop());
-            match controller.poll_write(stream, &mut context, data, false) {
+            match poll_write_ordinary(stream, &mut context, data) {
                 Poll::Ready(Ok(written)) => written,
                 outcome => panic!("a fresh loopback socket accepts the send: {outcome:?}"),
             }
