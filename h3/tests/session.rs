@@ -1202,6 +1202,36 @@ fn closed_edge_on_a_critical_stream_closes_the_connection() {
 }
 
 #[test]
+fn a_credit_edge_is_inert_on_every_kind_of_stream() {
+    let mut h = Harness::ready();
+    h.receive(
+        client_uni(1),
+        &[StreamType::QPACK_DECODER.as_u64() as u8],
+        false,
+    );
+    let id = client_bidi(0);
+    h.receive(id, &headers_frame(GET), false);
+    let log = [Ev::New(1), Ev::Request { id: 1, eom: false }];
+    assert_eq!(h.log(), log);
+    // A request stream in the middle of its exchange, the peer's control and QPACK decoder
+    // streams, and the server's own control stream.
+    for stream in [id, client_uni(0), client_uni(1), server_uni(0)] {
+        h.ready_edge(stream, StreamReady::CreditRaised);
+        assert_eq!(h.log(), log, "{stream}");
+        assert_eq!(h.closed(), None, "{stream}");
+    }
+    h.receive(id, &[], true);
+    let Poll::Ready(Ok(event)) = h.read_body(id, 100) else {
+        panic!("the FIN ends the request body");
+    };
+    assert!(event.eom());
+    h.pull_all(id, 1 << 20);
+    assert_eq!(body_of(&h.response(id)), b"hello");
+    assert!(h.conn.get(id).finished);
+    assert_eq!(h.log()[2..], [Ev::ResponseComplete(1), Ev::Complete(1)]);
+}
+
+#[test]
 fn control_stream_bytes_go_out_across_partial_sends_and_pulls() {
     let mut h = Harness::new();
     h.conn.uni_send_window = 4;

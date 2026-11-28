@@ -715,7 +715,10 @@ impl QuicSession for ClientSession {
                         .send(Err(format!("the server reset the stream: {code:?}")));
                 }
             }
-            StreamReady::Progress | StreamReady::Stopped { .. } | StreamReady::Closed => {}
+            StreamReady::Progress
+            | StreamReady::CreditRaised
+            | StreamReady::Stopped { .. }
+            | StreamReady::Closed => {}
         }
     }
 
