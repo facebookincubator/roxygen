@@ -327,13 +327,13 @@ struct StreamShared {
 
 /// An exclusive read's wait for the source event while the source has no read
 /// timeout. It stands in for a `TimedWait` on `event` with no cancellation, so
-/// it is woken as `event` wakes its registered waiter, and `event` is neither
-/// created nor signalled for it.
+/// it is woken as `event` wakes its registered waiter until the signal wakes
+/// it, and `event` is neither created nor signalled for it.
 struct DirectWait {
-    waker: Waker,
-    /// Whether the event was signalled since the wait started, the one status
-    /// change after which `TimedBaton` stops waking its waiter.
-    signalled: bool,
+    /// The reader's waker, which the first signal since the wait started takes
+    /// to wake the reader. That signal is the one status change after which
+    /// `TimedBaton` stops waking its waiter on a signal.
+    waker: Option<Waker>,
 }
 
 enum CallbackOwner {
@@ -422,14 +422,14 @@ impl StreamShared {
     }
 
     fn signal_direct_wait(&self) {
-        let waker = match self.direct_wait.borrow_mut().as_mut() {
-            Some(wait) if !wait.signalled => {
-                wait.signalled = true;
-                wait.waker.clone()
-            }
-            _ => return,
-        };
-        waker.wake();
+        let waker = self
+            .direct_wait
+            .borrow_mut()
+            .as_mut()
+            .and_then(|wait| wait.waker.take());
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 
     /// Whether a wait that starts now would arm a read timeout.
@@ -441,10 +441,11 @@ impl StreamShared {
     }
 
     /// Applies a timeout update to a direct wait the same way
-    /// `TimedBaton::set_timeout` does for a registered `TimedWait`. It wakes the
-    /// waiter, and an enabled timeout counts from now. For that, an unsignalled
-    /// wait moves to the `TimedWait` it stands in for, registered with the same
-    /// waker.
+    /// `TimedBaton::set_timeout` does for a registered `TimedWait`. It wakes an
+    /// unsignalled waiter, and an enabled timeout counts from now. For that, an
+    /// unsignalled wait moves to the `TimedWait` it stands in for, registered
+    /// with the same waker. A signalled waiter is not woken again: the signal
+    /// took its waker to wake it, and its next poll completes.
     #[cold]
     #[inline(never)]
     fn retime_direct_wait(&self, timeout: Duration) {
@@ -452,20 +453,20 @@ impl StreamShared {
             .direct_wait
             .borrow()
             .as_ref()
-            .is_some_and(|wait| wait.signalled);
+            .is_some_and(|wait| wait.waker.is_none());
         if timeout.is_zero() || signalled {
             self.store_read_timeout(timeout);
             let waker = self
                 .direct_wait
                 .borrow()
                 .as_ref()
-                .map(|wait| wait.waker.clone());
+                .and_then(|wait| wait.waker.clone());
             if let Some(waker) = waker {
                 waker.wake();
             }
             return;
         }
-        let Some(DirectWait { waker, .. }) = self.direct_wait.take() else {
+        let Some(DirectWait { waker: Some(waker) }) = self.direct_wait.take() else {
             return self.store_read_timeout(timeout);
         };
         // The event was reset when the wait started and is not signalled.
@@ -2651,17 +2652,16 @@ where
             Self::Direct => {
                 let mut direct = shared.direct_wait.borrow_mut();
                 match direct.as_mut() {
-                    Some(wait) if wait.signalled => *direct = None,
-                    Some(wait) => {
-                        if !wait.waker.will_wake(context.waker()) {
-                            wait.waker = context.waker().clone();
+                    Some(DirectWait { waker: None }) => *direct = None,
+                    Some(DirectWait { waker: Some(waker) }) => {
+                        if !waker.will_wake(context.waker()) {
+                            *waker = context.waker().clone();
                         }
                         return Poll::Pending;
                     }
                     None => {
                         *direct = Some(DirectWait {
-                            waker: context.waker().clone(),
-                            signalled: false,
+                            waker: Some(context.waker().clone()),
                         });
                         return Poll::Pending;
                     }

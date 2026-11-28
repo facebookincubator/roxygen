@@ -3141,7 +3141,7 @@ mod stream_source {
             reader.arm_body(&owner, u32::MAX).unwrap();
             assert!(reader.poll_body(&mut context).is_pending());
 
-            // Every timeout update wakes the pending read.
+            // A timeout update wakes the pending read.
             assert!(producer.set_read_timeout(Duration::ZERO));
             assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
             assert!(reader.poll_body(&mut context).is_pending());
@@ -3158,14 +3158,128 @@ mod stream_source {
             );
             assert_eq!(wakes.0.load(Ordering::SeqCst), 2);
 
-            // The woken read stays registered until it is polled.
+            // The woken read already has its poll coming, so an update does not wake it again.
             assert!(producer.set_read_timeout(Duration::ZERO));
-            assert_eq!(wakes.0.load(Ordering::SeqCst), 3);
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 2);
             let Poll::Ready(Ok(event)) = reader.poll_body(&mut context) else {
                 panic!("the woken read must return the queued body");
             };
             assert_eq!(event.event_type(), HttpBodyEventType::Body);
-            assert_eq!(wakes.0.load(Ordering::SeqCst), 3);
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    /// The body that signals a pending exclusive read wakes it with the waker the read stored,
+    /// so the reader holds no extra reference until its next poll, and is woken once.
+    #[test]
+    fn direct_wait_signal_moves_the_reader_waker() {
+        run_paused(async {
+            let (owner, mut reader, producer) = reading_response();
+            reader.set_suspend_free(true);
+            let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&wakes));
+            let baseline = Arc::strong_count(&wakes);
+            let mut context = Context::from_waker(&waker);
+            reader.arm_body(&owner, u32::MAX).unwrap();
+            assert!(reader.poll_body(&mut context).is_pending());
+            assert_eq!(
+                Arc::strong_count(&wakes),
+                baseline + 1,
+                "the pending read stores its waker"
+            );
+
+            assert_eq!(
+                producer.body(body(b"token"), 0, false),
+                FlowControlState::Open
+            );
+            assert_eq!(
+                Arc::strong_count(&wakes),
+                baseline,
+                "the body's wake takes the stored waker"
+            );
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+            let Poll::Ready(Ok(event)) = reader.poll_body(&mut context) else {
+                panic!("the woken read must return the body");
+            };
+            assert_eq!(event.event_type(), HttpBodyEventType::Body);
+            assert_eq!(
+                wakes.0.load(Ordering::SeqCst),
+                1,
+                "the reader is woken once"
+            );
+            assert_eq!(Arc::strong_count(&wakes), baseline);
+        });
+    }
+
+    /// A timeout update after a body signalled the pending exclusive read, and before the reader
+    /// polls, does not wake it again: the body's wake already scheduled the poll that returns it.
+    #[test]
+    fn retime_after_signal_needs_no_second_wake() {
+        run_paused(async {
+            for timeout in [Duration::ZERO, Duration::from_secs(2)] {
+                let (owner, mut reader, producer) = reading_response();
+                reader.set_suspend_free(true);
+                let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wakes));
+                let mut context = Context::from_waker(&waker);
+                reader.arm_body(&owner, u32::MAX).unwrap();
+                assert!(reader.poll_body(&mut context).is_pending());
+                assert_eq!(
+                    producer.body(body(b"token"), 0, false),
+                    FlowControlState::Open
+                );
+                assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+
+                assert!(producer.set_read_timeout(timeout));
+                assert_eq!(
+                    wakes.0.load(Ordering::SeqCst),
+                    1,
+                    "the signalled read is not woken again (timeout {timeout:?})"
+                );
+                let Poll::Ready(Ok(event)) = reader.poll_body(&mut context) else {
+                    panic!("the signalled read must return the body (timeout {timeout:?})");
+                };
+                assert_eq!(event.event_type(), HttpBodyEventType::Body);
+                assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+            }
+        });
+    }
+
+    /// A timeout update moves a pending exclusive read's wait to a timed wait registered with
+    /// the waker the read stored, so a later body wakes that waker before the read polls again.
+    #[test]
+    fn retimed_exclusive_read_keeps_its_waker() {
+        run_paused(async {
+            let (owner, mut reader, producer) = reading_response();
+            reader.set_suspend_free(true);
+            let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&wakes));
+            let baseline = Arc::strong_count(&wakes);
+            let mut context = Context::from_waker(&waker);
+            reader.arm_body(&owner, u32::MAX).unwrap();
+            assert!(reader.poll_body(&mut context).is_pending());
+
+            assert!(producer.set_read_timeout(Duration::from_secs(2)));
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                Arc::strong_count(&wakes),
+                baseline + 1,
+                "the timed wait holds the stored waker"
+            );
+            assert_eq!(
+                producer.body(body(b"token"), 0, false),
+                FlowControlState::Open
+            );
+            assert_eq!(
+                wakes.0.load(Ordering::SeqCst),
+                2,
+                "the body wakes the stored waker"
+            );
+            let Poll::Ready(Ok(event)) = reader.poll_body(&mut context) else {
+                panic!("the retimed read must return the body");
+            };
+            assert_eq!(event.event_type(), HttpBodyEventType::Body);
+            assert_eq!(Arc::strong_count(&wakes), baseline);
         });
     }
 
