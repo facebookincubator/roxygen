@@ -4775,6 +4775,321 @@ mod stream_source {
             assert_eq!(body_text(&event), b"456789");
         });
     }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum Delivered {
+        Processed(usize),
+        Window,
+        Complete(Option<HttpErrorCode>),
+    }
+
+    type DispatchHook = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
+
+    /// Logs each event without allocating while the log has capacity, and runs
+    /// the installed hook once, from a `bytes_processed` that is being
+    /// dispatched.
+    struct HookedCallback {
+        log: Rc<RefCell<Vec<Delivered>>>,
+        hook: DispatchHook,
+    }
+
+    impl HttpStreamSourceCallback for HookedCallback {
+        fn bytes_processed(&mut self, _id: StreamId, amount: usize, _to_acknowledge: usize) {
+            self.log.borrow_mut().push(Delivered::Processed(amount));
+            let hook = self.hook.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+
+        fn window_open(&mut self, _id: StreamId) {
+            self.log.borrow_mut().push(Delivered::Window);
+        }
+
+        fn source_complete(&mut self, _id: StreamId, error: Option<HttpError>) {
+            self.log
+                .borrow_mut()
+                .push(Delivered::Complete(error.map(|error| error.code())));
+        }
+    }
+
+    fn hooked_callback() -> (HookedCallback, Rc<RefCell<Vec<Delivered>>>, DispatchHook) {
+        let log = Rc::new(RefCell::new(Vec::with_capacity(64)));
+        let hook = DispatchHook::default();
+        let callback = HookedCallback {
+            log: Rc::clone(&log),
+            hook: Rc::clone(&hook),
+        };
+        (callback, log, hook)
+    }
+
+    /// A session source after its request head, with a [`HookedCallback`].
+    fn hooked_session_source(
+        capacity: u32,
+    ) -> (
+        HttpStreamSource,
+        HttpStreamSourceProducer,
+        Rc<RefCell<Vec<Delivered>>>,
+        DispatchHook,
+    ) {
+        let (callback, log, hook) = hooked_callback();
+        let source =
+            HttpStreamSource::new_session(StreamId::new(7), callback, capacity, Duration::ZERO)
+                .unwrap();
+        let producer = source.producer();
+        assert!(producer.headers(request(None), false));
+        read_header(&source).unwrap();
+        (source, producer, log, hook)
+    }
+
+    /// [`request_owner`] with a [`HookedCallback`].
+    fn hooked_request_owner() -> (
+        HttpStreamSourceOwner,
+        HttpStreamSourceProducer,
+        Rc<RefCell<Vec<Delivered>>>,
+    ) {
+        let (callback, log, _hook) = hooked_callback();
+        let ingress =
+            HttpIngressBody::new(StreamId::new(1), callback, 65_535, Host::tokio()).unwrap();
+        assert!(ingress.initialize_body_only(&mut request(None), false));
+        let producer = ingress.producer();
+        (ingress.into_source_owner(), producer, log)
+    }
+
+    #[test]
+    fn callback_events_queued_during_dispatch_are_delivered_in_order() {
+        let (mut source, producer, log, hook) = hooked_session_source(8);
+        let _drain = source.drain_on_drop();
+        assert_eq!(
+            producer.body(body(b"abcd"), 0, false),
+            FlowControlState::Open
+        );
+        // During the drain's first credit, a body that closes the window and an
+        // abort queue a credit, a window update and the completion.
+        let reentrant = producer.clone();
+        *hook.borrow_mut() = Some(Box::new(move || {
+            assert_eq!(
+                reentrant.body(body(b"efghijkl"), 0, false),
+                FlowControlState::Closed
+            );
+            assert!(reentrant.abort(HttpErrorCode::TRANSPORT_READ_ERROR, b"gone"));
+        }));
+        source.stop_reading(None);
+        assert_eq!(
+            *log.borrow(),
+            [
+                Delivered::Processed(4),
+                Delivered::Processed(8),
+                Delivered::Window,
+                Delivered::Complete(None),
+            ]
+        );
+    }
+
+    #[test]
+    fn deferred_callback_events_allocate_at_the_first_deferral() {
+        let observable = std_allocations_observable();
+        // Each source drains to a sink, so every body is credited as it arrives.
+        let draining = || {
+            let (mut source, producer, log, hook) = hooked_session_source(65_535);
+            let drain = source.drain_on_drop();
+            source.stop_reading(None);
+            (source, drain, producer, log, hook)
+        };
+        let bodies = || [body(b"one"), body(b"two"), body(b"three")];
+
+        // The second and third credits arrive while the first is dispatched.
+        let (_source, _drain, producer, deferred_log, hook) = draining();
+        let [first, second, third] = bodies();
+        let reentrant = producer.clone();
+        *hook.borrow_mut() = Some(Box::new(move || {
+            assert_eq!(reentrant.body(second, 0, false), FlowControlState::Open);
+            assert_eq!(reentrant.body(third, 0, false), FlowControlState::Open);
+        }));
+        let (state, deferring) = count_allocations(|| producer.body(first, 0, false));
+        assert_eq!(state, FlowControlState::Open);
+
+        // Control: the same credits, each delivered at once.
+        let (_source, _drain, producer, direct_log, _hook) = draining();
+        let [first, second, third] = bodies();
+        let ((), direct) = count_allocations(|| {
+            for body in [first, second, third] {
+                assert_eq!(producer.body(body, 0, false), FlowControlState::Open);
+            }
+        });
+
+        let delivered = [
+            Delivered::Processed(3),
+            Delivered::Processed(3),
+            Delivered::Processed(5),
+        ];
+        assert_eq!(*deferred_log.borrow(), delivered);
+        assert_eq!(*direct_log.borrow(), delivered);
+        println!("deferring dispatch: {deferring} allocations, direct: {direct}");
+        if observable {
+            // The queue's box and its buffer, both kept for later deferrals.
+            assert_eq!(
+                deferring - direct,
+                2,
+                "the first deferral allocates the deferral queue"
+            );
+        } else {
+            eprintln!("allocation counts need a statically linked std");
+        }
+    }
+
+    #[test]
+    fn body_reader_paced_body_reads_allocate_nothing() {
+        run_paused(async {
+            let observable = std_allocations_observable();
+            let (owner, producer, log) = hooked_request_owner();
+            let mut reader = owner.into_body_reader();
+            let mut context = Context::from_waker(Waker::noop());
+            let bodies = [body(b"one"), body(b"two"), body(b"three")];
+            let ((), allocations) = count_allocations(|| {
+                for body in bodies {
+                    assert!(reader.poll_body(&mut context, u32::MAX).is_pending());
+                    assert_eq!(producer.body(body, 0, false), FlowControlState::Open);
+                    let Poll::Ready(Ok(event)) = reader.poll_body(&mut context, u32::MAX) else {
+                        panic!("the body must complete the pending read");
+                    };
+                    assert!(!event.eom());
+                }
+                assert!(reader.poll_body(&mut context, u32::MAX).is_pending());
+                assert!(producer.eom());
+                let Poll::Ready(Ok(event)) = reader.poll_body(&mut context, u32::MAX) else {
+                    panic!("the EOM must complete the pending read");
+                };
+                assert!(event.eom());
+            });
+            assert_eq!(
+                *log.borrow(),
+                [
+                    Delivered::Processed(3),
+                    Delivered::Processed(3),
+                    Delivered::Processed(5),
+                    Delivered::Complete(None),
+                ]
+            );
+            println!("paced body reader reads: {allocations} allocations");
+            if observable {
+                assert_eq!(allocations, 0);
+            } else {
+                eprintln!("allocation counts need a statically linked std");
+            }
+        });
+    }
+
+    #[test]
+    fn general_read_suspend_and_resume_allocation_count() {
+        run_paused(async {
+            let observable = std_allocations_observable();
+            let (owner, producer, log) = hooked_request_owner();
+            let source = owner.source().unwrap();
+            let mut context = Context::from_waker(Waker::noop());
+            let mut bodies = [body(b"one"), body(b"two"), body(b"three")].into_iter();
+            let mut produce = || {
+                let body = bodies.next().expect("a body for each wait");
+                assert_eq!(producer.body(body, 0, false), FlowControlState::Open);
+            };
+            let (suspends, allocations) = count_allocations(|| {
+                let mut suspends = 0;
+                let mut read_bodies = 0;
+                while read_bodies < 3 {
+                    let mut read =
+                        source.read_body_event_unboxed(u32::MAX, CancellationToken::never());
+                    let event = loop {
+                        match Pin::new(&mut read).poll(&mut context) {
+                            Poll::Ready(result) => break result.unwrap(),
+                            Poll::Pending => produce(),
+                        }
+                    };
+                    if event.event_type() == HttpBodyEventType::Suspend {
+                        suspends += 1;
+                        let mut resume = take_resume(event);
+                        while resume.as_mut().poll(&mut context).is_pending() {
+                            produce();
+                        }
+                        continue;
+                    }
+                    assert!(!event.eom());
+                    read_bodies += 1;
+                }
+                suspends
+            });
+            // A read after a suspend's resume returns the body, and the next
+            // empty read waits for the body after it instead of suspending.
+            assert_eq!(suspends, 2);
+            assert_eq!(
+                *log.borrow(),
+                [
+                    Delivered::Processed(3),
+                    Delivered::Processed(3),
+                    Delivered::Processed(5),
+                ]
+            );
+            println!("general read suspend and resume: {allocations} allocations");
+            if observable {
+                // The event baton once, then one boxed resume per suspend.
+                assert_eq!(allocations, 3);
+            } else {
+                eprintln!("allocation counts need a statically linked std");
+            }
+        });
+    }
+
+    #[test]
+    fn deferred_read_timeout_applied_at_eom_allocation_count() {
+        run_paused(async {
+            let observable = std_allocations_observable();
+            let (owner, producer, log) = hooked_request_owner();
+            let source = owner.source().unwrap();
+            let mut context = Context::from_waker(Waker::noop());
+            let ((), allocations) = count_allocations(|| {
+                assert!(
+                    producer.defer_read_timeout(DeferredReadTimeout::DeferUpdates(
+                        Duration::from_secs(5)
+                    ))
+                );
+                // The request's EOM applies the deferred timeout.
+                assert!(producer.arm_read_timeout());
+            });
+            assert!(!producer.arm_read_timeout());
+            let mut read = source.read_body_event_unboxed(u32::MAX, CancellationToken::never());
+            let Poll::Ready(Ok(event)) = Pin::new(&mut read).poll(&mut context) else {
+                panic!("an empty general read must suspend");
+            };
+            let mut resume = take_resume(event);
+            time::advance(Duration::from_secs(5)).await;
+            assert_eq!(
+                std::future::poll_fn(|context| resume.as_mut().poll(context)).await,
+                ResumeStatus::TimedOut
+            );
+            assert!(log.borrow().is_empty());
+            println!("deferred read timeout set and applied: {allocations} allocations");
+            if observable {
+                assert_eq!(allocations, 0);
+            } else {
+                eprintln!("allocation counts need a statically linked std");
+            }
+        });
+    }
+
+    #[test]
+    fn stream_shared_fits_the_512_class() {
+        let (_owner, producer, _log) = hooked_request_owner();
+        let (size, fields) = producer.shared_layout_for_test();
+        for (field, bytes) in &fields {
+            println!("{field}: {bytes} B");
+        }
+        // An `Rc` allocation holds the strong and weak counts before the value.
+        let allocation = size + 2 * size_of::<usize>();
+        println!("StreamShared: {size} B, Rc allocation: {allocation} B");
+        assert!(
+            allocation <= 512,
+            "each stream source allocates {allocation} B for its shared state"
+        );
+    }
 }
 
 mod stream_source_holder {

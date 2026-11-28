@@ -317,8 +317,9 @@ struct StreamShared {
     /// A pending exclusive read waiting for the event without a `TimedWait`.
     direct_wait: RefCell<Option<DirectWait>>,
     /// The `TimedWait` that took over that read's wait when a read timeout was
-    /// set during it, until the read next polls.
-    retimed_wait: RefCell<Option<TimedWait>>,
+    /// set during it, until the read next polls. It is boxed because few
+    /// sources set a read timeout during a wait.
+    retimed_wait: RefCell<Option<Box<TimedWait>>>,
     uninitialized_read_timeout: Cell<Duration>,
     deferred_read_timeout: Cell<Option<DeferredReadTimeout>>,
     ingress_completion: IngressCompletionPublisher,
@@ -365,7 +366,12 @@ impl HttpStreamSourceCallback for CallbackOwner {
 
 struct CallbackSlot {
     callback: Option<CallbackOwner>,
-    pending: VecDeque<CallbackEvent>,
+    /// Events emitted during a dispatch, allocated by the first one.
+    #[expect(
+        clippy::box_collection,
+        reason = "a slot that never defers an event keeps 8 bytes instead of an empty deque's 32"
+    )]
+    pending: Option<Box<VecDeque<CallbackEvent>>>,
     dispatching: bool,
 }
 
@@ -467,7 +473,7 @@ impl StreamShared {
         let mut wait = event.wait(CancellationToken::never());
         let registered = Pin::new(&mut wait).poll(&mut Context::from_waker(&waker));
         debug_assert!(registered.is_pending(), "an unsignalled wait registers");
-        *self.retimed_wait.borrow_mut() = Some(wait);
+        *self.retimed_wait.borrow_mut() = Some(Box::new(wait));
         event.set_timeout(Some(timeout));
     }
 
@@ -1565,7 +1571,7 @@ impl HttpStreamSource {
                 }),
                 callback: RefCell::new(CallbackSlot {
                     callback,
-                    pending: VecDeque::new(),
+                    pending: None,
                     dispatching: false,
                 }),
                 host,
@@ -2259,6 +2265,84 @@ impl HttpStreamSourceProducer {
             .upgrade()
             .is_some_and(|shared| shared.event.get().is_some())
     }
+
+    /// The size of the live source's shared state, and the size of each of its
+    /// fields and of the fields of its state and callback slot.
+    pub(crate) fn shared_layout_for_test(&self) -> (usize, Vec<(&'static str, usize)>) {
+        use std::mem::size_of_val;
+
+        let shared = self.shared.upgrade().expect("the source is live");
+        let state = shared.state.borrow();
+        let callback = shared.callback.borrow();
+        let flags = [
+            &state.sink_mode,
+            &state.deliver_ingress_before_abort,
+            &state.keeps_queued_events,
+            &state.drain_on_drop,
+            &state.draining,
+            &state.source_complete,
+            &state.strict_flow_control,
+            &state.should_validate_content_length,
+            &state.empty_content_length_is_zero,
+            &state.can_suspend,
+            &state.suspend_wait_active,
+            &state.inline_reads,
+        ]
+        .into_iter()
+        .map(size_of_val)
+        .sum::<usize>();
+        let fields = vec![
+            ("owner_thread", size_of_val(&shared.owner_thread)),
+            ("state", size_of_val(&shared.state)),
+            ("state.id", size_of_val(&state.id)),
+            ("state.error", size_of_val(&state.error)),
+            ("state.header_queue", size_of_val(&state.header_queue)),
+            ("state.body_queue", size_of_val(&state.body_queue)),
+            ("state.receive_window", size_of_val(&state.receive_window)),
+            (
+                "state.expected_content_length",
+                size_of_val(&state.expected_content_length),
+            ),
+            (
+                "state.remaining_content_length",
+                size_of_val(&state.remaining_content_length),
+            ),
+            ("state.ingress_state", size_of_val(&state.ingress_state)),
+            ("state.read_state", size_of_val(&state.read_state)),
+            ("state.active_read", size_of_val(&state.active_read)),
+            ("state.next_read_id", size_of_val(&state.next_read_id)),
+            (
+                "state.body_segment_hint",
+                size_of_val(&state.body_segment_hint),
+            ),
+            (
+                "state.resume_threshold",
+                size_of_val(&state.resume_threshold),
+            ),
+            ("state.flags (12 bools)", flags),
+            ("callback", size_of_val(&shared.callback)),
+            ("callback.callback", size_of_val(&callback.callback)),
+            ("callback.pending", size_of_val(&callback.pending)),
+            ("callback.dispatching", size_of_val(&callback.dispatching)),
+            ("host", size_of_val(&shared.host)),
+            ("event", size_of_val(&shared.event)),
+            ("direct_wait", size_of_val(&shared.direct_wait)),
+            ("retimed_wait", size_of_val(&shared.retimed_wait)),
+            (
+                "uninitialized_read_timeout",
+                size_of_val(&shared.uninitialized_read_timeout),
+            ),
+            (
+                "deferred_read_timeout",
+                size_of_val(&shared.deferred_read_timeout),
+            ),
+            (
+                "ingress_completion",
+                size_of_val(&shared.ingress_completion),
+            ),
+        ];
+        (size_of_val(&*shared), fields)
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -2617,7 +2701,7 @@ impl<T: From<TimedWait>> ExclusiveWait<T> {
     #[inline(never)]
     fn adopt_retimed_wait(&mut self, shared: &StreamShared) {
         if let Some(wait) = shared.retimed_wait.take() {
-            *self = Self::Timed(T::from(wait));
+            *self = Self::Timed(T::from(*wait));
         }
     }
 }
@@ -3678,7 +3762,10 @@ fn emit_callback(shared: &Rc<StreamShared>, event: CallbackEvent) {
         }));
         let mut slot = shared.callback.borrow_mut();
         if result.is_ok()
-            && let Some(next) = slot.pending.pop_front()
+            && let Some(next) = slot
+                .pending
+                .as_mut()
+                .and_then(|pending| pending.pop_front())
         {
             drop(slot);
             event = next;
@@ -3698,7 +3785,7 @@ fn emit_callback(shared: &Rc<StreamShared>, event: CallbackEvent) {
 #[cold]
 #[inline(never)]
 fn defer_callback_event(slot: &mut CallbackSlot, event: CallbackEvent) {
-    slot.pending.push_back(event);
+    slot.pending.get_or_insert_default().push_back(event);
 }
 
 #[cold]
