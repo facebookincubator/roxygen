@@ -11829,6 +11829,289 @@ mod pull_through {
         });
     }
 
+    /// The poll that parses a response releases the exchange's capacity, and that poll's turns
+    /// take the release's mark, so the release does not wake the run. Reading the response to
+    /// its end wakes the run once, and one poll then retires the exchange.
+    #[test]
+    fn a_release_in_the_run_s_poll_does_not_wake_the_run() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::Run, |_| {});
+                let mut response = fixture.submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                fixture.origin.send(OK_RESPONSE);
+                assert!(fixture.poll_run().is_pending());
+                assert!(
+                    response.control().capacity_released(),
+                    "the poll that parsed the response released its capacity"
+                );
+                assert!(!fixture.run_woken(), "the release did not wake the run");
+                let mut head = fixture.next_header(&mut response);
+                assert_eq!(head.headers_mut().status_code().unwrap(), 200);
+                let run = fixture.run_wake.get();
+                while !fixture.next_event(&mut response, u32::MAX).unwrap().eom() {}
+                assert_eq!(
+                    fixture.run_wake.get() - run,
+                    1,
+                    "the source's completion wakes the run once"
+                );
+                let polls = fixture.run_polls;
+                assert!(fixture.settle_run().is_none());
+                assert_eq!(
+                    (
+                        fixture.run_polls - polls,
+                        fixture.handle.available_capacity()
+                    ),
+                    (1, 1),
+                    "one poll retires the exchange and returns the slot"
+                );
+                assert!(fixture.handle.close_when_idle().unwrap());
+                fixture
+                    .settle_run()
+                    .expect("the idle connection closes")
+                    .unwrap();
+            })
+        });
+    }
+
+    /// Between the driver's polls, a capacity release or an admission close wakes the last
+    /// registered waker once: the run's, or the holder's while a body holds the drive.
+    #[test]
+    fn a_release_or_close_between_polls_wakes_the_registered_waker_once() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::Run, |_| {});
+                assert!(fixture.poll_run().is_pending());
+                let run = fixture.run_wake.get();
+                drop(fixture.handle.reserve_request().unwrap());
+                assert_eq!(
+                    fixture.run_wake.get() - run,
+                    1,
+                    "the release wakes the run once"
+                );
+                assert!(fixture.settle_run().is_none());
+                let run = fixture.run_wake.get();
+                assert!(fixture.handle.close_when_idle().unwrap());
+                assert_eq!(
+                    fixture.run_wake.get() - run,
+                    1,
+                    "the close wakes the run once"
+                );
+                fixture
+                    .settle_run()
+                    .expect("the idle connection closes")
+                    .unwrap();
+            })
+        });
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                let (holder, run) = (fixture.holder_wake.get(), fixture.run_wake.get());
+                assert!(fixture.handle.close_when_idle().unwrap());
+                assert_eq!(
+                    (
+                        fixture.holder_wake.get() - holder,
+                        fixture.run_wake.get() - run
+                    ),
+                    (1, 0),
+                    "while the body holds the drive, the close wakes the holder once"
+                );
+                fixture.origin.send(b"0\r\n\r\n");
+                while !fixture.next_event(&mut response, u32::MAX).unwrap().eom() {}
+                fixture
+                    .settle_run()
+                    .expect("the connection closes once its exchange retires")
+                    .unwrap();
+            })
+        });
+    }
+
+    /// An admission close from a read start in the holder's drive does not wake either waker,
+    /// because that drive's turns take its mark. It leaves the wake record set, so the holder's
+    /// next read drives the connection, and the read after that does not.
+    #[test]
+    fn an_owner_thread_wake_in_the_holder_s_drive_only_sets_the_wake_record() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                let handle = fixture.handle.clone();
+                *fixture.origin.on_read_start.borrow_mut() = Some(Box::new(move || {
+                    assert!(handle.close_when_idle().unwrap());
+                }));
+                let (holder, run) = (fixture.holder_wake.get(), fixture.run_wake.get());
+                fixture.origin.send(&chunk(b"one"));
+                let Poll::Ready(event) = fixture.body(&mut response, u32::MAX) else {
+                    panic!("the chunk is taken in the read that parses it");
+                };
+                assert_eq!(body_bytes(&event.unwrap()), b"one");
+                assert!(
+                    fixture.origin.on_read_start.borrow().is_none(),
+                    "the drive started the next read, which closed admission"
+                );
+                assert_eq!(
+                    (
+                        fixture.holder_wake.get() - holder,
+                        fixture.run_wake.get() - run
+                    ),
+                    (1, 0),
+                    "only the chunk's arrival woke the holder"
+                );
+                let turns = driver_turns();
+                assert!(fixture.body(&mut response, u32::MAX).is_pending());
+                assert!(driver_turns() > turns, "the holder's next read drives");
+                let turns = driver_turns();
+                assert!(fixture.body(&mut response, u32::MAX).is_pending());
+                assert_eq!(driver_turns(), turns, "the read after it does not");
+                fixture.origin.send(b"0\r\n\r\n");
+                while !fixture.next_event(&mut response, u32::MAX).unwrap().eom() {}
+                fixture
+                    .settle_run()
+                    .expect("the connection closes once its exchange retires")
+                    .unwrap();
+            })
+        });
+    }
+
+    /// The holder's drive that parses the response's end returns the drive to the run. That
+    /// drive's turns take the release's mark, and its end still wakes the run once, since the run
+    /// polls the driver from then on. The holder is not woken.
+    #[test]
+    fn a_drive_returned_in_the_holder_s_drive_wakes_the_run_once_at_its_end() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::PullThrough, |_| {});
+                let mut response = fixture.held();
+                fixture
+                    .origin
+                    .send(&[chunk(b"one"), b"0\r\n\r\n".to_vec()].concat());
+                let (holder, run) = (fixture.holder_wake.get(), fixture.run_wake.get());
+                // The read takes one byte, so the source does not complete in it.
+                let Poll::Ready(event) = fixture.body(&mut response, 1) else {
+                    panic!("a byte is taken in the read that parses the response");
+                };
+                assert_eq!(body_bytes(&event.unwrap()), b"o");
+                assert!(!response.body().holds_the_drive());
+                assert_eq!(
+                    (
+                        fixture.holder_wake.get() - holder,
+                        fixture.run_wake.get() - run
+                    ),
+                    (0, 1),
+                    "the drive's end wakes only the run, once"
+                );
+                let mut rest = Vec::new();
+                loop {
+                    let event = fixture.next_event(&mut response, u32::MAX).unwrap();
+                    rest.extend(body_bytes(&event));
+                    if event.eom() {
+                        break;
+                    }
+                }
+                assert_eq!(rest, b"ne");
+                assert!(fixture.settle_run().is_none());
+                assert_eq!(
+                    fixture.handle.available_capacity(),
+                    1,
+                    "the exchange retired"
+                );
+                assert!(fixture.handle.close_when_idle().unwrap());
+                fixture
+                    .settle_run()
+                    .expect("the idle connection closes")
+                    .unwrap();
+            })
+        });
+    }
+
+    /// Inside nested marks of the driver's poll, a release only marks the driver's signal. The
+    /// inner exit does not wake, and the outermost exit finds the mark and wakes the run once.
+    #[test]
+    fn nested_polling_marks_wake_only_at_the_outermost_exit() {
+        run_on_host(|context| {
+            Box::pin(async move {
+                let mut fixture = Fixture::new(context, Mode::Run, |_| {});
+                assert!(fixture.poll_run().is_pending());
+                let (handle, run_wake) = (fixture.handle.clone(), Arc::clone(&fixture.run_wake));
+                let run = run_wake.get();
+                let inner = handle.as_if_polled(|| {
+                    handle.as_if_polled(|| drop(handle.reserve_request().unwrap()));
+                    run_wake.get() - run
+                });
+                assert_eq!(
+                    (inner, run_wake.get() - run),
+                    (0, 1),
+                    "the inner exit does not wake the run, and the outer exit wakes it once"
+                );
+                assert!(fixture.settle_run().is_none());
+                assert!(fixture.handle.close_when_idle().unwrap());
+                fixture
+                    .settle_run()
+                    .expect("the idle connection closes")
+                    .unwrap();
+            })
+        });
+    }
+
+    /// The outermost exit of the driver's poll contains a panic of the waker that it wakes and
+    /// reports it at the transport site. The connection then serves a request under a waker that
+    /// does not panic.
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn a_waker_that_panics_at_the_poll_s_exit_is_reported() {
+        struct PanickingWake;
+
+        impl Wake for PanickingWake {
+            fn wake(self: Arc<Self>) {
+                panic!("waker panicked");
+            }
+        }
+
+        run_on_host(|context| {
+            Box::pin(async move {
+                take_contained_panics();
+                let mut fixture = Fixture::new(context, Mode::Run, |_| {});
+                let panicking = Waker::from(Arc::new(PanickingWake));
+                let mut panicking = Context::from_waker(&panicking);
+                assert!(fixture.run.as_mut().poll(&mut panicking).is_pending());
+                let handle = fixture.handle.clone();
+                let exit = catch_unwind(AssertUnwindSafe(|| {
+                    handle.as_if_polled(|| drop(handle.reserve_request().unwrap()))
+                }));
+                assert!(exit.is_ok(), "the waker's panic does not leave the exit");
+                assert_eq!(
+                    take_contained_panics(),
+                    [(
+                        PanicSite::Transport,
+                        None,
+                        Some("waker panicked".to_owned())
+                    )]
+                );
+                assert!(fixture.poll_run().is_pending());
+                let mut response = fixture.submit(
+                    get_head(),
+                    HttpSourceHolder::empty(),
+                    CancellationToken::never(),
+                );
+                fixture.origin.send(OK_RESPONSE);
+                let mut head = fixture.next_header(&mut response);
+                assert_eq!(head.headers_mut().status_code().unwrap(), 200);
+                while !fixture.next_event(&mut response, u32::MAX).unwrap().eom() {}
+                assert!(fixture.settle_run().is_none());
+                assert!(fixture.handle.close_when_idle().unwrap());
+                fixture
+                    .settle_run()
+                    .expect("the idle connection closes")
+                    .unwrap();
+                assert!(take_contained_panics().is_empty());
+            })
+        });
+    }
+
     #[test]
     fn a_body_read_after_its_response_ended_does_not_take_the_drive() {
         run_on_host(|context| {

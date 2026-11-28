@@ -134,9 +134,10 @@ struct Shared {
     closed: RefCell<Option<HttpError>>,
     observer: RefCell<Option<Rc<dyn OwnedUpstreamObserver>>>,
     queued: RefCell<Option<Submission>>,
-    /// Set while the driver polls. A callback that panics then is contained and reported.
-    /// Otherwise its panic reaches the caller.
-    polling: Cell<bool>,
+    /// The capacity release, the admission close and the response sources' callbacks wake the
+    /// driver here. Its `polling` is set while the driver polls (`SharedPolling`): a callback
+    /// that panics then is contained and reported, and otherwise its panic reaches the caller.
+    owner: Rc<OwnerWake>,
     /// The observer panicked while the driver polled, which drains the connection.
     escalate_drain: Cell<bool>,
     /// Who polls the driver of a session run with `run_pull_through`.
@@ -163,7 +164,8 @@ enum DriveState {
 /// waker shows that one of the driver's wake sources fired since its last poll. So every input
 /// of the driver must do one of these, or it is lost while a body holds the drive:
 ///
-/// - wake the task waker, through a `Signal` or `task.wake()`, which set the record;
+/// - wake the task waker, through a `Signal` or `task.wake()`, or make an owner-thread wake
+///   (`OwnerWake::wake_local`), all of which set the record;
 /// - be covered by a term of the body's check, such as a pending budget yield;
 /// - reach the run's future, which takes the drive back, as the held request's cancellation
 ///   token and worker cancellation do.
@@ -310,7 +312,7 @@ impl Shared {
         stream: Option<StreamId>,
         panic: PanicPayload,
     ) {
-        if !self.polling.get() {
+        if !self.owner.polling.get() {
             if first.is_none() {
                 *first = Some(panic);
             } else {
@@ -359,7 +361,7 @@ impl Shared {
             }
         }
         self.contain_callback(&mut panic, PanicSite::Transport, None, || {
-            self.wake.wake_by_ref()
+            self.owner.wake_local(Some(&self.wake))
         });
         finish_panic(panic);
     }
@@ -407,9 +409,27 @@ impl Shared {
             });
         }
         self.contain_callback(&mut panic, PanicSite::Transport, None, || {
-            self.wake.wake_by_ref()
+            self.owner.wake_local(Some(&self.wake))
         });
         finish_panic(panic);
+    }
+
+    /// Whether an owner-thread wake during the driver's poll left work for the next poll: the
+    /// exchange signal's mark, or a drive that left its holder during the holder's own drive,
+    /// which only a wake announces to the run. A finished run is not woken.
+    fn owner_wake_left(&self) -> bool {
+        !self.complete.get()
+            && (self.wake.is_ready()
+                || (self.drive.driving.get()
+                    && !matches!(self.drive.state.get(), DriveState::Held(_))))
+    }
+
+    /// Wakes the registered waker, the run future's or the holder's, through the task waker's
+    /// lock, at the end of the poll that the wake belongs to: a waker that panics is reported.
+    fn wake_after_poll(&self) {
+        if let Err(panic) = guarded(|| self.wake.task.wake()) {
+            report_panic(&self.context, PanicSite::Transport, None, panic);
+        }
     }
 }
 
@@ -499,20 +519,25 @@ const TEARDOWN_PANIC_LIMIT: u8 = 3;
 
 /// Marks the connection as polled by its driver while the guard lives, then restores the
 /// previous mark. It holds the connection's state weakly, so it never drops the last reference
-/// to it.
+/// to it. The outermost guard's exit wakes the driver once if an owner-thread wake during the
+/// poll left work for it.
 struct SharedPolling(Weak<Shared>, bool);
 
 impl SharedPolling {
     #[inline(always)]
     fn enter(shared: &Rc<Shared>) -> Self {
-        Self(Rc::downgrade(shared), shared.polling.replace(true))
+        Self(Rc::downgrade(shared), shared.owner.polling.replace(true))
     }
 }
 
 impl Drop for SharedPolling {
     fn drop(&mut self) {
-        if let Some(shared) = self.0.upgrade() {
-            shared.polling.set(self.1);
+        let Some(shared) = self.0.upgrade() else {
+            return;
+        };
+        shared.owner.polling.set(self.1);
+        if !self.1 && shared.owner.local_pending.take() && shared.owner_wake_left() {
+            shared.wake_after_poll();
         }
     }
 }
@@ -703,6 +728,14 @@ impl OwnedH1UpstreamHandle {
             shared: Rc::clone(&self.0),
             active: true,
         })
+    }
+
+    /// Runs `inside` with the connection marked as polled by its driver, as a poll of its run
+    /// does.
+    #[cfg(test)]
+    pub(crate) fn as_if_polled<R>(&self, inside: impl FnOnce() -> R) -> R {
+        let _polling = SharedPolling::enter(&self.0);
+        inside()
     }
 }
 
@@ -2458,7 +2491,7 @@ impl UpstreamDriver {
             closed: RefCell::new(None),
             observer: RefCell::new(None),
             queued: RefCell::new(None),
-            polling: Cell::new(false),
+            owner: Rc::new(OwnerWake::new(Arc::clone(&task))),
             escalate_drain: Cell::new(false),
             drive: Drive::default(),
         });
@@ -3217,7 +3250,7 @@ impl UpstreamDriver {
             source_complete: Cell::new(false),
             completed: Cell::new(None),
             stream: Arc::clone(&self.stream_wake),
-            owner: None,
+            owner: Rc::clone(&self.shared.owner),
             drive: pull_through
                 .is_some()
                 .then(|| DriveLink(Rc::downgrade(&self.shared))),

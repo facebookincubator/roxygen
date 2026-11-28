@@ -361,11 +361,10 @@ pub enum Http1UpgradePolicy {
     AsOrdinaryRequest,
 }
 
-/// The session owner's waker and its wake record, for one connection. Downstream, the request
-/// sources' callbacks and the handle's drain and cancel go through `OwnerWake`, which wakes its
-/// own copy of the waker, and set only the record here. Each wake sets the record, and the owned
-/// HTTP/1.1 upstream driver clears it as each of its polls begins, so that a pull-through body
-/// can check whether one of the driver's wake sources fired since the driver's last poll.
+/// The session owner's waker and its wake record, for one connection. Each wake sets the record,
+/// and so does each `OwnerWake::wake_local`, which does not always wake the session. The owned
+/// HTTP/1.1 upstream driver clears the record as each of its polls begins, so that a pull-through
+/// body can check whether one of the driver's wake sources fired since the driver's last poll.
 #[derive(Default)]
 struct TaskWaker {
     waker: Mutex<Option<Waker>>,
@@ -467,20 +466,22 @@ impl Wake for Signal {
     }
 }
 
-/// The wakes that a downstream connection's own thread makes: its request source's callbacks
-/// and its handle's drain and cancel. During the driver's poll they only mark, and the poll's
-/// turns act on the mark or the poll's exit wakes the session. Between polls they wake the
-/// session through `owner_waker`, once until the next poll starts. The `Signal` wakers, which
-/// other threads may wake, use `TaskWaker::wake`.
+/// The wakes that a connection's own thread makes: its exchange source's callbacks, plus its
+/// handle's drain and cancel downstream, or its capacity release and admission close upstream.
+/// During the driver's poll they only mark, and the poll's turns act on the mark or the poll's
+/// exit wakes the session. Between polls they wake the session: downstream through
+/// `owner_waker`, once until the next poll starts, and upstream, where a pull-through drive moves
+/// the registered waker between polls, through `task`. The `Signal` wakers, which other threads
+/// may wake, use `TaskWaker::wake`.
 struct OwnerWake {
     task: Arc<TaskWaker>,
-    /// Set while the driver polls, by `OwnerPoll`.
+    /// Set while the driver polls, by `OwnerPoll` downstream and `SharedPolling` upstream.
     polling: Cell<bool>,
     /// An owner-thread wake came during the current poll.
     local_pending: Cell<bool>,
     /// `owner_waker` has been woken since the last poll started.
     notified: Cell<bool>,
-    /// The owner thread's copy of the waker registered in `task`.
+    /// The owner thread's copy of the waker registered in `task`. Upstream leaves it empty.
     owner_waker: RefCell<Option<Waker>>,
 }
 
@@ -526,14 +527,16 @@ impl OwnerWake {
         }
     }
 
-    /// Wakes the session through `owner_waker` once until the next poll starts. A waker that
-    /// panics leaves `notified` clear.
+    /// Wakes the session through `owner_waker` once until the next poll starts, or, without an
+    /// owner-thread copy, through `task`. A waker that panics leaves `notified` clear.
     fn notify(&self) {
         if self.notified.get() {
             return;
         }
         let waker = self.owner_waker.borrow();
         let Some(waker) = waker.as_ref() else {
+            drop(waker);
+            self.task.wake();
             return;
         };
         // Set before the wake, so that a host that polls the session inside it clears it.
@@ -633,8 +636,7 @@ struct IngressSignals {
     source_complete: Cell<bool>,
     completed: Cell<Option<Result<(), HttpError>>>,
     stream: Arc<Signal>,
-    /// Set downstream, where the callbacks wake through `OwnerWake::wake_local`.
-    owner: Option<Rc<OwnerWake>>,
+    owner: Rc<OwnerWake>,
     /// The connection of a pull-through exchange. The source's completion returns the drive to
     /// the connection's run before the wake that announces it.
     drive: Option<upstream::DriveLink>,
@@ -645,10 +647,7 @@ struct IngressSignals {
 
 impl IngressSignals {
     fn wake(&self) {
-        match &self.owner {
-            Some(owner) => owner.wake_local(Some(&self.stream)),
-            None => self.stream.wake_by_ref(),
-        }
+        self.owner.wake_local(Some(&self.stream));
     }
 
     /// Whether the source completed with `NO_ERROR`, its reader having stopped without error,
@@ -1089,7 +1088,7 @@ impl<A: OwnedApplication> CodecInput<'_, A> {
             source_complete: Cell::new(false),
             completed: Cell::new(None),
             stream: Arc::clone(self.stream_wake),
-            owner: Some(Rc::clone(&self.control.owner)),
+            owner: Rc::clone(&self.control.owner),
             drive: None,
             returning: Cell::new(None),
         });
