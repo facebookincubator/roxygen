@@ -151,16 +151,25 @@ impl PriorityQueue {
         }
         entry.priority = priority;
         if previous.enqueued && !priority.paused {
-            self.insert(stream, priority);
+            self.insert(stream, priority, false);
             entry.enqueued = true;
         }
     }
 
     pub(crate) fn enqueue(&mut self, stream: StreamId, entry: &mut PriorityEntry) -> bool {
+        self.enqueue_at(stream, entry, false)
+    }
+
+    /// `enqueue`, but ahead of the incremental streams already queued at the stream's urgency.
+    pub(crate) fn enqueue_front(&mut self, stream: StreamId, entry: &mut PriorityEntry) -> bool {
+        self.enqueue_at(stream, entry, true)
+    }
+
+    fn enqueue_at(&mut self, stream: StreamId, entry: &mut PriorityEntry, front: bool) -> bool {
         if entry.enqueued || entry.priority.paused {
             return false;
         }
-        self.insert(stream, entry.priority);
+        self.insert(stream, entry.priority, front);
         entry.enqueued = true;
         true
     }
@@ -243,23 +252,27 @@ impl PriorityQueue {
         true
     }
 
-    fn insert(&mut self, stream: StreamId, priority: HttpPriority) {
+    fn insert(&mut self, stream: StreamId, priority: HttpPriority, front: bool) {
         if self.nonempty_urgencies == 0 {
             match self.solo.take() {
                 None => {
                     self.solo = Some((stream, priority));
                     return;
                 }
-                Some((solo, solo_priority)) => self.insert_queued(solo, solo_priority),
+                Some((solo, solo_priority)) => self.insert_queued(solo, solo_priority, false),
             }
         }
-        self.insert_queued(stream, priority);
+        self.insert_queued(stream, priority, front);
     }
 
-    fn insert_queued(&mut self, stream: StreamId, priority: HttpPriority) {
+    fn insert_queued(&mut self, stream: StreamId, priority: HttpPriority, front: bool) {
         let urgency = usize::from(priority.urgency.min(7));
         if priority.incremental {
-            self.incremental[urgency].push_back(stream);
+            if front {
+                self.incremental[urgency].push_front(stream);
+            } else {
+                self.incremental[urgency].push_back(stream);
+            }
         } else {
             self.ordered[urgency].insert(OrderedStream {
                 order_id: priority.order_id,

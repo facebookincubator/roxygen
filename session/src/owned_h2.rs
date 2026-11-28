@@ -1171,6 +1171,8 @@ where
     }
 
     fn can_serialize(&self, budget: SerializationBudget) -> bool {
+        #[cfg(test)]
+        SERIALIZE_PROBES.with(|probes| probes.set(probes.get() + 1));
         if !self.protocol_active() {
             return false;
         }
@@ -1644,6 +1646,8 @@ thread_local! {
     static INLINE_POLLS: Cell<usize> = const { Cell::new(0) };
     static TURNS: Cell<usize> = const { Cell::new(0) };
     static OWNER_POLLS: Cell<usize> = const { Cell::new(0) };
+    static SERIALIZE_PROBES: Cell<usize> = const { Cell::new(0) };
+    static CONN_BLOCKED_PEAK: Cell<usize> = const { Cell::new(0) };
     static RUN_FAULT: Cell<bool> = const { Cell::new(false) };
     static COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
 }
@@ -1704,6 +1708,20 @@ pub(crate) fn turns() -> usize {
 #[cfg(test)]
 pub(crate) fn owner_polls() -> usize {
     OWNER_POLLS.with(Cell::get)
+}
+
+/// How many times the owned H2 drivers on this thread have checked whether a stream's pending
+/// event can serialize.
+#[cfg(test)]
+pub(crate) fn serialize_probes() -> usize {
+    SERIALIZE_PROBES.with(Cell::get)
+}
+
+/// The most entries that an owned H2 driver on this thread has held in its list of bodies blocked
+/// on the connection window since the last call; resets the count.
+#[cfg(test)]
+pub(crate) fn take_conn_blocked_peak() -> usize {
+    CONN_BLOCKED_PEAK.replace(0)
 }
 
 /// A downstream HTTP/2 driver with concrete exchange owners.
@@ -2003,6 +2021,9 @@ struct ConnectionState {
     control: Rc<Control>,
     config: UniplexConfig,
     scheduler: PriorityQueue,
+    /// Streams whose body waits for connection credit, in the order they left the scheduler's
+    /// head. An entry can outlive its stream's wait: each is checked when the list drains.
+    conn_blocked: Vec<StreamId>,
     write_fences: VecDeque<(u64, StreamId)>,
     peer_initial_window: u32,
     peer_maximum_streams: u32,
@@ -2511,6 +2532,7 @@ where
                         control: Rc::clone(&handle.0),
                         config: io,
                         scheduler: PriorityQueue::default(),
+                        conn_blocked: Vec::new(),
                         write_fences: VecDeque::new(),
                         peer_initial_window: DEFAULT_STREAM_WINDOW,
                         peer_maximum_streams: u32::MAX,
@@ -3049,6 +3071,11 @@ where
                     Err(error) => self.parse_failed(error),
                 }
                 ran = true;
+            }
+            // Only a parse opens the connection window, but local resets also leave stale
+            // entries, so the prune runs in turns without one.
+            if !self.connection.state.conn_blocked.is_empty() {
+                self.resume_conn_blocked();
             }
             self.check_cancel_after(&mut ran);
             if self.failure.fatal.is_none() && !self.failure.failures.is_empty() {
@@ -4690,6 +4717,7 @@ where
                     else {
                         return actions.into();
                     };
+                    let stalled = owner.stalled;
                     if !protocol::free_stream_send(
                         &mut owner.send_window,
                         &mut owner.stalled,
@@ -4702,12 +4730,7 @@ where
                                 b"stream send-window update overflowed",
                             ),
                         ));
-                        let owner = self
-                            .streams
-                            .get_mut(&stream)
-                            .expect("window update retains its stream");
-                        self.state.scheduler.enqueue(stream, &mut owner.scheduling);
-                    } else {
+                    } else if stalled && !owner.stalled && owner.pending.is_some() {
                         self.state.scheduler.enqueue(stream, &mut owner.scheduling);
                     }
                 }
@@ -4745,7 +4768,7 @@ where
                                 &mut self.state.peer_initial_window,
                                 capacity,
                                 windows
-                                    .into_iter()
+                                    .iter_mut()
                                     .map(|(_, stream)| &mut stream.send_window),
                             ) {
                                 self.fail(Failure::new(
@@ -4755,6 +4778,18 @@ where
                                         b"peer initial stream window is not representable",
                                     ),
                                 ));
+                            } else {
+                                for (id, stream) in windows {
+                                    if stream.stalled && stream.send_window.non_negative_size() != 0
+                                    {
+                                        stream.stalled = false;
+                                        if stream.pending.is_some() {
+                                            self.state
+                                                .scheduler
+                                                .enqueue(*id, &mut stream.scheduling);
+                                        }
+                                    }
+                                }
                             }
                         }
                         PeerSetting::Other => {}
@@ -6202,6 +6237,35 @@ where
     A: OwnedApplication,
     A::Exchange: ExchangeStorage<UPSTREAM>,
 {
+    /// Once the connection has send credit, returns the streams in `conn_blocked` to the front of
+    /// the scheduler in their former order, before any owner queues an event in this turn. An
+    /// entry whose stream was since reset, retired or stalled is dropped. While the window stays
+    /// closed, the list keeps only streams with a pending event once it is more than twice as
+    /// long as the stream table.
+    #[cold]
+    #[inline(never)]
+    fn resume_conn_blocked(&mut self) {
+        let state = &mut self.connection.state;
+        if self.connection.codec.available_send() == 0 {
+            if state.conn_blocked.len() > 2 * self.streams.len() {
+                state.conn_blocked.retain(|id| {
+                    self.streams
+                        .get(id)
+                        .is_some_and(|stream| stream.pending.is_some())
+                });
+            }
+            return;
+        }
+        for id in state.conn_blocked.drain(..).rev() {
+            if let Some(stream) = self.streams.get_mut(&id)
+                && stream.pending.is_some()
+                && !stream.stalled
+            {
+                state.scheduler.enqueue_front(id, &mut stream.scheduling);
+            }
+        }
+    }
+
     fn serialize_next(&mut self) -> Result<bool, (StreamId, HttpError)> {
         if self.connection.state.scheduler.is_empty() {
             return Ok(false);
@@ -6213,21 +6277,22 @@ where
         ) else {
             return Ok(false);
         };
-        let Some(id) = self.connection.state.scheduler.next_matching(|id| {
-            self.streams
-                .get(&id)
-                .is_some_and(|stream| stream.can_serialize(budget))
-        }) else {
-            return Ok(false);
-        };
         let (streams, mut connection) = self.stream_connection();
-        let stream = streams
-            .get_mut(&id)
-            .expect("scheduler selected an owned stream");
-        connection
-            .serialize_selected(id, stream, budget, false)
-            .map(|_| true)
-            .map_err(|error| (id, error))
+        while let Some(id) = connection.connection.state.scheduler.head() {
+            let stream = streams
+                .get_mut(&id)
+                .expect("the scheduler holds live streams");
+            if stream.can_serialize(budget) {
+                return connection
+                    .serialize_selected(id, stream, budget, false)
+                    .map(|_| true)
+                    .map_err(|error| (id, error));
+            }
+            if !connection.take_blocked_head(id, stream) {
+                break;
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -6254,9 +6319,49 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
             &self.connection.codec,
         )?;
         if !stream.can_serialize(budget) {
+            self.take_blocked_head(id, stream);
             return None;
         }
         Some(self.serialize_selected(id, stream, budget, then_body))
+    }
+
+    /// Removes `stream`, the scheduler's head, whose pending event cannot serialize, unless only
+    /// the turn's write budget holds the event back, and returns whether it did. A body that waits
+    /// for connection credit is added to `conn_blocked`. Otherwise a body whose stream window is
+    /// exhausted marks the stream stalled until a WINDOW_UPDATE or a larger initial window queues
+    /// it again. Any other head is queued again with its owner's next event.
+    fn take_blocked_head<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        id: StreamId,
+        stream: &mut Stream<E, UPSTREAM>,
+    ) -> bool {
+        if stream.protocol_active()
+            && let Some(PendingEgress::Body(event)) = &stream.pending
+        {
+            match event.kind() {
+                HttpBodyEventKind::Body(bytes)
+                    if !bytes.is_empty() && (UPSTREAM || !stream.request_head) =>
+                {
+                    if self.connection.codec.available_send() == 0 {
+                        let blocked = &mut self.connection.state.conn_blocked;
+                        blocked.push(id);
+                        #[cfg(test)]
+                        CONN_BLOCKED_PEAK.set(CONN_BLOCKED_PEAK.get().max(blocked.len()));
+                    } else if stream.send_window.non_negative_size() == 0 {
+                        stream.stalled = true;
+                    } else {
+                        return false;
+                    }
+                }
+                HttpBodyEventKind::Body(_) | HttpBodyEventKind::Padding(_) => return false,
+                _ => {}
+            }
+        }
+        self.connection
+            .state
+            .scheduler
+            .dequeue(id, &mut stream.scheduling);
+        true
     }
 
     /// Serializes the pending event, or the part of its body that `budget` admits, and queues the
@@ -6295,6 +6400,10 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
                 .state
                 .scheduler
                 .dequeue(id, &mut stream.scheduling);
+        } else if self.connection.state.scheduler.head() == Some(id) {
+            // A stream that rotated behind other incremental streams leaves only from the head,
+            // which keeps `conn_blocked` in queue order.
+            self.take_blocked_head(id, stream);
         }
         let body_next =
             head && stream.response_headers && !stream.response_complete && self.can_continue();

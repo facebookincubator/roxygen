@@ -34,6 +34,8 @@ use crate::external_host_tests::after_forced_teardown;
 use crate::external_host_tests::forced_teardown_of_scope;
 use crate::http2::StreamReceiveWindowMode;
 use crate::http2::protocol::connection_error_goaway_code;
+use crate::http2::scheduler::PriorityEntry;
+use crate::http2::scheduler::PriorityQueue;
 use crate::owned::PanicSite;
 use crate::owned::take_contained_panics;
 use crate::owned_h2::OWNER_POLLS_PER_TURN;
@@ -49,7 +51,9 @@ use crate::owned_h2::OwnedH2UpstreamSubmission;
 use crate::owned_h2::TURN_BUDGET;
 use crate::owned_h2::fault_next_run_poll;
 use crate::owned_h2::owner_polls;
+use crate::owned_h2::serialize_probes;
 use crate::owned_h2::stream_seed_order;
+use crate::owned_h2::take_conn_blocked_peak;
 use crate::owned_h2::take_discarded_streams;
 use crate::owned_h2::turns;
 use crate::uniplex::UniplexReader;
@@ -7854,29 +7858,30 @@ fn a_body_that_pends_after_its_head_is_polled_when_woken() {
 
 /// A head polled while another stream heads the scheduler is serialized from the scheduler after
 /// the owner phase, and its owner is queued again for the body. Stream 1's last body byte waits
-/// for credit at the scheduler's head.
+/// for connection credit, and the WINDOW_UPDATE that comes with stream 3's request returns it to
+/// the scheduler's head before stream 3's owner is polled. Stream 3's body then waits for credit.
 #[test]
 fn a_head_behind_the_scheduler_head_queues_its_owner_for_the_body() {
     run_on_worker(|context| {
         Box::pin(async move {
             let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            // Only the connection's 65,535-byte window then blocks stream 1's response.
+            peer.egress_settings_mut()
+                .set(SettingsId::InitialWindowSize, 131_072);
             let mut input = arming_preface(&mut peer);
             input.extend(eligibility_request(&mut peer, 3));
-            let later = eligibility_request(&mut peer, 3);
-            let mut update = eligibility_frame(
-                &mut peer,
-                EgressFrame::WindowUpdate {
-                    stream: StreamId::UNSPECIFIED,
-                    amount: 2,
-                },
-            );
-            update.extend(eligibility_frame(
-                &mut peer,
-                EgressFrame::WindowUpdate {
-                    stream: StreamId::new(1),
-                    amount: 1,
-                },
-            ));
+            let reopen = |peer: &mut Http2Codec| {
+                eligibility_frame(
+                    peer,
+                    EgressFrame::WindowUpdate {
+                        stream: StreamId::UNSPECIFIED,
+                        amount: 1,
+                    },
+                )
+            };
+            let mut later = eligibility_request(&mut peer, 3);
+            later.extend(reopen(&mut peer));
+            let update = reopen(&mut peer);
             let gates: [_; 3] = std::array::from_fn(|_| Arc::new(tokio::sync::Notify::new()));
             let (transport, state) = FixtureTransport::new([
                 FixtureRead::SegmentedData(queue(&input)),
@@ -7897,9 +7902,16 @@ fn a_head_behind_the_scheduler_head_queues_its_owner_for_the_body() {
                 65_535
             );
             gates[0].notify_one();
+            owner_polls_of_one_poll(run.as_mut());
             assert_eq!(
-                owner_polls_of_one_poll(run.as_mut()),
-                2,
+                stream_frame_kinds(&state.borrow().writes.concat(), 1).last(),
+                Some(&(FrameType::DATA.as_u8(), END_STREAM)),
+                "stream 1's last byte precedes stream 3's head"
+            );
+            let first = probes.borrow()[1].owner_poll_at_poll.borrow()[0];
+            assert_eq!(
+                *probes.borrow()[1].owner_poll_at_poll.borrow(),
+                [first, first + 1],
                 "stream 3's head and its body take one owner poll each"
             );
             let (headers, data) = (FrameType::HEADERS.as_u8(), FrameType::DATA.as_u8());
@@ -8391,10 +8403,587 @@ fn incremental_streams_released_together_serialize_in_round_robin_in_one_turn() 
     assert_eq!(round_robin_release_turns(3), round_robin_release_turns(1));
 }
 
-/// A header callback that cancels the session while the turn serializes queued events stops the
-/// serializations after it. Stream 1's body stays at the scheduler's head, blocked on the
-/// connection window, so the later heads queue behind it instead of serializing in their owners'
+/// Polls `run` once with a waker that does nothing, and returns how many times it checked whether
+/// a stream's pending event can serialize.
+fn serialize_probes_of_one_poll(run: Pin<&mut impl Future>) -> usize {
+    let before = serialize_probes();
+    let polled = run.poll(&mut Context::from_waker(Waker::noop()));
+    assert!(polled.is_pending(), "the session waits for the peer");
+    serialize_probes() - before
+}
+
+/// Bodies that wait for the connection window leave the scheduler. The turns that answer a PING
+/// while the window is closed do not check them, and the WINDOW_UPDATE that reopens it serializes
+/// each with one check, in stream order.
+#[test]
+fn bodies_blocked_on_the_connection_window_are_checked_once_per_block() {
+    const BLOCKED: usize = 100;
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut input = arming_preface(&mut peer);
+            for _ in 0..=BLOCKED {
+                input.extend(eligibility_request(&mut peer, 3));
+            }
+            let ping = eligibility_frame(&mut peer, EgressFrame::PingRequest { data: Some(46) });
+            let update = eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::UNSPECIFIED,
+                    amount: BLOCKED as u32,
+                },
+            );
+            let gates: [_; 3] = std::array::from_fn(|_| Arc::new(tokio::sync::Notify::new()));
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitSegmentedData(Arc::clone(&gates[0]), queue(&ping)),
+                FixtureRead::WaitSegmentedData(Arc::clone(&gates[1]), queue(&update)),
+                FixtureRead::WaitDataEof(Arc::clone(&gates[2]), Vec::new()),
+            ]);
+            let mut replies = vec![Reply::Body(1); BLOCKED + 1];
+            replies[0] = Reply::Body(65_535);
+            let (mut application, probes) = Application::new(replies);
+            application.body_chunk = 65_535;
+            let mut config = options(context, transport);
+            config.io.maximum_write_size = config.io.buffer_limit;
+            let (session, _) = OwnedH2Session::new(application, config).unwrap();
+            let mut run = Box::pin(session.run());
+            let decoded =
+                || decode_server_frames_with_requests(&state.borrow().writes.concat(), BLOCKED + 1);
+            serialize_probes_of_one_poll(run.as_mut());
+            assert_eq!(decoded().body_bytes, 65_535);
+            assert!(
+                probes.borrow()[1..]
+                    .iter()
+                    .all(|probe| probe.produced_bytes.get() == 1),
+                "every blocked body is queued"
+            );
+            gates[0].notify_one();
+            assert_eq!(
+                serialize_probes_of_one_poll(run.as_mut()),
+                0,
+                "the turns that answer the PING do not check the blocked bodies"
+            );
+            assert_eq!(decoded().ping_replies, [46]);
+            gates[1].notify_one();
+            assert_eq!(
+                serialize_probes_of_one_poll(run.as_mut()),
+                BLOCKED,
+                "each released body is checked once"
+            );
+            let decoded = decoded();
+            assert_eq!(decoded.body_bytes, 65_535 + BLOCKED);
+            let released: Vec<_> = (1..=BLOCKED as u64)
+                .map(|ordinal| StreamId::new(2 * ordinal + 1))
+                .collect();
+            assert_eq!(
+                decoded.body_streams[decoded.body_streams.len() - BLOCKED..],
+                released
+            );
+            gates[2].notify_one();
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection closes at the peer's EOF")
+                .unwrap();
+            assert_eq!(completions(&probes), [1; BLOCKED + 1]);
+        })
+    });
+}
+
+/// A stream WINDOW_UPDATE for a response with nothing pending does not queue the stream, so the
+/// turns that parse it check no stream's event.
+#[test]
+fn a_stream_window_update_without_a_pending_event_queues_nothing() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut input = arming_preface(&mut peer);
+            input.extend(eligibility_request(&mut peer, 3));
+            let mut update = eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::new(1),
+                    amount: 1024,
+                },
+            );
+            update.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::PingRequest { data: Some(47) },
+            ));
+            let terminal = Arc::new(tokio::sync::Notify::new());
+            let gates: [_; 2] = std::array::from_fn(|_| Arc::new(tokio::sync::Notify::new()));
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitSegmentedData(Arc::clone(&gates[0]), queue(&update)),
+                FixtureRead::WaitDataEof(Arc::clone(&gates[1]), Vec::new()),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(4)]);
+            application.empty_terminal = Some(Arc::clone(&terminal));
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let mut run = Box::pin(session.run());
+            let decoded = || decode_server_frames(&state.borrow().writes.concat());
+            serialize_probes_of_one_poll(run.as_mut());
+            assert_eq!(
+                decoded().body_bytes,
+                4,
+                "the response waits for its terminal event"
+            );
+            gates[0].notify_one();
+            assert_eq!(
+                serialize_probes_of_one_poll(run.as_mut()),
+                0,
+                "the stream with nothing pending stays out of the scheduler"
+            );
+            assert_eq!(decoded().ping_replies, [47]);
+            terminal.notify_one();
+            gates[1].notify_one();
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection closes at the peer's EOF")
+                .unwrap();
+            assert_eq!(completions(&probes), [1]);
+        })
+    });
+}
+
+/// A response that its own send window blocks leaves the scheduler in the owner poll that blocks
+/// it, so the later responses of the same turn are serialized, head and body, by their own owner
 /// polls.
+#[test]
+fn a_stream_blocked_on_its_window_does_not_stop_later_owners_serializing_in_place() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut input = arming_preface(&mut peer);
+            // Only stream 1's 65,535-byte window then blocks its response.
+            input.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::UNSPECIFIED,
+                    amount: 1 << 20,
+                },
+            ));
+            for _ in 0..3 {
+                input.extend(eligibility_request(&mut peer, 3));
+            }
+            let update = eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::new(1),
+                    amount: 1,
+                },
+            );
+            let gates: [_; 2] = std::array::from_fn(|_| Arc::new(tokio::sync::Notify::new()));
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitSegmentedData(Arc::clone(&gates[0]), queue(&update)),
+                FixtureRead::WaitDataEof(Arc::clone(&gates[1]), Vec::new()),
+            ]);
+            let (mut application, probes) =
+                Application::new(vec![Reply::Body(65_536), Reply::Body(16), Reply::Body(16)]);
+            application.body_chunk = 65_536;
+            let mut config = options(context, transport);
+            config.io.maximum_write_size = config.io.buffer_limit;
+            let (session, _) = OwnedH2Session::new(application, config).unwrap();
+            let mut run = Box::pin(session.run());
+            let wire = || state.borrow().writes.concat();
+            owner_polls_of_one_poll(run.as_mut());
+            assert_eq!(
+                decode_server_frames_with_requests(&wire(), 3).body_bytes,
+                65_535 + 32
+            );
+            let (headers, data) = (FrameType::HEADERS.as_u8(), FrameType::DATA.as_u8());
+            for (probe, stream) in probes.borrow()[1..].iter().zip([3, 5]) {
+                let first = probe.owner_poll_at_poll.borrow()[0];
+                assert_eq!(
+                    *probe.owner_poll_at_poll.borrow(),
+                    [first, first],
+                    "stream {stream}'s head and body are polled by one owner poll"
+                );
+                assert_eq!(
+                    stream_frame_kinds(&wire(), stream),
+                    [(headers, END_HEADERS), (data, END_STREAM)]
+                );
+            }
+            gates[0].notify_one();
+            owner_polls_of_one_poll(run.as_mut());
+            assert_eq!(
+                decode_server_frames_with_requests(&wire(), 3).body_bytes,
+                65_536 + 32
+            );
+            gates[1].notify_one();
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection closes at the peer's EOF")
+                .unwrap();
+            assert_eq!(completions(&probes), [1, 1, 1]);
+        })
+    });
+}
+
+/// Bodies that wait for the connection window rejoin the scheduler in the order in which they left
+/// its head. Stream 3's first event takes the window's last bytes, so stream 3 blocks before
+/// stream 1's second event does, and the reopened window serves stream 3 first.
+#[test]
+fn a_connection_window_reopen_resumes_blocked_bodies_in_their_former_order() {
+    const EVENT: usize = 40_000;
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            // Only the connection's window then blocks the responses.
+            peer.egress_settings_mut()
+                .set(SettingsId::InitialWindowSize, 1 << 20);
+            let mut input = arming_preface(&mut peer);
+            for _ in 0..2 {
+                input.extend(eligibility_request(&mut peer, 3));
+            }
+            let update = eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::UNSPECIFIED,
+                    amount: 1 << 20,
+                },
+            );
+            let gates: [_; 2] = std::array::from_fn(|_| Arc::new(tokio::sync::Notify::new()));
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitSegmentedData(Arc::clone(&gates[0]), queue(&update)),
+                FixtureRead::WaitDataEof(Arc::clone(&gates[1]), Vec::new()),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(2 * EVENT); 2]);
+            application.body_chunk = EVENT;
+            application.response_priorities =
+                vec![Some(HttpPriority::from_urgency_and_incremental(3, true)); 2];
+            let mut config = options(context, transport);
+            config.io.maximum_write_size = config.io.buffer_limit;
+            let (session, _) = OwnedH2Session::new(application, config).unwrap();
+            let mut run = Box::pin(session.run());
+            let decoded = || decode_server_frames_with_requests(&state.borrow().writes.concat(), 2);
+            // The stream of each run of DATA frames.
+            let runs = |streams: &[StreamId]| {
+                let mut runs = streams.to_vec();
+                runs.dedup();
+                runs
+            };
+            owner_polls_of_one_poll(run.as_mut());
+            let blocked = decoded();
+            assert_eq!(blocked.body_bytes, 65_535);
+            assert_eq!(runs(&blocked.body_streams), [1, 3].map(StreamId::new));
+            gates[0].notify_one();
+            owner_polls_of_one_poll(run.as_mut());
+            let released = decoded();
+            assert_eq!(released.body_bytes, 4 * EVENT);
+            assert_eq!(
+                runs(&released.body_streams[blocked.body_streams.len()..]),
+                [3, 1, 3].map(StreamId::new),
+                "stream 3's remainder goes first, then stream 1's second event"
+            );
+            gates[1].notify_one();
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection closes at the peer's EOF")
+                .unwrap();
+            assert_eq!(completions(&probes), [1, 1]);
+        })
+    });
+}
+
+/// Streams that the peer resets while their bodies wait for the connection window leave stale
+/// entries in the list of those bodies. The list is pruned once it is more than twice as long as
+/// the stream table, so 40 such streams, each opened and reset in its own read, keep it within
+/// twice the four streams open at once: streams 3 and 5, the stream that a read resets and the
+/// one it opens. The WINDOW_UPDATE that reopens the window then serves the two bodies that waited
+/// throughout.
+#[test]
+fn streams_reset_while_blocked_on_the_connection_window_leave_the_blocked_list_bounded() {
+    const RESETS: usize = 40;
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_conn_blocked_peak();
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut input = arming_preface(&mut peer);
+            for _ in 0..3 {
+                input.extend(eligibility_request(&mut peer, 3));
+            }
+            // Each read resets the stream that the previous read opened, from stream 7 on.
+            let mut reads = Vec::new();
+            for cycle in 0..=RESETS as u64 {
+                let mut read = Vec::new();
+                if cycle > 0 {
+                    read.extend(eligibility_frame(
+                        &mut peer,
+                        EgressFrame::Reset {
+                            stream: StreamId::new(5 + 2 * cycle),
+                            code: H2ErrorCode::CANCEL,
+                        },
+                    ));
+                }
+                read.extend(if cycle < RESETS as u64 {
+                    eligibility_request(&mut peer, 3)
+                } else {
+                    eligibility_frame(
+                        &mut peer,
+                        EgressFrame::WindowUpdate {
+                            stream: StreamId::UNSPECIFIED,
+                            amount: 2,
+                        },
+                    )
+                });
+                reads.push(read);
+            }
+            let gates: Vec<_> = (0..reads.len() + 1)
+                .map(|_| Arc::new(tokio::sync::Notify::new()))
+                .collect();
+            let (transport, state) = FixtureTransport::new(
+                std::iter::once(FixtureRead::SegmentedData(queue(&input)))
+                    .chain(reads.iter().zip(&gates).map(|(read, gate)| {
+                        FixtureRead::WaitSegmentedData(Arc::clone(gate), queue(read))
+                    }))
+                    .chain([FixtureRead::WaitDataEof(
+                        Arc::clone(&gates[reads.len()]),
+                        Vec::new(),
+                    )]),
+            );
+            let mut replies = vec![Reply::Body(1); RESETS + 3];
+            replies[0] = Reply::Body(65_535);
+            let (mut application, probes) = Application::new(replies);
+            application.body_chunk = 65_535;
+            let mut config = options(context, transport);
+            config.io.maximum_write_size = config.io.buffer_limit;
+            let (session, _) = OwnedH2Session::new(application, config).unwrap();
+            let mut run = Box::pin(session.run());
+            let decoded =
+                || decode_server_frames_with_requests(&state.borrow().writes.concat(), RESETS + 3);
+            owner_polls_of_one_poll(run.as_mut());
+            assert_eq!(decoded().body_bytes, 65_535);
+            for gate in &gates[..RESETS] {
+                gate.notify_one();
+                owner_polls_of_one_poll(run.as_mut());
+            }
+            assert_eq!(
+                decoded().body_bytes,
+                65_535,
+                "every later body waits for the connection window"
+            );
+            assert!(
+                probes.borrow()[3..]
+                    .iter()
+                    .all(|probe| probe.produced_bytes.get() == 1),
+                "every reset stream's body was queued before its reset"
+            );
+            let peak = take_conn_blocked_peak();
+            assert!(
+                (3..=8).contains(&peak),
+                "the blocked list holds at most twice the four open streams, but held {peak}"
+            );
+            gates[RESETS].notify_one();
+            owner_polls_of_one_poll(run.as_mut());
+            let decoded = decoded();
+            assert_eq!(decoded.body_bytes, 65_537);
+            assert_eq!(
+                decoded.body_streams[decoded.body_streams.len() - 2..],
+                [3, 5].map(StreamId::new),
+                "the reopened window serves the bodies that waited throughout"
+            );
+            gates[RESETS + 1].notify_one();
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection closes at the peer's EOF")
+                .unwrap();
+            assert_eq!(completions(&probes)[..3], [1, 1, 1]);
+        })
+    });
+}
+
+/// A client that cancels requests whose bodies wait for the connection window leaves stale
+/// entries in the list of those bodies while the peer sends nothing. The list is also pruned in
+/// turns without a parse, so 40 such requests, each cancelled before the next, keep it within
+/// twice the two streams open at once.
+#[test]
+fn cancelled_requests_blocked_on_the_connection_window_leave_the_blocked_list_bounded() {
+    const CANCELLED: usize = 40;
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_conn_blocked_peak();
+            let mut peer = Http2Codec::new(TransportDirection::Downstream);
+            let eof = Arc::new(tokio::sync::Notify::new());
+            let (session, handle, state) = forwarding_upstream(
+                context,
+                vec![
+                    FixtureRead::Data(transcript_settings(&mut peer)),
+                    FixtureRead::WaitDataEof(Arc::clone(&eof), Vec::new()),
+                ],
+            );
+            let mut run = Box::pin(session.run());
+            let submit = |length: usize| {
+                let body = HttpFixedSource::make_fixed_body(queue(&vec![b'u'; length]));
+                handle.reserve_request().unwrap().submit(
+                    committed_test_headers(b"/blocked", false),
+                    HttpSourceHolder::new(Box::new(body)),
+                    CancellationToken::never(),
+                )
+            };
+            let wire = || decode_client_frames(&state.borrow().writes.concat());
+            // Stream 1's body takes the whole connection window.
+            let first = submit(65_535);
+            owner_polls_of_one_poll(run.as_mut());
+            assert_eq!(wire().body_bytes, 65_535);
+            for _ in 0..CANCELLED {
+                let request = submit(1);
+                owner_polls_of_one_poll(run.as_mut());
+                drop(request);
+                owner_polls_of_one_poll(run.as_mut());
+            }
+            let written = wire();
+            assert_eq!(written.header_streams.len(), CANCELLED + 1);
+            assert_eq!(
+                written.resets.len(),
+                CANCELLED,
+                "every later request is reset"
+            );
+            assert_eq!(written.body_bytes, 65_535);
+            let peak = take_conn_blocked_peak();
+            assert!(
+                (1..=4).contains(&peak),
+                "the blocked list holds at most twice the two open streams, but held {peak}"
+            );
+            drop(first);
+            eof.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection closes at the peer's EOF")
+                .unwrap();
+        })
+    });
+}
+
+/// An incremental response that its own send window blocks rejoins its urgency's round robin at
+/// the back when a WINDOW_UPDATE reopens the window, so the events that the other responses
+/// queued before the update are sent before its remainder. A held transport write keeps those
+/// events queued while the update is parsed.
+#[test]
+fn a_stream_window_update_queues_a_blocked_incremental_stream_behind_the_others() {
+    const EVENT: usize = 1000;
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            peer.egress_settings_mut()
+                .set(SettingsId::InitialWindowSize, EVENT as u64);
+            let mut input = arming_preface(&mut peer);
+            for _ in 0..3 {
+                input.extend(eligibility_request(&mut peer, 3));
+            }
+            // Only stream 1's window, which fits its first event, then blocks a response.
+            for stream in [StreamId::UNSPECIFIED, StreamId::new(3), StreamId::new(5)] {
+                input.extend(eligibility_frame(
+                    &mut peer,
+                    EgressFrame::WindowUpdate {
+                        stream,
+                        amount: 1 << 20,
+                    },
+                ));
+            }
+            let update = eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::new(1),
+                    amount: EVENT as u32,
+                },
+            );
+            let gates: [_; 2] = std::array::from_fn(|_| Arc::new(tokio::sync::Notify::new()));
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitSegmentedData(Arc::clone(&gates[0]), queue(&update)),
+                FixtureRead::WaitDataEof(Arc::clone(&gates[1]), Vec::new()),
+            ]);
+            let release_write = Arc::new(tokio::sync::Notify::new());
+            state.borrow_mut().write_gate = Some(Arc::clone(&release_write));
+            let (mut application, probes) = Application::new(vec![
+                Reply::Body(2 * EVENT),
+                Reply::Body(20 * EVENT),
+                Reply::Body(20 * EVENT),
+            ]);
+            application.body_chunk = EVENT;
+            application.response_priorities =
+                vec![Some(HttpPriority::from_urgency_and_incremental(3, true)); 3];
+            let mut config = options(context, transport);
+            config.io.maximum_write_size = 8 * EVENT;
+            let (session, _) = OwnedH2Session::new(application, config).unwrap();
+            let mut run = Box::pin(session.run());
+            owner_polls_of_one_poll(run.as_mut());
+            assert!(state.borrow().write_gate_pending.is_some());
+            assert_eq!(probes.borrow()[0].produced_bytes.get(), 2 * EVENT);
+            gates[0].notify_one();
+            owner_polls_of_one_poll(run.as_mut());
+            let queued: usize = probes.borrow()[1..]
+                .iter()
+                .map(|probe| probe.produced_bytes.get())
+                .sum();
+            assert!(
+                queued < 40 * EVENT,
+                "streams 3 and 5 have more body to send"
+            );
+            release_write.notify_one();
+            owner_polls_of_one_poll(run.as_mut());
+            gates[1].notify_one();
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection closes at the peer's EOF")
+                .unwrap();
+            assert_eq!(completions(&probes), [1, 1, 1]);
+            let frames = raw_frames(&state.borrow().writes.concat());
+            let data = FrameType::DATA.as_u8();
+            let last = frames
+                .iter()
+                .rposition(|frame| frame.frame_type == data && frame.stream == 1)
+                .unwrap();
+            assert_eq!(frames[last].flags, END_STREAM);
+            let before: usize = frames[..last]
+                .iter()
+                .filter(|frame| frame.frame_type == data)
+                .filter(|frame| frame.stream != 1)
+                .map(|frame| frame.payload.len())
+                .sum();
+            assert_eq!(
+                before, queued,
+                "stream 1's remainder follows every event queued before its WINDOW_UPDATE"
+            );
+        })
+    });
+}
+
+/// A stream queued at the front goes ahead of the incremental streams queued at its urgency.
+#[test]
+fn a_stream_queued_at_the_front_precedes_queued_incremental_streams() {
+    let mut queue = PriorityQueue::default();
+    let ids = [1, 3, 5, 7].map(StreamId::new);
+    let mut entries = [PriorityEntry::default(); 4];
+    for (id, entry) in ids.iter().zip(&mut entries) {
+        queue.update(
+            *id,
+            entry,
+            HttpPriority::from_urgency_and_incremental(3, true),
+        );
+    }
+    assert!(queue.enqueue(ids[0], &mut entries[0]));
+    assert!(queue.enqueue_front(ids[1], &mut entries[1]));
+    assert!(queue.enqueue(ids[2], &mut entries[2]));
+    assert!(queue.enqueue_front(ids[3], &mut entries[3]));
+    assert!(!queue.enqueue_front(ids[3], &mut entries[3]));
+    let mut order = Vec::new();
+    while let Some(head) = queue.head() {
+        order.push(head.get());
+        let index = ids.iter().position(|id| *id == head).unwrap();
+        assert!(queue.dequeue(head, &mut entries[index]));
+    }
+    assert_eq!(order, [7, 3, 1, 5]);
+}
+
+/// A header callback that cancels the session while the turn serializes queued events stops the
+/// serializations after it. Stream 1's body waits for credit, and the WINDOW_UPDATE that comes
+/// with the later requests returns it to the scheduler's head before their owners are polled, so
+/// their heads queue behind it instead of serializing in their owners' polls.
 #[test]
 fn a_cancel_from_a_queued_serialization_stops_the_later_serializations() {
     run_on_worker(|context| {
@@ -8402,9 +8991,16 @@ fn a_cancel_from_a_queued_serialization_stops_the_later_serializations() {
             let mut peer = Http2Codec::new(TransportDirection::Upstream);
             let mut input = arming_preface(&mut peer);
             input.extend(eligibility_request(&mut peer, 3));
-            let later: Vec<u8> = (0..3)
+            let mut later: Vec<u8> = (0..3)
                 .flat_map(|_| eligibility_request(&mut peer, 3))
                 .collect();
+            later.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::UNSPECIFIED,
+                    amount: 1,
+                },
+            ));
             let send_later = Arc::new(tokio::sync::Notify::new());
             let (transport, state) = FixtureTransport::new([
                 FixtureRead::SegmentedData(queue(&input)),
