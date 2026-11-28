@@ -15,7 +15,6 @@
 //! server keeps draining and stopping the connection as it does its own, and calls
 //! [`OwnedConnectionFactory::worker_stopping`] once a stopping worker has no session left.
 
-use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -41,6 +40,7 @@ use tokio::sync::watch;
 
 use crate::acceptor::ConnectionId;
 use crate::acceptor::ConnectionInfo;
+use crate::acceptor::RunFinished;
 use crate::acceptor::ServerSession;
 use crate::acceptor::ServerSessionConfig;
 use crate::acceptor::SessionControl;
@@ -218,9 +218,9 @@ impl<'a> OwnedConnectionAttach<'a> {
             self.transport,
             self.io,
             self.session,
-            |handle: &OwnedH2Handle, finished: &Rc<Cell<bool>>| {
+            |handle: &OwnedH2Handle, finished: &RunFinished| {
                 make(OwnedConnectionControl {
-                    handle: ControlHandle::Http2(handle.clone(), Rc::clone(finished)),
+                    handle: ControlHandle::Http2(handle.clone(), finished.clone()),
                     tls_close: self.tls_close,
                 })
             },
@@ -293,7 +293,7 @@ enum ControlHandle {
     Http1(OwnedH1Handle),
     /// The handle and the server's flag that the run has ended. A run that unwound out of a
     /// poll never marks its handle finished, because the server drops it at once.
-    Http2(OwnedH2Handle, Rc<Cell<bool>>),
+    Http2(OwnedH2Handle, RunFinished),
 }
 
 impl OwnedConnectionControl {

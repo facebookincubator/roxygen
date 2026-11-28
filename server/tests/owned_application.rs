@@ -67,7 +67,7 @@ use crate::ConnectionLifecycleObserver;
 use crate::ConnectionOutcome;
 use crate::acceptor::ConnectionInfo;
 use crate::acceptor::ServerSessionConfig;
-use crate::acceptor::fault_next_http2_run;
+use crate::acceptor::fault_next_owned_run;
 use crate::owned_application::OwnedApplicationFactory;
 use crate::owned_application::OwnedAttached;
 use crate::owned_application::OwnedConnectionAttach;
@@ -118,7 +118,7 @@ struct Probe {
 enum AttachFailure {
     Error,
     Panic,
-    /// The attach serves, and the session's HTTP/2 run unwinds out of its first poll.
+    /// The attach serves, and the session's run unwinds out of its first poll.
     RunPanic,
 }
 
@@ -341,7 +341,7 @@ impl OwnedConnectionFactory for TestConnections {
                 ));
             }
             Some(AttachFailure::Panic) => panic!("attach panics"),
-            Some(AttachFailure::RunPanic) => fault_next_http2_run(),
+            Some(AttachFailure::RunPanic) => fault_next_owned_run(),
             None => {}
         }
         let probe = Arc::clone(&self.probe);
@@ -1174,6 +1174,48 @@ fn owned_app_h2_run_panic_finishes_its_control() {
     assert_eq!(
         probe.events(),
         ["stopping: 1 of 1 sessions finished", "drain: Ok(false)"]
+    );
+}
+
+/// A hosted HTTP/1.1 run that unwinds out of a poll fails only its connection: the client sees
+/// it close with no response, the worker counts one connection-scope panic, and the next
+/// connection is served.
+#[test]
+fn an_owned_http1_run_fault_fails_only_its_connection() {
+    let probe = Arc::new(Probe::default());
+    probe
+        .attach_failures
+        .lock()
+        .unwrap()
+        .push_back(AttachFailure::RunPanic);
+    let server =
+        HttpServer::start_owned(owned_config(CodecProtocol::Http11), factory(&probe), None)
+            .expect("server starts");
+    let address = server.address().expect("one address");
+    let received = read_until_closed(&mut connect(address));
+    assert!(
+        received.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&received)
+    );
+    wait_until("the run's panic is contained per connection", || {
+        contained_panics(&server) == (1, 1)
+    });
+    let response = h1_exchange(
+        address,
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.ends_with(b"\r\n\r\nok"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(probe.attaches(), 2);
+    assert_eq!(contained_panics(&server), (1, 1));
+    assert!(
+        server
+            .force_stop()
+            .expect("the panic is not a server failure")
     );
 }
 

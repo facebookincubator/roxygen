@@ -7,7 +7,6 @@
 
 //! Accepted-connection admission and downstream session construction.
 
-use std::cell::Cell;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
@@ -68,12 +67,16 @@ use crate::server::record_callback_failure;
 mod handler_application;
 mod owned_http1;
 mod owned_http2;
+mod owned_run;
 
 pub(crate) use handler_application::HandlerApplication;
 use owned_http1::OwnedHttp1Session;
 use owned_http2::OwnedHttp2Session;
+use owned_run::OwnedDriver;
+use owned_run::OwnedSession;
+pub(crate) use owned_run::RunFinished;
 #[cfg(test)]
-pub(crate) use owned_http2::fault_next_http2_run;
+pub(crate) use owned_run::fault_next_owned_run;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectionInfo {
@@ -630,11 +633,11 @@ enum SessionHandle {
     Uniplex(UniplexHandle),
     OwnedHttp1 {
         handle: OwnedH1Handle,
-        finished: Rc<Cell<bool>>,
+        finished: RunFinished,
     },
     OwnedHttp2 {
         handle: OwnedH2Handle,
-        finished: Rc<Cell<bool>>,
+        finished: RunFinished,
     },
 }
 
@@ -727,13 +730,7 @@ pub(crate) trait HostedSession {
     fn run(self: Box<Self>) -> RunFuture;
 }
 
-impl<A: OwnedApplication> HostedSession for OwnedHttp1Session<A> {
-    fn run(self: Box<Self>) -> RunFuture {
-        Box::pin((*self).run())
-    }
-}
-
-impl<A: OwnedApplication> HostedSession for OwnedHttp2Session<A> {
+impl<D: OwnedDriver> HostedSession for OwnedSession<D> {
     fn run(self: Box<Self>) -> RunFuture {
         Box::pin((*self).run())
     }
@@ -1389,7 +1386,7 @@ pub(crate) fn hosted_http2_session<A: OwnedApplication>(
     transport: Rc<dyn UniplexTransport>,
     io: UniplexConfig,
     config: &ServerSessionConfig,
-    make: impl FnOnce(&OwnedH2Handle, &Rc<Cell<bool>>) -> A,
+    make: impl FnOnce(&OwnedH2Handle, &RunFinished) -> A,
 ) -> Result<(ServerSession, SessionControl), HttpError> {
     let (session, handle, finished) = OwnedHttp2Session::new_with(
         context,
