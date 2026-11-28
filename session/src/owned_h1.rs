@@ -1146,10 +1146,10 @@ impl<A: OwnedApplication> HttpCodecCallback for CodecInput<'_, A> {
     }
 
     fn on_ingress_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
-        let mut actions = Vec::new();
+        let mut actions = CodecCallbackActions::new();
         if self.failure.is_some() {
             actions.push(CodecCallbackAction::SetParserPaused(true));
-            return actions.into();
+            return actions;
         }
         match event {
             CodecEvent::MessageBegin { stream, .. } => {
@@ -1159,7 +1159,7 @@ impl<A: OwnedApplication> HttpCodecCallback for CodecInput<'_, A> {
             }
             CodecEvent::HeadersComplete { mut message, .. } => {
                 let Some(exchange) = self.exchange.as_mut() else {
-                    return actions.into();
+                    return actions;
                 };
                 let source = exchange
                     .source
@@ -1170,7 +1170,7 @@ impl<A: OwnedApplication> HttpCodecCallback for CodecInput<'_, A> {
                         HttpErrorCode::HEADER_PARSE_ERROR,
                         b"ingress source rejected request head",
                     ));
-                    return actions.into();
+                    return actions;
                 }
                 // The codec marks a downstream CONNECT upgraded and a WebSocket upgrade request
                 // as one, unless it parses them as ordinary requests.
@@ -1186,7 +1186,7 @@ impl<A: OwnedApplication> HttpCodecCallback for CodecInput<'_, A> {
             }
             CodecEvent::Body { body, padding, .. } => {
                 let Some(exchange) = self.exchange.as_mut() else {
-                    return actions.into();
+                    return actions;
                 };
                 exchange.body_events = true;
                 match exchange.producer.body(body, padding, false) {
@@ -1220,7 +1220,7 @@ impl<A: OwnedApplication> HttpCodecCallback for CodecInput<'_, A> {
             }
             CodecEvent::TrailersComplete { trailers, .. } => {
                 let Some(exchange) = self.exchange.as_mut() else {
-                    return actions.into();
+                    return actions;
                 };
                 // As `UniplexSession`: the trailers are an event the exchange reads from its
                 // body source; the message completion that follows ends the body.
@@ -1246,12 +1246,12 @@ impl<A: OwnedApplication> HttpCodecCallback for CodecInput<'_, A> {
             }
             _ => {}
         }
-        actions.into()
+        actions
     }
 }
 
 impl<A: OwnedApplication> CodecInput<'_, A> {
-    fn complete_request(&mut self, actions: &mut Vec<CodecCallbackAction>) {
+    fn complete_request(&mut self, actions: &mut CodecCallbackActions) {
         let Some(exchange) = self.exchange.as_mut() else {
             return;
         };

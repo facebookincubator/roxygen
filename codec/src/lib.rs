@@ -391,42 +391,87 @@ pub enum IngressStreamState {
 /// Ordered controls requested by one synchronous ingress callback.
 ///
 /// The empty sequence is the allocation-free default for observation-only
-/// callbacks.
+/// callbacks. A lone parser pause or resume added with
+/// [`CodecCallbackActions::push`] does not allocate either.
 #[derive(Default)]
 #[must_use]
-pub struct CodecCallbackActions(Vec<CodecCallbackAction>);
+pub struct CodecCallbackActions(ActionsRepr);
+
+#[derive(Default)]
+enum ActionsRepr {
+    #[default]
+    Empty,
+    Pause(bool),
+    Many(Vec<CodecCallbackAction>),
+}
 
 impl CodecCallbackActions {
     /// Creates an empty action sequence without allocating.
     pub const fn new() -> Self {
-        Self(Vec::new())
+        Self(ActionsRepr::Empty)
+    }
+
+    /// Appends one action.
+    pub fn push(&mut self, action: CodecCallbackAction) {
+        if matches!(self.0, ActionsRepr::Empty)
+            && let CodecCallbackAction::SetParserPaused(paused) = action
+        {
+            self.0 = ActionsRepr::Pause(paused);
+            return;
+        }
+        self.many().push(action);
     }
 
     /// Returns whether the callback requested no controls.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        match &self.0 {
+            ActionsRepr::Empty => true,
+            ActionsRepr::Pause(_) => false,
+            ActionsRepr::Many(actions) => actions.is_empty(),
+        }
     }
 
     /// Iterates mutably so a filter can transform actions while they unwind.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut CodecCallbackAction> {
-        self.0.iter_mut()
+        self.many().iter_mut()
     }
 
     /// Removes actions rejected by a filter while preserving remaining order.
-    pub fn retain(&mut self, keep: impl FnMut(&CodecCallbackAction) -> bool) {
-        self.0.retain(keep);
+    pub fn retain(&mut self, mut keep: impl FnMut(&CodecCallbackAction) -> bool) {
+        match &mut self.0 {
+            ActionsRepr::Empty => {}
+            ActionsRepr::Pause(paused) => {
+                if !keep(&CodecCallbackAction::SetParserPaused(*paused)) {
+                    self.0 = ActionsRepr::Empty;
+                }
+            }
+            ActionsRepr::Many(actions) => actions.retain(keep),
+        }
     }
 
     /// Appends a later action sequence without changing action order.
-    pub fn append(&mut self, mut later: Self) {
-        self.0.append(&mut later.0);
+    pub fn append(&mut self, later: Self) {
+        if self.is_empty() {
+            *self = later;
+            return;
+        }
+        match later.0 {
+            ActionsRepr::Pause(paused) => self.push(CodecCallbackAction::SetParserPaused(paused)),
+            ActionsRepr::Many(mut actions) if !actions.is_empty() => {
+                self.many().append(&mut actions);
+            }
+            ActionsRepr::Empty | ActionsRepr::Many(_) => {}
+        }
     }
 
     /// Installs a hook around every generated action while preserving action
     /// order. Multiple filters are invoked in installation order before
     /// generation and reverse order afterward.
     pub fn intercept_generate(&mut self, interceptor: Rc<dyn CodecCallbackGenerateInterceptor>) {
-        self.0.iter_mut().for_each(|action| match action {
+        let ActionsRepr::Many(actions) = &mut self.0 else {
+            return;
+        };
+        actions.iter_mut().for_each(|action| match action {
             CodecCallbackAction::Generate(_) => {
                 let previous =
                     std::mem::replace(action, CodecCallbackAction::SetParserPaused(false));
@@ -445,20 +490,70 @@ impl CodecCallbackActions {
             | CodecCallbackAction::ClosedStreamFrame { .. } => {}
         });
     }
+
+    /// Moves the actions into a vector, which allocates only for a held pause.
+    fn many(&mut self) -> &mut Vec<CodecCallbackAction> {
+        if !matches!(self.0, ActionsRepr::Many(_)) {
+            let mut actions = Vec::new();
+            if let ActionsRepr::Pause(paused) = self.0 {
+                actions.push(CodecCallbackAction::SetParserPaused(paused));
+            }
+            self.0 = ActionsRepr::Many(actions);
+        }
+        let ActionsRepr::Many(actions) = &mut self.0 else {
+            unreachable!("held actions were just moved into a vector");
+        };
+        actions
+    }
 }
 
 impl From<Vec<CodecCallbackAction>> for CodecCallbackActions {
     fn from(actions: Vec<CodecCallbackAction>) -> Self {
-        Self(actions)
+        Self(ActionsRepr::Many(actions))
     }
 }
 
 impl IntoIterator for CodecCallbackActions {
     type Item = CodecCallbackAction;
-    type IntoIter = std::vec::IntoIter<Self::Item>;
+    type IntoIter = CodecCallbackActionsIntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
+        CodecCallbackActionsIntoIter(match self.0 {
+            ActionsRepr::Empty => ActionsIntoIterRepr::Pause(None),
+            ActionsRepr::Pause(paused) => ActionsIntoIterRepr::Pause(Some(paused)),
+            ActionsRepr::Many(actions) => ActionsIntoIterRepr::Many(actions.into_iter()),
+        })
+    }
+}
+
+/// Yields the actions of a [`CodecCallbackActions`] in order.
+pub struct CodecCallbackActionsIntoIter(ActionsIntoIterRepr);
+
+enum ActionsIntoIterRepr {
+    Pause(Option<bool>),
+    Many(std::vec::IntoIter<CodecCallbackAction>),
+}
+
+impl Iterator for CodecCallbackActionsIntoIter {
+    type Item = CodecCallbackAction;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.0 {
+            ActionsIntoIterRepr::Pause(paused) => {
+                paused.take().map(CodecCallbackAction::SetParserPaused)
+            }
+            ActionsIntoIterRepr::Many(actions) => actions.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match &self.0 {
+            ActionsIntoIterRepr::Pause(paused) => {
+                let len = usize::from(paused.is_some());
+                (len, Some(len))
+            }
+            ActionsIntoIterRepr::Many(actions) => actions.size_hint(),
+        }
     }
 }
 
@@ -751,9 +846,15 @@ pub trait HttpCodec {
         callback: &mut dyn HttpCodecCallback,
         callback_egress: &mut BufQueue,
     ) -> CodecCallbackResult {
-        if actions.is_empty() {
-            return CodecCallbackResult::default();
-        }
+        let actions = match actions.0 {
+            ActionsRepr::Pause(paused) => {
+                HttpCodec::set_parser_paused(self, paused);
+                return CodecCallbackResult::default();
+            }
+            ActionsRepr::Many(actions) if !actions.is_empty() => actions,
+            ActionsRepr::Empty | ActionsRepr::Many(_) => return CodecCallbackResult::default(),
+        };
+        // Collecting through the vector's own iterator lets the results reuse its buffer.
         let egress_results = actions
             .into_iter()
             .filter_map(|action| match action {

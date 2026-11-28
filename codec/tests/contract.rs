@@ -16,8 +16,10 @@ use roxygen_core::http::TransportDirection;
 use roxygen_core::ids::StreamId;
 use roxygen_core::message::HttpMessage;
 
+use crate::ActionsRepr;
 use crate::CodecCallbackAction;
 use crate::CodecCallbackActions;
+use crate::CodecCallbackGenerateInterceptor;
 use crate::CodecCallbackResult;
 use crate::CodecCapabilities;
 use crate::CodecEvent;
@@ -33,6 +35,7 @@ use crate::HttpCodecFilterChain;
 use crate::HttpCodecQuery;
 use crate::HttpException;
 use crate::HttpExceptionDirection;
+use crate::IngressStreamState;
 use crate::MultiplexedSessionTransport;
 use crate::OwnedEgressFrame;
 
@@ -544,19 +547,25 @@ impl HttpCodecCallback for ErrorCapture {
 
 struct PauseAfterFirstComplete {
     completions: usize,
+    push: bool,
 }
 
 impl HttpCodecCallback for PauseAfterFirstComplete {
     fn on_event(&mut self, _event: CodecEvent<'_>) {}
 
     fn on_ingress_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
+        let mut actions = CodecCallbackActions::new();
         if matches!(event, CodecEvent::MessageComplete { .. }) {
             self.completions += 1;
             if self.completions == 1 {
-                return vec![CodecCallbackAction::SetParserPaused(true)].into();
+                let pause = CodecCallbackAction::SetParserPaused(true);
+                if !self.push {
+                    return vec![pause].into();
+                }
+                actions.push(pause);
             }
         }
-        CodecCallbackActions::new()
+        actions
     }
 }
 
@@ -810,7 +819,10 @@ fn callback_pause_preserves_the_exact_pipelined_remainder() {
         pipelined: true,
         ..SpikeCodec::default()
     };
-    let mut callback = PauseAfterFirstComplete { completions: 0 };
+    let mut callback = PauseAfterFirstComplete {
+        completions: 0,
+        push: false,
+    };
     let mut callback_egress = BufQueue::new(0);
     let mut input = queue(&[0, 0]);
 
@@ -839,7 +851,10 @@ fn segmented_ingress_reports_exact_consumption() {
         pipelined: true,
         ..SpikeCodec::default()
     };
-    let mut callback = PauseAfterFirstComplete { completions: 0 };
+    let mut callback = PauseAfterFirstComplete {
+        completions: 0,
+        push: false,
+    };
     let mut callback_egress = BufQueue::new(0);
     let mut input = BufQueue::new(2);
     input.push_copy(&[0]).expect("first segment fits");
@@ -1373,4 +1388,242 @@ fn empty_callback_results_leave_the_ingress_results_unchanged() {
         [1, 2, 3],
         "later results follow earlier ones"
     );
+}
+
+#[test]
+fn a_lone_pause_pauses_the_parser_however_it_is_built() {
+    for push in [false, true] {
+        for filtered in [false, true] {
+            let context = format!("push={push} filtered={filtered}");
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut chain = HttpCodecFilterChain::new(SpikeCodec {
+                pipelined: true,
+                action_log: Some(Rc::clone(&log)),
+                ..SpikeCodec::default()
+            });
+            if filtered {
+                chain.add_filter(RecordingFilter {
+                    name: "filter",
+                    log: Rc::new(RefCell::new(Vec::new())),
+                });
+            }
+            let mut callback = PauseAfterFirstComplete {
+                completions: 0,
+                push,
+            };
+            let mut callback_egress = BufQueue::new(0);
+
+            let result = HttpCodec::on_ingress(
+                &mut chain,
+                &queue(&[0, 0]),
+                &mut callback,
+                &mut callback_egress,
+            );
+
+            assert_eq!(result.consumed, 1, "{context}");
+            assert!(result.egress_results.is_empty(), "{context}");
+            assert!(HttpCodec::is_parser_paused(&chain), "{context}");
+            assert_eq!(*log.borrow(), ["pause:true"], "{context}");
+            assert_eq!(callback.completions, 1, "{context}");
+            assert!(callback_egress.is_empty(), "{context}");
+        }
+    }
+}
+
+#[test]
+fn a_lone_pushed_pause_is_held_without_a_vector() {
+    assert_eq!(
+        size_of::<CodecCallbackActions>(),
+        size_of::<Vec<CodecCallbackAction>>(),
+        "a held pause does not grow the action sequence"
+    );
+    for paused in [false, true] {
+        let held = |actions: &CodecCallbackActions| matches!(actions.0, ActionsRepr::Pause(value) if value == paused);
+        let mut actions = CodecCallbackActions::new();
+        actions.push(CodecCallbackAction::SetParserPaused(paused));
+        assert!(held(&actions), "paused={paused}: one pushed pause is held");
+
+        // The default filter interception appends a callback's actions to an empty sequence.
+        let mut filtered = CodecCallbackActions::new();
+        filtered.append(actions);
+        filtered.append(CodecCallbackActions::new());
+        filtered.append(CodecCallbackActions::from(Vec::new()));
+        filtered.retain(|_| true);
+        filtered.intercept_generate(Rc::new(NoopInterceptor));
+        assert!(
+            held(&filtered),
+            "paused={paused}: filtering keeps the pause held"
+        );
+
+        filtered.retain(|_| false);
+        assert!(matches!(filtered.0, ActionsRepr::Empty), "paused={paused}");
+    }
+
+    let mut actions = CodecCallbackActions::new();
+    actions.push(CodecCallbackAction::SetParserPaused(true));
+    actions.push(CodecCallbackAction::SetParserPaused(false));
+    assert_eq!(action_names(actions), ["pause:true", "pause:false"]);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ActionSpec {
+    Pause(bool),
+    Generate(u64),
+    Closed(u64),
+}
+
+impl ActionSpec {
+    fn build(self) -> CodecCallbackAction {
+        match self {
+            Self::Pause(paused) => CodecCallbackAction::SetParserPaused(paused),
+            Self::Generate(stream) => {
+                CodecCallbackAction::Generate(OwnedEgressFrame::EndOfMessage {
+                    stream: StreamId::new(stream),
+                })
+            }
+            Self::Closed(stream) => CodecCallbackAction::ClosedStreamFrame {
+                stream: StreamId::new(stream),
+                state: IngressStreamState::Closed,
+                trailers: false,
+            },
+        }
+    }
+}
+
+fn pushed(specs: &[ActionSpec]) -> CodecCallbackActions {
+    let mut actions = CodecCallbackActions::new();
+    specs.iter().for_each(|spec| actions.push(spec.build()));
+    actions
+}
+
+fn collected(specs: &[ActionSpec]) -> CodecCallbackActions {
+    specs
+        .iter()
+        .map(|spec| spec.build())
+        .collect::<Vec<_>>()
+        .into()
+}
+
+fn end_of_message_stream(frame: &OwnedEgressFrame) -> u64 {
+    let OwnedEgressFrame::EndOfMessage { stream } = frame else {
+        panic!("the test generates only end-of-message frames");
+    };
+    stream.get()
+}
+
+fn action_names(actions: CodecCallbackActions) -> Vec<String> {
+    let actions = actions.into_iter();
+    let (lower, upper) = actions.size_hint();
+    let names: Vec<_> = actions
+        .map(|action| match action {
+            CodecCallbackAction::SetParserPaused(paused) => format!("pause:{paused}"),
+            CodecCallbackAction::Generate(frame) => {
+                format!("generate:{}", end_of_message_stream(&frame))
+            }
+            CodecCallbackAction::InterceptedGenerate {
+                frame,
+                interceptors,
+            } => format!(
+                "intercepted:{}:{}",
+                end_of_message_stream(&frame),
+                interceptors.len()
+            ),
+            CodecCallbackAction::ClosedStreamFrame { stream, .. } => {
+                format!("closed:{}", stream.get())
+            }
+        })
+        .collect();
+    assert_eq!((lower, upper), (names.len(), Some(names.len())));
+    names
+}
+
+struct NoopInterceptor;
+
+impl CodecCallbackGenerateInterceptor for NoopInterceptor {
+    fn before_generate(&self, _frame: &OwnedEgressFrame) -> Result<(), HttpError> {
+        Ok(())
+    }
+
+    fn after_generate(&self, _result: &Result<GeneratedFrame, HttpError>) {}
+}
+
+#[test]
+fn pushed_and_collected_actions_are_the_same_sequence() {
+    use ActionSpec::Closed;
+    use ActionSpec::Generate;
+    use ActionSpec::Pause;
+    let sequences: [&[ActionSpec]; 8] = [
+        &[],
+        &[Pause(true)],
+        &[Pause(false)],
+        &[Pause(true), Pause(false)],
+        &[Pause(true), Generate(1)],
+        &[Generate(1), Pause(true)],
+        &[Closed(3)],
+        &[Generate(1), Pause(false), Closed(3), Generate(2)],
+    ];
+    let builds: [fn(&[ActionSpec]) -> CodecCallbackActions; 2] = [pushed, collected];
+    let is_pause =
+        |action: &CodecCallbackAction| matches!(action, CodecCallbackAction::SetParserPaused(_));
+    let names_of = |specs: Vec<ActionSpec>| action_names(collected(&specs));
+
+    for specs in sequences {
+        let expected = names_of(specs.to_vec());
+        let (only_pauses, without_pauses): (Vec<_>, Vec<_>) = expected
+            .iter()
+            .cloned()
+            .partition(|name| name.starts_with("pause:"));
+        let flipped = names_of(
+            specs
+                .iter()
+                .map(|spec| match *spec {
+                    Pause(paused) => Pause(!paused),
+                    spec => spec,
+                })
+                .collect(),
+        );
+        let intercepted: Vec<_> = expected
+            .iter()
+            .map(|name| match name.strip_prefix("generate:") {
+                Some(stream) => format!("intercepted:{stream}:2"),
+                None => name.clone(),
+            })
+            .collect();
+
+        for build in builds {
+            let context = format!("{specs:?}");
+            assert_eq!(build(specs).is_empty(), specs.is_empty(), "{context}");
+            assert_eq!(action_names(build(specs)), expected, "{context}");
+
+            let mut actions = build(specs);
+            actions.retain(|action| !is_pause(action));
+            assert_eq!(action_names(actions), without_pauses, "{context}");
+
+            let mut actions = build(specs);
+            actions.retain(is_pause);
+            assert_eq!(action_names(actions), only_pauses, "{context}");
+
+            let mut actions = build(specs);
+            actions.iter_mut().for_each(|action| {
+                if let CodecCallbackAction::SetParserPaused(paused) = action {
+                    *paused = !*paused;
+                }
+            });
+            assert_eq!(action_names(actions), flipped, "{context}");
+
+            let mut actions = build(specs);
+            actions.intercept_generate(Rc::new(NoopInterceptor));
+            actions.intercept_generate(Rc::new(NoopInterceptor));
+            assert_eq!(action_names(actions), intercepted, "{context}");
+
+            for later in sequences {
+                let joined = names_of([specs, later].concat());
+                for later_build in builds {
+                    let mut actions = build(specs);
+                    actions.append(later_build(later));
+                    assert_eq!(action_names(actions), joined, "{context} + {later:?}");
+                }
+            }
+        }
+    }
 }

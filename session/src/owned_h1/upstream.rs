@@ -2315,10 +2315,10 @@ impl ResponseInput<'_> {
     fn handle_event(&mut self, event: CodecEvent<'_>) -> CodecCallbackActions {
         #[cfg(test)]
         count(&RESPONSE_EVENTS);
-        let mut actions = Vec::new();
+        let mut actions = CodecCallbackActions::new();
         if self.failure.is_some() {
             actions.push(CodecCallbackAction::SetParserPaused(true));
-            return actions.into();
+            return actions;
         }
         let Some(exchange) = self.exchange.as_mut() else {
             self.fail(failure(
@@ -2326,13 +2326,13 @@ impl ResponseInput<'_> {
                 b"owned H1 upstream response without a request",
             ));
             actions.push(CodecCallbackAction::SetParserPaused(true));
-            return actions.into();
+            return actions;
         };
         // Publishing an event can wake code that cancels: the next event is not parsed for it.
         if let Some(error) = exchange.cancel_error() {
             self.fail(error);
             actions.push(CodecCallbackAction::SetParserPaused(true));
-            return actions.into();
+            return actions;
         }
         match event {
             CodecEvent::HeadersComplete { message, .. } => {
@@ -2395,7 +2395,7 @@ impl ResponseInput<'_> {
             }
             _ => {}
         }
-        actions.into()
+        actions
     }
 }
 
