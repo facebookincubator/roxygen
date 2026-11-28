@@ -58,6 +58,7 @@
 
 use std::any::Any;
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::future::Future;
 use std::ops::Deref;
 use std::panic::AssertUnwindSafe;
@@ -157,8 +158,10 @@ thread_local! {
     static READ_POLLS: Cell<usize> = const { Cell::new(0) };
     static WRITE_POLLS: Cell<usize> = const { Cell::new(0) };
     static SIGNAL_TAKES: Cell<usize> = const { Cell::new(0) };
-    static AFTER_BODY_EVENT_SERIALIZED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-        const { std::cell::RefCell::new(None) };
+    static WAKER_REGISTRATIONS: Cell<usize> = const { Cell::new(0) };
+    static AFTER_BODY_EVENT_SERIALIZED: RefCell<Option<Box<dyn FnOnce()>>> =
+        const { RefCell::new(None) };
+    static BEFORE_POLL_EXIT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static UPSTREAM_RUN_FAULT: Cell<bool> = const { Cell::new(false) };
     static UPSTREAM_COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
 }
@@ -263,6 +266,28 @@ fn body_event_serialized() {
     }
 }
 
+/// How many times the owned HTTP/1.1 downstream drivers on this thread have registered a new
+/// session waker, which takes the shared waker's lock.
+#[cfg(test)]
+pub(crate) fn waker_registrations() -> usize {
+    WAKER_REGISTRATIONS.with(Cell::get)
+}
+
+/// Runs `hook` once, as this thread's next owned HTTP/1.1 downstream poll that returns pending
+/// ends: after its last turn check and before its exit wake.
+#[cfg(test)]
+pub(crate) fn before_next_poll_exit(hook: impl FnOnce() + 'static) {
+    BEFORE_POLL_EXIT.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn poll_exit() {
+    let hook = BEFORE_POLL_EXIT.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// One of a driver's wake signals, for a test that marks it from another thread, as its source's
 /// wake does first (`Signal::wake_by_ref`), while the driver consumes the wake to poll that
 /// source immediately (`Signal::clear`).
@@ -336,10 +361,11 @@ pub enum Http1UpgradePolicy {
     AsOrdinaryRequest,
 }
 
-/// The session owner's waker, shared by every wake source of one connection, and its wake
-/// record. Each wake sets the record, and the owned HTTP/1.1 upstream driver clears it as each
-/// of its polls begins, so that a pull-through body can check whether one of the driver's wake
-/// sources fired since the driver's last poll.
+/// The session owner's waker and its wake record, for one connection. Downstream, the request
+/// sources' callbacks and the handle's drain and cancel go through `OwnerWake`, which wakes its
+/// own copy of the waker, and set only the record here. Each wake sets the record, and the owned
+/// HTTP/1.1 upstream driver clears it as each of its polls begins, so that a pull-through body
+/// can check whether one of the driver's wake sources fired since the driver's last poll.
 #[derive(Default)]
 struct TaskWaker {
     waker: Mutex<Option<Waker>>,
@@ -382,7 +408,7 @@ impl TaskWaker {
         self.woken.load(Ordering::Acquire)
     }
 
-    /// Records a wake without waking, for a drive revocation.
+    /// Records a wake without waking.
     fn note_wake(&self) {
         self.woken.store(true, Ordering::Release);
     }
@@ -441,13 +467,119 @@ impl Wake for Signal {
     }
 }
 
+/// The wakes that a downstream connection's own thread makes: its request source's callbacks
+/// and its handle's drain and cancel. During the driver's poll they only mark, and the poll's
+/// turns act on the mark or the poll's exit wakes the session. Between polls they wake the
+/// session through `owner_waker`, once until the next poll starts. The `Signal` wakers, which
+/// other threads may wake, use `TaskWaker::wake`.
+struct OwnerWake {
+    task: Arc<TaskWaker>,
+    /// Set while the driver polls, by `OwnerPoll`.
+    polling: Cell<bool>,
+    /// An owner-thread wake came during the current poll.
+    local_pending: Cell<bool>,
+    /// `owner_waker` has been woken since the last poll started.
+    notified: Cell<bool>,
+    /// The owner thread's copy of the waker registered in `task`.
+    owner_waker: RefCell<Option<Waker>>,
+}
+
+impl OwnerWake {
+    fn new(task: Arc<TaskWaker>) -> Self {
+        Self {
+            task,
+            polling: Cell::new(false),
+            local_pending: Cell::new(false),
+            notified: Cell::new(false),
+            owner_waker: RefCell::new(None),
+        }
+    }
+
+    /// Registers the poll's waker. Only the owner thread registers, so a waker that will wake
+    /// the one already registered does not take the lock.
+    fn register(&self, waker: &Waker) {
+        if self
+            .owner_waker
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| current.will_wake(waker))
+        {
+            return;
+        }
+        #[cfg(test)]
+        count(&WAKER_REGISTRATIONS);
+        self.task.register(waker);
+        drop(self.owner_waker.replace(Some(waker.clone())));
+    }
+
+    /// Marks `signal`, if any, records the wake as `TaskWaker::wake` does, and wakes the session
+    /// unless the driver is polling.
+    fn wake_local(&self, signal: Option<&Signal>) {
+        if let Some(signal) = signal {
+            signal.mark();
+        }
+        self.task.note_wake();
+        if self.polling.get() {
+            self.local_pending.set(true);
+        } else {
+            self.notify();
+        }
+    }
+
+    /// Wakes the session through `owner_waker` once until the next poll starts. A waker that
+    /// panics leaves `notified` clear.
+    fn notify(&self) {
+        if self.notified.get() {
+            return;
+        }
+        let waker = self.owner_waker.borrow();
+        let Some(waker) = waker.as_ref() else {
+            return;
+        };
+        // Set before the wake, so that a host that polls the session inside it clears it.
+        self.notified.set(true);
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| waker.wake_by_ref())) {
+            self.notified.set(false);
+            resume_unwind(panic);
+        }
+    }
+}
+
+/// Brackets one poll of the driver, so that an owner-thread wake during it does not wake the
+/// session. It clears `polling` on every way out, including unwinding.
+struct OwnerPoll(Rc<OwnerWake>);
+
+impl OwnerPoll {
+    fn enter(owner: &Rc<OwnerWake>) -> Self {
+        owner.polling.set(true);
+        owner.notified.set(false);
+        owner.local_pending.set(false);
+        Self(Rc::clone(owner))
+    }
+
+    /// Ends a poll that returns pending, and wakes the session if an owner-thread wake during
+    /// it left work that the turns did not take (`left`).
+    fn finish(self, left: impl FnOnce() -> bool) {
+        self.0.polling.set(false);
+        if self.0.local_pending.take() && left() {
+            self.0.notify();
+        }
+    }
+}
+
+impl Drop for OwnerPoll {
+    fn drop(&mut self) {
+        self.0.polling.set(false);
+    }
+}
+
 struct Control {
     drain: Cell<bool>,
     cancel: Cell<bool>,
     complete: Cell<bool>,
     /// Set by `complete_handshake`.
     handshake_complete: Cell<bool>,
-    task: Arc<TaskWaker>,
+    owner: Rc<OwnerWake>,
 }
 
 impl Control {
@@ -471,7 +603,7 @@ impl OwnedH1Handle {
             return Ok(false);
         }
         let changed = !self.0.drain.replace(true);
-        self.0.task.wake();
+        self.0.owner.wake_local(None);
         Ok(changed)
     }
 
@@ -479,7 +611,7 @@ impl OwnedH1Handle {
     /// and the transport is reset, on the worker, before `run` completes.
     pub fn cancel(&self) {
         self.0.cancel.set(true);
-        self.0.task.wake();
+        self.0.owner.wake_local(None);
     }
 
     /// Whether the connection handshake has completed: the driver has validated the first
@@ -501,6 +633,8 @@ struct IngressSignals {
     source_complete: Cell<bool>,
     completed: Cell<Option<Result<(), HttpError>>>,
     stream: Arc<Signal>,
+    /// Set downstream, where the callbacks wake through `OwnerWake::wake_local`.
+    owner: Option<Rc<OwnerWake>>,
     /// The connection of a pull-through exchange. The source's completion returns the drive to
     /// the connection's run before the wake that announces it.
     drive: Option<upstream::DriveLink>,
@@ -510,6 +644,13 @@ struct IngressSignals {
 }
 
 impl IngressSignals {
+    fn wake(&self) {
+        match &self.owner {
+            Some(owner) => owner.wake_local(Some(&self.stream)),
+            None => self.stream.wake_by_ref(),
+        }
+    }
+
     /// Whether the source completed with `NO_ERROR`, its reader having stopped without error,
     /// and the driver has yet to take that completion.
     fn stopped(&self) -> bool {
@@ -540,7 +681,7 @@ impl HttpStreamSourceSharedCallback for IngressSignals {
     fn bytes_processed(&self, _id: StreamId, _amount: usize, _acknowledge: usize) {
         #[cfg(test)]
         INGRESS_CREDIT_CALLBACKS.set(INGRESS_CREDIT_CALLBACKS.get() + 1);
-        self.stream.wake_by_ref();
+        self.wake();
     }
 
     fn source_complete(&self, id: StreamId, error: Option<HttpError>) {
@@ -552,7 +693,7 @@ impl HttpStreamSourceSharedCallback for IngressSignals {
         if let Some(returning) = self.returning.take() {
             returning();
         }
-        self.stream.wake_by_ref();
+        self.wake();
     }
 }
 
@@ -865,7 +1006,6 @@ struct Driver<A: OwnedApplication> {
     read: ReadSlot,
     write: Option<LocalTransportFuture<Result<WriteInfo, TransportWriteError>>>,
     write_queue: Option<Box<dyn UniplexWriteQueue>>,
-    task: Arc<TaskWaker>,
     read_wake: Arc<Signal>,
     read_waker: Waker,
     write_wake: Arc<Signal>,
@@ -949,6 +1089,7 @@ impl<A: OwnedApplication> CodecInput<'_, A> {
             source_complete: Cell::new(false),
             completed: Cell::new(None),
             stream: Arc::clone(self.stream_wake),
+            owner: Some(Rc::clone(&self.control.owner)),
             drive: None,
             returning: Cell::new(None),
         });
@@ -1160,7 +1301,7 @@ impl<A: OwnedApplication> Driver<A> {
             cancel: Cell::new(false),
             complete: Cell::new(false),
             handshake_complete: Cell::new(false),
-            task: Arc::clone(&task),
+            owner: Rc::new(OwnerWake::new(Arc::clone(&task))),
         });
         let read_wake = Signal::new(&task);
         let write_wake = Signal::new(&task);
@@ -1208,7 +1349,6 @@ impl<A: OwnedApplication> Driver<A> {
                 read,
                 write: None,
                 write_queue,
-                task,
                 read_waker: Waker::from(Arc::clone(&read_wake)),
                 read_wake,
                 write_waker: Waker::from(Arc::clone(&write_wake)),
@@ -1253,18 +1393,32 @@ impl<A: OwnedApplication> Driver<A> {
     }
 
     fn poll(&mut self, context: &mut Context<'_>) -> Poll<Result<UniplexRunSummary, HttpError>> {
+        let exit = OwnerPoll::enter(&self.control.owner);
         let polled = self.poll_turns(context);
-        if polled.is_pending() && self.deadline.is_some() {
-            self.sync_deadline();
+        if polled.is_pending() {
+            if self.deadline.is_some() {
+                self.sync_deadline();
+            }
+            #[cfg(test)]
+            poll_exit();
+            exit.finish(|| self.local_wake_left());
         }
         polled
+    }
+
+    /// Whether an owner-thread wake during the poll left work that its turns did not take: the
+    /// exchange's mark, or a drain or cancel that the next turn would act on.
+    fn local_wake_left(&self) -> bool {
+        (self.fatal.is_none()
+            && (self.stream_wake.is_ready() || (self.control.drain.get() && !self.draining)))
+            || (self.control.cancel.get() && !self.transport_reset)
     }
 
     fn poll_turns(
         &mut self,
         context: &mut Context<'_>,
     ) -> Poll<Result<UniplexRunSummary, HttpError>> {
-        self.task.register(context.waker());
+        self.control.owner.register(context.waker());
         if self.budget_yield.is_some() && self.poll_budget_yield(context).is_pending() {
             return Poll::Pending;
         }
@@ -1418,6 +1572,9 @@ impl<A: OwnedApplication> Driver<A> {
             }
         }
         self.budget_yield = Some(self.context.host().yield_to_io());
+        // The yield's wake polls the session again, and that poll takes what owner-thread wakes
+        // left.
+        self.control.owner.local_pending.set(false);
         // A yield that completes on its first poll arranged no wake.
         if self.poll_budget_yield(context).is_ready() {
             context.waker().wake_by_ref();

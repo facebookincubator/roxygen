@@ -11,8 +11,10 @@
 
 use std::sync::atomic::AtomicBool;
 use std::task::Context;
+use std::task::Wake;
 use std::task::Waker;
 
+use roxygen_core::events::ResumeFuture;
 use roxygen_core::ids::StreamId;
 use roxygen_core::ingress_completion::IngressCompletion;
 use roxygen_core::message::HttpMessage;
@@ -44,11 +46,13 @@ use crate::owned_h1::OwnedH1Options;
 use crate::owned_h1::OwnedH1Session;
 use crate::owned_h1::SignalProbe;
 use crate::owned_h1::after_next_body_event_serialized;
+use crate::owned_h1::before_next_poll_exit;
 use crate::owned_h1::codec_parses;
 use crate::owned_h1::driver_turns;
 use crate::owned_h1::phase_checks;
 use crate::owned_h1::read_start_checks;
 use crate::owned_h1::read_write_polls_and_signal_takes;
+use crate::owned_h1::waker_registrations;
 use crate::uniplex::UniplexWriteCompletion;
 use crate::uniplex::UniplexWriteQueue;
 
@@ -6756,6 +6760,8 @@ struct PushedBody {
     /// drops it.
     keep_request: bool,
     request: RefCell<Option<HttpSourceHolder>>,
+    /// The resume of a suspended read of `request`, which `read_kept` waits for.
+    request_resume: RefCell<Option<ResumeFuture>>,
     /// When set, a poll that returns an event wakes its waker first, as a source with more data
     /// ready behind the event may.
     wake_with_event: bool,
@@ -8801,4 +8807,352 @@ fn h1_drain_expiry_aborts_a_staged_close() {
             assert_eq!(probes.borrow()[0].completed.get(), 1);
         })
     });
+}
+
+/// Counts the session's wakes, and how many of them came while the test polled the run.
+#[derive(Default)]
+struct PollWakes {
+    polling: AtomicBool,
+    in_poll: AtomicUsize,
+    total: AtomicUsize,
+}
+
+impl Wake for PollWakes {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if self.polling.load(Ordering::SeqCst) {
+            self.in_poll.fetch_add(1, Ordering::SeqCst);
+        }
+        self.total.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl PollWakes {
+    /// Polls `run` once with this waker.
+    fn poll<F: Future + ?Sized>(self: &Arc<Self>, run: Pin<&mut F>) -> Poll<F::Output> {
+        let waker = Waker::from(Arc::clone(self));
+        self.polling.store(true, Ordering::SeqCst);
+        let polled = run.poll(&mut Context::from_waker(&waker));
+        self.polling.store(false, Ordering::SeqCst);
+        polled
+    }
+
+    /// The wakes made during polls, and those made between them.
+    fn counts(&self) -> (usize, usize) {
+        let in_poll = self.in_poll.load(Ordering::SeqCst);
+        (in_poll, self.total.load(Ordering::SeqCst) - in_poll)
+    }
+}
+
+/// A POST with an 11-byte body and an `ingress_buffer_limit` of 4. Its first read carries 8 body
+/// bytes, which pause parsing; its second read carries the last 3, which wait behind that pause
+/// with the request's end. Its exchange keeps the body unread, and its response, `ok`, ends at
+/// once.
+fn kept_upload_session(
+    context: WorkerContext,
+) -> (OwnedH1Session<PushedApp>, OwnedH1Handle, Rc<PushedBody>) {
+    let head = b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 11\r\n\r\n12345678";
+    let (transport, _state) = ScriptedTransport::new([
+        ReadAction::Data(head.to_vec()),
+        ReadAction::Data(b"9ab".to_vec()),
+    ]);
+    let body = Rc::new(PushedBody {
+        keep_request: true,
+        ..PushedBody::default()
+    });
+    body.events
+        .borrow_mut()
+        .push_back(HttpBodyEvent::body(queue(b"ok"), true));
+    let mut options = owned_options(context, transport);
+    options.io.ingress_buffer_limit = 4;
+    let (session, handle) = OwnedH1Session::new(
+        PushedApp {
+            body: Rc::clone(&body),
+        },
+        options,
+    )
+    .unwrap();
+    (session, handle, body)
+}
+
+/// Reads the next event of the request body that `body` keeps, if one is ready. A read with
+/// nothing queued suspends, and later calls wait for that suspension to resume.
+fn read_kept(body: &PushedBody) -> Option<HttpBodyEvent> {
+    loop {
+        if let Some(resume) = body.request_resume.borrow_mut().as_mut()
+            && poll_once(resume.as_mut()).is_pending()
+        {
+            return None;
+        }
+        body.request_resume.take();
+        let mut request = body.request.borrow_mut();
+        let mut read = request
+            .as_mut()
+            .expect("the exchange kept its request body")
+            .read_body_event(4);
+        let Poll::Ready(event) = poll_once(read.as_mut()) else {
+            return None;
+        };
+        let event = event.expect("the request body reads");
+        if !matches!(event.kind(), HttpBodyEventKind::Suspend(_)) {
+            return Some(event);
+        }
+        let HttpBodyEventKind::Suspend(resume) = event.into_kind() else {
+            unreachable!("the event is a suspension");
+        };
+        *body.request_resume.borrow_mut() = Some(resume);
+    }
+}
+
+/// Reads the kept request body to its end, polling `run` whenever no event is ready, then drains
+/// the connection and completes the run.
+async fn finish_kept_upload<F>(
+    mut run: Pin<&mut F>,
+    wakes: &Arc<PollWakes>,
+    body: &PushedBody,
+    handle: &OwnedH1Handle,
+) where
+    F: Future<Output = Result<crate::uniplex::UniplexRunSummary, HttpError>>,
+{
+    for _ in 0..8 {
+        match read_kept(body) {
+            Some(event) if event.eom() => {
+                handle.initiate_drain().unwrap();
+                run.await.unwrap();
+                return;
+            }
+            Some(_) => {}
+            None => assert!(wakes.poll(run.as_mut()).is_pending()),
+        }
+    }
+    panic!("the request body did not end");
+}
+
+/// A bodiless GET's request source completes inside the driver's poll, and that poll's turns
+/// take the completion, so serving the GET does not wake the session. A cancel between polls
+/// wakes it once.
+#[test]
+fn a_bodiless_get_is_served_without_a_wake_from_its_poll() {
+    let (completed, wakes, error) = run_on_host(|context| {
+        Box::pin(async move {
+            let (transport, _state) =
+                ScriptedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())]);
+            let (application, probes) = H1App::new(vec![Response::fixed(200, b"hello")]);
+            let (session, handle) =
+                OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+            let wakes = Arc::new(PollWakes::default());
+            let mut run = std::pin::pin!(session.run());
+            assert!(wakes.poll(run.as_mut()).is_pending());
+            let completed = probes.borrow()[0].completed.get();
+            let served = wakes.counts();
+            handle.cancel();
+            let cancelled = wakes.counts();
+            let error = run.await.expect_err("the cancel fails the run");
+            (completed, [served, cancelled], error.code())
+        })
+    });
+    assert_eq!(completed, 1, "the one poll served and retired the GET");
+    assert_eq!(
+        wakes,
+        [(0, 0), (0, 1)],
+        "(wakes during polls, wakes between polls) after the poll, then after the cancel"
+    );
+    assert_eq!(error, HttpErrorCode::CORO_CANCELLED);
+}
+
+/// Request body reads that the application makes on the session's thread between polls wake
+/// the session through the last poll's waker, once until the next poll starts. Before the second
+/// poll, the read that takes the unread body below the resume threshold reports credit and wakes
+/// the session, and a drain adds no wake. After that poll, the read of the request's end wakes
+/// it again.
+#[test]
+fn owner_thread_wakes_between_polls_wake_the_session_once() {
+    let (counts, credit, response) = run_on_host(|context| {
+        Box::pin(async move {
+            let (session, handle, body) = kept_upload_session(context);
+            let wakes = Arc::new(PollWakes::default());
+            let mut run = std::pin::pin!(session.run());
+            take_ingress_credit_callbacks(true);
+            assert!(wakes.poll(run.as_mut()).is_pending());
+            let response = body.response_completes.get();
+            let mut counts = vec![wakes.counts()];
+            for _ in 0..2 {
+                let event = read_kept(&body).expect("the parsed body is ready");
+                assert_eq!(event.as_body().map(BufQueue::chain_length), Some(4));
+                counts.push(wakes.counts());
+            }
+            assert!(
+                read_kept(&body).is_none(),
+                "the rest waits behind the pause"
+            );
+            let mut credit = vec![take_ingress_credit_callbacks(true)];
+            assert!(handle.initiate_drain().unwrap());
+            counts.push(wakes.counts());
+            assert!(wakes.poll(run.as_mut()).is_pending());
+            counts.push(wakes.counts());
+            let mut events = 0;
+            while let Some(event) = read_kept(&body) {
+                events += 1;
+                if event.eom() {
+                    break;
+                }
+            }
+            assert!(events >= 1, "the second poll parsed the rest of the body");
+            credit.push(take_ingress_credit_callbacks(true));
+            counts.push(wakes.counts());
+            run.await.unwrap();
+            (counts, credit, response)
+        })
+    });
+    assert_eq!(response, 1, "the response ended in the first poll");
+    assert_eq!(
+        credit,
+        [1, 0],
+        "only the second read takes the unread body below the threshold"
+    );
+    assert_eq!(
+        counts,
+        [(0, 0), (0, 0), (0, 1), (0, 1), (0, 1), (0, 2)],
+        "(wakes during polls, wakes between polls) after the first poll, each read, the drain, \
+         the second poll and the reads to the request's end"
+    );
+}
+
+/// An owner-thread wake that a test makes after the driver's last turn check of a poll.
+/// `Credit` reads the request body twice, and the second read reports credit, which marks the
+/// exchange's signal.
+#[derive(Clone, Copy, Debug)]
+enum LateWake {
+    Credit,
+    Drain,
+    Cancel,
+}
+
+/// An owner-thread wake after the poll's last turn check is left to the poll's exit, which
+/// wakes the session once. The next poll takes it without another wake, and a cancel then fails
+/// the run.
+#[test]
+fn a_wake_after_the_last_turn_check_wakes_the_session_once_at_the_exit() {
+    for late in [LateWake::Credit, LateWake::Drain, LateWake::Cancel] {
+        run_on_host(move |context| {
+            Box::pin(async move {
+                let (session, handle, body) = kept_upload_session(context);
+                let wakes = Arc::new(PollWakes::default());
+                let mut run = std::pin::pin!(session.run());
+                let (hook_handle, hook_body) = (handle.clone(), Rc::clone(&body));
+                before_next_poll_exit(move || match late {
+                    LateWake::Credit => {
+                        for _ in 0..2 {
+                            read_kept(&hook_body).expect("the parsed body is ready");
+                        }
+                    }
+                    LateWake::Drain => assert!(hook_handle.initiate_drain().unwrap()),
+                    LateWake::Cancel => hook_handle.cancel(),
+                });
+                assert!(wakes.poll(run.as_mut()).is_pending());
+                assert_eq!(
+                    wakes.counts(),
+                    (1, 0),
+                    "{late:?}: (wakes during polls, wakes between polls) after the poll whose \
+                     exit found the wake"
+                );
+                if let LateWake::Cancel = late {
+                    let error = run.await.expect_err("the cancel fails the run");
+                    assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+                    return;
+                }
+                assert!(wakes.poll(run.as_mut()).is_pending());
+                assert_eq!(
+                    wakes.counts(),
+                    (1, 0),
+                    "{late:?}: (wakes during polls, wakes between polls) after the poll that \
+                     took the wake"
+                );
+                finish_kept_upload(run, &wakes, &body, &handle).await;
+            })
+        });
+    }
+}
+
+/// A poll that a callback panic unwinds still ends the poll, so the next owner-thread wake
+/// wakes the session.
+#[test]
+fn a_panicking_poll_leaves_owner_thread_wakes_waking() {
+    let (counts, panic) = run_on_host(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let (transport, _state) =
+                ScriptedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())]);
+            let (mut application, _probes) = H1App::new(vec![Response::fixed(200, b"hello")]);
+            application.panic_in = Some("poll_headers");
+            let (session, handle) =
+                OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+            let wakes = Arc::new(PollWakes::default());
+            let mut run = std::pin::pin!(session.run());
+            assert!(wakes.poll(run.as_mut()).is_pending());
+            let panicked = wakes.counts();
+            assert!(handle.initiate_drain().unwrap());
+            let drained = wakes.counts();
+            let panic = futures::FutureExt::catch_unwind(AssertUnwindSafe(run))
+                .await
+                .err()
+                .map(panic_text);
+            take_contained_panics();
+            ((panicked, drained), panic)
+        })
+    });
+    let (panicked, drained) = counts;
+    assert!(
+        panicked.0 >= 1 && panicked.1 == 0,
+        "the teardown of the contained panic woke the session during its poll: {panicked:?}"
+    );
+    assert_eq!(
+        drained,
+        (panicked.0, 1),
+        "(wakes during polls, wakes between polls): a drain after the poll wakes the session"
+    );
+    assert_eq!(panic.as_deref(), Some("exchange panicked polling headers"));
+}
+
+/// Polls with a waker that will wake the registered one take the shared waker's lock only for
+/// the first of them. A new waker takes it once more, and owner-thread wakes then wake that
+/// waker.
+#[test]
+fn polls_with_a_stable_waker_register_it_once() {
+    let (registrations, wakes) = run_on_host(|context| {
+        Box::pin(async move {
+            let (transport, _state) =
+                ScriptedTransport::new([ReadAction::Data(KEEP_ALIVE_GET.to_vec())]);
+            let (application, _probes) = H1App::new(vec![Response::fixed(200, b"hello")]);
+            let (session, handle) =
+                OwnedH1Session::new(application, owned_options(context, transport)).unwrap();
+            let mut run = std::pin::pin!(session.run());
+            let stable = Arc::new(PollWakes::default());
+            let before = waker_registrations();
+            for _ in 0..5 {
+                assert!(stable.poll(run.as_mut()).is_pending());
+            }
+            let stable_polls = waker_registrations() - before;
+            let other = Arc::new(PollWakes::default());
+            assert!(other.poll(run.as_mut()).is_pending());
+            let other_poll = waker_registrations() - before;
+            handle.cancel();
+            let wakes = (stable.counts(), other.counts());
+            run.await.expect_err("the cancel fails the run");
+            ((stable_polls, other_poll), wakes)
+        })
+    });
+    assert_eq!(
+        registrations,
+        (1, 2),
+        "registrations after five polls with one waker, then after a poll with another"
+    );
+    assert_eq!(
+        wakes,
+        ((0, 0), (0, 1)),
+        "the cancel wakes the waker that the last poll registered"
+    );
 }

@@ -3217,6 +3217,7 @@ impl UpstreamDriver {
             source_complete: Cell::new(false),
             completed: Cell::new(None),
             stream: Arc::clone(&self.stream_wake),
+            owner: None,
             drive: pull_through
                 .is_some()
                 .then(|| DriveLink(Rc::downgrade(&self.shared))),
