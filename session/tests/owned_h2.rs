@@ -48,6 +48,7 @@ use crate::owned_h2::OwnedH2UpstreamSession;
 use crate::owned_h2::OwnedH2UpstreamSubmission;
 use crate::owned_h2::TURN_BUDGET;
 use crate::owned_h2::fault_next_run_poll;
+use crate::owned_h2::owner_polls;
 use crate::owned_h2::stream_seed_order;
 use crate::owned_h2::take_discarded_streams;
 use crate::owned_h2::turns;
@@ -74,6 +75,7 @@ struct Probe {
     request_trailer: RefCell<Option<Vec<u8>>>,
     produced_bytes: Cell<usize>,
     body_polls: Cell<usize>,
+    owner_poll_at_poll: RefCell<Vec<usize>>,
     body_event_ends: RefCell<Vec<u64>>,
     response_complete: Cell<usize>,
     completed: Cell<usize>,
@@ -174,6 +176,11 @@ struct Application {
     drain_request_last: bool,
     /// Drops the request body unread as soon as the request head arrives.
     drop_request_body: bool,
+    /// Stops the request body that `retain_request` holds with this code in the poll that
+    /// produces the response head.
+    stop_request_at_head: Option<HttpErrorCode>,
+    /// Drains the session through this handle in the poll that produces the response head.
+    drain_at_head: Option<OwnedH2Handle>,
     /// Awaits the resume of each suspend event while reading the request body, as
     /// `FixtureHandler` does, instead of reading on immediately.
     await_request_resume: bool,
@@ -190,6 +197,8 @@ struct Application {
     /// until then.
     late_answer: Option<(u16, Duration)>,
     hold_headers: bool,
+    /// Holds the response body until this is notified.
+    body_gate: Option<Arc<tokio::sync::Notify>>,
     empty_terminal: Option<Arc<tokio::sync::Notify>>,
     body_chunk: usize,
     reentrant_cancel: Option<Rc<ReentrantCancel>>,
@@ -213,12 +222,15 @@ impl Application {
                 retain_request: false,
                 drain_request_last: false,
                 drop_request_body: false,
+                stop_request_at_head: None,
+                drain_at_head: None,
                 await_request_resume: false,
                 upload_after_head: false,
                 response_head_error: None,
                 answer_read_timeout: false,
                 late_answer: None,
                 hold_headers: false,
+                body_gate: None,
                 empty_terminal: None,
                 body_chunk: 4096,
                 reentrant_cancel: None,
@@ -240,10 +252,13 @@ struct Exchange {
     response_date: Option<&'static [u8]>,
     remaining: usize,
     suspended: bool,
+    body_gate: Option<LocalSourceFuture<()>>,
     terminal: Option<LocalSourceFuture<()>>,
     retain_request: bool,
     drain_request_last: bool,
     drop_request_body: bool,
+    stop_request_at_head: Option<HttpErrorCode>,
+    drain_at_head: Option<OwnedH2Handle>,
     await_request_resume: bool,
     upload_after_head: bool,
     response_head_error: Option<HttpErrorCode>,
@@ -274,10 +289,11 @@ impl OwnedH2Application for Application {
         let ordinal = self.probes.borrow().len();
         self.probes.borrow_mut().push(Rc::clone(&probe));
         let reply = self.replies[ordinal];
-        let terminal = self.empty_terminal.as_ref().map(|gate| {
+        let gated = |gate: &Arc<tokio::sync::Notify>| {
             let gate = Arc::clone(gate);
             Box::pin(async move { gate.notified().await }) as LocalSourceFuture<()>
-        });
+        };
+        let terminal = self.empty_terminal.as_ref().map(gated);
         Exchange {
             reply,
             response_priority: self.response_priorities.get(ordinal).copied().flatten(),
@@ -287,10 +303,13 @@ impl OwnedH2Application for Application {
                 Reply::Push => 0,
             },
             suspended: false,
+            body_gate: self.body_gate.as_ref().map(gated),
             terminal,
             retain_request: self.retain_request,
             drain_request_last: self.drain_request_last,
             drop_request_body: self.drop_request_body,
+            stop_request_at_head: self.stop_request_at_head,
+            drain_at_head: self.drain_at_head.clone(),
             await_request_resume: self.await_request_resume,
             upload_after_head: self.upload_after_head,
             response_head_error: self.response_head_error,
@@ -368,6 +387,10 @@ impl OwnedH2Exchange for Exchange {
         &mut self,
         context: &mut Context<'_>,
     ) -> Poll<Result<HttpHeaderEvent, HttpError>> {
+        self.probe
+            .owner_poll_at_poll
+            .borrow_mut()
+            .push(owner_polls());
         if self.hold_headers {
             return Poll::Pending;
         }
@@ -455,6 +478,14 @@ impl OwnedH2Exchange for Exchange {
         if matches!(panic_at, Some(CallbackPanicAt::HeaderPoll)) {
             panic_any("application header poll");
         }
+        if let Some(code) = self.stop_request_at_head
+            && let Some(mut body) = self.probe.held_body.borrow_mut().take()
+        {
+            body.stop_reading(Some(code));
+        }
+        if let Some(handle) = self.drain_at_head.take() {
+            assert!(handle.initiate_drain().unwrap());
+        }
         let mut response = HttpMessage::new();
         response.set_status_code(status).unwrap();
         response.set_http_version(1, 1);
@@ -495,6 +526,14 @@ impl OwnedH2Exchange for Exchange {
         maximum: u32,
     ) -> Poll<Result<HttpBodyEvent, HttpError>> {
         self.probe.body_polls.set(self.probe.body_polls.get() + 1);
+        self.probe
+            .owner_poll_at_poll
+            .borrow_mut()
+            .push(owner_polls());
+        if let Some(gate) = &mut self.body_gate {
+            std::task::ready!(gate.as_mut().poll(context));
+            self.body_gate = None;
+        }
         if self.upload_after_head
             && let Some(upload) = &mut self.upload
         {
@@ -7211,6 +7250,654 @@ fn continuously_ready_owners_are_polled_once_per_turn() {
     });
 }
 
+/// A write queue that is never saturated, so a stream whose request is complete retires when its
+/// END_STREAM is serialized.
+fn unsaturated_transport(
+    reads: impl IntoIterator<Item = FixtureRead>,
+) -> Rc<ScriptedWriteTransport> {
+    let transport = ScriptedWriteTransport::new(
+        reads,
+        [],
+        ScriptedWrite::Complete,
+        INLINE_OUTSTANDING_WRITES,
+        None,
+    );
+    transport.state.borrow_mut().saturated = false;
+    transport
+}
+
+/// Polls `run` once with a waker that does nothing, and returns the owner polls it ran.
+fn owner_polls_of_one_poll(run: Pin<&mut impl Future>) -> usize {
+    let before = owner_polls();
+    let polled = run.poll(&mut Context::from_waker(Waker::noop()));
+    assert!(polled.is_pending(), "the session waits for the peer");
+    owner_polls() - before
+}
+
+/// A fixed response's head and its only body event are serialized by one owner poll. The stream
+/// skips its write fence, so a second owner poll retires it.
+#[test]
+fn a_fixed_response_is_served_by_one_owner_poll() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let send_eof = Arc::new(tokio::sync::Notify::new());
+            let (_, input) = ready_owner_requests(1);
+            let transport = unsaturated_transport([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitDataEof(Arc::clone(&send_eof), Vec::new()),
+            ]);
+            let state = Rc::clone(&transport.state);
+            let (application, probes) = Application::new(vec![Reply::Body(16)]);
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let mut run = Box::pin(session.run());
+            assert_eq!(owner_polls_of_one_poll(run.as_mut()), 2);
+            let probe = Rc::clone(&probes.borrow()[0]);
+            assert_eq!(probe.body_polls.get(), 1);
+            assert_eq!(probe.completed.get(), 1);
+            assert_eq!(
+                stream_frame_kinds(&state.borrow().writes.concat(), 1),
+                [
+                    (FrameType::HEADERS.as_u8(), END_HEADERS),
+                    (FrameType::DATA.as_u8(), END_STREAM)
+                ]
+            );
+            send_eof.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection closes at the peer's EOF")
+                .unwrap();
+            join_scripted_tasks(&state).await;
+        })
+    });
+}
+
+/// Over a transport without a write queue, a fixed response's stream waits for its write. The
+/// owner poll that serializes the head and the body also serves the wake that the request
+/// source's completion queued during that poll, so the only other owner poll retires the stream.
+#[test]
+fn a_fixed_response_that_waits_for_its_write_takes_two_owner_polls() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let send_eof = Arc::new(tokio::sync::Notify::new());
+            let (_, input) = ready_owner_requests(1);
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitDataEof(Arc::clone(&send_eof), Vec::new()),
+            ]);
+            let (application, probes) = Application::new(vec![Reply::Body(16)]);
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let before = owner_polls();
+            let scenario = async {
+                let completed = drive_until(DRIVE_LIMIT, || {
+                    probes
+                        .borrow()
+                        .first()
+                        .is_some_and(|probe| probe.completed.get() == 1)
+                })
+                .await;
+                send_eof.notify_one();
+                completed
+            };
+            let (result, completed) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(session.run(), scenario)
+            })
+            .await
+            .expect("the connection closes at the peer's EOF");
+            result.unwrap();
+            assert!(completed, "the exchange completes");
+            assert_eq!(owner_polls() - before, 2);
+            assert_eq!(
+                stream_frame_kinds(&state.borrow().writes.concat(), 1),
+                [
+                    (FrameType::HEADERS.as_u8(), END_HEADERS),
+                    (FrameType::DATA.as_u8(), END_STREAM)
+                ]
+            );
+        })
+    });
+}
+
+/// Over a saturated write queue, a fixed response's stream waits for its write, as over single
+/// writes, so the owner poll that serializes the head and the body removes the entry that the
+/// request source's completion queued.
+#[test]
+fn a_fixed_response_over_a_saturated_write_queue_takes_two_owner_polls() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let send_eof = Arc::new(tokio::sync::Notify::new());
+            let (_, input) = ready_owner_requests(1);
+            let transport = ScriptedWriteTransport::new(
+                [
+                    FixtureRead::SegmentedData(queue(&input)),
+                    FixtureRead::WaitDataEof(Arc::clone(&send_eof), Vec::new()),
+                ],
+                [],
+                ScriptedWrite::Complete,
+                INLINE_OUTSTANDING_WRITES,
+                None,
+            );
+            let state = Rc::clone(&transport.state);
+            let (application, probes) = Application::new(vec![Reply::Body(16)]);
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let before = owner_polls();
+            let scenario = async {
+                let completed = drive_until(DRIVE_LIMIT, || {
+                    probes
+                        .borrow()
+                        .first()
+                        .is_some_and(|probe| probe.completed.get() == 1)
+                })
+                .await;
+                send_eof.notify_one();
+                completed
+            };
+            let (result, completed) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(session.run(), scenario)
+            })
+            .await
+            .expect("the connection closes at the peer's EOF");
+            result.unwrap();
+            assert!(completed, "the exchange completes");
+            assert_eq!(owner_polls() - before, 2);
+            join_scripted_tasks(&state).await;
+        })
+    });
+}
+
+/// 100 pipelined GETs answered by fixed responses take two owner polls each. The HEADERS frames
+/// and the DATA frames match their recorded digests, each in stream order, and each response's
+/// DATA directly follows its HEADERS.
+#[test]
+fn pipelined_fixed_responses_send_each_body_after_its_head() {
+    const COUNT: u32 = 100;
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let send_eof = Arc::new(tokio::sync::Notify::new());
+            let (_, input) = ready_owner_requests(COUNT as usize);
+            let transport = unsaturated_transport([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitDataEof(Arc::clone(&send_eof), Vec::new()),
+            ]);
+            let state = Rc::clone(&transport.state);
+            let (mut application, probes) = Application::new(vec![Reply::Body(16); COUNT as usize]);
+            application.response_date = Some(TRANSCRIPT_DATE);
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let mut run = Box::pin(session.run());
+            assert_eq!(owner_polls_of_one_poll(run.as_mut()), 2 * COUNT as usize);
+            assert_eq!(completions(&probes), vec![1; COUNT as usize]);
+            let written =
+                WireTranscript::new(WireDirection::Written, &state.borrow().writes.concat());
+            let digest = |frame_type: FrameType| {
+                WireTranscript {
+                    preface: false,
+                    frames: written
+                        .frames
+                        .iter()
+                        .filter(|frame| frame.frame_type == frame_type.as_u8())
+                        .copied()
+                        .collect(),
+                }
+                .digest()
+            };
+            assert_eq!(
+                digest(FrameType::HEADERS),
+                (100, 17_523_616_737_126_423_206)
+            );
+            assert_eq!(digest(FrameType::DATA), (100, 10_567_087_929_404_831_423));
+            let (headers, data) = (FrameType::HEADERS.as_u8(), FrameType::DATA.as_u8());
+            let order: Vec<_> = written
+                .frames
+                .iter()
+                .filter(|frame| frame.stream != 0)
+                .map(|frame| (frame.frame_type, frame.stream))
+                .collect();
+            let expected: Vec<_> = (0..COUNT)
+                .flat_map(|ordinal| [(headers, 2 * ordinal + 1), (data, 2 * ordinal + 1)])
+                .collect();
+            assert_eq!(order, expected);
+            send_eof.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection closes at the peer's EOF")
+                .unwrap();
+            join_scripted_tasks(&state).await;
+        })
+    });
+}
+
+/// A body that pends in the owner poll that serialized its head registers the owner's waker.
+/// The request body's arrival wakes the owner, and its next poll serializes the response body.
+#[test]
+fn a_body_that_pends_after_its_head_is_polled_when_woken() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut input = arming_preface(&mut peer);
+            let (stream, head) = padding_post_headers(&mut peer);
+            input.extend(head);
+            let body = eligibility_frame(
+                &mut peer,
+                EgressFrame::Body {
+                    stream,
+                    body: queue(b"post"),
+                    padding: None,
+                    end_stream: true,
+                },
+            );
+            let send_body = Arc::new(tokio::sync::Notify::new());
+            let send_eof = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitSegmentedData(Arc::clone(&send_body), queue(&body)),
+                FixtureRead::WaitDataEof(Arc::clone(&send_eof), Vec::new()),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(2)]);
+            application.upload_after_head = true;
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let mut run = Box::pin(session.run());
+            assert_eq!(
+                owner_polls_of_one_poll(run.as_mut()),
+                1,
+                "one owner poll serializes the head and polls the pending body"
+            );
+            let probe = Rc::clone(&probes.borrow()[0]);
+            assert_eq!(probe.body_polls.get(), 1);
+            assert_eq!(probe.produced_bytes.get(), 0);
+            let (headers, data) = (FrameType::HEADERS.as_u8(), FrameType::DATA.as_u8());
+            assert_eq!(
+                stream_frame_kinds(&state.borrow().writes.concat(), 1),
+                [(headers, END_HEADERS)]
+            );
+            send_body.notify_one();
+            owner_polls_of_one_poll(run.as_mut());
+            assert_eq!(probe.body_polls.get(), 2);
+            assert_eq!(probe.request_bytes.get(), 4);
+            assert_eq!(probe.response_complete.get(), 1);
+            assert_eq!(
+                stream_frame_kinds(&state.borrow().writes.concat(), 1),
+                [(headers, END_HEADERS), (data, END_STREAM)]
+            );
+            send_eof.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection closes at the peer's EOF")
+                .unwrap();
+            assert_eq!(probe.completed.get(), 1);
+            assert!(probe.cancelled.borrow().is_empty());
+        })
+    });
+}
+
+/// A head polled while another stream heads the scheduler is serialized from the scheduler after
+/// the owner phase, and its owner is queued again for the body. Stream 1's last body byte waits
+/// for credit at the scheduler's head.
+#[test]
+fn a_head_behind_the_scheduler_head_queues_its_owner_for_the_body() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut input = arming_preface(&mut peer);
+            input.extend(eligibility_request(&mut peer, 3));
+            let later = eligibility_request(&mut peer, 3);
+            let mut update = eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::UNSPECIFIED,
+                    amount: 2,
+                },
+            );
+            update.extend(eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::new(1),
+                    amount: 1,
+                },
+            ));
+            let gates: [_; 3] = std::array::from_fn(|_| Arc::new(tokio::sync::Notify::new()));
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitSegmentedData(Arc::clone(&gates[0]), queue(&later)),
+                FixtureRead::WaitSegmentedData(Arc::clone(&gates[1]), queue(&update)),
+                FixtureRead::WaitDataEof(Arc::clone(&gates[2]), Vec::new()),
+            ]);
+            let (mut application, probes) =
+                Application::new(vec![Reply::Body(65_536), Reply::Body(1)]);
+            application.body_chunk = 65_536;
+            let mut config = options(context, transport);
+            config.io.maximum_write_size = config.io.buffer_limit;
+            let (session, _) = OwnedH2Session::new(application, config).unwrap();
+            let mut run = Box::pin(session.run());
+            owner_polls_of_one_poll(run.as_mut());
+            assert_eq!(
+                decode_server_frames(&state.borrow().writes.concat()).body_bytes,
+                65_535
+            );
+            gates[0].notify_one();
+            assert_eq!(
+                owner_polls_of_one_poll(run.as_mut()),
+                2,
+                "stream 3's head and its body take one owner poll each"
+            );
+            let (headers, data) = (FrameType::HEADERS.as_u8(), FrameType::DATA.as_u8());
+            assert_eq!(
+                stream_frame_kinds(&state.borrow().writes.concat(), 3),
+                [(headers, END_HEADERS)]
+            );
+            assert_eq!(probes.borrow()[1].body_polls.get(), 1);
+            assert_eq!(probes.borrow()[1].produced_bytes.get(), 1);
+            gates[1].notify_one();
+            owner_polls_of_one_poll(run.as_mut());
+            assert_eq!(
+                stream_frame_kinds(&state.borrow().writes.concat(), 3),
+                [(headers, END_HEADERS), (data, END_STREAM)]
+            );
+            gates[2].notify_one();
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection closes at the peer's EOF")
+                .unwrap();
+            assert_eq!(completions(&probes), [1, 1]);
+        })
+    });
+}
+
+/// An informational head is serialized by its own owner poll, and the owner is queued again.
+/// The next poll serializes the final head and the body's first event, and a third retires the
+/// stream.
+#[test]
+fn an_informational_head_does_not_continue_into_the_body() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let gate = Rc::new(OwnerPollGate {
+                ready: Cell::new(true),
+                informational: Cell::new(true),
+                ..OwnerPollGate::default()
+            });
+            let send_eof = Arc::new(tokio::sync::Notify::new());
+            let (_, input) = ready_owner_requests(1);
+            let transport = unsaturated_transport([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitDataEof(Arc::clone(&send_eof), Vec::new()),
+            ]);
+            let state = Rc::clone(&transport.state);
+            let (mut application, probes) = Application::new(vec![Reply::Body(2)]);
+            application.owner_poll_gate = Some(Rc::clone(&gate));
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let mut run = Box::pin(session.run());
+            let first = owner_polls() + 1;
+            assert_eq!(owner_polls_of_one_poll(run.as_mut()), 3);
+            let probe = Rc::clone(&probes.borrow()[0]);
+            assert_eq!(
+                *probe.owner_poll_at_poll.borrow(),
+                [first, first + 1, first + 1],
+                "the informational head, then the final head and the body, are polled by two \
+                 owner polls"
+            );
+            assert_eq!(probe.body_polls.get(), 1);
+            assert_eq!(probe.completed.get(), 1);
+            let decoded = decode_server_frames(&state.borrow().writes.concat());
+            assert_eq!(
+                decoded.header_statuses,
+                [(StreamId::new(1), 103), (StreamId::new(1), 200)]
+            );
+            assert_eq!(decoded.body_data, b"rr");
+            send_eof.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection closes at the peer's EOF")
+                .unwrap();
+            join_scripted_tasks(&state).await;
+        })
+    });
+}
+
+/// When a handler stops its unfinished request body with NO_ERROR in its head poll, the stream
+/// gets HEADERS, DATA with END_STREAM, then RST_STREAM(NO_ERROR). The owner poll that serializes
+/// the head applies the stop before it polls the body.
+#[test]
+fn a_request_stop_in_the_head_poll_applies_before_the_body() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut input = arming_preface(&mut peer);
+            input.extend(padding_post_headers(&mut peer).1);
+            let send_eof = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitDataEof(Arc::clone(&send_eof), Vec::new()),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(4)]);
+            application.retain_request = true;
+            application.stop_request_at_head = Some(HttpErrorCode::NO_ERROR);
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let mut run = Box::pin(session.run());
+            owner_polls_of_one_poll(run.as_mut());
+            let probe = Rc::clone(&probes.borrow()[0]);
+            let first = probe.owner_poll_at_poll.borrow()[0];
+            assert_eq!(
+                *probe.owner_poll_at_poll.borrow(),
+                [first, first],
+                "one owner poll polls the head and the body"
+            );
+            let wire = state.borrow().writes.concat();
+            assert_eq!(
+                stream_frame_kinds(&wire, 1),
+                [
+                    (FrameType::HEADERS.as_u8(), END_HEADERS),
+                    (FrameType::DATA.as_u8(), END_STREAM),
+                    (FrameType::RST_STREAM.as_u8(), 0),
+                ]
+            );
+            assert_eq!(
+                decode_server_frames(&wire).resets,
+                [(StreamId::new(1), H2ErrorCode::NO_ERROR)]
+            );
+            send_eof.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection closes at the peer's EOF")
+                .unwrap();
+            assert_eq!(probe.completed.get(), 1);
+            assert!(probe.cancelled.borrow().is_empty());
+        })
+    });
+}
+
+/// A cancel from the callback of a head that its owner's poll serialized ends that poll. The
+/// poll neither polls the body nor applies the request stop that the head poll made, so the
+/// exchange is cancelled once, with the session's cancel.
+#[test]
+fn a_cancel_from_an_encoded_head_ends_its_owner_poll() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut input = arming_preface(&mut peer);
+            input.extend(padding_post_headers(&mut peer).1);
+            let (transport, state) =
+                FixtureTransport::new([FixtureRead::SegmentedData(queue(&input))]);
+            let cancel = Rc::new(ReentrantCancel {
+                at: CancelAt::HeaderEncoded,
+                handle: RefCell::new(None),
+                transport: Rc::clone(&state),
+                writes_at_cancel: Cell::new(None),
+            });
+            let (mut application, probes) = Application::new(vec![Reply::Body(4)]);
+            application.retain_request = true;
+            application.stop_request_at_head = Some(HttpErrorCode::CANCEL);
+            application.reentrant_cancel = Some(Rc::clone(&cancel));
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            *cancel.handle.borrow_mut() = Some(handle);
+            let error = tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+            assert_eq!(
+                Some(state.borrow().writes.len()),
+                cancel.writes_at_cancel.get()
+            );
+            let probe = Rc::clone(&probes.borrow()[0]);
+            assert_eq!(probe.body_polls.get(), 0);
+            assert_eq!(
+                probe.cancelled.borrow().as_slice(),
+                &[(HttpErrorCode::CORO_CANCELLED, false)]
+            );
+            assert_eq!(probe.completed.get(), 0);
+            assert_eq!(probe.dropped.get(), 1);
+        })
+    });
+}
+
+/// Responses whose head is followed directly by trailers encode their header blocks by stream:
+/// each stream's trailers precede the next stream's head.
+#[test]
+fn trailers_that_directly_follow_a_head_precede_the_next_head() {
+    const TRAILERS: &[(&str, &str)] = &[("x-check", "done")];
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let send_eof = Arc::new(tokio::sync::Notify::new());
+            let (_, input) = ready_owner_requests(2);
+            let transport = unsaturated_transport([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitDataEof(Arc::clone(&send_eof), Vec::new()),
+            ]);
+            let state = Rc::clone(&transport.state);
+            let (application, probes) =
+                Application::new(vec![Reply::BodyThenTrailers(0, TRAILERS); 2]);
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let mut run = Box::pin(session.run());
+            assert_eq!(owner_polls_of_one_poll(run.as_mut()), 4);
+            assert_eq!(completions(&probes), [1, 1]);
+            let wire = state.borrow().writes.concat();
+            let blocks: Vec<_> = raw_frames(&wire)
+                .iter()
+                .filter(|frame| frame.stream != 0)
+                .map(|frame| (frame.stream, frame.frame_type, frame.flags))
+                .collect();
+            let headers = FrameType::HEADERS.as_u8();
+            assert_eq!(
+                blocks,
+                [
+                    (1, headers, END_HEADERS),
+                    (1, headers, END_HEADERS | END_STREAM),
+                    (3, headers, END_HEADERS),
+                    (3, headers, END_HEADERS | END_STREAM),
+                ]
+            );
+            for stream in [1, 3] {
+                assert_eq!(
+                    trailer_fields(&wire, stream).expect("each stream ends with trailers"),
+                    [HpackHeader::new("x-check", "done")]
+                );
+            }
+            send_eof.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection closes at the peer's EOF")
+                .unwrap();
+            join_scripted_tasks(&state).await;
+        })
+    });
+}
+
+/// A drain that a handler requests in its final head's poll starts before that owner's body is
+/// polled: the owner is queued after its head, and the drain's GOAWAYs precede the DATA.
+#[test]
+fn a_drain_from_a_head_poll_starts_before_the_body() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let (_, input) = ready_owner_requests(1);
+            let (transport, state) = FixtureTransport::new([FixtureRead::DataEof(input)]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(4)]);
+            let (session, _) = OwnedH2Session::new_with(options(context, transport), |handle| {
+                application.drain_at_head = Some(handle.clone());
+                application
+            })
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .expect("the drained connection finishes")
+                .expect("the drained run succeeds");
+            let probe = Rc::clone(&probes.borrow()[0]);
+            let first = probe.owner_poll_at_poll.borrow()[0];
+            assert_eq!(
+                *probe.owner_poll_at_poll.borrow(),
+                [first, first + 1],
+                "the head and the body are polled by consecutive owner polls"
+            );
+            assert_eq!(probe.completed.get(), 1);
+            let (headers, data, goaway) = (
+                FrameType::HEADERS.as_u8(),
+                FrameType::DATA.as_u8(),
+                FrameType::GOAWAY.as_u8(),
+            );
+            let order: Vec<_> = raw_frames(&state.borrow().writes.concat())
+                .iter()
+                .filter(|frame| frame.stream == 1 || frame.frame_type == goaway)
+                .map(|frame| (frame.stream, frame.frame_type))
+                .collect();
+            assert_eq!(order, [(1, headers), (0, goaway), (0, goaway), (1, data)]);
+        })
+    });
+}
+
+/// Over a write queue that is not saturated, the owner poll that serializes a head keeps the
+/// entry that the request source's completion queued, since a ready body's END_STREAM would retire
+/// the stream and queue the owner again. A body that pends after the head is then polled again by
+/// that entry's poll.
+#[test]
+fn a_pending_body_over_an_unsaturated_write_queue_is_polled_again() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let release = Arc::new(tokio::sync::Notify::new());
+            let send_eof = Arc::new(tokio::sync::Notify::new());
+            let (_, input) = ready_owner_requests(1);
+            let transport = unsaturated_transport([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitDataEof(Arc::clone(&send_eof), Vec::new()),
+            ]);
+            let state = Rc::clone(&transport.state);
+            let (mut application, probes) = Application::new(vec![Reply::Body(2)]);
+            application.body_gate = Some(Arc::clone(&release));
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let mut run = Box::pin(session.run());
+            let first = owner_polls() + 1;
+            assert_eq!(owner_polls_of_one_poll(run.as_mut()), 2);
+            let probe = Rc::clone(&probes.borrow()[0]);
+            assert_eq!(
+                *probe.owner_poll_at_poll.borrow(),
+                [first, first, first + 1]
+            );
+            release.notify_one();
+            assert_eq!(owner_polls_of_one_poll(run.as_mut()), 2);
+            assert_eq!(probe.completed.get(), 1);
+            assert_eq!(
+                stream_frame_kinds(&state.borrow().writes.concat(), 1),
+                [
+                    (FrameType::HEADERS.as_u8(), END_HEADERS),
+                    (FrameType::DATA.as_u8(), END_STREAM)
+                ]
+            );
+            send_eof.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection closes at the peer's EOF")
+                .unwrap();
+            join_scripted_tasks(&state).await;
+        })
+    });
+}
+
 /// The turns that the poll parsing a connection WINDOW_UPDATE spends when the update releases
 /// `blocked` one-byte bodies. Stream 1's 65,535-byte body closes the connection window, and the
 /// bodies of the streams after it queue behind the closed window.
@@ -11360,7 +12047,7 @@ fn owned_h2_transcripts_are_unchanged() {
         [read.digest(), written.digest()],
         [
             (9, 11_231_806_118_693_533_887),
-            (10, 7_227_848_528_293_173_899)
+            (10, 18_186_566_884_050_023_305)
         ],
         "downstream transcripts are unchanged; read: {read:#?}; written: {written:#?}"
     );
@@ -15476,10 +16163,10 @@ fn downstream_transcripts_are_unchanged_by_early_retirement() {
         assert_eq!(
             recorded,
             [
-                ((8, 234_198_259_703_760_995), Ok(())),
+                ((8, 1_772_831_934_112_788_329), Ok(())),
                 ((5, 12_245_000_780_145_702_999), Ok(())),
                 ((5, 9_586_466_474_454_564_876), Ok(())),
-                ((8, 15_476_332_832_309_872_086), Ok(())),
+                ((8, 11_637_329_952_085_812_236), Ok(())),
                 ((6, 11_756_098_851_954_770_615), Ok(())),
             ],
             "downstream transcripts are unchanged (unsaturated: {unsaturated}); \
@@ -16412,8 +17099,8 @@ fn downstream_trailers_transcript_is_unchanged_by_early_retirement() {
     let written = WireTranscript::new(WireDirection::Written, &wire);
     assert_eq!(
         written.digest(),
-        (7, 17_566_401_009_799_498_029),
-        "written transcript recorded before streams retired at END_STREAM framing; written: {written:#?}"
+        (7, 12_923_807_153_470_661_261),
+        "the written transcript is unchanged; written: {written:#?}"
     );
 }
 

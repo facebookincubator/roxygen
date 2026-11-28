@@ -155,7 +155,9 @@ use crate::uniplex::UniplexWriteQueue;
 pub(crate) const TURN_BUDGET: usize = 64;
 /// The most stream owners that one turn polls. Like folly's `EventBase::runLoopCallbacks`, which
 /// runs only the callbacks queued before it starts, a turn polls only owners queued before its
-/// owner phase: an owner queued during the phase, by its own poll or another's, waits a turn.
+/// owner phase: an owner queued during the phase, by its own poll or another's, waits a turn. The
+/// exception is a downstream poll that goes on from a final head to the body: it can remove the
+/// entry that it queued for itself, if that entry is still the last, and serve that wake.
 pub(crate) const OWNER_POLLS_PER_TURN: usize = 16;
 
 /// The status of the error response sent after a downstream stream read timeout.
@@ -725,6 +727,22 @@ impl Control {
         if let Err(panic) = guarded(|| waker.wake_by_ref()) {
             self.notified.set(false);
             resume_unwind(panic);
+        }
+    }
+
+    /// Removes `wake`'s entry if the session's thread queued it and it is still the last entry, so
+    /// that a poll of its owner that starts now serves the wake that queued it.
+    fn unqueue_last(&self, wake: &StreamWake) {
+        if !wake.queued.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut owners = self.owners.borrow_mut();
+        if owners
+            .back()
+            .is_some_and(|owner| owner.id == wake.id && !owner.shared)
+        {
+            owners.pop_back();
+            wake.queued.store(false, Ordering::Relaxed);
         }
     }
 
@@ -1625,6 +1643,7 @@ thread_local! {
     static READ_START_CHECKS: Cell<usize> = const { Cell::new(0) };
     static INLINE_POLLS: Cell<usize> = const { Cell::new(0) };
     static TURNS: Cell<usize> = const { Cell::new(0) };
+    static OWNER_POLLS: Cell<usize> = const { Cell::new(0) };
     static RUN_FAULT: Cell<bool> = const { Cell::new(false) };
     static COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
 }
@@ -1679,6 +1698,12 @@ pub(crate) fn inline_polls() -> usize {
 #[cfg(test)]
 pub(crate) fn turns() -> usize {
     TURNS.with(Cell::get)
+}
+
+/// How many stream owner polls the owned H2 drivers on this thread have run.
+#[cfg(test)]
+pub(crate) fn owner_polls() -> usize {
+    OWNER_POLLS.with(Cell::get)
 }
 
 /// A downstream HTTP/2 driver with concrete exchange owners.
@@ -5068,6 +5093,8 @@ where
     }
 
     fn poll_stream(&mut self, owner: QueuedOwner) -> Result<OwnerPollResult, HttpError> {
+        #[cfg(test)]
+        OWNER_POLLS.with(|polls| polls.set(polls.get() + 1));
         let id = owner.id;
         let mut serialized = None;
         let retired = {
@@ -5077,47 +5104,73 @@ where
             };
             let stream = entry.get_mut();
             stream.wake.take_mark(owner);
-            if let Err(error) = connection.poll_stream_owner(id, stream) {
-                if self.failure.panicked && self.failure.fatal.is_none() {
-                    self.abort_retirement_panic();
-                }
-                return Err(error);
-            }
-            // While the message's last event waits, the source's completion wakes the owner.
-            if stream.pending.as_ref().is_some_and(PendingEgress::eom) {
-                stream.signals.wake_on_completion.set(true);
-            }
-            // Until a byte event is registered the observer is empty, and an event cannot wait.
-            let retired = stream.consumed
-                && stream.response_complete
-                && stream.physically_complete
-                && (!connection.connection.state.byte_events_registered || {
-                    let waker = waker_ref(&stream.wake);
-                    let mut context = Context::from_waker(&waker);
-                    match connection
-                        .connection
-                        .state
-                        .observer
-                        .poll_stream_events_drained(connection.context, id, &mut context)
-                    {
-                        Poll::Ready(Ok(())) => true,
-                        Poll::Ready(Err(error)) => {
-                            push_connection_failure(&mut connection.failure.failures, error);
-                            false
-                        }
-                        Poll::Pending => false,
+            // Once a downstream owner's final head without END_STREAM is serialized, this poll
+            // polls the owner again for the body. `then_body` allows that once, so an owner poll
+            // makes at most two application polls. The second pass serves a wake that the first
+            // queued, such as the request source's completion, so it removes that entry. Over a
+            // write queue that is not saturated the entry stays: a stream there usually skips its
+            // write fence, and its END_STREAM queues the owner again.
+            let mut then_body = !UPSTREAM;
+            loop {
+                if let Err(error) = connection.poll_stream_owner(id, stream) {
+                    if self.failure.panicked && self.failure.fatal.is_none() {
+                        self.abort_retirement_panic();
                     }
-                });
-            if retired {
-                connection.connection.state.settle_ingress(stream);
-                connection.connection.state.consumed_streams -= 1;
-                if stream.reset || !stream.wire_ingress_complete {
-                    connection.connection.codec.abandon_stream(id);
+                    return Err(error);
                 }
-                Some(entry.remove())
-            } else {
-                serialized = connection.serialize_polled(id, stream);
-                None
+                // While the message's last event waits, the source's completion wakes the owner.
+                if stream.pending.as_ref().is_some_and(PendingEgress::eom) {
+                    stream.signals.wake_on_completion.set(true);
+                }
+                // Until a byte event is registered the observer is empty, and an event cannot
+                // wait.
+                let retired = stream.consumed
+                    && stream.response_complete
+                    && stream.physically_complete
+                    && (!connection.connection.state.byte_events_registered || {
+                        let waker = waker_ref(&stream.wake);
+                        let mut context = Context::from_waker(&waker);
+                        match connection
+                            .connection
+                            .state
+                            .observer
+                            .poll_stream_events_drained(connection.context, id, &mut context)
+                        {
+                            Poll::Ready(Ok(())) => true,
+                            Poll::Ready(Err(error)) => {
+                                push_connection_failure(&mut connection.failure.failures, error);
+                                false
+                            }
+                            Poll::Pending => false,
+                        }
+                    });
+                if retired {
+                    connection.connection.state.settle_ingress(stream);
+                    connection.connection.state.consumed_streams -= 1;
+                    if stream.reset || !stream.wire_ingress_complete {
+                        connection.connection.codec.abandon_stream(id);
+                    }
+                    break Some(entry.remove());
+                }
+                match connection.serialize_polled(id, stream, then_body) {
+                    Some(Ok(true)) => {
+                        then_body = false;
+                        if !connection
+                            .write_queue
+                            .is_some_and(|queue| !queue.is_saturated())
+                        {
+                            connection
+                                .connection
+                                .state
+                                .control
+                                .unqueue_last(&stream.wake);
+                        }
+                    }
+                    polled => {
+                        serialized = polled.map(|result| result.map(drop));
+                        break None;
+                    }
+                }
             }
         };
         if let Some(mut stream) = retired {
@@ -6120,18 +6173,21 @@ where
             .get_mut(&id)
             .expect("scheduler selected an owned stream");
         connection
-            .serialize_selected(id, stream, budget)
-            .map(|()| true)
+            .serialize_selected(id, stream, budget, false)
+            .map(|_| true)
             .map_err(|error| (id, error))
     }
 }
 
 impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
+    /// Serializes the event that the owner's poll left pending, if its stream heads the scheduler
+    /// and the budget admits it. The result is `serialize_selected`'s.
     fn serialize_polled<E: ExchangeStorage<UPSTREAM>>(
         &mut self,
         id: StreamId,
         stream: &mut Stream<E, UPSTREAM>,
-    ) -> Option<Result<(), HttpError>> {
+        then_body: bool,
+    ) -> Option<Result<bool, HttpError>> {
         // Cancellation and retirement retain their checkpoint before serialization.
         if self.failure.fatal.is_some()
             || self.failure.panicked
@@ -6148,20 +6204,28 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
         if !stream.can_serialize(budget) {
             return None;
         }
-        Some(self.serialize_selected(id, stream, budget))
+        Some(self.serialize_selected(id, stream, budget, then_body))
     }
 
+    /// Serializes the pending event, or the part of its body that `budget` admits, and queues the
+    /// owner again once the event is taken, unless the stream waits for its write fence. With
+    /// `then_body`, a final head without END_STREAM returns true instead of queueing the owner, and
+    /// the caller polls the owner for the body, unless the session is cancelled, a connection
+    /// failure is queued or a requested local drain has not started: the driver handles those
+    /// before it polls the owner again.
     fn serialize_selected<E: ExchangeStorage<UPSTREAM>>(
         &mut self,
         id: StreamId,
         stream: &mut Stream<E, UPSTREAM>,
         budget: SerializationBudget,
-    ) -> Result<(), HttpError> {
+        then_body: bool,
+    ) -> Result<bool, HttpError> {
         let maximum = budget.credit.min(stream.send_window.non_negative_size());
         let mut event = stream
             .pending
             .take()
             .expect("serialization requires a pending event");
+        let head = then_body && matches!(event, PendingEgress::Headers(_));
         if let PendingEgress::Body(body) = &mut event
             && (UPSTREAM || !stream.request_head)
             && let Some(bytes) = body.as_body_mut()
@@ -6180,10 +6244,19 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
                 .scheduler
                 .dequeue(id, &mut stream.scheduling);
         }
-        if stream.pending.is_none() && (!stream.response_complete || stream.physically_complete) {
+        let body_next = head
+            && stream.response_headers
+            && !stream.response_complete
+            && self.failure.failures.is_empty()
+            && !self.cancelled()
+            && (self.connection.state.draining || !self.connection.state.control.drain.get());
+        if !body_next
+            && stream.pending.is_none()
+            && (!stream.response_complete || stream.physically_complete)
+        {
             self.connection.state.control.enqueue(&stream.wake);
         }
-        Ok(())
+        Ok(body_next)
     }
 
     fn serialize_event<E: ExchangeStorage<UPSTREAM>>(
@@ -6733,6 +6806,50 @@ mod ready_queue_tests {
         assert!(control.enqueue(&b), "a polled owner can be queued again");
         let polled = control.pop_batch(&mut batch);
         assert_eq!(ids(&batch[..polled]), [3]);
+    }
+
+    #[test]
+    fn unqueue_last_removes_only_a_last_entry_that_the_sessions_thread_queued() {
+        let control = control();
+        install_waker(&control);
+        let [a, b] = [1, 3].map(|id| stream_wake(&control, id));
+        assert!(control.enqueue(&a));
+        assert!(control.enqueue(&b));
+        control.unqueue_last(&a);
+        assert!(
+            a.queued.load(Ordering::Relaxed) && control.owners.borrow().len() == 2,
+            "an entry that is not the last stays queued, with its mark"
+        );
+        control.unqueue_last(&b);
+        assert!(
+            !b.queued.load(Ordering::Relaxed) && control.owners.borrow().len() == 1,
+            "the last entry is removed, and its mark cleared"
+        );
+        control.unqueue_last(&b);
+        assert_eq!(
+            control.owners.borrow().len(),
+            1,
+            "an owner that is not queued removes nothing"
+        );
+        let waker = futures::task::waker(Arc::clone(&a));
+        thread::spawn(move || waker.wake_by_ref())
+            .join()
+            .expect("the wake completes");
+        control.ready.drain_into(&control.owners);
+        control.unqueue_last(&a);
+        assert!(
+            a.queued.load(Ordering::Relaxed) && a.shared_queued.load(Ordering::Acquire),
+            "an entry that a waker queued is not removed, and both marks stay"
+        );
+        let mut batch = [QueuedOwner::default(); OWNER_POLLS_PER_TURN];
+        let polled = control.pop_batch(&mut batch);
+        assert_eq!(
+            batch[..polled]
+                .iter()
+                .map(|owner| (owner.id.get(), owner.shared))
+                .collect::<Vec<_>>(),
+            [(1, false), (1, true)]
+        );
     }
 
     #[test]
