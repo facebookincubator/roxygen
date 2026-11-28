@@ -50,6 +50,7 @@ use crate::owned_h2::TURN_BUDGET;
 use crate::owned_h2::fault_next_run_poll;
 use crate::owned_h2::stream_seed_order;
 use crate::owned_h2::take_discarded_streams;
+use crate::owned_h2::turns;
 use crate::uniplex::UniplexReader;
 use crate::uniplex::UniplexRunSummary;
 use crate::uniplex_tests::ParkedEnd;
@@ -100,11 +101,14 @@ struct ReentrantCancel {
 }
 
 impl ReentrantCancel {
+    /// Does not cancel until `handle` is set.
     fn fire(&self, at: CancelAt) {
-        if self.at == at {
+        if self.at == at
+            && let Some(handle) = self.handle.borrow().as_ref()
+        {
             self.writes_at_cancel
                 .set(Some(self.transport.borrow().writes.len()));
-            self.handle.borrow().as_ref().unwrap().cancel();
+            handle.cancel();
         }
     }
 }
@@ -7201,6 +7205,257 @@ fn continuously_ready_owners_are_polled_once_per_turn() {
             for probe in probes.borrow().iter() {
                 assert_eq!(probe.body_polls.get(), 1024);
                 assert_eq!(probe.completed.get(), 1);
+                assert_eq!(probe.dropped.get(), 1);
+            }
+        })
+    });
+}
+
+/// The turns that the poll parsing a connection WINDOW_UPDATE spends when the update releases
+/// `blocked` one-byte bodies. Stream 1's 65,535-byte body closes the connection window, and the
+/// bodies of the streams after it queue behind the closed window.
+fn turns_to_release_blocked_bodies(blocked: usize) -> usize {
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut input = arming_preface(&mut peer);
+            for _ in 0..=blocked {
+                input.extend(eligibility_request(&mut peer, 3));
+            }
+            let update = eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::UNSPECIFIED,
+                    amount: blocked as u32,
+                },
+            );
+            let send_update = Arc::new(tokio::sync::Notify::new());
+            let send_eof = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitSegmentedData(Arc::clone(&send_update), queue(&update)),
+                FixtureRead::WaitDataEof(Arc::clone(&send_eof), Vec::new()),
+            ]);
+            let mut replies = vec![Reply::Body(1); blocked + 1];
+            replies[0] = Reply::Body(65_535);
+            let (mut application, probes) = Application::new(replies);
+            application.body_chunk = 65_535;
+            let mut config = options(context, transport);
+            config.io.maximum_write_size = config.io.buffer_limit;
+            let (session, _) = OwnedH2Session::new(application, config).unwrap();
+            let mut run = Box::pin(session.run());
+            let mut poll = || {
+                let before = turns();
+                let polled = run.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+                assert!(polled.is_pending(), "the session waits for the peer");
+                turns() - before
+            };
+            poll();
+            let decoded =
+                decode_server_frames_with_requests(&state.borrow().writes.concat(), blocked + 1);
+            assert_eq!(decoded.body_bytes, 65_535);
+            assert!(
+                decoded
+                    .body_streams
+                    .iter()
+                    .all(|stream| *stream == StreamId::new(1))
+            );
+            assert!(
+                probes.borrow()[1..]
+                    .iter()
+                    .all(|probe| probe.produced_bytes.get() == 1),
+                "every blocked body is queued"
+            );
+            send_update.notify_one();
+            let spent = poll();
+            let decoded =
+                decode_server_frames_with_requests(&state.borrow().writes.concat(), blocked + 1);
+            assert_eq!(decoded.body_bytes, 65_535 + blocked);
+            let released: Vec<_> = (1..=blocked as u64)
+                .map(|ordinal| StreamId::new(2 * ordinal + 1))
+                .collect();
+            assert_eq!(
+                decoded.body_streams[decoded.body_streams.len() - blocked..],
+                released
+            );
+            send_eof.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection closes at the peer's EOF")
+                .unwrap();
+            for probe in probes.borrow().iter() {
+                assert_eq!(probe.completed.get(), 1);
+                assert_eq!(probe.dropped.get(), 1);
+            }
+            spent
+        })
+    })
+}
+
+/// A connection WINDOW_UPDATE serializes every body queued behind the closed window in the
+/// turn that parses it, so the poll spends as many turns on 16 released bodies as on one.
+#[test]
+fn bodies_released_by_a_connection_window_update_serialize_in_one_turn() {
+    assert_eq!(
+        turns_to_release_blocked_bodies(16),
+        turns_to_release_blocked_bodies(1)
+    );
+}
+
+/// The turns that each poll spends on `count` incremental responses whose stream windows
+/// release 1,000 bytes at a time: the poll that sends the first 1,000 bytes of each, then the
+/// two polls that each parse one WINDOW_UPDATE per stream. The responses take turns in round
+/// robin.
+fn round_robin_release_turns(count: usize) -> Vec<usize> {
+    const WINDOW: usize = 1000;
+    run_on_worker(move |context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            peer.egress_settings_mut()
+                .set(SettingsId::InitialWindowSize, WINDOW as u64);
+            let mut input = arming_preface(&mut peer);
+            for _ in 0..count {
+                input.extend(eligibility_request(&mut peer, 3));
+            }
+            let streams: Vec<_> = (0..count as u64)
+                .map(|ordinal| StreamId::new(2 * ordinal + 1))
+                .collect();
+            let updates: Vec<u8> = streams
+                .iter()
+                .flat_map(|stream| {
+                    eligibility_frame(
+                        &mut peer,
+                        EgressFrame::WindowUpdate {
+                            stream: *stream,
+                            amount: WINDOW as u32,
+                        },
+                    )
+                })
+                .collect();
+            let gates: [_; 3] = std::array::from_fn(|_| Arc::new(tokio::sync::Notify::new()));
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitSegmentedData(Arc::clone(&gates[0]), queue(&updates)),
+                FixtureRead::WaitSegmentedData(Arc::clone(&gates[1]), queue(&updates)),
+                FixtureRead::WaitDataEof(Arc::clone(&gates[2]), Vec::new()),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(3 * WINDOW); count]);
+            application.body_chunk = 3 * WINDOW;
+            application.response_priorities =
+                vec![Some(HttpPriority::from_urgency_and_incremental(3, true)); count];
+            let (session, _) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let mut run = Box::pin(session.run());
+            let mut poll = || {
+                let before = turns();
+                let polled = run.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+                assert!(polled.is_pending(), "the session waits for the peer");
+                turns() - before
+            };
+            let data_streams = || {
+                decode_server_frames_with_requests(&state.borrow().writes.concat(), count)
+                    .body_streams
+            };
+            let mut spent = vec![poll()];
+            assert_eq!(data_streams(), streams);
+            for (released, gate) in (2..).zip(&gates[..2]) {
+                gate.notify_one();
+                spent.push(poll());
+                assert_eq!(data_streams(), streams.repeat(released));
+            }
+            gates[2].notify_one();
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the connection closes at the peer's EOF")
+                .unwrap();
+            for probe in probes.borrow().iter() {
+                assert_eq!(probe.produced_bytes.get(), 3 * WINDOW);
+                assert_eq!(probe.completed.get(), 1);
+            }
+            spent
+        })
+    })
+}
+
+/// Incremental responses released by the same reads serialize in round robin, all in the turn
+/// that parses their WINDOW_UPDATEs, so each poll spends as many turns on three of them as on
+/// one.
+#[test]
+fn incremental_streams_released_together_serialize_in_round_robin_in_one_turn() {
+    assert_eq!(round_robin_release_turns(3), round_robin_release_turns(1));
+}
+
+/// A header callback that cancels the session while the turn serializes queued events stops the
+/// serializations after it. Stream 1's body stays at the scheduler's head, blocked on the
+/// connection window, so the later heads queue behind it instead of serializing in their owners'
+/// polls.
+#[test]
+fn a_cancel_from_a_queued_serialization_stops_the_later_serializations() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            let mut input = arming_preface(&mut peer);
+            input.extend(eligibility_request(&mut peer, 3));
+            let later: Vec<u8> = (0..3)
+                .flat_map(|_| eligibility_request(&mut peer, 3))
+                .collect();
+            let send_later = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitSegmentedData(Arc::clone(&send_later), queue(&later)),
+            ]);
+            let cancel = Rc::new(ReentrantCancel {
+                at: CancelAt::HeaderEncoded,
+                handle: RefCell::new(None),
+                transport: Rc::clone(&state),
+                writes_at_cancel: Cell::new(None),
+            });
+            let (mut application, probes) = Application::new(vec![
+                Reply::Body(65_536),
+                Reply::Body(0),
+                Reply::Body(0),
+                Reply::Body(0),
+            ]);
+            application.body_chunk = 65_536;
+            application.reentrant_cancel = Some(Rc::clone(&cancel));
+            let mut config = options(context, transport);
+            config.io.maximum_write_size = config.io.buffer_limit;
+            let (session, handle) = OwnedH2Session::new(application, config).unwrap();
+            let mut run = Box::pin(session.run());
+            let polled = run.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+            assert!(polled.is_pending(), "stream 1 waits for connection credit");
+            assert_eq!(
+                decode_server_frames(&state.borrow().writes.concat()).body_bytes,
+                65_535
+            );
+            *cancel.handle.borrow_mut() = Some(handle);
+            send_later.notify_one();
+            let error = tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .expect("the cancelled connection joins its native I/O")
+                .unwrap_err();
+            assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+            assert_eq!(
+                Some(state.borrow().writes.len()),
+                cancel.writes_at_cancel.get(),
+                "nothing is written after the cancel"
+            );
+            let probes = probes.borrow();
+            let completions: Vec<_> = probes
+                .iter()
+                .map(|probe| probe.response_complete.get())
+                .collect();
+            assert_eq!(
+                completions,
+                [0, 1, 0, 0],
+                "only stream 3's head is serialized"
+            );
+            for probe in probes.iter() {
+                assert_eq!(
+                    probe.cancelled.borrow().as_slice(),
+                    &[(HttpErrorCode::CORO_CANCELLED, false)]
+                );
+                assert_eq!(probe.completed.get(), 0);
                 assert_eq!(probe.dropped.get(), 1);
             }
         })

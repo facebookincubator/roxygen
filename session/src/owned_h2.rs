@@ -1624,6 +1624,7 @@ thread_local! {
     static OWNER_WRITE_STATE_READS: Cell<usize> = const { Cell::new(0) };
     static READ_START_CHECKS: Cell<usize> = const { Cell::new(0) };
     static INLINE_POLLS: Cell<usize> = const { Cell::new(0) };
+    static TURNS: Cell<usize> = const { Cell::new(0) };
     static RUN_FAULT: Cell<bool> = const { Cell::new(false) };
     static COMMIT_FAULT: Cell<bool> = const { Cell::new(false) };
 }
@@ -1672,6 +1673,12 @@ pub(crate) fn read_start_checks() -> usize {
 #[cfg(test)]
 pub(crate) fn inline_polls() -> usize {
     INLINE_POLLS.with(Cell::get)
+}
+
+/// How many turns the owned H2 drivers on this thread have started.
+#[cfg(test)]
+pub(crate) fn turns() -> usize {
+    TURNS.with(Cell::get)
 }
 
 /// A downstream HTTP/2 driver with concrete exchange owners.
@@ -2950,6 +2957,8 @@ where
         // Only an exit below publishes idleness, so it stays false for every turn until then.
         self.connection.state.control.idle.set(false);
         for turn in 0..TURN_BUDGET {
+            #[cfg(test)]
+            TURNS.with(|turns| turns.set(turns.get() + 1));
             if self.unarmed_write
                 && !self.write_wake.ready.load(Ordering::Acquire)
                 && self.write_completion_needed()
@@ -3027,19 +3036,13 @@ where
                 ran = true;
             }
             self.check_cancel_after(&mut ran);
-            let mut serialized_owner = false;
             let mut owners = [QueuedOwner::default(); OWNER_POLLS_PER_TURN];
             let polled = self.connection.state.control.pop_batch(&mut owners);
             // Owners are polled after a connection failure too: only their polls retire streams.
             for &owner in &owners[..polled] {
                 match self.poll_stream(owner) {
-                    Ok(OwnerPollResult::Polled) => {}
-                    Ok(OwnerPollResult::Serialized(result)) => {
-                        serialized_owner = true;
-                        if let Err(error) = result {
-                            self.fail_connection(error);
-                        }
-                    }
+                    Ok(OwnerPollResult::Polled | OwnerPollResult::Serialized(Ok(()))) => {}
+                    Ok(OwnerPollResult::Serialized(Err(error))) => self.fail_connection(error),
                     Err(error) => self.reset_polled_stream(owner.id, error),
                 }
                 ran = true;
@@ -3047,16 +3050,27 @@ where
                 self.check_cancel_after(&mut ran);
             }
             progress |= polled != 0;
-            if self.failure.fatal.is_none() && !serialized_owner {
-                // On `Ok(false)` the selection was empty and did not run application code.
+            // Events are queued outside this loop, and each `Ok(true)` takes one or writes part of
+            // one until egress reaches `maximum_write_size`, so the loop ends. On `Ok(false)` the
+            // selection was empty and did not run application code.
+            while self.failure.fatal.is_none() {
                 match self.serialize_next() {
-                    Ok(serialized) => {
-                        progress |= serialized;
-                        ran |= serialized;
+                    Ok(true) => {
+                        progress = true;
+                        ran = true;
+                        // A cancel that this serialization raised stops the later ones.
+                        self.check_cancel_after(&mut ran);
+                        // After a contained panic a turn serializes at most one queued event,
+                        // and the next owner poll aborts the connection.
+                        if self.failure.panicked {
+                            break;
+                        }
                     }
+                    Ok(false) => break,
                     Err((_stream, error)) => {
                         self.fail_connection(error);
                         ran = true;
+                        break;
                     }
                 }
             }
