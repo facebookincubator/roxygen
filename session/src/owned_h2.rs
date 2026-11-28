@@ -5109,9 +5109,10 @@ where
             // makes at most two application polls. The second pass serves a wake that the first
             // queued, such as the request source's completion, so it removes that entry. Over a
             // write queue that is not saturated the entry stays: a stream there usually skips its
-            // write fence, and its END_STREAM queues the owner again.
+            // write fence, so its END_STREAM would queue the owner again, and retiring the stream
+            // in this poll removes the entry.
             let mut then_body = !UPSTREAM;
-            loop {
+            let retired = loop {
                 if let Err(error) = connection.poll_stream_owner(id, stream) {
                     if self.failure.panicked && self.failure.fatal.is_none() {
                         self.abort_retirement_panic();
@@ -5122,35 +5123,8 @@ where
                 if stream.pending.as_ref().is_some_and(PendingEgress::eom) {
                     stream.signals.wake_on_completion.set(true);
                 }
-                // Until a byte event is registered the observer is empty, and an event cannot
-                // wait.
-                let retired = stream.consumed
-                    && stream.response_complete
-                    && stream.physically_complete
-                    && (!connection.connection.state.byte_events_registered || {
-                        let waker = waker_ref(&stream.wake);
-                        let mut context = Context::from_waker(&waker);
-                        match connection
-                            .connection
-                            .state
-                            .observer
-                            .poll_stream_events_drained(connection.context, id, &mut context)
-                        {
-                            Poll::Ready(Ok(())) => true,
-                            Poll::Ready(Err(error)) => {
-                                push_connection_failure(&mut connection.failure.failures, error);
-                                false
-                            }
-                            Poll::Pending => false,
-                        }
-                    });
-                if retired {
-                    connection.connection.state.settle_ingress(stream);
-                    connection.connection.state.consumed_streams -= 1;
-                    if stream.reset || !stream.wire_ingress_complete {
-                        connection.connection.codec.abandon_stream(id);
-                    }
-                    break Some(entry.remove());
+                if connection.retirable(id, stream) {
+                    break true;
                 }
                 match connection.serialize_polled(id, stream, then_body) {
                     Some(Ok(true)) => {
@@ -5168,11 +5142,23 @@ where
                     }
                     polled => {
                         serialized = polled.map(|result| result.map(drop));
-                        break None;
+                        break matches!(serialized, Some(Ok(())))
+                            && connection.retires_in_place(id, stream);
                     }
                 }
+            };
+            if retired {
+                connection.connection.state.settle_ingress(stream);
+                connection.connection.state.consumed_streams -= 1;
+                if stream.reset || !stream.wire_ingress_complete {
+                    connection.connection.codec.abandon_stream(id);
+                }
+                Some(entry.remove())
+            } else {
+                None
             }
         };
+        let retiring = retired.is_some();
         if let Some(mut stream) = retired {
             self.debug_assert_stream_counts();
             // Admission contains its observer's panics while the driver polls.
@@ -5199,7 +5185,12 @@ where
                 observation.retired(id, self.streams.is_empty());
             }
         }
-        if serialized.is_none() && self.failure.panicked && self.failure.fatal.is_none() {
+        // A poll that serialized leaves a contained panic to the next owner poll, unless it
+        // retired its stream.
+        if (retiring || serialized.is_none())
+            && self.failure.panicked
+            && self.failure.fatal.is_none()
+        {
             self.abort_retirement_panic();
         }
         Ok(serialized.map_or(OwnerPollResult::Polled, OwnerPollResult::Serialized))
@@ -5244,6 +5235,67 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
 
     fn cancelled(&self) -> bool {
         self.connection.state.control.cancel.get() || self.context.is_cancelled()
+    }
+
+    /// Whether an owner poll can go on after it serializes an event: the session is not
+    /// cancelled, the queue of connection failures is empty, and a requested local drain has
+    /// started. The driver handles those before it polls owners.
+    fn can_continue(&self) -> bool {
+        self.failure.failures.is_empty()
+            && !self.cancelled()
+            && (self.connection.state.draining || !self.connection.state.control.drain.get())
+    }
+
+    /// Whether `stream` can retire: its request source's completion is consumed, its response is
+    /// complete and no longer waits for its write, and its byte events are drained. Inlined
+    /// because every owner poll runs it.
+    #[inline(always)]
+    fn retirable<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        id: StreamId,
+        stream: &Stream<E, UPSTREAM>,
+    ) -> bool {
+        // Until a byte event is registered the observer is empty, and an event cannot wait.
+        stream.consumed
+            && stream.response_complete
+            && stream.physically_complete
+            && (!self.connection.state.byte_events_registered || {
+                let waker = waker_ref(&stream.wake);
+                let mut context = Context::from_waker(&waker);
+                match self.connection.state.observer.poll_stream_events_drained(
+                    self.context,
+                    id,
+                    &mut context,
+                ) {
+                    Poll::Ready(Ok(())) => true,
+                    Poll::Ready(Err(error)) => {
+                        push_connection_failure(&mut self.failure.failures, error);
+                        false
+                    }
+                    Poll::Pending => false,
+                }
+            })
+    }
+
+    /// Whether `stream`, whose event its owner's poll just serialized, retires in that poll. Its
+    /// END_STREAM must have skipped its write fence, or its bytes must already be written, and the
+    /// driver must not have a cancel, a queued connection failure, a requested local drain or a
+    /// contained panic to handle first. Retiring removes the owner's entry if it is the local
+    /// queue's last, because a retired owner's poll is empty.
+    fn retires_in_place<E: ExchangeStorage<UPSTREAM>>(
+        &mut self,
+        id: StreamId,
+        stream: &Stream<E, UPSTREAM>,
+    ) -> bool {
+        if !stream.physically_complete
+            || self.failure.panicked
+            || !self.can_continue()
+            || !self.retirable(id, stream)
+        {
+            return false;
+        }
+        self.connection.state.control.unqueue_last(&stream.wake);
+        true
     }
 
     fn poll_stream_owner<E: ExchangeStorage<UPSTREAM>>(
@@ -6244,12 +6296,8 @@ impl<const UPSTREAM: bool> StreamConnection<'_, UPSTREAM> {
                 .scheduler
                 .dequeue(id, &mut stream.scheduling);
         }
-        let body_next = head
-            && stream.response_headers
-            && !stream.response_complete
-            && self.failure.failures.is_empty()
-            && !self.cancelled()
-            && (self.connection.state.draining || !self.connection.state.control.drain.get());
+        let body_next =
+            head && stream.response_headers && !stream.response_complete && self.can_continue();
         if !body_next
             && stream.pending.is_none()
             && (!stream.response_complete || stream.physically_complete)
