@@ -915,8 +915,12 @@ fn combined_header_bytes_remain_owned_across_boundaries() {
         ),
         (b"hOsT".as_slice(), HttpHeaderCode::Host, vec![0x80; 22]),
         (b"hOsT".as_slice(), HttpHeaderCode::Host, vec![0xff; 23]),
+        (b"hOsT".as_slice(), HttpHeaderCode::Host, vec![0x80; 29]),
+        (b"hOsT".as_slice(), HttpHeaderCode::Host, vec![0xff; 30]),
         (b"X-\xff".as_slice(), HttpHeaderCode::Other, vec![0x80; 19]),
         (b"X-\xff".as_slice(), HttpHeaderCode::Other, vec![0; 20]),
+        (b"X-\xff".as_slice(), HttpHeaderCode::Other, vec![0x80; 26]),
+        (b"X-\xff".as_slice(), HttpHeaderCode::Other, vec![0; 27]),
     ] {
         let stored_name = if code == HttpHeaderCode::Host {
             b"Host".as_slice()
@@ -1446,7 +1450,10 @@ fn first_insert_into_unallocated_headers_reserves_sixteen() {
     assert_eq!(cleared.capacity(), capacity);
 
     assert_eq!(HttpHeaders::new().capacity(), 16);
-    assert_eq!(HttpHeaders::default().capacity(), 16);
+    let mut defaulted = HttpHeaders::default();
+    assert_eq!(defaulted.capacity(), 0);
+    defaulted.add("x-a", "1");
+    assert_eq!(defaulted.capacity(), 16);
     // Taking moves the storage out and leaves the source with capacity 0. The
     // source's next insert reserves 16 again.
     let mut taken = HttpHeaders::unallocated();
@@ -1456,6 +1463,40 @@ fn first_insert_into_unallocated_headers_reserves_sixteen() {
     assert_eq!(moved.capacity(), 16);
     taken.add("x-b", "2");
     assert_eq!(taken.capacity(), 16);
+}
+
+#[test]
+fn values_up_to_twenty_nine_bytes_stay_inside_the_entries() {
+    // Entries are 32 bytes each, and an uncommon entry holds its name and
+    // value together.
+    let date = HttpHeaderName::Code(HttpHeaderCode::Date);
+    let uncommon = HttpHeaderName::from("x");
+    let short_uncommon = HttpHeaderName::from("x-b");
+    for (name, length, inline) in [
+        (date, 22, true),
+        (date, 23, true),
+        (date, 29, true),
+        (date, 30, false),
+        (uncommon, 22, true),
+        (uncommon, 23, true),
+        (uncommon, 29, false),
+        (uncommon, 30, false),
+        (short_uncommon, 26, true),
+        (short_uncommon, 27, false),
+    ] {
+        let value: Vec<u8> = (b'a'..=b'z').cycle().take(length).collect();
+        let mut headers = HttpHeaders::new();
+        headers.add(name, &value);
+        let stored = headers.get_single_or_empty(name);
+        assert_eq!(stored, value, "{name:?} with {length} bytes");
+        let entries =
+            headers.entries_address()..headers.entries_address() + 32 * headers.capacity();
+        assert_eq!(
+            entries.contains(&stored.as_ptr().addr()),
+            inline,
+            "{name:?} with {length} bytes"
+        );
+    }
 }
 
 #[test]

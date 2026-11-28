@@ -1616,7 +1616,7 @@ fn default_message_headers_allocate_on_first_insert() {
     assert_eq!(extracted_from.headers().capacity(), 16);
 
     assert_eq!(HttpHeaders::new().capacity(), 16);
-    assert_eq!(HttpHeaders::default().capacity(), 16);
+    assert_eq!(HttpHeaders::default().capacity(), 0);
     // Taking moves the storage out and leaves the source with none. The next
     // insert allocates the initial capacity.
     let mut headers = HttpHeaders::new();

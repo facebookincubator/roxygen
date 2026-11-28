@@ -636,7 +636,7 @@ enum HeaderEntry {
     CommonInline {
         code: HttpHeaderCode,
         len: u8,
-        bytes: [u8; 22],
+        bytes: [u8; HeaderEntry::INLINE],
     },
     CommonHeap {
         code: HttpHeaderCode,
@@ -645,7 +645,7 @@ enum HeaderEntry {
     OtherInline {
         name_len: u8,
         len: u8,
-        bytes: [u8; 22],
+        bytes: [u8; HeaderEntry::INLINE],
     },
     OtherHeap {
         name_len: usize,
@@ -653,12 +653,18 @@ enum HeaderEntry {
     },
 }
 
+const _: () = assert!(size_of::<HeaderEntry>() == 32);
+
 impl HeaderEntry {
+    /// The 32-byte size of `OtherHeap`, less the tag and the two length bytes.
+    /// An IMF-fixdate is exactly this long.
+    const INLINE: usize = 29;
+
     fn new(name: ResolvedHeaderName<'_>, value: &[u8]) -> Self {
         match name {
             ResolvedHeaderName::Code(code) => {
-                if value.len() <= 22 {
-                    let mut bytes = [0; 22];
+                if value.len() <= Self::INLINE {
+                    let mut bytes = [0; Self::INLINE];
                     bytes[..value.len()].copy_from_slice(value);
                     Self::CommonInline {
                         code,
@@ -677,8 +683,8 @@ impl HeaderEntry {
                     .len()
                     .checked_add(value.len())
                     .expect("HTTP header name and value length overflow");
-                if len <= 22 {
-                    let mut bytes = [0; 22];
+                if len <= Self::INLINE {
+                    let mut bytes = [0; Self::INLINE];
                     bytes[..name.len()].copy_from_slice(name);
                     bytes[name.len()..len].copy_from_slice(value);
                     Self::OtherInline {
@@ -1233,7 +1239,7 @@ impl HttpHeaders {
     ///
     /// The emptied collection does not allocate until the next insert.
     pub fn take(&mut self) -> Self {
-        std::mem::replace(self, Self::unallocated())
+        std::mem::take(self)
     }
 
     /// Replaces this collection by moving all headers out of `source`.
@@ -1350,7 +1356,7 @@ impl HttpHeaders {
 
 impl Default for HttpHeaders {
     fn default() -> Self {
-        Self::new()
+        Self::unallocated()
     }
 }
 
@@ -1496,10 +1502,11 @@ mod shared_entries_tests {
     fn sample() -> HttpHeaders {
         let mut headers = HttpHeaders::new();
         headers.add(HttpHeaderCode::Host, b"example.test");
-        headers.add(HttpHeaderCode::Date, b"Mon, 21 Sep 2026 12:00:00 GMT");
+        headers.add(HttpHeaderCode::Date, b"Monday, 21-Sep-26 12:00:00 GMT");
         headers.add(b"X-Dup", b"one");
         headers.add(b"x-dup", b"two");
         headers.add(b"x_version", b"old");
+        assert!(matches!(headers.entries[1], HeaderEntry::CommonHeap { .. }));
         headers
     }
 
