@@ -6807,6 +6807,8 @@ fn ready_owner_suffix_precedes_later_cross_thread_wake_after_yield() {
                 };
                 for _ in 0..16 {
                     poll_pending();
+                    // A budget yield wakes the session once this task returns to the scheduler.
+                    tokio::task::yield_now().await;
                     if !wake.0.load(Ordering::SeqCst) {
                         break;
                     }
@@ -6841,6 +6843,10 @@ fn ready_owner_suffix_precedes_later_cross_thread_wake_after_yield() {
                     "the ready batch spans a yield"
                 );
                 assert_eq!(prefix, (0..prefix.len()).collect::<Vec<_>>());
+                assert!(
+                    !wake.0.load(Ordering::SeqCst),
+                    "the poll's exit leaves the next poll to the budget yield"
+                );
                 // The budget yield wakes the session once this task returns to the scheduler.
                 tokio::task::yield_now().await;
                 assert!(
@@ -7264,14 +7270,14 @@ fn a_cross_thread_wake_polls_a_queued_owner_once_more() {
     });
 }
 
-/// Owners that the turns queue through a schedule wake the session once per poll, since the host
-/// polls the session again after the turns.
+/// Owners that a poll queues through a schedule, here as each reads its request body, are polled
+/// in that poll's turns, so the poll answers them without waking the session.
 #[test]
-fn schedules_during_the_turns_wake_the_session_once() {
+fn schedules_during_a_poll_do_not_wake_the_session() {
     run_on_worker(|context| {
         Box::pin(async move {
             let input = peer_posts(&[(64, 16_384, None), (64, 16_384, None)]);
-            let (transport, _state) =
+            let (transport, state) =
                 FixtureTransport::new([FixtureRead::SegmentedData(queue(&input))]);
             let (application, probes) = Application::new(vec![Reply::Body(0); 2]);
             let (session, handle) =
@@ -7292,9 +7298,16 @@ fn schedules_during_the_turns_wake_the_session_once() {
                 "each owner read its request body during the poll, which schedules it"
             );
             assert_eq!(
+                decode_server_frames_with_requests(&state.borrow().writes.concat(), 2)
+                    .header_statuses
+                    .len(),
+                2,
+                "the poll answered both requests"
+            );
+            assert_eq!(
                 wake.wakes.load(Ordering::SeqCst),
-                1,
-                "the first schedule of the turns wakes the session, and the others do not"
+                0,
+                "the turns poll the owners that the poll's schedules queue, without a wake"
             );
             handle.cancel();
             let error = tokio::time::timeout(Duration::from_secs(5), run)
@@ -7306,38 +7319,193 @@ fn schedules_during_the_turns_wake_the_session_once() {
     });
 }
 
-/// A session waker that panics when a schedule during the turns wakes it is contained where the
-/// schedule runs, like any other panic at that site.
-#[cfg(panic = "unwind")]
+/// Request bodies that the application reads on the session's thread between two polls queue
+/// their owners. The first of those schedules wakes the session and the later ones do not, until
+/// the next poll starts.
 #[test]
-fn a_session_waker_panic_in_a_schedule_is_contained_at_its_site() {
-    struct ArmedPanic(AtomicBool);
+fn owner_thread_schedules_between_polls_wake_the_session_once() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let input = peer_posts(&[(64, 16_384, None); 3]);
+            let (transport, _state) =
+                FixtureTransport::new([FixtureRead::SegmentedData(queue(&input))]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0); 3]);
+            application.retain_request = true;
+            application.hold_headers = true;
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let wake = Arc::new(HandWake::default());
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut run = Box::pin(session.run());
+            assert!(
+                run.as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            assert!(
+                (0..3).all(|ordinal| held_body_buffered(&probes, ordinal, 64)),
+                "the first poll buffered every request body"
+            );
+            let wakes = || wake.wakes.load(Ordering::SeqCst);
+            let read = |ordinal: usize| {
+                let probe = Rc::clone(&probes.borrow()[ordinal]);
+                let mut body = probe.held_body.borrow_mut().take().unwrap();
+                assert_eq!(read_buffered_body(&mut body), 64);
+                body
+            };
+            let before = wakes();
+            let first = [read(0), read(1)];
+            assert_eq!(
+                wakes() - before,
+                1,
+                "the first read's schedule wakes the session, and the poll that wake brings \
+                 serves the second"
+            );
+            assert!(
+                run.as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            let last = read(2);
+            assert_eq!(
+                wakes() - before,
+                2,
+                "a schedule after the next poll started wakes the session again"
+            );
+            drop((first, last));
+            handle.cancel();
+            let error = tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .unwrap()
+                .expect_err("the cancelled session fails its run");
+            assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+        })
+    });
+}
 
-    impl std::task::Wake for ArmedPanic {
-        fn wake(self: Arc<Self>) {
-            self.wake_by_ref();
-        }
-
-        fn wake_by_ref(self: &Arc<Self>) {
-            if self.0.load(Ordering::SeqCst) {
-                panic_any("session waker");
+/// A WINDOW_UPDATE that reopens the connection's send window opens it inside the parse that reads
+/// it. The same poll serializes the byte that the window held back, without a session wake.
+#[test]
+fn a_connection_window_update_serves_the_blocked_stream_in_the_same_poll() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            let mut peer = Http2Codec::new(TransportDirection::Upstream);
+            // Only the connection's 65,535-byte window then blocks the response.
+            peer.egress_settings_mut()
+                .set(SettingsId::InitialWindowSize, 131_072);
+            let mut preface = BufQueue::new(4096);
+            peer.generate(
+                &mut preface,
+                EgressFrame::ConnectionPreface,
+                &mut IgnoreCodecEvents,
+            )
+            .unwrap();
+            peer.generate_configured_settings(&mut preface, &mut IgnoreCodecEvents)
+                .unwrap();
+            let mut input = preface.coalesce(preface.chain_length()).unwrap().to_vec();
+            input.extend(eligibility_request(&mut peer, 0));
+            let update = eligibility_frame(
+                &mut peer,
+                EgressFrame::WindowUpdate {
+                    stream: StreamId::UNSPECIFIED,
+                    amount: 1,
+                },
+            );
+            let send_update = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitData(Arc::clone(&send_update), update),
+            ]);
+            let (application, probes) = Application::new(vec![Reply::Body(65_536)]);
+            let (session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let wake = Arc::new(HandWake::default());
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut run = Box::pin(session.run());
+            let body_bytes = || decode_server_frames(&state.borrow().writes.concat()).body_bytes;
+            let mut blocked = false;
+            for _ in 0..DRIVE_LIMIT {
+                assert!(
+                    run.as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                if body_bytes() == 65_535 && state.borrow().reads.is_empty() {
+                    blocked = true;
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-        }
+            assert!(
+                blocked,
+                "the connection window holds back the response's last byte"
+            );
+            let before = wake.wakes.load(Ordering::SeqCst);
+            send_update.notify_one();
+            assert_eq!(
+                wake.wakes.load(Ordering::SeqCst) - before,
+                1,
+                "the read's completion wakes the session"
+            );
+            assert!(
+                run.as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            assert_eq!(
+                body_bytes(),
+                65_536,
+                "the poll that reads the WINDOW_UPDATE serializes the blocked byte"
+            );
+            assert_eq!(
+                wake.wakes.load(Ordering::SeqCst) - before,
+                1,
+                "the window that opens inside the parse does not wake the session"
+            );
+            assert_eq!(probes.borrow()[0].response_complete.get(), 1);
+            handle.cancel();
+            let error = tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .unwrap()
+                .expect_err("the cancelled session fails its run");
+            assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
+        })
+    });
+}
+
+/// A session waker that panics on every wake while it is armed.
+struct ArmedPanic(AtomicBool);
+
+impl std::task::Wake for ArmedPanic {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
     }
 
+    fn wake_by_ref(self: &Arc<Self>) {
+        if self.0.load(Ordering::SeqCst) {
+            panic_any("session waker");
+        }
+    }
+}
+
+/// A cancel resets every stream in the next poll, and each reset queues its owner. That poll polls
+/// them all, so it does not wake the session, here through a waker that would panic.
+#[cfg(panic = "unwind")]
+#[test]
+fn a_reset_fan_out_during_a_poll_does_not_wake_the_session() {
     run_on_worker(|context| {
         Box::pin(async move {
             take_contained_panics();
-            let input = peer_request_bytes(HttpMethod::Get, &[], None, PeerControl::None);
+            let (_, input) = ready_owner_requests(3);
             let (transport, state) = FixtureTransport::new([FixtureRead::DataEof(input)]);
-            let (mut application, probes) = Application::new(vec![Reply::Body(1)]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(1); 3]);
             application.hold_headers = true;
             let (session, handle) =
                 OwnedH2Session::new(application, options(context, transport)).unwrap();
             let armed = Arc::new(ArmedPanic(AtomicBool::new(false)));
             let waker = Waker::from(Arc::clone(&armed));
             let mut run = Box::pin(session.run());
-            // Reads the request and EOF; the held head leaves the owner idle and unqueued.
+            // Reads the requests and EOF; the held heads leave the owners idle and unqueued.
             for _ in 0..DRIVE_LIMIT {
                 assert!(
                     run.as_mut()
@@ -7346,15 +7514,14 @@ fn a_session_waker_panic_in_a_schedule_is_contained_at_its_site() {
                 );
                 tokio::task::yield_now().await;
             }
-            assert!(state.borrow().reads.is_empty() && probes.borrow().len() == 1);
+            assert!(state.borrow().reads.is_empty() && probes.borrow().len() == 3);
             handle.cancel();
-            // The cancel resets the transport, whose per-stream schedule wakes the session.
             armed.0.store(true, Ordering::SeqCst);
             let polled = run.as_mut().poll(&mut Context::from_waker(&waker));
             armed.0.store(false, Ordering::SeqCst);
-            assert_eq!(
-                take_contained_panics(),
-                [(PanicSite::Transport, None, Some("session waker".to_owned()))]
+            assert!(
+                take_contained_panics().is_empty(),
+                "the poll serves the owners that its resets queue, without a wake"
             );
             let result = match polled {
                 Poll::Ready(result) => result,
@@ -7364,16 +7531,113 @@ fn a_session_waker_panic_in_a_schedule_is_contained_at_its_site() {
             };
             let error = result.expect_err("the cancelled session fails its run");
             assert_eq!(error.code(), HttpErrorCode::CORO_CANCELLED);
-            assert_eq!(probes.borrow()[0].dropped.get(), 1);
+            assert!(probes.borrow().iter().all(|probe| probe.dropped.get() == 1));
         })
     });
 }
 
-/// A Driver-scope panic in the turns skips the end of the poll. Its teardown still leaves the
-/// turns' wake state, so schedules during the teardown wake the session at once.
+/// Reads the first retained request body at the first lifecycle event after it is armed.
+struct ReadHeldBody {
+    probes: Rc<RefCell<Vec<Rc<Probe>>>>,
+    armed: Cell<bool>,
+    body: RefCell<Option<HttpSourceHolder>>,
+}
+
+impl LifecycleObserver for ReadHeldBody {
+    fn on_event(&self, _event: LifecycleEvent) {
+        if !self.armed.replace(false) {
+            return;
+        }
+        let probe = Rc::clone(&self.probes.borrow()[0]);
+        let mut body = probe.held_body.borrow_mut().take().unwrap();
+        assert_eq!(read_buffered_body(&mut body), 64);
+        *self.body.borrow_mut() = Some(body);
+    }
+}
+
+/// An owner queued after the turns, here by a lifecycle observer that reads a request body as the
+/// poll delivers its events, wakes the session as the poll returns. A session waker that panics
+/// there is reported at Driver scope, and the connection continues.
 #[cfg(panic = "unwind")]
 #[test]
-fn a_turn_panic_leaves_the_turns_wake_state() {
+fn a_session_waker_panic_at_the_poll_exit_is_contained() {
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let input = peer_posts(&[(64, 16_384, None)]);
+            let ping = eligibility_frame(
+                &mut Http2Codec::new(TransportDirection::Upstream),
+                EgressFrame::PingRequest { data: Some(42) },
+            );
+            let send_ping = Arc::new(tokio::sync::Notify::new());
+            let (transport, state) = FixtureTransport::new([
+                FixtureRead::SegmentedData(queue(&input)),
+                FixtureRead::WaitData(Arc::clone(&send_ping), ping),
+            ]);
+            let (mut application, probes) = Application::new(vec![Reply::Body(0)]);
+            application.retain_request = true;
+            application.hold_headers = true;
+            let (mut session, handle) =
+                OwnedH2Session::new(application, options(context, transport)).unwrap();
+            let observer = Rc::new(ReadHeldBody {
+                probes: Rc::clone(&probes),
+                armed: Cell::new(false),
+                body: RefCell::new(None),
+            });
+            session.add_lifecycle_observer(observer.clone()).unwrap();
+            let armed = Arc::new(ArmedPanic(AtomicBool::new(false)));
+            let waker = Waker::from(Arc::clone(&armed));
+            let mut run = Box::pin(session.run());
+            // Reads the request; the held head leaves the owner idle and unqueued.
+            for _ in 0..DRIVE_LIMIT {
+                assert!(
+                    run.as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                tokio::task::yield_now().await;
+            }
+            assert!(state.borrow().reads.is_empty() && held_body_buffered(&probes, 0, 64));
+            observer.armed.set(true);
+            send_ping.notify_one();
+            armed.0.store(true, Ordering::SeqCst);
+            let polled = run.as_mut().poll(&mut Context::from_waker(&waker));
+            armed.0.store(false, Ordering::SeqCst);
+            assert!(polled.is_pending());
+            assert!(
+                observer.body.borrow().is_some(),
+                "the observer read the body as the poll delivered the PING's events"
+            );
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::DriverTurn,
+                    None,
+                    Some("session waker".to_owned())
+                )],
+                "the wake for the owner left queued panics as the poll returns"
+            );
+            drop(observer.body.take());
+            handle.cancel();
+            let error = tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .unwrap()
+                .expect_err("the cancelled session fails its run");
+            assert_eq!(
+                error.code(),
+                HttpErrorCode::CORO_CANCELLED,
+                "the waker's panic does not abort the connection"
+            );
+        })
+    });
+}
+
+/// A Driver-scope panic in the turns starts a teardown inside the poll. The owner's schedules,
+/// in the turns and in the abort's resets, only queue it, and the poll's exit leaves the teardown
+/// to its own wakes.
+#[cfg(panic = "unwind")]
+#[test]
+fn a_turn_panic_wakes_the_session_only_for_its_teardown() {
     run_on_worker(|context| {
         Box::pin(async move {
             take_contained_panics();
@@ -7383,7 +7647,7 @@ fn a_turn_panic_leaves_the_turns_wake_state() {
             let (application, probes) = Application::new(vec![Reply::Body(1)]);
             let mut config = options(context, transport);
             config.http2.header_indexing_strategy = Some(Rc::new(PanickingIndexing));
-            let (session, handle) = OwnedH2Session::new(application, config).unwrap();
+            let (session, _handle) = OwnedH2Session::new(application, config).unwrap();
             let wake = Arc::new(HandWake::default());
             let waker = Waker::from(Arc::clone(&wake));
             let mut run = Box::pin(session.run());
@@ -7396,7 +7660,7 @@ fn a_turn_panic_leaves_the_turns_wake_state() {
             assert_eq!(
                 probes.borrow()[0].request_bytes.get(),
                 64,
-                "the owner read its body, whose schedule woke the session, before the panic"
+                "the owner read its body, which schedules it, before the panic"
             );
             assert_eq!(
                 take_contained_panics(),
@@ -7407,9 +7671,9 @@ fn a_turn_panic_leaves_the_turns_wake_state() {
                 )]
             );
             assert_eq!(
-                handle.turns_wake_state(),
-                (false, false),
-                "the teardown runs outside the turns"
+                wake.wakes.load(Ordering::SeqCst),
+                1,
+                "the teardown's own wake is the only one"
             );
             let error = tokio::time::timeout(Duration::from_secs(5), run)
                 .await
@@ -15403,8 +15667,8 @@ fn write_failure_after_retirement_leaves_the_stream_complete() {
 /// Once every stream has retired, a downstream session does not arm the writer for the completion
 /// of a write. Every write completes at the transport's flush, after the session's poll, and the
 /// queue is unsaturated, so each GET's stream retires when its END_STREAM is serialized. The
-/// third of three sequential GETs then takes two polls and two wakes: the read's wake, and the
-/// request source's self-wake inside the poll that reads the GET. The response's write is not
+/// third of three sequential GETs then takes one poll and one wake, the read's: the request
+/// source's completion inside that poll only queues its owner. The response's write is not
 /// followed by a wake, and the receipt it leaves is consumed before the session ends at EOF.
 #[test]
 fn retired_downstream_stream_needs_no_write_completion_poll() {
@@ -15468,7 +15732,7 @@ fn retired_downstream_stream_needs_no_write_completion_poll() {
             assert_eq!(answered, [true; 3], "every GET is answered and retires");
             assert_eq!(
                 per_request[2],
-                (2, 2, 1),
+                (1, 1, 0),
                 "the third GET's session (polls, wakes, in-poll wakes): no wake follows its \
                  response's write"
             );
@@ -21969,7 +22233,7 @@ fn reads_and_queued_writes_that_complete_without_waking_poll_nothing_inline() {
         requests_over_a_reader_and_write_queue(8),
         ServedWindow {
             session_polls: 16,
-            session_wakes: 24,
+            session_wakes: 16,
             inline_polls: 0,
         }
     );

@@ -248,8 +248,9 @@ impl ReadyQueue {
     // so a stable waker does not need the lock. Pushes racing with a poll are still seen, or
     // woken through the installed waker, because a push sets `pushed` under the lock before it
     // clones the waker.
-    fn register(&self, installed: &mut Option<Arc<Waker>>, context: &Context<'_>) {
+    fn register(&self, installed: &RefCell<Option<Arc<Waker>>>, context: &Context<'_>) {
         if installed
+            .borrow()
             .as_ref()
             .is_some_and(|waker| waker.will_wake(context.waker()))
         {
@@ -257,7 +258,7 @@ impl ReadyQueue {
         }
         let replacement = Arc::new(context.waker().clone());
         let old = self.state.lock().waker.replace(Arc::clone(&replacement));
-        let previous = installed.replace(replacement);
+        let previous = installed.replace(Some(replacement));
         drop(old);
         drop(previous);
     }
@@ -625,10 +626,13 @@ struct Control {
     /// Owners queued for a poll, in queue order. The session's thread queues them here
     /// without the lock, and moves the streams that wakers queued here before its own.
     owners: RefCell<VecDeque<QueuedOwner>>,
-    /// Set while the driver runs its turns.
+    /// Set while a poll of the session's run is in progress, by its `PollExit`.
     polling: Cell<bool>,
-    /// Set once `schedule` has woken the session during the turns.
-    woken: Cell<bool>,
+    /// The session's copy of the waker it last installed in `ready`, which wakes from the
+    /// session's thread use without the lock.
+    owner_waker: RefCell<Option<Arc<Waker>>>,
+    /// Set once `owner_waker` has been woken since the last poll started.
+    notified: Cell<bool>,
     upstream: Option<Rc<upstream::Admission>>,
     idle: Cell<bool>,
     host: Host,
@@ -698,12 +702,29 @@ impl Control {
         true
     }
 
-    /// `enqueue`, then a session wake if it queued the owner. During the turns the first wake
-    /// is enough, because the host polls the session again after the turns return.
+    /// `enqueue`, then a session wake if it queued the owner outside a poll. During a poll the
+    /// turns serve the owner, or `PollExit` wakes the session for it.
     fn schedule(&self, wake: &StreamWake) {
-        if self.enqueue(wake) && !self.woken.get() {
-            self.ready.wake();
-            self.woken.set(self.polling.get());
+        if self.enqueue(wake) && !self.polling.get() {
+            self.notify();
+        }
+    }
+
+    /// Wakes the session through `owner_waker` once until the next poll starts. A waker that
+    /// panics leaves `notified` clear.
+    fn notify(&self) {
+        if self.notified.get() {
+            return;
+        }
+        let waker = self.owner_waker.borrow();
+        let Some(waker) = waker.as_deref() else {
+            return;
+        };
+        // Set before the wake, so that a host that polls the session inside it clears it.
+        self.notified.set(true);
+        if let Err(panic) = guarded(|| waker.wake_by_ref()) {
+            self.notified.set(false);
+            resume_unwind(panic);
         }
     }
 
@@ -758,20 +779,19 @@ impl OwnedH2Handle {
     pub fn is_finished(&self) -> bool {
         self.0.complete.get()
     }
-
-    /// Whether the session is in its turns, and whether a schedule has woken it there.
-    #[cfg(test)]
-    pub(crate) fn turns_wake_state(&self) -> (bool, bool) {
-        (self.0.polling.get(), self.0.woken.get())
-    }
 }
 
 struct ConnectionWindowWake(Rc<Control>);
 
 impl ConnectionFlowControlCallback for ConnectionWindowWake {
+    // The window opens only inside a parse that consumed the WINDOW_UPDATE. That is progress,
+    // so the turns serialize again before the poll returns or yields.
     fn on_connection_send_window_open(&self) {
         self.0.window_transition.set(Some(true));
-        self.0.ready.wake();
+        if !self.0.polling.get() {
+            self.0.ready.busy.store(true, Ordering::Release);
+            self.0.notify();
+        }
     }
 
     fn on_connection_send_window_closed(&self) {
@@ -1698,6 +1718,69 @@ where
     }
 }
 
+/// Brackets one poll of a session's run, including its teardown and its lifecycle delivery, so
+/// that `Control::schedule` only queues owners. On every way out, an owner left queued wakes the
+/// session through `Control::owner_waker`, unless the session waits for a budget yield or tears
+/// down, which does not poll owners. It holds the control weakly, so it never drops the last
+/// reference to it.
+struct PollExit(Option<Weak<Control>>);
+
+impl PollExit {
+    #[inline(always)]
+    fn enter(control: &Rc<Control>) -> Self {
+        control.notified.set(false);
+        control.polling.set(true);
+        Self(Some(Rc::downgrade(control)))
+    }
+
+    /// Ends a poll after which the run continues, reporting a panicking waker at Driver scope.
+    #[inline(always)]
+    fn finish<A, const UPSTREAM: bool>(mut self, driver: &Driver<A, UPSTREAM>)
+    where
+        A: OwnedApplication,
+        A::Exchange: ExchangeStorage<UPSTREAM>,
+    {
+        self.0 = None;
+        let control = &driver.connection.state.control;
+        control.polling.set(false);
+        if driver.budget_yield.is_none()
+            && driver.teardown.is_none()
+            && !control.owners.borrow().is_empty()
+        {
+            notify_at_exit(control, &driver.context);
+        }
+    }
+}
+
+impl Drop for PollExit {
+    /// Ends a poll that completed the run or unwound, discarding a panicking waker's panic.
+    fn drop(&mut self) {
+        if let Some(control) = self.0.take().and_then(|control| control.upgrade()) {
+            end_abandoned_poll(&control);
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn notify_at_exit(control: &Control, context: &WorkerContext) {
+    if let Err(panic) = guarded(|| control.notify()) {
+        report_panic(context, PanicSite::DriverTurn, None, panic);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn end_abandoned_poll(control: &Control) {
+    control.polling.set(false);
+    if control.owners.borrow().is_empty() {
+        return;
+    }
+    if let Err(panic) = guarded(|| control.notify()) {
+        discard_panic(panic);
+    }
+}
+
 /// Marks the upstream admission as polled by its driver while the guard lives, then restores
 /// the previous mark. It holds the admission weakly, so it never drops the last reference to
 /// it. Downstream it is `None`.
@@ -1776,6 +1859,7 @@ where
             return Poll::Ready(Err(polled_after_completion()));
         };
         this.poisoned = true;
+        let exit = PollExit::enter(&driver.connection.state.control);
         let polled = {
             let _polling = AdmissionPolling::enter(driver);
             let polled = if driver.teardown.is_some() {
@@ -1812,6 +1896,9 @@ where
             if driver.connection.state.observation.is_some() {
                 driver.flush_observation(context);
             }
+        }
+        if let Some(driver) = &this.driver {
+            exit.finish(driver);
         }
         this.poisoned = false;
         polled
@@ -1856,7 +1943,6 @@ where
     /// The last `poll_read` left a drained reader's next read waiting for its waker. For
     /// `read_idle`, that read counts as issued and outstanding.
     read_parked: bool,
-    ready_waker: Option<Arc<Waker>>,
     /// A queued write started without arming the writer, and `poll_complete` has not since
     /// registered its waker or reported the queue idle.
     unarmed_write: bool,
@@ -2301,7 +2387,8 @@ where
             ready,
             owners: RefCell::new(VecDeque::new()),
             polling: Cell::new(false),
-            woken: Cell::new(false),
+            owner_waker: RefCell::new(None),
+            notified: Cell::new(false),
             upstream,
             idle: Cell::new(false),
             host: context.host().clone(),
@@ -2439,7 +2526,6 @@ where
                 timers: None,
                 deadline,
                 read_parked: false,
-                ready_waker: None,
                 unarmed_write: false,
                 teardown: None,
             },
@@ -2460,9 +2546,6 @@ where
     #[inline(never)]
     fn poll_panicked(&mut self, panic: PanicPayload, context: &Context<'_>) {
         discard_panic(panic);
-        // The panic skipped the end of `Driver::poll`, which resets these.
-        self.connection.state.control.polling.set(false);
-        self.connection.state.control.woken.set(false);
         self.teardown = Some(Box::default());
         if let Err(panic) = guarded(|| {
             self.abort(failure(
@@ -2496,8 +2579,7 @@ where
         context: &mut Context<'_>,
     ) -> Poll<Result<UniplexRunSummary, HttpError>> {
         let control = &self.connection.state.control;
-        let ready_waker = &mut self.ready_waker;
-        if let Err(panic) = guarded(|| control.ready.register(ready_waker, context)) {
+        if let Err(panic) = guarded(|| control.ready.register(&control.owner_waker, context)) {
             teardown_panicked(&self.context, panic);
         }
         if !self.transport_reset
@@ -2697,10 +2779,10 @@ where
             timers,
             deadline,
             read_parked: _,
-            ready_waker,
             unarmed_write: _,
             teardown: _,
         } = self;
+        let owner_waker = connection.state.control.owner_waker.take();
         release_field(&context, transport);
         release_field(&context, application);
         release_field(&context, h2);
@@ -2721,7 +2803,7 @@ where
         release_field(&context, budget_yield);
         release_field(&context, timers);
         release_field(&context, deadline);
-        release_field(&context, ready_waker);
+        release_field(&context, owner_waker);
         drop(context);
     }
 
@@ -2839,9 +2921,6 @@ where
 
     fn poll(&mut self, context: &mut Context<'_>) -> Poll<Result<UniplexRunSummary, HttpError>> {
         let polled = self.poll_turns(context);
-        let control = &self.connection.state.control;
-        control.polling.set(false);
-        control.woken.set(false);
         if polled.is_pending() && self.deadline.is_some() {
             self.sync_deadline();
         }
@@ -2858,12 +2937,8 @@ where
             }
             self.connection.state.control.quiescent.set(false);
         }
-        self.connection
-            .state
-            .control
-            .ready
-            .register(&mut self.ready_waker, context);
-        self.connection.state.control.polling.set(true);
+        let control = &self.connection.state.control;
+        control.ready.register(&control.owner_waker, context);
         // This poll consumes an unarmed write's completion, since its waker was never
         // registered.
         if self.unarmed_write {
@@ -3027,10 +3102,15 @@ where
                 if let Some(closed) = self.close_idle() {
                     return Poll::Ready(closed);
                 }
-                // Only the outstanding read can progress: its completion wakes the task.
-                if !progress {
+                // Unless an owner is queued, only the outstanding read can progress: its
+                // completion wakes the task.
+                if !progress && self.connection.state.control.owners.borrow().is_empty() {
                     return Poll::Pending;
                 }
+                continue;
+            }
+            // An owner queued after this turn's owner polls is polled in another turn.
+            if !progress && !self.connection.state.control.owners.borrow().is_empty() {
                 continue;
             }
             if !progress || turn + 1 == TURN_BUDGET {
@@ -6492,7 +6572,8 @@ mod ready_queue_tests {
             ready: Arc::new(ReadyQueue::default()),
             owners: RefCell::new(VecDeque::new()),
             polling: Cell::new(false),
-            woken: Cell::new(false),
+            owner_waker: RefCell::new(None),
+            notified: Cell::new(false),
             upstream: None,
             idle: Cell::new(false),
             host: Host::tokio(),
@@ -6530,14 +6611,17 @@ mod ready_queue_tests {
     }
 
     /// Installs a counting session waker on `control`'s queue.
-    fn install_waker(control: &Control) -> (Arc<SessionWakes>, Option<Arc<Waker>>) {
+    fn install_waker(control: &Control) -> Arc<SessionWakes> {
         let wakes = Arc::new(SessionWakes::default());
         let waker = Waker::from(Arc::clone(&wakes));
-        let mut installed = None;
         control
             .ready
-            .register(&mut installed, &Context::from_waker(&waker));
-        (wakes, installed)
+            .register(&control.owner_waker, &Context::from_waker(&waker));
+        wakes
+    }
+
+    fn session_wakes(wakes: &SessionWakes) -> usize {
+        wakes.0.load(Ordering::SeqCst)
     }
 
     fn ids(owners: &[QueuedOwner]) -> Vec<u64> {
@@ -6581,7 +6665,7 @@ mod ready_queue_tests {
     #[test]
     fn owner_thread_queues_skip_the_lock_and_keep_one_queue_order() {
         let control = control();
-        let (wakes, _installed) = install_waker(&control);
+        let wakes = install_waker(&control);
         let [a, b, c] = [1, 3, 5].map(|id| stream_wake(&control, id));
         let b_waker = futures::task::waker(Arc::clone(&b));
 
@@ -6640,7 +6724,7 @@ mod ready_queue_tests {
     #[test]
     fn a_wake_from_another_thread_queues_through_the_lock() {
         let control = control();
-        let (wakes, _installed) = install_waker(&control);
+        let wakes = install_waker(&control);
         let a = stream_wake(&control, 1);
         assert!(control.enqueue(&a));
         let waker = futures::task::waker(Arc::clone(&a));
@@ -6662,7 +6746,7 @@ mod ready_queue_tests {
     #[test]
     fn a_cross_thread_wake_adds_one_entry_that_its_poll_retires() {
         let control = control();
-        let (_wakes, _installed) = install_waker(&control);
+        install_waker(&control);
         let a = stream_wake(&control, 1);
         let waker = futures::task::waker(Arc::clone(&a));
         assert!(control.enqueue(&a));
@@ -6691,73 +6775,238 @@ mod ready_queue_tests {
     }
 
     #[test]
-    fn schedule_wakes_the_session_once_during_the_turns() {
-        let control = control();
-        let (wakes, _installed) = install_waker(&control);
-        let [a, b, c] = [1, 3, 5].map(|id| stream_wake(&control, id));
+    fn schedule_only_queues_during_a_poll() {
+        let control = Rc::new(control());
+        let wakes = install_waker(&control);
+        let [a, b, c, d] = [1, 3, 5, 7].map(|id| stream_wake(&control, id));
 
-        control.polling.set(true);
+        let exit = PollExit::enter(&control);
         control.schedule(&a);
         control.schedule(&b);
         assert_eq!(
-            wakes.0.load(Ordering::SeqCst),
+            session_wakes(&wakes),
+            0,
+            "the turns poll the owners queued during the poll, without a wake"
+        );
+        let mut batch = [QueuedOwner::default(); OWNER_POLLS_PER_TURN];
+        let polled = control.pop_batch(&mut batch);
+        assert_eq!(ids(&batch[..polled]), [1, 3]);
+        drop(exit);
+        assert_eq!(
+            session_wakes(&wakes),
+            0,
+            "a poll that leaves no owner queued does not wake the session as it returns"
+        );
+
+        control.schedule(&c);
+        control.schedule(&d);
+        control.schedule(&c);
+        assert_eq!(
+            session_wakes(&wakes),
             1,
-            "the first schedule of the turns wakes the session, and the host polls it again \
-             after the turns"
+            "between polls the first schedule wakes the session, and the poll that wake brings \
+             serves the later ones"
         );
-        control.polling.set(false);
-        control.woken.set(false);
+        let exit = PollExit::enter(&control);
+        let polled = control.pop_batch(&mut batch);
+        assert_eq!(ids(&batch[..polled]), [5, 7]);
+        drop(exit);
+        for (wake, owner) in [&c, &d].into_iter().zip(&batch[..polled]) {
+            wake.take_mark(*owner);
+        }
         control.schedule(&c);
         assert_eq!(
-            wakes.0.load(Ordering::SeqCst),
+            session_wakes(&wakes),
             2,
-            "outside the turns each schedule wakes the session"
+            "a schedule after the next poll started wakes the session again"
         );
-        control.schedule(&c);
+    }
+
+    #[test]
+    fn a_poll_exit_wakes_the_session_once_for_an_owner_left_queued() {
+        let control = Rc::new(control());
+        let wakes = install_waker(&control);
+        let [a, b] = [1, 3].map(|id| stream_wake(&control, id));
+
+        let exit = PollExit::enter(&control);
+        control.schedule(&a);
+        drop(exit);
+        assert!(!control.polling.get());
         assert_eq!(
-            wakes.0.load(Ordering::SeqCst),
-            2,
-            "an owner that is already queued does not send a wake"
+            session_wakes(&wakes),
+            1,
+            "an owner left queued wakes the session as the poll returns"
         );
+        control.schedule(&b);
+        assert_eq!(
+            session_wakes(&wakes),
+            1,
+            "that wake also covers the schedules made before the next poll"
+        );
+    }
+
+    /// Counts its wakes and panics on the first `panics` of them.
+    struct PanickingWakes {
+        panics: usize,
+        wakes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Wake for PanickingWakes {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            if self.wakes.fetch_add(1, Ordering::SeqCst) < self.panics {
+                panic!("session waker");
+            }
+        }
+    }
+
+    fn install_panicking_waker(control: &Control, panics: usize) -> Arc<PanickingWakes> {
+        let wakes = Arc::new(PanickingWakes {
+            panics,
+            wakes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let waker = Waker::from(Arc::clone(&wakes));
+        control
+            .ready
+            .register(&control.owner_waker, &Context::from_waker(&waker));
+        wakes
     }
 
     #[cfg(panic = "unwind")]
     #[test]
     fn a_schedule_whose_wake_panicked_lets_the_next_one_wake() {
-        struct PanicOnce(std::sync::atomic::AtomicUsize);
-
-        impl Wake for PanicOnce {
-            fn wake(self: Arc<Self>) {
-                self.wake_by_ref();
-            }
-
-            fn wake_by_ref(self: &Arc<Self>) {
-                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
-                    panic!("session waker");
-                }
-            }
-        }
-
         let control = control();
-        let wakes = Arc::new(PanicOnce(std::sync::atomic::AtomicUsize::new(0)));
-        let waker = Waker::from(Arc::clone(&wakes));
-        let mut installed = None;
-        control
-            .ready
-            .register(&mut installed, &Context::from_waker(&waker));
+        let wakes = install_panicking_waker(&control, 1);
         let [a, b] = [1, 3].map(|id| stream_wake(&control, id));
 
-        control.polling.set(true);
-        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| control.schedule(&a)));
+        let panicked = catch_unwind(AssertUnwindSafe(|| control.schedule(&a)));
         assert!(
             panicked.is_err(),
-            "the waker's panic reaches the schedule's caller"
+            "between polls the waker's panic reaches the schedule's caller"
         );
         control.schedule(&b);
         assert_eq!(
+            wakes.wakes.load(Ordering::SeqCst),
+            2,
+            "a wake that panicked does not hold back the next schedule's wake"
+        );
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn a_panic_out_of_a_poll_leaves_polling_clear_and_a_later_schedule_wakes() {
+        let control = Rc::new(control());
+        let wakes = install_waker(&control);
+        let [a, b] = [1, 3].map(|id| stream_wake(&control, id));
+
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            let _exit = PollExit::enter(&control);
+            control.schedule(&a);
+            let mut batch = [QueuedOwner::default(); OWNER_POLLS_PER_TURN];
+            assert_eq!(control.pop_batch(&mut batch), 1);
+            panic!("turn");
+        }));
+        assert!(unwound.is_err());
+        assert!(!control.polling.get(), "the unwound poll is over");
+        assert_eq!(
+            session_wakes(&wakes),
+            0,
+            "the unwound poll left no owner queued, so it did not wake the session"
+        );
+        control.schedule(&b);
+        assert_eq!(
+            session_wakes(&wakes),
+            1,
+            "a later schedule wakes the session"
+        );
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn a_waker_panic_as_a_poll_unwinds_is_discarded() {
+        let control = Rc::new(control());
+        let wakes = install_panicking_waker(&control, 1);
+        let [a, b] = [1, 3].map(|id| stream_wake(&control, id));
+
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            let _exit = PollExit::enter(&control);
+            control.schedule(&a);
+            panic!("turn");
+        }));
+        let payload = unwound.expect_err("the poll unwinds");
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"turn"),
+            "the poll's own panic unwinds, and the waker's panic at its exit is discarded"
+        );
+        assert_eq!(
+            wakes.wakes.load(Ordering::SeqCst),
+            1,
+            "the exit wakes the session for the owner left queued"
+        );
+        control.schedule(&b);
+        assert_eq!(
+            wakes.wakes.load(Ordering::SeqCst),
+            2,
+            "a wake that panicked does not hold back the next schedule's wake"
+        );
+    }
+
+    thread_local! {
+        static INLINE_POLLED: RefCell<Option<Rc<Control>>> = const { RefCell::new(None) };
+    }
+
+    /// Counts its wakes and polls `INLINE_POLLED`'s session inside each one.
+    #[derive(Default)]
+    struct InlinePollWakes(std::sync::atomic::AtomicUsize);
+
+    impl Wake for InlinePollWakes {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            INLINE_POLLED.with_borrow(|control| {
+                let control = control.as_ref().expect("a session to poll");
+                let _exit = PollExit::enter(control);
+                let mut batch = [QueuedOwner::default(); OWNER_POLLS_PER_TURN];
+                control.pop_batch(&mut batch);
+            });
+        }
+    }
+
+    #[test]
+    fn a_poll_inside_the_wake_lets_a_later_schedule_wake() {
+        let control = Rc::new(control());
+        INLINE_POLLED.set(Some(Rc::clone(&control)));
+        let wakes = Arc::new(InlinePollWakes::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        control
+            .ready
+            .register(&control.owner_waker, &Context::from_waker(&waker));
+        let [a, b] = [1, 3].map(|id| stream_wake(&control, id));
+
+        control.schedule(&a);
+        control.schedule(&b);
+        INLINE_POLLED.set(None);
+        assert_eq!(
             wakes.0.load(Ordering::SeqCst),
             2,
-            "a wake that panicked does not count as the turns' wake"
+            "the poll that the first wake ran served its owner, so the next schedule wakes again"
+        );
+    }
+
+    /// Each connection allocates one `Control` behind an `Rc`, which adds its two counts.
+    #[test]
+    fn control_allocation_stays_in_the_192_class() {
+        let allocation = size_of::<Control>() + 2 * size_of::<usize>();
+        assert!(
+            allocation <= 192,
+            "Control's Rc allocation is {allocation} B, past the 192 B class"
         );
     }
 }

@@ -3742,6 +3742,57 @@ fn upstream_driver_panic_returns_err() {
     });
 }
 
+/// A run that completes releases the driver field by field. A destructor that panics there,
+/// here the observer's as the driver drops the connection's last reference, is counted as a
+/// teardown step, and the run still returns its result.
+#[cfg(panic = "unwind")]
+#[test]
+fn a_panicking_drop_after_owned_upstream_completion_is_reported() {
+    struct PanicsOnDrop;
+
+    impl OwnedH2UpstreamObserver for PanicsOnDrop {}
+
+    impl Drop for PanicsOnDrop {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                panic!("observer drop panicked");
+            }
+        }
+    }
+
+    run_on_worker(|context| {
+        Box::pin(async move {
+            take_contained_panics();
+            let worker = context.handle().clone();
+            let start = worker.poll_stats();
+            let (transport, wire) = FixtureTransport::new([]);
+            let (session, handle) =
+                OwnedH2UpstreamSession::new(options(context, transport)).unwrap();
+            handle.set_observer(Rc::new(PanicsOnDrop)).unwrap();
+            assert!(handle.close_when_idle().unwrap());
+            drop(handle);
+            let run = tokio::time::timeout(Duration::from_secs(5), session.run())
+                .await
+                .expect("the idle connection closes")
+                .unwrap();
+            assert!(!run.reset);
+            assert_eq!(wire.borrow().close, FixtureClose::Closed);
+            assert_eq!(
+                take_contained_panics(),
+                [(
+                    PanicSite::Teardown,
+                    None,
+                    Some("observer drop panicked".to_owned())
+                )]
+            );
+            assert_eq!(
+                super::owned::contained_panic_counts(&worker, &start),
+                (0, 0, 1)
+            );
+        })
+    });
+}
+
 #[test]
 fn an_owned_upload_polls_the_submitted_filter_before_serializing_its_body() {
     struct ObserveBody(Rc<Cell<usize>>);
