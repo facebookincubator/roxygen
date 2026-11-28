@@ -400,8 +400,9 @@ pub trait ByteStreamTransport: 'static {
 /// results, and close and cancellation outcomes as `read`, except for timing.
 /// It has no deadline, its completion does not wake a task, and over a
 /// Tokio-backed stream its I/O state lives in the backend, so it does not
-/// allocate a future. Over TCP its first poll fills the tailroom of a buffer
-/// that the transport keeps between reads, where a `read` starts a new buffer.
+/// allocate a future. Over TCP its first poll fills the tailroom of a reused
+/// buffer, where a `read` starts a new buffer. A reader that waits on its
+/// socket does not hold that buffer.
 ///
 /// A cancellation wakes a pending read, as a timed read's wait does. The reader
 /// registers that wake once for all its reads, so a cancellation requested

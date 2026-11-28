@@ -9479,6 +9479,8 @@ mod tcp_tls {
         use crate::byte_stream::OwnedReader;
         use crate::byte_stream::read_operations_for_test;
         use crate::byte_stream::read_registrations_for_test;
+        use crate::tcp::ReadRoom;
+        use crate::tcp::free_read_rooms_for_test;
         use crate::tcp::io_read_futures_for_test;
         use crate::tcp_tls_tests::tcp_tls::native_write_queue::with_accepted_tcp;
 
@@ -9913,8 +9915,9 @@ mod tcp_tls {
             });
         }
 
-        /// Dropping a reader whose read pends ends only that read. The transport keeps the reader's
-        /// buffer, so the next reader's read reclaims it instead of reserving one.
+        /// Dropping a reader whose read pends ends only that read. The pending read releases the
+        /// reader's buffer to the thread's free list, so the next reader's read reclaims it instead
+        /// of reserving one.
         #[test]
         fn dropping_a_pending_tcp_reader_read_keeps_the_readers_buffer() {
             with_accepted_tcp(limits(), |context, transport, mut peer| async move {
@@ -9927,12 +9930,22 @@ mod tcp_tls {
                 let read = poll_fn(|context| reader.poll_read(context)).await.unwrap();
                 let start = read.data().front().unwrap().as_ptr() as usize;
                 assert_eq!(read_bytes(read), b"one ");
+                assert_eq!(
+                    free_read_rooms_for_test(),
+                    0,
+                    "a read that does not report the socket drained keeps its buffer",
+                );
                 let reservations = tcp_first_reservations_for_test();
                 reader.start_read(64, 64).unwrap();
                 assert!(
                     reader
                         .poll_read(&mut Context::from_waker(Waker::noop()))
                         .is_pending()
+                );
+                assert_eq!(
+                    free_read_rooms_for_test(),
+                    1,
+                    "the pending read leaves the buffer on the free list",
                 );
                 drop(reader);
 
@@ -9955,6 +9968,193 @@ mod tcp_tls {
                     "the cancelled read's reader buffer outlives it",
                 );
                 transport.close(&context).unwrap();
+            });
+        }
+
+        /// A read that drains the socket releases its buffer to the thread's free list, even while
+        /// the read's bytes are held, so the idle transport does not hold a buffer. The next read
+        /// takes the buffer back and fills its tailroom.
+        #[test]
+        fn a_drained_tcp_reader_read_releases_its_buffer() {
+            let limits = ByteStreamLimits::new(8_000, 1024, 8).unwrap();
+            with_observed_tcp(
+                limits,
+                |context, transport, mut peer, observer| async move {
+                    let mut reader = transport
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    let signal = Arc::new(WakeSignal::default());
+                    let reservations = tcp_first_reservations_for_test();
+                    let mut held = Vec::new();
+                    for chunk in [&b"one "[..], b"two "] {
+                        peer.write_all(chunk).await.unwrap();
+                        wait_until_queued(&observer, chunk.len()).await;
+                        let read = read_through(&mut reader, &signal, 8_000, 4_000)
+                            .await
+                            .unwrap();
+                        assert!(reader.is_drained());
+                        assert_eq!(free_read_rooms_for_test(), 1);
+                        assert_eq!(read_bytes_ref(&read), chunk);
+                        held.push(read);
+                        signal.take();
+                    }
+                    let starts: Vec<usize> = held
+                        .iter()
+                        .map(|read| read.data().front().unwrap().as_ptr() as usize)
+                        .collect();
+                    assert_eq!(
+                        starts[1],
+                        starts[0] + 4,
+                        "the second read fills the released buffer's tailroom",
+                    );
+                    assert_eq!(tcp_first_reservations_for_test(), reservations + 1);
+                    transport.close(&context).unwrap();
+                },
+            );
+        }
+
+        /// A buffer that one transport's drained read released, its bytes since dropped, is
+        /// reclaimed by the next read of another transport on the same thread.
+        #[test]
+        fn a_tcp_reader_read_reclaims_a_buffer_that_another_transport_released() {
+            with_observed_tcp(
+                limits(),
+                |context, first, mut first_peer, first_observer| async move {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let mut second_peer = TcpStream::connect(listener.local_addr().unwrap())
+                        .await
+                        .unwrap();
+                    let accepted = listener.accept().await.unwrap().0.into_std().unwrap();
+                    let second_observer = accepted.try_clone().unwrap();
+                    let second = TcpTransport::from_accepted(&context, accepted, limits()).unwrap();
+                    let signal = Arc::new(WakeSignal::default());
+
+                    let reservations = tcp_first_reservations_for_test();
+                    let mut reader = first
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    drain_once(&mut reader, &signal, &mut first_peer, &first_observer).await;
+                    assert_eq!(tcp_first_reservations_for_test(), reservations + 1);
+                    let start = last_tcp_first_reservation_for_test().unwrap();
+
+                    let mut reader = second
+                        .reader(&context, Duration::ZERO, CancellationToken::never())
+                        .unwrap()
+                        .unwrap();
+                    second_peer.write_all(b"two ").await.unwrap();
+                    wait_until_queued(&second_observer, 4).await;
+                    let read = read_through(&mut reader, &signal, 64, 64).await.unwrap();
+                    assert_eq!(
+                        read.data().front().unwrap().as_ptr() as usize,
+                        start,
+                        "the second transport fills the first one's buffer from its start",
+                    );
+                    assert_eq!(read_bytes(read), b"two ");
+                    assert_eq!(tcp_first_reservations_for_test(), reservations + 1);
+                    first.close(&context).unwrap();
+                    second.close(&context).unwrap();
+                },
+            );
+        }
+
+        /// Runs `test` on a current-thread runtime with an accepted TCP stream and its peer.
+        fn with_tcp_pair<F, Fut>(test: F)
+        where
+            F: FnOnce(TcpStream, TcpStream) -> Fut,
+            Fut: Future<Output = ()>,
+        {
+            Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let peer = TcpStream::connect(listener.local_addr().unwrap())
+                        .await
+                        .unwrap();
+                    let (stream, _) = listener.accept().await.unwrap();
+                    test(stream, peer).await;
+                });
+        }
+
+        /// Has `peer` write `data`, then reads it from `stream` with a first poll into `room`.
+        async fn read_data_through_room(
+            stream: &mut TcpStream,
+            peer: &mut TcpStream,
+            room: &mut ReadRoom,
+        ) -> BufQueue {
+            peer.write_all(b"data").await.unwrap();
+            let mut read = OwnedRead::new(4_000);
+            let eof = time::timeout(
+                Duration::from_secs(5),
+                poll_fn(|context| stream.poll_read_reusing(context, 4_000, 4_000, &mut read, room)),
+            )
+            .await
+            .expect("a TCP read of queued bytes completes")
+            .unwrap();
+            assert!(!eof);
+            let data = read.into_data().unwrap();
+            assert_eq!(data.front().unwrap().as_ref(), b"data");
+            data
+        }
+
+        fn start_of(data: &BufQueue) -> usize {
+            data.front().unwrap().as_ptr() as usize
+        }
+
+        /// A dropped room releases its buffer to the thread's free list, which keeps at most 16.
+        #[test]
+        fn dropped_read_rooms_fill_a_bounded_free_list() {
+            with_tcp_pair(|mut stream, mut peer| async move {
+                let mut rooms: Vec<ReadRoom> = (0..17).map(|_| ReadRoom::default()).collect();
+                for room in &mut rooms {
+                    read_data_through_room(&mut stream, &mut peer, room).await;
+                }
+                assert_eq!(
+                    free_read_rooms_for_test(),
+                    0,
+                    "each room keeps its buffer between reads",
+                );
+                drop(rooms.pop());
+                assert_eq!(free_read_rooms_for_test(), 1);
+                drop(rooms);
+                assert_eq!(free_read_rooms_for_test(), 16);
+            });
+        }
+
+        /// A room without a buffer takes the latest free buffer that it can reclaim whole, ahead
+        /// of a later one whose bytes are still held. With only the held one free, it fills that
+        /// one's tailroom.
+        #[test]
+        fn a_read_room_takes_a_reclaimable_free_buffer_ahead_of_a_held_one() {
+            with_tcp_pair(|mut stream, mut peer| async move {
+                let mut first = ReadRoom::default();
+                let mut second = ReadRoom::default();
+                read_data_through_room(&mut stream, &mut peer, &mut first).await;
+                let reclaimable = last_tcp_first_reservation_for_test().unwrap();
+                let held = read_data_through_room(&mut stream, &mut peer, &mut second).await;
+                drop(first);
+                drop(second);
+                assert_eq!(free_read_rooms_for_test(), 2);
+                let reservations = tcp_first_reservations_for_test();
+
+                let mut room = ReadRoom::default();
+                let data = read_data_through_room(&mut stream, &mut peer, &mut room).await;
+                assert_eq!(
+                    start_of(&data),
+                    reclaimable,
+                    "the read fills the reclaimed buffer from its start",
+                );
+                let mut room = ReadRoom::default();
+                let data = read_data_through_room(&mut stream, &mut peer, &mut room).await;
+                assert_eq!(
+                    start_of(&data),
+                    start_of(&held) + 4,
+                    "the read fills the held buffer's tailroom",
+                );
+                assert_eq!(tcp_first_reservations_for_test(), reservations);
             });
         }
 

@@ -453,24 +453,67 @@ fn poll_tcp_first(
 /// matches Proxygen's minimum read size.
 const MIN_READ_SIZE: usize = 1_460;
 
-/// A buffer that successive `OwnedReader` reads of a TCP stream fill in turn,
-/// each in the tailroom that earlier reads left. A read hands out the bytes it
-/// filled as a view of the buffer. The buffer does not hold unread bytes
-/// between reads.
+/// The most buffers that a thread's free list of read rooms keeps.
+const FREE_READ_ROOM_LIMIT: usize = 16;
+
+std::thread_local! {
+    /// Buffers that this thread's read rooms released, most recent last, each
+    /// with the capacity of its allocation. Views of a buffer may still be held.
+    static FREE_READ_ROOMS: RefCell<Vec<(BytesMut, usize)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Takes from this thread's free list the latest buffer that offers `capacity`
+/// bytes, after a whole reclaim if its views are all dropped, or else the
+/// latest buffer.
+fn take_free_read_room(capacity: usize) -> Option<(BytesMut, usize)> {
+    FREE_READ_ROOMS
+        .try_with(|rooms| {
+            let mut rooms = rooms.borrow_mut();
+            let whole = rooms.iter_mut().rposition(|(buffer, _)| {
+                buffer.capacity() >= capacity || buffer.try_reclaim(capacity)
+            });
+            match whole {
+                Some(index) => Some(rooms.remove(index)),
+                None => rooms.pop(),
+            }
+        })
+        .ok()
+        .flatten()
+}
+
+/// The buffer, if any, whose tailroom a TCP stream's next `OwnedReader` read
+/// fills. A read hands out the bytes it filled as a view of the buffer, and the
+/// buffer does not hold unread bytes between reads. A reader read that pends or
+/// drains the stream, or dropping the room, releases the buffer to the thread's
+/// free list, so the room of an idle connection does not hold an allocation.
 #[derive(Default)]
 pub(crate) struct ReadRoom {
     buffer: BytesMut,
-    /// The capacity of the allocation that `buffer` lies in.
+    /// The capacity of the allocation that `buffer` lies in, or 0 when the room
+    /// does not hold one.
     backing: usize,
+}
+
+impl Drop for ReadRoom {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 impl ReadRoom {
     /// Readies the tailroom for a first offer of at most `capacity` bytes and
-    /// returns the offer. When the tailroom is short of `capacity`, the whole
+    /// returns the offer. A room without a buffer first takes one from its
+    /// thread's free list. When the tailroom is short of `capacity`, the whole
     /// buffer is reclaimed if no view of it is left. Otherwise the tailroom is
     /// offered while it holds at least `min(MIN_READ_SIZE, capacity)` bytes,
     /// and a new buffer of `capacity` bytes replaces it when it holds less.
     fn prepare(&mut self, capacity: usize) -> usize {
+        if self.backing == 0
+            && let Some((buffer, backing)) = take_free_read_room(capacity)
+        {
+            self.buffer = buffer;
+            self.backing = backing;
+        }
         let tailroom = self.buffer.capacity();
         if tailroom < capacity {
             if self.buffer.try_reclaim(capacity) {
@@ -520,6 +563,29 @@ impl ReadRoom {
     fn take_filled(&mut self) -> (Bytes, usize) {
         (self.buffer.split().freeze(), self.backing)
     }
+
+    /// Moves the buffer to this thread's free list, or drops it when the list
+    /// is full.
+    fn release(&mut self) {
+        if self.backing == 0 {
+            return;
+        }
+        let released = (std::mem::take(&mut self.buffer), self.backing);
+        self.backing = 0;
+        // The list can be gone during thread teardown, and the buffer is then dropped.
+        let _ = FREE_READ_ROOMS.try_with(|rooms| {
+            let mut rooms = rooms.borrow_mut();
+            if rooms.len() < FREE_READ_ROOM_LIMIT {
+                rooms.push(released);
+            }
+        });
+    }
+}
+
+/// Buffers on this thread's free list of read rooms.
+#[cfg(test)]
+pub(crate) fn free_read_rooms_for_test() -> usize {
+    FREE_READ_ROOMS.with_borrow(Vec::len)
 }
 
 /// Like `poll_tcp_first`, but fills the reader's `room`, which is prepared
@@ -1824,7 +1890,8 @@ impl IoRead {
 /// read, or else at most `maximum` gathered bytes, the first of them in `room`
 /// when the stream reuses it. With `arm`, a read that gathered bytes without
 /// an error or EOF also polls whether the stream is drained
-/// (`TokioByteStream::poll_read_drained`).
+/// (`TokioByteStream::poll_read_drained`). A read that pends or drains the
+/// stream releases `room`'s buffer.
 fn poll_io_read<S>(
     shared: &TokioIoShared<S>,
     context: &mut Context<'_>,
@@ -1853,13 +1920,18 @@ where
         let mut stream = shared.stream.borrow_mut();
         match stream.as_mut() {
             Some(stream) => {
-                let ended = ready!(
-                    stream
-                        .poll_read_reusing(context, *maximum, *allocation_size, gathered, room)
-                        .map_err(read_io_error)
-                );
+                let Poll::Ready(ended) =
+                    stream.poll_read_reusing(context, *maximum, *allocation_size, gathered, room)
+                else {
+                    room.release();
+                    return Poll::Pending;
+                };
+                let ended = ended.map_err(read_io_error);
                 let drained =
                     arm && matches!(ended, Ok(false)) && stream.poll_read_drained(context);
+                if drained {
+                    room.release();
+                }
                 (ended, drained)
             }
             None => (Err(dropped_error()), false),
